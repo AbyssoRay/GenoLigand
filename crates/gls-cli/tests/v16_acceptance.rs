@@ -69,12 +69,110 @@ fn v16_contract_files_exist_with_positive_and_negative_examples() {
         "schema_examples/short_circuit_gate.invalid.json",
         "schema_examples/tolerance_profile.valid.json",
         "schema_examples/tolerance_profile.invalid.json",
+        "schema_examples/geometry_budget_report.valid.json",
+        "schema_examples/geometry_budget_report.invalid.json",
+        "schema_examples/patch_realization.valid.json",
+        "schema_examples/patch_realization.invalid.json",
         "docs/pipeline_contract.md",
         "workflows/main.nf",
         "config/plm_budget.yaml",
     ] {
         assert!(root.join(path).exists(), "missing {path}");
     }
+}
+
+#[test]
+fn v16_schema_examples_validate_and_reject() {
+    let root = workspace_root();
+    for (schema, valid, invalid, validator) in [
+        (
+            "schemas/short_circuit_gate.schema.json",
+            "schema_examples/short_circuit_gate.valid.json",
+            "schema_examples/short_circuit_gate.invalid.json",
+            validate_short_circuit_gate as fn(&str) -> bool,
+        ),
+        (
+            "schemas/tolerance_profile.schema.json",
+            "schema_examples/tolerance_profile.valid.json",
+            "schema_examples/tolerance_profile.invalid.json",
+            validate_tolerance_profile,
+        ),
+        (
+            "schemas/geometry_budget_report.schema.json",
+            "schema_examples/geometry_budget_report.valid.json",
+            "schema_examples/geometry_budget_report.invalid.json",
+            validate_geometry_budget_report,
+        ),
+        (
+            "schemas/patch_realization.schema.json",
+            "schema_examples/patch_realization.valid.json",
+            "schema_examples/patch_realization.invalid.json",
+            validate_patch_realization,
+        ),
+    ] {
+        let schema_value = read_text(root.join(schema));
+        let valid_value = read_text(root.join(valid));
+        let invalid_value = read_text(root.join(invalid));
+
+        assert!(validator(&valid_value), "{valid} should validate");
+        assert!(!validator(&invalid_value), "{invalid} should be rejected");
+        assert!(schema_value.contains("\"schema_version\""));
+        assert!(schema_value.contains("\"const\": \"1.6\""));
+        assert!(valid_value.contains("\"schema_version\": \"1.6\""));
+        assert!(invalid_value.contains("\"schema_version\": \"1.6\""));
+    }
+}
+
+fn workspace_root() -> std::path::PathBuf {
+    std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .ancestors()
+        .nth(2)
+        .expect("workspace root")
+        .to_path_buf()
+}
+
+fn read_text(path: impl AsRef<std::path::Path>) -> String {
+    let path = path.as_ref();
+    std::fs::read_to_string(path).unwrap_or_else(|err| {
+        panic!("failed to read {}: {err}", path.display());
+    })
+}
+
+fn validate_short_circuit_gate(value: &str) -> bool {
+    has(value, "\"candidate_id\"")
+        && has(value, "\"decision\": \"pass_plm\"")
+        && has(value, "\"pass_plm\": true")
+        && has(value, "\"failure_reason\": null")
+        && !has(value, "\"failure_reason\": \"budget exhausted\"")
+}
+
+fn validate_tolerance_profile(value: &str) -> bool {
+    has(value, "\"generated_by_fixture_calibration\": true")
+        && has(value, "\"radius_tolerance\"")
+        && has(value, "\"angle_tolerance_deg\"")
+        && has(value, "\"max_bucket_occupancy\"")
+        && has(value, "\"max_seed_triplets\"")
+}
+
+fn validate_geometry_budget_report(value: &str) -> bool {
+    has(value, "\"max_bucket_occupancy_observed\": 3")
+        && has(value, "\"memory_estimate_mb\": 4.5")
+        && has(
+            value,
+            "\"relaxed_profiles_tried\": [\"narrow\", \"standard\"]",
+        )
+        && has(value, "\"failure_reason\": null")
+}
+
+fn validate_patch_realization(value: &str) -> bool {
+    has(value, "\"pass_l2\": true")
+        && has(value, "\"matched_constraints\": 3")
+        && has(value, "\"failure_reason\": null")
+        && has(value, "\"source\": \"gls-patch-realizer\"")
+}
+
+fn has(value: &str, needle: &str) -> bool {
+    value.contains(needle)
 }
 
 fn candidate(id: &str, sequence: &str) -> OrfCandidate {

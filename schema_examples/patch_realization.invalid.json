@@ -1,0 +1,17 @@
+{
+  "schema_version": "1.6",
+  "candidate_id": "bad",
+  "profile_id": "tol_standard_dev",
+  "pass_l2": true,
+  "matched_constraints": 0,
+  "rmsd": 0.22,
+  "score": 0.91,
+  "failure_reason": "should_not_exist",
+  "audit": [],
+  "provenance": {
+    "source": "gls-patch-realizer",
+    "version": "v1.6",
+    "parameters_hash": "0123456789abcdef",
+    "artifact_hash": "fedcba9876543210"
+  }
+}

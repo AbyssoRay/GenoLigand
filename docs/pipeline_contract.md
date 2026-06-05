@@ -6,6 +6,7 @@ This contract implements the three files in `goal/` as hard V1.6 requirements.
 
 - L1 genome candidates must not call pLM directly.
 - `gls-plm-gate` accepts only `ShortCircuitGateResult.pass_plm = true`.
+- `gls-plm-gate` batches by sequence length, uses a versioned cache key, and requires a GPU batch semaphore before worker invocation.
 - L1 and L1.25 candidates must not enter docking.
 - L1.5 accepts only G2/G3 candidates.
 - L2 docking accepts only `PatchRealizationResult.pass_l2 = true`.
@@ -46,3 +47,11 @@ L2 gls-dock
 ## Reporting
 
 Reports must include candidate counts, retention, failure reasons, CPU time, and peak memory for L1, L1.20, L1.25, L1.5, patch realization, and L2. IDP/IDR outputs are trend only in MVP and must not include macro free energy.
+
+## L1.25 pLM Versioning
+
+The default pLM path uses a small primary model. Boundary candidates can be upgraded to a larger model only after L1.20 has already selected them. Cache identity is `sequence_hash + model_id + tokenizer_id + weights_hash`, so primary and upgraded embeddings are never conflated.
+
+## L2 Docking Manifest
+
+`gls-dock` builds a batch manifest from `PatchRealizationResult` values. Manifest entries are emitted only for `pass_l2 = true`; rejected candidate ids are recorded separately with a machine-readable reason. Vina-style output parsing accepts both tabular mode lines and `REMARK VINA RESULT:` lines.

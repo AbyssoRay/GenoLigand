@@ -33,6 +33,10 @@ pub struct PatchFixture {
     pub split: String,
     pub source: String,
     pub license_note: String,
+    pub ligand_id: String,
+    pub pocket_id: String,
+    pub interaction_labels: Vec<String>,
+    pub resolution_angstrom: f64,
     pub ligand_class: String,
     pub structure_confidence_bin: String,
     pub interaction_kind: InteractionKind,
@@ -62,8 +66,16 @@ impl PatchFixture {
         let source = source.into();
         let license_note = license_note.into();
         let residue_signature = residue_signature.into();
+        let ligand_id = format!("ligand_{fixture_id}");
+        let pocket_id = format!("pocket_{fixture_id}");
+        let interaction_labels = vec![format!(
+            "{}:{}",
+            InteractionKind::HydrogenBond.as_str(),
+            residue_signature
+        )];
+        let resolution_angstrom = 1.8;
         let payload = format!(
-            "{fixture_id}:{split}:{source}:{license_note}:{residue_signature}:{observed_radius_error:.3}:{observed_angle_error_deg:.3}"
+            "{fixture_id}:{split}:{source}:{license_note}:{ligand_id}:{pocket_id}:{residue_signature}:{observed_radius_error:.3}:{observed_angle_error_deg:.3}"
         );
         Self {
             fixture_id,
@@ -71,6 +83,10 @@ impl PatchFixture {
             split,
             source,
             license_note,
+            ligand_id,
+            pocket_id,
+            interaction_labels,
+            resolution_angstrom,
             ligand_class: "generic".to_string(),
             structure_confidence_bin: "high".to_string(),
             interaction_kind: InteractionKind::HydrogenBond,
@@ -123,6 +139,21 @@ impl FixtureManifest {
             }
             if fixture.split.is_empty() {
                 return Err(format!("fixture_missing_split:{}", fixture.fixture_id));
+            }
+            if fixture.ligand_id.is_empty() {
+                return Err(format!("fixture_missing_ligand:{}", fixture.fixture_id));
+            }
+            if fixture.pocket_id.is_empty() {
+                return Err(format!("fixture_missing_pocket:{}", fixture.fixture_id));
+            }
+            if fixture.interaction_labels.is_empty() {
+                return Err(format!(
+                    "fixture_missing_interaction_labels:{}",
+                    fixture.fixture_id
+                ));
+            }
+            if fixture.resolution_angstrom <= 0.0 {
+                return Err(format!("fixture_missing_resolution:{}", fixture.fixture_id));
             }
             if fixture.fixture_type.is_positive() {
                 positive_keys.insert(fixture.leakage_key());
@@ -178,9 +209,41 @@ pub fn dev_fixture_manifest() -> FixtureManifest {
     hard_negative.observed_bucket_occupancy = 1;
     hard_negative.observed_seed_triplets = 4;
 
+    let mut pocket_decoy = PatchFixture::new(
+        "pocket_decoy_1",
+        FixtureType::PocketDecoy,
+        "calibration_holdout",
+        "curated-dev-pocket-decoy",
+        "internal dev fixture; pocket decoy bucket-explosion control",
+        "D-H-Q",
+        (2.25, 48.0),
+    );
+    pocket_decoy.observed_bucket_occupancy = 12;
+    pocket_decoy.observed_seed_triplets = 64;
+    pocket_decoy.pocket_id = "decoy_surface_patch_1".to_string();
+
+    let mut predicted_noise = PatchFixture::new(
+        "predicted_noise_1",
+        FixtureType::PredictedStructureNoise,
+        "calibration_train",
+        "curated-dev-predicted-noise",
+        "internal dev fixture; predicted-structure coordinate noise",
+        "D-H-Q",
+        (0.95, 22.0),
+    );
+    predicted_noise.structure_confidence_bin = "low".to_string();
+    predicted_noise.observed_bucket_occupancy = 5;
+    predicted_noise.observed_seed_triplets = 10;
+
     FixtureManifest {
         dataset_id: "dev-fixtures-v1.6".to_string(),
-        fixtures: vec![positive, perturbed, hard_negative],
+        fixtures: vec![
+            positive,
+            perturbed,
+            hard_negative,
+            pocket_decoy,
+            predicted_noise,
+        ],
     }
 }
 
@@ -198,6 +261,32 @@ mod tests {
                 .iter()
                 .all(|fixture| !fixture.hash.is_empty())
         );
+        assert!(manifest.fixtures.iter().all(|fixture| {
+            !fixture.ligand_id.is_empty()
+                && !fixture.pocket_id.is_empty()
+                && !fixture.interaction_labels.is_empty()
+                && fixture.resolution_angstrom > 0.0
+        }));
+    }
+
+    #[test]
+    fn dev_manifest_covers_all_required_fixture_types() {
+        let manifest = dev_fixture_manifest();
+        let types = manifest
+            .fixtures
+            .iter()
+            .map(|fixture| fixture.fixture_type.as_str())
+            .collect::<BTreeSet<_>>();
+
+        for required in [
+            "positive_holo",
+            "positive_perturbed",
+            "hard_negative_same_residues",
+            "pocket_decoy",
+            "predicted_structure_noise",
+        ] {
+            assert!(types.contains(required), "missing fixture type {required}");
+        }
     }
 
     #[test]
