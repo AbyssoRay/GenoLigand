@@ -1,0 +1,11 @@
+[package]
+name = "gls-artifacts"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+gls-types = { path = "../gls-types" }

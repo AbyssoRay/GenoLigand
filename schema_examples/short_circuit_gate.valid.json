@@ -1,0 +1,18 @@
+{
+  "schema_version": "1.6",
+  "candidate_id": "dark_shard_1:1:0-12",
+  "decision": "pass_plm",
+  "rule_version": "gls-shortcircuit-v1.6",
+  "sequence_hash": "0123456789abcdef",
+  "canonical_cluster_id": "dark_shard_1:1:0-12",
+  "aa_len": 42,
+  "low_complexity_score": 0.22,
+  "entropy_score": 3.1,
+  "fragment_info_score": 8.7,
+  "cooccur_q_value": 0.01,
+  "locus_class": "dark_genome",
+  "context_priority_score": 0.25,
+  "budget_rank": 1,
+  "pass_plm": true,
+  "failure_reason": null
+}

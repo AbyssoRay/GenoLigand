@@ -1,0 +1,47 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://genoligand.local/schemas/short_circuit_gate.schema.json",
+  "title": "ShortCircuitGateResult",
+  "type": "object",
+  "required": [
+    "schema_version",
+    "candidate_id",
+    "decision",
+    "rule_version",
+    "sequence_hash",
+    "aa_len",
+    "pass_plm"
+  ],
+  "properties": {
+    "schema_version": { "const": "1.6" },
+    "candidate_id": { "type": "string", "minLength": 1 },
+    "decision": {
+      "enum": ["reject", "hold_no_plm", "pass_plm", "force_keep_dark_candidate"]
+    },
+    "rule_version": { "type": "string", "minLength": 1 },
+    "sequence_hash": { "type": "string", "pattern": "^[0-9a-f]{16,}$" },
+    "canonical_cluster_id": { "type": ["string", "null"] },
+    "aa_len": { "type": "integer", "minimum": 1 },
+    "low_complexity_score": { "type": "number", "minimum": 0 },
+    "entropy_score": { "type": "number", "minimum": 0 },
+    "fragment_info_score": { "type": "number", "minimum": 0 },
+    "cooccur_q_value": { "type": ["number", "null"], "minimum": 0, "maximum": 1 },
+    "locus_class": { "type": "string" },
+    "context_priority_score": { "type": "number" },
+    "budget_rank": { "type": "integer", "minimum": 0 },
+    "pass_plm": { "type": "boolean" },
+    "failure_reason": { "type": ["string", "null"], "pattern": "^[a-z0-9_]+$" }
+  },
+  "allOf": [
+    {
+      "if": { "properties": { "pass_plm": { "const": true } } },
+      "then": {
+        "properties": {
+          "decision": { "const": "pass_plm" },
+          "failure_reason": { "type": "null" }
+        }
+      }
+    }
+  ],
+  "additionalProperties": false
+}

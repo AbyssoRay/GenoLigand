@@ -1,0 +1,30 @@
+[workspace]
+resolver = "2"
+members = [
+  "crates/gls-types",
+  "crates/gls-artifacts",
+  "crates/gls-ligand",
+  "crates/gls-fragment",
+  "crates/gls-genome",
+  "crates/gls-stats",
+  "crates/gls-shortcircuit",
+  "crates/gls-plm-gate",
+  "crates/gls-fixtures",
+  "crates/gls-tolerance-calib",
+  "crates/gls-geometry",
+  "crates/gls-patch-realizer",
+  "crates/gls-foldgate",
+  "crates/gls-dock",
+  "crates/gls-idp-trend",
+  "crates/gls-report",
+  "crates/gls-geometry-bench",
+  "crates/gls-cli",
+]
+
+[workspace.package]
+edition = "2024"
+license = "MIT OR Apache-2.0"
+version = "0.1.0"
+
+[workspace.lints.rust]
+unsafe_code = "forbid"

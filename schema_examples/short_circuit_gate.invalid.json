@@ -1,0 +1,10 @@
+{
+  "schema_version": "1.6",
+  "candidate_id": "bad",
+  "decision": "hold_no_plm",
+  "rule_version": "gls-shortcircuit-v1.6",
+  "sequence_hash": "0123456789abcdef",
+  "aa_len": 8,
+  "pass_plm": true,
+  "failure_reason": "budget exhausted"
+}

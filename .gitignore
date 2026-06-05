@@ -1,0 +1,108 @@
+# Rust build output
+/target/
+**/*.rs.bk
+*.profraw
+*.profdata
+
+# Nextflow runtime and generated outputs
+/.nextflow/
+/.nextflow.log*
+/work/
+/results/
+/out/
+/outputs/
+/trace*.txt
+/timeline*.html
+/report*.html
+/dag*.html
+*.command.*
+
+# Generated reports and local artifacts
+/artifacts/
+/reports/
+/coverage/
+/tmp/
+/temp/
+/.cache/
+
+# Logs and runtime dumps
+*.log
+*.pid
+*.seed
+*.stackdump
+core.*
+
+# Local environment and secrets
+.env
+.env.*
+!.env.example
+*.local
+
+# Editor and IDE files
+.vscode/*
+!.vscode/settings.json
+!.vscode/extensions.json
+!.vscode/tasks.json
+!.vscode/launch.json
+.idea/
+*.swp
+*.swo
+*~
+
+# OS metadata
+.DS_Store
+Thumbs.db
+ehthumbs.db
+Desktop.ini
+$RECYCLE.BIN/
+
+# Archives and compressed generated data
+*.7z
+*.gz
+*.rar
+*.tar
+*.tar.gz
+*.tgz
+*.zip
+
+# Large scientific or pipeline data products
+*.bam
+*.bai
+*.cram
+*.crai
+*.sam
+*.fastq
+*.fq
+*.fastq.gz
+*.fq.gz
+*.vcf
+*.vcf.gz
+*.bcf
+*.h5
+*.hdf5
+*.parquet
+*.npy
+*.npz
+
+# Molecular modeling and docking run products
+*.dcd
+*.trr
+*.xtc
+*.gro
+*.edr
+*.cpt
+*.pdbqt
+*.sdf
+*.mol2
+
+# Temporary Office files
+~$*.doc
+~$*.docx
+~$*.ppt
+~$*.pptx
+~$*.xls
+~$*.xlsx
+
+# Keep project fixtures and examples trackable.
+!fixtures/**
+!schema_examples/**

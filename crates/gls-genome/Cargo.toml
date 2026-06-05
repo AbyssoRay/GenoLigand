@@ -1,0 +1,14 @@
+[package]
+name = "gls-genome"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+gls-artifacts = { path = "../gls-artifacts" }
+gls-fragment = { path = "../gls-fragment" }
+gls-stats = { path = "../gls-stats" }
+gls-types = { path = "../gls-types" }
