@@ -1,0 +1,19 @@
+{
+  "schema_version": "1.6",
+  "dataset_id": "curated-dev-v1.6",
+  "fixtures": [
+    {
+      "fixture_id": "pos_hbond_1",
+      "fixture_type": "positive_holo",
+      "split": "calibration_train",
+      "source": "internal_curated",
+      "license_note": "",
+      "ligand_id": "ligand_pos_hbond_1",
+      "pocket_id": "pocket_pos_hbond_1",
+      "interaction_labels": [],
+      "resolution_angstrom": 0,
+      "interaction_kind": "hydrogen_bond",
+      "hash": ""
+    }
+  ]
+}

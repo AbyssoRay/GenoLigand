@@ -1,0 +1,67 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://genoligand.local/schemas/fixture_manifest.schema.json",
+  "title": "GenoLigand V1.6 Fixture Manifest",
+  "type": "object",
+  "required": ["schema_version", "dataset_id", "fixtures"],
+  "properties": {
+    "schema_version": { "const": "1.6" },
+    "dataset_id": { "type": "string", "minLength": 1 },
+    "fixtures": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "type": "object",
+        "required": [
+          "fixture_id",
+          "fixture_type",
+          "split",
+          "source",
+          "license_note",
+          "ligand_id",
+          "pocket_id",
+          "interaction_labels",
+          "resolution_angstrom",
+          "interaction_kind",
+          "hash"
+        ],
+        "properties": {
+          "fixture_id": { "type": "string", "minLength": 1 },
+          "fixture_type": {
+            "enum": [
+              "positive_holo",
+              "positive_perturbed",
+              "hard_negative_same_residues",
+              "pocket_decoy",
+              "predicted_structure_noise"
+            ]
+          },
+          "split": { "type": "string", "minLength": 1 },
+          "source": { "type": "string", "minLength": 1 },
+          "license_note": { "type": "string", "minLength": 1 },
+          "ligand_id": { "type": "string", "minLength": 1 },
+          "pocket_id": { "type": "string", "minLength": 1 },
+          "interaction_labels": {
+            "type": "array",
+            "minItems": 1,
+            "items": { "type": "string", "minLength": 1 }
+          },
+          "resolution_angstrom": { "type": "number", "exclusiveMinimum": 0 },
+          "interaction_kind": {
+            "enum": [
+              "hydrogen_bond",
+              "hydrophobic",
+              "aromatic_stacking",
+              "salt_bridge",
+              "metal_coordination",
+              "generic"
+            ]
+          },
+          "hash": { "type": "string", "minLength": 1 }
+        },
+        "additionalProperties": true
+      }
+    }
+  },
+  "additionalProperties": false
+}

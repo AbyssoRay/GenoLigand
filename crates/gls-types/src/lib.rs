@@ -214,6 +214,7 @@ pub struct PatchNode {
     pub point: Point3Data,
     pub vector: Point3Data,
     pub sasa: f64,
+    pub occlusion: f64,
     pub pocket_depth: f64,
     pub confidence: f64,
 }
@@ -256,6 +257,10 @@ pub struct ToleranceProfile {
     pub angle_tolerance_deg: f64,
     pub distance_bin_width: f64,
     pub vector_angle_bin_width: f64,
+    pub min_sasa: f64,
+    pub max_occlusion: f64,
+    pub min_pocket_overlap_score: f64,
+    pub min_rotamer_feasibility_score: f64,
     pub max_bucket_occupancy: usize,
     pub max_seed_triplets: usize,
     pub max_memory_mb: f64,
@@ -280,6 +285,13 @@ impl ToleranceProfile {
             || self.vector_angle_bin_width <= 0.0
         {
             return Err("tolerance_profile_has_non_positive_geometry_budget".to_string());
+        }
+        if !(0.0..=1.0).contains(&self.min_sasa)
+            || !(0.0..=1.0).contains(&self.max_occlusion)
+            || !(0.0..=1.0).contains(&self.min_pocket_overlap_score)
+            || !(0.0..=1.0).contains(&self.min_rotamer_feasibility_score)
+        {
+            return Err("tolerance_profile_has_invalid_surface_or_rotamer_budget".to_string());
         }
         if self.max_bucket_occupancy == 0 || self.max_seed_triplets == 0 {
             return Err("tolerance_profile_has_zero_guard".to_string());
@@ -328,8 +340,22 @@ pub struct FoldabilityGateResult {
 pub struct StructureGateResult {
     pub candidate_id: CandidateId,
     pub accepted_for_l15: bool,
+    pub orf_extension: Option<OrfExtensionResult>,
     pub candidate_patch_graph: Option<CandidatePatchGraph>,
     pub failure_reason: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct OrfExtensionResult {
+    pub candidate_id: CandidateId,
+    pub original_nucleotide_range: (usize, usize),
+    pub extended_nucleotide_range: (usize, usize),
+    pub original_aa_len: usize,
+    pub extended_aa_len: usize,
+    pub upstream_aa_added: usize,
+    pub downstream_aa_added: usize,
+    pub sequence_hash: String,
+    pub provenance: Provenance,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -389,7 +415,35 @@ pub struct StageResourceUsage {
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct EndToEndReport {
     pub stages: Vec<StageResourceUsage>,
+    pub audit_records: Vec<CandidateAuditRecord>,
     pub notes: Vec<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CandidateAuditRecord {
+    pub candidate_id: CandidateId,
+    pub stage: String,
+    pub tool_name: String,
+    pub tool_version: String,
+    pub parameters_hash: String,
+    pub artifact_hash: String,
+}
+
+impl CandidateAuditRecord {
+    pub fn from_provenance(
+        candidate_id: CandidateId,
+        stage: impl Into<String>,
+        provenance: &Provenance,
+    ) -> Self {
+        Self {
+            candidate_id,
+            stage: stage.into(),
+            tool_name: provenance.source.clone(),
+            tool_version: provenance.version.clone(),
+            parameters_hash: provenance.parameters_hash.clone(),
+            artifact_hash: provenance.artifact_hash.clone(),
+        }
+    }
 }
 
 pub fn stable_hash(input: &str) -> String {
@@ -441,6 +495,10 @@ mod tests {
             angle_tolerance_deg: 20.0,
             distance_bin_width: 0.5,
             vector_angle_bin_width: 10.0,
+            min_sasa: 0.05,
+            max_occlusion: 0.65,
+            min_pocket_overlap_score: 0.1,
+            min_rotamer_feasibility_score: 0.1,
             max_bucket_occupancy: 8,
             max_seed_triplets: 64,
             max_memory_mb: 64.0,

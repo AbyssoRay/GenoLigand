@@ -1,0 +1,19 @@
+{
+  "schema_version": "1.6",
+  "dataset_id": "curated-dev-v1.6",
+  "profiles": [
+    {
+      "profile_id": "manual",
+      "profile_level": "standard",
+      "generated_by_fixture_calibration": false
+    }
+  ],
+  "positive_recall": 0.95,
+  "hard_negative_rejection": 0.98,
+  "bucket_occupancy_p95": 3.0,
+  "seed_triplets_p95": 8.0,
+  "max_seed_triplets_observed": 10,
+  "peak_memory_mb": 4.5,
+  "runtime_ms_per_fixture": 12.0,
+  "oom_risk_score": 1.5
+}

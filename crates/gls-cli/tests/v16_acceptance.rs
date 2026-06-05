@@ -6,6 +6,7 @@ use gls_types::{
     CandidateGrade, CandidateId, DockingResult, FoldabilityGateResult, LocusClass, OrfCandidate,
     PatchRealizationResult, Provenance, ShortCircuitDecision, ShortCircuitGateResult,
 };
+use std::process::Command;
 
 #[test]
 fn dev_smoke_runs_l0_to_l2_and_reports_every_required_layer() {
@@ -18,6 +19,104 @@ fn dev_smoke_runs_l0_to_l2_and_reports_every_required_layer() {
     assert!(markdown.contains("Candidates In"));
     assert!(markdown.contains("Peak MB"));
     assert!(markdown.contains("trend only"));
+    assert!(markdown.contains("Candidate Audit"));
+    assert!(markdown.contains("Artifact Hash"));
+    assert!(markdown.contains("gls-plm-gate"));
+    assert!(markdown.contains("gls-foldgate-orf-extension"));
+    assert!(markdown.contains("gls-tolerance-calib"));
+    assert!(markdown.contains("gls-geometry"));
+    assert!(markdown.contains("pLM budget profile dev_gpu_lowmem enforced"));
+}
+
+#[test]
+fn cli_dev_smoke_uses_persistent_worker_subprocess_protocol() {
+    let output = Command::new(env!("CARGO_BIN_EXE_gls-cli"))
+        .arg("dev-smoke")
+        .output()
+        .expect("run gls-cli dev-smoke");
+
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8(output.stdout).expect("utf8 stdout");
+    assert!(stdout.contains("persistent worker subprocess protocol"));
+    assert!(stdout.contains("gls-foldgate-pocket-worker"));
+    assert!(stdout.contains("gls-dock"));
+}
+
+#[test]
+fn cli_external_worker_override_fails_loudly_when_missing() {
+    let output = Command::new(env!("CARGO_BIN_EXE_gls-cli"))
+        .arg("dev-smoke")
+        .env(
+            "GENOLIGAND_PLM_WORKER_BIN",
+            definitely_missing_worker_path(),
+        )
+        .output()
+        .expect("run gls-cli dev-smoke with missing external worker");
+
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("worker_spawn_failed:plm"), "{stderr}");
+}
+
+#[test]
+fn cli_plm_budget_profile_is_enforced_from_yaml() {
+    let output = Command::new(env!("CARGO_BIN_EXE_gls-cli"))
+        .arg("dev-smoke")
+        .env("GENOLIGAND_PLM_BUDGET_PROFILE", "dev_cpu_smoke")
+        .output()
+        .expect("run gls-cli dev-smoke with zero pLM budget");
+
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("dev_smoke_expected_at_least_one_pass_plm_candidate"),
+        "{stderr}"
+    );
+}
+
+#[test]
+fn cli_dev_smoke_accepts_ligand_and_genome_files() {
+    let dir = std::env::temp_dir().join(format!("genoligand-inputs-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).expect("temp dir");
+    let ligand = dir.join("ligand.yaml");
+    let fasta = dir.join("genome.fa");
+    std::fs::write(
+        &ligand,
+        "\
+ligand_id: file_ligand
+ligand_class: generic
+fragments:
+  - exact: DHQ
+  - residue: D
+  - residue: H
+  - residue: Q
+",
+    )
+    .expect("write ligand");
+    std::fs::write(&fasta, ">file_shard\nATGGATCATCAAGCTTGTGATGAATTTGGTTAA\n")
+        .expect("write fasta");
+
+    let output = Command::new(env!("CARGO_BIN_EXE_gls-cli"))
+        .arg("dev-smoke")
+        .arg("--ligand-yaml")
+        .arg(&ligand)
+        .arg("--genome-fasta")
+        .arg(&fasta)
+        .output()
+        .expect("run gls-cli dev-smoke with files");
+
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8(output.stdout).expect("utf8 stdout");
+    assert!(stdout.contains("file_shard"));
+    assert!(stdout.contains("L2"));
 }
 
 #[test]
@@ -39,7 +138,7 @@ fn plm_gate_contract_rejects_any_non_pass_plm_input() {
 #[test]
 fn docking_contract_keeps_non_pass_l2_out_of_worker_results() {
     let mut worker = MockDockWorker::default();
-    let results = run_docking(&[patch("no", false)], &mut worker);
+    let results = run_docking(&[patch("no", false)], &mut worker).expect("dock");
 
     assert_eq!(
         results,
@@ -63,22 +162,50 @@ fn v16_contract_files_exist_with_positive_and_negative_examples() {
     for path in [
         "schemas/short_circuit_gate.schema.json",
         "schemas/tolerance_profile.schema.json",
+        "schemas/fixture_manifest.schema.json",
+        "schemas/calibration_report.schema.json",
         "schemas/geometry_budget_report.schema.json",
         "schemas/patch_realization.schema.json",
         "schema_examples/short_circuit_gate.valid.json",
         "schema_examples/short_circuit_gate.invalid.json",
         "schema_examples/tolerance_profile.valid.json",
         "schema_examples/tolerance_profile.invalid.json",
+        "schema_examples/fixture_manifest.valid.json",
+        "schema_examples/fixture_manifest.invalid.json",
+        "schema_examples/calibration_report.valid.json",
+        "schema_examples/calibration_report.invalid.json",
         "schema_examples/geometry_budget_report.valid.json",
         "schema_examples/geometry_budget_report.invalid.json",
         "schema_examples/patch_realization.valid.json",
         "schema_examples/patch_realization.invalid.json",
         "docs/pipeline_contract.md",
         "workflows/main.nf",
+        "workflows/modules/gls_dev_smoke.nf",
+        "tools/cargo-runner.sh",
         "config/plm_budget.yaml",
+        "workers/plm-worker/README.md",
+        "workers/plm-worker/external_line_worker.py",
+        "workers/fold-worker/README.md",
+        "workers/fold-worker/external_line_worker.py",
+        "workers/pocket-worker/README.md",
+        "workers/pocket-worker/external_line_worker.py",
+        "workers/dock-worker/README.md",
+        "workers/dock-worker/vina_worker.py",
     ] {
         assert!(root.join(path).exists(), "missing {path}");
     }
+
+    let workflow = std::fs::read_to_string(root.join("workflows/main.nf"))
+        .expect("workflow should be readable");
+    let module = std::fs::read_to_string(root.join("workflows/modules/gls_dev_smoke.nf"))
+        .expect("workflow module should be readable");
+    assert!(workflow.contains("include { GLS_DEV_SMOKE }"));
+    assert!(workflow.contains("sourceFingerprint()"));
+    assert!(workflow.contains("'workers'"));
+    assert!(module.contains("storeDir"));
+    assert!(module.contains("source_fingerprint"));
+    assert!(module.contains("tools/cargo-runner.sh"));
+    assert!(module.contains("--manifest-path"));
 }
 
 #[test]
@@ -96,6 +223,18 @@ fn v16_schema_examples_validate_and_reject() {
             "schema_examples/tolerance_profile.valid.json",
             "schema_examples/tolerance_profile.invalid.json",
             validate_tolerance_profile,
+        ),
+        (
+            "schemas/fixture_manifest.schema.json",
+            "schema_examples/fixture_manifest.valid.json",
+            "schema_examples/fixture_manifest.invalid.json",
+            validate_fixture_manifest,
+        ),
+        (
+            "schemas/calibration_report.schema.json",
+            "schema_examples/calibration_report.valid.json",
+            "schema_examples/calibration_report.invalid.json",
+            validate_calibration_report,
         ),
         (
             "schemas/geometry_budget_report.schema.json",
@@ -150,8 +289,38 @@ fn validate_tolerance_profile(value: &str) -> bool {
     has(value, "\"generated_by_fixture_calibration\": true")
         && has(value, "\"radius_tolerance\"")
         && has(value, "\"angle_tolerance_deg\"")
+        && has(value, "\"min_sasa\"")
+        && has(value, "\"max_occlusion\"")
+        && has(value, "\"min_pocket_overlap_score\"")
+        && has(value, "\"min_rotamer_feasibility_score\"")
         && has(value, "\"max_bucket_occupancy\"")
         && has(value, "\"max_seed_triplets\"")
+        && has(value, "\"hard_negative_false_positive_rate\"")
+}
+
+fn validate_fixture_manifest(value: &str) -> bool {
+    has(value, "\"dataset_id\"")
+        && has(value, "\"fixture_type\": \"positive_holo\"")
+        && has(value, "\"ligand_id\"")
+        && has(value, "\"pocket_id\"")
+        && has(value, "\"interaction_labels\": [\"hydrogen_bond:D-H-Q\"]")
+        && has(value, "\"resolution_angstrom\": 1.8")
+        && has(value, "\"interaction_kind\": \"hydrogen_bond\"")
+        && !has(value, "\"license_note\": \"\"")
+        && !has(value, "\"interaction_labels\": []")
+        && !has(value, "\"resolution_angstrom\": 0")
+}
+
+fn validate_calibration_report(value: &str) -> bool {
+    has(value, "\"profiles\"")
+        && has(value, "\"profile_level\": \"narrow\"")
+        && has(value, "\"profile_level\": \"standard\"")
+        && has(value, "\"profile_level\": \"relaxed\"")
+        && has(value, "\"generated_by_fixture_calibration\": true")
+        && has(value, "\"seed_triplets_p95\"")
+        && has(value, "\"oom_risk_score\": 0.1")
+        && !has(value, "\"generated_by_fixture_calibration\": false")
+        && !has(value, "\"oom_risk_score\": 1.5")
 }
 
 fn validate_geometry_budget_report(value: &str) -> bool {
@@ -173,6 +342,12 @@ fn validate_patch_realization(value: &str) -> bool {
 
 fn has(value: &str, needle: &str) -> bool {
     value.contains(needle)
+}
+
+fn definitely_missing_worker_path() -> String {
+    let mut path = std::env::temp_dir();
+    path.push(format!("genoligand-missing-worker-{}", std::process::id()));
+    path.display().to_string()
 }
 
 fn candidate(id: &str, sequence: &str) -> OrfCandidate {

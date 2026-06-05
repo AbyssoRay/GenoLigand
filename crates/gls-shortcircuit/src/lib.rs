@@ -21,6 +21,20 @@ pub struct ShortCircuitConfig {
     pub simhash_hamming_threshold: u32,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PlmBudgetProfile {
+    pub profile_name: String,
+    pub max_plm_candidates_per_shard: Option<usize>,
+    pub max_sequence_length: Option<usize>,
+}
+
+impl PlmBudgetProfile {
+    pub fn require_bounded_plm_candidates(&self) -> Result<usize, String> {
+        self.max_plm_candidates_per_shard
+            .ok_or_else(|| format!("plm_budget_profile_requires_bound:{}", self.profile_name))
+    }
+}
+
 impl ShortCircuitConfig {
     pub fn dev_cpu_smoke() -> Self {
         Self {
@@ -48,6 +62,86 @@ impl ShortCircuitConfig {
             ..Self::dev_cpu_smoke()
         }
     }
+
+    pub fn apply_plm_budget_profile(&mut self, profile: &PlmBudgetProfile) -> Result<(), String> {
+        self.max_plm_candidates_per_shard = profile.require_bounded_plm_candidates()?;
+        if let Some(max_sequence_length) = profile.max_sequence_length {
+            self.max_len = max_sequence_length;
+        }
+        Ok(())
+    }
+}
+
+pub fn parse_plm_budget_profile(
+    yaml: &str,
+    profile_name: &str,
+) -> Result<PlmBudgetProfile, String> {
+    let mut in_root = false;
+    let mut in_profile = false;
+    let mut max_plm_candidates_per_shard = None;
+    let mut max_sequence_length = None;
+
+    for raw_line in yaml.lines() {
+        let without_comment = raw_line.split('#').next().unwrap_or("").trim_end();
+        if without_comment.trim().is_empty() {
+            continue;
+        }
+        let indent = without_comment
+            .chars()
+            .take_while(|ch| ch.is_ascii_whitespace())
+            .count();
+        let line = without_comment.trim();
+        if indent == 0 {
+            in_root = line == "plm_budget:";
+            in_profile = false;
+            continue;
+        }
+        if !in_root {
+            continue;
+        }
+        if indent == 2 && line.ends_with(':') {
+            in_profile = line.trim_end_matches(':') == profile_name;
+            continue;
+        }
+        if !in_profile || indent < 4 {
+            continue;
+        }
+        let (key, value) = line
+            .split_once(':')
+            .ok_or_else(|| format!("plm_budget_bad_line:{line}"))?;
+        let value = value.trim();
+        match key.trim() {
+            "max_plm_candidates_per_shard" => {
+                max_plm_candidates_per_shard = parse_budget_value(value, key.trim())?;
+            }
+            "max_sequence_length" => {
+                max_sequence_length = parse_budget_value(value, key.trim())?;
+            }
+            _ => {}
+        }
+    }
+
+    if !yaml
+        .lines()
+        .any(|line| line.trim() == format!("{profile_name}:"))
+    {
+        return Err(format!("plm_budget_profile_not_found:{profile_name}"));
+    }
+    Ok(PlmBudgetProfile {
+        profile_name: profile_name.to_string(),
+        max_plm_candidates_per_shard,
+        max_sequence_length,
+    })
+}
+
+fn parse_budget_value(value: &str, key: &str) -> Result<Option<usize>, String> {
+    if value == "configurable" {
+        return Ok(None);
+    }
+    value
+        .parse::<usize>()
+        .map(Some)
+        .map_err(|err| format!("plm_budget_bad_value:{key}:{err}"))
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -443,6 +537,32 @@ mod tests {
         assert_eq!(
             results[0].failure_reason.as_deref(),
             Some("plm_budget_exhausted")
+        );
+    }
+
+    #[test]
+    fn plm_budget_yaml_profile_updates_runtime_config() {
+        let yaml = "\
+plm_budget:
+  dev_gpu_lowmem:
+    max_plm_candidates_per_shard: 32
+    max_sequence_length: 256
+  hpc:
+    max_plm_candidates_per_shard: configurable
+";
+        let profile = parse_plm_budget_profile(yaml, "dev_gpu_lowmem").expect("profile");
+        let mut config = ShortCircuitConfig::workstation();
+        config
+            .apply_plm_budget_profile(&profile)
+            .expect("apply profile");
+
+        assert_eq!(config.max_plm_candidates_per_shard, 32);
+        assert_eq!(config.max_len, 256);
+        assert_eq!(
+            parse_plm_budget_profile(yaml, "hpc")
+                .expect("hpc")
+                .require_bounded_plm_candidates(),
+            Err("plm_budget_profile_requires_bound:hpc".to_string())
         );
     }
 

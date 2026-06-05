@@ -32,6 +32,10 @@
 *.stackdump
 core.*
 
+# Python worker bytecode
+__pycache__/
+*.pyc
+
 # Local environment and secrets
 .env
 .env.*

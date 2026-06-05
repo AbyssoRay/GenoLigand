@@ -7,9 +7,6 @@ use gls_types::{
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct PatchRealizerConfig {
-    pub min_sasa: f64,
-    pub min_pocket_overlap_score: f64,
-    pub min_rotamer_feasibility_score: f64,
     pub min_realization_score: f64,
     pub runtime_ms_per_attempt_budget: f64,
 }
@@ -17,9 +14,6 @@ pub struct PatchRealizerConfig {
 impl PatchRealizerConfig {
     pub fn dev() -> Self {
         Self {
-            min_sasa: 0.05,
-            min_pocket_overlap_score: 0.1,
-            min_rotamer_feasibility_score: 0.1,
             min_realization_score: 0.5,
             runtime_ms_per_attempt_budget: 100.0,
         }
@@ -97,6 +91,17 @@ pub fn realize_patch(
                 &[
                     ("icg_hash", icg.hash.clone()),
                     ("profile_id", profile.profile_id.clone()),
+                    ("profile_dataset", profile.dataset_id.clone()),
+                    (
+                        "radius_tolerance",
+                        format!("{:.6}", profile.radius_tolerance),
+                    ),
+                    (
+                        "angle_tolerance_deg",
+                        format!("{:.6}", profile.angle_tolerance_deg),
+                    ),
+                    ("min_sasa", format!("{:.6}", profile.min_sasa)),
+                    ("max_occlusion", format!("{:.6}", profile.max_occlusion)),
                     ("cpg_candidate", cpg.candidate_id.to_string()),
                 ],
             );
@@ -129,6 +134,20 @@ pub fn realize_patch(
         &[
             ("icg_hash", icg.hash.clone()),
             ("profile_id", fallback_profile.profile_id.clone()),
+            ("profile_dataset", fallback_profile.dataset_id.clone()),
+            (
+                "radius_tolerance",
+                format!("{:.6}", fallback_profile.radius_tolerance),
+            ),
+            (
+                "angle_tolerance_deg",
+                format!("{:.6}", fallback_profile.angle_tolerance_deg),
+            ),
+            ("min_sasa", format!("{:.6}", fallback_profile.min_sasa)),
+            (
+                "max_occlusion",
+                format!("{:.6}", fallback_profile.max_occlusion),
+            ),
             ("cpg_candidate", cpg.candidate_id.to_string()),
         ],
     );
@@ -190,6 +209,7 @@ fn bounded_ransac_kabsch(
     let mut mobile_points = Vec::new();
     let mut angle_penalty = 0.0;
     let mut exposure_score = 0.0;
+    let mut occlusion_score_sum = 0.0;
 
     for constraint in &icg.constraints {
         let reference = Point3::from(constraint.point);
@@ -201,10 +221,12 @@ fn bounded_ransac_kabsch(
                 let point = Point3::from(node.point);
                 let distance = reference.distance(point);
                 let angle = reference_vector.angle_deg(Point3::from(node.vector));
-                let sasa_ok = node.sasa >= config.min_sasa;
+                let sasa_ok = node.sasa >= profile.min_sasa;
+                let occlusion_ok = node.occlusion <= profile.max_occlusion;
                 if distance <= profile.radius_tolerance
                     && angle <= profile.angle_tolerance_deg
                     && sasa_ok
+                    && occlusion_ok
                 {
                     Some((
                         *node,
@@ -221,14 +243,19 @@ fn bounded_ransac_kabsch(
         angle_penalty += reference_vector.angle_deg(Point3::from(node.vector))
             / profile.angle_tolerance_deg.max(f64::EPSILON);
         exposure_score +=
-            pocket_overlap_score(node, config) + rotamer_feasibility_score(node, config);
+            pocket_overlap_score(node, profile) + rotamer_feasibility_score(node, profile);
+        occlusion_score_sum += occlusion_score(node, profile);
     }
 
     let rmsd = kabsch_rmsd(&reference_points, &mobile_points).ok()?;
     let matched_constraints = reference_points.len();
     let normalized_exposure = exposure_score / (matched_constraints.max(1) as f64 * 2.0);
+    let normalized_occlusion = occlusion_score_sum / matched_constraints.max(1) as f64;
     let normalized_angle = 1.0 / (1.0 + angle_penalty / matched_constraints.max(1) as f64);
-    let score = (1.0 / (1.0 + rmsd)) * 0.5 + normalized_angle * 0.25 + normalized_exposure * 0.25;
+    let score = (1.0 / (1.0 + rmsd)) * 0.45
+        + normalized_angle * 0.20
+        + normalized_exposure * 0.20
+        + normalized_occlusion * 0.15;
     if rmsd <= profile.radius_tolerance && score >= config.min_realization_score {
         Some(MatchResult {
             matched_constraints,
@@ -240,14 +267,21 @@ fn bounded_ransac_kabsch(
     }
 }
 
-fn pocket_overlap_score(node: &PatchNode, config: &PatchRealizerConfig) -> f64 {
+fn pocket_overlap_score(node: &PatchNode, profile: &ToleranceProfile) -> f64 {
     let depth_component = (node.pocket_depth / (node.pocket_depth + 1.0)).clamp(0.0, 1.0);
-    depth_component.max(config.min_pocket_overlap_score)
+    depth_component.max(profile.min_pocket_overlap_score)
 }
 
-fn rotamer_feasibility_score(node: &PatchNode, config: &PatchRealizerConfig) -> f64 {
+fn rotamer_feasibility_score(node: &PatchNode, profile: &ToleranceProfile) -> f64 {
     node.confidence
-        .clamp(config.min_rotamer_feasibility_score, 1.0)
+        .clamp(profile.min_rotamer_feasibility_score, 1.0)
+}
+
+fn occlusion_score(node: &PatchNode, profile: &ToleranceProfile) -> f64 {
+    if node.occlusion > profile.max_occlusion {
+        return 0.0;
+    }
+    (1.0 - node.occlusion / profile.max_occlusion.max(f64::EPSILON)).clamp(0.0, 1.0)
 }
 
 #[cfg(test)]
@@ -307,6 +341,7 @@ mod tests {
                     point: Point3Data::new(x + offset, *y, 0.0),
                     vector: Point3Data::new(1.0, 0.0, 0.0),
                     sasa: 0.5,
+                    occlusion: 0.1,
                     pocket_depth: 2.0,
                     confidence: 0.9,
                 })
@@ -329,6 +364,10 @@ mod tests {
             angle_tolerance_deg: 20.0,
             distance_bin_width: radius,
             vector_angle_bin_width: 10.0,
+            min_sasa: 0.05,
+            max_occlusion: 0.65,
+            min_pocket_overlap_score: 0.1,
+            min_rotamer_feasibility_score: 0.1,
             max_bucket_occupancy: 16,
             max_seed_triplets: 100,
             max_memory_mb: 100.0,
@@ -391,6 +430,48 @@ mod tests {
             result.failure_reason.as_deref(),
             Some("no_patch_match_under_profile")
         );
+    }
+
+    #[test]
+    fn high_occlusion_patch_is_rejected_before_l2() {
+        let mut cpg = cpg(0.0);
+        for node in &mut cpg.nodes {
+            node.occlusion = 0.95;
+        }
+        let (result, _) = realize_patch(&icg(), &cpg, &[profile(0.5)], &PatchRealizerConfig::dev())
+            .expect("realization completes");
+
+        assert!(!result.pass_l2);
+        assert_eq!(
+            result.failure_reason.as_deref(),
+            Some("no_patch_match_under_profile")
+        );
+    }
+
+    #[test]
+    fn occlusion_threshold_is_taken_from_tolerance_profile() {
+        let mut cpg = cpg(0.0);
+        for node in &mut cpg.nodes {
+            node.occlusion = 0.40;
+        }
+        let mut strict = profile(0.5);
+        strict.max_occlusion = 0.20;
+        let mut calibrated_relaxed = profile(0.5);
+        calibrated_relaxed.max_occlusion = 0.65;
+
+        let (strict_result, _) =
+            realize_patch(&icg(), &cpg, &[strict], &PatchRealizerConfig::dev())
+                .expect("strict profile completes");
+        let (relaxed_result, _) = realize_patch(
+            &icg(),
+            &cpg,
+            &[calibrated_relaxed],
+            &PatchRealizerConfig::dev(),
+        )
+        .expect("relaxed profile completes");
+
+        assert!(!strict_result.pass_l2);
+        assert!(relaxed_result.pass_l2);
     }
 
     #[test]

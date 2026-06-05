@@ -80,7 +80,7 @@ pub trait PersistentPlmWorker {
         model: &PlmModelSpec,
         bucket_len: usize,
         sequences: &[(String, String)],
-    ) -> Vec<Vec<f32>>;
+    ) -> Result<Vec<Vec<f32>>, String>;
     fn invocation_count(&self) -> usize;
 }
 
@@ -107,14 +107,14 @@ impl PersistentPlmWorker for MockPlmWorker {
         model: &PlmModelSpec,
         bucket_len: usize,
         sequences: &[(String, String)],
-    ) -> Vec<Vec<f32>> {
+    ) -> Result<Vec<Vec<f32>>, String> {
         self.invocations += 1;
         self.embedded_sequences += sequences.len();
         self.model_invocations.push(model.model_id.clone());
-        sequences
+        Ok(sequences
             .iter()
             .map(|(_, sequence)| mock_embedding(sequence, bucket_len))
-            .collect()
+            .collect())
     }
 
     fn invocation_count(&self) -> usize {
@@ -211,7 +211,10 @@ pub fn run_plm_gate<W: PersistentPlmWorker>(
     let mut gpu_semaphore = GpuSemaphore::new(config.max_concurrent_gpu_batches);
     for ((model, bucket_len), sequences) in batches {
         gpu_semaphore.acquire()?;
-        let embeddings = worker.embed_batch(&model, bucket_len, &sequences);
+        let embeddings = worker.embed_batch(&model, bucket_len, &sequences)?;
+        if embeddings.len() != sequences.len() {
+            return Err("plm_worker_embedding_count_mismatch".to_string());
+        }
         for ((key, _), embedding) in sequences.into_iter().zip(embeddings) {
             cache.insert(key, embedding);
         }

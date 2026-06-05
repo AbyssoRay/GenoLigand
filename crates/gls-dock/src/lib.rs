@@ -24,7 +24,7 @@ impl DockingManifest {
 }
 
 pub trait PersistentDockWorker {
-    fn dock_batch(&mut self, candidates: &[PatchRealizationResult]) -> Vec<f64>;
+    fn dock_batch(&mut self, candidates: &[PatchRealizationResult]) -> Result<Vec<f64>, String>;
     fn process_start_count(&self) -> usize;
 }
 
@@ -42,16 +42,16 @@ impl MockDockWorker {
 }
 
 impl PersistentDockWorker for MockDockWorker {
-    fn dock_batch(&mut self, candidates: &[PatchRealizationResult]) -> Vec<f64> {
+    fn dock_batch(&mut self, candidates: &[PatchRealizationResult]) -> Result<Vec<f64>, String> {
         if !self.started {
             self.started = true;
             self.starts += 1;
         }
         self.batches += 1;
-        candidates
+        Ok(candidates
             .iter()
             .map(|candidate| -7.0 - candidate.score)
-            .collect()
+            .collect())
     }
 
     fn process_start_count(&self) -> usize {
@@ -62,7 +62,7 @@ impl PersistentDockWorker for MockDockWorker {
 pub fn run_docking<W: PersistentDockWorker>(
     candidates: &[PatchRealizationResult],
     worker: &mut W,
-) -> Vec<DockingResult> {
+) -> Result<Vec<DockingResult>, String> {
     let _manifest =
         build_docking_manifest(candidates, "vina-persistent-pool", &["--exhaustiveness=8"]);
     let accepted = candidates
@@ -73,15 +73,18 @@ pub fn run_docking<W: PersistentDockWorker>(
     let scores = if accepted.is_empty() {
         Vec::new()
     } else {
-        worker.dock_batch(&accepted)
+        worker.dock_batch(&accepted)?
     };
+    if scores.len() != accepted.len() {
+        return Err("dock_worker_score_count_mismatch".to_string());
+    }
     let mut score_by_candidate = accepted
         .iter()
         .map(|candidate| candidate.candidate_id.clone())
         .zip(scores)
         .collect::<std::collections::BTreeMap<_, _>>();
 
-    candidates
+    Ok(candidates
         .iter()
         .map(|candidate| {
             if !candidate.pass_l2 {
@@ -101,7 +104,7 @@ pub fn run_docking<W: PersistentDockWorker>(
                 failure_reason: None,
             }
         })
-        .collect()
+        .collect())
 }
 
 pub fn build_docking_manifest(
@@ -191,7 +194,8 @@ mod tests {
     #[test]
     fn docking_only_processes_pass_l2_candidates() {
         let mut worker = MockDockWorker::default();
-        let results = run_docking(&[patch("ok", true), patch("no", false)], &mut worker);
+        let results =
+            run_docking(&[patch("ok", true), patch("no", false)], &mut worker).expect("dock");
 
         assert!(results.iter().any(|result| result.score.is_some()));
         assert!(results.iter().any(
@@ -202,7 +206,7 @@ mod tests {
     #[test]
     fn docking_worker_is_persistent_across_batch() {
         let mut worker = MockDockWorker::default();
-        let _ = run_docking(&[patch("a", true), patch("b", true)], &mut worker);
+        let _ = run_docking(&[patch("a", true), patch("b", true)], &mut worker).expect("dock");
 
         assert_eq!(worker.process_start_count(), 1);
         assert_eq!(worker.batches(), 1);

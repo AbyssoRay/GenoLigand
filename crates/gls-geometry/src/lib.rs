@@ -296,6 +296,10 @@ mod tests {
             angle_tolerance_deg: 10.0,
             distance_bin_width: 10.0,
             vector_angle_bin_width: 5.0,
+            min_sasa: 0.05,
+            max_occlusion: 0.65,
+            min_pocket_overlap_score: 0.1,
+            min_rotamer_feasibility_score: 0.1,
             max_bucket_occupancy: 1,
             max_seed_triplets: 10,
             max_memory_mb: 100.0,
@@ -315,6 +319,7 @@ mod tests {
             point: Point3Data::new(0.0, 0.0, 0.0),
             vector: Point3Data::new(1.0, 0.0, 0.0),
             sasa: 0.2,
+            occlusion: 0.1,
             pocket_depth: 1.0,
             confidence: 0.9,
         };

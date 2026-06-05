@@ -58,6 +58,22 @@ pub fn render_markdown(report: &EndToEndReport) -> String {
             out.push('\n');
         }
     }
+    if !report.audit_records.is_empty() {
+        out.push_str("\n## Candidate Audit\n");
+        out.push_str("| Candidate | Stage | Tool | Version | Parameters Hash | Artifact Hash |\n");
+        out.push_str("|---|---|---|---|---|---|\n");
+        for audit in &report.audit_records {
+            out.push_str(&format!(
+                "| {} | {} | {} | {} | {} | {} |\n",
+                audit.candidate_id,
+                audit.stage,
+                audit.tool_name,
+                audit.tool_version,
+                audit.parameters_hash,
+                audit.artifact_hash
+            ));
+        }
+    }
     out
 }
 
@@ -91,6 +107,14 @@ mod tests {
                 12.0,
                 4.0,
             )],
+            audit_records: vec![gls_types::CandidateAuditRecord {
+                candidate_id: gls_types::CandidateId::from("c1"),
+                stage: "L1.20".to_string(),
+                tool_name: "gls-shortcircuit".to_string(),
+                tool_version: "v1.6".to_string(),
+                parameters_hash: "p".to_string(),
+                artifact_hash: "a".to_string(),
+            }],
             notes: vec!["trend only for IDP/IDR".to_string()],
         };
         let markdown = render_markdown(&report);
@@ -98,5 +122,7 @@ mod tests {
         assert!(markdown.contains("Candidates In"));
         assert!(markdown.contains("plm_budget_exhausted:1"));
         assert!(markdown.contains("Peak MB"));
+        assert!(markdown.contains("Candidate Audit"));
+        assert!(markdown.contains("gls-shortcircuit"));
     }
 }

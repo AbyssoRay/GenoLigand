@@ -1,6 +1,6 @@
 use gls_types::{
     CandidateGrade, CandidatePatchGraph, FoldabilityGateResult, InteractionKind, OrfCandidate,
-    PatchNode, Point3Data, StructureGateResult,
+    OrfExtensionResult, PatchNode, Point3Data, Provenance, StructureGateResult, stable_hash,
 };
 
 pub trait PersistentFoldWorker {
@@ -13,6 +13,21 @@ pub trait PersistentPocketWorker {
         candidate: &OrfCandidate,
         structure_id: &str,
     ) -> Result<CandidatePatchGraph, String>;
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct OrfExtensionPolicy {
+    pub upstream_aa: usize,
+    pub downstream_aa: usize,
+}
+
+impl Default for OrfExtensionPolicy {
+    fn default() -> Self {
+        Self {
+            upstream_aa: 15,
+            downstream_aa: 15,
+        }
+    }
 }
 
 #[derive(Clone, Debug, Default)]
@@ -59,7 +74,7 @@ impl PersistentPocketWorker for MockPocketWorker {
         } else {
             residues
         };
-        let nodes = source_residues
+        let nodes: Vec<PatchNode> = source_residues
             .into_iter()
             .enumerate()
             .map(|(idx, residue)| PatchNode {
@@ -69,14 +84,23 @@ impl PersistentPocketWorker for MockPocketWorker {
                 point: Point3Data::new(idx as f64, 0.0, 0.0),
                 vector: Point3Data::new(1.0, 0.0, 0.0),
                 sasa: 0.5,
+                occlusion: 0.1,
                 pocket_depth: 2.0,
                 confidence: 0.8,
             })
             .collect();
+        let node_count = nodes.len();
         Ok(CandidatePatchGraph {
             candidate_id: candidate.candidate_id.clone(),
             nodes,
-            provenance: candidate.provenance.clone(),
+            provenance: Provenance::new(
+                "gls-foldgate-pocket-worker",
+                "v1.6",
+                &format!(
+                    "candidate_id={};structure_id={};detector=p2rank_or_fpocket;nodes={}",
+                    candidate.candidate_id, _structure_id, node_count
+                ),
+            ),
             confidence_bin: "high".to_string(),
             ligand_class: "generic".to_string(),
         })
@@ -89,10 +113,12 @@ pub fn run_foldgate<F: PersistentFoldWorker, P: PersistentPocketWorker>(
     fold_worker: &mut F,
     pocket_worker: &mut P,
 ) -> StructureGateResult {
+    let orf_extension = extend_orf_candidate(candidate, &OrfExtensionPolicy::default());
     if !matches!(candidate.grade, CandidateGrade::G2 | CandidateGrade::G3) {
         return StructureGateResult {
             candidate_id: candidate.candidate_id.clone(),
             accepted_for_l15: false,
+            orf_extension: Some(orf_extension),
             candidate_patch_graph: None,
             failure_reason: Some("l15_requires_g2_or_g3_candidate".to_string()),
         };
@@ -101,6 +127,7 @@ pub fn run_foldgate<F: PersistentFoldWorker, P: PersistentPocketWorker>(
         return StructureGateResult {
             candidate_id: candidate.candidate_id.clone(),
             accepted_for_l15: false,
+            orf_extension: Some(orf_extension),
             candidate_patch_graph: None,
             failure_reason: Some("foldability_gate_failed".to_string()),
         };
@@ -111,6 +138,7 @@ pub fn run_foldgate<F: PersistentFoldWorker, P: PersistentPocketWorker>(
             return StructureGateResult {
                 candidate_id: candidate.candidate_id.clone(),
                 accepted_for_l15: false,
+                orf_extension: Some(orf_extension),
                 candidate_patch_graph: None,
                 failure_reason: Some(reason),
             };
@@ -120,15 +148,55 @@ pub fn run_foldgate<F: PersistentFoldWorker, P: PersistentPocketWorker>(
         Ok(cpg) => StructureGateResult {
             candidate_id: candidate.candidate_id.clone(),
             accepted_for_l15: true,
+            orf_extension: Some(orf_extension),
             candidate_patch_graph: Some(cpg),
             failure_reason: None,
         },
         Err(reason) => StructureGateResult {
             candidate_id: candidate.candidate_id.clone(),
             accepted_for_l15: false,
+            orf_extension: Some(orf_extension),
             candidate_patch_graph: None,
             failure_reason: Some(reason),
         },
+    }
+}
+
+pub fn extend_orf_candidate(
+    candidate: &OrfCandidate,
+    policy: &OrfExtensionPolicy,
+) -> OrfExtensionResult {
+    let upstream_nt = policy.upstream_aa.saturating_mul(3);
+    let downstream_nt = policy.downstream_aa.saturating_mul(3);
+    let start = candidate.nucleotide_range.0.saturating_sub(upstream_nt);
+    let end = candidate.nucleotide_range.1.saturating_add(downstream_nt);
+    let upstream_aa_added = (candidate.nucleotide_range.0 - start) / 3;
+    let downstream_aa_added = (end - candidate.nucleotide_range.1) / 3;
+    let extended_aa_len = candidate
+        .sequence
+        .len()
+        .saturating_add(upstream_aa_added)
+        .saturating_add(downstream_aa_added);
+    let parameters = format!(
+        "candidate_id={};original={}-{};extended={}-{};upstream={};downstream={}",
+        candidate.candidate_id,
+        candidate.nucleotide_range.0,
+        candidate.nucleotide_range.1,
+        start,
+        end,
+        policy.upstream_aa,
+        policy.downstream_aa
+    );
+    OrfExtensionResult {
+        candidate_id: candidate.candidate_id.clone(),
+        original_nucleotide_range: candidate.nucleotide_range,
+        extended_nucleotide_range: (start, end),
+        original_aa_len: candidate.sequence.len(),
+        extended_aa_len,
+        upstream_aa_added,
+        downstream_aa_added,
+        sequence_hash: stable_hash(&format!("{}:{}:{}", candidate.sequence, start, end)),
+        provenance: Provenance::new("gls-foldgate-orf-extension", "v1.6", &parameters),
     }
 }
 
@@ -201,5 +269,21 @@ mod tests {
             result.failure_reason.as_deref(),
             Some("pocket_worker_failed")
         );
+    }
+
+    #[test]
+    fn l15_records_orf_extension_before_worker_boundary() {
+        let c = candidate(CandidateGrade::G2);
+        let result = run_foldgate(
+            &c,
+            &foldability(&c),
+            &mut MockFoldWorker::default(),
+            &mut MockPocketWorker::default(),
+        );
+        let extension = result.orf_extension.expect("extension is recorded");
+
+        assert_eq!(extension.original_nucleotide_range, (0, 27));
+        assert!(extension.extended_nucleotide_range.1 > extension.original_nucleotide_range.1);
+        assert_eq!(extension.provenance.source, "gls-foldgate-orf-extension");
     }
 }

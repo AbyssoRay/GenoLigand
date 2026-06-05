@@ -41,8 +41,11 @@ pub struct CalibrationReport {
     pub positive_recall: f64,
     pub hard_negative_rejection: f64,
     pub bucket_occupancy_p95: f64,
+    pub seed_triplets_p95: f64,
+    pub max_seed_triplets_observed: usize,
     pub peak_memory_mb: f64,
     pub runtime_ms_per_fixture: f64,
+    pub oom_risk_score: f64,
 }
 
 pub fn calibrate_tolerances(
@@ -94,6 +97,20 @@ pub fn calibrate_tolerances(
         .iter()
         .map(|fixture| fixture.peak_memory_mb)
         .fold(0.0, f64::max);
+    let seed_triplets_p95 = percentile(
+        &manifest
+            .fixtures
+            .iter()
+            .map(|fixture| fixture.observed_seed_triplets as f64)
+            .collect::<Vec<_>>(),
+        0.95,
+    );
+    let max_seed_triplets_observed = manifest
+        .fixtures
+        .iter()
+        .map(|fixture| fixture.observed_seed_triplets)
+        .max()
+        .unwrap_or(0);
     let runtime = manifest
         .fixtures
         .iter()
@@ -103,6 +120,9 @@ pub fn calibrate_tolerances(
 
     if bucket_p95 > config.max_bucket_occupancy_p95 {
         return Err("calibration_bucket_occupancy_exceeds_threshold".to_string());
+    }
+    if max_seed_triplets_observed > config.max_seed_triplets {
+        return Err("calibration_seed_triplets_exceeds_threshold".to_string());
     }
     if peak_memory > config.max_peak_memory_mb {
         return Err("calibration_peak_memory_exceeds_threshold".to_string());
@@ -115,6 +135,24 @@ pub fn calibrate_tolerances(
     for (level, scale) in &config.level_scales {
         let radius = base_radius * scale;
         let angle = base_angle * scale;
+        let min_sasa = lower_surface_threshold(
+            min_positive_metric(&positives, |fixture| fixture.observed_sasa),
+            *scale,
+        );
+        let max_occlusion = upper_surface_threshold(
+            max_positive_metric(&positives, |fixture| fixture.observed_occlusion),
+            *scale,
+        );
+        let min_pocket_overlap_score = lower_surface_threshold(
+            min_positive_metric(&positives, |fixture| fixture.observed_pocket_overlap_score),
+            *scale,
+        );
+        let min_rotamer_feasibility_score = lower_surface_threshold(
+            min_positive_metric(&positives, |fixture| {
+                fixture.observed_rotamer_feasibility_score
+            }),
+            *scale,
+        );
         let positive_recall = recall(&positives, radius, angle);
         let hard_negative_false_positive_rate = recall(&hard_negatives, radius, angle);
         if hard_negative_false_positive_rate > config.max_hard_negative_false_positive_rate
@@ -130,6 +168,10 @@ pub fn calibrate_tolerances(
             ProfileMetrics {
                 radius,
                 angle,
+                min_sasa,
+                max_occlusion,
+                min_pocket_overlap_score,
+                min_rotamer_feasibility_score,
                 positive_recall,
                 hard_negative_rejection,
                 hard_negative_false_positive_rate,
@@ -151,8 +193,11 @@ pub fn calibrate_tolerances(
         positive_recall: standard_metrics.0,
         hard_negative_rejection: standard_metrics.1,
         bucket_occupancy_p95: bucket_p95,
+        seed_triplets_p95,
+        max_seed_triplets_observed,
         peak_memory_mb: peak_memory,
         runtime_ms_per_fixture: runtime,
+        oom_risk_score: oom_risk_score(config, bucket_p95, seed_triplets_p95, peak_memory),
     })
 }
 
@@ -182,6 +227,10 @@ fn profile_from_metrics(
         angle_tolerance_deg: metrics.angle,
         distance_bin_width: (metrics.radius / 2.0).max(f64::EPSILON),
         vector_angle_bin_width: (metrics.angle / 2.0).max(f64::EPSILON),
+        min_sasa: metrics.min_sasa,
+        max_occlusion: metrics.max_occlusion,
+        min_pocket_overlap_score: metrics.min_pocket_overlap_score,
+        min_rotamer_feasibility_score: metrics.min_rotamer_feasibility_score,
         max_bucket_occupancy: config.max_bucket_occupancy,
         max_seed_triplets: config.max_seed_triplets,
         max_memory_mb: config.max_peak_memory_mb,
@@ -200,6 +249,10 @@ fn profile_from_metrics(
 struct ProfileMetrics {
     radius: f64,
     angle: f64,
+    min_sasa: f64,
+    max_occlusion: f64,
+    min_pocket_overlap_score: f64,
+    min_rotamer_feasibility_score: f64,
     positive_recall: f64,
     hard_negative_rejection: f64,
     hard_negative_false_positive_rate: f64,
@@ -216,6 +269,40 @@ fn recall(fixtures: &[&PatchFixture], radius: f64, angle: f64) -> f64 {
         })
         .count();
     passing as f64 / fixtures.len().max(1) as f64
+}
+
+fn min_positive_metric(fixtures: &[&PatchFixture], read: fn(&PatchFixture) -> f64) -> f64 {
+    fixtures
+        .iter()
+        .map(|fixture| read(fixture))
+        .fold(1.0, f64::min)
+}
+
+fn max_positive_metric(fixtures: &[&PatchFixture], read: fn(&PatchFixture) -> f64) -> f64 {
+    fixtures
+        .iter()
+        .map(|fixture| read(fixture))
+        .fold(0.0, f64::max)
+}
+
+fn lower_surface_threshold(value: f64, scale: f64) -> f64 {
+    (value / scale.max(f64::EPSILON)).clamp(0.0, 1.0)
+}
+
+fn upper_surface_threshold(value: f64, scale: f64) -> f64 {
+    (value * scale).clamp(0.0, 1.0)
+}
+
+fn oom_risk_score(
+    config: &CalibrationConfig,
+    bucket_p95: f64,
+    seed_triplets_p95: f64,
+    peak_memory_mb: f64,
+) -> f64 {
+    let bucket_risk = bucket_p95 / config.max_bucket_occupancy_p95.max(f64::EPSILON);
+    let seed_risk = seed_triplets_p95 / config.max_seed_triplets.max(1) as f64;
+    let memory_risk = peak_memory_mb / config.max_peak_memory_mb.max(f64::EPSILON);
+    bucket_risk.max(seed_risk).max(memory_risk).clamp(0.0, 1.0)
 }
 
 fn percentile(values: &[f64], quantile: f64) -> f64 {
@@ -275,6 +362,8 @@ mod tests {
                 .iter()
                 .any(|profile| profile.profile_level == ToleranceProfileLevel::Narrow)
         );
+        assert!(report.seed_triplets_p95 > 0.0);
+        assert!(report.oom_risk_score > 0.0);
     }
 
     #[test]
@@ -291,5 +380,37 @@ mod tests {
 
         assert_eq!(selected[0].profile_level, ToleranceProfileLevel::Narrow);
         assert_eq!(selected[2].profile_level, ToleranceProfileLevel::Relaxed);
+    }
+
+    #[test]
+    fn calibration_profiles_carry_fixture_derived_surface_thresholds() {
+        let manifest = dev_fixture_manifest();
+        let report =
+            calibrate_tolerances(&manifest, &CalibrationConfig::dev()).expect("calibration ok");
+        let narrow = report
+            .profiles
+            .iter()
+            .find(|profile| profile.profile_level == ToleranceProfileLevel::Narrow)
+            .expect("narrow profile");
+        let relaxed = report
+            .profiles
+            .iter()
+            .find(|profile| profile.profile_level == ToleranceProfileLevel::Relaxed)
+            .expect("relaxed profile");
+
+        assert!(narrow.min_sasa > relaxed.min_sasa);
+        assert!(narrow.max_occlusion < relaxed.max_occlusion);
+        assert!(narrow.min_pocket_overlap_score > relaxed.min_pocket_overlap_score);
+        assert!(narrow.min_rotamer_feasibility_score > relaxed.min_rotamer_feasibility_score);
+    }
+
+    #[test]
+    fn calibration_rejects_seed_triplet_explosion() {
+        let mut manifest = dev_fixture_manifest();
+        manifest.fixtures[0].observed_seed_triplets = 10_000;
+        let err = calibrate_tolerances(&manifest, &CalibrationConfig::dev())
+            .expect_err("seed triplet guard should fail");
+
+        assert_eq!(err, "calibration_seed_triplets_exceeds_threshold");
     }
 }

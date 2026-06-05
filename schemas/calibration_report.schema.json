@@ -1,0 +1,46 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://genoligand.local/schemas/calibration_report.schema.json",
+  "title": "GenoLigand V1.6 Tolerance Calibration Report",
+  "type": "object",
+  "required": [
+    "schema_version",
+    "dataset_id",
+    "profiles",
+    "positive_recall",
+    "hard_negative_rejection",
+    "bucket_occupancy_p95",
+    "seed_triplets_p95",
+    "max_seed_triplets_observed",
+    "peak_memory_mb",
+    "runtime_ms_per_fixture",
+    "oom_risk_score"
+  ],
+  "properties": {
+    "schema_version": { "const": "1.6" },
+    "dataset_id": { "type": "string", "minLength": 1 },
+    "profiles": {
+      "type": "array",
+      "minItems": 3,
+      "items": {
+        "type": "object",
+        "required": ["profile_id", "profile_level", "generated_by_fixture_calibration"],
+        "properties": {
+          "profile_id": { "type": "string", "minLength": 1 },
+          "profile_level": { "enum": ["narrow", "standard", "relaxed"] },
+          "generated_by_fixture_calibration": { "const": true }
+        },
+        "additionalProperties": true
+      }
+    },
+    "positive_recall": { "type": "number", "minimum": 0, "maximum": 1 },
+    "hard_negative_rejection": { "type": "number", "minimum": 0, "maximum": 1 },
+    "bucket_occupancy_p95": { "type": "number", "minimum": 0 },
+    "seed_triplets_p95": { "type": "number", "minimum": 0 },
+    "max_seed_triplets_observed": { "type": "integer", "minimum": 0 },
+    "peak_memory_mb": { "type": "number", "minimum": 0 },
+    "runtime_ms_per_fixture": { "type": "number", "minimum": 0 },
+    "oom_risk_score": { "type": "number", "minimum": 0, "maximum": 1 }
+  },
+  "additionalProperties": false
+}
