@@ -12,4 +12,4 @@ It accepts persistent stdin/stdout `FOLD` requests and returns a structure id. P
 
 Production replacement is configured with `GENOLIGAND_FOLD_WORKER_BIN` and optional `GENOLIGAND_FOLD_WORKER_ARGS`. Invalid commands must fail loudly with a worker spawn/protocol error.
 
-`external_line_worker.py` is a production adapter shim for ColabFold/ESMFold-style tools. It expects `GENOLIGAND_FOLD_COMMAND` to read one `FOLD` line from stdin and return a structure id.
+`external_line_worker.py` is a production adapter shim for ColabFold/ESMFold-style tools. It expects `GENOLIGAND_FOLD_COMMAND` to start a long-lived line-protocol subprocess that reads `FOLD` lines from stdin and returns one structure id per line. The shim launches that subprocess once and reuses it for the worker lifetime.

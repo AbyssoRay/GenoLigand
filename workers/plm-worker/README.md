@@ -12,4 +12,4 @@ It is a persistent stdin/stdout line worker. Each request is one tab-separated `
 
 Production replacement is configured with `GENOLIGAND_PLM_WORKER_BIN` and optional `GENOLIGAND_PLM_WORKER_ARGS`. If those variables point to a missing or invalid command, the pipeline fails with a machine-readable worker error instead of falling back to the dev worker.
 
-`external_line_worker.py` is a production adapter shim for ESM/ESMFold-style embedding tools. It expects `GENOLIGAND_PLM_EMBED_COMMAND` to read one `EMBED` line from stdin and return the embedding payload.
+`external_line_worker.py` is a production adapter shim for ESM/ESMFold-style embedding tools. It expects `GENOLIGAND_PLM_EMBED_COMMAND` to start a long-lived line-protocol subprocess that reads `EMBED` lines from stdin and returns one embedding payload per line. The shim launches that subprocess once and reuses it for the worker lifetime.
