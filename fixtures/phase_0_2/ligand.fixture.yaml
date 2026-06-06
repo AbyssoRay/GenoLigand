@@ -1,0 +1,21 @@
+ligand_id: phase_0_2_fixture_ligand
+ligand_class: generic_offline_fixture
+fragments:
+  - exact: YHEDLV
+  - exact: KQWCM
+  - exact: QWCMR
+  - exact: KQWC
+  - exact: AAAAAA
+  - exact: GPGPGP
+  - residue: Y
+  - residue: H
+  - residue: E
+  - residue: D
+  - residue: L
+  - residue: V
+  - residue: K
+  - residue: Q
+  - residue: W
+  - residue: C
+  - residue: M
+  - residue: R

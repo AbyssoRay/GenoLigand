@@ -1,8 +1,11 @@
 use gls_cli::stages::{
-    DockOptions, FoldgateOptions, GatePlmOptions, GateShortCircuitOptions, PatchOptions,
-    SearchOptions, SplitDevSmokeOptions, StatsOptions, ValidateKind, ValidateOptions, run_dock,
-    run_foldgate_realize, run_gate_plm, run_gate_short_circuit, run_patch_realize,
-    run_search_genome, run_split_dev_smoke, run_stats_score, run_validate,
+    ClassifyLociOptions, CooccurScoreOptions, DockOptions, FoldgateOptions, GatePlmOptions,
+    GateShortCircuitOptions, OrfExtendOptions, PatchOptions, PhaseGateShortCircuitOptions,
+    ReportMarkdownOptions, SearchOptions, SplitDevSmokeOptions, StatsOptions, ValidateKind,
+    ValidateOptions, run_classify_loci, run_cooccur_score, run_dock, run_foldgate_realize,
+    run_gate_plm, run_gate_short_circuit, run_gate_short_circuit_phase, run_orf_extend,
+    run_patch_realize, run_report_markdown, run_search_genome, run_split_dev_smoke,
+    run_stats_score, run_validate,
 };
 use gls_cli::{
     DevSmokeInputs, WorkerCommandSet, run_calibrate_patch_tolerance_json,
@@ -55,10 +58,14 @@ fn run_cli(args: &[String]) -> Result<Option<String>, String> {
         }
         "search" => run_search_cli(&args[1..]).map(Some),
         "stats" => run_stats_cli(&args[1..]).map(Some),
+        "orf" => run_orf_cli(&args[1..]).map(Some),
+        "classify" => run_classify_cli(&args[1..]).map(Some),
+        "cooccur" => run_cooccur_cli(&args[1..]).map(Some),
         "gate" => run_gate_cli(&args[1..]).map(Some),
         "foldgate" => run_foldgate_cli(&args[1..]).map(Some),
         "patch" => run_patch_cli(&args[1..]).map(Some),
         "dock" => run_dock_cli(&args[1..]).map(Some),
+        "report" => run_report_cli(&args[1..]).map(Some),
         "validate" => run_validate_cli(&args[1..]).map(Some),
         "--help" | "-h" => Ok(Some(GLOBAL_HELP.to_string())),
         _ => Err(format!("unknown_command:{command}")),
@@ -150,6 +157,71 @@ fn run_stats_cli(args: &[String]) -> Result<String, String> {
     }
 }
 
+fn run_orf_cli(args: &[String]) -> Result<String, String> {
+    if args.is_empty() || is_help(args) {
+        return Ok(ORF_HELP.to_string());
+    }
+    match args[0].as_str() {
+        "extend" => {
+            if is_help(&args[1..]) {
+                return Ok(ORF_EXTEND_HELP.to_string());
+            }
+            let options = OrfExtendArgs::parse(&args[1..])?;
+            let count = run_orf_extend(&OrfExtendOptions {
+                genome: options.genome,
+                hits: options.hits,
+                out: options.out.clone(),
+            })?;
+            Ok(stage_ok("orf extend", count, &options.out))
+        }
+        other => Err(format!("unknown_orf_command:{other}")),
+    }
+}
+
+fn run_classify_cli(args: &[String]) -> Result<String, String> {
+    if args.is_empty() || is_help(args) {
+        return Ok(CLASSIFY_HELP.to_string());
+    }
+    match args[0].as_str() {
+        "loci" => {
+            if is_help(&args[1..]) {
+                return Ok(CLASSIFY_LOCI_HELP.to_string());
+            }
+            let options = ClassifyLociArgs::parse(&args[1..])?;
+            let count = run_classify_loci(&ClassifyLociOptions {
+                annotation: options.annotation,
+                orfs: options.orfs,
+                out: options.out.clone(),
+            })?;
+            Ok(stage_ok("classify loci", count, &options.out))
+        }
+        other => Err(format!("unknown_classify_command:{other}")),
+    }
+}
+
+fn run_cooccur_cli(args: &[String]) -> Result<String, String> {
+    if args.is_empty() || is_help(args) {
+        return Ok(COOCCUR_HELP.to_string());
+    }
+    match args[0].as_str() {
+        "score" => {
+            if is_help(&args[1..]) {
+                return Ok(COOCCUR_SCORE_HELP.to_string());
+            }
+            let options = CooccurScoreArgs::parse(&args[1..])?;
+            let count = run_cooccur_score(&CooccurScoreOptions {
+                hits: options.hits,
+                stats: options.stats,
+                orfs: options.orfs,
+                context: options.context,
+                out: options.out.clone(),
+            })?;
+            Ok(stage_ok("cooccur score", count, &options.out))
+        }
+        other => Err(format!("unknown_cooccur_command:{other}")),
+    }
+}
+
 fn run_gate_cli(args: &[String]) -> Result<String, String> {
     if args.is_empty() || is_help(args) {
         return Ok(GATE_HELP.to_string());
@@ -160,10 +232,24 @@ fn run_gate_cli(args: &[String]) -> Result<String, String> {
                 return Ok(GATE_SHORT_CIRCUIT_HELP.to_string());
             }
             let options = GateShortCircuitArgs::parse(&args[1..])?;
-            let count = run_gate_short_circuit(&GateShortCircuitOptions {
-                stats: options.stats,
-                out: options.out.clone(),
-            })?;
+            let count = if let (Some(orfs), Some(context), Some(cooccur)) = (
+                options.orfs.clone(),
+                options.context.clone(),
+                options.cooccur.clone(),
+            ) {
+                run_gate_short_circuit_phase(&PhaseGateShortCircuitOptions {
+                    stats: options.stats,
+                    orfs,
+                    context,
+                    cooccur,
+                    out: options.out.clone(),
+                })?
+            } else {
+                run_gate_short_circuit(&GateShortCircuitOptions {
+                    stats: options.stats,
+                    out: options.out.clone(),
+                })?
+            };
             Ok(stage_ok("gate short-circuit", count, &options.out))
         }
         "plm" => {
@@ -242,6 +328,35 @@ fn run_dock_cli(args: &[String]) -> Result<String, String> {
             Ok(stage_ok("dock run", count, &options.out))
         }
         other => Err(format!("unknown_dock_command:{other}")),
+    }
+}
+
+fn run_report_cli(args: &[String]) -> Result<String, String> {
+    if args.is_empty() || is_help(args) {
+        return Ok(REPORT_HELP.to_string());
+    }
+    match args[0].as_str() {
+        "markdown" => {
+            if is_help(&args[1..]) {
+                return Ok(REPORT_MARKDOWN_HELP.to_string());
+            }
+            let options = ReportMarkdownArgs::parse(&args[1..])?;
+            let count = run_report_markdown(&ReportMarkdownOptions {
+                hits: options.hits,
+                stats: options.stats,
+                orfs: options.orfs,
+                context: options.context,
+                cooccur: options.cooccur,
+                gate: options.gate,
+                plm: options.plm,
+                foldgate: options.foldgate,
+                patches: options.patches,
+                dock: options.dock,
+                out: options.out.clone(),
+            })?;
+            Ok(stage_ok("report markdown", count, &options.out))
+        }
+        other => Err(format!("unknown_report_command:{other}")),
     }
 }
 
@@ -390,18 +505,153 @@ impl StatsScoreArgs {
     }
 }
 
+struct OrfExtendArgs {
+    genome: PathBuf,
+    hits: PathBuf,
+    out: PathBuf,
+}
+
+impl OrfExtendArgs {
+    fn parse(args: &[String]) -> Result<Self, String> {
+        let mut genome = None;
+        let mut hits = None;
+        let mut out = None;
+        parse_options(args, |flag, args, index| match flag {
+            "--genome" | "--genome-fasta" => {
+                genome = Some(take_path(args, index, flag)?);
+                Ok(())
+            }
+            "--hits" => {
+                hits = Some(take_path(args, index, flag)?);
+                Ok(())
+            }
+            "--out" => {
+                out = Some(take_path(args, index, flag)?);
+                Ok(())
+            }
+            other => Err(format!("unknown_orf_extend_option:{other}")),
+        })?;
+        Ok(Self {
+            genome: genome.ok_or_else(|| "missing_required_option:--genome".to_string())?,
+            hits: hits.ok_or_else(|| "missing_required_option:--hits".to_string())?,
+            out: out.ok_or_else(|| "missing_required_option:--out".to_string())?,
+        })
+    }
+}
+
+struct ClassifyLociArgs {
+    annotation: PathBuf,
+    orfs: PathBuf,
+    out: PathBuf,
+}
+
+impl ClassifyLociArgs {
+    fn parse(args: &[String]) -> Result<Self, String> {
+        let mut annotation = None;
+        let mut orfs = None;
+        let mut out = None;
+        parse_options(args, |flag, args, index| match flag {
+            "--annotation" | "--gff" => {
+                annotation = Some(take_path(args, index, flag)?);
+                Ok(())
+            }
+            "--orfs" => {
+                orfs = Some(take_path(args, index, flag)?);
+                Ok(())
+            }
+            "--out" => {
+                out = Some(take_path(args, index, flag)?);
+                Ok(())
+            }
+            other => Err(format!("unknown_classify_loci_option:{other}")),
+        })?;
+        Ok(Self {
+            annotation: annotation
+                .ok_or_else(|| "missing_required_option:--annotation".to_string())?,
+            orfs: orfs.ok_or_else(|| "missing_required_option:--orfs".to_string())?,
+            out: out.ok_or_else(|| "missing_required_option:--out".to_string())?,
+        })
+    }
+}
+
+struct CooccurScoreArgs {
+    hits: PathBuf,
+    stats: PathBuf,
+    orfs: PathBuf,
+    context: PathBuf,
+    out: PathBuf,
+}
+
+impl CooccurScoreArgs {
+    fn parse(args: &[String]) -> Result<Self, String> {
+        let mut hits = None;
+        let mut stats = None;
+        let mut orfs = None;
+        let mut context = None;
+        let mut out = None;
+        parse_options(args, |flag, args, index| match flag {
+            "--hits" => {
+                hits = Some(take_path(args, index, flag)?);
+                Ok(())
+            }
+            "--stats" => {
+                stats = Some(take_path(args, index, flag)?);
+                Ok(())
+            }
+            "--orfs" => {
+                orfs = Some(take_path(args, index, flag)?);
+                Ok(())
+            }
+            "--context" => {
+                context = Some(take_path(args, index, flag)?);
+                Ok(())
+            }
+            "--out" => {
+                out = Some(take_path(args, index, flag)?);
+                Ok(())
+            }
+            other => Err(format!("unknown_cooccur_score_option:{other}")),
+        })?;
+        Ok(Self {
+            hits: hits.ok_or_else(|| "missing_required_option:--hits".to_string())?,
+            stats: stats.ok_or_else(|| "missing_required_option:--stats".to_string())?,
+            orfs: orfs.ok_or_else(|| "missing_required_option:--orfs".to_string())?,
+            context: context.ok_or_else(|| "missing_required_option:--context".to_string())?,
+            out: out.ok_or_else(|| "missing_required_option:--out".to_string())?,
+        })
+    }
+}
+
 struct GateShortCircuitArgs {
     stats: PathBuf,
+    orfs: Option<PathBuf>,
+    context: Option<PathBuf>,
+    cooccur: Option<PathBuf>,
     out: PathBuf,
 }
 
 impl GateShortCircuitArgs {
     fn parse(args: &[String]) -> Result<Self, String> {
         let mut stats = None;
+        let mut orfs = None;
+        let mut context = None;
+        let mut cooccur = None;
         let mut out = None;
         parse_options(args, |flag, args, index| match flag {
             "--stats" => {
                 stats = Some(take_path(args, index, flag)?);
+                Ok(())
+            }
+            "--orfs" => {
+                orfs = Some(take_path(args, index, flag)?);
+                Ok(())
+            }
+            "--context" => {
+                context = Some(take_path(args, index, flag)?);
+                Ok(())
+            }
+            "--cooccur" => {
+                cooccur = Some(take_path(args, index, flag)?);
                 Ok(())
             }
             "--out" => {
@@ -412,6 +662,9 @@ impl GateShortCircuitArgs {
         })?;
         Ok(Self {
             stats: stats.ok_or_else(|| "missing_required_option:--stats".to_string())?,
+            orfs,
+            context,
+            cooccur,
             out: out.ok_or_else(|| "missing_required_option:--out".to_string())?,
         })
     }
@@ -556,6 +809,96 @@ impl DockRunArgs {
     }
 }
 
+struct ReportMarkdownArgs {
+    hits: PathBuf,
+    stats: PathBuf,
+    orfs: PathBuf,
+    context: PathBuf,
+    cooccur: PathBuf,
+    gate: PathBuf,
+    plm: PathBuf,
+    foldgate: PathBuf,
+    patches: PathBuf,
+    dock: PathBuf,
+    out: PathBuf,
+}
+
+impl ReportMarkdownArgs {
+    fn parse(args: &[String]) -> Result<Self, String> {
+        let mut hits = None;
+        let mut stats = None;
+        let mut orfs = None;
+        let mut context = None;
+        let mut cooccur = None;
+        let mut gate = None;
+        let mut plm = None;
+        let mut foldgate = None;
+        let mut patches = None;
+        let mut dock = None;
+        let mut out = None;
+        parse_options(args, |flag, args, index| match flag {
+            "--hits" => {
+                hits = Some(take_path(args, index, flag)?);
+                Ok(())
+            }
+            "--stats" => {
+                stats = Some(take_path(args, index, flag)?);
+                Ok(())
+            }
+            "--orfs" => {
+                orfs = Some(take_path(args, index, flag)?);
+                Ok(())
+            }
+            "--context" => {
+                context = Some(take_path(args, index, flag)?);
+                Ok(())
+            }
+            "--cooccur" => {
+                cooccur = Some(take_path(args, index, flag)?);
+                Ok(())
+            }
+            "--gate" => {
+                gate = Some(take_path(args, index, flag)?);
+                Ok(())
+            }
+            "--plm" => {
+                plm = Some(take_path(args, index, flag)?);
+                Ok(())
+            }
+            "--foldgate" => {
+                foldgate = Some(take_path(args, index, flag)?);
+                Ok(())
+            }
+            "--patches" => {
+                patches = Some(take_path(args, index, flag)?);
+                Ok(())
+            }
+            "--dock" => {
+                dock = Some(take_path(args, index, flag)?);
+                Ok(())
+            }
+            "--out" => {
+                out = Some(take_path(args, index, flag)?);
+                Ok(())
+            }
+            other => Err(format!("unknown_report_markdown_option:{other}")),
+        })?;
+        Ok(Self {
+            hits: hits.ok_or_else(|| "missing_required_option:--hits".to_string())?,
+            stats: stats.ok_or_else(|| "missing_required_option:--stats".to_string())?,
+            orfs: orfs.ok_or_else(|| "missing_required_option:--orfs".to_string())?,
+            context: context.ok_or_else(|| "missing_required_option:--context".to_string())?,
+            cooccur: cooccur.ok_or_else(|| "missing_required_option:--cooccur".to_string())?,
+            gate: gate.ok_or_else(|| "missing_required_option:--gate".to_string())?,
+            plm: plm.ok_or_else(|| "missing_required_option:--plm".to_string())?,
+            foldgate: foldgate.ok_or_else(|| "missing_required_option:--foldgate".to_string())?,
+            patches: patches.ok_or_else(|| "missing_required_option:--patches".to_string())?,
+            dock: dock.ok_or_else(|| "missing_required_option:--dock".to_string())?,
+            out: out.ok_or_else(|| "missing_required_option:--out".to_string())?,
+        })
+    }
+}
+
 struct ValidateArgs {
     input: PathBuf,
 }
@@ -637,11 +980,15 @@ commands:
   dev-smoke
   search genome
   stats score
+  orf extend
+  classify loci
+  cooccur score
   gate short-circuit
   gate plm
   foldgate realize
   patch realize
   dock run
+  report markdown
   validate fasta|gff|fragment-kernel|ligand
   gls-calibrate-patch-tolerance
 ";
@@ -658,9 +1005,17 @@ const SEARCH_GENOME_HELP: &str =
     "usage: gls-cli search genome --genome PATH --fragments PATH --out PATH";
 const STATS_HELP: &str = "usage: gls-cli stats <score>\ncommands:\n  score";
 const STATS_SCORE_HELP: &str = "usage: gls-cli stats score --hits PATH --out PATH";
+const ORF_HELP: &str = "usage: gls-cli orf <extend>\ncommands:\n  extend";
+const ORF_EXTEND_HELP: &str = "usage: gls-cli orf extend --genome PATH --hits PATH --out PATH";
+const CLASSIFY_HELP: &str = "usage: gls-cli classify <loci>\ncommands:\n  loci";
+const CLASSIFY_LOCI_HELP: &str =
+    "usage: gls-cli classify loci --annotation PATH --orfs PATH --out PATH";
+const COOCCUR_HELP: &str = "usage: gls-cli cooccur <score>\ncommands:\n  score";
+const COOCCUR_SCORE_HELP: &str =
+    "usage: gls-cli cooccur score --hits PATH --stats PATH --orfs PATH --context PATH --out PATH";
 const GATE_HELP: &str =
     "usage: gls-cli gate <short-circuit|plm>\ncommands:\n  short-circuit\n  plm";
-const GATE_SHORT_CIRCUIT_HELP: &str = "usage: gls-cli gate short-circuit --stats PATH --out PATH";
+const GATE_SHORT_CIRCUIT_HELP: &str = "usage: gls-cli gate short-circuit --stats PATH [--orfs PATH --context PATH --cooccur PATH] --out PATH";
 const GATE_PLM_HELP: &str = "usage: gls-cli gate plm --candidates PATH [--profile NAME] --out PATH";
 const FOLDGATE_HELP: &str = "usage: gls-cli foldgate <realize>\ncommands:\n  realize";
 const FOLDGATE_REALIZE_HELP: &str = "usage: gls-cli foldgate realize --candidates PATH --out PATH";
@@ -668,6 +1023,8 @@ const PATCH_HELP: &str = "usage: gls-cli patch <realize>\ncommands:\n  realize";
 const PATCH_REALIZE_HELP: &str = "usage: gls-cli patch realize --foldgate PATH --ligand PATH [--tolerance-profile PATH] --out PATH";
 const DOCK_HELP: &str = "usage: gls-cli dock <run>\ncommands:\n  run";
 const DOCK_RUN_HELP: &str = "usage: gls-cli dock run --patches PATH [--mode MODE] --out PATH";
+const REPORT_HELP: &str = "usage: gls-cli report <markdown>\ncommands:\n  markdown";
+const REPORT_MARKDOWN_HELP: &str = "usage: gls-cli report markdown --hits PATH --stats PATH --orfs PATH --context PATH --cooccur PATH --gate PATH --plm PATH --foldgate PATH --patches PATH --dock PATH --out PATH";
 const VALIDATE_HELP: &str =
     "usage: gls-cli validate <fasta|gff|fragment-kernel|ligand> --input PATH";
 const VALIDATE_FASTA_HELP: &str = "usage: gls-cli validate fasta --input PATH";

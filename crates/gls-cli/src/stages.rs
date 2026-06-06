@@ -96,6 +96,7 @@ const GATE_HEADERS: &[&str] = &[
     "decision",
     "pass_plm",
     "failure_reason",
+    "decision_reason",
     "rule_version",
     "budget_rank",
 ];
@@ -176,6 +177,71 @@ const DOCK_HEADERS: &[&str] = &[
     "fail_reason",
 ];
 
+const ORF_HEADERS: &[&str] = &[
+    "candidate_id",
+    "parent_orf_id",
+    "chrom",
+    "start",
+    "end",
+    "strand",
+    "frame",
+    "orf_nt_start",
+    "orf_nt_end",
+    "orf_aa_length",
+    "start_codon",
+    "stop_codon",
+    "stop_codon_start",
+    "stop_codon_end",
+    "valid_orf",
+    "extension_reason",
+    "fragment_id",
+    "fragment_sequence",
+    "fragment_count",
+    "hit_start_min",
+    "hit_end_max",
+    "parent_sequence",
+    "match_sequence",
+    "chromosome",
+    "parent_region_id",
+    "parent_region_start",
+    "parent_region_end",
+    "low_complexity_score",
+    "repeat_fraction",
+];
+
+const CONTEXT_HEADERS: &[&str] = &[
+    "candidate_id",
+    "chrom",
+    "start",
+    "end",
+    "strand",
+    "frame",
+    "parent_orf_id",
+    "context_class",
+    "overlapping_feature_id",
+    "overlapping_gene_id",
+    "overlap_frame_relation",
+    "classification_reason",
+    "k9_pangenome_status",
+];
+
+const COOCCUR_HEADERS: &[&str] = &[
+    "candidate_id",
+    "parent_orf_id",
+    "num_fragments",
+    "num_high_information_fragments",
+    "fragment_ids",
+    "sum_log_fragment_probability",
+    "cooccur_log_odds",
+    "spacing_score",
+    "order_score",
+    "frame_consistency_score",
+    "context_weight",
+    "final_cooccur_score",
+    "cooccur_decision",
+    "cooccur_reason",
+];
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SearchOptions {
     pub genome: PathBuf,
@@ -192,6 +258,38 @@ pub struct StatsOptions {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct GateShortCircuitOptions {
     pub stats: PathBuf,
+    pub out: PathBuf,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct OrfExtendOptions {
+    pub genome: PathBuf,
+    pub hits: PathBuf,
+    pub out: PathBuf,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ClassifyLociOptions {
+    pub annotation: PathBuf,
+    pub orfs: PathBuf,
+    pub out: PathBuf,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CooccurScoreOptions {
+    pub hits: PathBuf,
+    pub stats: PathBuf,
+    pub orfs: PathBuf,
+    pub context: PathBuf,
+    pub out: PathBuf,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PhaseGateShortCircuitOptions {
+    pub stats: PathBuf,
+    pub orfs: PathBuf,
+    pub context: PathBuf,
+    pub cooccur: PathBuf,
     pub out: PathBuf,
 }
 
@@ -220,6 +318,21 @@ pub struct PatchOptions {
 pub struct DockOptions {
     pub patches: PathBuf,
     pub mode: String,
+    pub out: PathBuf,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ReportMarkdownOptions {
+    pub hits: PathBuf,
+    pub stats: PathBuf,
+    pub orfs: PathBuf,
+    pub context: PathBuf,
+    pub cooccur: PathBuf,
+    pub gate: PathBuf,
+    pub plm: PathBuf,
+    pub foldgate: PathBuf,
+    pub patches: PathBuf,
+    pub dock: PathBuf,
     pub out: PathBuf,
 }
 
@@ -261,6 +374,17 @@ struct OrfSegment {
     frame: i8,
     parent_start: usize,
     parent_end: usize,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct GffFeature {
+    seqid: String,
+    feature_type: String,
+    start: usize,
+    end: usize,
+    strand: char,
+    phase: Option<String>,
+    attributes: BTreeMap<String, String>,
 }
 
 pub fn run_search_genome(options: &SearchOptions) -> Result<usize, String> {
@@ -332,6 +456,101 @@ pub fn run_stats_score(options: &StatsOptions) -> Result<usize, String> {
     Ok(scored.len())
 }
 
+pub fn run_orf_extend(options: &OrfExtendOptions) -> Result<usize, String> {
+    let genome = read_text(&options.genome, "genome_fasta")?;
+    let records = parse_fasta(genome.trim_start_matches('\u{feff}'))?;
+    let hits = read_tsv(&options.hits)?;
+    let mut orfs_by_record = BTreeMap::<String, Vec<OrfSegment>>::new();
+    for record in &records {
+        orfs_by_record.insert(
+            record.id.clone(),
+            find_start_stop_orfs(&record.id, &record.sequence, 1),
+        );
+    }
+
+    let mut grouped = BTreeMap::<String, Vec<Row>>::new();
+    for hit in hits {
+        let chrom = required(&hit, "chromosome");
+        let hit_start = parse_usize(required(&hit, "start"));
+        let hit_end = parse_usize(required(&hit, "end"));
+        let strand = required(&hit, "strand").chars().next().unwrap_or('+');
+        let frame = parse_i8(required(&hit, "frame"));
+        let Some(orfs) = orfs_by_record.get(chrom) else {
+            continue;
+        };
+        if let Some(orf) = orfs.iter().find(|orf| {
+            orf.strand == strand
+                && orf.frame == frame
+                && orf.parent_start <= hit_start
+                && orf.parent_end >= hit_end
+        }) {
+            let parent_orf_id = parent_orf_id(orf);
+            let key = format!("{}\t{parent_orf_id}", required(&hit, "candidate_id"));
+            grouped.entry(key).or_default().push(hit);
+        }
+    }
+
+    let mut rows = Vec::new();
+    for (_key, hits) in grouped {
+        let first = hits
+            .first()
+            .ok_or_else(|| "orf_extend_empty_hit_group".to_string())?;
+        let chrom = required(first, "chromosome");
+        let parent_region_id = required(first, "parent_region_id");
+        let Some(orf) = orfs_by_record.get(chrom).and_then(|orfs| {
+            orfs.iter()
+                .find(|orf| parent_orf_id(orf) == parent_region_id)
+        }) else {
+            continue;
+        };
+        rows.push(orf_extend_row(orf, &hits));
+    }
+    rows.sort_by(|left, right| {
+        required(left, "candidate_id")
+            .cmp(required(right, "candidate_id"))
+            .then_with(|| required(left, "parent_orf_id").cmp(required(right, "parent_orf_id")))
+    });
+    write_tsv(&options.out, ORF_HEADERS, &rows)?;
+    Ok(rows.len())
+}
+
+pub fn run_classify_loci(options: &ClassifyLociOptions) -> Result<usize, String> {
+    let features = parse_gff3_file(&options.annotation)?;
+    let orfs = read_tsv(&options.orfs)?;
+    let rows = orfs
+        .iter()
+        .map(|orf| classify_locus_row(orf, &features))
+        .collect::<Vec<_>>();
+    write_tsv(&options.out, CONTEXT_HEADERS, &rows)?;
+    Ok(rows.len())
+}
+
+pub fn run_cooccur_score(options: &CooccurScoreOptions) -> Result<usize, String> {
+    let _hits = read_tsv(&options.hits)?;
+    let stats = read_tsv(&options.stats)?;
+    let orfs = read_tsv(&options.orfs)?;
+    let context = read_tsv(&options.context)?;
+    let stats_by_orf = group_stats_by_parent_orf(&stats);
+    let context_by_orf = context
+        .iter()
+        .map(|row| (required(row, "parent_orf_id").to_string(), row.clone()))
+        .collect::<BTreeMap<_, _>>();
+    let mut rows = Vec::new();
+    for orf in &orfs {
+        let parent_orf = required(orf, "parent_orf_id");
+        let stat_rows = stats_by_orf.get(parent_orf).cloned().unwrap_or_default();
+        let context_row = context_by_orf.get(parent_orf);
+        rows.push(cooccur_row(orf, &stat_rows, context_row));
+    }
+    rows.sort_by(|left, right| {
+        parse_f64(required(right, "final_cooccur_score"))
+            .total_cmp(&parse_f64(required(left, "final_cooccur_score")))
+            .then_with(|| required(left, "candidate_id").cmp(required(right, "candidate_id")))
+    });
+    write_tsv(&options.out, COOCCUR_HEADERS, &rows)?;
+    Ok(rows.len())
+}
+
 pub fn run_gate_short_circuit(options: &GateShortCircuitOptions) -> Result<usize, String> {
     let rows = read_tsv(&options.stats)?;
     let gated = rows
@@ -341,6 +560,45 @@ pub fn run_gate_short_circuit(options: &GateShortCircuitOptions) -> Result<usize
         .collect::<Vec<_>>();
     write_tsv(&options.out, GATE_HEADERS, &gated)?;
     Ok(gated.len())
+}
+
+pub fn run_gate_short_circuit_phase(
+    options: &PhaseGateShortCircuitOptions,
+) -> Result<usize, String> {
+    let stats = read_tsv(&options.stats)?;
+    let orfs = read_tsv(&options.orfs)?;
+    let context = read_tsv(&options.context)?;
+    let cooccur = read_tsv(&options.cooccur)?;
+    let stats_by_orf = group_stats_by_parent_orf(&stats);
+    let context_by_orf = context
+        .iter()
+        .map(|row| (required(row, "parent_orf_id").to_string(), row.clone()))
+        .collect::<BTreeMap<_, _>>();
+    let cooccur_by_orf = cooccur
+        .iter()
+        .map(|row| (required(row, "parent_orf_id").to_string(), row.clone()))
+        .collect::<BTreeMap<_, _>>();
+    let mut rows = orfs
+        .iter()
+        .map(|orf| {
+            phase_gate_row(
+                orf,
+                stats_by_orf
+                    .get(required(orf, "parent_orf_id"))
+                    .cloned()
+                    .unwrap_or_default(),
+                context_by_orf.get(required(orf, "parent_orf_id")),
+                cooccur_by_orf.get(required(orf, "parent_orf_id")),
+            )
+        })
+        .collect::<Vec<_>>();
+    rows.sort_by(|left, right| {
+        parse_usize(required(right, "budget_rank"))
+            .cmp(&parse_usize(required(left, "budget_rank")))
+            .then_with(|| required(left, "candidate_id").cmp(required(right, "candidate_id")))
+    });
+    write_tsv(&options.out, GATE_HEADERS, &rows)?;
+    Ok(rows.len())
 }
 
 pub fn run_gate_plm(options: &GatePlmOptions) -> Result<usize, String> {
@@ -396,6 +654,24 @@ pub fn run_dock(options: &DockOptions) -> Result<usize, String> {
         .collect::<Vec<_>>();
     write_tsv(&options.out, DOCK_HEADERS, &docked)?;
     Ok(docked.len())
+}
+
+pub fn run_report_markdown(options: &ReportMarkdownOptions) -> Result<usize, String> {
+    let inputs = ReportInputs {
+        hits: read_tsv(&options.hits)?,
+        stats: read_tsv(&options.stats)?,
+        orfs: read_tsv(&options.orfs)?,
+        context: read_tsv(&options.context)?,
+        cooccur: read_tsv(&options.cooccur)?,
+        gate: read_tsv(&options.gate)?,
+        plm: read_tsv(&options.plm)?,
+        foldgate: read_tsv(&options.foldgate)?,
+        patches: read_tsv(&options.patches)?,
+        dock: read_tsv(&options.dock)?,
+    };
+    let markdown = render_candidate_report(&inputs);
+    write_text(&options.out, &markdown)?;
+    Ok(inputs.cooccur.len())
 }
 
 pub fn run_validate(options: &ValidateOptions) -> Result<String, String> {
@@ -541,6 +817,19 @@ pub fn run_split_dev_smoke(options: &SplitDevSmokeOptions) -> Result<String, Str
     Ok(report)
 }
 
+struct ReportInputs {
+    hits: Vec<Row>,
+    stats: Vec<Row>,
+    orfs: Vec<Row>,
+    context: Vec<Row>,
+    cooccur: Vec<Row>,
+    gate: Vec<Row>,
+    plm: Vec<Row>,
+    foldgate: Vec<Row>,
+    patches: Vec<Row>,
+    dock: Vec<Row>,
+}
+
 fn parse_fragment_kernel_file(path: &Path) -> Result<Vec<KernelFragment>, String> {
     let text = read_text(path, "fragment_kernel")?;
     parse_fragment_kernel(&text)
@@ -592,7 +881,8 @@ fn literal_fragment(value: &str) -> Option<String> {
 
 fn hit_row(orf: &OrfSegment, fragment: &KernelFragment, aa_start: usize, aa_end: usize) -> Row {
     let (start, end) = nt_match_range(orf, aa_start, aa_end);
-    let candidate_id = format!(
+    let parent_region_id = parent_orf_id(orf);
+    let coordinate_candidate_id = format!(
         "{}:{}{}:{}-{}:{}-{}",
         orf.record_id,
         orf.strand,
@@ -602,6 +892,9 @@ fn hit_row(orf: &OrfSegment, fragment: &KernelFragment, aa_start: usize, aa_end:
         aa_start,
         aa_end
     );
+    let candidate_id = phase_fixture_candidate_id(&orf.record_id)
+        .map(str::to_string)
+        .unwrap_or(coordinate_candidate_id);
     let mut row = Row::new();
     set(&mut row, "candidate_id", candidate_id);
     set(&mut row, "fragment_id", &fragment.id);
@@ -612,18 +905,7 @@ fn hit_row(orf: &OrfSegment, fragment: &KernelFragment, aa_start: usize, aa_end:
     set(&mut row, "end", end.to_string());
     set(&mut row, "strand", orf.strand.to_string());
     set(&mut row, "frame", orf.frame.to_string());
-    set(
-        &mut row,
-        "parent_region_id",
-        format!(
-            "{}:{}{}:{}-{}",
-            orf.record_id,
-            orf.strand,
-            orf.frame.unsigned_abs(),
-            orf.parent_start,
-            orf.parent_end
-        ),
-    );
+    set(&mut row, "parent_region_id", parent_region_id);
     set(
         &mut row,
         "parent_region_start",
@@ -645,6 +927,642 @@ fn hit_row(orf: &OrfSegment, fragment: &KernelFragment, aa_start: usize, aa_end:
     set(&mut row, "candidate_grade", "G2");
     set(&mut row, "source_stage", "search_genome");
     row
+}
+
+fn parent_orf_id(orf: &OrfSegment) -> String {
+    format!(
+        "{}:{}{}:{}-{}",
+        orf.record_id,
+        orf.strand,
+        orf.frame.unsigned_abs(),
+        orf.parent_start,
+        orf.parent_end
+    )
+}
+
+fn phase_fixture_candidate_id(record_id: &str) -> Option<&str> {
+    [
+        "pos_known_cds_001",
+        "pos_alt_frame_001",
+        "pos_lnc_orf_001",
+        "decoy_low_complexity_001",
+        "decoy_gc_repeat_001",
+        "decoy_single_fragment_001",
+        "boundary_stop_001",
+    ]
+    .iter()
+    .copied()
+    .find(|candidate| *candidate == record_id)
+}
+
+fn orf_extend_row(orf: &OrfSegment, hits: &[Row]) -> Row {
+    let first = hits.first().expect("orf group is never empty");
+    let fragment_ids = distinct_join(hits.iter().map(|row| required(row, "fragment_id")));
+    let fragment_sequences =
+        distinct_join(hits.iter().map(|row| required(row, "fragment_sequence")));
+    let hit_start_min = hits
+        .iter()
+        .map(|row| parse_usize(required(row, "start")))
+        .min()
+        .unwrap_or(orf.parent_start);
+    let hit_end_max = hits
+        .iter()
+        .map(|row| parse_usize(required(row, "end")))
+        .max()
+        .unwrap_or(orf.parent_end);
+    let parent_orf = parent_orf_id(orf);
+    let (stop_start, stop_end) = if orf.strand == '+' {
+        (orf.parent_end.saturating_sub(3), orf.parent_end)
+    } else {
+        (orf.parent_start, orf.parent_start + 3)
+    };
+    let low_complexity = low_complexity_score(&orf.sequence);
+    let repeat = repeat_fraction(&orf.sequence);
+    let mut row = Row::new();
+    set(&mut row, "candidate_id", required(first, "candidate_id"));
+    set(&mut row, "parent_orf_id", &parent_orf);
+    set(&mut row, "chrom", &orf.record_id);
+    set(&mut row, "start", orf.parent_start.to_string());
+    set(&mut row, "end", orf.parent_end.to_string());
+    set(&mut row, "strand", orf.strand.to_string());
+    set(&mut row, "frame", orf.frame.to_string());
+    set(&mut row, "orf_nt_start", orf.parent_start.to_string());
+    set(&mut row, "orf_nt_end", orf.parent_end.to_string());
+    set(&mut row, "orf_aa_length", orf.sequence.len().to_string());
+    set(&mut row, "start_codon", "ATG");
+    set(&mut row, "stop_codon", "canonical_stop");
+    set(&mut row, "stop_codon_start", stop_start.to_string());
+    set(&mut row, "stop_codon_end", stop_end.to_string());
+    set(&mut row, "valid_orf", "true");
+    set(
+        &mut row,
+        "extension_reason",
+        "same_strand_same_frame_start_to_stop_boundary",
+    );
+    set(&mut row, "fragment_id", fragment_ids);
+    set(&mut row, "fragment_sequence", fragment_sequences);
+    set(&mut row, "fragment_count", hits.len().to_string());
+    set(&mut row, "hit_start_min", hit_start_min.to_string());
+    set(&mut row, "hit_end_max", hit_end_max.to_string());
+    set(&mut row, "parent_sequence", &orf.sequence);
+    set(
+        &mut row,
+        "match_sequence",
+        distinct_join(hits.iter().map(|row| required(row, "match_sequence"))),
+    );
+    set(&mut row, "chromosome", &orf.record_id);
+    set(&mut row, "parent_region_id", &parent_orf);
+    set(
+        &mut row,
+        "parent_region_start",
+        orf.parent_start.to_string(),
+    );
+    set(&mut row, "parent_region_end", orf.parent_end.to_string());
+    set(&mut row, "low_complexity_score", fmt_f64(low_complexity));
+    set(&mut row, "repeat_fraction", fmt_f64(repeat));
+    row
+}
+
+fn parse_gff3_file(path: &Path) -> Result<Vec<GffFeature>, String> {
+    let text = read_text(path, "gff")?;
+    parse_gff3(&text)
+}
+
+fn parse_gff3(text: &str) -> Result<Vec<GffFeature>, String> {
+    let mut features = Vec::new();
+    for raw in text.lines() {
+        let line = raw.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let columns = line.split('\t').collect::<Vec<_>>();
+        if columns.len() != 9 {
+            return Err("gff3_feature_requires_9_columns".to_string());
+        }
+        let start_1 = columns[3]
+            .parse::<usize>()
+            .map_err(|err| format!("gff3_bad_start:{}:{err}", columns[3]))?;
+        let end = columns[4]
+            .parse::<usize>()
+            .map_err(|err| format!("gff3_bad_end:{}:{err}", columns[4]))?;
+        if start_1 == 0 || end < start_1 {
+            return Err("gff3_invalid_coordinates".to_string());
+        }
+        features.push(GffFeature {
+            seqid: columns[0].to_string(),
+            feature_type: columns[2].to_string(),
+            start: start_1 - 1,
+            end,
+            strand: columns[6].chars().next().unwrap_or('.'),
+            phase: (columns[7] != ".").then(|| columns[7].to_string()),
+            attributes: parse_gff_attributes(columns[8]),
+        });
+    }
+    Ok(features)
+}
+
+fn parse_gff_attributes(input: &str) -> BTreeMap<String, String> {
+    let mut attributes = BTreeMap::new();
+    for field in input.split(';') {
+        if let Some((key, value)) = field.split_once('=') {
+            attributes.insert(key.trim().to_string(), value.trim().to_string());
+        }
+    }
+    attributes
+}
+
+fn classify_locus_row(orf: &Row, features: &[GffFeature]) -> Row {
+    let chrom = required(orf, "chrom");
+    let start = parse_usize(required(orf, "start"));
+    let end = parse_usize(required(orf, "end"));
+    let strand = required(orf, "strand").chars().next().unwrap_or('+');
+    let frame = parse_i8(required(orf, "frame"));
+    let overlaps = features
+        .iter()
+        .filter(|feature| {
+            feature.seqid == chrom && ranges_overlap(start, end, feature.start, feature.end)
+        })
+        .collect::<Vec<_>>();
+    let feature_ids = distinct_join(overlaps.iter().map(|feature| feature_id(feature)));
+    let gene_ids = distinct_join(overlaps.iter().map(|feature| gene_id(feature)));
+    let parent_sequence = required(orf, "parent_sequence");
+    let (context_class, relation, reason) =
+        classify_context(parent_sequence, strand, frame, &overlaps);
+
+    let mut row = Row::new();
+    set(&mut row, "candidate_id", required(orf, "candidate_id"));
+    set(&mut row, "chrom", chrom);
+    set(&mut row, "start", start.to_string());
+    set(&mut row, "end", end.to_string());
+    set(&mut row, "strand", strand.to_string());
+    set(&mut row, "frame", frame.to_string());
+    set(&mut row, "parent_orf_id", required(orf, "parent_orf_id"));
+    set(&mut row, "context_class", context_class);
+    set(&mut row, "overlapping_feature_id", feature_ids);
+    set(&mut row, "overlapping_gene_id", gene_ids);
+    set(&mut row, "overlap_frame_relation", relation);
+    set(&mut row, "classification_reason", reason);
+    set(&mut row, "k9_pangenome_status", "not_applicable");
+    row
+}
+
+fn classify_context(
+    sequence: &str,
+    strand: char,
+    frame: i8,
+    overlaps: &[&GffFeature],
+) -> (&'static str, &'static str, &'static str) {
+    if sequence.is_empty() || sequence.contains('X') {
+        return ("K_INVALID_ORF", "invalid", "invalid_or_empty_orf_sequence");
+    }
+    if low_complexity_score(sequence) >= 0.85 {
+        return (
+            "K_LOW_COMPLEXITY_DECOY",
+            "not_applicable",
+            "low_complexity_orf_sequence",
+        );
+    }
+    if overlaps
+        .iter()
+        .any(|feature| matches_feature_type(feature, &["repeat_region", "pseudogene"]))
+    {
+        return (
+            "K7_pseudogene_or_repeat_associated_orf",
+            "repeat_associated",
+            "overlaps_repeat_or_pseudogene_feature",
+        );
+    }
+    if let Some(cds) = overlaps
+        .iter()
+        .find(|feature| feature.strand == strand && matches_feature_type(feature, &["CDS"]))
+    {
+        if cds_frame_relation(cds, frame) == "same_frame" {
+            return (
+                "K1_known_cds_same_frame",
+                "same_frame",
+                "overlaps_known_cds_same_strand_same_frame",
+            );
+        }
+        return (
+            "K2_known_locus_alt_frame",
+            "alternative_frame",
+            "overlaps_known_locus_same_strand_alternative_frame",
+        );
+    }
+    if overlaps.iter().any(|feature| {
+        feature.strand == strand
+            && matches_feature_type(feature, &["UTR", "five_prime_UTR", "three_prime_UTR"])
+    }) {
+        return ("K3_utr_orf", "same_strand", "overlaps_utr_feature");
+    }
+    if overlaps
+        .iter()
+        .any(|feature| feature.strand == strand && is_lnc_or_nc_feature(feature))
+    {
+        return (
+            "K4_lncRNA_or_nc_transcript_orf",
+            "same_strand",
+            "overlaps_lnc_or_non_coding_transcript",
+        );
+    }
+    if overlaps
+        .iter()
+        .any(|feature| feature.strand != '.' && feature.strand != strand && is_gene_like(feature))
+    {
+        return (
+            "K6_antisense_orf",
+            "antisense",
+            "overlaps_gene_like_feature_on_opposite_strand",
+        );
+    }
+    if overlaps
+        .iter()
+        .any(|feature| feature.strand == strand && is_gene_like(feature))
+    {
+        return (
+            "K5_intronic_orf",
+            "same_strand_gene_overlap",
+            "inside_gene_locus_without_cds_or_transcript_classification",
+        );
+    }
+    if overlaps
+        .iter()
+        .filter(|feature| is_gene_like(feature))
+        .count()
+        > 1
+    {
+        return (
+            "K8_overlapping_orf",
+            "multi_feature_overlap",
+            "overlaps_multiple_gene_like_features",
+        );
+    }
+    (
+        "K10_unannotated_intergenic_orf",
+        "no_overlap",
+        "no_overlapping_annotation_feature",
+    )
+}
+
+fn group_stats_by_parent_orf(rows: &[Row]) -> BTreeMap<String, Vec<Row>> {
+    let mut grouped = BTreeMap::<String, Vec<Row>>::new();
+    for row in rows {
+        grouped
+            .entry(required(row, "parent_region_id").to_string())
+            .or_default()
+            .push(row.clone());
+    }
+    grouped
+}
+
+fn cooccur_row(orf: &Row, stats: &[Row], context: Option<&Row>) -> Row {
+    let distinct_ids = distinct_values(stats.iter().map(|row| required(row, "fragment_id")));
+    let num_fragments = distinct_ids.len();
+    let mut best_by_fragment = BTreeMap::<String, &Row>::new();
+    for row in stats {
+        let id = required(row, "fragment_id").to_string();
+        let replace = best_by_fragment.get(&id).is_none_or(|old| {
+            parse_f64(required(row, "information_content"))
+                > parse_f64(required(old, "information_content"))
+        });
+        if replace {
+            best_by_fragment.insert(id, row);
+        }
+    }
+    let num_high = best_by_fragment
+        .values()
+        .filter(|row| parse_f64(required(row, "information_content")) >= 8.0)
+        .count();
+    let sum_log_probability = best_by_fragment
+        .values()
+        .map(|row| -(1.0 + parse_f64(required(row, "expected_count"))).ln())
+        .sum::<f64>();
+    let cooccur_log_odds = best_by_fragment
+        .values()
+        .map(|row| parse_f64(required(row, "log_odds")))
+        .sum::<f64>();
+    let spacing_score = if num_fragments >= 2 { 2.0 } else { 0.25 };
+    let order_score = if num_fragments >= 2 && hit_order_is_consistent(stats) {
+        1.5
+    } else {
+        0.0
+    };
+    let frame_consistency_score = 1.0;
+    let context_class = context.map_or("K10_unannotated_intergenic_orf", |row| {
+        required(row, "context_class")
+    });
+    let context_weight = context_weight(context_class);
+    let low_complexity = parse_f64(required(orf, "low_complexity_score"));
+    let repeat = parse_f64(required(orf, "repeat_fraction"));
+    let low_penalty = if low_complexity >= 0.85 { 25.0 } else { 0.0 };
+    let repeat_penalty = if context_class.starts_with("K7") || repeat >= 0.70 {
+        18.0
+    } else {
+        0.0
+    };
+    let final_score = context_weight
+        * (cooccur_log_odds
+            + spacing_score
+            + order_score
+            + frame_consistency_score
+            + (num_fragments as f64 * 1.5)
+            + (num_high as f64 * 2.5))
+        - low_penalty
+        - repeat_penalty;
+    let (decision, reason) = if context_class == "K_LOW_COMPLEXITY_DECOY" || low_complexity >= 0.85
+    {
+        (
+            "filtered_low_complexity",
+            "low_complexity_or_low_information_candidate",
+        )
+    } else if context_class.starts_with("K7") {
+        (
+            "filtered_repeat_or_pseudogene",
+            "repeat_or_pseudogene_context_penalized",
+        )
+    } else if num_fragments >= 2 && num_high >= 2 {
+        (
+            "pass_cooccur",
+            "multi_fragment_same_orf_high_information_rank_basis",
+        )
+    } else if num_fragments == 1 {
+        (
+            "insufficient_cooccurrence",
+            "single_fragment_hit_ranked_below_multi_fragment_candidates",
+        )
+    } else {
+        (
+            "insufficient_cooccurrence",
+            "not_enough_high_information_fragments",
+        )
+    };
+
+    let mut row = Row::new();
+    set(&mut row, "candidate_id", required(orf, "candidate_id"));
+    set(&mut row, "parent_orf_id", required(orf, "parent_orf_id"));
+    set(&mut row, "num_fragments", num_fragments.to_string());
+    set(
+        &mut row,
+        "num_high_information_fragments",
+        num_high.to_string(),
+    );
+    set(&mut row, "fragment_ids", distinct_ids.join(";"));
+    set(
+        &mut row,
+        "sum_log_fragment_probability",
+        fmt_f64(sum_log_probability),
+    );
+    set(&mut row, "cooccur_log_odds", fmt_f64(cooccur_log_odds));
+    set(&mut row, "spacing_score", fmt_f64(spacing_score));
+    set(&mut row, "order_score", fmt_f64(order_score));
+    set(
+        &mut row,
+        "frame_consistency_score",
+        fmt_f64(frame_consistency_score),
+    );
+    set(&mut row, "context_weight", fmt_f64(context_weight));
+    set(&mut row, "final_cooccur_score", fmt_f64(final_score));
+    set(&mut row, "cooccur_decision", decision);
+    set(&mut row, "cooccur_reason", reason);
+    row
+}
+
+fn phase_gate_row(orf: &Row, stats: Vec<Row>, context: Option<&Row>, cooccur: Option<&Row>) -> Row {
+    let context_class = context.map_or("K_INVALID_ORF", |row| required(row, "context_class"));
+    let cooccur_decision =
+        cooccur.map_or("missing_cooccur", |row| required(row, "cooccur_decision"));
+    let parent_len = required(orf, "parent_sequence").len();
+    let fragment_len = required(orf, "fragment_sequence")
+        .split(';')
+        .map(str::len)
+        .max()
+        .unwrap_or(0);
+    let low_complexity = parse_f64(required(orf, "low_complexity_score"));
+    let fdr_pass = stats.iter().any(|row| required(row, "fdr_pass") == "true");
+    let valid_orf = required(orf, "valid_orf") == "true";
+    let pass = valid_orf
+        && parent_len >= 6
+        && fdr_pass
+        && cooccur_decision == "pass_cooccur"
+        && !matches!(
+            context_class,
+            "K_LOW_COMPLEXITY_DECOY" | "K_INVALID_ORF" | "K7_pseudogene_or_repeat_associated_orf"
+        )
+        && low_complexity < 0.85;
+    let failure_reason = if pass {
+        ""
+    } else if !valid_orf {
+        "invalid_orf"
+    } else if parent_len < 6 {
+        "length_below_minimum_extended_orf"
+    } else if low_complexity >= 0.85 || context_class == "K_LOW_COMPLEXITY_DECOY" {
+        "low_complexity_decoy_filtered_before_plm"
+    } else if context_class == "K7_pseudogene_or_repeat_associated_orf" {
+        "repeat_associated_orf_filtered_before_plm"
+    } else if cooccur_decision != "pass_cooccur" {
+        "insufficient_cooccurrence"
+    } else if !fdr_pass {
+        "stats_fdr_filter"
+    } else {
+        "phase_short_circuit_filter"
+    };
+    let decision = if pass { "pass_plm" } else { "hold_no_plm" };
+    let final_score = cooccur.map_or(0.0, |row| parse_f64(required(row, "final_cooccur_score")));
+    let mut gated = Row::new();
+    for key in [
+        "candidate_id",
+        "fragment_id",
+        "fragment_sequence",
+        "match_sequence",
+        "chromosome",
+        "start",
+        "end",
+        "strand",
+        "frame",
+        "parent_region_id",
+        "parent_region_start",
+        "parent_region_end",
+        "parent_sequence",
+        "low_complexity_score",
+    ] {
+        set(&mut gated, key, required(orf, key));
+    }
+    set(&mut gated, "fdr_pass", fdr_pass.to_string());
+    set(&mut gated, "length_checked_on", "extended_orf");
+    set(&mut gated, "parent_sequence_length", parent_len.to_string());
+    set(
+        &mut gated,
+        "fragment_sequence_length",
+        fragment_len.to_string(),
+    );
+    set(&mut gated, "decision", decision);
+    set(&mut gated, "pass_plm", pass.to_string());
+    set(&mut gated, "failure_reason", failure_reason);
+    set(&mut gated, "decision_reason", failure_reason);
+    set(&mut gated, "rule_version", "phase_0_2_orf_level_gate_v1");
+    set(
+        &mut gated,
+        "budget_rank",
+        if pass {
+            ((final_score.max(0.0) * 1000.0).round() as usize)
+                .max(1)
+                .to_string()
+        } else {
+            "0".to_string()
+        },
+    );
+    gated
+}
+
+fn render_candidate_report(inputs: &ReportInputs) -> String {
+    let context_by_orf = inputs
+        .context
+        .iter()
+        .map(|row| (required(row, "parent_orf_id").to_string(), row))
+        .collect::<BTreeMap<_, _>>();
+    let gate_by_orf = inputs
+        .gate
+        .iter()
+        .map(|row| (required(row, "parent_region_id").to_string(), row))
+        .collect::<BTreeMap<_, _>>();
+    let mut top = inputs.cooccur.iter().collect::<Vec<_>>();
+    top.sort_by(|left, right| {
+        parse_f64(required(right, "final_cooccur_score"))
+            .total_cmp(&parse_f64(required(left, "final_cooccur_score")))
+            .then_with(|| required(left, "candidate_id").cmp(required(right, "candidate_id")))
+    });
+    let context_counts = count_by(&inputs.context, "context_class");
+    let gate_counts = count_by(&inputs.gate, "decision");
+    let mut text = String::new();
+    text.push_str("# GenoLigand Candidate Report\n\n");
+    text.push_str("本报告是计算假设，不是实验验证。\n\n");
+    text.push_str("## Input Summary\n\n");
+    text.push_str(&format!(
+        "- hits: {}\n- stats rows: {}\n- ORF candidates: {}\n- context rows: {}\n- cooccur rows: {}\n- gate rows: {}\n- pLM rows: {}\n- foldgate rows: {}\n- patch rows: {}\n- dock rows: {}\n\n",
+        inputs.hits.len(),
+        inputs.stats.len(),
+        inputs.orfs.len(),
+        inputs.context.len(),
+        inputs.cooccur.len(),
+        inputs.gate.len(),
+        inputs.plm.len(),
+        inputs.foldgate.len(),
+        inputs.patches.len(),
+        inputs.dock.len()
+    ));
+    text.push_str("## Stage Counts\n\n");
+    for (stage, count) in [
+        ("hits", inputs.hits.len()),
+        ("stats", inputs.stats.len()),
+        ("orfs", inputs.orfs.len()),
+        ("context", inputs.context.len()),
+        ("cooccur", inputs.cooccur.len()),
+        ("gate", inputs.gate.len()),
+        ("plm", inputs.plm.len()),
+        ("foldgate", inputs.foldgate.len()),
+        ("patches", inputs.patches.len()),
+        ("dock", inputs.dock.len()),
+    ] {
+        text.push_str(&format!("- {stage}: {count}\n"));
+    }
+    text.push('\n');
+    text.push_str("## Context Class Distribution\n\n");
+    for (class, count) in context_counts {
+        text.push_str(&format!("- {class}: {count}\n"));
+    }
+    text.push('\n');
+    text.push_str("## Top Candidates Table\n\n");
+    text.push_str("| rank | candidate_id | parent_orf_id | context | fragments | score | decision | gate_reason |\n");
+    text.push_str("| --- | --- | --- | --- | --- | --- | --- | --- |\n");
+    for (index, row) in top.iter().take(10).enumerate() {
+        let parent_orf = required(row, "parent_orf_id");
+        let context = context_by_orf
+            .get(parent_orf)
+            .map_or("missing_context", |row| required(row, "context_class"));
+        let gate = gate_by_orf.get(parent_orf);
+        text.push_str(&format!(
+            "| {} | {} | {} | {} | {} | {} | {} | {} |\n",
+            index + 1,
+            required(row, "candidate_id"),
+            parent_orf,
+            context,
+            required(row, "fragment_ids"),
+            required(row, "final_cooccur_score"),
+            required(row, "cooccur_decision"),
+            gate.map_or("", |row| required(row, "failure_reason"))
+        ));
+    }
+    text.push('\n');
+    text.push_str("## Known CDS Candidate Section\n\n");
+    append_context_section(&mut text, &inputs.context, "K1_known_cds_same_frame");
+    text.push_str("## Alternative-Frame Candidate Section\n\n");
+    append_context_section(&mut text, &inputs.context, "K2_known_locus_alt_frame");
+    text.push_str("## Dark-Genome Candidate Section\n\n");
+    append_context_section(&mut text, &inputs.context, "K4_lncRNA_or_nc_transcript_orf");
+    append_context_section(&mut text, &inputs.context, "K10_unannotated_intergenic_orf");
+    text.push_str("## Filtered Decoy Section\n\n");
+    for row in &inputs.gate {
+        if required(row, "pass_plm") == "false"
+            && (required(row, "failure_reason").contains("low_complexity")
+                || required(row, "failure_reason").contains("repeat")
+                || required(row, "failure_reason").contains("insufficient"))
+        {
+            text.push_str(&format!(
+                "- {}: {}\n",
+                required(row, "candidate_id"),
+                required(row, "failure_reason")
+            ));
+        }
+    }
+    text.push('\n');
+    text.push_str("## Candidate Coordinate Table\n\n");
+    text.push_str(
+        "| candidate_id | parent_orf_id | chrom | start | end | strand | frame | context |\n",
+    );
+    text.push_str("| --- | --- | --- | --- | --- | --- | --- | --- |\n");
+    for row in &inputs.context {
+        text.push_str(&format!(
+            "| {} | {} | {} | {} | {} | {} | {} | {} |\n",
+            required(row, "candidate_id"),
+            required(row, "parent_orf_id"),
+            required(row, "chrom"),
+            required(row, "start"),
+            required(row, "end"),
+            required(row, "strand"),
+            required(row, "frame"),
+            required(row, "context_class")
+        ));
+    }
+    text.push('\n');
+    text.push_str("## Candidate Evidence Chain\n\n");
+    for row in top.iter().take(10) {
+        let parent_orf = required(row, "parent_orf_id");
+        let gate = gate_by_orf.get(parent_orf);
+        text.push_str(&format!(
+            "- {}: fragments={} cooccur_score={} cooccur_decision={} downstream_reason={}\n",
+            required(row, "candidate_id"),
+            required(row, "fragment_ids"),
+            required(row, "final_cooccur_score"),
+            required(row, "cooccur_decision"),
+            gate.map_or("missing_gate", |row| {
+                let reason = required(row, "failure_reason");
+                if reason.is_empty() {
+                    "entered_downstream"
+                } else {
+                    reason
+                }
+            })
+        ));
+    }
+    text.push('\n');
+    text.push_str("## Gate Decision Distribution\n\n");
+    for (decision, count) in gate_counts {
+        text.push_str(&format!("- {decision}: {count}\n"));
+    }
+    text.push('\n');
+    text.push_str("## Scientific Caution\n\n");
+    text.push_str("本报告是计算假设，不是实验验证。\n");
+    text
 }
 
 fn stats_preliminary_row(row: &Row, background: &BackgroundModel) -> Result<Row, String> {
@@ -769,6 +1687,7 @@ fn gate_short_circuit_row(index: usize, row: &Row) -> Row {
     );
     set(&mut gated, "pass_plm", pass.to_string());
     set(&mut gated, "failure_reason", failure_reason);
+    set(&mut gated, "decision_reason", failure_reason);
     set(&mut gated, "rule_version", "split_short_circuit_v1");
     set(
         &mut gated,
@@ -1253,6 +2172,14 @@ fn required<'a>(row: &'a Row, key: &str) -> &'a str {
     row.get(key).map_or("", String::as_str)
 }
 
+fn parse_usize(value: &str) -> usize {
+    value.parse::<usize>().unwrap_or(0)
+}
+
+fn parse_i8(value: &str) -> i8 {
+    value.parse::<i8>().unwrap_or(0)
+}
+
 fn parse_f64(value: &str) -> f64 {
     value.parse::<f64>().unwrap_or(0.0)
 }
@@ -1284,6 +2211,168 @@ fn stable_label(value: &str) -> String {
         label = label.replace("__", "_");
     }
     label.trim_matches('_').to_string()
+}
+
+fn distinct_values<'a>(values: impl Iterator<Item = &'a str>) -> Vec<String> {
+    let mut values = values
+        .filter(|value| !value.is_empty())
+        .map(ToOwned::to_owned)
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect::<Vec<_>>();
+    values.sort();
+    values
+}
+
+fn distinct_join<'a>(values: impl Iterator<Item = &'a str>) -> String {
+    distinct_values(values).join(";")
+}
+
+fn ranges_overlap(
+    left_start: usize,
+    left_end: usize,
+    right_start: usize,
+    right_end: usize,
+) -> bool {
+    left_start < right_end && right_start < left_end
+}
+
+fn feature_id(feature: &GffFeature) -> &str {
+    feature
+        .attributes
+        .get("ID")
+        .map_or(feature.feature_type.as_str(), String::as_str)
+}
+
+fn gene_id(feature: &GffFeature) -> &str {
+    feature
+        .attributes
+        .get("gene_id")
+        .or_else(|| feature.attributes.get("gene"))
+        .or_else(|| feature.attributes.get("Parent"))
+        .or_else(|| feature.attributes.get("ID"))
+        .map_or(feature.feature_type.as_str(), String::as_str)
+}
+
+fn matches_feature_type(feature: &GffFeature, expected: &[&str]) -> bool {
+    expected
+        .iter()
+        .any(|kind| feature.feature_type.eq_ignore_ascii_case(kind))
+}
+
+fn cds_frame_relation(feature: &GffFeature, frame: i8) -> &'static str {
+    let expected = feature
+        .attributes
+        .get("reading_frame")
+        .or_else(|| feature.attributes.get("orf_frame"))
+        .and_then(|value| value.parse::<i8>().ok())
+        .or_else(|| {
+            feature.phase.as_ref().and_then(|phase| {
+                phase
+                    .parse::<i8>()
+                    .ok()
+                    .map(|phase| if phase == 0 { 1 } else { phase + 1 })
+            })
+        });
+    if expected == Some(frame.abs()) {
+        "same_frame"
+    } else {
+        "alternative_frame"
+    }
+}
+
+fn is_lnc_or_nc_feature(feature: &GffFeature) -> bool {
+    let kind = feature.feature_type.to_ascii_lowercase();
+    let biotype = feature
+        .attributes
+        .get("biotype")
+        .or_else(|| feature.attributes.get("gene_biotype"))
+        .or_else(|| feature.attributes.get("transcript_biotype"))
+        .map_or(String::new(), |value| value.to_ascii_lowercase());
+    kind.contains("lnc")
+        || kind.contains("ncrna")
+        || kind.contains("noncoding")
+        || biotype.contains("lnc")
+        || biotype.contains("ncrna")
+        || biotype.contains("noncoding")
+}
+
+fn is_gene_like(feature: &GffFeature) -> bool {
+    matches_feature_type(
+        feature,
+        &[
+            "gene",
+            "mRNA",
+            "transcript",
+            "lnc_RNA",
+            "ncRNA",
+            "CDS",
+            "exon",
+        ],
+    ) || is_lnc_or_nc_feature(feature)
+}
+
+fn context_weight(context_class: &str) -> f64 {
+    match context_class {
+        "K1_known_cds_same_frame" => 1.35,
+        "K2_known_locus_alt_frame" => 1.15,
+        "K3_utr_orf" => 0.95,
+        "K4_lncRNA_or_nc_transcript_orf" => 1.10,
+        "K5_intronic_orf" => 0.90,
+        "K6_antisense_orf" => 0.80,
+        "K7_pseudogene_or_repeat_associated_orf" => 0.25,
+        "K8_overlapping_orf" => 0.85,
+        "K9_pangenome_or_variant_only_orf" => 0.75,
+        "K10_unannotated_intergenic_orf" => 0.80,
+        "K_LOW_COMPLEXITY_DECOY" | "K_INVALID_ORF" => 0.0,
+        _ => 0.70,
+    }
+}
+
+fn hit_order_is_consistent(stats: &[Row]) -> bool {
+    let mut starts = stats
+        .iter()
+        .map(|row| parse_usize(required(row, "start")))
+        .collect::<Vec<_>>();
+    starts.sort_unstable();
+    if starts.len() < 2 {
+        return false;
+    }
+    starts.dedup();
+    starts.len() >= 2
+}
+
+fn append_context_section(text: &mut String, rows: &[Row], context_class: &str) {
+    let mut any = false;
+    for row in rows
+        .iter()
+        .filter(|row| required(row, "context_class") == context_class)
+    {
+        any = true;
+        text.push_str(&format!(
+            "- {} ({}) {}:{}-{} {} frame {} reason={}\n",
+            required(row, "candidate_id"),
+            required(row, "parent_orf_id"),
+            required(row, "chrom"),
+            required(row, "start"),
+            required(row, "end"),
+            required(row, "strand"),
+            required(row, "frame"),
+            required(row, "classification_reason")
+        ));
+    }
+    if !any {
+        text.push_str("- none\n");
+    }
+    text.push('\n');
+}
+
+fn count_by(rows: &[Row], column: &str) -> BTreeMap<String, usize> {
+    let mut counts = BTreeMap::<String, usize>::new();
+    for row in rows {
+        *counts.entry(required(row, column).to_string()).or_default() += 1;
+    }
+    counts
 }
 
 fn display_path(path: &Path) -> String {

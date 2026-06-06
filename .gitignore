@@ -20,12 +20,16 @@
 # Generated reports and local artifacts
 /artifacts/
 /acceptance_artifacts/
+/acceptance_artifacts_phase_0_2/
 /ACCEPTANCE_REPORT.md
+/PHASE_0_2_ACCEPTANCE_REPORT.md
+/GENOLIGAND_CANDIDATE_REPORT.md
 /reports/
 /coverage/
 /tmp/
 /temp/
 /.cache/
+/goal/
 
 # Logs and runtime dumps
 *.log

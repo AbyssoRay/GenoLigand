@@ -18,11 +18,26 @@ Useful CLI entry points:
 ```powershell
 gls-cli search genome --genome <genome.fa> --fragments <fragment_kernel.json> --out hits.tsv
 gls-cli stats score --hits hits.tsv --out stats.tsv
-gls-cli gate short-circuit --stats stats.tsv --out gate.tsv
+gls-cli orf extend --genome <genome.fa> --hits hits.tsv --out orfs.tsv
+gls-cli classify loci --annotation <annotation.gff3> --orfs orfs.tsv --out context.tsv
+gls-cli cooccur score --hits hits.tsv --stats stats.tsv --orfs orfs.tsv --context context.tsv --out cooccur.tsv
+gls-cli gate short-circuit --stats stats.tsv --orfs orfs.tsv --context context.tsv --cooccur cooccur.tsv --out gate.tsv
 gls-cli gate plm --candidates gate.tsv --profile dev_cpu_smoke --out plm.tsv
 gls-cli foldgate realize --candidates plm.tsv --out foldgate.tsv
 gls-cli patch realize --foldgate foldgate.tsv --ligand ligand.yaml --out patches.tsv
 gls-cli dock run --patches patches.tsv --mode stub --out dock.tsv
+gls-cli report markdown --hits hits.tsv --stats stats.tsv --orfs orfs.tsv --context context.tsv --cooccur cooccur.tsv --gate gate.tsv --plm plm.tsv --foldgate foldgate.tsv --patches patches.tsv --dock dock.tsv --out GENOLIGAND_CANDIDATE_REPORT.md
+```
+
+## Phase 0.2 Mini Benchmark
+
+Phase 0.2 upgrades the toy split pipeline into a real-format, offline mini benchmark under `fixtures/phase_0_2/`. The fixture includes known-CDS, alternative-frame, lncRNA-like, low-complexity, repeat-associated, single-fragment, and stop-boundary cases. Generated acceptance archives are local-only and ignored by Git.
+
+Run the split CLI chain directly with the commands above, or run the reproducible Nextflow smoke:
+
+```powershell
+nextflow run workflows/phase_0_2_mini_benchmark.nf -profile dev_cpu_smoke
+nextflow run workflows/phase_0_2_mini_benchmark.nf -profile dev_cpu_smoke -resume
 ```
 
 ## License

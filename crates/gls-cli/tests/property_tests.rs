@@ -1,8 +1,10 @@
 use gls_cli::stages::{
-    DockOptions, FoldgateOptions, GatePlmOptions, GateShortCircuitOptions, PatchOptions,
-    SearchOptions, StatsOptions, ValidateKind, ValidateOptions, run_dock, run_foldgate_realize,
-    run_gate_plm, run_gate_short_circuit, run_patch_realize, run_search_genome, run_stats_score,
-    run_validate,
+    ClassifyLociOptions, CooccurScoreOptions, DockOptions, FoldgateOptions, GatePlmOptions,
+    GateShortCircuitOptions, OrfExtendOptions, PatchOptions, PhaseGateShortCircuitOptions,
+    ReportMarkdownOptions, SearchOptions, StatsOptions, ValidateKind, ValidateOptions,
+    run_classify_loci, run_cooccur_score, run_dock, run_foldgate_realize, run_gate_plm,
+    run_gate_short_circuit, run_gate_short_circuit_phase, run_orf_extend, run_patch_realize,
+    run_report_markdown, run_search_genome, run_stats_score, run_validate,
 };
 use gls_genome::{reverse_complement, six_frame_translations};
 use gls_stats::benjamini_hochberg;
@@ -180,6 +182,194 @@ fn validators_accept_minimal_valid_contract_files() {
     }
 }
 
+#[test]
+fn phase_0_2_pipeline_preserves_context_ranking_and_stop_boundaries() {
+    let root = temp_root("phase-0-2");
+    let workspace = workspace_root();
+    let fixtures = workspace.join("fixtures").join("phase_0_2");
+    let genome = fixtures.join("mini_genome.fa");
+    let fragments = fixtures.join("fragment_kernel.json");
+    let annotation = fixtures.join("mini_annotation.gff3");
+    let ligand = fixtures.join("ligand.fixture.yaml");
+    let hits = root.join("hits.tsv");
+    let stats = root.join("stats.tsv");
+    let orfs = root.join("orfs.tsv");
+    let context = root.join("context.tsv");
+    let cooccur = root.join("cooccur.tsv");
+    let gate = root.join("gate.tsv");
+    let plm = root.join("plm.tsv");
+    let foldgate = root.join("foldgate.tsv");
+    let patches = root.join("patches.tsv");
+    let dock = root.join("dock.tsv");
+    let report = root.join("GENOLIGAND_CANDIDATE_REPORT.md");
+    let report_again = root.join("GENOLIGAND_CANDIDATE_REPORT.again.md");
+
+    run_search_genome(&SearchOptions {
+        genome: genome.clone(),
+        fragments: fragments.clone(),
+        out: hits.clone(),
+    })
+    .expect("phase search");
+    run_stats_score(&StatsOptions {
+        hits: hits.clone(),
+        out: stats.clone(),
+    })
+    .expect("phase stats");
+    run_orf_extend(&OrfExtendOptions {
+        genome,
+        hits: hits.clone(),
+        out: orfs.clone(),
+    })
+    .expect("phase orf extend");
+    run_classify_loci(&ClassifyLociOptions {
+        annotation,
+        orfs: orfs.clone(),
+        out: context.clone(),
+    })
+    .expect("phase classify");
+    run_cooccur_score(&CooccurScoreOptions {
+        hits: hits.clone(),
+        stats: stats.clone(),
+        orfs: orfs.clone(),
+        context: context.clone(),
+        out: cooccur.clone(),
+    })
+    .expect("phase cooccur");
+    run_gate_short_circuit_phase(&PhaseGateShortCircuitOptions {
+        stats: stats.clone(),
+        orfs: orfs.clone(),
+        context: context.clone(),
+        cooccur: cooccur.clone(),
+        out: gate.clone(),
+    })
+    .expect("phase gate");
+    run_gate_plm(&GatePlmOptions {
+        candidates: gate.clone(),
+        profile: "dev_cpu_smoke".to_string(),
+        out: plm.clone(),
+    })
+    .expect("phase plm");
+    run_foldgate_realize(&FoldgateOptions {
+        candidates: plm.clone(),
+        out: foldgate.clone(),
+    })
+    .expect("phase foldgate");
+    run_patch_realize(&PatchOptions {
+        foldgate: foldgate.clone(),
+        ligand: ligand.clone(),
+        tolerance_profile: root.join("dev_fixture_tolerance.tsv"),
+        out: patches.clone(),
+    })
+    .expect("phase patch");
+    run_dock(&DockOptions {
+        patches: patches.clone(),
+        mode: "stub".to_string(),
+        out: dock.clone(),
+    })
+    .expect("phase dock");
+    for out in [&report, &report_again] {
+        run_report_markdown(&ReportMarkdownOptions {
+            hits: hits.clone(),
+            stats: stats.clone(),
+            orfs: orfs.clone(),
+            context: context.clone(),
+            cooccur: cooccur.clone(),
+            gate: gate.clone(),
+            plm: plm.clone(),
+            foldgate: foldgate.clone(),
+            patches: patches.clone(),
+            dock: dock.clone(),
+            out: out.clone(),
+        })
+        .expect("phase report");
+    }
+
+    assert_eq!(
+        table_value(
+            &context,
+            "candidate_id",
+            "pos_known_cds_001",
+            "context_class"
+        ),
+        "K1_known_cds_same_frame"
+    );
+    assert_eq!(
+        table_value(
+            &context,
+            "candidate_id",
+            "pos_alt_frame_001",
+            "context_class"
+        ),
+        "K2_known_locus_alt_frame"
+    );
+    assert_eq!(
+        table_value(&context, "candidate_id", "pos_lnc_orf_001", "context_class"),
+        "K4_lncRNA_or_nc_transcript_orf"
+    );
+    assert_eq!(
+        table_value(
+            &context,
+            "candidate_id",
+            "decoy_low_complexity_001",
+            "context_class"
+        ),
+        "K_LOW_COMPLEXITY_DECOY"
+    );
+    assert!(
+        table_value(
+            &gate,
+            "candidate_id",
+            "decoy_low_complexity_001",
+            "failure_reason"
+        )
+        .contains("low_complexity")
+    );
+    assert!(
+        table_value(
+            &gate,
+            "candidate_id",
+            "decoy_low_complexity_001",
+            "pass_plm"
+        ) == "false"
+    );
+    let known_score = table_value(
+        &cooccur,
+        "candidate_id",
+        "pos_known_cds_001",
+        "final_cooccur_score",
+    )
+    .parse::<f64>()
+    .expect("known score");
+    let single_score = table_value(
+        &cooccur,
+        "candidate_id",
+        "decoy_single_fragment_001",
+        "final_cooccur_score",
+    )
+    .parse::<f64>()
+    .expect("single score");
+    assert!(known_score > single_score);
+    assert!(
+        table_value(
+            &cooccur,
+            "candidate_id",
+            "decoy_single_fragment_001",
+            "cooccur_reason"
+        )
+        .contains("single_fragment")
+    );
+    let boundary_rows = matching_rows(&orfs, "candidate_id", "boundary_stop_001");
+    assert!(
+        boundary_rows
+            .iter()
+            .all(|row| !row.contains("pos_yhedlv;pos_kqwc"))
+    );
+    assert_eq!(
+        fs::read_to_string(report).expect("read report"),
+        fs::read_to_string(report_again).expect("read report again")
+    );
+}
+
 fn temp_root(label: &str) -> PathBuf {
     let root = std::env::temp_dir().join(format!(
         "genoligand-{label}-{}-{}",
@@ -226,4 +416,59 @@ fragments:
 ",
     )
     .expect("write ligand");
+}
+
+fn workspace_root() -> PathBuf {
+    std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .ancestors()
+        .nth(2)
+        .expect("workspace root")
+        .to_path_buf()
+}
+
+fn table_value(path: &PathBuf, key_column: &str, key_value: &str, target_column: &str) -> String {
+    let text = fs::read_to_string(path).expect("read table");
+    let mut lines = text.lines();
+    let headers = lines
+        .next()
+        .expect("headers")
+        .split('\t')
+        .collect::<Vec<_>>();
+    let key_index = headers
+        .iter()
+        .position(|header| *header == key_column)
+        .expect("key column");
+    let target_index = headers
+        .iter()
+        .position(|header| *header == target_column)
+        .expect("target column");
+    for line in lines {
+        let cells = line.split('\t').collect::<Vec<_>>();
+        if cells.get(key_index).copied() == Some(key_value) {
+            return cells
+                .get(target_index)
+                .copied()
+                .unwrap_or_default()
+                .to_string();
+        }
+    }
+    panic!("missing row {key_column}={key_value} in {}", path.display());
+}
+
+fn matching_rows(path: &PathBuf, key_column: &str, key_value: &str) -> Vec<String> {
+    let text = fs::read_to_string(path).expect("read table");
+    let mut lines = text.lines();
+    let headers = lines
+        .next()
+        .expect("headers")
+        .split('\t')
+        .collect::<Vec<_>>();
+    let key_index = headers
+        .iter()
+        .position(|header| *header == key_column)
+        .expect("key column");
+    lines
+        .filter(|line| line.split('\t').nth(key_index) == Some(key_value))
+        .map(ToOwned::to_owned)
+        .collect()
 }
