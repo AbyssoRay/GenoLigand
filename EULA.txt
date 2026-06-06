@@ -1,0 +1,37 @@
+GENOLIGAND END USER LICENSE AGREEMENT
+
+Version: 0.1.0
+
+This End User License Agreement ("EULA") governs use of the GenoLigand software and related materials ("Software"). By using the Software, you agree to this EULA.
+
+1. License Grant
+
+The copyright holder grants you a limited, non-exclusive, non-transferable license to use the Software for internal research, development, evaluation, and testing.
+
+2. Restrictions
+
+You may not sell, sublicense, redistribute, host as a public service, or provide the Software to third parties without prior written permission from the copyright holder. You may not remove copyright, license, or attribution notices.
+
+3. Scientific and Clinical Use
+
+The Software is a research and development tool. It is not validated for clinical diagnosis, treatment decisions, regulatory submissions, or safety-critical use.
+
+4. Ownership
+
+The Software remains the property of the copyright holder. No ownership rights are transferred by this EULA.
+
+5. Warranty Disclaimer
+
+The Software is provided "as is" without warranties of any kind, express or implied, including warranties of merchantability, fitness for a particular purpose, and non-infringement.
+
+6. Limitation of Liability
+
+To the maximum extent permitted by law, the copyright holder is not liable for any indirect, incidental, consequential, special, exemplary, or punitive damages, or for loss of data, profits, or business opportunities arising from use of the Software.
+
+7. Termination
+
+This license terminates automatically if you violate this EULA. Upon termination, you must stop using the Software and delete copies under your control unless retention is required by law.
+
+8. Contact
+
+For permissions beyond this EULA, contact the project owner.

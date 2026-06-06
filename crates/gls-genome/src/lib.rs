@@ -63,6 +63,9 @@ pub fn reverse_complement(dna: &str) -> String {
 }
 
 pub fn translate_frame(dna: &str, frame: usize) -> String {
+    if frame >= dna.len() {
+        return String::new();
+    }
     dna.as_bytes()[frame..]
         .chunks(3)
         .filter(|codon| codon.len() == 3)

@@ -19,6 +19,8 @@
 
 # Generated reports and local artifacts
 /artifacts/
+/acceptance_artifacts/
+/ACCEPTANCE_REPORT.md
 /reports/
 /coverage/
 /tmp/

@@ -493,6 +493,9 @@ mod tests {
         let upgraded = config.upgraded_model.as_ref().expect("upgrade model");
         assert_eq!(results[0].model_id, upgraded.model_id);
         assert!(results[0].cache_key.contains(&upgraded.weights_hash));
-        assert_eq!(worker.model_invocations(), &[upgraded.model_id.clone()]);
+        assert_eq!(
+            worker.model_invocations(),
+            std::slice::from_ref(&upgraded.model_id)
+        );
     }
 }

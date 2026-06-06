@@ -23,6 +23,8 @@ use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
 
+pub mod stages;
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct DevSmokeInputs {
     pub ligand_yaml: String,
@@ -52,21 +54,23 @@ fragments:
     ) -> Result<Self, String> {
         let mut inputs = Self::builtin();
         if let Some(path) = ligand_yaml_path {
-            inputs.ligand_yaml = fs::read_to_string(path)
-                .map_err(|err| format!("ligand_yaml_read_failed:{}:{err}", path.display()))?;
+            inputs.ligand_yaml = read_utf8_text(path, "ligand_yaml")?;
         } else if let Ok(path) = std::env::var("GENOLIGAND_LIGAND_YAML_FILE") {
-            inputs.ligand_yaml = fs::read_to_string(&path)
-                .map_err(|err| format!("ligand_yaml_read_failed:{path}:{err}"))?;
+            inputs.ligand_yaml = read_utf8_text(Path::new(&path), "ligand_yaml")?;
         }
         if let Some(path) = genome_fasta_path {
-            inputs.genome_fasta = fs::read_to_string(path)
-                .map_err(|err| format!("genome_fasta_read_failed:{}:{err}", path.display()))?;
+            inputs.genome_fasta = read_utf8_text(path, "genome_fasta")?;
         } else if let Ok(path) = std::env::var("GENOLIGAND_GENOME_FASTA_FILE") {
-            inputs.genome_fasta = fs::read_to_string(&path)
-                .map_err(|err| format!("genome_fasta_read_failed:{path}:{err}"))?;
+            inputs.genome_fasta = read_utf8_text(Path::new(&path), "genome_fasta")?;
         }
         Ok(inputs)
     }
+}
+
+fn read_utf8_text(path: &Path, label: &str) -> Result<String, String> {
+    let text = fs::read_to_string(path)
+        .map_err(|err| format!("{label}_read_failed:{}:{err}", path.display()))?;
+    Ok(text.trim_start_matches('\u{feff}').to_string())
 }
 
 pub fn run_dev_smoke() -> Result<EndToEndReport, String> {
