@@ -22,16 +22,23 @@
 /acceptance_artifacts/
 /acceptance_artifacts_phase_0_2/
 /acceptance_artifacts_phase_0_3/
+/acceptance_artifacts_phase_0_4/
 /ACCEPTANCE_REPORT.md
 /PHASE_0_2_ACCEPTANCE_REPORT.md
 /PHASE_0_3_ACCEPTANCE_REPORT.md
+/PHASE_0_4_ACCEPTANCE_REPORT.md
 /GENOLIGAND_CANDIDATE_REPORT.md
 /reports/
 /coverage/
 /tmp/
 /temp/
 /.cache/
+/.pytest_cache/
 /goal/
+/.phase_0_4_env/
+/.phase_0_4_tools/
+/data/external_phase_0_4/
+/outputs/phase_0_4/
 
 # Logs and runtime dumps
 *.log

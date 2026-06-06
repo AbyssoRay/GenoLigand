@@ -22,6 +22,7 @@ dependencies = [
  "gls-patch-realizer",
  "gls-plm-gate",
  "gls-report",
+ "gls-sequence",
  "gls-shortcircuit",
  "gls-stats",
  "gls-tolerance-calib",
@@ -119,6 +120,10 @@ version = "0.1.0"
 dependencies = [
  "gls-types",
 ]
+
+[[package]]
+name = "gls-sequence"
+version = "0.1.0"
 
 [[package]]
 name = "gls-shortcircuit"

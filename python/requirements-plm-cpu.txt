@@ -1,0 +1,4 @@
+torch
+fair-esm
+numpy
+pytest

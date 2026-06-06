@@ -17,6 +17,7 @@ gls-ligand = { path = "../gls-ligand" }
 gls-patch-realizer = { path = "../gls-patch-realizer" }
 gls-plm-gate = { path = "../gls-plm-gate" }
 gls-report = { path = "../gls-report" }
+gls-sequence = { path = "../gls-sequence" }
 gls-shortcircuit = { path = "../gls-shortcircuit" }
 gls-stats = { path = "../gls-stats" }
 gls-tolerance-calib = { path = "../gls-tolerance-calib" }

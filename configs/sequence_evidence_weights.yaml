@@ -1,0 +1,8 @@
+context_prior: 0.20
+protein_like: 0.20
+complexity: 0.15
+length_suitability: 0.10
+similarity_support: 0.20
+novelty_balance: 0.10
+plm_embedding_quality: 0.05
+risk_penalty: 1.00

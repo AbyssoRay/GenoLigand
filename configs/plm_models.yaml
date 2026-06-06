@@ -1,0 +1,21 @@
+models:
+  esm2_t6_8M_UR50D:
+    backend: "esm2_fair"
+    model_source: "facebookresearch/esm"
+    model_id: "esm2_t6_8M_UR50D"
+    repr_layer: "final"
+    embedding_include: ["mean"]
+    default_device: "auto"
+    dtype: "float32"
+    sequence_max_length: 1022
+    license_note: "ESM model resources are downloaded at acceptance time and recorded in external_resource_manifest.tsv."
+  fixture_mock:
+    backend: "fixture_mock"
+    model_source: "deterministic_local_fixture"
+    model_id: "fixture_mock_64"
+    repr_layer: "none"
+    embedding_include: ["mean"]
+    default_device: "cpu"
+    dtype: "float32"
+    sequence_max_length: 4096
+    license_note: "Local deterministic mock vectors for reproducibility controls only."

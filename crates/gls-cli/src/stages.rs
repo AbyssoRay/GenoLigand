@@ -2,6 +2,10 @@ use gls_fixtures::dev_fixture_manifest;
 use gls_fragment::information_content;
 use gls_genome::{parse_fasta, reverse_complement};
 use gls_ligand::LigandSpec;
+use gls_sequence::{
+    SequenceEvidenceWeights, candidate_fasta_header, canonical_sequence, fmt_f64 as seq_fmt_f64,
+    score_sequence_evidence, sequence_features, sha256_hex,
+};
 use gls_shortcircuit::{amino_acid_entropy, low_complexity_score, repeat_fraction};
 use gls_stats::{BackgroundModel, benjamini_hochberg};
 use gls_tolerance_calib::{CalibrationConfig, calibrate_tolerances};
@@ -272,6 +276,75 @@ const COOCCUR_HEADERS: &[&str] = &[
     "cooccurrence_reason",
 ];
 
+const SEQUENCE_CANDIDATE_HEADERS: &[&str] = &[
+    "candidate_id",
+    "orf_id",
+    "fragment_ids",
+    "context_class",
+    "genomic_locus",
+    "strand",
+    "frame",
+    "nt_start",
+    "nt_end",
+    "aa_length",
+    "aa_sequence",
+    "aa_sequence_sha256",
+    "phase_0_3_rank",
+    "phase_0_3_score",
+    "low_complexity_precheck",
+    "export_status",
+    "export_notes",
+];
+
+const SEQUENCE_FEATURE_HEADERS: &[&str] = &[
+    "candidate_id",
+    "aa_length",
+    "aa_valid",
+    "noncanonical_aa_count",
+    "noncanonical_aa_positions",
+    "stop_count",
+    "molecular_weight",
+    "aa_entropy",
+    "low_complexity_score",
+    "max_homopolymer_run",
+    "acidic_fraction",
+    "basic_fraction",
+    "charged_fraction",
+    "polar_fraction",
+    "hydrophobic_fraction",
+    "aromatic_fraction",
+    "glycine_fraction",
+    "proline_fraction",
+    "cysteine_count",
+    "net_charge_approx_pH7",
+    "mean_kd_hydropathy",
+    "max_kd_window_9",
+    "max_kd_window_19",
+    "tm_like_hydrophobic_run_flag",
+    "signal_peptide_heuristic_flag",
+    "disorder_heuristic_score",
+    "sequence_risk_flags",
+    "feature_version",
+    "feature_config_sha256",
+];
+
+const SEQUENCE_EVIDENCE_HEADERS: &[&str] = &[
+    "candidate_id",
+    "context_class",
+    "phase_0_3_score",
+    "protein_like_score",
+    "complexity_score",
+    "length_suitability_score",
+    "similarity_support_score",
+    "novelty_balance_score",
+    "plm_embedding_quality_score",
+    "risk_penalty",
+    "sequence_evidence_score",
+    "sequence_evidence_rank",
+    "sequence_evidence_flags",
+    "score_config_sha256",
+];
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SearchOptions {
     pub genome: PathBuf,
@@ -374,6 +447,43 @@ pub struct ReportCandidateOptions {
     pub context: PathBuf,
     pub cooccur: PathBuf,
     pub gate: PathBuf,
+    pub evidence: PathBuf,
+    pub out: PathBuf,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SequenceExportOptions {
+    pub orfs: PathBuf,
+    pub context: PathBuf,
+    pub cooccur: PathBuf,
+    pub gate: PathBuf,
+    pub out_fasta: PathBuf,
+    pub out_tsv: PathBuf,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SequenceFeaturesOptions {
+    pub candidates: PathBuf,
+    pub config: PathBuf,
+    pub out: PathBuf,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SequenceScoreOptions {
+    pub candidates: PathBuf,
+    pub features: PathBuf,
+    pub embeddings: PathBuf,
+    pub similarity: PathBuf,
+    pub weights: PathBuf,
+    pub out: PathBuf,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ReportPhase04Options {
+    pub candidates: PathBuf,
+    pub features: PathBuf,
+    pub embeddings: PathBuf,
+    pub similarity: PathBuf,
     pub evidence: PathBuf,
     pub out: PathBuf,
 }
@@ -755,6 +865,340 @@ pub fn run_report_candidate(options: &ReportCandidateOptions) -> Result<usize, S
     let markdown = render_phase_0_3_candidate_report(&inputs, &evidence);
     write_text(&options.out, &markdown)?;
     Ok(inputs.cooccur.len())
+}
+
+pub fn run_sequence_export_fasta(options: &SequenceExportOptions) -> Result<usize, String> {
+    let orfs = read_tsv(&options.orfs)?;
+    let context = read_tsv(&options.context)?;
+    let cooccur = read_tsv(&options.cooccur)?;
+    let gate = read_tsv(&options.gate)?;
+    let context_by_orf = context
+        .iter()
+        .map(|row| (required(row, "parent_orf_id").to_string(), row.clone()))
+        .collect::<BTreeMap<_, _>>();
+    let cooccur_by_orf = cooccur
+        .iter()
+        .map(|row| (required(row, "parent_orf_id").to_string(), row.clone()))
+        .collect::<BTreeMap<_, _>>();
+    let gate_by_candidate = gate
+        .iter()
+        .map(|row| (required(row, "candidate_id").to_string(), row.clone()))
+        .collect::<BTreeMap<_, _>>();
+    let mut rows = Vec::new();
+    for orf in &orfs {
+        let candidate_id = required(orf, "candidate_id");
+        let parent_orf = required(orf, "parent_orf_id");
+        let context_row = context_by_orf.get(parent_orf);
+        let cooccur_row = cooccur_by_orf.get(parent_orf);
+        let gate_row = gate_by_candidate.get(candidate_id);
+        rows.push(sequence_candidate_row(SequenceCandidateInput {
+            candidate_id,
+            parent_orf,
+            sequence: required(orf, "parent_sequence"),
+            orf,
+            context: context_row,
+            cooccur: cooccur_row,
+            gate: gate_row,
+            export_note_prefix: "phase_0_3_orf_export",
+        }));
+    }
+    append_phase_0_4_controls(&mut rows);
+    rows.sort_by(|left, right| {
+        let left_status = required(left, "export_status");
+        let right_status = required(right, "export_status");
+        left_status
+            .cmp(right_status)
+            .then_with(|| required(left, "candidate_id").cmp(required(right, "candidate_id")))
+    });
+    write_tsv(&options.out_tsv, SEQUENCE_CANDIDATE_HEADERS, &rows)?;
+    let mut fasta = String::new();
+    for row in &rows {
+        let source = if required(row, "export_status").contains("control") {
+            "phase_0_4_control"
+        } else {
+            "phase_0_3_candidate"
+        };
+        fasta.push_str(&candidate_fasta_header(
+            required(row, "candidate_id"),
+            required(row, "context_class"),
+            parse_usize(required(row, "aa_length")),
+            source,
+        ));
+        fasta.push('\n');
+        fasta.push_str(required(row, "aa_sequence"));
+        fasta.push('\n');
+    }
+    write_text(&options.out_fasta, &fasta)?;
+    Ok(rows.len())
+}
+
+pub fn run_sequence_features(options: &SequenceFeaturesOptions) -> Result<usize, String> {
+    let config_text = read_text(&options.config, "sequence_feature_config")?;
+    let config_hash = sha256_hex(config_text.as_bytes());
+    let candidates = read_tsv(&options.candidates)?;
+    let rows = candidates
+        .iter()
+        .map(|candidate| {
+            let features = sequence_features(
+                required(candidate, "aa_sequence"),
+                required(candidate, "context_class"),
+                required(candidate, "export_status"),
+            );
+            let mut row = Row::new();
+            set(
+                &mut row,
+                "candidate_id",
+                required(candidate, "candidate_id"),
+            );
+            set(&mut row, "aa_length", features.aa_length.to_string());
+            set(&mut row, "aa_valid", features.aa_valid.to_string());
+            set(
+                &mut row,
+                "noncanonical_aa_count",
+                features.noncanonical_aa_count.to_string(),
+            );
+            set(
+                &mut row,
+                "noncanonical_aa_positions",
+                features.noncanonical_aa_positions,
+            );
+            set(&mut row, "stop_count", features.stop_count.to_string());
+            set(
+                &mut row,
+                "molecular_weight",
+                seq_fmt_f64(features.molecular_weight),
+            );
+            set(&mut row, "aa_entropy", seq_fmt_f64(features.aa_entropy));
+            set(
+                &mut row,
+                "low_complexity_score",
+                seq_fmt_f64(features.low_complexity_score),
+            );
+            set(
+                &mut row,
+                "max_homopolymer_run",
+                features.max_homopolymer_run.to_string(),
+            );
+            set(
+                &mut row,
+                "acidic_fraction",
+                seq_fmt_f64(features.acidic_fraction),
+            );
+            set(
+                &mut row,
+                "basic_fraction",
+                seq_fmt_f64(features.basic_fraction),
+            );
+            set(
+                &mut row,
+                "charged_fraction",
+                seq_fmt_f64(features.charged_fraction),
+            );
+            set(
+                &mut row,
+                "polar_fraction",
+                seq_fmt_f64(features.polar_fraction),
+            );
+            set(
+                &mut row,
+                "hydrophobic_fraction",
+                seq_fmt_f64(features.hydrophobic_fraction),
+            );
+            set(
+                &mut row,
+                "aromatic_fraction",
+                seq_fmt_f64(features.aromatic_fraction),
+            );
+            set(
+                &mut row,
+                "glycine_fraction",
+                seq_fmt_f64(features.glycine_fraction),
+            );
+            set(
+                &mut row,
+                "proline_fraction",
+                seq_fmt_f64(features.proline_fraction),
+            );
+            set(
+                &mut row,
+                "cysteine_count",
+                features.cysteine_count.to_string(),
+            );
+            set(
+                &mut row,
+                "net_charge_approx_pH7",
+                seq_fmt_f64(features.net_charge_approx_ph7),
+            );
+            set(
+                &mut row,
+                "mean_kd_hydropathy",
+                seq_fmt_f64(features.mean_kd_hydropathy),
+            );
+            set(
+                &mut row,
+                "max_kd_window_9",
+                seq_fmt_f64(features.max_kd_window_9),
+            );
+            set(
+                &mut row,
+                "max_kd_window_19",
+                seq_fmt_f64(features.max_kd_window_19),
+            );
+            set(
+                &mut row,
+                "tm_like_hydrophobic_run_flag",
+                features.tm_like_hydrophobic_run_flag.to_string(),
+            );
+            set(
+                &mut row,
+                "signal_peptide_heuristic_flag",
+                features.signal_peptide_heuristic_flag.to_string(),
+            );
+            set(
+                &mut row,
+                "disorder_heuristic_score",
+                seq_fmt_f64(features.disorder_heuristic_score),
+            );
+            set(
+                &mut row,
+                "sequence_risk_flags",
+                features.sequence_risk_flags.join(";"),
+            );
+            set(
+                &mut row,
+                "feature_version",
+                "phase_0_4_sequence_features_v1",
+            );
+            set(&mut row, "feature_config_sha256", &config_hash);
+            row
+        })
+        .collect::<Vec<_>>();
+    write_tsv(&options.out, SEQUENCE_FEATURE_HEADERS, &rows)?;
+    Ok(rows.len())
+}
+
+pub fn run_sequence_score(options: &SequenceScoreOptions) -> Result<usize, String> {
+    let weight_text = read_text(&options.weights, "sequence_evidence_weights")?;
+    let weights = parse_sequence_evidence_weights(&weight_text);
+    let weight_hash = sha256_hex(weight_text.as_bytes());
+    let candidates = read_tsv(&options.candidates)?;
+    let features = read_tsv(&options.features)?;
+    let embeddings = read_tsv(&options.embeddings)?;
+    let similarity = read_tsv(&options.similarity)?;
+    let features_by_candidate = row_by_candidate(&features);
+    let embeddings_by_candidate = row_by_candidate(&embeddings);
+    let similarity_by_candidate = row_by_candidate(&similarity);
+    let mut rows = Vec::new();
+    for candidate in &candidates {
+        let candidate_id = required(candidate, "candidate_id");
+        let Some(feature_row) = features_by_candidate.get(candidate_id) else {
+            return Err(format!("sequence_score_missing_features:{candidate_id}"));
+        };
+        let features = sequence_features(
+            required(candidate, "aa_sequence"),
+            required(candidate, "context_class"),
+            required(candidate, "export_status"),
+        );
+        let similarity_row = similarity_by_candidate.get(candidate_id);
+        let embedding_row = embeddings_by_candidate.get(candidate_id);
+        let similarity_support = similarity_support_score(candidate, similarity_row);
+        let novelty = novelty_balance_score(candidate, similarity_row);
+        let plm_quality = plm_quality_score(embedding_row);
+        let score = score_sequence_evidence(
+            required(candidate, "context_class"),
+            parse_f64(required(candidate, "phase_0_3_score")),
+            &features,
+            similarity_support,
+            novelty,
+            plm_quality,
+            &weights,
+        );
+        let mut row = Row::new();
+        set(&mut row, "candidate_id", candidate_id);
+        set(
+            &mut row,
+            "context_class",
+            required(candidate, "context_class"),
+        );
+        set(
+            &mut row,
+            "phase_0_3_score",
+            required(candidate, "phase_0_3_score"),
+        );
+        set(
+            &mut row,
+            "protein_like_score",
+            seq_fmt_f64(score.protein_like_score),
+        );
+        set(
+            &mut row,
+            "complexity_score",
+            seq_fmt_f64(score.complexity_score),
+        );
+        set(
+            &mut row,
+            "length_suitability_score",
+            seq_fmt_f64(score.length_suitability_score),
+        );
+        set(
+            &mut row,
+            "similarity_support_score",
+            seq_fmt_f64(score.similarity_support_score),
+        );
+        set(
+            &mut row,
+            "novelty_balance_score",
+            seq_fmt_f64(score.novelty_balance_score),
+        );
+        set(
+            &mut row,
+            "plm_embedding_quality_score",
+            seq_fmt_f64(score.plm_embedding_quality_score),
+        );
+        set(&mut row, "risk_penalty", seq_fmt_f64(score.risk_penalty));
+        set(
+            &mut row,
+            "sequence_evidence_score",
+            seq_fmt_f64(score.sequence_evidence_score),
+        );
+        set(&mut row, "sequence_evidence_rank", "0");
+        let mut flags = score.flags;
+        if !required(feature_row, "sequence_risk_flags").is_empty() {
+            flags.extend(
+                required(feature_row, "sequence_risk_flags")
+                    .split(';')
+                    .filter(|flag| !flag.is_empty())
+                    .map(ToOwned::to_owned),
+            );
+        }
+        flags.sort();
+        flags.dedup();
+        set(&mut row, "sequence_evidence_flags", flags.join(";"));
+        set(&mut row, "score_config_sha256", &weight_hash);
+        rows.push(row);
+    }
+    rows.sort_by(|left, right| {
+        parse_f64(required(right, "sequence_evidence_score"))
+            .total_cmp(&parse_f64(required(left, "sequence_evidence_score")))
+            .then_with(|| required(left, "candidate_id").cmp(required(right, "candidate_id")))
+    });
+    for (index, row) in rows.iter_mut().enumerate() {
+        set(row, "sequence_evidence_rank", (index + 1).to_string());
+    }
+    write_tsv(&options.out, SEQUENCE_EVIDENCE_HEADERS, &rows)?;
+    Ok(rows.len())
+}
+
+pub fn run_report_phase_0_4(options: &ReportPhase04Options) -> Result<usize, String> {
+    let candidates = read_tsv(&options.candidates)?;
+    let features = read_tsv(&options.features)?;
+    let embeddings = read_tsv(&options.embeddings)?;
+    let similarity = read_tsv(&options.similarity)?;
+    let evidence = read_tsv(&options.evidence)?;
+    let markdown =
+        render_phase_0_4_report(&candidates, &features, &embeddings, &similarity, &evidence);
+    write_text(&options.out, &markdown)?;
+    Ok(evidence.len())
 }
 
 pub fn run_validate(options: &ValidateOptions) -> Result<String, String> {
@@ -1933,6 +2377,437 @@ fn render_phase_0_3_candidate_report(inputs: &ReportInputs, evidence: &[Row]) ->
 
 fn caution_statement_phase_0_3() -> &'static str {
     "\u{8fd9}\u{4e9b}\u{5019}\u{9009}\u{4ec5}\u{4e3a}\u{8ba1}\u{7b97}\u{751f}\u{6210}\u{7684}\u{9776}\u{70b9}\u{5047}\u{8bbe}\u{ff1b}\u{672a}\u{6ce8}\u{91ca} ORF \u{5019}\u{9009}\u{4e0d}\u{80fd}\u{88ab}\u{89e3}\u{91ca}\u{4e3a}\u{5df2}\u{8bc1}\u{5b9e}\u{86cb}\u{767d}\u{ff1b}\u{7f3a}\u{5c11}\u{8f6c}\u{5f55}\u{3001}\u{7ffb}\u{8bd1}\u{6216}\u{86cb}\u{767d}\u{8d28}\u{7ec4}\u{8bc1}\u{636e}\u{65f6}\u{ff0c}\u{5e94}\u{8fdb}\u{5165}\u{63a2}\u{7d22}\u{961f}\u{5217}\u{800c}\u{4e0d}\u{662f}\u{9ad8}\u{7f6e}\u{4fe1}\u{961f}\u{5217}\u{3002}"
+}
+
+struct SequenceCandidateInput<'a> {
+    candidate_id: &'a str,
+    parent_orf: &'a str,
+    sequence: &'a str,
+    orf: &'a Row,
+    context: Option<&'a Row>,
+    cooccur: Option<&'a Row>,
+    gate: Option<&'a Row>,
+    export_note_prefix: &'a str,
+}
+
+fn sequence_candidate_row(input: SequenceCandidateInput<'_>) -> Row {
+    let aa_sequence = canonical_sequence(input.sequence);
+    let context_class = input
+        .context
+        .map_or("missing_context", |row| required(row, "context_class"));
+    let risk_flags = input.gate.map_or("", |row| required(row, "risk_flags"));
+    let decision = input
+        .gate
+        .map_or("missing_gate", |row| required(row, "decision"));
+    let export_status = if context_class.contains("DECOY")
+        || context_class.contains("decoy")
+        || risk_flags.contains("low_information_background")
+    {
+        "control_sequence"
+    } else if decision == "pass_plm" || decision == "exploration_queue" {
+        "exported_candidate"
+    } else {
+        "filtered_phase_0_3_control"
+    };
+    let mut row = Row::new();
+    set(&mut row, "candidate_id", input.candidate_id);
+    set(&mut row, "orf_id", input.parent_orf);
+    set(
+        &mut row,
+        "fragment_ids",
+        input
+            .cooccur
+            .map(|row| required(row, "fragment_ids"))
+            .filter(|value| !value.is_empty())
+            .unwrap_or_else(|| required(input.orf, "fragment_id")),
+    );
+    set(&mut row, "context_class", context_class);
+    set(
+        &mut row,
+        "genomic_locus",
+        format!(
+            "{}:{}-{}",
+            required(input.orf, "chrom"),
+            required(input.orf, "start"),
+            required(input.orf, "end")
+        ),
+    );
+    set(&mut row, "strand", required(input.orf, "strand"));
+    set(&mut row, "frame", required(input.orf, "frame"));
+    set(&mut row, "nt_start", required(input.orf, "orf_nt_start"));
+    set(&mut row, "nt_end", required(input.orf, "orf_nt_end"));
+    set(&mut row, "aa_length", aa_sequence.len().to_string());
+    set(&mut row, "aa_sequence", &aa_sequence);
+    set(
+        &mut row,
+        "aa_sequence_sha256",
+        sha256_hex(aa_sequence.as_bytes()),
+    );
+    set(
+        &mut row,
+        "phase_0_3_rank",
+        input
+            .cooccur
+            .map_or("0", |row| required(row, "cooccurrence_rank")),
+    );
+    set(
+        &mut row,
+        "phase_0_3_score",
+        input
+            .cooccur
+            .map(|row| required(row, "cooccurrence_score"))
+            .filter(|value| !value.is_empty())
+            .unwrap_or("0"),
+    );
+    set(
+        &mut row,
+        "low_complexity_precheck",
+        required(input.orf, "low_complexity_score"),
+    );
+    set(&mut row, "export_status", export_status);
+    set(
+        &mut row,
+        "export_notes",
+        format!(
+            "{};phase_0_3_decision={decision};risk_flags={risk_flags}",
+            input.export_note_prefix
+        ),
+    );
+    row
+}
+
+fn append_phase_0_4_controls(rows: &mut Vec<Row>) {
+    let Some(template) = rows
+        .iter()
+        .filter(|row| required(row, "export_status") == "exported_candidate")
+        .max_by(|left, right| {
+            parse_f64(required(left, "phase_0_3_score"))
+                .total_cmp(&parse_f64(required(right, "phase_0_3_score")))
+        })
+        .cloned()
+    else {
+        return;
+    };
+    let base_id = stable_label(required(&template, "candidate_id"));
+    let base_sequence = required(&template, "aa_sequence");
+    let shuffled = deterministic_composition_shuffle(base_sequence);
+    let reversed = base_sequence.chars().rev().collect::<String>();
+    let random =
+        deterministic_random_sequence(base_sequence.len(), &sha256_hex(base_sequence.as_bytes()));
+    rows.push(control_sequence_row(
+        &template,
+        &format!("p04_d3_shuffled_{base_id}"),
+        "D3_shuffled_sequence_control",
+        &shuffled,
+        "D3 shuffled composition-preserving sequence control",
+    ));
+    rows.push(control_sequence_row(
+        &template,
+        &format!("p04_d4_reversed_{base_id}"),
+        "D4_reversed_sequence_control",
+        &reversed,
+        "D4 reversed sequence control",
+    ));
+    rows.push(control_sequence_row(
+        &template,
+        "p04_d5_random_matched_length_001",
+        "D5_seeded_random_sequence_control",
+        &random,
+        "D5 seeded random matched-length sequence control",
+    ));
+}
+
+fn control_sequence_row(
+    template: &Row,
+    candidate_id: &str,
+    context_class: &str,
+    sequence: &str,
+    notes: &str,
+) -> Row {
+    let aa_sequence = canonical_sequence(sequence);
+    let mut row = template.clone();
+    set(&mut row, "candidate_id", candidate_id);
+    set(
+        &mut row,
+        "orf_id",
+        format!("control_from:{}", required(template, "orf_id")),
+    );
+    set(&mut row, "context_class", context_class);
+    set(&mut row, "aa_length", aa_sequence.len().to_string());
+    set(&mut row, "aa_sequence", &aa_sequence);
+    set(
+        &mut row,
+        "aa_sequence_sha256",
+        sha256_hex(aa_sequence.as_bytes()),
+    );
+    set(&mut row, "phase_0_3_rank", "control");
+    set(&mut row, "phase_0_3_score", "0");
+    set(&mut row, "export_status", "control_sequence");
+    set(
+        &mut row,
+        "export_notes",
+        format!("{notes};excluded_from_biological_discovery_interpretation"),
+    );
+    row
+}
+
+fn deterministic_composition_shuffle(sequence: &str) -> String {
+    let chars = sequence.chars().collect::<Vec<_>>();
+    let mut shuffled = chars
+        .iter()
+        .skip(1)
+        .step_by(2)
+        .chain(chars.iter().step_by(2))
+        .copied()
+        .collect::<String>();
+    if shuffled == sequence && shuffled.len() > 1 {
+        shuffled = shuffled.chars().rev().collect();
+    }
+    shuffled
+}
+
+fn deterministic_random_sequence(length: usize, seed_hex: &str) -> String {
+    const AAS: &[u8] = b"ACDEFGHIKLMNPQRSTVWY";
+    let mut state = u64::from_str_radix(seed_hex.get(..16).unwrap_or("3407"), 16).unwrap_or(3407);
+    let mut output = String::new();
+    for _ in 0..length.max(1) {
+        state = state
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
+        output.push(AAS[(state as usize) % AAS.len()] as char);
+    }
+    output
+}
+
+fn parse_sequence_evidence_weights(text: &str) -> SequenceEvidenceWeights {
+    let defaults = SequenceEvidenceWeights::default();
+    SequenceEvidenceWeights {
+        context_prior: config_f64(text, "context_prior", defaults.context_prior),
+        protein_like: config_f64(text, "protein_like", defaults.protein_like),
+        complexity: config_f64(text, "complexity", defaults.complexity),
+        length_suitability: config_f64(text, "length_suitability", defaults.length_suitability),
+        similarity_support: config_f64(text, "similarity_support", defaults.similarity_support),
+        novelty_balance: config_f64(text, "novelty_balance", defaults.novelty_balance),
+        plm_embedding_quality: config_f64(
+            text,
+            "plm_embedding_quality",
+            defaults.plm_embedding_quality,
+        ),
+        risk_penalty: config_f64(text, "risk_penalty", defaults.risk_penalty),
+    }
+}
+
+fn config_f64(text: &str, key: &str, default: f64) -> f64 {
+    text.lines()
+        .find_map(|line| {
+            let trimmed = line.trim();
+            let (left, right) = trimmed.split_once(':')?;
+            (left.trim() == key).then(|| parse_f64(right.trim().trim_matches('"')))
+        })
+        .unwrap_or(default)
+}
+
+fn row_by_candidate(rows: &[Row]) -> BTreeMap<String, &Row> {
+    rows.iter()
+        .map(|row| (required(row, "candidate_id").to_string(), row))
+        .collect()
+}
+
+fn similarity_support_score(candidate: &Row, row: Option<&&Row>) -> f64 {
+    if required(candidate, "export_status").contains("control") {
+        return 0.0;
+    }
+    let Some(row) = row else {
+        return 0.0;
+    };
+    if required(row, "reviewed_hit_present") == "true" {
+        0.85
+    } else if required(row, "known_similarity_flag") == "true" {
+        0.70
+    } else if required(row, "short_sequence_alignment_warning") == "true" {
+        0.45
+    } else {
+        0.25
+    }
+}
+
+fn novelty_balance_score(candidate: &Row, row: Option<&&Row>) -> f64 {
+    if required(candidate, "export_status").contains("control") {
+        return 0.0;
+    }
+    let Some(row) = row else {
+        return 0.25;
+    };
+    let pident = parse_f64(required(row, "best_hit_pident"));
+    let cover = parse_f64(required(row, "best_hit_query_cover"));
+    if pident >= 95.0 && cover >= 0.90 {
+        0.25
+    } else if required(row, "known_similarity_flag") == "true" {
+        0.45
+    } else {
+        0.55
+    }
+}
+
+fn plm_quality_score(row: Option<&&Row>) -> f64 {
+    let Some(row) = row else {
+        return 0.0;
+    };
+    let status = required(row, "plm_status");
+    let backend = required(row, "backend");
+    let dim = parse_usize(required(row, "embedding_dim"));
+    let hash_present = !required(row, "embedding_sha256").is_empty();
+    if status == "success" && backend != "fixture_mock" && dim > 0 && hash_present {
+        1.0
+    } else if status == "success" && backend == "fixture_mock" && dim > 0 && hash_present {
+        0.5
+    } else {
+        0.0
+    }
+}
+
+fn render_phase_0_4_report(
+    candidates: &[Row],
+    features: &[Row],
+    embeddings: &[Row],
+    similarity: &[Row],
+    evidence: &[Row],
+) -> String {
+    let features_by_candidate = row_by_candidate(features);
+    let embeddings_by_candidate = row_by_candidate(embeddings);
+    let similarity_by_candidate = row_by_candidate(similarity);
+    let mut ranked = evidence.iter().collect::<Vec<_>>();
+    ranked.sort_by(|left, right| {
+        parse_usize(required(left, "sequence_evidence_rank"))
+            .cmp(&parse_usize(required(right, "sequence_evidence_rank")))
+    });
+    let real_embedding_rows = embeddings
+        .iter()
+        .filter(|row| {
+            required(row, "backend") != "fixture_mock" && required(row, "plm_status") == "success"
+        })
+        .count();
+    let real_similarity_backend = similarity
+        .iter()
+        .find(|row| required(row, "similarity_backend") != "fixture_mock")
+        .map_or("missing", |row| required(row, "similarity_backend"));
+    let mut text = String::new();
+    text.push_str("# Candidate Report\n\n");
+    text.push_str("## Input Summary\n\n");
+    text.push_str(&format!(
+        "- phase: 0.4\n- candidate/control rows: {}\n- sequence feature rows: {}\n- embedding manifest rows: {}\n- similarity summary rows: {}\n- sequence evidence rows: {}\n\n",
+        candidates.len(),
+        features.len(),
+        embeddings.len(),
+        similarity.len(),
+        evidence.len()
+    ));
+    text.push_str("## Sequence Evidence Summary\n\n");
+    text.push_str("| rank | candidate_id | context_class | sequence_evidence_score | flags |\n");
+    text.push_str("| --- | --- | --- | --- | --- |\n");
+    for row in ranked.iter().take(12) {
+        text.push_str(&format!(
+            "| {} | {} | {} | {} | {} |\n",
+            required(row, "sequence_evidence_rank"),
+            required(row, "candidate_id"),
+            required(row, "context_class"),
+            required(row, "sequence_evidence_score"),
+            required(row, "sequence_evidence_flags")
+        ));
+    }
+    text.push('\n');
+    text.push_str("## pLM Embedding Summary\n\n");
+    text.push_str(&format!(
+        "- real_embedding_success_rows: {}\n- backends: {}\n- devices: {}\n\n",
+        real_embedding_rows,
+        distinct_join(embeddings.iter().map(|row| required(row, "backend"))),
+        distinct_join(
+            embeddings
+                .iter()
+                .map(|row| required(row, "device_resolved"))
+        )
+    ));
+    text.push_str("## Similarity Search Summary\n\n");
+    text.push_str(&format!(
+        "- similarity_backend: {}\n- reviewed_hit_rows: {}\n- short_sequence_warning_rows: {}\n\n",
+        real_similarity_backend,
+        similarity
+            .iter()
+            .filter(|row| required(row, "reviewed_hit_present") == "true")
+            .count(),
+        similarity
+            .iter()
+            .filter(|row| required(row, "short_sequence_alignment_warning") == "true")
+            .count()
+    ));
+    text.push_str("## Sequence Risk Flags\n\n");
+    for row in candidates {
+        let feature = features_by_candidate.get(required(row, "candidate_id"));
+        text.push_str(&format!(
+            "- {}: export_status={} feature_flags={} notes={}\n",
+            required(row, "candidate_id"),
+            required(row, "export_status"),
+            feature.map_or("", |row| required(row, "sequence_risk_flags")),
+            required(row, "export_notes")
+        ));
+    }
+    text.push('\n');
+    text.push_str("## Sequence Evidence Ranking Table\n\n");
+    text.push_str("| rank | candidate_id | context_class | phase_0_3_score | sequence_evidence_score | aa_length | low_complexity_score | best_hit_accession | best_hit_evalue | plm_backend | plm_status | sequence_risk_flags | interpretation |\n");
+    text.push_str(
+        "| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |\n",
+    );
+    for row in &ranked {
+        let candidate_id = required(row, "candidate_id");
+        let feature = features_by_candidate.get(candidate_id);
+        let embedding = embeddings_by_candidate.get(candidate_id);
+        let sim = similarity_by_candidate.get(candidate_id);
+        let interpretation = if candidate_id.contains("_d")
+            || required(row, "sequence_evidence_flags").contains("control")
+        {
+            "control_not_biological_discovery"
+        } else {
+            "candidate_prioritization_only"
+        };
+        text.push_str(&format!(
+            "| {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} |\n",
+            required(row, "sequence_evidence_rank"),
+            candidate_id,
+            required(row, "context_class"),
+            required(row, "phase_0_3_score"),
+            required(row, "sequence_evidence_score"),
+            feature.map_or("", |row| required(row, "aa_length")),
+            feature.map_or("", |row| required(row, "low_complexity_score")),
+            sim.map_or("", |row| required(row, "best_hit_accession")),
+            sim.map_or("", |row| required(row, "best_hit_evalue")),
+            embedding.map_or("", |row| required(row, "backend")),
+            embedding.map_or("", |row| required(row, "plm_status")),
+            required(row, "sequence_evidence_flags"),
+            interpretation
+        ));
+    }
+    text.push('\n');
+    text.push_str("## Sequence Evidence Controls\n\n");
+    for id in [
+        "p03_d1_low_complexity_001",
+        "p03_d2_background_001",
+        "p04_d3",
+        "p04_d4",
+        "p04_d5",
+    ] {
+        let present = candidates
+            .iter()
+            .any(|row| required(row, "candidate_id").contains(id));
+        text.push_str(&format!("- {id}: present={present}\n"));
+    }
+    text.push('\n');
+    text.push_str("## CUDA / Device Metadata\n\n");
+    text.push_str("- CUDA is optional for Phase 0.4 acceptance; resolved pLM devices are recorded in embedding manifests and acceptance metrics.\n\n");
+    text.push_str("## Phase 0.4 Interpretation Cautions\n\n");
+    text.push_str("Phase 0.4 sequence evidence is an audit and prioritization layer. pLM embeddings, similarity searches, and sequence-derived features are used to flag candidates for downstream structural and experimental evaluation. Synthetic semantic controls are retained for software validation and are not biological discoveries.\n\n");
+    text.push_str("## Reproducibility Metadata\n\n");
+    text.push_str("- report_schema: phase_0_4_sequence_evidence_report_v1\n- generated_by: gls-cli report phase-0-4\n");
+    text
 }
 
 fn stats_preliminary_row(row: &Row, background: &BackgroundModel) -> Result<Row, String> {

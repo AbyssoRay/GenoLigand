@@ -63,6 +63,30 @@ nextflow run workflows/phase_0_3.nf -profile dev_cpu_smoke
 nextflow run workflows/phase_0_3.nf -profile dev_cpu_smoke -resume
 ```
 
+## Phase 0.4 Sequence Evidence
+
+Phase 0.4 adds a sequence evidence layer for Phase 0.3 candidate ORFs. It exports candidate/control FASTA, computes deterministic sequence features, embeds sequences with the real `esm2_t6_8M_UR50D` fair-esm backend, runs real Swiss-Prot similarity through DIAMOND, scores sequence evidence, and writes a candidate report with explicit caution text. The fixture/mock path remains available only for deterministic workflow checks; final acceptance requires real pLM and real similarity resources.
+
+Local environments, model weights, databases, and acceptance archives stay in ignored project directories such as `.phase_0_4_env/`, `.phase_0_4_tools/`, `data/external_phase_0_4/`, and `acceptance_artifacts_phase_0_4/`.
+
+Useful Phase 0.4 commands:
+
+```powershell
+gls-cli sequence export-fasta --orfs orf_extensions.tsv --context context.tsv --cooccur cooccurrence.tsv --gate orf_gate.tsv --out-fasta candidate_orfs.fasta --out-tsv candidate_orfs.tsv
+gls-cli sequence features --candidates candidate_orfs.tsv --config configs/phase_0_4.yaml --out sequence_features.tsv
+python -m geno_plm.cli diagnose-device --out cuda_env.json
+python -m geno_plm.cli embed --input-fasta candidate_orfs.fasta --output-dir plm_embeddings --backend esm2_fair --model-id esm2_t6_8M_UR50D --device cpu --metadata plm_embeddings/embedding_metadata.json
+gls-cli sequence score --candidates candidate_orfs.tsv --features sequence_features.tsv --embeddings plm_embeddings/embedding_manifest.tsv --similarity similarity_summary.tsv --weights configs/sequence_evidence_weights.yaml --out sequence_evidence.tsv
+gls-cli report phase-0-4 --candidates candidate_orfs.tsv --features sequence_features.tsv --embeddings plm_embeddings/embedding_manifest.tsv --similarity similarity_summary.tsv --evidence sequence_evidence.tsv --out candidate_report_phase_0_4.md
+```
+
+Reproducible mock workflow:
+
+```powershell
+nextflow run workflows/phase_0_4_sequence_evidence.nf -profile mock
+nextflow run workflows/phase_0_4_sequence_evidence.nf -profile mock -resume
+```
+
 ## License
 
 GenoLigand is distributed under the project EULA in `EULA.txt`.

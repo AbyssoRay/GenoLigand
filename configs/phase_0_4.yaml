@@ -1,0 +1,25 @@
+phase: "0.4"
+seed: 3407
+candidate_export:
+  include_phase_0_3_decoys_as_controls: true
+  generate_controls: ["D3_shuffled", "D4_reversed", "D5_seeded_random"]
+sequence_features:
+  entropy_windows: [6, 8, 12]
+  low_complexity_flag_threshold: 0.70
+  homopolymer_flag_threshold: 6
+  tm_kd_window_19_threshold: 1.60
+  tm_hydrophobic_run_threshold: 14
+plm:
+  backend: "esm2_fair"
+  model_id: "esm2_t6_8M_UR50D"
+  device: "auto"
+  dtype: "float32"
+  repr_layer: "final"
+  pooling: "mean"
+  toks_per_batch: 4096
+  sequence_max_length: 1022
+  allow_cpu_fallback: true
+similarity:
+  backend_preference: ["diamond", "blastp"]
+  database: "uniprot_swissprot_reviewed"
+  short_sequence_warning_length: 30

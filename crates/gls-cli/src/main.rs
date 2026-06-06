@@ -1,11 +1,13 @@
 use gls_cli::stages::{
     ClassifyLociOptions, CooccurScoreOptions, DockOptions, FoldgateOptions, GatePlmOptions,
     GateShortCircuitOptions, OrfExtendOptions, PatchOptions, PhaseGateShortCircuitOptions,
-    ReportCandidateOptions, ReportMarkdownOptions, SearchOptions, SplitDevSmokeOptions,
+    ReportCandidateOptions, ReportMarkdownOptions, ReportPhase04Options, SearchOptions,
+    SequenceExportOptions, SequenceFeaturesOptions, SequenceScoreOptions, SplitDevSmokeOptions,
     StatsOptions, ValidateKind, ValidateOptions, run_classify_loci, run_cooccur_score, run_dock,
     run_foldgate_realize, run_gate_plm, run_gate_short_circuit, run_gate_short_circuit_phase,
     run_gate_short_circuit_phase_with_evidence, run_orf_extend, run_patch_realize,
-    run_report_candidate, run_report_markdown, run_search_genome, run_split_dev_smoke,
+    run_report_candidate, run_report_markdown, run_report_phase_0_4, run_search_genome,
+    run_sequence_export_fasta, run_sequence_features, run_sequence_score, run_split_dev_smoke,
     run_stats_score, run_validate,
 };
 use gls_cli::{
@@ -67,6 +69,7 @@ fn run_cli(args: &[String]) -> Result<Option<String>, String> {
         "foldgate" => run_foldgate_cli(&args[1..]).map(Some),
         "patch" => run_patch_cli(&args[1..]).map(Some),
         "dock" => run_dock_cli(&args[1..]).map(Some),
+        "sequence" => run_sequence_cli(&args[1..]).map(Some),
         "report" => run_report_cli(&args[1..]).map(Some),
         "validate" => run_validate_cli(&args[1..]).map(Some),
         "--help" | "-h" => Ok(Some(GLOBAL_HELP.to_string())),
@@ -359,11 +362,81 @@ fn run_dock_cli(args: &[String]) -> Result<String, String> {
     }
 }
 
+fn run_sequence_cli(args: &[String]) -> Result<String, String> {
+    if args.is_empty() || is_help(args) {
+        return Ok(SEQUENCE_HELP.to_string());
+    }
+    match args[0].as_str() {
+        "export-fasta" => {
+            if is_help(&args[1..]) {
+                return Ok(SEQUENCE_EXPORT_FASTA_HELP.to_string());
+            }
+            let options = SequenceExportFastaArgs::parse(&args[1..])?;
+            let count = run_sequence_export_fasta(&SequenceExportOptions {
+                orfs: options.orfs,
+                context: options.context,
+                cooccur: options.cooccur,
+                gate: options.gate,
+                out_fasta: options.out_fasta.clone(),
+                out_tsv: options.out_tsv.clone(),
+            })?;
+            Ok(format!(
+                "stage_ok\tstage=sequence export-fasta\trows={count}\tout_fasta={}\tout_tsv={}",
+                options.out_fasta.display(),
+                options.out_tsv.display()
+            ))
+        }
+        "features" => {
+            if is_help(&args[1..]) {
+                return Ok(SEQUENCE_FEATURES_HELP.to_string());
+            }
+            let options = SequenceFeaturesArgs::parse(&args[1..])?;
+            let count = run_sequence_features(&SequenceFeaturesOptions {
+                candidates: options.candidates,
+                config: options.config,
+                out: options.out.clone(),
+            })?;
+            Ok(stage_ok("sequence features", count, &options.out))
+        }
+        "score" => {
+            if is_help(&args[1..]) {
+                return Ok(SEQUENCE_SCORE_HELP.to_string());
+            }
+            let options = SequenceScoreArgs::parse(&args[1..])?;
+            let count = run_sequence_score(&SequenceScoreOptions {
+                candidates: options.candidates,
+                features: options.features,
+                embeddings: options.embeddings,
+                similarity: options.similarity,
+                weights: options.weights,
+                out: options.out.clone(),
+            })?;
+            Ok(stage_ok("sequence score", count, &options.out))
+        }
+        other => Err(format!("unknown_sequence_command:{other}")),
+    }
+}
+
 fn run_report_cli(args: &[String]) -> Result<String, String> {
     if args.is_empty() || is_help(args) {
         return Ok(REPORT_HELP.to_string());
     }
     match args[0].as_str() {
+        "phase-0-4" => {
+            if is_help(&args[1..]) {
+                return Ok(REPORT_PHASE_0_4_HELP.to_string());
+            }
+            let options = ReportPhase04Args::parse(&args[1..])?;
+            let count = run_report_phase_0_4(&ReportPhase04Options {
+                candidates: options.candidates,
+                features: options.features,
+                embeddings: options.embeddings,
+                similarity: options.similarity,
+                evidence: options.evidence,
+                out: options.out.clone(),
+            })?;
+            Ok(stage_ok("report phase-0-4", count, &options.out))
+        }
         "candidate" => {
             if is_help(&args[1..]) {
                 return Ok(REPORT_CANDIDATE_HELP.to_string());
@@ -861,6 +934,156 @@ impl DockRunArgs {
     }
 }
 
+struct SequenceExportFastaArgs {
+    orfs: PathBuf,
+    context: PathBuf,
+    cooccur: PathBuf,
+    gate: PathBuf,
+    out_fasta: PathBuf,
+    out_tsv: PathBuf,
+}
+
+impl SequenceExportFastaArgs {
+    fn parse(args: &[String]) -> Result<Self, String> {
+        let mut orfs = None;
+        let mut context = None;
+        let mut cooccur = None;
+        let mut gate = None;
+        let mut out_fasta = None;
+        let mut out_tsv = None;
+        parse_options(args, |flag, args, index| match flag {
+            "--orfs" | "--orf-extensions" => {
+                orfs = Some(take_path(args, index, flag)?);
+                Ok(())
+            }
+            "--context" => {
+                context = Some(take_path(args, index, flag)?);
+                Ok(())
+            }
+            "--cooccur" | "--cooccurrence" => {
+                cooccur = Some(take_path(args, index, flag)?);
+                Ok(())
+            }
+            "--gate" | "--orf-gate" => {
+                gate = Some(take_path(args, index, flag)?);
+                Ok(())
+            }
+            "--out-fasta" => {
+                out_fasta = Some(take_path(args, index, flag)?);
+                Ok(())
+            }
+            "--out-tsv" => {
+                out_tsv = Some(take_path(args, index, flag)?);
+                Ok(())
+            }
+            other => Err(format!("unknown_sequence_export_fasta_option:{other}")),
+        })?;
+        Ok(Self {
+            orfs: orfs.ok_or_else(|| "missing_required_option:--orfs".to_string())?,
+            context: context.ok_or_else(|| "missing_required_option:--context".to_string())?,
+            cooccur: cooccur.ok_or_else(|| "missing_required_option:--cooccur".to_string())?,
+            gate: gate.ok_or_else(|| "missing_required_option:--gate".to_string())?,
+            out_fasta: out_fasta
+                .ok_or_else(|| "missing_required_option:--out-fasta".to_string())?,
+            out_tsv: out_tsv.ok_or_else(|| "missing_required_option:--out-tsv".to_string())?,
+        })
+    }
+}
+
+struct SequenceFeaturesArgs {
+    candidates: PathBuf,
+    config: PathBuf,
+    out: PathBuf,
+}
+
+impl SequenceFeaturesArgs {
+    fn parse(args: &[String]) -> Result<Self, String> {
+        let mut candidates = None;
+        let mut config = None;
+        let mut out = None;
+        parse_options(args, |flag, args, index| match flag {
+            "--candidates" => {
+                candidates = Some(take_path(args, index, flag)?);
+                Ok(())
+            }
+            "--config" => {
+                config = Some(take_path(args, index, flag)?);
+                Ok(())
+            }
+            "--out" => {
+                out = Some(take_path(args, index, flag)?);
+                Ok(())
+            }
+            other => Err(format!("unknown_sequence_features_option:{other}")),
+        })?;
+        Ok(Self {
+            candidates: candidates
+                .ok_or_else(|| "missing_required_option:--candidates".to_string())?,
+            config: config.unwrap_or_else(|| PathBuf::from("configs/phase_0_4.yaml")),
+            out: out.ok_or_else(|| "missing_required_option:--out".to_string())?,
+        })
+    }
+}
+
+struct SequenceScoreArgs {
+    candidates: PathBuf,
+    features: PathBuf,
+    embeddings: PathBuf,
+    similarity: PathBuf,
+    weights: PathBuf,
+    out: PathBuf,
+}
+
+impl SequenceScoreArgs {
+    fn parse(args: &[String]) -> Result<Self, String> {
+        let mut candidates = None;
+        let mut features = None;
+        let mut embeddings = None;
+        let mut similarity = None;
+        let mut weights = None;
+        let mut out = None;
+        parse_options(args, |flag, args, index| match flag {
+            "--candidates" => {
+                candidates = Some(take_path(args, index, flag)?);
+                Ok(())
+            }
+            "--features" => {
+                features = Some(take_path(args, index, flag)?);
+                Ok(())
+            }
+            "--embeddings" | "--embedding-manifest" => {
+                embeddings = Some(take_path(args, index, flag)?);
+                Ok(())
+            }
+            "--similarity" | "--similarity-summary" => {
+                similarity = Some(take_path(args, index, flag)?);
+                Ok(())
+            }
+            "--weights" => {
+                weights = Some(take_path(args, index, flag)?);
+                Ok(())
+            }
+            "--out" => {
+                out = Some(take_path(args, index, flag)?);
+                Ok(())
+            }
+            other => Err(format!("unknown_sequence_score_option:{other}")),
+        })?;
+        Ok(Self {
+            candidates: candidates
+                .ok_or_else(|| "missing_required_option:--candidates".to_string())?,
+            features: features.ok_or_else(|| "missing_required_option:--features".to_string())?,
+            embeddings: embeddings
+                .ok_or_else(|| "missing_required_option:--embeddings".to_string())?,
+            similarity: similarity
+                .ok_or_else(|| "missing_required_option:--similarity".to_string())?,
+            weights: weights
+                .unwrap_or_else(|| PathBuf::from("configs/sequence_evidence_weights.yaml")),
+            out: out.ok_or_else(|| "missing_required_option:--out".to_string())?,
+        })
+    }
+}
+
 struct ReportMarkdownArgs {
     hits: PathBuf,
     stats: PathBuf,
@@ -873,6 +1096,64 @@ struct ReportMarkdownArgs {
     patches: PathBuf,
     dock: PathBuf,
     out: PathBuf,
+}
+
+struct ReportPhase04Args {
+    candidates: PathBuf,
+    features: PathBuf,
+    embeddings: PathBuf,
+    similarity: PathBuf,
+    evidence: PathBuf,
+    out: PathBuf,
+}
+
+impl ReportPhase04Args {
+    fn parse(args: &[String]) -> Result<Self, String> {
+        let mut candidates = None;
+        let mut features = None;
+        let mut embeddings = None;
+        let mut similarity = None;
+        let mut evidence = None;
+        let mut out = None;
+        parse_options(args, |flag, args, index| match flag {
+            "--candidates" => {
+                candidates = Some(take_path(args, index, flag)?);
+                Ok(())
+            }
+            "--features" => {
+                features = Some(take_path(args, index, flag)?);
+                Ok(())
+            }
+            "--embeddings" | "--embedding-manifest" => {
+                embeddings = Some(take_path(args, index, flag)?);
+                Ok(())
+            }
+            "--similarity" | "--similarity-summary" => {
+                similarity = Some(take_path(args, index, flag)?);
+                Ok(())
+            }
+            "--evidence" | "--sequence-evidence" => {
+                evidence = Some(take_path(args, index, flag)?);
+                Ok(())
+            }
+            "--out" => {
+                out = Some(take_path(args, index, flag)?);
+                Ok(())
+            }
+            other => Err(format!("unknown_report_phase_0_4_option:{other}")),
+        })?;
+        Ok(Self {
+            candidates: candidates
+                .ok_or_else(|| "missing_required_option:--candidates".to_string())?,
+            features: features.ok_or_else(|| "missing_required_option:--features".to_string())?,
+            embeddings: embeddings
+                .ok_or_else(|| "missing_required_option:--embeddings".to_string())?,
+            similarity: similarity
+                .ok_or_else(|| "missing_required_option:--similarity".to_string())?,
+            evidence: evidence.ok_or_else(|| "missing_required_option:--evidence".to_string())?,
+            out: out.ok_or_else(|| "missing_required_option:--out".to_string())?,
+        })
+    }
 }
 
 struct ReportCandidateArgs {
@@ -1110,8 +1391,12 @@ commands:
   foldgate realize
   patch realize
   dock run
+  sequence export-fasta
+  sequence features
+  sequence score
   report markdown
   report candidate
+  report phase-0-4
   validate fasta|gff|fragment-kernel|ligand
   gls-calibrate-patch-tolerance
 ";
@@ -1149,10 +1434,15 @@ const PATCH_HELP: &str = "usage: gls-cli patch <realize>\ncommands:\n  realize";
 const PATCH_REALIZE_HELP: &str = "usage: gls-cli patch realize --foldgate PATH --ligand PATH [--tolerance-profile PATH] --out PATH";
 const DOCK_HELP: &str = "usage: gls-cli dock <run>\ncommands:\n  run";
 const DOCK_RUN_HELP: &str = "usage: gls-cli dock run --patches PATH [--mode MODE] --out PATH";
-const REPORT_HELP: &str =
-    "usage: gls-cli report <markdown|candidate>\ncommands:\n  markdown\n  candidate";
+const SEQUENCE_HELP: &str = "usage: gls-cli sequence <export-fasta|features|score>\ncommands:\n  export-fasta\n  features\n  score";
+const SEQUENCE_EXPORT_FASTA_HELP: &str = "usage: gls-cli sequence export-fasta --orfs PATH --context PATH --cooccur PATH --gate PATH --out-fasta PATH --out-tsv PATH";
+const SEQUENCE_FEATURES_HELP: &str =
+    "usage: gls-cli sequence features --candidates PATH [--config PATH] --out PATH";
+const SEQUENCE_SCORE_HELP: &str = "usage: gls-cli sequence score --candidates PATH --features PATH --embeddings PATH --similarity PATH [--weights PATH] --out PATH";
+const REPORT_HELP: &str = "usage: gls-cli report <markdown|candidate|phase-0-4>\ncommands:\n  markdown\n  candidate\n  phase-0-4";
 const REPORT_MARKDOWN_HELP: &str = "usage: gls-cli report markdown --hits PATH --stats PATH --orfs PATH --context PATH --cooccur PATH --gate PATH --plm PATH --foldgate PATH --patches PATH --dock PATH --out PATH";
 const REPORT_CANDIDATE_HELP: &str = "usage: gls-cli report candidate --hits PATH --stats PATH --orfs PATH --context PATH --cooccur PATH --gate PATH --evidence PATH --out PATH";
+const REPORT_PHASE_0_4_HELP: &str = "usage: gls-cli report phase-0-4 --candidates PATH --features PATH --embeddings PATH --similarity PATH --evidence PATH --out PATH";
 const VALIDATE_HELP: &str =
     "usage: gls-cli validate <fasta|gff|fragment-kernel|ligand> --input PATH";
 const VALIDATE_FASTA_HELP: &str = "usage: gls-cli validate fasta --input PATH";

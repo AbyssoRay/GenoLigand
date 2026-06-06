@@ -1,12 +1,17 @@
 use gls_cli::stages::{
     ClassifyLociOptions, CooccurScoreOptions, DockOptions, FoldgateOptions, GatePlmOptions,
     GateShortCircuitOptions, OrfExtendOptions, PatchOptions, PhaseGateShortCircuitOptions,
-    ReportMarkdownOptions, SearchOptions, StatsOptions, ValidateKind, ValidateOptions,
+    ReportMarkdownOptions, ReportPhase04Options, SearchOptions, SequenceExportOptions,
+    SequenceFeaturesOptions, SequenceScoreOptions, StatsOptions, ValidateKind, ValidateOptions,
     run_classify_loci, run_cooccur_score, run_dock, run_foldgate_realize, run_gate_plm,
     run_gate_short_circuit, run_gate_short_circuit_phase, run_orf_extend, run_patch_realize,
-    run_report_markdown, run_search_genome, run_stats_score, run_validate,
+    run_report_markdown, run_report_phase_0_4, run_search_genome, run_sequence_export_fasta,
+    run_sequence_features, run_sequence_score, run_stats_score, run_validate,
 };
 use gls_genome::{parse_fasta, reverse_complement, six_frame_translations, translate_frame};
+use gls_sequence::{
+    candidate_fasta_header, parse_candidate_fasta_header, sequence_features, sha256_hex,
+};
 use gls_stats::benjamini_hochberg;
 use std::collections::HashMap;
 use std::fs;
@@ -580,6 +585,157 @@ fn phase_0_3_fixture_covers_context_evidence_and_decoy_semantics() {
     assert!(report_text.contains("未注释 ORF 候选不能被解释为已证实蛋白"));
 }
 
+#[test]
+fn phase_0_4_sequence_layer_exports_features_scores_and_report_controls() {
+    let root = temp_root("phase-0-4");
+    let workspace = workspace_root();
+    let fixtures = workspace.join("fixtures").join("phase_0_3");
+    let genome = fixtures.join("genome.fa");
+    let fragments = fixtures.join("fragment_kernel.json");
+    let annotation = fixtures.join("annotation.gff3");
+    let evidence_table = fixtures.join("evidence_table.tsv");
+    let hits = root.join("hits.tsv");
+    let stats = root.join("stats.tsv");
+    let orfs = root.join("orf_extensions.tsv");
+    let context = root.join("context.tsv");
+    let cooccur = root.join("cooccurrence.tsv");
+    let gate = root.join("orf_gate.tsv");
+    let candidates = root.join("candidate_orfs.tsv");
+    let fasta = root.join("candidate_orfs.fasta");
+    let features = root.join("sequence_features.tsv");
+    let embeddings = root.join("embedding_manifest.tsv");
+    let similarity = root.join("similarity_summary.tsv");
+    let sequence_evidence = root.join("sequence_evidence.tsv");
+    let report = root.join("candidate_report_phase_0_4.md");
+
+    run_search_genome(&SearchOptions {
+        genome: genome.clone(),
+        fragments,
+        out: hits.clone(),
+    })
+    .expect("phase 0.4 search");
+    run_stats_score(&StatsOptions {
+        hits: hits.clone(),
+        out: stats.clone(),
+    })
+    .expect("phase 0.4 stats");
+    run_orf_extend(&OrfExtendOptions {
+        genome,
+        hits: hits.clone(),
+        out: orfs.clone(),
+    })
+    .expect("phase 0.4 orfs");
+    run_classify_loci(&ClassifyLociOptions {
+        annotation,
+        orfs: orfs.clone(),
+        out: context.clone(),
+    })
+    .expect("phase 0.4 context");
+    run_cooccur_score(&CooccurScoreOptions {
+        hits,
+        stats: stats.clone(),
+        orfs: orfs.clone(),
+        context: context.clone(),
+        out: cooccur.clone(),
+    })
+    .expect("phase 0.4 cooccur");
+    gls_cli::stages::run_gate_short_circuit_phase_with_evidence(
+        &PhaseGateShortCircuitOptions {
+            stats,
+            orfs: orfs.clone(),
+            context: context.clone(),
+            cooccur: cooccur.clone(),
+            out: gate.clone(),
+        },
+        Some(&evidence_table),
+    )
+    .expect("phase 0.4 gate");
+    run_sequence_export_fasta(&SequenceExportOptions {
+        orfs,
+        context,
+        cooccur,
+        gate,
+        out_fasta: fasta.clone(),
+        out_tsv: candidates.clone(),
+    })
+    .expect("phase 0.4 export");
+    run_sequence_features(&SequenceFeaturesOptions {
+        candidates: candidates.clone(),
+        config: workspace.join("configs").join("phase_0_4.yaml"),
+        out: features.clone(),
+    })
+    .expect("phase 0.4 features");
+    write_fake_embedding_and_similarity(&candidates, &embeddings, &similarity);
+    run_sequence_score(&SequenceScoreOptions {
+        candidates: candidates.clone(),
+        features: features.clone(),
+        embeddings: embeddings.clone(),
+        similarity: similarity.clone(),
+        weights: workspace
+            .join("configs")
+            .join("sequence_evidence_weights.yaml"),
+        out: sequence_evidence.clone(),
+    })
+    .expect("phase 0.4 score");
+    run_report_phase_0_4(&ReportPhase04Options {
+        candidates: candidates.clone(),
+        features: features.clone(),
+        embeddings,
+        similarity,
+        evidence: sequence_evidence.clone(),
+        out: report.clone(),
+    })
+    .expect("phase 0.4 report");
+
+    let header = candidate_fasta_header("cand", "K1_known_cds_same_frame", 7, "fixture");
+    assert_eq!(
+        parse_candidate_fasta_header(&header)
+            .expect("parse header")
+            .0,
+        "cand"
+    );
+    assert_eq!(
+        sha256_hex(b"abc"),
+        "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+    );
+    assert!(
+        sequence_features("AAAAAAAA", "K_LOW_COMPLEXITY_DECOY", "control_sequence")
+            .sequence_risk_flags
+            .contains(&"low_complexity".to_string())
+    );
+    let candidate_text = fs::read_to_string(&candidates).expect("read candidates");
+    for control in [
+        "p04_d3",
+        "p04_d4",
+        "p04_d5",
+        "p03_d1_low_complexity_001",
+        "p03_d2_background_001",
+    ] {
+        assert!(
+            candidate_text.contains(control),
+            "missing control {control}"
+        );
+    }
+    let score_text = fs::read_to_string(sequence_evidence).expect("read sequence evidence");
+    assert!(score_text.contains("sequence_evidence_rank"));
+    let report_text = fs::read_to_string(report).expect("read report");
+    for section in [
+        "## Sequence Evidence Summary",
+        "## pLM Embedding Summary",
+        "## Similarity Search Summary",
+        "## Sequence Risk Flags",
+        "## Sequence Evidence Ranking Table",
+        "## Sequence Evidence Controls",
+        "## CUDA / Device Metadata",
+        "## Phase 0.4 Interpretation Cautions",
+    ] {
+        assert!(report_text.contains(section), "missing section {section}");
+    }
+    assert!(
+        report_text.contains("Synthetic semantic controls are retained for software validation")
+    );
+}
+
 fn temp_root(label: &str) -> PathBuf {
     let root = std::env::temp_dir().join(format!(
         "genoligand-{label}-{}-{}",
@@ -626,6 +782,47 @@ fragments:
 ",
     )
     .expect("write ligand");
+}
+
+fn write_fake_embedding_and_similarity(
+    candidates: &PathBuf,
+    embeddings: &PathBuf,
+    similarity: &PathBuf,
+) {
+    let rows = table_rows(candidates);
+    let mut embedding_text = String::from(
+        "candidate_id\tmodel_id\tbackend\tmodel_source\ttokenizer_id\tdevice_requested\tdevice_resolved\tdtype\trepr_layer\tpooling\tembedding_dim\tsequence_length_input\tsequence_length_effective\ttruncated\tembedding_file\tembedding_sha256\tembedding_mean_abs\tembedding_l2_norm\tcreated_at_utc\tsoftware_versions\tplm_status\tplm_notes\n",
+    );
+    let mut similarity_text = String::from(
+        "candidate_id\tbest_hit_accession\tbest_hit_name\tbest_hit_evalue\tbest_hit_bitscore\tbest_hit_pident\tbest_hit_query_cover\treviewed_hit_present\tknown_similarity_flag\tnovelty_flag\tshort_sequence_alignment_warning\tsimilarity_backend\tsimilarity_database\tsimilarity_config_sha256\n",
+    );
+    for row in rows {
+        let candidate_id = row.get("candidate_id").expect("candidate_id");
+        let aa_length = row.get("aa_length").expect("aa_length");
+        let is_control = row
+            .get("export_status")
+            .is_some_and(|value| value.contains("control"));
+        embedding_text.push_str(&format!(
+            "{candidate_id}\tesm2_t6_8M_UR50D\tesm2_fair\tfacebookresearch/esm\tesm2_t6_8M_UR50D\tcpu\tcpu\tfloat32\t6\tmean\t64\t{aa_length}\t{aa_length}\tfalse\t{candidate_id}.npy\t{}\t0.100000\t1.000000\t2026-06-06T00:00:00Z\t{{}}\tsuccess\treal_esm_embedding\n",
+            sha256_hex(candidate_id.as_bytes())
+        ));
+        similarity_text.push_str(&format!(
+            "{candidate_id}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\tdiamond\tuniprot_swissprot_reviewed\t{}\n",
+            if is_control { "" } else { "sp|P0DTC2|SPIKE_SARS2" },
+            if is_control { "" } else { "fixture reviewed hit" },
+            if is_control { "" } else { "1e-5" },
+            if is_control { "" } else { "42.0" },
+            if is_control { "" } else { "55.0" },
+            if is_control { "" } else { "0.85" },
+            !is_control,
+            !is_control,
+            is_control,
+            aa_length.parse::<usize>().unwrap_or(0) < 30,
+            sha256_hex(b"similarity_config")
+        ));
+    }
+    fs::write(embeddings, embedding_text).expect("write fake embeddings");
+    fs::write(similarity, similarity_text).expect("write fake similarity");
 }
 
 fn workspace_root() -> PathBuf {
