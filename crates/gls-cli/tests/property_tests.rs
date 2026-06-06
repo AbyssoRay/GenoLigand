@@ -6,8 +6,9 @@ use gls_cli::stages::{
     run_gate_short_circuit, run_gate_short_circuit_phase, run_orf_extend, run_patch_realize,
     run_report_markdown, run_search_genome, run_stats_score, run_validate,
 };
-use gls_genome::{reverse_complement, six_frame_translations};
+use gls_genome::{parse_fasta, reverse_complement, six_frame_translations, translate_frame};
 use gls_stats::benjamini_hochberg;
+use std::collections::HashMap;
 use std::fs;
 use std::path::PathBuf;
 
@@ -216,7 +217,7 @@ fn phase_0_2_pipeline_preserves_context_ranking_and_stop_boundaries() {
     })
     .expect("phase stats");
     run_orf_extend(&OrfExtendOptions {
-        genome,
+        genome: genome.clone(),
         hits: hits.clone(),
         out: orfs.clone(),
     })
@@ -284,6 +285,7 @@ fn phase_0_2_pipeline_preserves_context_ranking_and_stop_boundaries() {
         .expect("phase report");
     }
 
+    assert_hit_coordinates_translate_back_to_matches(&genome, &hits);
     assert_eq!(
         table_value(
             &context,
@@ -365,9 +367,66 @@ fn phase_0_2_pipeline_preserves_context_ranking_and_stop_boundaries() {
             .all(|row| !row.contains("pos_yhedlv;pos_kqwc"))
     );
     assert_eq!(
+        table_value(&orfs, "candidate_id", "pos_known_cds_001", "parent_orf_id"),
+        "pos_known_cds_001:+1:0-42"
+    );
+    assert_eq!(
+        table_value(&orfs, "candidate_id", "pos_alt_frame_001", "parent_orf_id"),
+        "pos_alt_frame_001:+2:1-43"
+    );
+    assert_eq!(
+        table_value(&orfs, "candidate_id", "pos_lnc_orf_001", "parent_orf_id"),
+        "pos_lnc_orf_001:-1:0-36"
+    );
+    assert_eq!(
+        table_value(&orfs, "candidate_id", "pos_lnc_orf_001", "strand"),
+        "-"
+    );
+    assert_eq!(
+        table_value(&orfs, "candidate_id", "pos_lnc_orf_001", "frame"),
+        "-1"
+    );
+    assert_eq!(
+        table_value(&orfs, "candidate_id", "pos_alt_frame_001", "frame"),
+        "2"
+    );
+    assert_eq!(
         fs::read_to_string(report).expect("read report"),
         fs::read_to_string(report_again).expect("read report again")
     );
+}
+
+#[test]
+fn phase_0_2_nextflow_resume_hash_record_is_consistent_when_present() {
+    let workspace = workspace_root();
+    let workflow = workspace
+        .join("workflows")
+        .join("phase_0_2_mini_benchmark.nf");
+    let workflow_text = fs::read_to_string(&workflow).expect("read phase workflow");
+    for required in [
+        "cache 'deep'",
+        "sourceFingerprint()",
+        "report markdown",
+        "GENOLIGAND_CANDIDATE_REPORT.md",
+    ] {
+        assert!(
+            workflow_text.contains(required),
+            "workflow missing deterministic resume contract token: {required}"
+        );
+    }
+
+    let compare = workspace
+        .join("acceptance_artifacts_phase_0_2")
+        .join("metrics")
+        .join("resume_hash_compare.tsv");
+    if compare.exists() {
+        let rows = table_rows(&compare);
+        let row = rows.first().expect("resume hash row");
+        let first = row.get("first_hash").expect("first hash");
+        let resume = row.get("resume_hash").expect("resume hash");
+        assert_eq!(first, resume);
+        assert_eq!(row.get("status").expect("resume status"), "PASS");
+    }
 }
 
 fn temp_root(label: &str) -> PathBuf {
@@ -471,4 +530,68 @@ fn matching_rows(path: &PathBuf, key_column: &str, key_value: &str) -> Vec<Strin
         .filter(|line| line.split('\t').nth(key_index) == Some(key_value))
         .map(ToOwned::to_owned)
         .collect()
+}
+
+fn table_rows(path: &PathBuf) -> Vec<HashMap<String, String>> {
+    let text = fs::read_to_string(path).expect("read table");
+    let mut lines = text.lines();
+    let headers = lines
+        .next()
+        .expect("headers")
+        .split('\t')
+        .map(clean_tsv_cell)
+        .collect::<Vec<_>>();
+    lines
+        .map(|line| {
+            headers
+                .iter()
+                .cloned()
+                .zip(line.split('\t').map(clean_tsv_cell))
+                .collect::<HashMap<_, _>>()
+        })
+        .collect()
+}
+
+fn clean_tsv_cell(cell: &str) -> String {
+    cell.trim_matches('"').to_string()
+}
+
+fn assert_hit_coordinates_translate_back_to_matches(genome: &PathBuf, hits: &PathBuf) {
+    let fasta = fs::read_to_string(genome).expect("read genome");
+    let records = parse_fasta(&fasta)
+        .expect("parse genome")
+        .into_iter()
+        .map(|record| (record.id, record.sequence))
+        .collect::<HashMap<_, _>>();
+    for row in table_rows(hits) {
+        let chromosome = row.get("chromosome").expect("chromosome");
+        let sequence = records.get(chromosome).expect("record sequence");
+        let start = row
+            .get("start")
+            .expect("start")
+            .parse::<usize>()
+            .expect("start usize");
+        let end = row
+            .get("end")
+            .expect("end")
+            .parse::<usize>()
+            .expect("end usize");
+        assert!(start < end, "hit must have positive width: {row:?}");
+        assert!(
+            end <= sequence.len(),
+            "hit must stay inside record: {row:?}"
+        );
+        assert_eq!((end - start) % 3, 0, "hit must cover full codons: {row:?}");
+        let dna = &sequence[start..end];
+        let coding_dna = if row.get("strand").expect("strand") == "-" {
+            reverse_complement(dna)
+        } else {
+            dna.to_string()
+        };
+        assert_eq!(
+            translate_frame(&coding_dna, 0),
+            *row.get("match_sequence").expect("match sequence"),
+            "DNA coordinate span must translate back to the matched peptide"
+        );
+    }
 }
