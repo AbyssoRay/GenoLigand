@@ -1,7 +1,10 @@
 import argparse
 import platform
 import subprocess
+import sys
 from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "python"))
 
 from genoligand_gpu.io import read_json, read_tsv
 
@@ -9,6 +12,13 @@ from genoligand_gpu.io import read_json, read_tsv
 def git_text(args: list[str]) -> str:
     try:
         return subprocess.check_output(["git", *args], text=True).strip()
+    except Exception:
+        return "unknown"
+
+
+def command_text(args: list[str]) -> str:
+    try:
+        return subprocess.check_output(args, text=True, stderr=subprocess.STDOUT).strip()
     except Exception:
         return "unknown"
 
@@ -25,8 +35,11 @@ def main() -> int:
     smoke = read_json(root / "metrics/cuda_tensor_smoke_test.json") if (root / "metrics/cuda_tensor_smoke_test.json").exists() else {}
     plm = read_json(root / "outputs/plm_gpu/plm_manifest.json") if (root / "outputs/plm_gpu/plm_manifest.json").exists() else {}
     structure = read_json(root / "outputs/structures/structure_backend_manifest.json") if (root / "outputs/structures/structure_backend_manifest.json").exists() else {}
+    memory = read_json(root / "metrics/gpu_memory_probe_structure.json") if (root / "metrics/gpu_memory_probe_structure.json").exists() else {}
+    semantic = read_tsv(root / "metrics/structure_semantic_hash_compare.tsv") if (root / "metrics/structure_semantic_hash_compare.tsv").exists() else []
     quality = read_tsv(root / "outputs/structure_features/structure_quality.tsv") if (root / "outputs/structure_features/structure_quality.tsv").exists() else []
     patches = read_tsv(root / "outputs/patches/patch_descriptors.tsv") if (root / "outputs/patches/patch_descriptors.tsv").exists() else []
+    structure_rows = read_tsv(root / "outputs/structures/structure_manifest.tsv") if (root / "outputs/structures/structure_manifest.tsv").exists() else []
     trace_status = "see metrics/nextflow_trace_first.tsv"
     lines = [
         "# GenoLigand-Search Phase 0.5 GPU-Strict Acceptance Report",
@@ -38,8 +51,10 @@ def main() -> int:
         f"- Commit: {git_text(['rev-parse', 'HEAD'])}",
         f"- Branch: {git_text(['branch', '--show-current'])}",
         f"- OS: {platform.platform()}",
+        f"- Rust version: {command_text(['rustc', '--version'])}",
         f"- Python orchestration version: {cuda.get('python', 'unknown')}",
         f"- Structure backend Python version: {cuda.get('python', 'unknown')}",
+        "- Nextflow version: local patched Nextflow runtime; see metrics/command_summary.tsv for the exact Java jar invocation",
         "- GPU acceptance mode: gpu_strict",
         "",
         "## 3. Implemented Scope",
@@ -77,12 +92,17 @@ def main() -> int:
         f"- model_id: {plm.get('model_id')}",
         f"- device: {plm.get('device')}",
         f"- rows: {plm.get('row_count')}",
+        f"- embedding hashes: {root / 'outputs/plm_gpu/plm_embedding_hashes.tsv'}",
+        f"- GPU memory delta: see {root / 'metrics/gpu_memory_probe_plm.json'}",
         "",
         "## 9. GPU Structure Prediction Gates",
         f"- backend: {structure.get('backend')}",
         f"- model_id: {structure.get('model_id')}",
         f"- device: {structure.get('device')}",
         f"- structures generated: {structure.get('row_count')}",
+        f"- mandatory candidates generated: {sum(1 for row in structure_rows if row.get('prediction_status') == 'success')}",
+        f"- GPU memory peak: {memory.get('memory_peak_mib')} MiB; delta: {memory.get('peak_delta_mib')} MiB; torch_max_memory_allocated_bytes: {memory.get('torch_max_memory_allocated_bytes')}",
+        f"- PDB/mmCIF outputs: {root / 'outputs/structures/pdb'} and {root / 'outputs/structures/mmcif'}",
         "",
         "## 10. Structure Quality Gates",
         f"- structure_quality.tsv rows: {len(quality)}",
@@ -98,7 +118,10 @@ def main() -> int:
         "",
         "## 14. Nextflow GPU Reproducibility",
         f"- trace file: {trace_status}",
-        "- semantic hash match: see metrics/structure_semantic_hash_compare.tsv",
+        f"- first semantic hash: {root / 'outputs/structures/structure_semantic_hashes_first.tsv'}",
+        f"- resume semantic hash: {root / 'outputs/structures/structure_semantic_hashes_resume.tsv'}",
+        f"- semantic hash match: {all(row.get('match') == 'true' for row in semantic) if semantic else False}",
+        "- GPU-labeled processes: GPU_ENV_CHECK, GPU_TENSOR_SMOKE_TEST, PLM_EMBED_GPU, STRUCTURE_PREDICT_GPU",
         "",
         "## 15. Decoy and Background Gates",
         "- D1/D2/D3/D4/D5 retained as controls and excluded from biological-discovery interpretation.",

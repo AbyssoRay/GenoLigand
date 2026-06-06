@@ -6,6 +6,7 @@ from pathlib import Path
 REQUIRED = {
     "GPU_ENV_CHECK",
     "GPU_TENSOR_SMOKE_TEST",
+    "EXPORT_CANDIDATE_FASTA",
     "PLM_EMBED_GPU",
     "STRUCTURE_PREDICT_GPU",
     "STRUCTURE_QUALITY",

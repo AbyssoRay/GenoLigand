@@ -1,5 +1,8 @@
 import argparse
+import sys
 from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "python"))
 
 from genoligand_gpu.cuda_env import tensor_smoke
 from genoligand_gpu.io import write_json

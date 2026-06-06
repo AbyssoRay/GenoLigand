@@ -46,12 +46,29 @@ process GPU_TENSOR_SMOKE_TEST {
   """
 }
 
+process EXPORT_CANDIDATE_FASTA {
+  publishDir "${params.outdir}/outputs", mode: 'copy'
+
+  input:
+  path smoke
+
+  output:
+  path 'phase05_inputs'
+
+  script:
+  """
+  mkdir -p phase05_inputs
+  cp "${rootWin()}/${params.phase04_dir}/outputs/candidates/candidate_orfs.fasta" phase05_inputs/candidate_orfs.fasta
+  cp "${rootWin()}/${params.phase04_dir}/outputs/candidates/candidate_orfs.tsv" phase05_inputs/candidate_orfs.tsv
+  """
+}
+
 process PLM_EMBED_GPU {
   label 'gpu'
   publishDir "${params.outdir}/outputs", mode: 'copy'
 
   input:
-  path smoke
+  path input_bundle
 
   output:
   path 'plm_gpu'
@@ -63,8 +80,8 @@ process PLM_EMBED_GPU {
   export PATH="\$CUDA_BASH/bin:\$CUDA_BASH/libnvvp:/usr/bin:/bin:/c/Windows/System32:\$PATH"
   export PYTHONPATH="${rootWin()}/python"
   "${params.python}" "${rootWin()}/scripts/plm/embed_candidates_gpu.py" \
-    --input-fasta "${rootWin()}/${params.phase04_dir}/outputs/candidates/candidate_orfs.fasta" \
-    --candidate-tsv "${rootWin()}/${params.phase04_dir}/outputs/candidates/candidate_orfs.tsv" \
+    --input-fasta phase05_inputs/candidate_orfs.fasta \
+    --candidate-tsv phase05_inputs/candidate_orfs.tsv \
     --output-dir plm_gpu \
     --model-id esm2_t6_8M_UR50D \
     --device cuda:0 \
@@ -78,6 +95,7 @@ process STRUCTURE_PREDICT_GPU {
   publishDir "${params.outdir}/outputs", mode: 'copy'
 
   input:
+  path input_bundle
   path plm_dir
 
   output:
@@ -90,8 +108,8 @@ process STRUCTURE_PREDICT_GPU {
   export PATH="\$CUDA_BASH/bin:\$CUDA_BASH/libnvvp:/usr/bin:/bin:/c/Windows/System32:\$PATH"
   export PYTHONPATH="${rootWin()}/python"
   "${params.python}" "${rootWin()}/scripts/structure/predict_structures_gpu.py" \
-    --input-fasta "${rootWin()}/${params.phase04_dir}/outputs/candidates/candidate_orfs.fasta" \
-    --candidate-tsv "${rootWin()}/${params.phase04_dir}/outputs/candidates/candidate_orfs.tsv" \
+    --input-fasta phase05_inputs/candidate_orfs.fasta \
+    --candidate-tsv phase05_inputs/candidate_orfs.tsv \
     --output-dir structures \
     --backend esmfold_hf_gpu \
     --model-id facebook/esmfold_v1 \
@@ -195,8 +213,9 @@ process PHASE05_ACCEPTANCE {
 workflow {
   env_ch = GPU_ENV_CHECK()
   smoke_ch = GPU_TENSOR_SMOKE_TEST(env_ch)
-  plm_ch = PLM_EMBED_GPU(smoke_ch)
-  structure_ch = STRUCTURE_PREDICT_GPU(plm_ch)
+  input_ch = EXPORT_CANDIDATE_FASTA(smoke_ch)
+  plm_ch = PLM_EMBED_GPU(input_ch)
+  structure_ch = STRUCTURE_PREDICT_GPU(input_ch, plm_ch)
   quality_ch = STRUCTURE_QUALITY(structure_ch)
   patch_ch = PATCH_DESCRIPTOR(quality_ch)
   report_ch = PHASE05_REPORT(plm_ch, structure_ch, quality_ch, patch_ch)

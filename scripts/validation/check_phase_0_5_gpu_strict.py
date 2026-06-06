@@ -1,5 +1,8 @@
 import argparse
+import sys
 from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "python"))
 
 from genoligand_gpu.io import read_json, read_tsv
 
@@ -28,19 +31,39 @@ def main() -> int:
     required = [
         "metrics/cuda_env.json",
         "metrics/cuda_tensor_smoke_test.json",
+        "metrics/torch_cuda_probe.json",
         "metrics/gpu_memory_probe_plm.json",
         "metrics/gpu_memory_probe_structure.json",
         "metrics/phase_0_5_gate_summary.tsv",
+        "metrics/python_package_freeze.txt",
+        "metrics/nextflow_trace_first.tsv",
+        "metrics/nextflow_trace_resume.tsv",
+        "metrics/nextflow_report.html",
+        "metrics/nextflow_timeline.html",
+        "metrics/structure_semantic_hash_compare.tsv",
         "outputs/plm_gpu/plm_embeddings.tsv",
         "outputs/plm_gpu/plm_manifest.json",
+        "outputs/plm_gpu/plm_embedding_hashes.tsv",
         "outputs/structures/structure_manifest.tsv",
         "outputs/structures/structure_backend_manifest.json",
+        "outputs/structures/structure_hashes.tsv",
+        "outputs/structures/structure_semantic_hashes_first.tsv",
+        "outputs/structures/structure_semantic_hashes_resume.tsv",
         "outputs/structure_features/structure_quality.tsv",
         "outputs/structure_features/ca_graph_summary.tsv",
+        "outputs/structure_features/secondary_structure_summary.tsv",
+        "outputs/patches/patch_manifest.json",
         "outputs/patches/patch_descriptors.tsv",
         "outputs/reports/candidate_report_phase_0_5.md",
         "outputs/reports/structure_score_decomposition.tsv",
+        "outputs/reports/structure_evidence_summary.tsv",
+        "logs/cuda_env_stdout_stderr.txt",
+        "logs/plm_gpu_stdout_stderr.txt",
+        "logs/structure_gpu_stdout_stderr.txt",
+        "logs/nextflow_gpu_stdout_stderr.txt",
+        "logs/python_package_freeze.txt",
         "external_resource_manifest.tsv",
+        "hashes.tsv",
     ]
     for rel in required:
         require(root / rel)
@@ -65,6 +88,30 @@ def main() -> int:
             raise SystemExit(f"mandatory_structure_not_cuda:{candidate_id}")
         if not Path(row["structure_path"]).exists():
             raise SystemExit(f"mandatory_structure_file_missing:{candidate_id}")
+        for column in [
+            "mean_plddt",
+            "median_plddt",
+            "min_plddt",
+            "low_confidence_fraction_plddt_lt_50",
+            "very_low_confidence_fraction_plddt_lt_30",
+            "residue_count_in_structure",
+            "chain_count",
+            "gpu_memory_peak_mib",
+            "runtime_seconds",
+        ]:
+            if row.get(column, "") == "":
+                raise SystemExit(f"mandatory_structure_missing_column_value:{candidate_id}:{column}")
+        if not row.get("mmcif_path"):
+            raise SystemExit(f"mandatory_mmcif_missing:{candidate_id}")
+        mmcif_path = Path(row["mmcif_path"])
+        if not mmcif_path.exists() or not row.get("mmcif_sha256"):
+            raise SystemExit(f"mandatory_mmcif_missing:{candidate_id}")
+        if not row.get("structure_sha256"):
+            raise SystemExit(f"mandatory_structure_hash_missing:{candidate_id}")
+        if int(float(row.get("atom_count", "0"))) <= 0:
+            raise SystemExit(f"mandatory_structure_empty_atoms:{candidate_id}")
+        if int(float(row.get("residue_count_in_structure", "0"))) <= 0:
+            raise SystemExit(f"mandatory_structure_empty_residues:{candidate_id}")
     quality_ids = {row["candidate_id"] for row in read_tsv(root / "outputs/structure_features/structure_quality.tsv")}
     patch_ids = {row["candidate_id"] for row in read_tsv(root / "outputs/patches/patch_descriptors.tsv")}
     for candidate_id in MANDATORY:
@@ -75,6 +122,11 @@ def main() -> int:
     memory = read_json(root / "metrics/gpu_memory_probe_structure.json")
     if not memory.get("success"):
         raise SystemExit("structure_gpu_memory_probe_failed")
+    if int(memory.get("peak_delta_mib", 0)) < 100 and int(memory.get("torch_max_memory_allocated_bytes", 0)) <= 0:
+        raise SystemExit("structure_gpu_memory_delta_missing")
+    compare = read_tsv(root / "metrics/structure_semantic_hash_compare.tsv")
+    if not compare or any(row.get("match") != "true" for row in compare):
+        raise SystemExit("structure_semantic_hash_resume_mismatch")
     report = (root / "outputs/reports/candidate_report_phase_0_5.md").read_text(encoding="utf-8-sig")
     for section in [
         "## CUDA Execution Summary",

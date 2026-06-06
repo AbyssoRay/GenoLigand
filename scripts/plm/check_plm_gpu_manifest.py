@@ -1,5 +1,8 @@
 import argparse
+import sys
 from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "python"))
 
 from genoligand_gpu.io import read_json, read_tsv
 
