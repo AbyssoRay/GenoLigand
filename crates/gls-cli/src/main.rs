@@ -1,14 +1,14 @@
 use gls_cli::stages::{
     ClassifyLociOptions, CooccurScoreOptions, DockOptions, FoldgateOptions, GatePlmOptions,
     GateShortCircuitOptions, OrfExtendOptions, PatchOptions, PhaseGateShortCircuitOptions,
-    ReportCandidateOptions, ReportMarkdownOptions, ReportPhase04Options, SearchOptions,
-    SequenceExportOptions, SequenceFeaturesOptions, SequenceScoreOptions, SplitDevSmokeOptions,
-    StatsOptions, ValidateKind, ValidateOptions, run_classify_loci, run_cooccur_score, run_dock,
-    run_foldgate_realize, run_gate_plm, run_gate_short_circuit, run_gate_short_circuit_phase,
-    run_gate_short_circuit_phase_with_evidence, run_orf_extend, run_patch_realize,
-    run_report_candidate, run_report_markdown, run_report_phase_0_4, run_search_genome,
-    run_sequence_export_fasta, run_sequence_features, run_sequence_score, run_split_dev_smoke,
-    run_stats_score, run_validate,
+    ReportCandidateOptions, ReportMarkdownOptions, ReportPhase04Options, ReportPhase05Options,
+    SearchOptions, SequenceExportOptions, SequenceFeaturesOptions, SequenceScoreOptions,
+    SplitDevSmokeOptions, StatsOptions, ValidateKind, ValidateOptions, run_classify_loci,
+    run_cooccur_score, run_dock, run_foldgate_realize, run_gate_plm, run_gate_short_circuit,
+    run_gate_short_circuit_phase, run_gate_short_circuit_phase_with_evidence, run_orf_extend,
+    run_patch_realize, run_report_candidate, run_report_markdown, run_report_phase_0_4,
+    run_report_phase_0_5, run_search_genome, run_sequence_export_fasta, run_sequence_features,
+    run_sequence_score, run_split_dev_smoke, run_stats_score, run_validate,
 };
 use gls_cli::{
     DevSmokeInputs, WorkerCommandSet, run_calibrate_patch_tolerance_json,
@@ -436,6 +436,23 @@ fn run_report_cli(args: &[String]) -> Result<String, String> {
                 out: options.out.clone(),
             })?;
             Ok(stage_ok("report phase-0-4", count, &options.out))
+        }
+        "phase-0-5" => {
+            if is_help(&args[1..]) {
+                return Ok(REPORT_PHASE_0_5_HELP.to_string());
+            }
+            let options = ReportPhase05Args::parse(&args[1..])?;
+            let count = run_report_phase_0_5(&ReportPhase05Options {
+                candidates: options.candidates,
+                sequence_evidence: options.sequence_evidence,
+                plm_gpu: options.plm_gpu,
+                structure_manifest: options.structure_manifest,
+                structure_quality: options.structure_quality,
+                patches: options.patches,
+                out: options.out.clone(),
+                score_out: options.score_out.clone(),
+            })?;
+            Ok(stage_ok("report phase-0-5", count, &options.out))
         }
         "candidate" => {
             if is_help(&args[1..]) {
@@ -1225,6 +1242,80 @@ impl ReportCandidateArgs {
     }
 }
 
+struct ReportPhase05Args {
+    candidates: PathBuf,
+    sequence_evidence: PathBuf,
+    plm_gpu: PathBuf,
+    structure_manifest: PathBuf,
+    structure_quality: PathBuf,
+    patches: PathBuf,
+    out: PathBuf,
+    score_out: PathBuf,
+}
+
+impl ReportPhase05Args {
+    fn parse(args: &[String]) -> Result<Self, String> {
+        let mut candidates = None;
+        let mut sequence_evidence = None;
+        let mut plm_gpu = None;
+        let mut structure_manifest = None;
+        let mut structure_quality = None;
+        let mut patches = None;
+        let mut out = None;
+        let mut score_out = None;
+        parse_options(args, |flag, args, index| match flag {
+            "--candidates" => {
+                candidates = Some(take_path(args, index, flag)?);
+                Ok(())
+            }
+            "--sequence-evidence" => {
+                sequence_evidence = Some(take_path(args, index, flag)?);
+                Ok(())
+            }
+            "--plm-gpu" | "--plm" => {
+                plm_gpu = Some(take_path(args, index, flag)?);
+                Ok(())
+            }
+            "--structure-manifest" => {
+                structure_manifest = Some(take_path(args, index, flag)?);
+                Ok(())
+            }
+            "--structure-quality" => {
+                structure_quality = Some(take_path(args, index, flag)?);
+                Ok(())
+            }
+            "--patches" => {
+                patches = Some(take_path(args, index, flag)?);
+                Ok(())
+            }
+            "--out" => {
+                out = Some(take_path(args, index, flag)?);
+                Ok(())
+            }
+            "--score-out" => {
+                score_out = Some(take_path(args, index, flag)?);
+                Ok(())
+            }
+            other => Err(format!("unknown_report_phase_0_5_option:{other}")),
+        })?;
+        Ok(Self {
+            candidates: candidates
+                .ok_or_else(|| "missing_required_option:--candidates".to_string())?,
+            sequence_evidence: sequence_evidence
+                .ok_or_else(|| "missing_required_option:--sequence-evidence".to_string())?,
+            plm_gpu: plm_gpu.ok_or_else(|| "missing_required_option:--plm-gpu".to_string())?,
+            structure_manifest: structure_manifest
+                .ok_or_else(|| "missing_required_option:--structure-manifest".to_string())?,
+            structure_quality: structure_quality
+                .ok_or_else(|| "missing_required_option:--structure-quality".to_string())?,
+            patches: patches.ok_or_else(|| "missing_required_option:--patches".to_string())?,
+            out: out.ok_or_else(|| "missing_required_option:--out".to_string())?,
+            score_out: score_out
+                .ok_or_else(|| "missing_required_option:--score-out".to_string())?,
+        })
+    }
+}
+
 impl ReportMarkdownArgs {
     fn parse(args: &[String]) -> Result<Self, String> {
         let mut hits = None;
@@ -1397,6 +1488,7 @@ commands:
   report markdown
   report candidate
   report phase-0-4
+  report phase-0-5
   validate fasta|gff|fragment-kernel|ligand
   gls-calibrate-patch-tolerance
 ";
@@ -1439,10 +1531,11 @@ const SEQUENCE_EXPORT_FASTA_HELP: &str = "usage: gls-cli sequence export-fasta -
 const SEQUENCE_FEATURES_HELP: &str =
     "usage: gls-cli sequence features --candidates PATH [--config PATH] --out PATH";
 const SEQUENCE_SCORE_HELP: &str = "usage: gls-cli sequence score --candidates PATH --features PATH --embeddings PATH --similarity PATH [--weights PATH] --out PATH";
-const REPORT_HELP: &str = "usage: gls-cli report <markdown|candidate|phase-0-4>\ncommands:\n  markdown\n  candidate\n  phase-0-4";
+const REPORT_HELP: &str = "usage: gls-cli report <markdown|candidate|phase-0-4|phase-0-5>\ncommands:\n  markdown\n  candidate\n  phase-0-4\n  phase-0-5";
 const REPORT_MARKDOWN_HELP: &str = "usage: gls-cli report markdown --hits PATH --stats PATH --orfs PATH --context PATH --cooccur PATH --gate PATH --plm PATH --foldgate PATH --patches PATH --dock PATH --out PATH";
 const REPORT_CANDIDATE_HELP: &str = "usage: gls-cli report candidate --hits PATH --stats PATH --orfs PATH --context PATH --cooccur PATH --gate PATH --evidence PATH --out PATH";
 const REPORT_PHASE_0_4_HELP: &str = "usage: gls-cli report phase-0-4 --candidates PATH --features PATH --embeddings PATH --similarity PATH --evidence PATH --out PATH";
+const REPORT_PHASE_0_5_HELP: &str = "usage: gls-cli report phase-0-5 --candidates PATH --sequence-evidence PATH --plm-gpu PATH --structure-manifest PATH --structure-quality PATH --patches PATH --out PATH --score-out PATH";
 const VALIDATE_HELP: &str =
     "usage: gls-cli validate <fasta|gff|fragment-kernel|ligand> --input PATH";
 const VALIDATE_FASTA_HELP: &str = "usage: gls-cli validate fasta --input PATH";

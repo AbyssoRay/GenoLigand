@@ -87,6 +87,24 @@ nextflow run workflows/phase_0_4_sequence_evidence.nf -profile mock
 nextflow run workflows/phase_0_4_sequence_evidence.nf -profile mock -resume
 ```
 
+## Phase 0.5 GPU Strict
+
+Phase 0.5 adds the GPU-only structure evidence layer. It requires CUDA diagnostics, CUDA PyTorch, GPU ESM-2 embeddings, GPU ESMFold structure prediction, structure quality metrics, 3D patch descriptors, a candidate ranking report, and a GPU-labeled Nextflow workflow to pass together. CPU or mock execution is useful for debugging only and cannot satisfy Phase 0.5 acceptance.
+
+Local-only resources stay ignored under `.phase_0_5_env/`, `models/phase_0_5/`, `databases/phase_0_5/`, and `acceptance_artifacts_phase_0_5_gpu_strict/`. The CUDA Toolkit path is configured as `D:\Program Files\CUDA`.
+
+Useful Phase 0.5 commands:
+
+```powershell
+python scripts/gpu/check_cuda_env.py --strict --nvcc "D:\Program Files\CUDA\bin\nvcc.exe" --out cuda_env.json
+python scripts/gpu/gpu_tensor_smoke_test.py --device cuda:0 --out cuda_tensor_smoke_test.json
+python scripts/plm/embed_candidates_gpu.py --input-fasta candidate_orfs.fasta --candidate-tsv candidate_orfs.tsv --output-dir plm_gpu --device cuda:0
+python scripts/structure/predict_structures_gpu.py --input-fasta candidate_orfs.fasta --candidate-tsv candidate_orfs.tsv --output-dir structures --device cuda:0
+gls-cli report phase-0-5 --candidates candidate_orfs.tsv --sequence-evidence sequence_evidence.tsv --plm-gpu plm_gpu/plm_embeddings.tsv --structure-manifest structures/structure_manifest.tsv --structure-quality structure_quality.tsv --patches patch_descriptors.tsv --out candidate_report_phase_0_5.md --score-out structure_score_decomposition.tsv
+nextflow run workflows/phase_0_5_gpu_strict.nf -profile gpu -with-trace -with-report -with-timeline
+nextflow run workflows/phase_0_5_gpu_strict.nf -profile gpu -resume -with-trace
+```
+
 ## License
 
 GenoLigand is distributed under the project EULA in `EULA.txt`.

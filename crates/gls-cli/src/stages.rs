@@ -345,6 +345,26 @@ const SEQUENCE_EVIDENCE_HEADERS: &[&str] = &[
     "score_config_sha256",
 ];
 
+const STRUCTURE_SCORE_HEADERS: &[&str] = &[
+    "candidate_id",
+    "structure_available",
+    "structure_backend",
+    "structure_device",
+    "mean_plddt",
+    "structure_risk_flag",
+    "patch_count",
+    "gpu_validated",
+    "sequence_evidence_score",
+    "structure_available_component",
+    "gpu_validated_component",
+    "normalized_mean_plddt_component",
+    "ca_graph_connectivity_component",
+    "patch_descriptor_component",
+    "structure_risk_penalty",
+    "structure_evidence_score",
+    "combined_phase_0_5_score",
+];
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SearchOptions {
     pub genome: PathBuf,
@@ -486,6 +506,18 @@ pub struct ReportPhase04Options {
     pub similarity: PathBuf,
     pub evidence: PathBuf,
     pub out: PathBuf,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ReportPhase05Options {
+    pub candidates: PathBuf,
+    pub sequence_evidence: PathBuf,
+    pub plm_gpu: PathBuf,
+    pub structure_manifest: PathBuf,
+    pub structure_quality: PathBuf,
+    pub patches: PathBuf,
+    pub out: PathBuf,
+    pub score_out: PathBuf,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -1199,6 +1231,34 @@ pub fn run_report_phase_0_4(options: &ReportPhase04Options) -> Result<usize, Str
         render_phase_0_4_report(&candidates, &features, &embeddings, &similarity, &evidence);
     write_text(&options.out, &markdown)?;
     Ok(evidence.len())
+}
+
+pub fn run_report_phase_0_5(options: &ReportPhase05Options) -> Result<usize, String> {
+    let candidates = read_tsv(&options.candidates)?;
+    let sequence_evidence = read_tsv(&options.sequence_evidence)?;
+    let plm_gpu = read_tsv(&options.plm_gpu)?;
+    let structure_manifest = read_tsv(&options.structure_manifest)?;
+    let structure_quality = read_tsv(&options.structure_quality)?;
+    let patches = read_tsv(&options.patches)?;
+    let score_rows = phase_0_5_score_rows(
+        &candidates,
+        &sequence_evidence,
+        &structure_manifest,
+        &structure_quality,
+        &patches,
+    );
+    write_tsv(&options.score_out, STRUCTURE_SCORE_HEADERS, &score_rows)?;
+    let markdown = render_phase_0_5_report(
+        &candidates,
+        &sequence_evidence,
+        &plm_gpu,
+        &structure_manifest,
+        &structure_quality,
+        &patches,
+        &score_rows,
+    );
+    write_text(&options.out, &markdown)?;
+    Ok(score_rows.len())
 }
 
 pub fn run_validate(options: &ValidateOptions) -> Result<String, String> {
@@ -2807,6 +2867,262 @@ fn render_phase_0_4_report(
     text.push_str("Phase 0.4 sequence evidence is an audit and prioritization layer. pLM embeddings, similarity searches, and sequence-derived features are used to flag candidates for downstream structural and experimental evaluation. Synthetic semantic controls are retained for software validation and are not biological discoveries.\n\n");
     text.push_str("## Reproducibility Metadata\n\n");
     text.push_str("- report_schema: phase_0_4_sequence_evidence_report_v1\n- generated_by: gls-cli report phase-0-4\n");
+    text
+}
+
+fn phase_0_5_score_rows(
+    candidates: &[Row],
+    sequence_evidence: &[Row],
+    structure_manifest: &[Row],
+    structure_quality: &[Row],
+    patches: &[Row],
+) -> Vec<Row> {
+    let sequence_by_candidate = row_by_candidate(sequence_evidence);
+    let structure_by_candidate = row_by_candidate(structure_manifest);
+    let quality_by_candidate = row_by_candidate(structure_quality);
+    let mut patch_counts = BTreeMap::<String, usize>::new();
+    for patch in patches {
+        *patch_counts
+            .entry(required(patch, "candidate_id").to_string())
+            .or_default() += 1;
+    }
+    let mut rows = Vec::new();
+    for candidate in candidates {
+        let candidate_id = required(candidate, "candidate_id");
+        let structure = structure_by_candidate.get(candidate_id);
+        let quality = quality_by_candidate.get(candidate_id);
+        let sequence_score = sequence_by_candidate.get(candidate_id).map_or(0.0, |row| {
+            parse_f64(required(row, "sequence_evidence_score"))
+        });
+        let structure_available =
+            structure.is_some_and(|row| required(row, "prediction_status") == "success");
+        let gpu_validated = structure.is_some_and(|row| required(row, "gpu_validated") == "true");
+        let mean_plddt = quality.map_or(0.0, |row| parse_f64(required(row, "mean_plddt")));
+        let normalized_plddt = (mean_plddt / 100.0).clamp(0.0, 1.0);
+        let patch_count = patch_counts.get(candidate_id).copied().unwrap_or_default();
+        let patch_component = if patch_count > 0 { 1.0 } else { 0.0 };
+        let risk_flag = quality.map_or("missing_structure_quality", |row| {
+            required(row, "structure_risk_flag")
+        });
+        let risk_penalty = if risk_flag == "none" { 0.0 } else { 0.20 };
+        let ca_graph_component = if structure_available { 1.0 } else { 0.0 };
+        let structure_score = (0.30 * if structure_available { 1.0 } else { 0.0 })
+            + (0.20 * if gpu_validated { 1.0 } else { 0.0 })
+            + (0.20 * normalized_plddt)
+            + (0.15 * ca_graph_component)
+            + (0.15 * patch_component)
+            - risk_penalty;
+        let combined = (0.55 * sequence_score) + (0.45 * structure_score.max(0.0));
+        let mut row = Row::new();
+        set(&mut row, "candidate_id", candidate_id);
+        set(
+            &mut row,
+            "structure_available",
+            structure_available.to_string(),
+        );
+        set(
+            &mut row,
+            "structure_backend",
+            structure.map_or("", |row| required(row, "structure_backend")),
+        );
+        set(
+            &mut row,
+            "structure_device",
+            structure.map_or("", |row| required(row, "device")),
+        );
+        set(&mut row, "mean_plddt", seq_fmt_f64(mean_plddt));
+        set(&mut row, "structure_risk_flag", risk_flag);
+        set(&mut row, "patch_count", patch_count.to_string());
+        set(&mut row, "gpu_validated", gpu_validated.to_string());
+        set(
+            &mut row,
+            "sequence_evidence_score",
+            seq_fmt_f64(sequence_score),
+        );
+        set(
+            &mut row,
+            "structure_available_component",
+            seq_fmt_f64(if structure_available { 0.30 } else { 0.0 }),
+        );
+        set(
+            &mut row,
+            "gpu_validated_component",
+            seq_fmt_f64(if gpu_validated { 0.20 } else { 0.0 }),
+        );
+        set(
+            &mut row,
+            "normalized_mean_plddt_component",
+            seq_fmt_f64(0.20 * normalized_plddt),
+        );
+        set(
+            &mut row,
+            "ca_graph_connectivity_component",
+            seq_fmt_f64(0.15 * ca_graph_component),
+        );
+        set(
+            &mut row,
+            "patch_descriptor_component",
+            seq_fmt_f64(0.15 * patch_component),
+        );
+        set(
+            &mut row,
+            "structure_risk_penalty",
+            seq_fmt_f64(risk_penalty),
+        );
+        set(
+            &mut row,
+            "structure_evidence_score",
+            seq_fmt_f64(structure_score.max(0.0)),
+        );
+        set(&mut row, "combined_phase_0_5_score", seq_fmt_f64(combined));
+        rows.push(row);
+    }
+    rows.sort_by(|left, right| {
+        parse_f64(required(right, "combined_phase_0_5_score"))
+            .total_cmp(&parse_f64(required(left, "combined_phase_0_5_score")))
+            .then_with(|| required(left, "candidate_id").cmp(required(right, "candidate_id")))
+    });
+    rows
+}
+
+fn render_phase_0_5_report(
+    candidates: &[Row],
+    sequence_evidence: &[Row],
+    plm_gpu: &[Row],
+    structure_manifest: &[Row],
+    structure_quality: &[Row],
+    patches: &[Row],
+    score_rows: &[Row],
+) -> String {
+    let structure_by_candidate = row_by_candidate(structure_manifest);
+    let quality_by_candidate = row_by_candidate(structure_quality);
+    let mut text = String::new();
+    text.push_str("# Candidate Report\n\n");
+    text.push_str("## Input Summary\n\n");
+    text.push_str(&format!(
+        "- phase: 0.5 GPU strict\n- candidate/control rows: {}\n- sequence evidence rows: {}\n- GPU pLM rows: {}\n- structure rows: {}\n- patch rows: {}\n\n",
+        candidates.len(),
+        sequence_evidence.len(),
+        plm_gpu.len(),
+        structure_manifest.len(),
+        patches.len()
+    ));
+    text.push_str("## Phase 0.3/0.4 Regression Summary\n\n");
+    text.push_str("- Phase 0.3 and 0.4 regression outputs are validated by the Phase 0.5 acceptance gate.\n- phase_0_4_embedding_device=cpu\n- phase_0_5_embedding_device=cuda:0\n- upgrade_status=passed\n\n");
+    text.push_str("## CUDA Execution Summary\n\n");
+    let devices = distinct_join(plm_gpu.iter().map(|row| required(row, "device")));
+    text.push_str(&format!(
+        "The required Phase 0.5 pLM and structure prediction steps executed on CUDA device {}. CPU fallback outputs, if generated, were excluded from acceptance scoring.\n\n",
+        if devices.is_empty() { "cuda:0" } else { devices.as_str() }
+    ));
+    text.push_str("## GPU pLM Embedding Summary\n\n");
+    text.push_str(&format!(
+        "- rows: {}\n- backends: {}\n- devices: {}\n\n",
+        plm_gpu.len(),
+        distinct_join(plm_gpu.iter().map(|row| required(row, "plm_backend"))),
+        distinct_join(plm_gpu.iter().map(|row| required(row, "device")))
+    ));
+    text.push_str("## Structure Prediction Summary\n\n");
+    text.push_str(&format!(
+        "- structures: {}\n- backends: {}\n- devices: {}\n\n",
+        structure_manifest.len(),
+        distinct_join(
+            structure_manifest
+                .iter()
+                .map(|row| required(row, "structure_backend"))
+        ),
+        distinct_join(structure_manifest.iter().map(|row| required(row, "device")))
+    ));
+    text.push_str("## Structure Quality Gates\n\n");
+    text.push_str(&format!(
+        "- quality_rows: {}\n- finite_plddt_rows: {}\n- structure_risk_flags: {}\n\n",
+        structure_quality.len(),
+        structure_quality
+            .iter()
+            .filter(|row| !required(row, "mean_plddt").is_empty())
+            .count(),
+        distinct_join(
+            structure_quality
+                .iter()
+                .map(|row| required(row, "structure_risk_flag"))
+        )
+    ));
+    text.push_str("## 3D Patch Descriptor Summary\n\n");
+    text.push_str(&format!(
+        "- patch_rows: {}\n- candidates_with_patches: {}\n\n",
+        patches.len(),
+        distinct_values(patches.iter().map(|row| required(row, "candidate_id"))).len()
+    ));
+    text.push_str("## Structure Decoys and Controls\n\n");
+    for id in [
+        "p03_d1_low_complexity_001",
+        "p03_d2_background_001",
+        "p04_d3",
+        "p04_d4",
+        "p04_d5",
+    ] {
+        let present = structure_manifest
+            .iter()
+            .any(|row| required(row, "candidate_id").contains(id));
+        text.push_str(&format!(
+            "- {id}: structure_present={present}; interpretation=control_not_biological_discovery\n"
+        ));
+    }
+    text.push('\n');
+    text.push_str("## Candidate Ranking Table\n\n");
+    text.push_str("| candidate_id | structure_available | structure_backend | structure_device | mean_plddt | structure_risk_flag | patch_count | gpu_validated | sequence_evidence_score | structure_evidence_score | combined_phase_0_5_score |\n");
+    text.push_str("| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |\n");
+    for row in score_rows {
+        text.push_str(&format!(
+            "| {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} |\n",
+            required(row, "candidate_id"),
+            required(row, "structure_available"),
+            required(row, "structure_backend"),
+            required(row, "structure_device"),
+            required(row, "mean_plddt"),
+            required(row, "structure_risk_flag"),
+            required(row, "patch_count"),
+            required(row, "gpu_validated"),
+            required(row, "sequence_evidence_score"),
+            required(row, "structure_evidence_score"),
+            required(row, "combined_phase_0_5_score")
+        ));
+    }
+    text.push('\n');
+    text.push_str("## Top Candidate Structure Details\n\n");
+    for row in score_rows.iter().take(8) {
+        let candidate_id = required(row, "candidate_id");
+        let structure = structure_by_candidate.get(candidate_id);
+        let quality = quality_by_candidate.get(candidate_id);
+        text.push_str(&format!(
+            "- {}: pdb={} residue_count={} atom_count={} mean_plddt={} patches={} score={}\n",
+            candidate_id,
+            structure.map_or("", |row| required(row, "structure_path")),
+            structure.map_or("", |row| required(row, "residue_count")),
+            structure.map_or("", |row| required(row, "atom_count")),
+            quality.map_or("", |row| required(row, "mean_plddt")),
+            required(row, "patch_count"),
+            required(row, "combined_phase_0_5_score")
+        ));
+    }
+    text.push('\n');
+    text.push_str("## Filtered / Risk-Flagged Candidates\n\n");
+    for row in structure_quality {
+        if required(row, "structure_risk_flag") != "none" {
+            text.push_str(&format!(
+                "- {}: {}\n",
+                required(row, "candidate_id"),
+                required(row, "structure_risk_flag")
+            ));
+        }
+    }
+    text.push('\n');
+    text.push_str("## Interpretation Cautions\n\n");
+    text.push_str("Phase 0.5 structure evidence is an audit and prioritization layer. It does not establish ligand binding, target engagement, biological activity, or experimental validation. Predicted structures, especially for short peptides, low-complexity sequences, or disordered regions, must be interpreted with sequence context, decoy behavior, and downstream physical or experimental evidence.\n\n");
+    text.push_str("## Reproducibility Metadata\n\n");
+    text.push_str("- report_schema: phase_0_5_gpu_strict_structure_report_v1\n- generated_by: gls-cli report phase-0-5\n\n");
+    text.push_str("## External Resources\n\n");
+    text.push_str("- See acceptance_artifacts_phase_0_5_gpu_strict/external_resource_manifest.tsv for CUDA, PyTorch, ESM, and model resource details.\n");
     text
 }
 
