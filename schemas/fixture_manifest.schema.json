@@ -23,6 +23,9 @@
           "interaction_labels",
           "resolution_angstrom",
           "interaction_kind",
+          "residue_flexibility_bin",
+          "pocket_depth_bin",
+          "coordinate_noise_level",
           "hash"
         ],
         "properties": {
@@ -57,6 +60,9 @@
               "generic"
             ]
           },
+          "residue_flexibility_bin": { "type": "string", "minLength": 1 },
+          "pocket_depth_bin": { "type": "string", "minLength": 1 },
+          "coordinate_noise_level": { "type": "string", "minLength": 1 },
           "hash": { "type": "string", "minLength": 1 }
         },
         "additionalProperties": true

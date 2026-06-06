@@ -9,6 +9,10 @@ import os
 import subprocess
 import sys
 
+if hasattr(sys.stdin, "reconfigure"):
+    sys.stdin.reconfigure(encoding="utf-8")
+    sys.stdout.reconfigure(encoding="utf-8")
+
 
 def respond_ok(payload: str = "") -> None:
     sys.stdout.write(f"OK\t{payload}\n" if payload else "OK\n")
@@ -65,7 +69,7 @@ def main() -> int:
         return 0
     external = ExternalLineProcess(command)
     for line in sys.stdin:
-        request = line.rstrip("\r\n")
+        request = line.lstrip("\ufeff").rstrip("\r\n")
         if not request.startswith("POCKET\t"):
             respond_err("pocket_worker_bad_request")
             continue

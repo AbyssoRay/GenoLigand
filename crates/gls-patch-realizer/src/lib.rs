@@ -205,39 +205,116 @@ fn bounded_ransac_kabsch(
     profile: &ToleranceProfile,
     config: &PatchRealizerConfig,
 ) -> Option<MatchResult> {
+    if icg.constraints.is_empty() {
+        return None;
+    }
+    let candidate_sets = icg
+        .constraints
+        .iter()
+        .map(|constraint| {
+            seed_nodes
+                .iter()
+                .copied()
+                .filter(|node| node_matches_constraint(node, constraint, profile))
+                .collect::<Vec<_>>()
+        })
+        .collect::<Vec<_>>();
+    if candidate_sets.iter().any(Vec::is_empty) {
+        return None;
+    }
+
+    let mut current = Vec::<&PatchNode>::with_capacity(icg.constraints.len());
+    let mut search = HypothesisSearch {
+        icg,
+        candidate_sets: &candidate_sets,
+        profile,
+        config,
+        evaluated: 0,
+        best: None,
+    };
+    search.enumerate(0, &mut current);
+    search.best
+}
+
+struct HypothesisSearch<'a, 'b> {
+    icg: &'b InteractionConstraintGraph,
+    candidate_sets: &'b [Vec<&'a PatchNode>],
+    profile: &'b ToleranceProfile,
+    config: &'b PatchRealizerConfig,
+    evaluated: usize,
+    best: Option<MatchResult>,
+}
+
+impl<'a> HypothesisSearch<'a, '_> {
+    fn enumerate(&mut self, depth: usize, current: &mut Vec<&'a PatchNode>) {
+        if self.evaluated >= self.profile.max_seed_triplets {
+            return;
+        }
+        if depth == self.candidate_sets.len() {
+            self.evaluated += 1;
+            if let Some(match_result) =
+                evaluate_hypothesis(self.icg, current, self.profile, self.config)
+            {
+                let replace = self
+                    .best
+                    .as_ref()
+                    .is_none_or(|existing| match_result.score > existing.score);
+                if replace {
+                    self.best = Some(match_result);
+                }
+            }
+            return;
+        }
+
+        for node in &self.candidate_sets[depth] {
+            if current
+                .iter()
+                .any(|selected| selected.node_id == node.node_id)
+            {
+                continue;
+            }
+            current.push(*node);
+            self.enumerate(depth + 1, current);
+            current.pop();
+            if self.evaluated >= self.profile.max_seed_triplets {
+                return;
+            }
+        }
+    }
+}
+
+fn node_matches_constraint(
+    node: &PatchNode,
+    constraint: &gls_types::InteractionConstraint,
+    profile: &ToleranceProfile,
+) -> bool {
+    if node.residue != constraint.residue || node.kind != constraint.kind {
+        return false;
+    }
+    let point = Point3::from(node.point);
+    let reference = Point3::from(constraint.point);
+    let angle = Point3::from(constraint.vector).angle_deg(Point3::from(node.vector));
+    point.distance(reference) <= profile.radius_tolerance
+        && angle <= profile.angle_tolerance_deg
+        && node.sasa >= profile.min_sasa
+        && node.occlusion <= profile.max_occlusion
+}
+
+fn evaluate_hypothesis(
+    icg: &InteractionConstraintGraph,
+    nodes: &[&PatchNode],
+    profile: &ToleranceProfile,
+    config: &PatchRealizerConfig,
+) -> Option<MatchResult> {
     let mut reference_points = Vec::new();
     let mut mobile_points = Vec::new();
     let mut angle_penalty = 0.0;
     let mut exposure_score = 0.0;
     let mut occlusion_score_sum = 0.0;
 
-    for constraint in &icg.constraints {
+    for (constraint, node) in icg.constraints.iter().zip(nodes) {
         let reference = Point3::from(constraint.point);
         let reference_vector = Point3::from(constraint.vector);
-        let best = seed_nodes
-            .iter()
-            .filter(|node| node.residue == constraint.residue && node.kind == constraint.kind)
-            .filter_map(|node| {
-                let point = Point3::from(node.point);
-                let distance = reference.distance(point);
-                let angle = reference_vector.angle_deg(Point3::from(node.vector));
-                let sasa_ok = node.sasa >= profile.min_sasa;
-                let occlusion_ok = node.occlusion <= profile.max_occlusion;
-                if distance <= profile.radius_tolerance
-                    && angle <= profile.angle_tolerance_deg
-                    && sasa_ok
-                    && occlusion_ok
-                {
-                    Some((
-                        *node,
-                        distance + angle / profile.angle_tolerance_deg.max(f64::EPSILON),
-                    ))
-                } else {
-                    None
-                }
-            })
-            .min_by(|a, b| a.1.total_cmp(&b.1));
-        let (node, _) = best?;
         reference_points.push(reference);
         mobile_points.push(Point3::from(node.point));
         angle_penalty += reference_vector.angle_deg(Point3::from(node.vector))
@@ -360,6 +437,9 @@ mod tests {
             interaction_kind: InteractionKind::HydrogenBond,
             ligand_class: "generic".to_string(),
             structure_confidence_bin: "high".to_string(),
+            residue_flexibility_bin: "medium".to_string(),
+            pocket_depth_bin: "shallow".to_string(),
+            coordinate_noise_level: "low".to_string(),
             radius_tolerance: radius,
             angle_tolerance_deg: 20.0,
             distance_bin_width: radius,

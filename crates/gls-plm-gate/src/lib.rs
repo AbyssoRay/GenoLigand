@@ -393,6 +393,48 @@ mod tests {
     }
 
     #[test]
+    fn versioned_embedding_cache_is_reused_across_runs() {
+        let c = candidate("c1", "WQHACDEFG");
+        let config = PlmGateConfig::dev_gpu_lowmem();
+        let mut passing_gate = gate(&c, true);
+        passing_gate.fragment_info_score = 12.0;
+        let mut cache = EmbeddingCache::default();
+        let mut first_worker = MockPlmWorker::default();
+        run_plm_gate(
+            std::slice::from_ref(&c),
+            std::slice::from_ref(&passing_gate),
+            &config,
+            &mut cache,
+            &mut first_worker,
+        )
+        .expect("first pLM run");
+        let mut second_worker = MockPlmWorker::default();
+        let second_results = run_plm_gate(
+            std::slice::from_ref(&c),
+            &[passing_gate],
+            &config,
+            &mut cache,
+            &mut second_worker,
+        )
+        .expect("second pLM run");
+
+        assert_eq!(first_worker.embedded_sequences(), 1);
+        assert_eq!(second_worker.embedded_sequences(), 0);
+        assert_eq!(cache.len(), 1);
+        assert!(
+            second_results[0]
+                .cache_key
+                .contains(&config.primary_model.model_id)
+        );
+        assert!(
+            second_results[0]
+                .cache_key
+                .contains(&config.primary_model.weights_hash)
+        );
+        assert!(second_results[0].embedding_from_cache);
+    }
+
+    #[test]
     fn budget_exhaustion_is_stable_failure_before_worker() {
         let c1 = candidate("c1", "WQHACDEFG");
         let c2 = candidate("c2", "WQHACDEFGK");

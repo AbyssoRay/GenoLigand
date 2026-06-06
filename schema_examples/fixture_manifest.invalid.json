@@ -13,6 +13,9 @@
       "interaction_labels": [],
       "resolution_angstrom": 0,
       "interaction_kind": "hydrogen_bond",
+      "residue_flexibility_bin": "",
+      "pocket_depth_bin": "shallow",
+      "coordinate_noise_level": "low",
       "hash": ""
     }
   ]

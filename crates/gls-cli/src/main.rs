@@ -1,6 +1,6 @@
 use gls_cli::{
-    DevSmokeInputs, WorkerCommandSet, run_dev_smoke_with_worker_commands_and_inputs,
-    run_worker_command,
+    DevSmokeInputs, WorkerCommandSet, run_calibrate_patch_tolerance_json,
+    run_dev_smoke_with_worker_commands_and_inputs, run_worker_command,
 };
 use gls_report::{render_html, render_markdown};
 use std::path::PathBuf;
@@ -27,6 +27,15 @@ fn main() {
         "dev-smoke-html" => worker_bin
             .and_then(|path| run_dev_smoke_cli(&path, &args[1..]))
             .map(|report| render_html(&report)),
+        "gls-calibrate-patch-tolerance" | "calibrate-patch-tolerance" => {
+            let options = CalibrationOptions::parse(&args[1..]);
+            options.and_then(|options| {
+                run_calibrate_patch_tolerance_json(
+                    options.fixture_tsv.as_deref(),
+                    options.dataset_id.as_deref(),
+                )
+            })
+        }
         _ => Err(format!("unknown_command:{command}")),
     };
     match result {
@@ -51,6 +60,46 @@ fn run_dev_smoke_cli(
         WorkerCommandSet::from_env_or_dev(worker_bin),
         inputs,
     )
+}
+
+#[derive(Default)]
+struct CalibrationOptions {
+    fixture_tsv: Option<PathBuf>,
+    dataset_id: Option<String>,
+}
+
+impl CalibrationOptions {
+    fn parse(args: &[String]) -> Result<Self, String> {
+        let mut options = Self::default();
+        let mut index = 0;
+        while index < args.len() {
+            match args[index].as_str() {
+                "--fixture-tsv" => {
+                    index += 1;
+                    let value = args
+                        .get(index)
+                        .ok_or_else(|| "missing_value_for:--fixture-tsv".to_string())?;
+                    options.fixture_tsv = Some(PathBuf::from(value));
+                }
+                "--dataset-id" => {
+                    index += 1;
+                    let value = args
+                        .get(index)
+                        .ok_or_else(|| "missing_value_for:--dataset-id".to_string())?;
+                    options.dataset_id = Some(value.clone());
+                }
+                "--help" | "-h" => {
+                    return Err(
+                        "usage: gls-cli gls-calibrate-patch-tolerance [--fixture-tsv PATH] [--dataset-id ID]"
+                            .to_string(),
+                    );
+                }
+                other => return Err(format!("unknown_calibration_option:{other}")),
+            }
+            index += 1;
+        }
+        Ok(options)
+    }
 }
 
 #[derive(Default)]

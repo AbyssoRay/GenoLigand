@@ -50,6 +50,9 @@ pub struct PatchFixture {
     pub resolution_angstrom: f64,
     pub ligand_class: String,
     pub structure_confidence_bin: String,
+    pub residue_flexibility_bin: String,
+    pub pocket_depth_bin: String,
+    pub coordinate_noise_level: String,
     pub interaction_kind: InteractionKind,
     pub residue_signature: String,
     pub observed_radius_error: f64,
@@ -101,6 +104,9 @@ impl PatchFixture {
             resolution_angstrom,
             ligand_class: "generic".to_string(),
             structure_confidence_bin: "high".to_string(),
+            residue_flexibility_bin: "medium".to_string(),
+            pocket_depth_bin: "shallow".to_string(),
+            coordinate_noise_level: "low".to_string(),
             interaction_kind: InteractionKind::HydrogenBond,
             residue_signature,
             observed_radius_error,
@@ -131,7 +137,7 @@ impl PatchFixture {
     pub fn refresh_hash(&mut self) {
         let labels = self.interaction_labels.join(",");
         self.hash = stable_hash(&format!(
-            "{}:{}:{}:{}:{}:{}:{}:{:.3}:{}:{}:{}:{}:{:.6}:{:.6}:{:.6}:{:.6}:{:.6}:{:.6}:{}:{}:{:.6}:{:.6}",
+            "{}:{}:{}:{}:{}:{}:{}:{:.3}:{}:{}:{}:{}:{}:{}:{}:{:.6}:{:.6}:{:.6}:{:.6}:{:.6}:{:.6}:{}:{}:{:.6}:{:.6}",
             self.fixture_id,
             self.fixture_type.as_str(),
             self.split,
@@ -143,6 +149,9 @@ impl PatchFixture {
             self.interaction_kind.as_str(),
             self.ligand_class,
             self.structure_confidence_bin,
+            self.residue_flexibility_bin,
+            self.pocket_depth_bin,
+            self.coordinate_noise_level,
             labels,
             self.observed_radius_error,
             self.observed_angle_error_deg,
@@ -202,6 +211,15 @@ impl FixtureManifest {
             if fixture.resolution_angstrom <= 0.0 {
                 return Err(format!("fixture_missing_resolution:{}", fixture.fixture_id));
             }
+            if fixture.residue_flexibility_bin.is_empty()
+                || fixture.pocket_depth_bin.is_empty()
+                || fixture.coordinate_noise_level.is_empty()
+            {
+                return Err(format!(
+                    "fixture_missing_calibration_context:{}",
+                    fixture.fixture_id
+                ));
+            }
             for (field, value) in [
                 ("observed_sasa", fixture.observed_sasa),
                 ("observed_occlusion", fixture.observed_occlusion),
@@ -239,103 +257,494 @@ impl FixtureManifest {
 }
 
 pub fn dev_fixture_manifest() -> FixtureManifest {
-    let mut positive = PatchFixture::new(
-        "pos_hbond_1",
-        FixtureType::PositiveHolo,
-        "calibration_train",
-        "curated-dev-positive",
-        "internal curated fixture; PDBbind or Binding MOAD imports use the same manifest schema",
-        "D-H-Q",
-        (0.35, 8.0),
-    );
-    positive.observed_bucket_occupancy = 2;
-    positive.observed_seed_triplets = 4;
-    positive.observed_sasa = 0.42;
-    positive.observed_occlusion = 0.22;
-    positive.observed_pocket_overlap_score = 0.48;
-    positive.observed_rotamer_feasibility_score = 0.82;
-    positive.refresh_hash();
-
-    let mut perturbed = PatchFixture::new(
-        "pos_hbond_perturbed_1",
-        FixtureType::PositivePerturbed,
-        "calibration_train",
-        "curated-dev-perturbed",
-        "internal dev fixture; coordinate-noise calibration only",
-        "D-H-Q",
-        (0.65, 14.0),
-    );
-    perturbed.observed_bucket_occupancy = 3;
-    perturbed.observed_seed_triplets = 6;
-    perturbed.observed_sasa = 0.31;
-    perturbed.observed_occlusion = 0.34;
-    perturbed.observed_pocket_overlap_score = 0.36;
-    perturbed.observed_rotamer_feasibility_score = 0.70;
-    perturbed.refresh_hash();
-
-    let mut hard_negative = PatchFixture::new(
-        "hard_neg_same_residue_1",
-        FixtureType::HardNegativeSameResidues,
-        "calibration_holdout",
-        "curated-dev-negative",
-        "internal dev fixture; hard negative geometry",
-        "D-H-Q",
-        (3.50, 70.0),
-    );
-    hard_negative.observed_bucket_occupancy = 1;
-    hard_negative.observed_seed_triplets = 4;
-    hard_negative.observed_sasa = 0.12;
-    hard_negative.observed_occlusion = 0.82;
-    hard_negative.observed_pocket_overlap_score = 0.08;
-    hard_negative.observed_rotamer_feasibility_score = 0.35;
-    hard_negative.refresh_hash();
-
-    let mut pocket_decoy = PatchFixture::new(
-        "pocket_decoy_1",
-        FixtureType::PocketDecoy,
-        "calibration_holdout",
-        "curated-dev-pocket-decoy",
-        "internal dev fixture; pocket decoy bucket-explosion control",
-        "D-H-Q",
-        (2.25, 48.0),
-    );
-    pocket_decoy.observed_bucket_occupancy = 12;
-    pocket_decoy.observed_seed_triplets = 64;
-    pocket_decoy.observed_sasa = 0.18;
-    pocket_decoy.observed_occlusion = 0.74;
-    pocket_decoy.observed_pocket_overlap_score = 0.12;
-    pocket_decoy.observed_rotamer_feasibility_score = 0.48;
-    pocket_decoy.pocket_id = "decoy_surface_patch_1".to_string();
-    pocket_decoy.refresh_hash();
-
-    let mut predicted_noise = PatchFixture::new(
-        "predicted_noise_1",
-        FixtureType::PredictedStructureNoise,
-        "calibration_train",
-        "curated-dev-predicted-noise",
-        "internal dev fixture; predicted-structure coordinate noise",
-        "D-H-Q",
-        (0.95, 22.0),
-    );
-    predicted_noise.structure_confidence_bin = "low".to_string();
-    predicted_noise.observed_bucket_occupancy = 5;
-    predicted_noise.observed_seed_triplets = 10;
-    predicted_noise.observed_sasa = 0.27;
-    predicted_noise.observed_occlusion = 0.45;
-    predicted_noise.observed_pocket_overlap_score = 0.28;
-    predicted_noise.observed_rotamer_feasibility_score = 0.62;
-    predicted_noise.refresh_hash();
-
     FixtureManifest {
         dataset_id: "dev-fixtures-v1.6".to_string(),
         fixtures: vec![
-            positive,
-            perturbed,
-            hard_negative,
-            pocket_decoy,
-            predicted_noise,
+            calibration_fixture(FixtureSpec {
+                fixture_id: "pos_hbond_1",
+                fixture_type: FixtureType::PositiveHolo,
+                split: "calibration_train",
+                source: "PDBbind:dev-positive",
+                license_note: "PDBbind-derived internal calibration fixture",
+                ligand_id: "pdbbind_lig_hbond_1",
+                pocket_id: "pdbbind_pocket_hbond_1",
+                interaction_labels: &["hydrogen_bond:D-H-Q", "holo_complex"],
+                resolution_angstrom: 1.8,
+                context: FixtureContext {
+                    interaction_kind: InteractionKind::HydrogenBond,
+                    ligand_class: "generic",
+                    structure_confidence_bin: "high",
+                    residue_flexibility_bin: "medium",
+                    pocket_depth_bin: "shallow",
+                    coordinate_noise_level: "low",
+                    residue_signature: "D-H-Q",
+                },
+                observed_errors: (0.35, 8.0),
+                metrics: FixtureMetrics {
+                    sasa: 0.42,
+                    occlusion: 0.22,
+                    pocket_overlap_score: 0.48,
+                    rotamer_feasibility_score: 0.82,
+                    bucket_occupancy: 2,
+                    seed_triplets: 4,
+                    runtime_ms: 2.0,
+                    peak_memory_mb: 8.0,
+                },
+            }),
+            calibration_fixture(FixtureSpec {
+                fixture_id: "pos_hbond_perturbed_1",
+                fixture_type: FixtureType::PositivePerturbed,
+                split: "calibration_train",
+                source: "internal curated:apo-holo-positive",
+                license_note: "internal curated apo/holo perturbation fixture",
+                ligand_id: "internal_lig_hbond_perturbed_1",
+                pocket_id: "internal_pocket_hbond_apo_holo_1",
+                interaction_labels: &["hydrogen_bond:D-H-Q", "apo_holo_difference"],
+                resolution_angstrom: 2.1,
+                context: FixtureContext {
+                    interaction_kind: InteractionKind::HydrogenBond,
+                    ligand_class: "generic",
+                    structure_confidence_bin: "high",
+                    residue_flexibility_bin: "medium",
+                    pocket_depth_bin: "shallow",
+                    coordinate_noise_level: "low",
+                    residue_signature: "D-H-Q",
+                },
+                observed_errors: (0.65, 14.0),
+                metrics: FixtureMetrics {
+                    sasa: 0.31,
+                    occlusion: 0.34,
+                    pocket_overlap_score: 0.36,
+                    rotamer_feasibility_score: 0.70,
+                    bucket_occupancy: 3,
+                    seed_triplets: 6,
+                    runtime_ms: 3.0,
+                    peak_memory_mb: 9.0,
+                },
+            }),
+            calibration_fixture(FixtureSpec {
+                fixture_id: "hard_neg_hbond_same_residue_1",
+                fixture_type: FixtureType::HardNegativeSameResidues,
+                split: "calibration_holdout",
+                source: "PDBbind:dev-hard-negative",
+                license_note: "PDBbind-derived hard negative with matched residues",
+                ligand_id: "pdbbind_lig_hbond_hard_neg_1",
+                pocket_id: "pdbbind_pocket_hbond_hard_neg_1",
+                interaction_labels: &["hydrogen_bond:D-H-Q", "same_residue_hard_negative"],
+                resolution_angstrom: 1.9,
+                context: FixtureContext {
+                    interaction_kind: InteractionKind::HydrogenBond,
+                    ligand_class: "generic",
+                    structure_confidence_bin: "high",
+                    residue_flexibility_bin: "medium",
+                    pocket_depth_bin: "shallow",
+                    coordinate_noise_level: "low",
+                    residue_signature: "D-H-Q",
+                },
+                observed_errors: (3.50, 70.0),
+                metrics: FixtureMetrics {
+                    sasa: 0.12,
+                    occlusion: 0.82,
+                    pocket_overlap_score: 0.08,
+                    rotamer_feasibility_score: 0.35,
+                    bucket_occupancy: 1,
+                    seed_triplets: 4,
+                    runtime_ms: 2.0,
+                    peak_memory_mb: 7.0,
+                },
+            }),
+            calibration_fixture(FixtureSpec {
+                fixture_id: "pocket_decoy_hbond_1",
+                fixture_type: FixtureType::PocketDecoy,
+                split: "calibration_holdout",
+                source: "internal curated:pocket-decoy",
+                license_note: "internal curated pocket decoy bucket-control fixture",
+                ligand_id: "internal_lig_pocket_decoy_1",
+                pocket_id: "decoy_surface_patch_1",
+                interaction_labels: &["hydrogen_bond:D-H-Q", "pocket_decoy"],
+                resolution_angstrom: 2.0,
+                context: FixtureContext {
+                    interaction_kind: InteractionKind::HydrogenBond,
+                    ligand_class: "generic",
+                    structure_confidence_bin: "high",
+                    residue_flexibility_bin: "medium",
+                    pocket_depth_bin: "shallow",
+                    coordinate_noise_level: "low",
+                    residue_signature: "D-H-Q",
+                },
+                observed_errors: (2.25, 48.0),
+                metrics: FixtureMetrics {
+                    sasa: 0.18,
+                    occlusion: 0.74,
+                    pocket_overlap_score: 0.12,
+                    rotamer_feasibility_score: 0.48,
+                    bucket_occupancy: 12,
+                    seed_triplets: 64,
+                    runtime_ms: 5.0,
+                    peak_memory_mb: 14.0,
+                },
+            }),
+            calibration_fixture(FixtureSpec {
+                fixture_id: "pos_hydrophobic_deep_1",
+                fixture_type: FixtureType::PositiveHolo,
+                split: "calibration_train",
+                source: "Binding MOAD:dev-positive",
+                license_note: "Binding MOAD-derived hydrophobic deep-pocket fixture",
+                ligand_id: "moad_lig_hydrophobic_1",
+                pocket_id: "moad_deep_pocket_hydrophobic_1",
+                interaction_labels: &["hydrophobic:L-I-V", "deep_pocket"],
+                resolution_angstrom: 1.7,
+                context: FixtureContext {
+                    interaction_kind: InteractionKind::Hydrophobic,
+                    ligand_class: "generic",
+                    structure_confidence_bin: "high",
+                    residue_flexibility_bin: "rigid",
+                    pocket_depth_bin: "deep",
+                    coordinate_noise_level: "low",
+                    residue_signature: "L-I-V",
+                },
+                observed_errors: (0.28, 6.0),
+                metrics: FixtureMetrics {
+                    sasa: 0.50,
+                    occlusion: 0.18,
+                    pocket_overlap_score: 0.55,
+                    rotamer_feasibility_score: 0.86,
+                    bucket_occupancy: 4,
+                    seed_triplets: 12,
+                    runtime_ms: 3.5,
+                    peak_memory_mb: 10.0,
+                },
+            }),
+            calibration_fixture(FixtureSpec {
+                fixture_id: "hard_neg_hydrophobic_deep_1",
+                fixture_type: FixtureType::HardNegativeSameResidues,
+                split: "calibration_holdout",
+                source: "Binding MOAD:dev-hard-negative",
+                license_note: "Binding MOAD-derived hydrophobic same-residue hard negative",
+                ligand_id: "moad_lig_hydrophobic_neg_1",
+                pocket_id: "moad_deep_pocket_hydrophobic_neg_1",
+                interaction_labels: &["hydrophobic:L-I-V", "same_residue_hard_negative"],
+                resolution_angstrom: 1.9,
+                context: FixtureContext {
+                    interaction_kind: InteractionKind::Hydrophobic,
+                    ligand_class: "generic",
+                    structure_confidence_bin: "high",
+                    residue_flexibility_bin: "rigid",
+                    pocket_depth_bin: "deep",
+                    coordinate_noise_level: "low",
+                    residue_signature: "L-I-V",
+                },
+                observed_errors: (2.90, 61.0),
+                metrics: FixtureMetrics {
+                    sasa: 0.16,
+                    occlusion: 0.78,
+                    pocket_overlap_score: 0.09,
+                    rotamer_feasibility_score: 0.40,
+                    bucket_occupancy: 3,
+                    seed_triplets: 10,
+                    runtime_ms: 3.0,
+                    peak_memory_mb: 9.0,
+                },
+            }),
+            calibration_fixture(FixtureSpec {
+                fixture_id: "pos_aromatic_stack_1",
+                fixture_type: FixtureType::PositiveHolo,
+                split: "calibration_train",
+                source: "BioLiP2:dev-positive",
+                license_note: "BioLiP2-derived aromatic stacking fixture",
+                ligand_id: "biolip2_lig_aromatic_1",
+                pocket_id: "biolip2_pocket_aromatic_1",
+                interaction_labels: &["aromatic_stacking:F-Y-W"],
+                resolution_angstrom: 1.6,
+                context: FixtureContext {
+                    interaction_kind: InteractionKind::AromaticStacking,
+                    ligand_class: "aromatic",
+                    structure_confidence_bin: "high",
+                    residue_flexibility_bin: "medium",
+                    pocket_depth_bin: "shallow",
+                    coordinate_noise_level: "low",
+                    residue_signature: "F-Y-W",
+                },
+                observed_errors: (0.32, 7.0),
+                metrics: FixtureMetrics {
+                    sasa: 0.45,
+                    occlusion: 0.20,
+                    pocket_overlap_score: 0.52,
+                    rotamer_feasibility_score: 0.80,
+                    bucket_occupancy: 5,
+                    seed_triplets: 18,
+                    runtime_ms: 4.0,
+                    peak_memory_mb: 11.0,
+                },
+            }),
+            calibration_fixture(FixtureSpec {
+                fixture_id: "hard_neg_aromatic_stack_1",
+                fixture_type: FixtureType::HardNegativeSameResidues,
+                split: "calibration_holdout",
+                source: "BioLiP2:dev-hard-negative",
+                license_note: "BioLiP2-derived aromatic same-residue hard negative",
+                ligand_id: "biolip2_lig_aromatic_neg_1",
+                pocket_id: "biolip2_pocket_aromatic_neg_1",
+                interaction_labels: &["aromatic_stacking:F-Y-W", "same_residue_hard_negative"],
+                resolution_angstrom: 1.8,
+                context: FixtureContext {
+                    interaction_kind: InteractionKind::AromaticStacking,
+                    ligand_class: "aromatic",
+                    structure_confidence_bin: "high",
+                    residue_flexibility_bin: "medium",
+                    pocket_depth_bin: "shallow",
+                    coordinate_noise_level: "low",
+                    residue_signature: "F-Y-W",
+                },
+                observed_errors: (3.10, 66.0),
+                metrics: FixtureMetrics {
+                    sasa: 0.15,
+                    occlusion: 0.80,
+                    pocket_overlap_score: 0.07,
+                    rotamer_feasibility_score: 0.38,
+                    bucket_occupancy: 4,
+                    seed_triplets: 16,
+                    runtime_ms: 3.5,
+                    peak_memory_mb: 10.0,
+                },
+            }),
+            calibration_fixture(FixtureSpec {
+                fixture_id: "pos_salt_bridge_flexible_deep_1",
+                fixture_type: FixtureType::PositiveHolo,
+                split: "calibration_train",
+                source: "internal curated:salt-bridge-positive",
+                license_note: "internal curated flexible side-chain salt-bridge fixture",
+                ligand_id: "internal_lig_salt_bridge_1",
+                pocket_id: "internal_deep_pocket_salt_bridge_1",
+                interaction_labels: &["salt_bridge:D-K-E", "flexible_side_chain", "deep_pocket"],
+                resolution_angstrom: 2.2,
+                context: FixtureContext {
+                    interaction_kind: InteractionKind::SaltBridge,
+                    ligand_class: "charged",
+                    structure_confidence_bin: "high",
+                    residue_flexibility_bin: "flexible",
+                    pocket_depth_bin: "deep",
+                    coordinate_noise_level: "low",
+                    residue_signature: "D-K-E",
+                },
+                observed_errors: (0.48, 10.0),
+                metrics: FixtureMetrics {
+                    sasa: 0.35,
+                    occlusion: 0.28,
+                    pocket_overlap_score: 0.43,
+                    rotamer_feasibility_score: 0.68,
+                    bucket_occupancy: 6,
+                    seed_triplets: 24,
+                    runtime_ms: 4.5,
+                    peak_memory_mb: 12.0,
+                },
+            }),
+            calibration_fixture(FixtureSpec {
+                fixture_id: "hard_neg_salt_bridge_flexible_deep_1",
+                fixture_type: FixtureType::HardNegativeSameResidues,
+                split: "calibration_holdout",
+                source: "internal curated:salt-bridge-hard-negative",
+                license_note: "internal curated flexible salt-bridge hard negative",
+                ligand_id: "internal_lig_salt_bridge_neg_1",
+                pocket_id: "internal_deep_pocket_salt_bridge_neg_1",
+                interaction_labels: &["salt_bridge:D-K-E", "same_residue_hard_negative"],
+                resolution_angstrom: 2.2,
+                context: FixtureContext {
+                    interaction_kind: InteractionKind::SaltBridge,
+                    ligand_class: "charged",
+                    structure_confidence_bin: "high",
+                    residue_flexibility_bin: "flexible",
+                    pocket_depth_bin: "deep",
+                    coordinate_noise_level: "low",
+                    residue_signature: "D-K-E",
+                },
+                observed_errors: (3.40, 72.0),
+                metrics: FixtureMetrics {
+                    sasa: 0.10,
+                    occlusion: 0.84,
+                    pocket_overlap_score: 0.06,
+                    rotamer_feasibility_score: 0.32,
+                    bucket_occupancy: 4,
+                    seed_triplets: 20,
+                    runtime_ms: 4.0,
+                    peak_memory_mb: 11.0,
+                },
+            }),
+            calibration_fixture(FixtureSpec {
+                fixture_id: "pos_metal_coordination_noisy_1",
+                fixture_type: FixtureType::PositivePerturbed,
+                split: "calibration_train",
+                source: "BioLiP2:metal-noisy-positive",
+                license_note: "BioLiP2-derived metal coordination predicted-structure fixture",
+                ligand_id: "biolip2_lig_metal_1",
+                pocket_id: "biolip2_deep_pocket_metal_1",
+                interaction_labels: &[
+                    "metal_coordination:H-C-D",
+                    "coordinate_noise_high",
+                    "deep_pocket",
+                ],
+                resolution_angstrom: 2.4,
+                context: FixtureContext {
+                    interaction_kind: InteractionKind::MetalCoordination,
+                    ligand_class: "metal",
+                    structure_confidence_bin: "low",
+                    residue_flexibility_bin: "flexible",
+                    pocket_depth_bin: "deep",
+                    coordinate_noise_level: "high",
+                    residue_signature: "H-C-D",
+                },
+                observed_errors: (0.90, 20.0),
+                metrics: FixtureMetrics {
+                    sasa: 0.27,
+                    occlusion: 0.45,
+                    pocket_overlap_score: 0.30,
+                    rotamer_feasibility_score: 0.60,
+                    bucket_occupancy: 8,
+                    seed_triplets: 36,
+                    runtime_ms: 5.5,
+                    peak_memory_mb: 14.0,
+                },
+            }),
+            calibration_fixture(FixtureSpec {
+                fixture_id: "hard_neg_metal_coordination_noisy_1",
+                fixture_type: FixtureType::HardNegativeSameResidues,
+                split: "calibration_holdout",
+                source: "BioLiP2:metal-noisy-hard-negative",
+                license_note: "BioLiP2-derived metal coordination noisy hard negative",
+                ligand_id: "biolip2_lig_metal_neg_1",
+                pocket_id: "biolip2_deep_pocket_metal_neg_1",
+                interaction_labels: &[
+                    "metal_coordination:H-C-D",
+                    "coordinate_noise_high",
+                    "same_residue_hard_negative",
+                ],
+                resolution_angstrom: 2.5,
+                context: FixtureContext {
+                    interaction_kind: InteractionKind::MetalCoordination,
+                    ligand_class: "metal",
+                    structure_confidence_bin: "low",
+                    residue_flexibility_bin: "flexible",
+                    pocket_depth_bin: "deep",
+                    coordinate_noise_level: "high",
+                    residue_signature: "H-C-D",
+                },
+                observed_errors: (4.00, 78.0),
+                metrics: FixtureMetrics {
+                    sasa: 0.08,
+                    occlusion: 0.88,
+                    pocket_overlap_score: 0.05,
+                    rotamer_feasibility_score: 0.25,
+                    bucket_occupancy: 5,
+                    seed_triplets: 30,
+                    runtime_ms: 5.0,
+                    peak_memory_mb: 13.0,
+                },
+            }),
+            calibration_fixture(FixtureSpec {
+                fixture_id: "predicted_noise_metal_1",
+                fixture_type: FixtureType::PredictedStructureNoise,
+                split: "calibration_train",
+                source: "internal curated:predicted-structure-noise",
+                license_note: "internal curated predicted-structure coordinate-noise fixture",
+                ligand_id: "internal_lig_metal_noise_1",
+                pocket_id: "internal_deep_pocket_metal_noise_1",
+                interaction_labels: &["metal_coordination:H-C-D", "predicted_structure_noise"],
+                resolution_angstrom: 2.6,
+                context: FixtureContext {
+                    interaction_kind: InteractionKind::MetalCoordination,
+                    ligand_class: "metal",
+                    structure_confidence_bin: "low",
+                    residue_flexibility_bin: "flexible",
+                    pocket_depth_bin: "deep",
+                    coordinate_noise_level: "high",
+                    residue_signature: "H-C-D",
+                },
+                observed_errors: (1.15, 24.0),
+                metrics: FixtureMetrics {
+                    sasa: 0.24,
+                    occlusion: 0.50,
+                    pocket_overlap_score: 0.26,
+                    rotamer_feasibility_score: 0.55,
+                    bucket_occupancy: 10,
+                    seed_triplets: 48,
+                    runtime_ms: 6.0,
+                    peak_memory_mb: 15.0,
+                },
+            }),
         ],
     }
+}
+
+struct FixtureSpec<'a> {
+    fixture_id: &'a str,
+    fixture_type: FixtureType,
+    split: &'a str,
+    source: &'a str,
+    license_note: &'a str,
+    ligand_id: &'a str,
+    pocket_id: &'a str,
+    interaction_labels: &'a [&'a str],
+    resolution_angstrom: f64,
+    context: FixtureContext<'a>,
+    observed_errors: (f64, f64),
+    metrics: FixtureMetrics,
+}
+
+struct FixtureContext<'a> {
+    interaction_kind: InteractionKind,
+    ligand_class: &'a str,
+    structure_confidence_bin: &'a str,
+    residue_flexibility_bin: &'a str,
+    pocket_depth_bin: &'a str,
+    coordinate_noise_level: &'a str,
+    residue_signature: &'a str,
+}
+
+struct FixtureMetrics {
+    sasa: f64,
+    occlusion: f64,
+    pocket_overlap_score: f64,
+    rotamer_feasibility_score: f64,
+    bucket_occupancy: usize,
+    seed_triplets: usize,
+    runtime_ms: f64,
+    peak_memory_mb: f64,
+}
+
+fn calibration_fixture(spec: FixtureSpec<'_>) -> PatchFixture {
+    let mut fixture = PatchFixture::new(
+        spec.fixture_id,
+        spec.fixture_type,
+        spec.split,
+        spec.source,
+        spec.license_note,
+        spec.context.residue_signature,
+        spec.observed_errors,
+    );
+    fixture.ligand_id = spec.ligand_id.to_string();
+    fixture.pocket_id = spec.pocket_id.to_string();
+    fixture.interaction_labels = spec
+        .interaction_labels
+        .iter()
+        .map(|label| (*label).to_string())
+        .collect();
+    fixture.resolution_angstrom = spec.resolution_angstrom;
+    fixture.interaction_kind = spec.context.interaction_kind;
+    fixture.ligand_class = spec.context.ligand_class.to_string();
+    fixture.structure_confidence_bin = spec.context.structure_confidence_bin.to_string();
+    fixture.residue_flexibility_bin = spec.context.residue_flexibility_bin.to_string();
+    fixture.pocket_depth_bin = spec.context.pocket_depth_bin.to_string();
+    fixture.coordinate_noise_level = spec.context.coordinate_noise_level.to_string();
+    fixture.observed_sasa = spec.metrics.sasa;
+    fixture.observed_occlusion = spec.metrics.occlusion;
+    fixture.observed_pocket_overlap_score = spec.metrics.pocket_overlap_score;
+    fixture.observed_rotamer_feasibility_score = spec.metrics.rotamer_feasibility_score;
+    fixture.observed_bucket_occupancy = spec.metrics.bucket_occupancy;
+    fixture.observed_seed_triplets = spec.metrics.seed_triplets;
+    fixture.runtime_ms = spec.metrics.runtime_ms;
+    fixture.peak_memory_mb = spec.metrics.peak_memory_mb;
+    fixture.refresh_hash();
+    fixture
 }
 
 pub fn fixture_manifest_from_tsv(
@@ -352,9 +761,9 @@ pub fn fixture_manifest_from_tsv(
             continue;
         }
         let fields = line.split('\t').collect::<Vec<_>>();
-        if fields.len() != 23 {
+        if fields.len() != 26 {
             return Err(format!(
-                "fixture_tsv_bad_field_count:line{}:expected23:found{}",
+                "fixture_tsv_bad_field_count:line{}:expected26:found{}",
                 line_index + 1,
                 fields.len()
             ));
@@ -365,10 +774,10 @@ pub fn fixture_manifest_from_tsv(
             fields[2],
             fields[3],
             fields[4],
-            fields[12],
+            fields[15],
             (
-                parse_f64(fields[13], line_index, "observed_radius_error")?,
-                parse_f64(fields[14], line_index, "observed_angle_error_deg")?,
+                parse_f64(fields[16], line_index, "observed_radius_error")?,
+                parse_f64(fields[17], line_index, "observed_angle_error_deg")?,
             ),
         );
         fixture.ligand_id = required_text(fields[5], line_index, "ligand_id")?.to_string();
@@ -379,18 +788,24 @@ pub fn fixture_manifest_from_tsv(
         fixture.ligand_class = required_text(fields[10], line_index, "ligand_class")?.to_string();
         fixture.structure_confidence_bin =
             required_text(fields[11], line_index, "structure_confidence_bin")?.to_string();
-        fixture.observed_sasa = parse_f64(fields[15], line_index, "observed_sasa")?;
-        fixture.observed_occlusion = parse_f64(fields[16], line_index, "observed_occlusion")?;
+        fixture.residue_flexibility_bin =
+            required_text(fields[12], line_index, "residue_flexibility_bin")?.to_string();
+        fixture.pocket_depth_bin =
+            required_text(fields[13], line_index, "pocket_depth_bin")?.to_string();
+        fixture.coordinate_noise_level =
+            required_text(fields[14], line_index, "coordinate_noise_level")?.to_string();
+        fixture.observed_sasa = parse_f64(fields[18], line_index, "observed_sasa")?;
+        fixture.observed_occlusion = parse_f64(fields[19], line_index, "observed_occlusion")?;
         fixture.observed_pocket_overlap_score =
-            parse_f64(fields[17], line_index, "observed_pocket_overlap_score")?;
+            parse_f64(fields[20], line_index, "observed_pocket_overlap_score")?;
         fixture.observed_rotamer_feasibility_score =
-            parse_f64(fields[18], line_index, "observed_rotamer_feasibility_score")?;
+            parse_f64(fields[21], line_index, "observed_rotamer_feasibility_score")?;
         fixture.observed_bucket_occupancy =
-            parse_usize(fields[19], line_index, "observed_bucket_occupancy")?;
+            parse_usize(fields[22], line_index, "observed_bucket_occupancy")?;
         fixture.observed_seed_triplets =
-            parse_usize(fields[20], line_index, "observed_seed_triplets")?;
-        fixture.runtime_ms = parse_f64(fields[21], line_index, "runtime_ms")?;
-        fixture.peak_memory_mb = parse_f64(fields[22], line_index, "peak_memory_mb")?;
+            parse_usize(fields[23], line_index, "observed_seed_triplets")?;
+        fixture.runtime_ms = parse_f64(fields[24], line_index, "runtime_ms")?;
+        fixture.peak_memory_mb = parse_f64(fields[25], line_index, "peak_memory_mb")?;
         fixture.refresh_hash();
         fixtures.push(fixture);
     }
@@ -472,6 +887,9 @@ mod tests {
                 && !fixture.pocket_id.is_empty()
                 && !fixture.interaction_labels.is_empty()
                 && fixture.resolution_angstrom > 0.0
+                && !fixture.residue_flexibility_bin.is_empty()
+                && !fixture.pocket_depth_bin.is_empty()
+                && !fixture.coordinate_noise_level.is_empty()
         }));
     }
 
@@ -493,6 +911,63 @@ mod tests {
         ] {
             assert!(types.contains(required), "missing fixture type {required}");
         }
+    }
+
+    #[test]
+    fn dev_manifest_covers_required_calibration_sources_and_contexts() {
+        let manifest = dev_fixture_manifest();
+        let kinds = manifest
+            .fixtures
+            .iter()
+            .map(|fixture| fixture.interaction_kind.as_str())
+            .collect::<BTreeSet<_>>();
+        for required in [
+            "hydrogen_bond",
+            "hydrophobic",
+            "aromatic_stacking",
+            "salt_bridge",
+            "metal_coordination",
+        ] {
+            assert!(
+                kinds.contains(required),
+                "missing interaction kind {required}"
+            );
+        }
+
+        for required_source in ["PDBbind", "Binding MOAD", "BioLiP2", "internal curated"] {
+            assert!(
+                manifest
+                    .fixtures
+                    .iter()
+                    .any(|fixture| fixture.source.contains(required_source)),
+                "missing source family {required_source}"
+            );
+        }
+
+        assert!(
+            manifest
+                .fixtures
+                .iter()
+                .any(|fixture| fixture.pocket_depth_bin == "shallow")
+        );
+        assert!(
+            manifest
+                .fixtures
+                .iter()
+                .any(|fixture| fixture.pocket_depth_bin == "deep")
+        );
+        assert!(
+            manifest
+                .fixtures
+                .iter()
+                .any(|fixture| fixture.residue_flexibility_bin == "flexible")
+        );
+        assert!(manifest.fixtures.iter().any(|fixture| {
+            fixture
+                .interaction_labels
+                .iter()
+                .any(|label| label == "apo_holo_difference")
+        }));
     }
 
     #[test]
@@ -526,9 +1001,9 @@ mod tests {
     #[test]
     fn curated_fixture_tsv_imports_manifest_with_metrics() {
         let tsv = "\
-fixture_id\tfixture_type\tsplit\tsource\tlicense_note\tligand_id\tpocket_id\tinteraction_labels\tresolution_angstrom\tinteraction_kind\tligand_class\tstructure_confidence_bin\tresidue_signature\tobserved_radius_error\tobserved_angle_error_deg\tobserved_sasa\tobserved_occlusion\tobserved_pocket_overlap_score\tobserved_rotamer_feasibility_score\tobserved_bucket_occupancy\tobserved_seed_triplets\truntime_ms\tpeak_memory_mb
-pos1\tpositive_holo\ttrain\tcurated-positive\tinternal\tlig1\tpocket1\thydrogen_bond:D-H-Q\t1.8\thydrogen_bond\tgeneric\thigh\tD-H-Q\t0.2\t5.0\t0.5\t0.2\t0.4\t0.8\t2\t4\t2.0\t1.0
-neg1\thard_negative_same_residues\tholdout\tcurated-negative\tinternal\tlig2\tpocket2\thydrogen_bond:D-H-Q\t2.0\thydrogen_bond\tgeneric\thigh\tD-H-Q\t3.0\t60.0\t0.1\t0.8\t0.1\t0.3\t1\t4\t2.0\t1.0";
+fixture_id\tfixture_type\tsplit\tsource\tlicense_note\tligand_id\tpocket_id\tinteraction_labels\tresolution_angstrom\tinteraction_kind\tligand_class\tstructure_confidence_bin\tresidue_flexibility_bin\tpocket_depth_bin\tcoordinate_noise_level\tresidue_signature\tobserved_radius_error\tobserved_angle_error_deg\tobserved_sasa\tobserved_occlusion\tobserved_pocket_overlap_score\tobserved_rotamer_feasibility_score\tobserved_bucket_occupancy\tobserved_seed_triplets\truntime_ms\tpeak_memory_mb
+pos1\tpositive_holo\ttrain\tcurated-positive\tinternal\tlig1\tpocket1\thydrogen_bond:D-H-Q\t1.8\thydrogen_bond\tgeneric\thigh\tmedium\tshallow\tlow\tD-H-Q\t0.2\t5.0\t0.5\t0.2\t0.4\t0.8\t2\t4\t2.0\t1.0
+neg1\thard_negative_same_residues\tholdout\tcurated-negative\tinternal\tlig2\tpocket2\thydrogen_bond:D-H-Q\t2.0\thydrogen_bond\tgeneric\thigh\tmedium\tshallow\tlow\tD-H-Q\t3.0\t60.0\t0.1\t0.8\t0.1\t0.3\t1\t4\t2.0\t1.0";
         let manifest = fixture_manifest_from_tsv("curated-v1", tsv).expect("fixture tsv");
 
         assert_eq!(manifest.dataset_id, "curated-v1");
@@ -543,6 +1018,9 @@ neg1\thard_negative_same_residues\tholdout\tcurated-negative\tinternal\tlig2\tpo
             manifest.fixtures[0].interaction_kind,
             InteractionKind::HydrogenBond
         );
+        assert_eq!(manifest.fixtures[0].residue_flexibility_bin, "medium");
+        assert_eq!(manifest.fixtures[0].pocket_depth_bin, "shallow");
+        assert_eq!(manifest.fixtures[0].coordinate_noise_level, "low");
         assert_eq!(manifest.fixtures[0].observed_seed_triplets, 4);
     }
 }

@@ -6,6 +6,8 @@ use gls_types::{
     CandidateGrade, CandidateId, DockingResult, FoldabilityGateResult, LocusClass, OrfCandidate,
     PatchRealizationResult, Provenance, ShortCircuitDecision, ShortCircuitGateResult,
 };
+use serde_json::Value;
+use std::collections::BTreeSet;
 use std::process::Command;
 
 #[test]
@@ -120,6 +122,72 @@ fragments:
 }
 
 #[test]
+fn cli_calibrate_patch_tolerance_outputs_schema_valid_report() {
+    let root = workspace_root();
+    let schema = parse_json(
+        &read_text(root.join("schemas/calibration_report.schema.json")),
+        "schemas/calibration_report.schema.json",
+    );
+    let output = Command::new(env!("CARGO_BIN_EXE_gls-cli"))
+        .arg("gls-calibrate-patch-tolerance")
+        .output()
+        .expect("run calibration command");
+
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let report = parse_json(
+        &String::from_utf8(output.stdout).expect("utf8 calibration stdout"),
+        "calibration stdout",
+    );
+    validate_schema(&schema, &report).expect("calibration output validates");
+    assert_eq!(report["dataset_id"], "dev-fixtures-v1.6");
+    assert_eq!(report["profiles"].as_array().expect("profiles").len(), 15);
+    assert!(report["profiles"].as_array().expect("profiles").iter().any(
+        |profile| profile["interaction_kind"] == "metal_coordination"
+            && profile["coordinate_noise_level"] == "high"
+    ));
+}
+
+#[test]
+fn cli_calibrate_patch_tolerance_accepts_curated_fixture_tsv() {
+    let dir = std::env::temp_dir().join(format!("genoligand-fixtures-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).expect("temp dir");
+    let tsv = dir.join("fixtures.tsv");
+    std::fs::write(
+        &tsv,
+        "\
+fixture_id\tfixture_type\tsplit\tsource\tlicense_note\tligand_id\tpocket_id\tinteraction_labels\tresolution_angstrom\tinteraction_kind\tligand_class\tstructure_confidence_bin\tresidue_flexibility_bin\tpocket_depth_bin\tcoordinate_noise_level\tresidue_signature\tobserved_radius_error\tobserved_angle_error_deg\tobserved_sasa\tobserved_occlusion\tobserved_pocket_overlap_score\tobserved_rotamer_feasibility_score\tobserved_bucket_occupancy\tobserved_seed_triplets\truntime_ms\tpeak_memory_mb
+pos1\tpositive_holo\ttrain\tcurated-positive\tinternal\tlig1\tpocket1\thydrogen_bond:D-H-Q\t1.8\thydrogen_bond\tgeneric\thigh\tmedium\tshallow\tlow\tD-H-Q\t0.2\t5.0\t0.5\t0.2\t0.4\t0.8\t2\t4\t2.0\t1.0
+neg1\thard_negative_same_residues\tholdout\tcurated-negative\tinternal\tlig2\tpocket2\thydrogen_bond:D-H-Q\t2.0\thydrogen_bond\tgeneric\thigh\tmedium\tshallow\tlow\tD-H-Q\t3.0\t60.0\t0.1\t0.8\t0.1\t0.3\t1\t4\t2.0\t1.0",
+    )
+    .expect("write fixture tsv");
+
+    let output = Command::new(env!("CARGO_BIN_EXE_gls-cli"))
+        .arg("calibrate-patch-tolerance")
+        .arg("--fixture-tsv")
+        .arg(&tsv)
+        .arg("--dataset-id")
+        .arg("curated-cli-v1")
+        .output()
+        .expect("run calibration command with TSV");
+
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let report = parse_json(
+        &String::from_utf8(output.stdout).expect("utf8 calibration stdout"),
+        "calibration stdout",
+    );
+    assert_eq!(report["dataset_id"], "curated-cli-v1");
+    assert_eq!(report["profiles"].as_array().expect("profiles").len(), 3);
+}
+
+#[test]
 fn plm_gate_contract_rejects_any_non_pass_plm_input() {
     let candidate = candidate("c", "DHQACDEFG");
     let gate = gate(&candidate, false);
@@ -211,54 +279,53 @@ fn v16_contract_files_exist_with_positive_and_negative_examples() {
 #[test]
 fn v16_schema_examples_validate_and_reject() {
     let root = workspace_root();
-    for (schema, valid, invalid, validator) in [
+    for (schema, valid, invalid) in [
         (
             "schemas/short_circuit_gate.schema.json",
             "schema_examples/short_circuit_gate.valid.json",
             "schema_examples/short_circuit_gate.invalid.json",
-            validate_short_circuit_gate as fn(&str) -> bool,
         ),
         (
             "schemas/tolerance_profile.schema.json",
             "schema_examples/tolerance_profile.valid.json",
             "schema_examples/tolerance_profile.invalid.json",
-            validate_tolerance_profile,
         ),
         (
             "schemas/fixture_manifest.schema.json",
             "schema_examples/fixture_manifest.valid.json",
             "schema_examples/fixture_manifest.invalid.json",
-            validate_fixture_manifest,
         ),
         (
             "schemas/calibration_report.schema.json",
             "schema_examples/calibration_report.valid.json",
             "schema_examples/calibration_report.invalid.json",
-            validate_calibration_report,
         ),
         (
             "schemas/geometry_budget_report.schema.json",
             "schema_examples/geometry_budget_report.valid.json",
             "schema_examples/geometry_budget_report.invalid.json",
-            validate_geometry_budget_report,
         ),
         (
             "schemas/patch_realization.schema.json",
             "schema_examples/patch_realization.valid.json",
             "schema_examples/patch_realization.invalid.json",
-            validate_patch_realization,
         ),
     ] {
-        let schema_value = read_text(root.join(schema));
-        let valid_value = read_text(root.join(valid));
-        let invalid_value = read_text(root.join(invalid));
+        let schema_text = read_text(root.join(schema));
+        let schema_value = parse_json(&schema_text, schema);
+        let valid_value = parse_json(&read_text(root.join(valid)), valid);
+        let invalid_value = parse_json(&read_text(root.join(invalid)), invalid);
 
-        assert!(validator(&valid_value), "{valid} should validate");
-        assert!(!validator(&invalid_value), "{invalid} should be rejected");
-        assert!(schema_value.contains("\"schema_version\""));
-        assert!(schema_value.contains("\"const\": \"1.6\""));
-        assert!(valid_value.contains("\"schema_version\": \"1.6\""));
-        assert!(invalid_value.contains("\"schema_version\": \"1.6\""));
+        validate_schema(&schema_value, &valid_value)
+            .unwrap_or_else(|err| panic!("{valid} should validate against {schema}: {err}"));
+        assert!(
+            validate_schema(&schema_value, &invalid_value).is_err(),
+            "{invalid} should be rejected by {schema}"
+        );
+        assert!(schema_text.contains("\"schema_version\""));
+        assert!(schema_text.contains("\"const\": \"1.6\""));
+        assert_eq!(valid_value["schema_version"], "1.6");
+        assert_eq!(invalid_value["schema_version"], "1.6");
     }
 }
 
@@ -277,71 +344,174 @@ fn read_text(path: impl AsRef<std::path::Path>) -> String {
     })
 }
 
-fn validate_short_circuit_gate(value: &str) -> bool {
-    has(value, "\"candidate_id\"")
-        && has(value, "\"decision\": \"pass_plm\"")
-        && has(value, "\"pass_plm\": true")
-        && has(value, "\"failure_reason\": null")
-        && !has(value, "\"failure_reason\": \"budget exhausted\"")
+fn parse_json(text: &str, path: &str) -> Value {
+    serde_json::from_str(text).unwrap_or_else(|err| panic!("failed to parse {path}: {err}"))
 }
 
-fn validate_tolerance_profile(value: &str) -> bool {
-    has(value, "\"generated_by_fixture_calibration\": true")
-        && has(value, "\"radius_tolerance\"")
-        && has(value, "\"angle_tolerance_deg\"")
-        && has(value, "\"min_sasa\"")
-        && has(value, "\"max_occlusion\"")
-        && has(value, "\"min_pocket_overlap_score\"")
-        && has(value, "\"min_rotamer_feasibility_score\"")
-        && has(value, "\"max_bucket_occupancy\"")
-        && has(value, "\"max_seed_triplets\"")
-        && has(value, "\"hard_negative_false_positive_rate\"")
+fn validate_schema(schema: &Value, value: &Value) -> Result<(), String> {
+    validate_schema_at("$", schema, value)
 }
 
-fn validate_fixture_manifest(value: &str) -> bool {
-    has(value, "\"dataset_id\"")
-        && has(value, "\"fixture_type\": \"positive_holo\"")
-        && has(value, "\"ligand_id\"")
-        && has(value, "\"pocket_id\"")
-        && has(value, "\"interaction_labels\": [\"hydrogen_bond:D-H-Q\"]")
-        && has(value, "\"resolution_angstrom\": 1.8")
-        && has(value, "\"interaction_kind\": \"hydrogen_bond\"")
-        && !has(value, "\"license_note\": \"\"")
-        && !has(value, "\"interaction_labels\": []")
-        && !has(value, "\"resolution_angstrom\": 0")
+fn validate_schema_at(path: &str, schema: &Value, value: &Value) -> Result<(), String> {
+    if let Some(expected) = schema.get("const")
+        && value != expected
+    {
+        return Err(format!("{path}: const mismatch"));
+    }
+    if let Some(options) = schema.get("enum").and_then(Value::as_array)
+        && !options.iter().any(|option| option == value)
+    {
+        return Err(format!("{path}: enum mismatch"));
+    }
+    if let Some(schema_type) = schema.get("type") {
+        let allowed = match schema_type {
+            Value::String(one) => vec![one.as_str()],
+            Value::Array(many) => many.iter().filter_map(Value::as_str).collect::<Vec<_>>(),
+            _ => return Err(format!("{path}: invalid schema type field")),
+        };
+        if !allowed.iter().any(|kind| json_type_matches(kind, value)) {
+            return Err(format!("{path}: type mismatch expected {allowed:?}"));
+        }
+    }
+
+    validate_number_bounds(path, schema, value)?;
+    validate_string_bounds(path, schema, value)?;
+    validate_array_bounds(path, schema, value)?;
+    validate_object_shape(path, schema, value)?;
+    validate_all_of(path, schema, value)?;
+    Ok(())
 }
 
-fn validate_calibration_report(value: &str) -> bool {
-    has(value, "\"profiles\"")
-        && has(value, "\"profile_level\": \"narrow\"")
-        && has(value, "\"profile_level\": \"standard\"")
-        && has(value, "\"profile_level\": \"relaxed\"")
-        && has(value, "\"generated_by_fixture_calibration\": true")
-        && has(value, "\"seed_triplets_p95\"")
-        && has(value, "\"oom_risk_score\": 0.1")
-        && !has(value, "\"generated_by_fixture_calibration\": false")
-        && !has(value, "\"oom_risk_score\": 1.5")
+fn json_type_matches(kind: &str, value: &Value) -> bool {
+    match kind {
+        "object" => value.is_object(),
+        "array" => value.is_array(),
+        "string" => value.is_string(),
+        "number" => value.is_number(),
+        "integer" => value.as_i64().is_some() || value.as_u64().is_some(),
+        "boolean" => value.is_boolean(),
+        "null" => value.is_null(),
+        _ => false,
+    }
 }
 
-fn validate_geometry_budget_report(value: &str) -> bool {
-    has(value, "\"max_bucket_occupancy_observed\": 3")
-        && has(value, "\"memory_estimate_mb\": 4.5")
-        && has(
-            value,
-            "\"relaxed_profiles_tried\": [\"narrow\", \"standard\"]",
-        )
-        && has(value, "\"failure_reason\": null")
+fn validate_number_bounds(path: &str, schema: &Value, value: &Value) -> Result<(), String> {
+    let Some(number) = value.as_f64() else {
+        return Ok(());
+    };
+    if let Some(minimum) = schema.get("minimum").and_then(Value::as_f64)
+        && number < minimum
+    {
+        return Err(format!("{path}: below minimum {minimum}"));
+    }
+    if let Some(maximum) = schema.get("maximum").and_then(Value::as_f64)
+        && number > maximum
+    {
+        return Err(format!("{path}: above maximum {maximum}"));
+    }
+    if let Some(minimum) = schema.get("exclusiveMinimum").and_then(Value::as_f64)
+        && number <= minimum
+    {
+        return Err(format!("{path}: not above exclusive minimum {minimum}"));
+    }
+    Ok(())
 }
 
-fn validate_patch_realization(value: &str) -> bool {
-    has(value, "\"pass_l2\": true")
-        && has(value, "\"matched_constraints\": 3")
-        && has(value, "\"failure_reason\": null")
-        && has(value, "\"source\": \"gls-patch-realizer\"")
+fn validate_string_bounds(path: &str, schema: &Value, value: &Value) -> Result<(), String> {
+    let Some(text) = value.as_str() else {
+        return Ok(());
+    };
+    if let Some(min_len) = schema.get("minLength").and_then(Value::as_u64)
+        && text.chars().count() < min_len as usize
+    {
+        return Err(format!("{path}: shorter than minLength {min_len}"));
+    }
+    if let Some(pattern) = schema.get("pattern").and_then(Value::as_str)
+        && !pattern_matches(pattern, text)
+    {
+        return Err(format!("{path}: pattern mismatch {pattern}"));
+    }
+    Ok(())
 }
 
-fn has(value: &str, needle: &str) -> bool {
-    value.contains(needle)
+fn validate_array_bounds(path: &str, schema: &Value, value: &Value) -> Result<(), String> {
+    let Some(items) = value.as_array() else {
+        return Ok(());
+    };
+    if let Some(min_items) = schema.get("minItems").and_then(Value::as_u64)
+        && items.len() < min_items as usize
+    {
+        return Err(format!("{path}: fewer than minItems {min_items}"));
+    }
+    if let Some(item_schema) = schema.get("items") {
+        for (index, item) in items.iter().enumerate() {
+            validate_schema_at(&format!("{path}[{index}]"), item_schema, item)?;
+        }
+    }
+    Ok(())
+}
+
+fn validate_object_shape(path: &str, schema: &Value, value: &Value) -> Result<(), String> {
+    let Some(object) = value.as_object() else {
+        return Ok(());
+    };
+    if let Some(required) = schema.get("required").and_then(Value::as_array) {
+        for key in required.iter().filter_map(Value::as_str) {
+            if !object.contains_key(key) {
+                return Err(format!("{path}: missing required property {key}"));
+            }
+        }
+    }
+    let properties = schema.get("properties").and_then(Value::as_object);
+    if schema.get("additionalProperties").and_then(Value::as_bool) == Some(false) {
+        let allowed = properties
+            .map(|props| props.keys().cloned().collect::<BTreeSet<_>>())
+            .unwrap_or_default();
+        for key in object.keys() {
+            if !allowed.contains(key) {
+                return Err(format!("{path}: additional property {key}"));
+            }
+        }
+    }
+    if let Some(properties) = properties {
+        for (key, property_schema) in properties {
+            if let Some(property_value) = object.get(key) {
+                validate_schema_at(&format!("{path}.{key}"), property_schema, property_value)?;
+            }
+        }
+    }
+    Ok(())
+}
+
+fn validate_all_of(path: &str, schema: &Value, value: &Value) -> Result<(), String> {
+    let Some(entries) = schema.get("allOf").and_then(Value::as_array) else {
+        return Ok(());
+    };
+    for (index, entry) in entries.iter().enumerate() {
+        if let Some(if_schema) = entry.get("if") {
+            if validate_schema_at(path, if_schema, value).is_ok()
+                && let Some(then_schema) = entry.get("then")
+            {
+                validate_schema_at(&format!("{path}.allOf[{index}].then"), then_schema, value)?;
+            }
+        } else {
+            validate_schema_at(&format!("{path}.allOf[{index}]"), entry, value)?;
+        }
+    }
+    Ok(())
+}
+
+fn pattern_matches(pattern: &str, text: &str) -> bool {
+    match pattern {
+        "^[0-9a-f]{16,}$" => text.len() >= 16 && text.chars().all(|ch| ch.is_ascii_hexdigit()),
+        "^[a-z0-9_]+$" => {
+            !text.is_empty()
+                && text
+                    .chars()
+                    .all(|ch| ch.is_ascii_lowercase() || ch.is_ascii_digit() || ch == '_')
+        }
+        _ => true,
+    }
 }
 
 fn definitely_missing_worker_path() -> String {

@@ -1,5 +1,5 @@
 use gls_dock::{MockDockWorker, PersistentDockWorker, run_docking};
-use gls_fixtures::dev_fixture_manifest;
+use gls_fixtures::{dev_fixture_manifest, fixture_manifest_from_tsv};
 use gls_foldgate::{
     MockFoldWorker, MockPocketWorker, PersistentFoldWorker, PersistentPocketWorker, run_foldgate,
 };
@@ -116,6 +116,136 @@ pub fn run_dev_smoke_with_worker_commands_and_inputs(
     Ok(report)
 }
 
+pub fn run_calibrate_patch_tolerance_json(
+    fixture_tsv_path: Option<&Path>,
+    dataset_id: Option<&str>,
+) -> Result<String, String> {
+    let manifest = if let Some(path) = fixture_tsv_path {
+        let tsv = fs::read_to_string(path)
+            .map_err(|err| format!("fixture_tsv_read_failed:{}:{err}", path.display()))?;
+        let dataset_id = dataset_id
+            .map(ToOwned::to_owned)
+            .or_else(|| {
+                path.file_stem()
+                    .and_then(|stem| stem.to_str())
+                    .map(ToOwned::to_owned)
+            })
+            .ok_or_else(|| "fixture_tsv_dataset_id_unavailable".to_string())?;
+        fixture_manifest_from_tsv(dataset_id, &tsv)?
+    } else {
+        dev_fixture_manifest()
+    };
+    let report = calibrate_tolerances(&manifest, &CalibrationConfig::dev())?;
+    Ok(render_calibration_report_json(&report))
+}
+
+fn render_calibration_report_json(report: &gls_tolerance_calib::CalibrationReport) -> String {
+    let profiles = report
+        .profiles
+        .iter()
+        .map(|profile| {
+            format!(
+                concat!(
+                    "    {{\n",
+                    "      \"profile_id\": \"{}\",\n",
+                    "      \"dataset_id\": \"{}\",\n",
+                    "      \"created_at\": \"{}\",\n",
+                    "      \"interaction_kind\": \"{}\",\n",
+                    "      \"ligand_class\": \"{}\",\n",
+                    "      \"structure_confidence_bin\": \"{}\",\n",
+                    "      \"residue_flexibility_bin\": \"{}\",\n",
+                    "      \"pocket_depth_bin\": \"{}\",\n",
+                    "      \"coordinate_noise_level\": \"{}\",\n",
+                    "      \"radius_tolerance\": {},\n",
+                    "      \"angle_tolerance_deg\": {},\n",
+                    "      \"distance_bin_width\": {},\n",
+                    "      \"vector_angle_bin_width\": {},\n",
+                    "      \"max_bucket_occupancy\": {},\n",
+                    "      \"max_seed_triplets\": {},\n",
+                    "      \"max_memory_mb\": {},\n",
+                    "      \"recall_at_profile\": {},\n",
+                    "      \"hard_negative_rejection\": {},\n",
+                    "      \"hard_negative_false_positive_rate\": {},\n",
+                    "      \"bucket_occupancy_p95\": {},\n",
+                    "      \"peak_memory_mb\": {},\n",
+                    "      \"runtime_ms_per_fixture\": {},\n",
+                    "      \"generated_by_fixture_calibration\": {},\n",
+                    "      \"profile_level\": \"{}\"\n",
+                    "    }}"
+                ),
+                json_escape(&profile.profile_id),
+                json_escape(&profile.dataset_id),
+                json_escape(&profile.created_at),
+                profile.interaction_kind.as_str(),
+                json_escape(&profile.ligand_class),
+                json_escape(&profile.structure_confidence_bin),
+                json_escape(&profile.residue_flexibility_bin),
+                json_escape(&profile.pocket_depth_bin),
+                json_escape(&profile.coordinate_noise_level),
+                json_number(profile.radius_tolerance),
+                json_number(profile.angle_tolerance_deg),
+                json_number(profile.distance_bin_width),
+                json_number(profile.vector_angle_bin_width),
+                profile.max_bucket_occupancy,
+                profile.max_seed_triplets,
+                json_number(profile.max_memory_mb),
+                json_number(profile.recall_at_profile),
+                json_number(profile.hard_negative_rejection),
+                json_number(profile.hard_negative_false_positive_rate),
+                json_number(profile.bucket_occupancy_p95),
+                json_number(profile.peak_memory_mb),
+                json_number(profile.runtime_ms_per_fixture),
+                profile.generated_by_fixture_calibration,
+                profile.profile_level.as_str()
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(",\n");
+    format!(
+        concat!(
+            "{{\n",
+            "  \"schema_version\": \"1.6\",\n",
+            "  \"dataset_id\": \"{}\",\n",
+            "  \"profiles\": [\n",
+            "{}\n",
+            "  ],\n",
+            "  \"positive_recall\": {},\n",
+            "  \"hard_negative_rejection\": {},\n",
+            "  \"bucket_occupancy_p95\": {},\n",
+            "  \"seed_triplets_p95\": {},\n",
+            "  \"max_seed_triplets_observed\": {},\n",
+            "  \"peak_memory_mb\": {},\n",
+            "  \"runtime_ms_per_fixture\": {},\n",
+            "  \"oom_risk_score\": {}\n",
+            "}}"
+        ),
+        json_escape(&report.dataset_id),
+        profiles,
+        json_number(report.positive_recall),
+        json_number(report.hard_negative_rejection),
+        json_number(report.bucket_occupancy_p95),
+        json_number(report.seed_triplets_p95),
+        report.max_seed_triplets_observed,
+        json_number(report.peak_memory_mb),
+        json_number(report.runtime_ms_per_fixture),
+        json_number(report.oom_risk_score)
+    )
+}
+
+fn json_escape(value: &str) -> String {
+    value
+        .replace('\\', "\\\\")
+        .replace('"', "\\\"")
+        .replace('\n', "\\n")
+        .replace('\r', "\\r")
+        .replace('\t', "\\t")
+}
+
+fn json_number(value: f64) -> String {
+    assert!(value.is_finite(), "non-finite JSON number");
+    format!("{value:.6}")
+}
+
 fn run_dev_smoke_with_workers<P, F, K, D>(
     inputs: &DevSmokeInputs,
     plm_worker: &mut P,
@@ -182,11 +312,16 @@ where
 
     let manifest = dev_fixture_manifest();
     let calibration = calibrate_tolerances(&manifest, &CalibrationConfig::dev())?;
+    let (residue_flexibility_bin, pocket_depth_bin, coordinate_noise_level) =
+        runtime_tolerance_context(&cpg);
     let profiles = select_profiles_for_runtime(
         &calibration.profiles,
         &icg.constraints[0].kind,
         &cpg.ligand_class,
         &cpg.confidence_bin,
+        residue_flexibility_bin,
+        pocket_depth_bin,
+        coordinate_noise_level,
     );
     let (patch_result, geometry_budget) =
         realize_patch(&icg, &cpg, &profiles, &PatchRealizerConfig::dev())?;
@@ -237,6 +372,43 @@ fn first_foldability(
     foldability
         .first()
         .ok_or_else(|| "dev_smoke_missing_foldability_result".to_string())
+}
+
+fn runtime_tolerance_context(
+    cpg: &CandidatePatchGraph,
+) -> (&'static str, &'static str, &'static str) {
+    let min_confidence = cpg
+        .nodes
+        .iter()
+        .map(|node| node.confidence)
+        .fold(1.0, f64::min);
+    let average_depth = if cpg.nodes.is_empty() {
+        0.0
+    } else {
+        cpg.nodes.iter().map(|node| node.pocket_depth).sum::<f64>() / cpg.nodes.len() as f64
+    };
+    let residue_flexibility_bin = if min_confidence < 0.70 {
+        "flexible"
+    } else if min_confidence >= 0.90 {
+        "rigid"
+    } else {
+        "medium"
+    };
+    let pocket_depth_bin = if average_depth >= 3.0 {
+        "deep"
+    } else {
+        "shallow"
+    };
+    let coordinate_noise_level = if cpg.confidence_bin == "low" {
+        "high"
+    } else {
+        "low"
+    };
+    (
+        residue_flexibility_bin,
+        pocket_depth_bin,
+        coordinate_noise_level,
+    )
 }
 
 fn load_plm_budget_profile() -> Result<PlmBudgetProfile, String> {

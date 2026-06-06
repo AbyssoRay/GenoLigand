@@ -19,3 +19,6 @@ gls-report = { path = "../gls-report" }
 gls-shortcircuit = { path = "../gls-shortcircuit" }
 gls-tolerance-calib = { path = "../gls-tolerance-calib" }
 gls-types = { path = "../gls-types" }
+
+[dev-dependencies]
+serde_json = "1"

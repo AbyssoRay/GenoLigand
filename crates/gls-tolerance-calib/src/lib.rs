@@ -1,5 +1,6 @@
 use gls_fixtures::{FixtureManifest, FixtureType, PatchFixture};
 use gls_types::{InteractionKind, ToleranceProfile, ToleranceProfileLevel, stable_hash};
+use std::collections::BTreeMap;
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct CalibrationConfig {
@@ -53,6 +54,89 @@ pub fn calibrate_tolerances(
     config: &CalibrationConfig,
 ) -> Result<CalibrationReport, String> {
     manifest.validate()?;
+    let grouped = grouped_calibration_manifests(manifest);
+    let mut profiles = Vec::new();
+    let mut positive_recall: f64 = 1.0;
+    let mut hard_negative_rejection: f64 = 1.0;
+    let mut bucket_occupancy_p95: f64 = 0.0;
+    let mut seed_triplets_p95: f64 = 0.0;
+    let mut max_seed_triplets_observed = 0usize;
+    let mut peak_memory_mb: f64 = 0.0;
+    let mut runtime_ms_per_fixture: f64 = 0.0;
+    let mut oom_risk_score: f64 = 0.0;
+    let mut calibrated_groups = 0usize;
+
+    for group in grouped {
+        let report = calibrate_tolerance_group(&group, config)?;
+        profiles.extend(report.profiles);
+        positive_recall = positive_recall.min(report.positive_recall);
+        hard_negative_rejection = hard_negative_rejection.min(report.hard_negative_rejection);
+        bucket_occupancy_p95 = bucket_occupancy_p95.max(report.bucket_occupancy_p95);
+        seed_triplets_p95 = seed_triplets_p95.max(report.seed_triplets_p95);
+        max_seed_triplets_observed =
+            max_seed_triplets_observed.max(report.max_seed_triplets_observed);
+        peak_memory_mb = peak_memory_mb.max(report.peak_memory_mb);
+        runtime_ms_per_fixture = runtime_ms_per_fixture.max(report.runtime_ms_per_fixture);
+        oom_risk_score = oom_risk_score.max(report.oom_risk_score);
+        calibrated_groups += 1;
+    }
+
+    if calibrated_groups == 0 {
+        return Err("calibration_requires_positive_fixtures".to_string());
+    }
+
+    Ok(CalibrationReport {
+        dataset_id: manifest.dataset_id.clone(),
+        profiles,
+        positive_recall,
+        hard_negative_rejection,
+        bucket_occupancy_p95,
+        seed_triplets_p95,
+        max_seed_triplets_observed,
+        peak_memory_mb,
+        runtime_ms_per_fixture,
+        oom_risk_score,
+    })
+}
+
+fn grouped_calibration_manifests(manifest: &FixtureManifest) -> Vec<FixtureManifest> {
+    let mut grouped = BTreeMap::<String, Vec<PatchFixture>>::new();
+    for fixture in &manifest.fixtures {
+        grouped
+            .entry(calibration_key(fixture))
+            .or_default()
+            .push(fixture.clone());
+    }
+    grouped
+        .into_values()
+        .filter(|fixtures| {
+            fixtures
+                .iter()
+                .any(|fixture| fixture.fixture_type.is_positive())
+        })
+        .map(|fixtures| FixtureManifest {
+            dataset_id: manifest.dataset_id.clone(),
+            fixtures,
+        })
+        .collect()
+}
+
+fn calibration_key(fixture: &PatchFixture) -> String {
+    format!(
+        "{}|{}|{}|{}|{}|{}",
+        fixture.interaction_kind.as_str(),
+        fixture.ligand_class,
+        fixture.structure_confidence_bin,
+        fixture.residue_flexibility_bin,
+        fixture.pocket_depth_bin,
+        fixture.coordinate_noise_level
+    )
+}
+
+fn calibrate_tolerance_group(
+    manifest: &FixtureManifest,
+    config: &CalibrationConfig,
+) -> Result<CalibrationReport, String> {
     let positives = manifest
         .fixtures
         .iter()
@@ -209,9 +293,14 @@ fn profile_from_metrics(
 ) -> ToleranceProfile {
     let first = &manifest.fixtures[0];
     let profile_payload = format!(
-        "{}:{}:{}:{:.3}:{:.3}",
+        "{}:{}:{}:{}:{}:{}:{}:{}:{:.3}:{:.3}",
         manifest.dataset_id,
         first.interaction_kind.as_str(),
+        first.ligand_class,
+        first.structure_confidence_bin,
+        first.residue_flexibility_bin,
+        first.pocket_depth_bin,
+        first.coordinate_noise_level,
         level.as_str(),
         metrics.radius,
         metrics.angle
@@ -223,6 +312,9 @@ fn profile_from_metrics(
         interaction_kind: first.interaction_kind.clone(),
         ligand_class: first.ligand_class.clone(),
         structure_confidence_bin: first.structure_confidence_bin.clone(),
+        residue_flexibility_bin: first.residue_flexibility_bin.clone(),
+        pocket_depth_bin: first.pocket_depth_bin.clone(),
+        coordinate_noise_level: first.coordinate_noise_level.clone(),
         radius_tolerance: metrics.radius,
         angle_tolerance_deg: metrics.angle,
         distance_bin_width: (metrics.radius / 2.0).max(f64::EPSILON),
@@ -320,6 +412,9 @@ pub fn select_profiles_for_runtime(
     interaction_kind: &InteractionKind,
     ligand_class: &str,
     confidence_bin: &str,
+    residue_flexibility_bin: &str,
+    pocket_depth_bin: &str,
+    coordinate_noise_level: &str,
 ) -> Vec<ToleranceProfile> {
     let mut selected = profiles
         .iter()
@@ -327,6 +422,9 @@ pub fn select_profiles_for_runtime(
             &profile.interaction_kind == interaction_kind
                 && profile.ligand_class == ligand_class
                 && profile.structure_confidence_bin == confidence_bin
+                && profile.residue_flexibility_bin == residue_flexibility_bin
+                && profile.pocket_depth_bin == pocket_depth_bin
+                && profile.coordinate_noise_level == coordinate_noise_level
         })
         .cloned()
         .collect::<Vec<_>>();
@@ -344,12 +442,12 @@ mod tests {
     use gls_fixtures::dev_fixture_manifest;
 
     #[test]
-    fn calibration_generates_three_fixture_backed_profiles() {
+    fn calibration_generates_fixture_backed_profiles_for_required_contexts() {
         let manifest = dev_fixture_manifest();
         let report =
             calibrate_tolerances(&manifest, &CalibrationConfig::dev()).expect("calibration ok");
 
-        assert_eq!(report.profiles.len(), 3);
+        assert_eq!(report.profiles.len(), 15);
         assert!(
             report
                 .profiles
@@ -362,6 +460,22 @@ mod tests {
                 .iter()
                 .any(|profile| profile.profile_level == ToleranceProfileLevel::Narrow)
         );
+        for required in [
+            InteractionKind::HydrogenBond,
+            InteractionKind::Hydrophobic,
+            InteractionKind::AromaticStacking,
+            InteractionKind::SaltBridge,
+            InteractionKind::MetalCoordination,
+        ] {
+            assert!(
+                report.profiles.iter().any(|profile| {
+                    profile.interaction_kind.as_str() == required.as_str()
+                        && profile.profile_level == ToleranceProfileLevel::Standard
+                }),
+                "missing standard profile for {}",
+                required.as_str()
+            );
+        }
         assert!(report.seed_triplets_p95 > 0.0);
         assert!(report.oom_risk_score > 0.0);
     }
@@ -376,8 +490,12 @@ mod tests {
             &InteractionKind::HydrogenBond,
             "generic",
             "high",
+            "medium",
+            "shallow",
+            "low",
         );
 
+        assert_eq!(selected.len(), 3);
         assert_eq!(selected[0].profile_level, ToleranceProfileLevel::Narrow);
         assert_eq!(selected[2].profile_level, ToleranceProfileLevel::Relaxed);
     }
@@ -387,13 +505,20 @@ mod tests {
         let manifest = dev_fixture_manifest();
         let report =
             calibrate_tolerances(&manifest, &CalibrationConfig::dev()).expect("calibration ok");
-        let narrow = report
-            .profiles
+        let hbond_profiles = select_profiles_for_runtime(
+            &report.profiles,
+            &InteractionKind::HydrogenBond,
+            "generic",
+            "high",
+            "medium",
+            "shallow",
+            "low",
+        );
+        let narrow = hbond_profiles
             .iter()
             .find(|profile| profile.profile_level == ToleranceProfileLevel::Narrow)
             .expect("narrow profile");
-        let relaxed = report
-            .profiles
+        let relaxed = hbond_profiles
             .iter()
             .find(|profile| profile.profile_level == ToleranceProfileLevel::Relaxed)
             .expect("relaxed profile");

@@ -253,6 +253,9 @@ pub struct ToleranceProfile {
     pub interaction_kind: InteractionKind,
     pub ligand_class: String,
     pub structure_confidence_bin: String,
+    pub residue_flexibility_bin: String,
+    pub pocket_depth_bin: String,
+    pub coordinate_noise_level: String,
     pub radius_tolerance: f64,
     pub angle_tolerance_deg: f64,
     pub distance_bin_width: f64,
@@ -298,6 +301,12 @@ impl ToleranceProfile {
         }
         if self.max_memory_mb <= 0.0 {
             return Err("tolerance_profile_has_zero_memory_guard".to_string());
+        }
+        if self.residue_flexibility_bin.is_empty()
+            || self.pocket_depth_bin.is_empty()
+            || self.coordinate_noise_level.is_empty()
+        {
+            return Err("tolerance_profile_missing_calibration_context".to_string());
         }
         Ok(())
     }
@@ -491,6 +500,9 @@ mod tests {
             interaction_kind: InteractionKind::HydrogenBond,
             ligand_class: "generic".to_string(),
             structure_confidence_bin: "high".to_string(),
+            residue_flexibility_bin: "medium".to_string(),
+            pocket_depth_bin: "shallow".to_string(),
+            coordinate_noise_level: "low".to_string(),
             radius_tolerance: 1.0,
             angle_tolerance_deg: 20.0,
             distance_bin_width: 0.5,

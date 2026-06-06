@@ -19,6 +19,10 @@ import subprocess
 import sys
 from pathlib import Path
 
+if hasattr(sys.stdin, "reconfigure"):
+    sys.stdin.reconfigure(encoding="utf-8")
+    sys.stdout.reconfigure(encoding="utf-8")
+
 
 def respond_ok(payload: str = "") -> None:
     sys.stdout.write(f"OK\t{payload}\n" if payload else "OK\n")
@@ -81,7 +85,7 @@ def run_vina(candidate_id: str) -> float:
 
 
 def handle(line: str) -> str:
-    fields = line.rstrip("\r\n").split("\t")
+    fields = line.lstrip("\ufeff").rstrip("\r\n").split("\t")
     if not fields or fields[0] != "DOCK":
         raise RuntimeError("dock_worker_bad_request")
     scores = []
