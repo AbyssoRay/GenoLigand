@@ -12,7 +12,7 @@ def main() -> int:
     parser.add_argument("--reference-manifest", type=path_arg, default=DEFAULT_ARTIFACT_DIR / "outputs/reference_structures/reference_structure_manifest.tsv")
     parser.add_argument("--out", type=path_arg, default=DEFAULT_ARTIFACT_DIR / "outputs/reference_patches/reference_binding_patches.tsv")
     parser.add_argument("--manifest-json", type=path_arg, default=DEFAULT_ARTIFACT_DIR / "outputs/reference_patches/reference_patch_manifest.json")
-    parser.add_argument("--min-patches", type=int, default=200)
+    parser.add_argument("--min-patches", type=int, default=500)
     args = parser.parse_args()
     build_reference_patch_db(args.biolip_tsv, args.reference_manifest, args.out, args.manifest_json, args.min_patches)
     return 0

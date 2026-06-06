@@ -9,7 +9,9 @@ params.foldseek_wsl_distro = params.foldseek_wsl_distro ?: (System.getenv('FOLDS
 params.usalign_bin = params.usalign_bin ?: (System.getenv('USALIGN_BIN') ?: '.phase_0_6_tools/USalign/USalign.exe')
 params.min_reference_entries = params.min_reference_entries ?: 200
 params.preferred_reference_entries = params.preferred_reference_entries ?: 500
-params.min_reference_patches = params.min_reference_patches ?: 200
+params.min_biolip_interactions = params.min_biolip_interactions ?: 500
+params.preferred_biolip_interactions = params.preferred_biolip_interactions ?: 2000
+params.min_reference_patches = params.min_reference_patches ?: 500
 params.foldseek_threads = params.foldseek_threads ?: 4
 
 def rootWin() {
@@ -43,7 +45,7 @@ process PHASE_0_6_REFERENCE_PREP {
   mkdir -p "\$ART/metrics" "\$ART/logs/nextflow" "\$ART/outputs/reference_structures" "\$ART/outputs/reference_patches"
   "\$PYTHON" "\$ROOT/scripts/phase06/check_phase05_inputs.py" --phase05-dir "\$PHASE05" --out "\$ART/metrics/phase05_input_check.json"
   "\$PYTHON" "\$ROOT/scripts/phase06/prepare_query_structures.py" --phase05-dir "\$PHASE05" --out-dir "\$ART/outputs/query_structures"
-  "\$PYTHON" "\$ROOT/scripts/phase06/prepare_biolip2_subset.py" --out "\$ART/outputs/reference_structures/biolip2_interactions.tsv" --schema-out "\$ART/metrics/biolip2_schema_check.tsv" --min-rows "${params.min_reference_patches}" --preferred-rows "${params.preferred_reference_entries}"
+  "\$PYTHON" "\$ROOT/scripts/phase06/prepare_biolip2_subset.py" --out "\$ART/outputs/reference_structures/biolip2_interactions.tsv" --schema-out "\$ART/metrics/biolip2_schema_compatibility.tsv" --min-rows "${params.min_biolip_interactions}" --preferred-rows "${params.preferred_biolip_interactions}"
   "\$PYTHON" "\$ROOT/scripts/phase06/fetch_rcsb_reference_subset.py" --biolip-tsv "\$ART/outputs/reference_structures/biolip2_interactions.tsv" --manifest-out "\$ART/outputs/reference_structures/reference_structure_manifest.tsv" --summary-out "\$ART/metrics/reference_structure_summary.tsv" --min-entries "${params.min_reference_entries}" --preferred-entries "${params.preferred_reference_entries}"
   "\$PYTHON" "\$ROOT/scripts/phase06/build_reference_patch_db.py" --biolip-tsv "\$ART/outputs/reference_structures/biolip2_interactions.tsv" --reference-manifest "\$ART/outputs/reference_structures/reference_structure_manifest.tsv" --out "\$ART/outputs/reference_patches/reference_binding_patches.tsv" --manifest-json "\$ART/outputs/reference_patches/reference_patch_manifest.json" --min-patches "${params.min_reference_patches}"
   "\$PYTHON" "\$ROOT/scripts/phase06/prepare_afdb_reference_subset.py" --out "\$ART/metrics/afdb_reference_subset_status.tsv"

@@ -35,11 +35,11 @@ def rows(path: Path, min_rows: int = 1, label: str | None = None) -> list[dict[s
     return parsed
 
 
-def check_reference_manifests(root: Path, min_references: int = 200, min_patches: int = 200) -> None:
+def check_reference_manifests(root: Path, min_references: int = 200, min_patches: int = 500) -> None:
     refs = rows(root / "outputs/reference_structures/reference_structure_manifest.tsv", min_references, "reference_structure_manifest")
     patches = rows(root / "outputs/reference_patches/reference_binding_patches.tsv", min_patches, "reference_binding_patches")
     biolip = rows(root / "outputs/reference_structures/biolip2_interactions.tsv", min_patches, "biolip2_interactions")
-    schema = rows(root / "metrics/biolip2_schema_check.tsv", 1, "biolip2_schema")
+    schema = rows(root / "metrics/biolip2_schema_compatibility.tsv", 1, "biolip2_schema")
     summary = rows(root / "metrics/reference_structure_summary.tsv", 1, "reference_structure_summary")
     manifest = rows(root / "external_resource_manifest.tsv", 4, "external_resource_manifest")
     if any(row.get("status") == "FAIL" for row in schema + summary + manifest):
@@ -48,8 +48,14 @@ def check_reference_manifests(root: Path, min_references: int = 200, min_patches
         raise SystemExit("phase_0_6_reference_manifest_contains_synthetic")
     if any(row.get("interaction_source") != "BioLiP2" for row in patches):
         raise SystemExit("phase_0_6_patch_source_not_biolip2")
-    if len({row.get("ligand_type", "") for row in biolip}) < 2:
-        raise SystemExit("phase_0_6_biolip2_ligand_type_diversity_missing")
+    ligand_types = {row.get("ligand_type", "") for row in biolip}
+    for required in ["small_molecule", "peptide", "metal"]:
+        if required not in ligand_types:
+            raise SystemExit(f"phase_0_6_biolip2_ligand_type_missing:{required}")
+    patch_types = {row.get("ligand_type", "") for row in patches}
+    for required in ["small_molecule", "peptide", "metal"]:
+        if required not in patch_types:
+            raise SystemExit(f"phase_0_6_reference_patch_ligand_type_missing:{required}")
 
 
 def check_foldseek_outputs(root: Path) -> None:

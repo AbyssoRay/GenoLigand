@@ -1317,6 +1317,13 @@ def render_acceptance_report(artifact_dir: Path, out: Path, verdict: str, failur
         target = artifact_dir / path
         return len(read_tsv(target)) if target.exists() else 0
 
+    def status(path: str, key: str = "status") -> str:
+        target = artifact_dir / path
+        if not target.exists():
+            return "missing"
+        parsed = read_tsv(target)
+        return parsed[0].get(key, "missing") if parsed else "missing"
+
     lines = [
         "# GenoLigand-Search Phase 0.6 Structure-Similarity and Binding-Patch Evidence Acceptance Report",
         "",
@@ -1356,6 +1363,8 @@ def render_acceptance_report(artifact_dir: Path, out: Path, verdict: str, failur
         f"- PDB reference structures: {count('outputs/reference_structures/reference_structure_manifest.tsv')}",
         "- AFDB reference structures: optional/not enabled by default",
         f"- BioLiP2 interactions/reference patches: {count('outputs/reference_patches/reference_binding_patches.tsv')}",
+        f"- BioLiP2 schema compatibility: {status('metrics/biolip2_schema_compatibility.tsv')}",
+        f"- PLIP cross-check status: {status('metrics/plip_reference_patch_status.tsv')}",
         "- external resource manifest status: checked",
         "",
         "## 9. Foldseek Structure Search Gates",
