@@ -1,0 +1,80 @@
+phase: "0.6"
+acceptance_mode: "structure_patch_strict"
+
+inputs:
+  phase_0_5_artifact_dir: "acceptance_artifacts_phase_0_5_gpu_strict"
+  query_pdb_dir: "acceptance_artifacts_phase_0_5_gpu_strict/outputs/structures/pdb"
+  query_mmcif_dir: "acceptance_artifacts_phase_0_5_gpu_strict/outputs/structures/mmcif"
+  structure_manifest: "acceptance_artifacts_phase_0_5_gpu_strict/outputs/structures/structure_manifest.tsv"
+  structure_quality: "acceptance_artifacts_phase_0_5_gpu_strict/outputs/structure_features/structure_quality.tsv"
+  phase_0_5_patch_descriptors: "acceptance_artifacts_phase_0_5_gpu_strict/outputs/patches/patch_descriptors.tsv"
+
+tools:
+  foldseek_required: true
+  usalign_required: true
+  wsl_distro: "GenoLigandPhase06"
+
+foldseek:
+  required: true
+  min_reference_structures: 200
+  preferred_reference_structures: 500
+  threads: 8
+  sensitivity: 7.5
+  max_seqs: 100
+  evalue: 10.0
+  use_gpu_if_available: false
+  require_real_binary: true
+  reject_mock: true
+
+usalign:
+  required: true
+  confirm_top_n_per_candidate: 3
+  min_positive_control_tm_score: 0.70
+  min_self_control_tm_score: 0.95
+  max_negative_control_tm_score: 0.40
+
+reference_databases:
+  pdb_experimental_seed:
+    required: true
+    min_entries: 200
+    preferred_entries: 500
+    allow_cached: true
+    rcsb_download_url_template: "https://files.rcsb.org/download/{pdb_id}.pdb"
+  biolip2_seed:
+    required: true
+    min_interactions: 500
+    preferred_interactions: 2000
+    url: "https://zhanggroup.org/BioLiP/download/BioLiP.txt.gz"
+  plip_validation:
+    required: false
+    min_validated_interactions: 20
+
+patch_matching:
+  required: true
+  distance_metric: "weighted_standardized_euclidean"
+  nearest_neighbors_per_patch: 20
+  min_patch_reference_entries: 500
+  min_patch_similarity_margin_over_best_decoy: 0.10
+
+decoys:
+  required_ids:
+    - "p03_d1_low_complexity_001"
+    - "p03_d2_background_001"
+    - "p04_d3_shuffled_p03_k1_cds_001"
+    - "p04_d4_reversed_p03_k1_cds_001"
+    - "p04_d5_random_matched_length_001"
+  require_all_decoys_in_foldseek: true
+  require_all_decoys_in_patch_matching: true
+  min_tm_score_margin_over_best_decoy: 0.05
+  min_zscore_vs_decoys: 1.0
+
+report:
+  require_target_prior_table: true
+  prohibit_validated_target_language: true
+  require_interpretation_cautions: true
+  required_caution: "Phase 0.6 structure-similarity and binding-patch evidence is an audit and prioritization layer. Fold-level similarity, local patch similarity, ligand-contact template similarity, and target-family annotations are used to rank candidates for downstream docking, molecular simulation, biochemical testing, and experimental validation. These outputs do not establish target engagement, binding affinity, biological activity, or pharmacological mechanism."
+  required_target_prior_caution: "Target-prior labels in this report are computational prioritization labels. They do not establish physical binding, target engagement, biological function, pharmacological mechanism, or experimental validation. Any candidate target must be evaluated in later docking, simulation, biochemical, cellular, or genetic perturbation phases."
+
+nextflow:
+  required: true
+  first_resume_semantic_hash_match: true

@@ -105,6 +105,32 @@ nextflow run workflows/phase_0_5_gpu_strict.nf -profile gpu -with-trace -with-re
 nextflow run workflows/phase_0_5_gpu_strict.nf -profile gpu -resume -with-trace
 ```
 
+## Phase 0.6 Structure Patch Strict
+
+Phase 0.6 adds a real structure-similarity and binding-patch evidence layer on top of the Phase 0.5 GPU structures. It uses Foldseek against an external RCSB-derived structure subset, confirms top hits with US-align, derives real BioLiP2 binding-patch references, matches candidate patches, calibrates against D1-D5 decoys, and writes a target-prioritization report. The report is explicitly a prioritization artifact: it does not claim target engagement, binding affinity, mechanism, biological activity, docking success, or experimental validation.
+
+Local-only tools, databases, and acceptance archives stay ignored under `.phase_0_6_tools/`, `data/external_phase_0_6/`, `databases/phase_0_6/`, and `acceptance_artifacts_phase_0_6_structure_patch_strict/`.
+
+Useful Phase 0.6 commands:
+
+```powershell
+python scripts/phase06/check_phase05_inputs.py
+python scripts/phase06/prepare_query_structures.py
+python scripts/phase06/prepare_biolip2_subset.py
+python scripts/phase06/fetch_rcsb_reference_subset.py
+python scripts/phase06/build_reference_patch_db.py
+python scripts/phase06/build_foldseek_databases.py --foldseek-bin /opt/foldseek/foldseek/bin/foldseek --wsl-distro GenoLigandPhase06
+python scripts/phase06/run_foldseek_search.py --foldseek-bin /opt/foldseek/foldseek/bin/foldseek --wsl-distro GenoLigandPhase06
+python scripts/phase06/run_usalign_confirmation.py --usalign-bin .phase_0_6_tools/USalign/USalign.exe
+python scripts/phase06/match_candidate_patches.py
+python scripts/phase06/calibrate_decoy_margins.py
+python scripts/phase06/score_target_priors.py
+python scripts/phase06/render_candidate_report_phase_0_6.py
+python scripts/validation/check_phase_0_6_structure_patch_strict.py
+nextflow run workflows/phase_0_6_structure_patch_strict.nf -profile strict_local -with-trace acceptance_artifacts_phase_0_6_structure_patch_strict/metrics/nextflow_trace_first.tsv
+nextflow run workflows/phase_0_6_structure_patch_strict.nf -profile strict_local -resume -with-trace acceptance_artifacts_phase_0_6_structure_patch_strict/metrics/nextflow_trace_resume.tsv
+```
+
 ## License
 
 GenoLigand is distributed under the project EULA in `EULA.txt`.
