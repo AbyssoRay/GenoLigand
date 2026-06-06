@@ -1,0 +1,41 @@
+fixture_name: phase_0_3_real_context_fixture
+source_category: mixed_real_public_excerpt_and_real_format_synthetic_sequence
+is_real_source: partial
+real_public_excerpt:
+  id: real_ensembl_shh_excerpt_001
+  source: Ensembl REST API
+  assembly: GRCh38
+  region: "human/7:155799900..155800080:1"
+  sequence_endpoint: "https://rest.ensembl.org/sequence/region/human/7:155799900..155800080:1"
+  overlap_endpoint: "https://rest.ensembl.org/overlap/region/human/7:155799900-155800080"
+  retrieved_by: "Invoke-WebRequest with approval on 2026-06-06"
+synthetic_controls:
+  source_status: real_format_synthetic_sequence
+  note: "Synthetic scaffold controls are for engineering semantic acceptance only and are not biological discoveries."
+generation_script: "manual deterministic fixture embedded in repository; full run hashes are recorded by acceptance_artifacts_phase_0_3/hashes.tsv"
+sha256:
+  README.md: E939508BFE1E365276FBBDEE883E16BB208A2DE66EAEF1A487279C9D5C1E791D
+  genome.fa: DF112A07A53DFFBA28AF2D9999BCFF8BD8FA95D4BC5196DC773E096F57E26453
+  annotation.gff3: A1A56582AA38E5BFA30F63326179DE55FE22A71C9D256144D68170844E8C29B0
+  transcripts.fa: 661AFB4FB788DA193E4BABB0B0F1FFA42DE47792257B3731B035949DAEACAA08
+  evidence_table.tsv: CE326DBE829EE32156372D4F4DEF3C2C3D17039EDC6C153B4B7542E4A2891ABA
+  fragment_kernel.json: DFF6D81C01E1AA57E5F3AFD2A7095553D6AD10706E6790B5589A457501BA6928
+  ligand.yml: 5C10EBFD1AFAF6892F0B92639EBC9F037C7B134FD48C4B5655D3B0392FDA74C5
+  expected_semantics.yml: 9A34D905E69AF8A48310749C95B93A578C0B985991CBB5781E3E64ECEE24F08B
+fields:
+  genome.fa: "FASTA contigs containing one real public excerpt and synthetic controls."
+  annotation.gff3: "GFF3 annotation for context classification gates."
+  transcripts.fa: "Transcript FASTA layer for evidence/report tests."
+  evidence_table.tsv: "RNA/Ribo/proteomics-like evidence table."
+  fragment_kernel.json: "Exact fragment kernel for search genome."
+  ligand.yml: "Minimal ligand fixture descriptor."
+  expected_semantics.yml: "Expected context, decoy, and ranking outcomes."
+expected_context_classes:
+  - K1_known_cds_same_frame
+  - K2_known_locus_alt_frame
+  - K3_utr_orf
+  - K4_lncRNA_or_nc_transcript_orf
+  - K5_intronic_orf
+  - K6_antisense_orf
+  - K_LOW_COMPLEXITY_DECOY
+  - high_background_low_information_decoy

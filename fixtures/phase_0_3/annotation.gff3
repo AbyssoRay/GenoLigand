@@ -1,0 +1,17 @@
+##gff-version 3
+real_ensembl_shh_excerpt_001	ensembl_rest	gene	81	181	.	-	.	ID=ENSG00000164690_excerpt;gene_id=ENSG00000164690;Name=SHH;biotype=protein_coding;source_region=GRCh38_chr7_155799900_155800080
+real_ensembl_shh_excerpt_001	ensembl_rest	mRNA	140	181	.	-	.	ID=ENST00000430104_excerpt;Parent=ENSG00000164690_excerpt;gene_id=ENSG00000164690;transcript_id=ENST00000430104;biotype=protein_coding
+p03_k1_cds_001	genoligand_fixture	gene	1	42	.	+	.	ID=p03_gene_k1;gene_id=p03_gene_k1;biotype=protein_coding
+p03_k1_cds_001	genoligand_fixture	mRNA	1	42	.	+	.	ID=p03_tx_k1;Parent=p03_gene_k1;gene_id=p03_gene_k1;transcript_id=p03_tx_k1;biotype=protein_coding
+p03_k1_cds_001	genoligand_fixture	CDS	1	42	.	+	0	ID=p03_cds_k1;Parent=p03_tx_k1;gene_id=p03_gene_k1;transcript_id=p03_tx_k1;reading_frame=1
+p03_k2_alt_frame_001	genoligand_fixture	gene	1	43	.	+	.	ID=p03_gene_k2;gene_id=p03_gene_k2;biotype=protein_coding
+p03_k2_alt_frame_001	genoligand_fixture	mRNA	1	43	.	+	.	ID=p03_tx_k2;Parent=p03_gene_k2;gene_id=p03_gene_k2;transcript_id=p03_tx_k2;biotype=protein_coding
+p03_k2_alt_frame_001	genoligand_fixture	CDS	1	43	.	+	0	ID=p03_cds_k2_reference;Parent=p03_tx_k2;gene_id=p03_gene_k2;transcript_id=p03_tx_k2;reading_frame=1
+p03_k3_utr_001	genoligand_fixture	gene	1	42	.	+	.	ID=p03_gene_k3;gene_id=p03_gene_k3;biotype=protein_coding
+p03_k3_utr_001	genoligand_fixture	mRNA	1	42	.	+	.	ID=p03_tx_k3;Parent=p03_gene_k3;gene_id=p03_gene_k3;transcript_id=p03_tx_k3;biotype=protein_coding
+p03_k3_utr_001	genoligand_fixture	five_prime_UTR	1	42	.	+	.	ID=p03_utr_k3;Parent=p03_tx_k3;gene_id=p03_gene_k3;transcript_id=p03_tx_k3
+p03_k4_lnc_001	genoligand_fixture	gene	1	36	.	-	.	ID=p03_gene_k4;gene_id=p03_gene_k4;biotype=lncRNA
+p03_k4_lnc_001	genoligand_fixture	lnc_RNA	1	36	.	-	.	ID=p03_tx_k4;Parent=p03_gene_k4;gene_id=p03_gene_k4;transcript_id=p03_tx_k4;biotype=lncRNA
+p03_k5_intronic_001	genoligand_fixture	gene	1	42	.	+	.	ID=p03_gene_k5;gene_id=p03_gene_k5;biotype=protein_coding
+p03_k5_intronic_001	genoligand_fixture	intron	1	42	.	+	.	ID=p03_intron_k5;Parent=p03_gene_k5;gene_id=p03_gene_k5
+p03_k6_antisense_001	genoligand_fixture	gene	1	42	.	-	.	ID=p03_gene_k6_opposite;gene_id=p03_gene_k6_opposite;biotype=protein_coding

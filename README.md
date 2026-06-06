@@ -40,6 +40,29 @@ nextflow run workflows/phase_0_2_mini_benchmark.nf -profile dev_cpu_smoke
 nextflow run workflows/phase_0_2_mini_benchmark.nf -profile dev_cpu_smoke -resume
 ```
 
+## Phase 0.3 Real-Format Semantics
+
+Phase 0.3 adds a mixed-source fixture under `fixtures/phase_0_3/`: one Ensembl REST SHH public excerpt for provenance plus real-format synthetic scaffold controls for K1/K2/K3/K4/K5/K6 and decoy gates. The synthetic controls are engineering fixtures only and are not biological discoveries.
+
+Run the Phase 0.3 split chain with file inputs:
+
+```powershell
+gls-cli search genome --genome fixtures/phase_0_3/genome.fa --fragments fixtures/phase_0_3/fragment_kernel.json --out hits.tsv
+gls-cli stats score --hits hits.tsv --out stats.tsv
+gls-cli orf extend --genome fixtures/phase_0_3/genome.fa --hits hits.tsv --out orf_extensions.tsv
+gls-cli context classify --annotation fixtures/phase_0_3/annotation.gff3 --orfs orf_extensions.tsv --out context.tsv
+gls-cli cooccur score --hits hits.tsv --stats stats.tsv --orfs orf_extensions.tsv --context context.tsv --out cooccurrence.tsv
+gls-cli gate short-circuit --stats stats.tsv --orfs orf_extensions.tsv --context context.tsv --cooccur cooccurrence.tsv --evidence fixtures/phase_0_3/evidence_table.tsv --out orf_gate.tsv
+gls-cli report candidate --hits hits.tsv --stats stats.tsv --orfs orf_extensions.tsv --context context.tsv --cooccur cooccurrence.tsv --gate orf_gate.tsv --evidence fixtures/phase_0_3/evidence_table.tsv --out candidate_report.md
+```
+
+Run the reproducible workflow:
+
+```powershell
+nextflow run workflows/phase_0_3.nf -profile dev_cpu_smoke
+nextflow run workflows/phase_0_3.nf -profile dev_cpu_smoke -resume
+```
+
 ## License
 
 GenoLigand is distributed under the project EULA in `EULA.txt`.

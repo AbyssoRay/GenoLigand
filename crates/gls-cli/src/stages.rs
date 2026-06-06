@@ -97,6 +97,10 @@ const GATE_HEADERS: &[&str] = &[
     "pass_plm",
     "failure_reason",
     "decision_reason",
+    "pass_orf_gate",
+    "pass_foldgate",
+    "evidence_summary",
+    "risk_flags",
     "rule_version",
     "budget_rank",
 ];
@@ -207,6 +211,17 @@ const ORF_HEADERS: &[&str] = &[
     "parent_region_end",
     "low_complexity_score",
     "repeat_fraction",
+    "contig",
+    "seed_fragment_id",
+    "seed_fragment_sequence",
+    "extended_orf_start",
+    "extended_orf_end",
+    "extended_orf_length_nt",
+    "extended_orf_length_aa",
+    "start_codon_type",
+    "stop_codon_found",
+    "nearest_upstream_stop",
+    "nearest_downstream_stop",
 ];
 
 const CONTEXT_HEADERS: &[&str] = &[
@@ -223,6 +238,14 @@ const CONTEXT_HEADERS: &[&str] = &[
     "overlap_frame_relation",
     "classification_reason",
     "k9_pangenome_status",
+    "context_label",
+    "overlapping_feature_type",
+    "reading_frame_relation",
+    "strand_relation",
+    "parent_transcript_id",
+    "parent_gene_id",
+    "annotation_overlap_bp",
+    "distance_to_nearest_feature",
 ];
 
 const COOCCUR_HEADERS: &[&str] = &[
@@ -240,6 +263,13 @@ const COOCCUR_HEADERS: &[&str] = &[
     "final_cooccur_score",
     "cooccur_decision",
     "cooccur_reason",
+    "orf_candidate_id",
+    "fragment_count",
+    "high_information_fragment_count",
+    "background_corrected_score",
+    "cooccurrence_score",
+    "cooccurrence_rank",
+    "cooccurrence_reason",
 ];
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -333,6 +363,18 @@ pub struct ReportMarkdownOptions {
     pub foldgate: PathBuf,
     pub patches: PathBuf,
     pub dock: PathBuf,
+    pub out: PathBuf,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ReportCandidateOptions {
+    pub hits: PathBuf,
+    pub stats: PathBuf,
+    pub orfs: PathBuf,
+    pub context: PathBuf,
+    pub cooccur: PathBuf,
+    pub gate: PathBuf,
+    pub evidence: PathBuf,
     pub out: PathBuf,
 }
 
@@ -547,6 +589,9 @@ pub fn run_cooccur_score(options: &CooccurScoreOptions) -> Result<usize, String>
             .total_cmp(&parse_f64(required(left, "final_cooccur_score")))
             .then_with(|| required(left, "candidate_id").cmp(required(right, "candidate_id")))
     });
+    for (index, row) in rows.iter_mut().enumerate() {
+        set(row, "cooccurrence_rank", (index + 1).to_string());
+    }
     write_tsv(&options.out, COOCCUR_HEADERS, &rows)?;
     Ok(rows.len())
 }
@@ -565,10 +610,23 @@ pub fn run_gate_short_circuit(options: &GateShortCircuitOptions) -> Result<usize
 pub fn run_gate_short_circuit_phase(
     options: &PhaseGateShortCircuitOptions,
 ) -> Result<usize, String> {
+    run_gate_short_circuit_phase_with_evidence(options, None)
+}
+
+pub fn run_gate_short_circuit_phase_with_evidence(
+    options: &PhaseGateShortCircuitOptions,
+    evidence: Option<&Path>,
+) -> Result<usize, String> {
     let stats = read_tsv(&options.stats)?;
     let orfs = read_tsv(&options.orfs)?;
     let context = read_tsv(&options.context)?;
     let cooccur = read_tsv(&options.cooccur)?;
+    let evidence_enabled = evidence.is_some();
+    let evidence_by_candidate = if let Some(path) = evidence {
+        evidence_summary_by_candidate(&read_tsv(path)?)
+    } else {
+        BTreeMap::new()
+    };
     let stats_by_orf = group_stats_by_parent_orf(&stats);
     let context_by_orf = context
         .iter()
@@ -581,6 +639,11 @@ pub fn run_gate_short_circuit_phase(
     let mut rows = orfs
         .iter()
         .map(|orf| {
+            let evidence_summary = evidence_enabled.then(|| {
+                evidence_by_candidate
+                    .get(required(orf, "candidate_id"))
+                    .map_or("no_evidence", String::as_str)
+            });
             phase_gate_row(
                 orf,
                 stats_by_orf
@@ -589,6 +652,7 @@ pub fn run_gate_short_circuit_phase(
                     .unwrap_or_default(),
                 context_by_orf.get(required(orf, "parent_orf_id")),
                 cooccur_by_orf.get(required(orf, "parent_orf_id")),
+                evidence_summary,
             )
         })
         .collect::<Vec<_>>();
@@ -670,6 +734,25 @@ pub fn run_report_markdown(options: &ReportMarkdownOptions) -> Result<usize, Str
         dock: read_tsv(&options.dock)?,
     };
     let markdown = render_candidate_report(&inputs);
+    write_text(&options.out, &markdown)?;
+    Ok(inputs.cooccur.len())
+}
+
+pub fn run_report_candidate(options: &ReportCandidateOptions) -> Result<usize, String> {
+    let inputs = ReportInputs {
+        hits: read_tsv(&options.hits)?,
+        stats: read_tsv(&options.stats)?,
+        orfs: read_tsv(&options.orfs)?,
+        context: read_tsv(&options.context)?,
+        cooccur: read_tsv(&options.cooccur)?,
+        gate: read_tsv(&options.gate)?,
+        plm: Vec::new(),
+        foldgate: Vec::new(),
+        patches: Vec::new(),
+        dock: Vec::new(),
+    };
+    let evidence = read_tsv(&options.evidence)?;
+    let markdown = render_phase_0_3_candidate_report(&inputs, &evidence);
     write_text(&options.out, &markdown)?;
     Ok(inputs.cooccur.len())
 }
@@ -949,6 +1032,15 @@ fn phase_fixture_candidate_id(record_id: &str) -> Option<&str> {
         "decoy_gc_repeat_001",
         "decoy_single_fragment_001",
         "boundary_stop_001",
+        "p03_k1_cds_001",
+        "p03_k2_alt_frame_001",
+        "p03_k3_utr_001",
+        "p03_k4_lnc_001",
+        "p03_k5_intronic_001",
+        "p03_k6_antisense_001",
+        "p03_d1_low_complexity_001",
+        "p03_d2_background_001",
+        "real_ensembl_shh_excerpt_001",
     ]
     .iter()
     .copied()
@@ -1020,6 +1112,45 @@ fn orf_extend_row(orf: &OrfSegment, hits: &[Row]) -> Row {
     set(&mut row, "parent_region_end", orf.parent_end.to_string());
     set(&mut row, "low_complexity_score", fmt_f64(low_complexity));
     set(&mut row, "repeat_fraction", fmt_f64(repeat));
+    set(&mut row, "contig", &orf.record_id);
+    set(&mut row, "seed_fragment_id", required(first, "fragment_id"));
+    set(
+        &mut row,
+        "seed_fragment_sequence",
+        required(first, "fragment_sequence"),
+    );
+    set(&mut row, "extended_orf_start", orf.parent_start.to_string());
+    set(&mut row, "extended_orf_end", orf.parent_end.to_string());
+    set(
+        &mut row,
+        "extended_orf_length_nt",
+        (orf.parent_end.saturating_sub(orf.parent_start)).to_string(),
+    );
+    set(
+        &mut row,
+        "extended_orf_length_aa",
+        orf.sequence.len().to_string(),
+    );
+    set(&mut row, "start_codon_type", "ATG");
+    set(&mut row, "stop_codon_found", "true");
+    set(
+        &mut row,
+        "nearest_upstream_stop",
+        if orf.strand == '+' {
+            orf.parent_start.to_string()
+        } else {
+            stop_end.to_string()
+        },
+    );
+    set(
+        &mut row,
+        "nearest_downstream_stop",
+        if orf.strand == '+' {
+            stop_start.to_string()
+        } else {
+            orf.parent_end.to_string()
+        },
+    );
     row
 }
 
@@ -1085,9 +1216,22 @@ fn classify_locus_row(orf: &Row, features: &[GffFeature]) -> Row {
         .collect::<Vec<_>>();
     let feature_ids = distinct_join(overlaps.iter().map(|feature| feature_id(feature)));
     let gene_ids = distinct_join(overlaps.iter().map(|feature| gene_id(feature)));
+    let feature_types = distinct_join(overlaps.iter().map(|feature| feature.feature_type.as_str()));
+    let transcript_ids = distinct_join(overlaps.iter().map(|feature| transcript_id(feature)));
+    let overlap_bp = overlaps
+        .iter()
+        .map(|feature| overlap_len(start, end, feature.start, feature.end))
+        .sum::<usize>();
+    let distance = features
+        .iter()
+        .filter(|feature| feature.seqid == chrom)
+        .map(|feature| distance_to_range(start, end, feature.start, feature.end))
+        .min()
+        .unwrap_or(usize::MAX);
     let parent_sequence = required(orf, "parent_sequence");
     let (context_class, relation, reason) =
         classify_context(parent_sequence, strand, frame, &overlaps);
+    let strand_relation = infer_strand_relation(strand, &overlaps);
 
     let mut row = Row::new();
     set(&mut row, "candidate_id", required(orf, "candidate_id"));
@@ -1099,10 +1243,26 @@ fn classify_locus_row(orf: &Row, features: &[GffFeature]) -> Row {
     set(&mut row, "parent_orf_id", required(orf, "parent_orf_id"));
     set(&mut row, "context_class", context_class);
     set(&mut row, "overlapping_feature_id", feature_ids);
-    set(&mut row, "overlapping_gene_id", gene_ids);
+    set(&mut row, "overlapping_gene_id", &gene_ids);
     set(&mut row, "overlap_frame_relation", relation);
     set(&mut row, "classification_reason", reason);
     set(&mut row, "k9_pangenome_status", "not_applicable");
+    set(&mut row, "context_label", context_label(context_class));
+    set(&mut row, "overlapping_feature_type", feature_types);
+    set(&mut row, "reading_frame_relation", relation);
+    set(&mut row, "strand_relation", strand_relation);
+    set(&mut row, "parent_transcript_id", transcript_ids);
+    set(&mut row, "parent_gene_id", gene_ids);
+    set(&mut row, "annotation_overlap_bp", overlap_bp.to_string());
+    set(
+        &mut row,
+        "distance_to_nearest_feature",
+        if distance == usize::MAX {
+            "not_available".to_string()
+        } else {
+            distance.to_string()
+        },
+    );
     row
 }
 
@@ -1215,6 +1375,32 @@ fn group_stats_by_parent_orf(rows: &[Row]) -> BTreeMap<String, Vec<Row>> {
     grouped
 }
 
+fn evidence_summary_by_candidate(rows: &[Row]) -> BTreeMap<String, String> {
+    let mut grouped = BTreeMap::<String, Vec<String>>::new();
+    for row in rows {
+        let id = required(row, "candidate_or_region_id");
+        if id.is_empty() {
+            continue;
+        }
+        let evidence_type = required(row, "evidence_type");
+        let support = required(row, "support_level");
+        let value = required(row, "value");
+        let unit = required(row, "unit");
+        let context = required(row, "cell_or_tissue_context");
+        grouped
+            .entry(id.to_string())
+            .or_default()
+            .push(format!("{evidence_type}:{support}:{value}{unit}:{context}"));
+    }
+    grouped
+        .into_iter()
+        .map(|(id, mut values)| {
+            values.sort();
+            (id, values.join(";"))
+        })
+        .collect()
+}
+
 fn cooccur_row(orf: &Row, stats: &[Row], context: Option<&Row>) -> Row {
     let distinct_ids = distinct_values(stats.iter().map(|row| required(row, "fragment_id")));
     let num_fragments = distinct_ids.len();
@@ -1324,10 +1510,27 @@ fn cooccur_row(orf: &Row, stats: &[Row], context: Option<&Row>) -> Row {
     set(&mut row, "final_cooccur_score", fmt_f64(final_score));
     set(&mut row, "cooccur_decision", decision);
     set(&mut row, "cooccur_reason", reason);
+    set(&mut row, "orf_candidate_id", required(orf, "candidate_id"));
+    set(&mut row, "fragment_count", num_fragments.to_string());
+    set(
+        &mut row,
+        "high_information_fragment_count",
+        num_high.to_string(),
+    );
+    set(&mut row, "background_corrected_score", fmt_f64(final_score));
+    set(&mut row, "cooccurrence_score", fmt_f64(final_score));
+    set(&mut row, "cooccurrence_rank", "0");
+    set(&mut row, "cooccurrence_reason", reason);
     row
 }
 
-fn phase_gate_row(orf: &Row, stats: Vec<Row>, context: Option<&Row>, cooccur: Option<&Row>) -> Row {
+fn phase_gate_row(
+    orf: &Row,
+    stats: Vec<Row>,
+    context: Option<&Row>,
+    cooccur: Option<&Row>,
+    evidence: Option<&str>,
+) -> Row {
     let context_class = context.map_or("K_INVALID_ORF", |row| required(row, "context_class"));
     let cooccur_decision =
         cooccur.map_or("missing_cooccur", |row| required(row, "cooccur_decision"));
@@ -1366,7 +1569,38 @@ fn phase_gate_row(orf: &Row, stats: Vec<Row>, context: Option<&Row>, cooccur: Op
     } else {
         "phase_short_circuit_filter"
     };
-    let decision = if pass { "pass_plm" } else { "hold_no_plm" };
+    let evidence_summary = evidence
+        .filter(|value| !value.is_empty())
+        .map(ToOwned::to_owned)
+        .unwrap_or_else(|| "no_evidence".to_string());
+    let mut risk_flags = Vec::new();
+    let low_context_evidence =
+        evidence_summary == "no_evidence" || evidence_summary.starts_with("no_evidence:");
+    if low_context_evidence {
+        risk_flags.push("low_context_evidence");
+    }
+    if stats
+        .iter()
+        .any(|row| required(row, "decision_reason") == "low_information_content")
+    {
+        risk_flags.push("low_information_background");
+    }
+    if context_class == "K_LOW_COMPLEXITY_DECOY" || low_complexity >= 0.85 {
+        risk_flags.push("low_complexity");
+    }
+    if context_class == "K7_pseudogene_or_repeat_associated_orf" {
+        risk_flags.push("repeat_or_pseudogene_context");
+    }
+    let decision = if pass {
+        if low_context_evidence && context_class != "K1_known_cds_same_frame" {
+            "exploration_queue"
+        } else {
+            "pass_plm"
+        }
+    } else {
+        "hold_no_plm"
+    };
+    let pass_plm = pass && decision == "pass_plm";
     let final_score = cooccur.map_or(0.0, |row| parse_f64(required(row, "final_cooccur_score")));
     let mut gated = Row::new();
     for key in [
@@ -1396,9 +1630,13 @@ fn phase_gate_row(orf: &Row, stats: Vec<Row>, context: Option<&Row>, cooccur: Op
         fragment_len.to_string(),
     );
     set(&mut gated, "decision", decision);
-    set(&mut gated, "pass_plm", pass.to_string());
+    set(&mut gated, "pass_plm", pass_plm.to_string());
     set(&mut gated, "failure_reason", failure_reason);
     set(&mut gated, "decision_reason", failure_reason);
+    set(&mut gated, "pass_orf_gate", pass.to_string());
+    set(&mut gated, "pass_foldgate", "false");
+    set(&mut gated, "evidence_summary", evidence_summary);
+    set(&mut gated, "risk_flags", risk_flags.join(";"));
     set(&mut gated, "rule_version", "phase_0_2_orf_level_gate_v1");
     set(
         &mut gated,
@@ -1563,6 +1801,138 @@ fn render_candidate_report(inputs: &ReportInputs) -> String {
     text.push_str("## Scientific Caution\n\n");
     text.push_str("本报告是计算假设，不是实验验证。\n");
     text
+}
+
+fn render_phase_0_3_candidate_report(inputs: &ReportInputs, evidence: &[Row]) -> String {
+    let context_by_orf = inputs
+        .context
+        .iter()
+        .map(|row| (required(row, "parent_orf_id").to_string(), row))
+        .collect::<BTreeMap<_, _>>();
+    let gate_by_orf = inputs
+        .gate
+        .iter()
+        .map(|row| (required(row, "parent_region_id").to_string(), row))
+        .collect::<BTreeMap<_, _>>();
+    let evidence_by_candidate = evidence_summary_by_candidate(evidence);
+    let mut top = inputs.cooccur.iter().collect::<Vec<_>>();
+    top.sort_by(|left, right| {
+        parse_f64(required(right, "cooccurrence_score"))
+            .total_cmp(&parse_f64(required(left, "cooccurrence_score")))
+            .then_with(|| required(left, "candidate_id").cmp(required(right, "candidate_id")))
+    });
+
+    let mut text = String::new();
+    text.push_str("# Candidate Report\n\n");
+    text.push_str("## Input Summary\n\n");
+    text.push_str(&format!(
+        "- hits: {}\n- stats rows: {}\n- ORF candidates: {}\n- context rows: {}\n- cooccurrence rows: {}\n- ORF gate rows: {}\n- evidence rows: {}\n\n",
+        inputs.hits.len(),
+        inputs.stats.len(),
+        inputs.orfs.len(),
+        inputs.context.len(),
+        inputs.cooccur.len(),
+        inputs.gate.len(),
+        evidence.len()
+    ));
+    text.push_str("## Fragment Kernel Summary\n\n");
+    text.push_str(&format!(
+        "- unique fragments observed: {}\n- high-information fragments observed: {}\n\n",
+        distinct_values(inputs.hits.iter().map(|row| required(row, "fragment_id"))).len(),
+        inputs
+            .stats
+            .iter()
+            .filter(|row| parse_f64(required(row, "information_content")) >= 8.0)
+            .count()
+    ));
+    text.push_str("## Genome/Annotation Summary\n\n");
+    text.push_str(&format!(
+        "- contigs with hits: {}\n- annotated context classes: {}\n\n",
+        distinct_values(inputs.orfs.iter().map(|row| required(row, "contig"))).len(),
+        count_by(&inputs.context, "context_class").len()
+    ));
+    text.push_str("## Evidence Summary\n\n");
+    for (candidate, summary) in &evidence_by_candidate {
+        text.push_str(&format!("- {candidate}: {summary}\n"));
+    }
+    text.push('\n');
+    text.push_str("## Candidate Ranking Table\n\n");
+    text.push_str("| rank | candidate_id | context | fragments | cooccurrence_score | gate_decision | evidence | risk_flags |\n");
+    text.push_str("| --- | --- | --- | --- | --- | --- | --- | --- |\n");
+    for (index, row) in top.iter().take(10).enumerate() {
+        let parent_orf = required(row, "parent_orf_id");
+        let context = context_by_orf
+            .get(parent_orf)
+            .map_or("missing_context", |row| required(row, "context_class"));
+        let gate = gate_by_orf.get(parent_orf);
+        let candidate = required(row, "candidate_id");
+        text.push_str(&format!(
+            "| {} | {} | {} | {} | {} | {} | {} | {} |\n",
+            index + 1,
+            candidate,
+            context,
+            required(row, "fragment_ids"),
+            required(row, "cooccurrence_score"),
+            gate.map_or("missing_gate", |row| required(row, "decision")),
+            evidence_by_candidate
+                .get(candidate)
+                .map_or("no_evidence", String::as_str),
+            gate.map_or("", |row| required(row, "risk_flags"))
+        ));
+    }
+    text.push('\n');
+    text.push_str("## Context Class Distribution\n\n");
+    for (class, count) in count_by(&inputs.context, "context_class") {
+        text.push_str(&format!("- {class}: {count}\n"));
+    }
+    text.push('\n');
+    text.push_str("## Top Candidate Details\n\n");
+    for row in top.iter().take(10) {
+        let parent_orf = required(row, "parent_orf_id");
+        let context = context_by_orf.get(parent_orf);
+        let gate = gate_by_orf.get(parent_orf);
+        text.push_str(&format!(
+            "- {}: parent_orf={} contig={} start={} end={} strand={} frame={} context={} fragments={} reason={} evidence={} decision={}\n",
+            required(row, "candidate_id"),
+            parent_orf,
+            context.map_or("", |row| required(row, "chrom")),
+            context.map_or("", |row| required(row, "start")),
+            context.map_or("", |row| required(row, "end")),
+            context.map_or("", |row| required(row, "strand")),
+            context.map_or("", |row| required(row, "frame")),
+            context.map_or("missing_context", |row| required(row, "context_class")),
+            required(row, "fragment_ids"),
+            required(row, "cooccurrence_reason"),
+            evidence_by_candidate
+                .get(required(row, "candidate_id"))
+                .map_or("no_evidence", String::as_str),
+            gate.map_or("missing_gate", |row| required(row, "decision"))
+        ));
+    }
+    text.push('\n');
+    text.push_str("## Filtered Decoys\n\n");
+    for row in &inputs.gate {
+        if required(row, "decision") == "hold_no_plm" {
+            text.push_str(&format!(
+                "- {}: {} risk_flags={}\n",
+                required(row, "candidate_id"),
+                required(row, "decision_reason"),
+                required(row, "risk_flags")
+            ));
+        }
+    }
+    text.push('\n');
+    text.push_str("## Interpretation Cautions\n\n");
+    text.push_str(caution_statement_phase_0_3());
+    text.push_str("\n\n");
+    text.push_str("## Reproducibility Metadata\n\n");
+    text.push_str("- report_schema: phase_0_3_candidate_report_v1\n");
+    text.push_str("- generated_by: gls-cli report candidate\n");
+    text
+}
+
+fn caution_statement_phase_0_3() -> &'static str {
+    "\u{8fd9}\u{4e9b}\u{5019}\u{9009}\u{4ec5}\u{4e3a}\u{8ba1}\u{7b97}\u{751f}\u{6210}\u{7684}\u{9776}\u{70b9}\u{5047}\u{8bbe}\u{ff1b}\u{672a}\u{6ce8}\u{91ca} ORF \u{5019}\u{9009}\u{4e0d}\u{80fd}\u{88ab}\u{89e3}\u{91ca}\u{4e3a}\u{5df2}\u{8bc1}\u{5b9e}\u{86cb}\u{767d}\u{ff1b}\u{7f3a}\u{5c11}\u{8f6c}\u{5f55}\u{3001}\u{7ffb}\u{8bd1}\u{6216}\u{86cb}\u{767d}\u{8d28}\u{7ec4}\u{8bc1}\u{636e}\u{65f6}\u{ff0c}\u{5e94}\u{8fdb}\u{5165}\u{63a2}\u{7d22}\u{961f}\u{5217}\u{800c}\u{4e0d}\u{662f}\u{9ad8}\u{7f6e}\u{4fe1}\u{961f}\u{5217}\u{3002}"
 }
 
 fn stats_preliminary_row(row: &Row, background: &BackgroundModel) -> Result<Row, String> {
@@ -2237,11 +2607,46 @@ fn ranges_overlap(
     left_start < right_end && right_start < left_end
 }
 
+fn overlap_len(left_start: usize, left_end: usize, right_start: usize, right_end: usize) -> usize {
+    if ranges_overlap(left_start, left_end, right_start, right_end) {
+        left_end
+            .min(right_end)
+            .saturating_sub(left_start.max(right_start))
+    } else {
+        0
+    }
+}
+
+fn distance_to_range(
+    left_start: usize,
+    left_end: usize,
+    right_start: usize,
+    right_end: usize,
+) -> usize {
+    if ranges_overlap(left_start, left_end, right_start, right_end) {
+        0
+    } else if left_end <= right_start {
+        right_start.saturating_sub(left_end)
+    } else {
+        left_start.saturating_sub(right_end)
+    }
+}
+
 fn feature_id(feature: &GffFeature) -> &str {
     feature
         .attributes
         .get("ID")
         .map_or(feature.feature_type.as_str(), String::as_str)
+}
+
+fn transcript_id(feature: &GffFeature) -> &str {
+    feature
+        .attributes
+        .get("transcript_id")
+        .or_else(|| feature.attributes.get("transcript"))
+        .or_else(|| feature.attributes.get("Parent"))
+        .or_else(|| feature.attributes.get("ID"))
+        .map_or("", String::as_str)
 }
 
 fn gene_id(feature: &GffFeature) -> &str {
@@ -2252,6 +2657,37 @@ fn gene_id(feature: &GffFeature) -> &str {
         .or_else(|| feature.attributes.get("Parent"))
         .or_else(|| feature.attributes.get("ID"))
         .map_or(feature.feature_type.as_str(), String::as_str)
+}
+
+fn infer_strand_relation(strand: char, overlaps: &[&GffFeature]) -> &'static str {
+    if overlaps.is_empty() {
+        "no_overlap"
+    } else if overlaps
+        .iter()
+        .any(|feature| feature.strand != '.' && feature.strand != strand)
+    {
+        "antisense_or_mixed"
+    } else {
+        "same_strand"
+    }
+}
+
+fn context_label(context_class: &str) -> &'static str {
+    match context_class {
+        "K1_known_cds_same_frame" => "known_cds_same_frame",
+        "K2_known_locus_alt_frame" => "known_locus_alternative_frame",
+        "K3_utr_orf" => "utr_orf",
+        "K4_lncRNA_or_nc_transcript_orf" => "lncrna_or_non_coding_transcript_orf",
+        "K5_intronic_orf" => "intronic_orf",
+        "K6_antisense_orf" => "antisense_orf",
+        "K7_pseudogene_or_repeat_associated_orf" => "repeat_or_pseudogene_associated",
+        "K8_overlapping_orf" => "overlapping_orf",
+        "K9_pangenome_or_variant_only_orf" => "pangenome_or_variant_only",
+        "K10_unannotated_intergenic_orf" => "unannotated_intergenic_orf",
+        "K_LOW_COMPLEXITY_DECOY" => "low_complexity_decoy",
+        "K_INVALID_ORF" => "invalid_orf",
+        _ => "unknown_context",
+    }
 }
 
 fn matches_feature_type(feature: &GffFeature, expected: &[&str]) -> bool {

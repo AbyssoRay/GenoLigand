@@ -1,0 +1,11 @@
+{
+  "schema_version": "phase_0_3",
+  "fragments": [
+    {"id": "pos_yhedlv", "kind": "exact_high_information", "sequence": "YHEDLV", "information_weight": 1.0},
+    {"id": "pos_kqwcm", "kind": "exact_high_information", "sequence": "KQWCM", "information_weight": 1.0},
+    {"id": "pos_qwcmr", "kind": "exact_high_information", "sequence": "QWCMR", "information_weight": 1.0},
+    {"id": "pos_kqwc", "kind": "exact_high_information", "sequence": "KQWC", "information_weight": 1.0},
+    {"id": "decoy_ala6", "kind": "low_complexity", "sequence": "AAAAAA", "information_weight": 1.0},
+    {"id": "background_st", "kind": "background_low_information", "sequence": "ST", "information_weight": 0.2}
+  ]
+}

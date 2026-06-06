@@ -429,6 +429,157 @@ fn phase_0_2_nextflow_resume_hash_record_is_consistent_when_present() {
     }
 }
 
+#[test]
+fn phase_0_3_fixture_covers_context_evidence_and_decoy_semantics() {
+    let root = temp_root("phase-0-3");
+    let workspace = workspace_root();
+    let fixtures = workspace.join("fixtures").join("phase_0_3");
+    let genome = fixtures.join("genome.fa");
+    let fragments = fixtures.join("fragment_kernel.json");
+    let annotation = fixtures.join("annotation.gff3");
+    let evidence = fixtures.join("evidence_table.tsv");
+    let hits = root.join("hits.tsv");
+    let stats = root.join("stats.tsv");
+    let orfs = root.join("orf_extensions.tsv");
+    let context = root.join("context.tsv");
+    let cooccur = root.join("cooccurrence.tsv");
+    let gate = root.join("orf_gate.tsv");
+    let report = root.join("candidate_report.md");
+
+    run_search_genome(&SearchOptions {
+        genome: genome.clone(),
+        fragments,
+        out: hits.clone(),
+    })
+    .expect("phase 0.3 search");
+    run_stats_score(&StatsOptions {
+        hits: hits.clone(),
+        out: stats.clone(),
+    })
+    .expect("phase 0.3 stats");
+    run_orf_extend(&OrfExtendOptions {
+        genome: genome.clone(),
+        hits: hits.clone(),
+        out: orfs.clone(),
+    })
+    .expect("phase 0.3 orf");
+    run_classify_loci(&ClassifyLociOptions {
+        annotation,
+        orfs: orfs.clone(),
+        out: context.clone(),
+    })
+    .expect("phase 0.3 context");
+    run_cooccur_score(&CooccurScoreOptions {
+        hits: hits.clone(),
+        stats: stats.clone(),
+        orfs: orfs.clone(),
+        context: context.clone(),
+        out: cooccur.clone(),
+    })
+    .expect("phase 0.3 cooccur");
+    gls_cli::stages::run_gate_short_circuit_phase_with_evidence(
+        &PhaseGateShortCircuitOptions {
+            stats: stats.clone(),
+            orfs: orfs.clone(),
+            context: context.clone(),
+            cooccur: cooccur.clone(),
+            out: gate.clone(),
+        },
+        Some(&evidence),
+    )
+    .expect("phase 0.3 gate");
+    gls_cli::stages::run_report_candidate(&gls_cli::stages::ReportCandidateOptions {
+        hits: hits.clone(),
+        stats: stats.clone(),
+        orfs: orfs.clone(),
+        context: context.clone(),
+        cooccur: cooccur.clone(),
+        gate: gate.clone(),
+        evidence: evidence.clone(),
+        out: report.clone(),
+    })
+    .expect("phase 0.3 report");
+
+    assert_hit_coordinates_translate_back_to_matches(&genome, &hits);
+    for (candidate, expected) in [
+        ("p03_k1_cds_001", "K1_known_cds_same_frame"),
+        ("p03_k2_alt_frame_001", "K2_known_locus_alt_frame"),
+        ("p03_k3_utr_001", "K3_utr_orf"),
+        ("p03_k4_lnc_001", "K4_lncRNA_or_nc_transcript_orf"),
+        ("p03_k5_intronic_001", "K5_intronic_orf"),
+        ("p03_k6_antisense_001", "K6_antisense_orf"),
+        ("p03_d1_low_complexity_001", "K_LOW_COMPLEXITY_DECOY"),
+    ] {
+        assert_eq!(
+            table_value(&context, "candidate_id", candidate, "context_class"),
+            expected
+        );
+    }
+    assert_eq!(
+        table_value(
+            &gate,
+            "candidate_id",
+            "p03_d1_low_complexity_001",
+            "pass_plm"
+        ),
+        "false"
+    );
+    assert!(
+        table_value(
+            &gate,
+            "candidate_id",
+            "p03_d1_low_complexity_001",
+            "decision_reason"
+        )
+        .contains("low_complexity")
+    );
+    assert!(
+        table_value(&gate, "candidate_id", "p03_d2_background_001", "risk_flags")
+            .contains("low_information_background")
+    );
+    assert_eq!(
+        table_value(&gate, "candidate_id", "p03_k5_intronic_001", "decision"),
+        "exploration_queue"
+    );
+    assert!(
+        table_value(&gate, "candidate_id", "p03_k5_intronic_001", "risk_flags")
+            .contains("low_context_evidence")
+    );
+    let k1_score = table_value(
+        &cooccur,
+        "candidate_id",
+        "p03_k1_cds_001",
+        "cooccurrence_score",
+    )
+    .parse::<f64>()
+    .expect("k1 score");
+    let d2_score = table_value(
+        &cooccur,
+        "candidate_id",
+        "p03_d2_background_001",
+        "cooccurrence_score",
+    )
+    .parse::<f64>()
+    .expect("d2 score");
+    assert!(k1_score > d2_score);
+    let report_text = fs::read_to_string(report).expect("read phase 0.3 report");
+    for section in [
+        "## Input Summary",
+        "## Fragment Kernel Summary",
+        "## Genome/Annotation Summary",
+        "## Evidence Summary",
+        "## Candidate Ranking Table",
+        "## Context Class Distribution",
+        "## Top Candidate Details",
+        "## Filtered Decoys",
+        "## Interpretation Cautions",
+        "## Reproducibility Metadata",
+    ] {
+        assert!(report_text.contains(section), "missing section {section}");
+    }
+    assert!(report_text.contains("未注释 ORF 候选不能被解释为已证实蛋白"));
+}
+
 fn temp_root(label: &str) -> PathBuf {
     let root = std::env::temp_dir().join(format!(
         "genoligand-{label}-{}-{}",
