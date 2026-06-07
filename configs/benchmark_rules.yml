@@ -1,0 +1,26 @@
+activity_rules:
+  direct_binding_types:
+    - "IC50"
+    - "EC50"
+    - "Ki"
+    - "Kd"
+  positive_threshold_nM: 1000.0
+  negative_threshold_nM: 30000.0
+  gray_zone_policy: "exclude_from_binary_benchmark"
+  relation_required: "="
+  non_exact_relation_policy: "retain_raw_exclude_binary"
+open_benchmark_sources:
+  mandatory:
+    - "plinder"
+    - "binding_moad"
+    - "reconstructed_openbindbench"
+    - "dude_z"
+  optional:
+    - "dud_e"
+    - "pdbbind"
+decoy_source_default: "dude_z"
+openbindbench_policy: "repo_reconstructed_recipe"
+label_policy:
+  positives_require_real_activity_or_curated_benchmark_row: true
+  negatives_require_real_inactive_or_curated_decoy_row: true
+  no_synthetic_labels_for_pass: true

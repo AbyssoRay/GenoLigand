@@ -1,0 +1,13 @@
+compound_mapping:
+  require_canonical_smiles_for_benchmark: true
+  require_inchikey_for_benchmark: true
+  retain_unresolved_compounds_in_raw: true
+  unresolved_compound_policy: "exclude_from_binary_benchmark_keep_raw"
+target_mapping:
+  require_uniprot_for_benchmark_targets: true
+  allow_complex_targets: true
+  complex_target_policy: "expand_components_and_mark_complex"
+  unmapped_target_policy: "exclude_from_benchmark_keep_in_raw"
+structure_mapping:
+  require_pdb_id_for_pdb_derived_benchmark_rows: true
+  prefer_sifts_or_rcsb_polymer_entity_mapping: true

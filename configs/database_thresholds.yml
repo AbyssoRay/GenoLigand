@@ -1,0 +1,19 @@
+compound_standardization:
+  benchmark_candidate_success_rate_min: 0.95
+target_mapping:
+  benchmark_uniprot_mapping_rate_min: 0.90
+  afdb_uniprot_mapping_rate_min: 0.99
+  pdb_chain_mapping_rate_hard_threshold: false
+benchmark_minimums:
+  known_positive_pairs_min: 1000
+  known_negative_pairs_min: 1000
+  unique_targets_min: 100
+  unique_compounds_min: 1000
+source_minimums:
+  mandatory_source_files_min: 1
+  mandatory_source_bytes_min: 1
+  required_open_benchmark_sources:
+    - "plinder"
+    - "binding_moad"
+    - "reconstructed_openbindbench"
+    - "dude_z"

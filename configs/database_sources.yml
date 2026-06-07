@@ -1,0 +1,90 @@
+sources:
+  chembl:
+    role: "reference_database"
+    required_for_pass: true
+    official_page: "https://www.ebi.ac.uk/chembl/downloads"
+    latest_directory: "https://ftp.ebi.ac.uk/pub/databases/chembl/ChEMBLdb/latest/"
+    acquisition: "full_current_release"
+    local_glob: "data/external_phase_0_8/chembl/**/*"
+    license_note: "ChEMBL data license must be recorded from source release."
+  bindingdb:
+    role: "reference_database"
+    required_for_pass: true
+    official_page: "https://www.bindingdb.org/rwd/bind/chemsearch/marvin/SDFdownload.jsp"
+    direct_url: "https://www.bindingdb.org/rwd/bind/downloads/BindingDB_All.tsv.zip"
+    acquisition: "full_dump"
+    local_glob: "data/external_phase_0_8/bindingdb/**/*"
+    license_note: "BindingDB terms and citation must be recorded from source release."
+  uniprot_reviewed_human:
+    role: "reference_database"
+    required_for_pass: true
+    official_page: "https://www.uniprot.org/help/downloads"
+    direct_url: "https://rest.uniprot.org/uniprotkb/stream?compressed=true&format=fasta&query=(reviewed:true)%20AND%20(organism_id:9606)"
+    acquisition: "reviewed_human_proteome"
+    local_glob: "data/external_phase_0_8/uniprot_reviewed_human/**/*"
+    license_note: "UniProt license/citation must be recorded."
+  afdb_human:
+    role: "structure_database"
+    required_for_pass: true
+    official_page: "https://alphafold.ebi.ac.uk/download"
+    latest_directory: "https://ftp.ebi.ac.uk/pub/databases/alphafold/latest/"
+    acquisition: "human_proteome"
+    local_glob: "data/external_phase_0_8/afdb_human/**/*"
+    license_note: "AlphaFold DB terms and source model version must be recorded."
+  rcsb_ligand_bound:
+    role: "structure_database"
+    required_for_pass: true
+    official_page: "https://www.rcsb.org/docs/programmatic-access/web-apis-overview"
+    data_api: "https://data.rcsb.org/"
+    file_url_template: "https://files.rcsb.org/download/{pdb_id}.cif"
+    acquisition: "declared_ligand_bound_query_scope"
+    local_glob: "data/external_phase_0_8/rcsb_ligand_bound/**/*"
+    license_note: "RCSB PDB data policy must be recorded."
+  biolip2:
+    role: "interaction_database"
+    required_for_pass: true
+    official_page: "https://zhanggroup.org/BioLiP/download.html"
+    direct_url: "https://zhanggroup.org/BioLiP/download/BioLiP.txt.gz"
+    acquisition: "full_or_declared_current_release"
+    local_glob: "data/external_phase_0_8/biolip2/**/*"
+    license_note: "BioLiP2 citation and terms must be recorded."
+  plinder:
+    role: "open_benchmark"
+    required_for_pass: true
+    official_page: "https://github.com/plinder-org/plinder"
+    bucket: "gs://plinder/2024-06/v2/"
+    acquisition: "current_public_release"
+    local_glob: "data/external_phase_0_8/plinder/**/*"
+    license_note: "PLINDER release and data license must be recorded."
+  binding_moad:
+    role: "open_benchmark"
+    required_for_pass: true
+    official_page: "https://bindingmoad.org/Home/download"
+    sunset_reference: "https://pmc.ncbi.nlm.nih.gov/articles/PMC9944886/"
+    rcsb_reference: "https://rcsb.org/docs/additional-resources/databases-and-knowledgebases"
+    acquisition: "last_public_or_auditable_rcsb_reconstruction"
+    local_glob: "data/external_phase_0_8/binding_moad/**/*"
+    license_note: "Binding MOAD sunset status and provenance must be recorded; PDBbind cannot substitute."
+  reconstructed_openbindbench:
+    role: "open_benchmark"
+    required_for_pass: true
+    official_page: "repo_reconstructed_from_open_sources"
+    acquisition: "recipe_reconstruction"
+    local_glob: "data/external_phase_0_8/reconstructed_openbindbench/**/*"
+    license_note: "No fabricated upstream claim; recipe and source hashes define provenance."
+  dude_z:
+    role: "open_benchmark"
+    required_for_pass: true
+    official_page: "https://dudez.docking.org/"
+    recommended_subdir: "DOCKING_GRIDS_AND_POSES/"
+    acquisition: "mandatory_decoy_benchmark"
+    local_glob: "data/external_phase_0_8/dude_z/**/*"
+    license_note: "DUDE-Z benchmark files, target count, ligand/decoy counts, and directory caveats must be recorded."
+  pdbbind:
+    role: "license_gated_external_comparator"
+    required_for_pass: false
+    official_page: "https://www.pdbbind-plus.org.cn/"
+    acquisition: "optional_manual_or_credentialed"
+    local_glob: "data/external_phase_0_8/pdbbind/**/*"
+    unavailable_status: "not_available_license_or_access_limited"
+    license_note: "PDBbind is never required for Phase 0.8 PASS."
