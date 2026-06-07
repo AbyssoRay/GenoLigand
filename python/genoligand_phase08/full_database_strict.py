@@ -4,15 +4,18 @@ import argparse
 import csv
 import glob
 import gzip
+import hashlib
 import json
 import os
 import re
 import shutil
+import sqlite3
 import subprocess
 import sys
 import tarfile
 import time
 import urllib.request
+import zipfile
 from pathlib import Path
 from typing import Iterable, Iterator
 
@@ -26,6 +29,18 @@ PHASE071_DIRNAME = "acceptance_artifacts_phase_0_7_1_audit_fix_strict"
 GUIDANCE_PHASE071_COMMIT = "30badc261f94526a72fd8143033eed4a2444f552"
 VALIDATED_PHASE071_COMMIT = "83e7375"
 OPENBINDBENCH_COMPONENT_SOURCES = ["chembl", "bindingdb", "plinder", "binding_moad", "dude_z"]
+CHEMBL_REQUIRED_TABLES = [
+    "molecule_dictionary",
+    "compound_structures",
+    "activities",
+    "assays",
+    "target_dictionary",
+    "target_components",
+    "component_sequences",
+    "docs",
+]
+BINDINGDB_FULL_TSV_ZIP = "BindingDB_All_202606_tsv.zip"
+BINDINGDB_FULL_TSV_EXPECTED_MD5 = "cf6c3727306a59e6cfaf113f8f78fd93"
 
 DEFAULT_JAVA = r"D:\user\codex\tools\java\jdk-25.0.3+9\bin\java.exe"
 DEFAULT_PHASE07_PYTHON = r"D:\user\codex\tools\genoligand-phase07\python312-embed\python.exe"
@@ -344,6 +359,44 @@ def aggregate_hash(paths: Iterable[Path]) -> str:
     return sha256_text("\n".join(parts)) if parts else ""
 
 
+def md5_file(path: Path) -> str:
+    digest = hashlib.md5()  # noqa: S324 - provenance checksum, not security.
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def bindingdb_full_tsv_zip_status(files: list[Path]) -> dict[str, object]:
+    zip_path = next((path for path in files if path.name == BINDINGDB_FULL_TSV_ZIP and path.is_file() and path.stat().st_size > 0), None)
+    if zip_path is None:
+        return {"status": "ABSENT", "path": "", "md5": "", "row_count": 0, "member": "", "notes": "full_tsv_zip_absent"}
+    actual_md5 = md5_file(zip_path)
+    if actual_md5.lower() != BINDINGDB_FULL_TSV_EXPECTED_MD5:
+        return {
+            "status": "FAIL",
+            "path": str(zip_path),
+            "md5": actual_md5,
+            "row_count": 0,
+            "member": "",
+            "notes": f"md5_mismatch_expected_{BINDINGDB_FULL_TSV_EXPECTED_MD5}",
+        }
+    try:
+        with zipfile.ZipFile(zip_path) as archive:
+            member = next((name for name in archive.namelist() if name.lower().endswith((".tsv", ".txt")) and not name.endswith("/")), "")
+            if not member:
+                return {"status": "FAIL", "path": str(zip_path), "md5": actual_md5, "row_count": 0, "member": "", "notes": "no_tsv_member_in_zip"}
+            nonblank_count = 0
+            with archive.open(member) as raw:
+                for raw_line in raw:
+                    if raw_line.strip():
+                        nonblank_count += 1
+            row_count = max(0, nonblank_count - 1)
+    except Exception as exc:  # noqa: BLE001
+        return {"status": "FAIL", "path": str(zip_path), "md5": actual_md5, "row_count": 0, "member": "", "notes": f"zip_parse_failed:{exc!r}"}
+    return {"status": "PASS", "path": str(zip_path), "md5": actual_md5, "row_count": row_count, "member": member, "notes": "local_full_tsv_zip_md5_verified_and_rows_counted"}
+
+
 def write_source_manifest(artifact_dir: Path) -> int:
     phase08_dirs(artifact_dir)
     rows: list[dict[str, object]] = []
@@ -358,10 +411,25 @@ def write_source_manifest(artifact_dir: Path) -> int:
             status = "PASS"
             notes = "optional_license_gated_comparator_absent_not_blocking"
         elif resource_id == "bindingdb":
+            local_full = bindingdb_full_tsv_zip_status(files)
             metadata_files = [path for path in files if path.name == "bindingdb_202606_remote_release_metadata.tsv"]
             metadata_rows = read_tsv(metadata_files[0]) if metadata_files else []
             metadata = metadata_rows[0] if metadata_rows else {}
-            if metadata.get("status") == "PASS":
+            if local_full.get("status") == "PASS":
+                parse_status = "local_full_tsv_zip_md5_verified_and_parsed"
+                status = "PASS"
+                record_count = safe_int(local_full.get("row_count", 0))
+                notes = (
+                    f"local_full_tsv_zip={Path(str(local_full.get('path'))).relative_to(ROOT).as_posix()}; "
+                    f"official_md5={BINDINGDB_FULL_TSV_EXPECTED_MD5}; observed_md5={local_full.get('md5', '')}; "
+                    f"zip_member={local_full.get('member', '')}; local_full_tsv_rows={record_count}"
+                )
+            elif local_full.get("status") == "FAIL":
+                parse_status = "local_full_tsv_zip_failed_integrity_or_parse"
+                status = "FAIL"
+                record_count = 0
+                notes = str(local_full.get("notes", "local_full_tsv_zip_failed"))
+            elif metadata.get("status") == "PASS":
                 parse_status = "remote_release_metadata_verified_local_full_tsv_unavailable"
                 status = "PASS"
                 record_count = safe_int(metadata.get("declared_measurements", 0))
@@ -405,6 +473,7 @@ def write_source_manifest(artifact_dir: Path) -> int:
             structure_file_count = sum(1 for path in files if path.suffix.lower() in {".cif", ".mmcif", ".pdb"})
             parse_status = "declared_query_scope_manifest_present" if entry_count > 0 else "absent"
             status = "PASS" if entry_count > 0 else "FAIL"
+            record_count = entry_count
             notes = f"entry_scope_count={entry_count}; structure_file_count={structure_file_count}; mmCIF structure download and Foldseek indexing remain separate strict gates"
         elif resource_id == "plinder":
             annotation_files = [path for path in files if path.name == "annotation_table.parquet"]
@@ -487,7 +556,7 @@ def download_command(resource_id: str, source_url: str) -> str:
     if resource_id == "plinder":
         return 'gsutil -m cp -r "gs://plinder/2024-06/v2/*" data/external_phase_0_8/plinder/2024-06/v2/'
     if resource_id == "rcsb_ligand_bound":
-        return "python scripts/phase08/download_phase08_sources.py --source rcsb_ligand_bound"
+        return "python scripts/phase08/download_rcsb_ligand_bound_structures_phase_0_8.py"
     if resource_id == "reconstructed_openbindbench":
         return "python scripts/phase08/reconstruct_openbindbench_phase_0_8.py"
     if source_url.startswith("http"):
@@ -647,6 +716,83 @@ def biolip2_source_summary_rows() -> list[dict[str, object]]:
     return rows
 
 
+def chembl_sqlite_db_path() -> Path:
+    preferred = ROOT / "databases/phase_0_8/normalized/chembl_37_sqlite/chembl_37.db"
+    if preferred.exists():
+        return preferred
+    matches = sorted((ROOT / "databases/phase_0_8").rglob("chembl_37.db"))
+    return matches[0] if matches else preferred
+
+
+def ensure_chembl_sqlite_db() -> tuple[Path, str]:
+    db_path = chembl_sqlite_db_path()
+    if db_path.exists() and db_path.stat().st_size > 0:
+        return db_path, "existing_chembl_sqlite_db_reused"
+    tar_files = source_files("chembl")
+    if not tar_files:
+        return db_path, "chembl_sqlite_tar_absent"
+    ensure_parent(db_path)
+    try:
+        with tarfile.open(tar_files[0], "r:gz") as archive:
+            member = next((item for item in archive if item.isfile() and item.name.endswith("/chembl_37.db")), None)
+            if member is None:
+                return db_path, "chembl_37_db_missing_inside_tar"
+            source = archive.extractfile(member)
+            if source is None:
+                return db_path, "chembl_37_db_extractfile_failed"
+            with source, db_path.open("wb") as handle:
+                shutil.copyfileobj(source, handle)
+    except Exception as exc:  # noqa: BLE001
+        return db_path, f"chembl_sqlite_extraction_failed:{exc!r}"
+    return db_path, "chembl_sqlite_db_extracted_from_audited_tarball"
+
+
+def chembl_table_count_rows() -> list[dict[str, object]]:
+    db_path, note = ensure_chembl_sqlite_db()
+    rows: list[dict[str, object]] = []
+    if not db_path.exists() or db_path.stat().st_size == 0:
+        return [
+            {
+                "table_name": table,
+                "row_count": 0,
+                "status": "FAIL",
+                "notes": note,
+            }
+            for table in CHEMBL_REQUIRED_TABLES
+        ]
+    try:
+        con = sqlite3.connect(str(db_path))
+        existing_tables = {
+            row[0]
+            for row in con.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()
+        }
+        for table in CHEMBL_REQUIRED_TABLES:
+            if table not in existing_tables:
+                rows.append({"table_name": table, "row_count": 0, "status": "FAIL", "notes": f"{note}; table_absent; db={db_path.relative_to(ROOT).as_posix()}"})
+                continue
+            count = safe_int(con.execute(f'SELECT COUNT(*) FROM "{table}"').fetchone()[0])
+            rows.append(
+                {
+                    "table_name": table,
+                    "row_count": count,
+                    "status": "PASS" if count > 0 else "FAIL",
+                    "notes": f"{note}; db={db_path.relative_to(ROOT).as_posix()}",
+                }
+            )
+        con.close()
+    except Exception as exc:  # noqa: BLE001
+        rows = [
+            {
+                "table_name": table,
+                "row_count": 0,
+                "status": "FAIL",
+                "notes": f"chembl_sqlite_count_failed:{exc!r}; db={db_path.relative_to(ROOT).as_posix()}",
+            }
+            for table in CHEMBL_REQUIRED_TABLES
+        ]
+    return rows
+
+
 def artifact_rows(path: Path) -> list[dict[str, str]]:
     return read_tsv(path) if path.exists() and path.is_file() else []
 
@@ -703,20 +849,25 @@ def plinder_target_count() -> int:
         return 0
 
 
-def ensure_afdb_foldseek_inputs(limit: int = 16) -> tuple[Path, int, str]:
-    input_dir = ensure_dir(ROOT / "databases/phase_0_8/index_inputs/afdb_human_foldseek_smoke")
+def ensure_afdb_foldseek_inputs(limit: int = 0) -> tuple[Path, int, str]:
+    smoke_limit = safe_int(os.environ.get("PHASE08_AFDB_SMOKE_LIMIT", ""), 0)
+    if smoke_limit > 0:
+        limit = smoke_limit
+    input_dir = ensure_dir(ROOT / ("databases/phase_0_8/index_inputs/afdb_human_foldseek_smoke" if limit > 0 else "databases/phase_0_8/index_inputs/afdb_human_foldseek"))
     existing = sorted(input_dir.glob("*.pdb.gz"))
-    if len(existing) >= limit:
+    if limit > 0 and len(existing) >= limit:
         return input_dir, len(existing), "existing_afdb_pdb_gz_smoke_inputs_reused"
     tar_files = source_files("afdb_human")
     if not tar_files:
         return input_dir, 0, "afdb_human_tar_absent"
     extracted = 0
+    target_count = 0
     try:
         with tarfile.open(tar_files[0], "r") as archive:
             for member in archive:
                 if not member.isfile() or not member.name.endswith(".pdb.gz"):
                     continue
+                target_count += 1
                 target = input_dir / Path(member.name).name
                 if not target.exists():
                     source = archive.extractfile(member)
@@ -725,14 +876,34 @@ def ensure_afdb_foldseek_inputs(limit: int = 16) -> tuple[Path, int, str]:
                     with source, target.open("wb") as handle:
                         shutil.copyfileobj(source, handle)
                 extracted += 1
-                if extracted >= limit:
+                if limit > 0 and extracted >= limit:
                     break
     except Exception as exc:  # noqa: BLE001
-        return input_dir, len(list(input_dir.glob("*.pdb.gz"))), f"afdb_smoke_input_extraction_failed:{exc!r}"
-    return input_dir, len(list(input_dir.glob("*.pdb.gz"))), "afdb_pdb_gz_smoke_inputs_extracted_from_audited_archive"
+        return input_dir, len(list(input_dir.glob("*.pdb.gz"))), f"afdb_input_extraction_failed:{exc!r}"
+    input_count = len(list(input_dir.glob("*.pdb.gz")))
+    if limit > 0:
+        return input_dir, input_count, "afdb_pdb_gz_smoke_inputs_extracted_from_audited_archive"
+    note = "afdb_pdb_gz_full_inputs_extracted_from_audited_archive" if input_count >= target_count and target_count > 0 else f"afdb_pdb_gz_partial_inputs_extracted_from_audited_archive; target_count={target_count}"
+    return input_dir, input_count, note
+
+
+def afdb_foldseek_scope_count() -> int:
+    tar_files = source_files("afdb_human")
+    if not tar_files:
+        return 0
+    try:
+        with tarfile.open(tar_files[0], "r") as archive:
+            return sum(1 for member in archive if member.isfile() and member.name.endswith(".pdb.gz"))
+    except Exception:  # noqa: BLE001
+        return 0
 
 
 def ensure_rcsb_foldseek_inputs(limit: int = 16) -> tuple[Path, int, str]:
+    full_dir = ensure_dir(ROOT / "data/external_phase_0_8/rcsb_ligand_bound/structures")
+    full_existing = sorted(path for path in full_dir.glob("*") if path.suffix.lower() in {".cif", ".mmcif", ".pdb"} and path.stat().st_size > 0)
+    if full_existing:
+        return full_dir, len(full_existing), "rcsb_ligand_bound_downloaded_structure_inputs_reused"
+
     input_dir = ensure_dir(ROOT / "data/external_phase_0_8/rcsb_ligand_bound/structures_smoke")
     manifest = ROOT / "data/external_phase_0_8/rcsb_ligand_bound/rcsb_ligand_bound_entry_manifest.tsv"
     rows = artifact_rows(manifest)
@@ -758,13 +929,26 @@ def ensure_rcsb_foldseek_inputs(limit: int = 16) -> tuple[Path, int, str]:
     return input_dir, len(list(input_dir.glob("*.cif"))), note
 
 
+def rcsb_ligand_bound_scope_count() -> int:
+    manifest = ROOT / "data/external_phase_0_8/rcsb_ligand_bound/rcsb_ligand_bound_entry_manifest.tsv"
+    return len(artifact_rows(manifest)) if manifest.exists() else 0
+
+
 def run_foldseek_createdb(binary: str, input_dir: Path, output_prefix: Path, log_dir: Path, log_name: str) -> tuple[str, str]:
     ensure_parent(output_prefix)
     ensure_dir(log_dir)
     dbtype = output_prefix.with_suffix(".dbtype")
     lookup = output_prefix.with_suffix(".lookup")
-    if dbtype.exists() and lookup.exists():
+    fingerprint_path = output_prefix.with_suffix(".input_fingerprint.sha256")
+    input_files = sorted(path for path in input_dir.glob("*") if path.is_file())
+    input_fingerprint = aggregate_hash(input_files)
+    existing_fingerprint = read_text(fingerprint_path).strip() if fingerprint_path.exists() else ""
+    if dbtype.exists() and lookup.exists() and existing_fingerprint == input_fingerprint:
         return "PASS", "existing_foldseek_createdb_output_reused"
+    if dbtype.exists() or lookup.exists():
+        for path in output_prefix.parent.glob(f"{output_prefix.name}*"):
+            if path.is_file():
+                path.unlink()
     command = foldseek_command_from_binary(
         binary,
         [
@@ -781,6 +965,8 @@ def run_foldseek_createdb(binary: str, input_dir: Path, output_prefix: Path, log
     (log_dir / f"{log_name}.stdout.log").write_text(out, encoding="utf-8", errors="replace")
     (log_dir / f"{log_name}.stderr.log").write_text(err, encoding="utf-8", errors="replace")
     status = "PASS" if code == 0 and dbtype.exists() and lookup.exists() else "FAIL"
+    if status == "PASS":
+        fingerprint_path.write_text(input_fingerprint + "\n", encoding="utf-8")
     note = f"command={command_string(command)}; exit_code={code}; dbtype_exists={dbtype.exists()}; lookup_exists={lookup.exists()}"
     return status, note
 
@@ -1378,6 +1564,24 @@ def write_warehouse_and_mapping(artifact_dir: Path) -> int:
             else:
                 table_rows.append({"table_name": "biolip2_interaction_source_files", "row_count": 0, "status": "FAIL", "notes": "biolip2_source_absent"})
 
+            chembl_counts = chembl_table_count_rows()
+            write_tsv(artifact_dir / "outputs/database_warehouse/chembl_table_counts.tsv", chembl_counts, ["table_name", "row_count", "status", "notes"])
+            chembl_count_parquet = parquet_dir / "chembl_table_counts.parquet"
+            parquet_write(chembl_counts, chembl_count_parquet)
+            con.execute(
+                f"CREATE OR REPLACE TABLE chembl_table_counts AS SELECT * FROM read_parquet('{duckdb_path_literal(chembl_count_parquet)}')"
+            )
+            chembl_tables_pass = bool(chembl_counts) and all(row.get("status") == "PASS" for row in chembl_counts)
+            table_rows.append(
+                {
+                    "table_name": "chembl_table_counts",
+                    "row_count": len(chembl_counts),
+                    "status": "PASS" if chembl_tables_pass else "FAIL",
+                    "notes": f"required ChEMBL SQLite table counts; parquet={chembl_count_parquet.relative_to(ROOT).as_posix()}",
+                }
+            )
+            available_table_count += 1 if chembl_tables_pass else 0
+
             compound_map: dict[str, dict[str, object]] = {}
             for row in passing_pair_rows:
                 key = row.get("inchikey", "") or row.get("compound_id", "")
@@ -1672,30 +1876,33 @@ def write_indexes(artifact_dir: Path) -> int:
     afdb_input_dir, afdb_input_count, afdb_input_note = ensure_afdb_foldseek_inputs()
     rcsb_input_dir, rcsb_input_count, rcsb_input_note = ensure_rcsb_foldseek_inputs()
     structure_specs = [
-        ("afdb_human_foldseek", "afdb_human", afdb_input_dir, afdb_input_count, afdb_input_note),
-        ("rcsb_ligand_bound_foldseek", "rcsb_ligand_bound", rcsb_input_dir, rcsb_input_count, rcsb_input_note),
+        ("afdb_human_foldseek", "afdb_human", afdb_input_dir, afdb_input_count, afdb_input_note, afdb_foldseek_scope_count()),
+        ("rcsb_ligand_bound_foldseek", "rcsb_ligand_bound", rcsb_input_dir, rcsb_input_count, rcsb_input_note, rcsb_ligand_bound_scope_count()),
     ]
-    for index_id, input_source, input_dir, record_count, input_note in structure_specs:
+    for index_id, input_source, input_dir, record_count, input_note, source_scope_count in structure_specs:
         index_prefix = ROOT / f"databases/phase_0_8/indexes/{index_id}/{index_id}"
         createdb_status = "FAIL"
         createdb_note = "Foldseek tool unavailable"
         if foldseek_ok and record_count > 0:
             createdb_status, createdb_note = run_foldseek_createdb(foldseek_binary, input_dir, index_prefix, log_dir, index_id)
+        full_scope_status = source_scope_count > 0 and record_count >= source_scope_count and "smoke" not in input_note.lower()
+        strict_status = foldseek_ok and createdb_status == "PASS" and full_scope_status
         struct_rows.append(
             {
                 "index_id": index_id,
                 "index_type": "Foldseek",
                 "input_source": input_source,
                 "record_count": record_count,
+                "source_scope_count": source_scope_count,
                 "index_path": index_prefix.relative_to(ROOT).as_posix(),
                 "tool_status": tool_status.get("Foldseek", "FAIL"),
                 "query_smoke_test_status": createdb_status,
-                "status": "PASS" if foldseek_ok and createdb_status == "PASS" and record_count > 0 else "FAIL",
-                "notes": f"{input_note}; {createdb_note}; smoke index built from audited source-derived structure files",
+                "status": "PASS" if strict_status else "FAIL",
+                "notes": f"{input_note}; source_scope_count={source_scope_count}; {createdb_note}; strict_full_scope_status={'PASS' if full_scope_status else 'FAIL'}; partial_inputs_do_not_pass",
             }
         )
     write_tsv(artifact_dir / "outputs/indexes/sequence_index_manifest.tsv", seq_rows, ["index_id", "index_type", "input_source", "record_count", "index_path", "tool_status", "query_smoke_test_status", "status", "notes"])
-    write_tsv(artifact_dir / "outputs/indexes/structure_index_manifest.tsv", struct_rows, ["index_id", "index_type", "input_source", "record_count", "index_path", "tool_status", "query_smoke_test_status", "status", "notes"])
+    write_tsv(artifact_dir / "outputs/indexes/structure_index_manifest.tsv", struct_rows, ["index_id", "index_type", "input_source", "record_count", "source_scope_count", "index_path", "tool_status", "query_smoke_test_status", "status", "notes"])
     return 0
 
 
@@ -1947,7 +2154,7 @@ def build_claims(artifact_dir: Path) -> list[dict[str, object]]:
         ("mapping_status", "compound/target/structure mapping summaries recorded", "mapping", "outputs/mapping/compound_mapping_summary.tsv", "status", "recorded"),
         ("sequence_index_status", f"sequence indexer status: {values['sequence_indexer_status']}", "index", "outputs/indexes/sequence_index_manifest.tsv", "status", values["sequence_indexer_status"]),
         ("foldseek_status", f"Foldseek status: {values['foldseek_status']}", "index", "outputs/indexes/structure_index_manifest.tsv", "status", values["foldseek_status"]),
-        ("structure_index_scope", "Foldseek structure indexes are source-derived smoke indexes", "index", "outputs/indexes/structure_index_manifest.tsv", "notes", "source-derived smoke indexes"),
+        ("structure_index_scope", "Foldseek structure indexes require full declared source scope, not partial inputs", "index", "outputs/indexes/structure_index_manifest.tsv", "notes", "partial_inputs_do_not_pass"),
         ("positive_benchmark_pairs", f"known-positive pairs: {values['positive_pairs']}", "benchmark", "outputs/benchmark/known_positive_pairs.tsv", "pair_id", values["positive_pairs"]),
         ("negative_benchmark_pairs", f"known-negative pairs: {values['negative_pairs']}", "benchmark", "outputs/benchmark/known_negative_pairs.tsv", "pair_id", values["negative_pairs"]),
         ("unique_targets", f"unique benchmark targets: {values['unique_targets']}", "benchmark", "outputs/evaluation/benchmark_label_summary.tsv", "value", values["unique_targets"]),
@@ -2328,14 +2535,20 @@ def validate_phase08(artifact_dir: Path, include_report: bool = True) -> tuple[b
         rows = read_tsv(artifact_dir / rel) if exists(rel) else []
         add_gate(gates, gate_id, gate_id.replace("_", " "), bool(rows) and all(row.get("status") == "PASS" for row in rows), expected, sum(1 for row in rows if row.get("status") != "PASS"), artifact_dir / rel)
     structure_rows = read_tsv(artifact_dir / "outputs/indexes/structure_index_manifest.tsv") if exists("outputs/indexes/structure_index_manifest.tsv") else []
-    smoke_rows = [row for row in structure_rows if "smoke" in row.get("notes", "").lower() or safe_int(row.get("record_count", 0)) < 1000]
+    incomplete_structure_rows = [
+        row
+        for row in structure_rows
+        if row.get("status") != "PASS"
+        or safe_int(row.get("record_count", 0)) < safe_int(row.get("source_scope_count", 0))
+        or safe_int(row.get("source_scope_count", 0)) <= 0
+    ]
     add_gate(
         gates,
         "structure_index_full_scope",
         "structure index full scope",
-        bool(structure_rows) and not smoke_rows,
+        bool(structure_rows) and not incomplete_structure_rows,
         "AFDB and RCSB structure indexes are full-scope, not smoke-only",
-        len(smoke_rows),
+        len(incomplete_structure_rows),
         artifact_dir / "outputs/indexes/structure_index_manifest.tsv",
     )
 
