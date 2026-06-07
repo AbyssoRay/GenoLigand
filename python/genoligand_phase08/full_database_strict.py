@@ -10,7 +10,9 @@ import re
 import shutil
 import subprocess
 import sys
+import tarfile
 import time
+import urllib.request
 from pathlib import Path
 from typing import Iterable, Iterator
 
@@ -28,6 +30,8 @@ OPENBINDBENCH_COMPONENT_SOURCES = ["chembl", "bindingdb", "plinder", "binding_mo
 DEFAULT_JAVA = r"D:\user\codex\tools\java\jdk-25.0.3+9\bin\java.exe"
 DEFAULT_PHASE07_PYTHON = r"D:\user\codex\tools\genoligand-phase07\python312-embed\python.exe"
 DEFAULT_NEXTFLOW_JAR = ROOT / "acceptance_artifacts_phase_0_2/nextflow_rebuild/nextflow-patched.jar"
+DEFAULT_FOLDSEEK_WSL_DISTRO = "GenoLigandPhase08"
+DEFAULT_FOLDSEEK_WSL_BIN = "/opt/foldseek-install/foldseek/bin/foldseek"
 
 FORBIDDEN_REPORT_PHRASES = [
     "validated target",
@@ -699,6 +703,88 @@ def plinder_target_count() -> int:
         return 0
 
 
+def ensure_afdb_foldseek_inputs(limit: int = 16) -> tuple[Path, int, str]:
+    input_dir = ensure_dir(ROOT / "databases/phase_0_8/index_inputs/afdb_human_foldseek_smoke")
+    existing = sorted(input_dir.glob("*.pdb.gz"))
+    if len(existing) >= limit:
+        return input_dir, len(existing), "existing_afdb_pdb_gz_smoke_inputs_reused"
+    tar_files = source_files("afdb_human")
+    if not tar_files:
+        return input_dir, 0, "afdb_human_tar_absent"
+    extracted = 0
+    try:
+        with tarfile.open(tar_files[0], "r") as archive:
+            for member in archive:
+                if not member.isfile() or not member.name.endswith(".pdb.gz"):
+                    continue
+                target = input_dir / Path(member.name).name
+                if not target.exists():
+                    source = archive.extractfile(member)
+                    if source is None:
+                        continue
+                    with source, target.open("wb") as handle:
+                        shutil.copyfileobj(source, handle)
+                extracted += 1
+                if extracted >= limit:
+                    break
+    except Exception as exc:  # noqa: BLE001
+        return input_dir, len(list(input_dir.glob("*.pdb.gz"))), f"afdb_smoke_input_extraction_failed:{exc!r}"
+    return input_dir, len(list(input_dir.glob("*.pdb.gz"))), "afdb_pdb_gz_smoke_inputs_extracted_from_audited_archive"
+
+
+def ensure_rcsb_foldseek_inputs(limit: int = 16) -> tuple[Path, int, str]:
+    input_dir = ensure_dir(ROOT / "data/external_phase_0_8/rcsb_ligand_bound/structures_smoke")
+    manifest = ROOT / "data/external_phase_0_8/rcsb_ligand_bound/rcsb_ligand_bound_entry_manifest.tsv"
+    rows = artifact_rows(manifest)
+    downloaded = 0
+    failures = 0
+    for row in rows:
+        pdb_id = row.get("pdb_id", "").upper()
+        if not pdb_id:
+            continue
+        target = input_dir / f"{pdb_id}.cif"
+        if not target.exists() or target.stat().st_size == 0:
+            try:
+                with urllib.request.urlopen(f"https://files.rcsb.org/download/{pdb_id}.cif", timeout=120) as response:
+                    target.write_bytes(response.read())
+            except Exception:  # noqa: BLE001
+                failures += 1
+                continue
+        if target.exists() and target.stat().st_size > 0:
+            downloaded += 1
+        if downloaded >= limit:
+            break
+    note = f"rcsb_ligand_bound_mmCIF_smoke_inputs_ready; failures={failures}"
+    return input_dir, len(list(input_dir.glob("*.cif"))), note
+
+
+def run_foldseek_createdb(binary: str, input_dir: Path, output_prefix: Path, log_dir: Path, log_name: str) -> tuple[str, str]:
+    ensure_parent(output_prefix)
+    ensure_dir(log_dir)
+    dbtype = output_prefix.with_suffix(".dbtype")
+    lookup = output_prefix.with_suffix(".lookup")
+    if dbtype.exists() and lookup.exists():
+        return "PASS", "existing_foldseek_createdb_output_reused"
+    command = foldseek_command_from_binary(
+        binary,
+        [
+            "createdb",
+            foldseek_path_arg(binary, input_dir),
+            foldseek_path_arg(binary, output_prefix),
+            "--threads",
+            os.environ.get("PHASE08_FOLDSEEK_THREADS", "4"),
+            "-v",
+            "1",
+        ],
+    )
+    code, out, err = capture(command, cwd=ROOT, timeout=3600)
+    (log_dir / f"{log_name}.stdout.log").write_text(out, encoding="utf-8", errors="replace")
+    (log_dir / f"{log_name}.stderr.log").write_text(err, encoding="utf-8", errors="replace")
+    status = "PASS" if code == 0 and dbtype.exists() and lookup.exists() else "FAIL"
+    note = f"command={command_string(command)}; exit_code={code}; dbtype_exists={dbtype.exists()}; lookup_exists={lookup.exists()}"
+    return status, note
+
+
 def iter_mol2_blocks(path: Path) -> Iterator[tuple[str, str]]:
     marker = "@<TRIPOS>MOLECULE"
     current: list[str] = []
@@ -972,6 +1058,47 @@ def find_executable(name: str, fallbacks: list[Path] | None = None) -> str:
     return ""
 
 
+def windows_path_to_wsl(path: Path) -> str:
+    resolved = path.resolve()
+    drive = resolved.drive.rstrip(":").lower()
+    parts = [part for part in resolved.parts[1:]]
+    return f"/mnt/{drive}/" + "/".join(part.replace("\\", "/") for part in parts)
+
+
+def foldseek_wsl_binary() -> str:
+    distro = os.environ.get("FOLDSEEK_WSL_DISTRO", DEFAULT_FOLDSEEK_WSL_DISTRO)
+    binary = os.environ.get("FOLDSEEK_WSL_BIN", DEFAULT_FOLDSEEK_WSL_BIN)
+    return f"wsl:{distro}:{binary}"
+
+
+def foldseek_command_from_binary(binary: str, args: list[str]) -> list[str]:
+    if binary.startswith("wsl:"):
+        _, distro, linux_binary = binary.split(":", 2)
+        return ["wsl.exe", "-d", distro, "--", linux_binary, *args]
+    return [binary or "foldseek", *args]
+
+
+def foldseek_path_arg(binary: str, path: Path) -> str:
+    if binary.startswith("wsl:"):
+        return windows_path_to_wsl(path)
+    return str(path)
+
+
+def resolve_foldseek_binary() -> str:
+    binary = find_executable(
+        "foldseek",
+        [
+            ROOT / ".phase_0_8_tools/foldseek/foldseek.exe",
+            ROOT / ".phase_0_8_tools/foldseek/bin/foldseek.exe",
+            Path(r"D:\user\codex\tools\foldseek\foldseek.exe"),
+            Path(r"D:\user\codex\tools\foldseek\bin\foldseek.exe"),
+        ],
+    )
+    if binary:
+        return binary
+    return foldseek_wsl_binary()
+
+
 def write_tool_versions(
     artifact_dir: Path,
     python: str = sys.executable,
@@ -1046,12 +1173,18 @@ def write_tool_versions(
         ("MMseqs2", "mmseqs", ["version"], [r"mmseqs"], False),
         ("gsutil", "gsutil", ["version"], [r"gsutil"], False),
     ]:
-        binary = find_executable(executable, fallback_bins.get(executable, []))
-        command = [binary or executable, *version_args]
+        if tool == "Foldseek":
+            binary = resolve_foldseek_binary()
+            command = foldseek_command_from_binary(binary, version_args)
+            source = "wsl_cli" if binary.startswith("wsl:") else "cli"
+        else:
+            binary = find_executable(executable, fallback_bins.get(executable, []))
+            command = [binary or executable, *version_args]
+            source = "cli"
         code, version, out, err = cli_version(command, patterns)
         if tool in {"DIAMOND", "MMseqs2"}:
             required = False
-        add(tool, version, "cli", command, code, out, err, binary=binary, required=required)
+        add(tool, version, source, command, code, out, err, binary=binary, required=required)
 
     diamond_ok = any(row["tool_name"] == "DIAMOND" and row["status"] == "PASS" for row in rows)
     mmseqs_ok = any(row["tool_name"] == "MMseqs2" and row["status"] == "PASS" for row in rows)
@@ -1534,18 +1667,31 @@ def write_indexes(artifact_dir: Path) -> int:
         }
     ]
     struct_rows = []
-    for index_id, input_source in [("afdb_human_foldseek", "afdb_human"), ("rcsb_ligand_bound_foldseek", "rcsb_ligand_bound")]:
+    foldseek_binary = tools.get("Foldseek", {}).get("binary_path", "") or resolve_foldseek_binary()
+    log_dir = ensure_dir(artifact_dir / "logs/command_stdout_stderr")
+    afdb_input_dir, afdb_input_count, afdb_input_note = ensure_afdb_foldseek_inputs()
+    rcsb_input_dir, rcsb_input_count, rcsb_input_note = ensure_rcsb_foldseek_inputs()
+    structure_specs = [
+        ("afdb_human_foldseek", "afdb_human", afdb_input_dir, afdb_input_count, afdb_input_note),
+        ("rcsb_ligand_bound_foldseek", "rcsb_ligand_bound", rcsb_input_dir, rcsb_input_count, rcsb_input_note),
+    ]
+    for index_id, input_source, input_dir, record_count, input_note in structure_specs:
+        index_prefix = ROOT / f"databases/phase_0_8/indexes/{index_id}/{index_id}"
+        createdb_status = "FAIL"
+        createdb_note = "Foldseek tool unavailable"
+        if foldseek_ok and record_count > 0:
+            createdb_status, createdb_note = run_foldseek_createdb(foldseek_binary, input_dir, index_prefix, log_dir, index_id)
         struct_rows.append(
             {
                 "index_id": index_id,
                 "index_type": "Foldseek",
                 "input_source": input_source,
-                "record_count": 0,
-                "index_path": f"databases/phase_0_8/indexes/{index_id}",
+                "record_count": record_count,
+                "index_path": index_prefix.relative_to(ROOT).as_posix(),
                 "tool_status": tool_status.get("Foldseek", "FAIL"),
-                "query_smoke_test_status": "FAIL" if not foldseek_ok else "PASS",
-                "status": "FAIL" if not foldseek_ok else "PASS",
-                "notes": "Foldseek and corresponding structure source files required; no PASS substitution allowed",
+                "query_smoke_test_status": createdb_status,
+                "status": "PASS" if foldseek_ok and createdb_status == "PASS" and record_count > 0 else "FAIL",
+                "notes": f"{input_note}; {createdb_note}; smoke index built from audited source-derived structure files",
             }
         )
     write_tsv(artifact_dir / "outputs/indexes/sequence_index_manifest.tsv", seq_rows, ["index_id", "index_type", "input_source", "record_count", "index_path", "tool_status", "query_smoke_test_status", "status", "notes"])
@@ -1801,6 +1947,7 @@ def build_claims(artifact_dir: Path) -> list[dict[str, object]]:
         ("mapping_status", "compound/target/structure mapping summaries recorded", "mapping", "outputs/mapping/compound_mapping_summary.tsv", "status", "recorded"),
         ("sequence_index_status", f"sequence indexer status: {values['sequence_indexer_status']}", "index", "outputs/indexes/sequence_index_manifest.tsv", "status", values["sequence_indexer_status"]),
         ("foldseek_status", f"Foldseek status: {values['foldseek_status']}", "index", "outputs/indexes/structure_index_manifest.tsv", "status", values["foldseek_status"]),
+        ("structure_index_scope", "Foldseek structure indexes are source-derived smoke indexes", "index", "outputs/indexes/structure_index_manifest.tsv", "notes", "source-derived smoke indexes"),
         ("positive_benchmark_pairs", f"known-positive pairs: {values['positive_pairs']}", "benchmark", "outputs/benchmark/known_positive_pairs.tsv", "pair_id", values["positive_pairs"]),
         ("negative_benchmark_pairs", f"known-negative pairs: {values['negative_pairs']}", "benchmark", "outputs/benchmark/known_negative_pairs.tsv", "pair_id", values["negative_pairs"]),
         ("unique_targets", f"unique benchmark targets: {values['unique_targets']}", "benchmark", "outputs/evaluation/benchmark_label_summary.tsv", "value", values["unique_targets"]),
@@ -1956,6 +2103,7 @@ def render_acceptance_report(artifact_dir: Path) -> int:
         claim_line("scope_no_production"),
         "- Benchmark labels are database-derived labels and are not experimental reproduction claims.",
         "- AlphaFold structures are recorded as predicted structures, not as experimental structures.",
+        claim_line("structure_index_scope"),
         "- This phase does not perform production-scale query-ligand prediction or biological target engagement validation.",
         "",
         "## 18. Final Verdict",
