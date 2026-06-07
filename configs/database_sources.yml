@@ -4,14 +4,15 @@ sources:
     required_for_pass: true
     official_page: "https://www.ebi.ac.uk/chembl/downloads"
     latest_directory: "https://ftp.ebi.ac.uk/pub/databases/chembl/ChEMBLdb/latest/"
-    acquisition: "full_current_release"
+    direct_url: "https://ftp.ebi.ac.uk/pub/databases/chembl/ChEMBLdb/latest/chembl_37_sqlite.tar.gz"
+    acquisition: "full_current_release_sqlite"
     local_glob: "data/external_phase_0_8/chembl/**/*"
     license_note: "ChEMBL data license must be recorded from source release."
   bindingdb:
     role: "reference_database"
     required_for_pass: true
     official_page: "https://www.bindingdb.org/rwd/bind/chemsearch/marvin/SDFdownload.jsp"
-    direct_url: "https://www.bindingdb.org/rwd/bind/downloads/BindingDB_All.tsv.zip"
+    direct_url: "https://www.bindingdb.org/rwd/bind/downloads/BindingDB_All_202605_tsv.zip"
     acquisition: "full_dump"
     local_glob: "data/external_phase_0_8/bindingdb/**/*"
     license_note: "BindingDB terms and citation must be recorded from source release."
@@ -28,6 +29,7 @@ sources:
     required_for_pass: true
     official_page: "https://alphafold.ebi.ac.uk/download"
     latest_directory: "https://ftp.ebi.ac.uk/pub/databases/alphafold/latest/"
+    direct_url: "https://ftp.ebi.ac.uk/pub/databases/alphafold/latest/UP000005640_9606_HUMAN_v6.tar"
     acquisition: "human_proteome"
     local_glob: "data/external_phase_0_8/afdb_human/**/*"
     license_note: "AlphaFold DB terms and source model version must be recorded."
@@ -61,10 +63,11 @@ sources:
     required_for_pass: true
     official_page: "https://bindingmoad.org/Home/download"
     sunset_reference: "https://pmc.ncbi.nlm.nih.gov/articles/PMC9944886/"
+    archive_url: "https://raw.githubusercontent.com/Mugsie1969/BindingMOAD/main/BindingMOAD_data_for_PDB_1_31_2022.csv"
     rcsb_reference: "https://rcsb.org/docs/additional-resources/databases-and-knowledgebases"
-    acquisition: "last_public_or_auditable_rcsb_reconstruction"
+    acquisition: "archived_last_binding_data_for_PDB_2022_01_31_sunset_2024_07_01"
     local_glob: "data/external_phase_0_8/binding_moad/**/*"
-    license_note: "Binding MOAD sunset status and provenance must be recorded; PDBbind cannot substitute."
+    license_note: "Binding MOAD sunset status and GitHub archive provenance must be recorded; PDBbind cannot substitute."
   reconstructed_openbindbench:
     role: "open_benchmark"
     required_for_pass: true
