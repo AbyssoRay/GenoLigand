@@ -131,6 +131,21 @@ nextflow run workflows/phase_0_6_structure_patch_strict.nf -profile strict_local
 nextflow run workflows/phase_0_6_structure_patch_strict.nf -profile strict_local -resume -with-trace acceptance_artifacts_phase_0_6_structure_patch_strict/metrics/nextflow_trace_resume.tsv
 ```
 
+## Phase 0.7 Anti-Hallucination Docking Strict
+
+Phase 0.7 adds a ligand-aware docking prefilter under strict anti-hallucination gates. The first accepted mode is `acceptance_control_only`: it uses a real co-crystal positive control and a documented negative ligand to verify ligand ingestion, conformer generation, receptor preparation, docking boxes, real Vina docking, redocking RMSD, interaction fingerprints, decoy calibration, evidence ledger, report linting, and Nextflow first/resume reproducibility. Control-only outputs are engineering evidence only and do not authorize production target-prior claims.
+
+Local-only tools, databases, and acceptance archives stay ignored under `acceptance_artifacts_phase_0_7_anti_hallucination_strict/`, `.phase_0_7_tools/`, `.phase_0_7_env/`, `data/external_phase_0_7/`, `databases/phase_0_7/`, and `models/phase_0_7/`. The preferred shared tool root for RDKit, Meeko, AutoDock Vina, and Open Babel is `D:\user\codex\tools\genoligand-phase07`; set `GENOLIGAND_PHASE07_VINA`, `GENOLIGAND_PHASE07_LIGAND_PREP`, `GENOLIGAND_PHASE07_RECEPTOR_PREP`, and `GENOLIGAND_PHASE07_OBABEL` when using tools outside PATH.
+
+Useful Phase 0.7 commands:
+
+```powershell
+python scripts/phase07/run_phase_0_7_anti_hallucination_strict_acceptance.py
+python scripts/validation/check_phase_0_7_master_acceptance.py --artifact-dir acceptance_artifacts_phase_0_7_anti_hallucination_strict
+nextflow run workflows/phase_0_7_anti_hallucination_docking.nf -profile strict -with-trace -with-report -with-timeline
+nextflow run workflows/phase_0_7_anti_hallucination_docking.nf -profile strict -resume -with-trace -with-report -with-timeline
+```
+
 ## License
 
 GenoLigand is distributed under the project EULA in `EULA.txt`.

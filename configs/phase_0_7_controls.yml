@@ -1,0 +1,10 @@
+control_only_reason: no_user_query_ligand_provided
+phase_0_6_artifact_dir: acceptance_artifacts_phase_0_6_structure_patch_strict
+phase_0_5_artifact_dir: acceptance_artifacts_phase_0_5_gpu_strict
+top_candidate_boxes_from_phase_0_6: 3
+required_d1_d5_decoys: 5
+random_off_pocket_boxes: 2
+wrong_pocket_offset_angstrom: 28.0
+random_box_offset_angstrom: 35.0
+decoy_superiority_policy: downgrade_and_report
+positive_control_fallback_policy: record_failed_control_and_select_next_local_biolip2_small_molecule
