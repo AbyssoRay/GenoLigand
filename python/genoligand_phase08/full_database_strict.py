@@ -362,6 +362,11 @@ def aggregate_hash(paths: Iterable[Path]) -> str:
     return sha256_text("\n".join(parts)) if parts else ""
 
 
+def is_structure_file(path: Path) -> bool:
+    suffixes = "".join(path.suffixes).lower()
+    return suffixes.endswith((".cif", ".mmcif", ".pdb", ".cif.gz", ".mmcif.gz", ".pdb.gz"))
+
+
 def md5_file(path: Path) -> str:
     digest = hashlib.md5()  # noqa: S324 - provenance checksum, not security.
     with path.open("rb") as handle:
@@ -508,7 +513,7 @@ def write_source_manifest(artifact_dir: Path) -> int:
             manifest_files = [path for path in files if path.name == "rcsb_ligand_bound_entry_manifest.tsv"]
             entry_count = count_records(manifest_files)
             structures_dir = ROOT / "data/external_phase_0_8/rcsb_ligand_bound/structures"
-            structure_file_count = sum(1 for path in structures_dir.glob("*") if path.suffix.lower() in {".cif", ".mmcif", ".pdb"} and path.stat().st_size > 0) if structures_dir.exists() else 0
+            structure_file_count = sum(1 for path in structures_dir.glob("*") if is_structure_file(path) and path.stat().st_size > 0) if structures_dir.exists() else 0
             parse_status = "declared_query_scope_manifest_present" if entry_count > 0 else "absent"
             status = "PASS" if entry_count > 0 else "FAIL"
             record_count = entry_count
@@ -940,7 +945,7 @@ def afdb_foldseek_scope_count() -> int:
 
 def ensure_rcsb_foldseek_inputs(limit: int = 16) -> tuple[Path, int, str]:
     full_dir = ensure_dir(ROOT / "data/external_phase_0_8/rcsb_ligand_bound/structures")
-    full_existing = sorted(path for path in full_dir.glob("*") if path.suffix.lower() in {".cif", ".mmcif", ".pdb"} and path.stat().st_size > 0)
+    full_existing = sorted(path for path in full_dir.glob("*") if is_structure_file(path) and path.stat().st_size > 0)
     if full_existing:
         return full_dir, len(full_existing), "rcsb_ligand_bound_downloaded_structure_inputs_reused"
 

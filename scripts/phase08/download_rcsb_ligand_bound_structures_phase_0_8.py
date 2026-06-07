@@ -15,6 +15,7 @@ DEFAULT_MANIFEST = DEFAULT_SOURCE_DIR / "rcsb_ligand_bound_entry_manifest.tsv"
 DEFAULT_STRUCTURES_DIR = DEFAULT_SOURCE_DIR / "structures"
 DEFAULT_AUDIT = ROOT / "outputs/phase_0_8/download_rcsb_ligand_bound_structures.tsv"
 RCSB_CIF_URL = "https://files.rcsb.org/download/{pdb_id}.cif"
+RCSB_CIF_GZ_URL = "https://files.rcsb.org/download/{pdb_id}.cif.gz"
 
 
 def read_tsv(path: Path) -> list[dict[str, str]]:
@@ -41,20 +42,30 @@ def sha256_file(path: Path) -> str:
     return digest.hexdigest()
 
 
-def download_one(pdb_id: str, structures_dir: Path, timeout: int, overwrite: bool) -> dict[str, object]:
+def existing_structure_path(pdb_id: str, structures_dir: Path) -> Path | None:
+    for suffix in [".cif.gz", ".cif"]:
+        path = structures_dir / f"{pdb_id}{suffix}"
+        if path.exists() and path.stat().st_size > 0:
+            return path
+    return None
+
+
+def download_one(pdb_id: str, structures_dir: Path, timeout: int, overwrite: bool, compressed: bool) -> dict[str, object]:
     pdb_id = pdb_id.upper()
-    url = RCSB_CIF_URL.format(pdb_id=pdb_id)
-    target = structures_dir / f"{pdb_id}.cif"
-    if target.exists() and target.stat().st_size > 0 and not overwrite:
+    existing = existing_structure_path(pdb_id, structures_dir)
+    if existing is not None and not overwrite:
+        url = RCSB_CIF_GZ_URL.format(pdb_id=pdb_id) if existing.name.endswith(".gz") else RCSB_CIF_URL.format(pdb_id=pdb_id)
         return {
             "pdb_id": pdb_id,
             "url": url,
-            "local_path": target.relative_to(ROOT).as_posix(),
-            "bytes": target.stat().st_size,
-            "sha256": sha256_file(target),
+            "local_path": existing.relative_to(ROOT).as_posix(),
+            "bytes": existing.stat().st_size,
+            "sha256": sha256_file(existing),
             "status": "PASS",
             "notes": "existing_structure_file_reused",
         }
+    url = RCSB_CIF_GZ_URL.format(pdb_id=pdb_id) if compressed else RCSB_CIF_URL.format(pdb_id=pdb_id)
+    target = structures_dir / f"{pdb_id}.cif.gz" if compressed else structures_dir / f"{pdb_id}.cif"
     try:
         request = urllib.request.Request(url, headers={"User-Agent": "GenoLigand-Phase08/0.8"})
         with urllib.request.urlopen(request, timeout=timeout) as response:
@@ -92,6 +103,7 @@ def main() -> int:
     parser.add_argument("--workers", type=int, default=8)
     parser.add_argument("--timeout", type=int, default=120)
     parser.add_argument("--overwrite", action="store_true")
+    parser.add_argument("--uncompressed", action="store_true", help="Download .cif instead of the default .cif.gz.")
     args = parser.parse_args()
 
     manifest_rows = read_tsv(args.manifest)
@@ -111,7 +123,7 @@ def main() -> int:
     rows: list[dict[str, object]] = []
     started = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
     with ThreadPoolExecutor(max_workers=max(1, args.workers)) as executor:
-        futures = [executor.submit(download_one, pdb_id, args.structures_dir, args.timeout, args.overwrite) for pdb_id in selected_pdb_ids]
+        futures = [executor.submit(download_one, pdb_id, args.structures_dir, args.timeout, args.overwrite, not args.uncompressed) for pdb_id in selected_pdb_ids]
         for future in as_completed(futures):
             row = future.result()
             row["generated_at_utc"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
