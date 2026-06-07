@@ -26,6 +26,7 @@
 /acceptance_artifacts_phase_0_5_gpu_strict/
 /acceptance_artifacts_phase_0_6_structure_patch_strict/
 /acceptance_artifacts_phase_0_7_anti_hallucination_strict/
+/acceptance_artifacts_phase_0_7_1_audit_fix_strict/
 /ACCEPTANCE_REPORT.md
 /PHASE_0_2_ACCEPTANCE_REPORT.md
 /PHASE_0_3_ACCEPTANCE_REPORT.md
@@ -33,6 +34,7 @@
 /PHASE_0_5_ACCEPTANCE_REPORT.md
 /PHASE_0_6_ACCEPTANCE_REPORT.md
 /PHASE_0_7_ACCEPTANCE_REPORT.md
+/PHASE_0_7_1_ACCEPTANCE_REPORT.md
 /GENOLIGAND_CANDIDATE_REPORT.md
 /reports/
 /coverage/
@@ -48,19 +50,25 @@
 /.phase_0_6_tools/
 /.phase_0_7_env/
 /.phase_0_7_tools/
+/.phase_0_7_1_env/
+/.phase_0_7_1_tools/
 /envs/esmfold-gpu/
 /envs/colabfold-gpu/
 /data/external_phase_0_4/
 /data/external_phase_0_6/
 /data/external_phase_0_7/
+/data/external_phase_0_7_1/
 /models/phase_0_5/
 /models/phase_0_6/
 /models/phase_0_7/
+/models/phase_0_7_1/
 /databases/phase_0_5/
 /databases/phase_0_6/
 /databases/phase_0_7/
+/databases/phase_0_7_1/
 /outputs/phase_0_4/
 /outputs/phase_0_7/
+/outputs/phase_0_7_1/
 
 # Logs and runtime dumps
 *.log

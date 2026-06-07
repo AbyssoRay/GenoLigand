@@ -146,6 +146,21 @@ nextflow run workflows/phase_0_7_anti_hallucination_docking.nf -profile strict -
 nextflow run workflows/phase_0_7_anti_hallucination_docking.nf -profile strict -resume -with-trace -with-report -with-timeline
 ```
 
+## Phase 0.7.1 Audit-Fix Strict
+
+Phase 0.7.1 is an audit-fix strict milestone for the Phase 0.7 control-only docking chain. It repairs metadata and report defensibility only: real AutoDock Vina/RDKit/Meeko/Open Babel/Nextflow versions, first/resume workflow evidence, direct semantic hash comparison, expanded decoy-superiority warnings, confidence-downgrade evidence, claim-to-evidence mapping, and placeholder/claim linting. It does not introduce production query-ligand target prioritization.
+
+Local-only Phase 0.7.1 acceptance outputs stay ignored under `acceptance_artifacts_phase_0_7_1_audit_fix_strict/`, `.phase_0_7_1_tools/`, `.phase_0_7_1_env/`, `data/external_phase_0_7_1/`, `databases/phase_0_7_1/`, and `models/phase_0_7_1/`.
+
+Useful Phase 0.7.1 commands:
+
+```powershell
+python scripts/phase07/run_phase_0_7_1_audit_fix_strict_acceptance.py
+python scripts/validation/check_phase_0_7_1_audit_fix_strict.py --artifact-dir acceptance_artifacts_phase_0_7_1_audit_fix_strict --phase07-dir acceptance_artifacts_phase_0_7_anti_hallucination_strict --strict
+nextflow run workflows/phase_0_7_anti_hallucination_strict.nf -profile control_only -with-trace acceptance_artifacts_phase_0_7_1_audit_fix_strict/outputs/workflow/nextflow_trace_first.tsv
+nextflow run workflows/phase_0_7_anti_hallucination_strict.nf -profile control_only -resume -with-trace acceptance_artifacts_phase_0_7_1_audit_fix_strict/outputs/workflow/nextflow_trace_resume.tsv
+```
+
 ## License
 
 GenoLigand is distributed under the project EULA in `EULA.txt`.
