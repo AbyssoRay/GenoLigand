@@ -2270,6 +2270,41 @@ def validate_phase08(artifact_dir: Path, include_report: bool = True) -> tuple[b
     add_gate(gates, "mandatory_source_status", "mandatory source status", bool(mandatory) and all(row.get("status") == "PASS" and safe_int(row.get("bytes")) > 0 and row.get("sha256") for row in mandatory), "all mandatory sources PASS with bytes and sha256", sum(1 for row in mandatory if row.get("status") != "PASS"), artifact_dir / "external_resource_manifest.tsv")
     pdbbind = next((row for row in sources if row.get("resource_id") == "pdbbind"), {})
     add_gate(gates, "pdbbind_optional", "PDBbind optional", pdbbind.get("required_for_pass") == "false", "PDBbind not required", pdbbind.get("parse_status", "absent"), artifact_dir / "external_resource_manifest.tsv")
+    source_map = {row.get("resource_id", ""): row for row in sources}
+    bindingdb = source_map.get("bindingdb", {})
+    add_gate(
+        gates,
+        "bindingdb_full_local_dump",
+        "BindingDB full local dump",
+        bindingdb.get("status") == "PASS" and "local_full_tsv_unavailable" not in bindingdb.get("parse_status", "") and "full TSV not locally downloaded" not in bindingdb.get("notes", ""),
+        "full BindingDB TSV/dump locally downloaded and parsed",
+        bindingdb.get("parse_status", "absent"),
+        artifact_dir / "external_resource_manifest.tsv",
+    )
+    chembl_required_tables = {"molecule_dictionary", "compound_structures", "activities", "assays", "target_dictionary", "target_components", "component_sequences", "docs"}
+    chembl_table_rows = read_tsv(artifact_dir / "outputs/database_warehouse/chembl_table_counts.tsv") if exists("outputs/database_warehouse/chembl_table_counts.tsv") else []
+    chembl_tables = {row.get("table_name", "") for row in chembl_table_rows if row.get("status") == "PASS" and safe_int(row.get("row_count", 0)) > 0}
+    add_gate(
+        gates,
+        "chembl_full_table_counts",
+        "ChEMBL full table counts",
+        chembl_required_tables.issubset(chembl_tables),
+        "required ChEMBL full SQLite tables introspected and counted",
+        ",".join(sorted(chembl_tables)) or "absent",
+        artifact_dir / "outputs/database_warehouse/chembl_table_counts.tsv",
+    )
+    rcsb = source_map.get("rcsb_ligand_bound", {})
+    rcsb_structure_files = re.search(r"structure_file_count=(\d+)", rcsb.get("notes", ""))
+    rcsb_structure_count = safe_int(rcsb_structure_files.group(1), 0) if rcsb_structure_files else 0
+    add_gate(
+        gates,
+        "rcsb_ligand_bound_structure_files",
+        "RCSB ligand-bound structure files",
+        rcsb_structure_count > 0 and rcsb_structure_count >= safe_int(rcsb.get("row_or_record_count", 0)),
+        "structure files downloaded for declared RCSB ligand-bound scope",
+        f"structure_file_count={rcsb_structure_count};scope={rcsb.get('row_or_record_count', 'absent')}",
+        artifact_dir / "external_resource_manifest.tsv",
+    )
 
     tools = read_tsv(artifact_dir / "outputs/versions/tool_versions.tsv") if exists("outputs/versions/tool_versions.tsv") else []
     tool_map = {row.get("tool_name", ""): row for row in tools}
@@ -2292,6 +2327,17 @@ def validate_phase08(artifact_dir: Path, include_report: bool = True) -> tuple[b
     ]:
         rows = read_tsv(artifact_dir / rel) if exists(rel) else []
         add_gate(gates, gate_id, gate_id.replace("_", " "), bool(rows) and all(row.get("status") == "PASS" for row in rows), expected, sum(1 for row in rows if row.get("status") != "PASS"), artifact_dir / rel)
+    structure_rows = read_tsv(artifact_dir / "outputs/indexes/structure_index_manifest.tsv") if exists("outputs/indexes/structure_index_manifest.tsv") else []
+    smoke_rows = [row for row in structure_rows if "smoke" in row.get("notes", "").lower() or safe_int(row.get("record_count", 0)) < 1000]
+    add_gate(
+        gates,
+        "structure_index_full_scope",
+        "structure index full scope",
+        bool(structure_rows) and not smoke_rows,
+        "AFDB and RCSB structure indexes are full-scope, not smoke-only",
+        len(smoke_rows),
+        artifact_dir / "outputs/indexes/structure_index_manifest.tsv",
+    )
 
     labels = {row.get("metric", ""): row for row in read_tsv(artifact_dir / "outputs/evaluation/benchmark_label_summary.tsv")} if exists("outputs/evaluation/benchmark_label_summary.tsv") else {}
     add_gate(gates, "positive_benchmark_min", "positive benchmark minimum", safe_int(labels.get("positive_pair_count", {}).get("value")) >= 1000, ">=1000", labels.get("positive_pair_count", {}).get("value", "absent"), artifact_dir / "outputs/evaluation/benchmark_label_summary.tsv")
