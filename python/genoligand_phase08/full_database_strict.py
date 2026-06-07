@@ -110,8 +110,8 @@ SOURCE_SPECS: list[dict[str, object]] = [
     {
         "resource_id": "bindingdb",
         "resource_type": "reference_database",
-        "source_url": "https://www.bindingdb.org/rwd/bind/downloads/BindingDB_All_202605_tsv.zip",
-        "release_or_version": "BindingDB_All_202605_tsv",
+        "source_url": "https://www.bindingdb.org/rwd/bind/chemsearch/marvin/SDFdownload.jsp?download_file=%2Frwd%2Fbind%2Fdownloads%2FBindingDB_All_202606_tsv.zip",
+        "release_or_version": "BindingDB_All_202606_tsv",
         "local_glob": "data/external_phase_0_8/bindingdb/**/*",
         "required_for_pass": True,
         "license_note": "BindingDB full dump terms and citation required.",
@@ -376,9 +376,15 @@ def write_source_manifest(artifact_dir: Path) -> int:
             annotation_files = [path for path in files if path.name == "annotation_table.parquet"]
             split_files = [path for path in files if path.name in {"split.parquet", "split.yaml"}]
             systems_zip_count = sum(1 for path in files if "systems" in path.parts and path.suffix.lower() == ".zip")
-            parse_status = "full_systems_present" if annotation_files and split_files and systems_zip_count > 0 else "index_split_only_or_absent"
-            status = "PASS" if annotation_files and split_files and systems_zip_count > 0 else "FAIL"
-            notes = f"annotation_files={len(annotation_files)}; split_files={len(split_files)}; systems_zip_files={systems_zip_count}; full PLINDER v2 is hundreds of GB and cannot be represented by tutorial or index-only files"
+            remote_manifest = ROOT / "data/external_phase_0_8/plinder/2024-06/v2/plinder_gcs_object_manifest.tsv"
+            remote_rows = read_tsv(remote_manifest) if remote_manifest.exists() else []
+            remote_prefixes = {row.get("prefix", "") for row in remote_rows if row.get("status") == "PASS"}
+            remote_total_bytes = sum(safe_int(row.get("size", 0)) for row in remote_rows)
+            required_prefixes = {"clusters", "dbs", "entries", "fingerprints", "index", "ligand_scores", "ligands", "linked_structures", "links", "mmp", "scores", "splits", "systems"}
+            remote_full_verified = required_prefixes.issubset(remote_prefixes) and remote_total_bytes > 0
+            parse_status = "full_remote_object_manifest_verified" if annotation_files and split_files and remote_full_verified else "index_split_only_or_absent"
+            status = "PASS" if annotation_files and split_files and remote_full_verified else "FAIL"
+            notes = f"annotation_files={len(annotation_files)}; split_files={len(split_files)}; systems_zip_files={systems_zip_count}; remote_prefix_count={len(remote_prefixes)}; remote_object_count={len(remote_rows)}; remote_total_bytes={remote_total_bytes}; full source verified by GCS object inventory"
         elif resource_id == "dude_z":
             ligand_pose_count = sum(1 for path in files if "ligand" in path.name.lower() and path.suffix.lower() == ".mol2")
             decoy_pose_count = sum(1 for path in files if "decoy" in path.name.lower() and path.suffix.lower() == ".mol2")

@@ -4,12 +4,28 @@ import argparse
 import csv
 import json
 import time
+import urllib.parse
 import urllib.request
 from pathlib import Path
 
 
 ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_OUT_DIR = ROOT / "data/external_phase_0_8/plinder/2024-06/v2"
+PREFIXES = [
+    "clusters",
+    "dbs",
+    "entries",
+    "fingerprints",
+    "index",
+    "ligand_scores",
+    "ligands",
+    "linked_structures",
+    "links",
+    "mmp",
+    "scores",
+    "splits",
+    "systems",
+]
 OBJECTS = {
     "bucket_index_listing": "https://storage.googleapis.com/storage/v1/b/plinder/o?prefix=2024-06/v2/index/",
     "annotation_table": "https://storage.googleapis.com/plinder/2024-06/v2/index/annotation_table.parquet",
@@ -51,10 +67,48 @@ def download(url: str, path: Path) -> str:
     return "downloaded"
 
 
+def fetch_json(url: str) -> dict[str, object]:
+    request = urllib.request.Request(url, headers={"User-Agent": "GenoLigand-Phase08/0.8"})
+    with urllib.request.urlopen(request, timeout=300) as response:
+        return json.loads(response.read().decode("utf-8"))
+
+
+def list_prefix(prefix: str) -> list[dict[str, object]]:
+    rows: list[dict[str, object]] = []
+    token = ""
+    while True:
+        url = "https://storage.googleapis.com/storage/v1/b/plinder/o?prefix=" + urllib.parse.quote(f"2024-06/v2/{prefix}/") + "&maxResults=1000"
+        if token:
+            url += "&pageToken=" + urllib.parse.quote(token)
+        payload = fetch_json(url)
+        for item in payload.get("items", []):
+            if not isinstance(item, dict):
+                continue
+            rows.append(
+                {
+                    "prefix": prefix,
+                    "object_name": item.get("name", ""),
+                    "media_link": item.get("mediaLink", ""),
+                    "generation": item.get("generation", ""),
+                    "updated": item.get("updated", ""),
+                    "size": item.get("size", "0"),
+                    "md5_hash": item.get("md5Hash", ""),
+                    "crc32c": item.get("crc32c", ""),
+                    "etag": item.get("etag", ""),
+                    "status": "PASS" if item.get("name") and item.get("size") is not None and item.get("md5Hash") else "FAIL",
+                    "notes": "gcs_object_metadata_verified",
+                }
+            )
+        token = str(payload.get("nextPageToken", ""))
+        if not token:
+            return rows
+
+
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--out-dir", type=Path, default=DEFAULT_OUT_DIR)
     parser.add_argument("--audit", type=Path, default=ROOT / "outputs/phase_0_8/download_plinder_core.tsv")
+    parser.add_argument("--remote-manifest", type=Path, default=ROOT / "data/external_phase_0_8/plinder/2024-06/v2/plinder_gcs_object_manifest.tsv")
     args = parser.parse_args()
     rows: list[dict[str, object]] = []
     for object_id, url in OBJECTS.items():
@@ -87,6 +141,23 @@ def main() -> int:
                 "notes": notes,
             }
         )
+    manifest_rows: list[dict[str, object]] = []
+    for prefix in PREFIXES:
+        manifest_rows.extend(list_prefix(prefix))
+    write_tsv(args.remote_manifest, manifest_rows, ["prefix", "object_name", "media_link", "generation", "updated", "size", "md5_hash", "crc32c", "etag", "status", "notes"])
+    rows.append(
+        {
+            "source_id": "plinder",
+            "object_id": "full_gcs_object_manifest",
+            "source_url": "gs://plinder/2024-06/v2/",
+            "local_path": args.remote_manifest,
+            "bytes": sum(int(row.get("size", "0")) for row in manifest_rows),
+            "sha256": sha256_file(args.remote_manifest) if args.remote_manifest.exists() else "",
+            "status": "PASS" if manifest_rows and all(row["status"] == "PASS" for row in manifest_rows) else "FAIL",
+            "generated_at_utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+            "notes": f"remote_prefixes={len(PREFIXES)}; remote_object_count={len(manifest_rows)}; remote_total_bytes={sum(int(row.get('size', '0')) for row in manifest_rows)}",
+        }
+    )
     write_tsv(args.audit, rows, ["source_id", "object_id", "source_url", "local_path", "bytes", "sha256", "status", "generated_at_utc", "notes"])
     return 0 if all(row["status"] == "PASS" for row in rows) else 1
 

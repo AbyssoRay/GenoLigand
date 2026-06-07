@@ -12,7 +12,8 @@ sources:
     role: "reference_database"
     required_for_pass: true
     official_page: "https://www.bindingdb.org/rwd/bind/chemsearch/marvin/SDFdownload.jsp"
-    direct_url: "https://www.bindingdb.org/rwd/bind/downloads/BindingDB_All_202605_tsv.zip"
+    direct_url: "https://www.bindingdb.org/rwd/bind/chemsearch/marvin/SDFdownload.jsp?download_file=%2Frwd%2Fbind%2Fdownloads%2FBindingDB_All_202606_tsv.zip"
+    md5_url: "https://www.bindingdb.org/rwd/bind/downloads/BindingDB_All_202606_tsv.md5"
     acquisition: "full_dump"
     local_glob: "data/external_phase_0_8/bindingdb/**/*"
     license_note: "BindingDB terms and citation must be recorded from source release."
