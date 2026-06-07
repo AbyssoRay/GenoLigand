@@ -87,6 +87,7 @@ def main() -> int:
     parser.add_argument("--manifest", type=Path, default=DEFAULT_MANIFEST)
     parser.add_argument("--structures-dir", type=Path, default=DEFAULT_STRUCTURES_DIR)
     parser.add_argument("--audit", type=Path, default=DEFAULT_AUDIT)
+    parser.add_argument("--start", type=int, default=0, help="0-based start offset in the manifest-derived unique PDB ID list.")
     parser.add_argument("--limit", type=int, default=0, help="0 means all manifest rows.")
     parser.add_argument("--workers", type=int, default=8)
     parser.add_argument("--timeout", type=int, default=120)
@@ -102,20 +103,27 @@ def main() -> int:
             continue
         seen.add(pdb_id)
         pdb_ids.append(pdb_id)
-        if args.limit and len(pdb_ids) >= args.limit:
-            break
+    selected_pdb_ids = pdb_ids[max(0, args.start) :]
+    if args.limit:
+        selected_pdb_ids = selected_pdb_ids[: args.limit]
     args.structures_dir.mkdir(parents=True, exist_ok=True)
+    existing_audit_rows = {row.get("pdb_id", "").upper(): row for row in read_tsv(args.audit) if row.get("pdb_id")}
     rows: list[dict[str, object]] = []
     started = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
     with ThreadPoolExecutor(max_workers=max(1, args.workers)) as executor:
-        futures = [executor.submit(download_one, pdb_id, args.structures_dir, args.timeout, args.overwrite) for pdb_id in pdb_ids]
+        futures = [executor.submit(download_one, pdb_id, args.structures_dir, args.timeout, args.overwrite) for pdb_id in selected_pdb_ids]
         for future in as_completed(futures):
             row = future.result()
             row["generated_at_utc"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
             row["scope_manifest_row_count"] = len(manifest_rows)
-            row["requested_pdb_count"] = len(pdb_ids)
+            row["requested_pdb_count"] = len(selected_pdb_ids)
+            row["chunk_start"] = max(0, args.start)
+            row["chunk_limit"] = args.limit
             row["run_started_at_utc"] = started
             rows.append(row)
+    for row in rows:
+        existing_audit_rows[str(row.get("pdb_id", "")).upper()] = {key: str(value) for key, value in row.items()}
+    rows = list(existing_audit_rows.values())
     rows.sort(key=lambda row: str(row.get("pdb_id", "")))
     fields = [
         "pdb_id",
@@ -127,11 +135,15 @@ def main() -> int:
         "notes",
         "scope_manifest_row_count",
         "requested_pdb_count",
+        "chunk_start",
+        "chunk_limit",
         "run_started_at_utc",
         "generated_at_utc",
     ]
     write_tsv(args.audit, rows, fields)
-    return 0 if rows and all(row.get("status") == "PASS" for row in rows) else 1
+    requested = {pdb_id.upper() for pdb_id in selected_pdb_ids}
+    requested_rows = [row for row in rows if str(row.get("pdb_id", "")).upper() in requested]
+    return 0 if requested_rows and all(row.get("status") == "PASS" for row in requested_rows) else 1
 
 
 if __name__ == "__main__":

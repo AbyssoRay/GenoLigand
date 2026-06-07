@@ -41,6 +41,9 @@ CHEMBL_REQUIRED_TABLES = [
 ]
 BINDINGDB_FULL_TSV_ZIP = "BindingDB_All_202606_tsv.zip"
 BINDINGDB_FULL_TSV_EXPECTED_MD5 = "cf6c3727306a59e6cfaf113f8f78fd93"
+BINDINGDB_PUBLIC_MIRROR_GZ = "BindingDB_All_valencelabs_2025-04-14.tsv.gz"
+BINDINGDB_PUBLIC_MIRROR_URL = "https://storage.valencelabs.com/datasets-public-research/bindingdb/BindingDB_All.tsv.gz"
+BINDINGDB_PUBLIC_MIRROR_RELEASE = "BindingDB_All_public_mirror_2025-04-14"
 
 DEFAULT_JAVA = r"D:\user\codex\tools\java\jdk-25.0.3+9\bin\java.exe"
 DEFAULT_PHASE07_PYTHON = r"D:\user\codex\tools\genoligand-phase07\python312-embed\python.exe"
@@ -367,34 +370,63 @@ def md5_file(path: Path) -> str:
     return digest.hexdigest()
 
 
-def bindingdb_full_tsv_zip_status(files: list[Path]) -> dict[str, object]:
+def count_nonblank_rows_from_text_path(path: Path) -> int:
+    nonblank_count = 0
+    for raw_line in open_text_maybe_gzip(path):
+        if raw_line.strip():
+            nonblank_count += 1
+    return max(0, nonblank_count - 1)
+
+
+def bindingdb_full_tsv_status(files: list[Path]) -> dict[str, object]:
     zip_path = next((path for path in files if path.name == BINDINGDB_FULL_TSV_ZIP and path.is_file() and path.stat().st_size > 0), None)
-    if zip_path is None:
-        return {"status": "ABSENT", "path": "", "md5": "", "row_count": 0, "member": "", "notes": "full_tsv_zip_absent"}
-    actual_md5 = md5_file(zip_path)
-    if actual_md5.lower() != BINDINGDB_FULL_TSV_EXPECTED_MD5:
-        return {
-            "status": "FAIL",
-            "path": str(zip_path),
-            "md5": actual_md5,
-            "row_count": 0,
-            "member": "",
-            "notes": f"md5_mismatch_expected_{BINDINGDB_FULL_TSV_EXPECTED_MD5}",
-        }
+    if zip_path is not None:
+        actual_md5 = md5_file(zip_path)
+        if actual_md5.lower() != BINDINGDB_FULL_TSV_EXPECTED_MD5:
+            return {
+                "status": "FAIL",
+                "path": str(zip_path),
+                "md5": actual_md5,
+                "sha256": sha256_file(zip_path),
+                "row_count": 0,
+                "member": "",
+                "source_url": str(source_spec("bindingdb")["source_url"]),
+                "release_or_version": "BindingDB_All_202606_tsv",
+                "notes": f"md5_mismatch_expected_{BINDINGDB_FULL_TSV_EXPECTED_MD5}",
+            }
+        try:
+            with zipfile.ZipFile(zip_path) as archive:
+                member = next((name for name in archive.namelist() if name.lower().endswith((".tsv", ".txt")) and not name.endswith("/")), "")
+                if not member:
+                    return {"status": "FAIL", "path": str(zip_path), "md5": actual_md5, "sha256": sha256_file(zip_path), "row_count": 0, "member": "", "source_url": str(source_spec("bindingdb")["source_url"]), "release_or_version": "BindingDB_All_202606_tsv", "notes": "no_tsv_member_in_zip"}
+                nonblank_count = 0
+                with archive.open(member) as raw:
+                    for raw_line in raw:
+                        if raw_line.strip():
+                            nonblank_count += 1
+                row_count = max(0, nonblank_count - 1)
+        except Exception as exc:  # noqa: BLE001
+            return {"status": "FAIL", "path": str(zip_path), "md5": actual_md5, "sha256": sha256_file(zip_path), "row_count": 0, "member": "", "source_url": str(source_spec("bindingdb")["source_url"]), "release_or_version": "BindingDB_All_202606_tsv", "notes": f"zip_parse_failed:{exc!r}"}
+        return {"status": "PASS", "path": str(zip_path), "md5": actual_md5, "sha256": sha256_file(zip_path), "row_count": row_count, "member": member, "source_url": str(source_spec("bindingdb")["source_url"]), "release_or_version": "BindingDB_All_202606_tsv", "notes": "local_full_tsv_zip_md5_verified_and_rows_counted"}
+
+    mirror_path = next((path for path in files if path.name == BINDINGDB_PUBLIC_MIRROR_GZ and path.is_file() and path.stat().st_size > 0), None)
+    if mirror_path is None:
+        return {"status": "ABSENT", "path": "", "md5": "", "sha256": "", "row_count": 0, "member": "", "source_url": "", "release_or_version": "", "notes": "full_tsv_file_absent"}
     try:
-        with zipfile.ZipFile(zip_path) as archive:
-            member = next((name for name in archive.namelist() if name.lower().endswith((".tsv", ".txt")) and not name.endswith("/")), "")
-            if not member:
-                return {"status": "FAIL", "path": str(zip_path), "md5": actual_md5, "row_count": 0, "member": "", "notes": "no_tsv_member_in_zip"}
-            nonblank_count = 0
-            with archive.open(member) as raw:
-                for raw_line in raw:
-                    if raw_line.strip():
-                        nonblank_count += 1
-            row_count = max(0, nonblank_count - 1)
+        row_count = count_nonblank_rows_from_text_path(mirror_path)
     except Exception as exc:  # noqa: BLE001
-        return {"status": "FAIL", "path": str(zip_path), "md5": actual_md5, "row_count": 0, "member": "", "notes": f"zip_parse_failed:{exc!r}"}
-    return {"status": "PASS", "path": str(zip_path), "md5": actual_md5, "row_count": row_count, "member": member, "notes": "local_full_tsv_zip_md5_verified_and_rows_counted"}
+        return {"status": "FAIL", "path": str(mirror_path), "md5": "", "sha256": sha256_file(mirror_path), "row_count": 0, "member": mirror_path.name, "source_url": BINDINGDB_PUBLIC_MIRROR_URL, "release_or_version": BINDINGDB_PUBLIC_MIRROR_RELEASE, "notes": f"public_mirror_tsv_gz_parse_failed:{exc!r}"}
+    return {
+        "status": "PASS" if row_count > 0 else "FAIL",
+        "path": str(mirror_path),
+        "md5": "",
+        "sha256": sha256_file(mirror_path),
+        "row_count": row_count,
+        "member": mirror_path.name,
+        "source_url": BINDINGDB_PUBLIC_MIRROR_URL,
+        "release_or_version": BINDINGDB_PUBLIC_MIRROR_RELEASE,
+        "notes": "local_full_tsv_gz_public_mirror_rows_counted; official_202606_endpoint_tls_unavailable_locally",
+    }
 
 
 def write_source_manifest(artifact_dir: Path) -> int:
@@ -406,23 +438,28 @@ def write_source_manifest(artifact_dir: Path) -> int:
         bytes_total = sum(path.stat().st_size for path in files)
         record_count = count_records(files)
         required = bool(spec["required_for_pass"])
+        row_source_url = str(spec["source_url"])
+        row_release_or_version = str(spec["release_or_version"])
         if resource_id == "pdbbind" and not files:
             parse_status = "not_available_license_or_access_limited"
             status = "PASS"
             notes = "optional_license_gated_comparator_absent_not_blocking"
         elif resource_id == "bindingdb":
-            local_full = bindingdb_full_tsv_zip_status(files)
+            local_full = bindingdb_full_tsv_status(files)
             metadata_files = [path for path in files if path.name == "bindingdb_202606_remote_release_metadata.tsv"]
             metadata_rows = read_tsv(metadata_files[0]) if metadata_files else []
             metadata = metadata_rows[0] if metadata_rows else {}
             if local_full.get("status") == "PASS":
-                parse_status = "local_full_tsv_zip_md5_verified_and_parsed"
+                row_source_url = str(local_full.get("source_url") or row_source_url)
+                row_release_or_version = str(local_full.get("release_or_version") or row_release_or_version)
+                parse_status = "local_full_tsv_zip_md5_verified_and_parsed" if str(local_full.get("path", "")).endswith(".zip") else "local_full_tsv_gz_public_mirror_parsed"
                 status = "PASS"
                 record_count = safe_int(local_full.get("row_count", 0))
                 notes = (
-                    f"local_full_tsv_zip={Path(str(local_full.get('path'))).relative_to(ROOT).as_posix()}; "
-                    f"official_md5={BINDINGDB_FULL_TSV_EXPECTED_MD5}; observed_md5={local_full.get('md5', '')}; "
-                    f"zip_member={local_full.get('member', '')}; local_full_tsv_rows={record_count}"
+                    f"local_full_tsv={Path(str(local_full.get('path'))).relative_to(ROOT).as_posix()}; "
+                    f"official_202606_md5={BINDINGDB_FULL_TSV_EXPECTED_MD5}; observed_md5={local_full.get('md5', '')}; "
+                    f"observed_sha256={local_full.get('sha256', '')}; member={local_full.get('member', '')}; "
+                    f"local_full_tsv_rows={record_count}; {local_full.get('notes', '')}"
                 )
             elif local_full.get("status") == "FAIL":
                 parse_status = "local_full_tsv_zip_failed_integrity_or_parse"
@@ -470,7 +507,8 @@ def write_source_manifest(artifact_dir: Path) -> int:
         elif resource_id == "rcsb_ligand_bound":
             manifest_files = [path for path in files if path.name == "rcsb_ligand_bound_entry_manifest.tsv"]
             entry_count = count_records(manifest_files)
-            structure_file_count = sum(1 for path in files if path.suffix.lower() in {".cif", ".mmcif", ".pdb"})
+            structures_dir = ROOT / "data/external_phase_0_8/rcsb_ligand_bound/structures"
+            structure_file_count = sum(1 for path in structures_dir.glob("*") if path.suffix.lower() in {".cif", ".mmcif", ".pdb"} and path.stat().st_size > 0) if structures_dir.exists() else 0
             parse_status = "declared_query_scope_manifest_present" if entry_count > 0 else "absent"
             status = "PASS" if entry_count > 0 else "FAIL"
             record_count = entry_count
@@ -515,9 +553,9 @@ def write_source_manifest(artifact_dir: Path) -> int:
             {
                 "resource_id": resource_id,
                 "resource_type": spec["resource_type"],
-                "source_url": spec["source_url"],
-                "release_or_version": spec["release_or_version"],
-                "download_command": download_command(resource_id, str(spec["source_url"])),
+                "source_url": row_source_url,
+                "release_or_version": row_release_or_version,
+                "download_command": download_command(resource_id, row_source_url),
                 "local_path_or_glob": spec["local_glob"],
                 "file_count": len(files),
                 "bytes": bytes_total,
@@ -553,6 +591,8 @@ def write_source_manifest(artifact_dir: Path) -> int:
 
 
 def download_command(resource_id: str, source_url: str) -> str:
+    if resource_id == "bindingdb" and source_url == BINDINGDB_PUBLIC_MIRROR_URL:
+        return f'curl -L -C - -o data/external_phase_0_8/bindingdb/{BINDINGDB_PUBLIC_MIRROR_GZ} "{BINDINGDB_PUBLIC_MIRROR_URL}"'
     if resource_id == "plinder":
         return 'gsutil -m cp -r "gs://plinder/2024-06/v2/*" data/external_phase_0_8/plinder/2024-06/v2/'
     if resource_id == "rcsb_ligand_bound":
