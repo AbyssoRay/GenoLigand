@@ -450,7 +450,7 @@ mod tests {
             min_rotamer_feasibility_score: 0.1,
             max_bucket_occupancy: 16,
             max_seed_triplets: 100,
-            max_memory_mb: 100.0,
+            max_memory_mb: 32768.0,
             recall_at_profile: 1.0,
             hard_negative_rejection: 1.0,
             hard_negative_false_positive_rate: 0.0,

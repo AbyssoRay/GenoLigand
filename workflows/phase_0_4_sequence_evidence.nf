@@ -7,7 +7,7 @@ params.plm_device = params.plm_device ?: 'cpu'
 params.model_id = params.model_id ?: (params.plm_backend == 'fixture_mock' ? 'fixture_mock_64' : 'esm2_t6_8M_UR50D')
 params.similarity_backend = params.similarity_backend ?: 'fixture_mock'
 params.similarity_db = params.similarity_db ?: ''
-params.threads = params.threads ?: '4'
+params.threads = params.threads ?: '12'
 
 def sourceFingerprint() {
   def launchPath = java.nio.file.Paths.get(launchDir.toString()).toAbsolutePath().normalize()

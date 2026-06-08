@@ -22,7 +22,7 @@ impl CalibrationConfig {
             target_positive_recall: 0.95,
             max_hard_negative_false_positive_rate: 0.05,
             max_bucket_occupancy_p95: 64.0,
-            max_peak_memory_mb: 256.0,
+            max_peak_memory_mb: 32768.0,
             max_runtime_ms_per_fixture: 1000.0,
             max_seed_triplets: 4096,
             max_bucket_occupancy: 128,

@@ -100,7 +100,7 @@ def main() -> int:
     parser.add_argument("--audit", type=Path, default=DEFAULT_AUDIT)
     parser.add_argument("--start", type=int, default=0, help="0-based start offset in the manifest-derived unique PDB ID list.")
     parser.add_argument("--limit", type=int, default=0, help="0 means all manifest rows.")
-    parser.add_argument("--workers", type=int, default=8)
+    parser.add_argument("--workers", type=int, default=12)
     parser.add_argument("--timeout", type=int, default=120)
     parser.add_argument("--overwrite", action="store_true")
     parser.add_argument("--uncompressed", action="store_true", help="Download .cif instead of the default .cif.gz.")

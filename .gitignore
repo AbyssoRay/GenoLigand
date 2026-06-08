@@ -28,6 +28,9 @@
 /acceptance_artifacts_phase_0_7_anti_hallucination_strict/
 /acceptance_artifacts_phase_0_7_1_audit_fix_strict/
 /acceptance_artifacts_phase_0_8_full_database_strict/
+/acceptance_artifacts_phase_0_8_1_database_audit_fix_strict/
+/acceptance_artifacts_phase_0_8_2_mapping_benchmark_storage_strict/
+/acceptance_artifacts_phase_0_8_2_failure_diagnosis/
 /ACCEPTANCE_REPORT.md
 /PHASE_0_2_ACCEPTANCE_REPORT.md
 /PHASE_0_3_ACCEPTANCE_REPORT.md
@@ -55,6 +58,10 @@
 /.phase_0_7_1_tools/
 /.phase_0_8_env/
 /.phase_0_8_tools/
+/.phase_0_8_1_env/
+/.phase_0_8_1_tools/
+/.phase_0_8_2_env/
+/.phase_0_8_2_tools/
 /envs/esmfold-gpu/
 /envs/colabfold-gpu/
 /data/external_phase_0_4/
@@ -62,6 +69,7 @@
 /data/external_phase_0_7/
 /data/external_phase_0_7_1/
 /data/external_phase_0_8/
+/data/external_phase_0_8_2/
 /models/phase_0_5/
 /models/phase_0_6/
 /models/phase_0_7/
@@ -71,10 +79,14 @@
 /databases/phase_0_7/
 /databases/phase_0_7_1/
 /databases/phase_0_8/
+/databases/phase_0_8_1/
+/databases/phase_0_8_2/
 /outputs/phase_0_4/
 /outputs/phase_0_7/
 /outputs/phase_0_7_1/
 /outputs/phase_0_8/
+/outputs/phase_0_8_1/
+/outputs/phase_0_8_2/
 
 # Logs and runtime dumps
 *.log
@@ -161,3 +173,10 @@ $RECYCLE.BIN/
 # Keep project fixtures and examples trackable.
 !fixtures/**
 !schema_examples/**
+
+# Phase 0.8.3 BioLiP2 resolver/patch strict runtime artifacts
+/acceptance_artifacts_phase_0_8_3_biolip2_resolver_patch_strict/
+/outputs/phase_0_8_3/
+/databases/phase_0_8_3/
+/.phase_0_8_3_env/
+/.phase_0_8_3_tools/

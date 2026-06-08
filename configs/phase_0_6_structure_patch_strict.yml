@@ -18,7 +18,7 @@ foldseek:
   required: true
   min_reference_structures: 200
   preferred_reference_structures: 500
-  threads: 8
+  threads: 12
   sensitivity: 7.5
   max_seqs: 100
   evalue: 10.0

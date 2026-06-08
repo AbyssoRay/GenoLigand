@@ -1001,7 +1001,7 @@ def run_foldseek_createdb(binary: str, input_dir: Path, output_prefix: Path, log
             foldseek_path_arg(binary, input_dir),
             foldseek_path_arg(binary, output_prefix),
             "--threads",
-            os.environ.get("PHASE08_FOLDSEEK_THREADS", "4"),
+            os.environ.get("PHASE08_FOLDSEEK_THREADS", "12"),
             "-v",
             "1",
         ],

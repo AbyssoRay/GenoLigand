@@ -55,7 +55,7 @@ def main() -> int:
     parser.add_argument("--backend", required=True, choices=["diamond", "blastp"])
     parser.add_argument("--out-hits", required=True)
     parser.add_argument("--out-summary", required=True)
-    parser.add_argument("--threads", default="4")
+    parser.add_argument("--threads", default="12")
     args = parser.parse_args()
     Path(args.out_hits).parent.mkdir(parents=True, exist_ok=True)
     raw = Path(args.out_hits).with_suffix(".raw.tsv")

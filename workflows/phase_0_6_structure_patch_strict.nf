@@ -12,7 +12,7 @@ params.preferred_reference_entries = params.preferred_reference_entries ?: 500
 params.min_biolip_interactions = params.min_biolip_interactions ?: 500
 params.preferred_biolip_interactions = params.preferred_biolip_interactions ?: 2000
 params.min_reference_patches = params.min_reference_patches ?: 500
-params.foldseek_threads = params.foldseek_threads ?: 4
+params.foldseek_threads = params.foldseek_threads ?: 12
 
 def rootWin() {
   java.nio.file.Paths.get(launchDir.toString()).toAbsolutePath().normalize().toString().replace('\\', '/')
