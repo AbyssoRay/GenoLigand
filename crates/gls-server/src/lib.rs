@@ -1250,12 +1250,36 @@ fn write_project_inputs_json(
     };
     let path = dir.join("input_manifest.json");
     match write_text(&path, &(manifest.clone() + "\n")) {
-        Ok(()) => format!(
-            "{{\"status\":\"saved\",\"project_id\":\"{}\",\"input_manifest\":\"{}\",\"bytes\":{}}}",
-            escape_json(project_id),
-            escape_json(&path.display().to_string()),
-            manifest.len()
-        ),
+        Ok(()) => {
+            if let Ok(parsed) = serde_json::from_str::<Value>(&manifest) {
+                let project_name =
+                    manifest_inputs(&parsed, &["project_name", "Project name", "项目名称"])
+                        .into_iter()
+                        .next()
+                        .filter(|value| !value.trim().is_empty())
+                        .unwrap_or_else(|| project_field(&dir, "project_name.txt", project_id));
+                let status = project_field(&dir, "project_status.txt", "created");
+                let latest = read_trimmed(&dir.join("latest_run_id.txt"));
+                let environment_validation =
+                    read_trimmed(&dir.join("environment_validation_template.txt"))
+                        .map(|value| value == "true")
+                        .unwrap_or(false);
+                let _ = write_project_state(
+                    options,
+                    project_id,
+                    &project_name,
+                    &status,
+                    latest.as_deref(),
+                    environment_validation,
+                );
+            }
+            format!(
+                "{{\"status\":\"saved\",\"project_id\":\"{}\",\"input_manifest\":\"{}\",\"bytes\":{}}}",
+                escape_json(project_id),
+                escape_json(&path.display().to_string()),
+                manifest.len()
+            )
+        }
         Err(err) => format!(
             "{{\"status\":\"failed\",\"error\":\"{}\"}}",
             escape_json(&err)
@@ -1295,17 +1319,15 @@ fn manifest_inputs(manifest: &Value, hints: &[&str]) -> Vec<String> {
             items
                 .iter()
                 .filter_map(|item| {
-                    let label = item
-                        .get("label")
-                        .or_else(|| item.get("field"))
-                        .and_then(Value::as_str)
-                        .unwrap_or("");
+                    let label = item.get("label").and_then(Value::as_str).unwrap_or("");
+                    let field = item.get("field").and_then(Value::as_str).unwrap_or("");
                     let value = item
                         .get("value")
                         .and_then(Value::as_str)
                         .unwrap_or("")
                         .trim();
-                    if !value.is_empty() && contains_hint(label, hints) {
+                    let searchable = format!("{label} {field}");
+                    if !value.is_empty() && contains_hint(&searchable, hints) {
                         Some(value.to_string())
                     } else {
                         None
@@ -3654,9 +3676,18 @@ mod tests {
             "POST",
             &format!("/api/projects/{project_id}/inputs"),
             &options,
-            "{\"inputs\":[{\"field\":\"SMILES\",\"value\":\"CCO\"}],\"files\":[{\"name\":\"ligand.sdf\",\"size\":123}],\"advanced_parameters_collapsed\":true}",
+            "{\"inputs\":[{\"field\":\"project_name\",\"label\":\"Project name\",\"value\":\"Production Study\"},{\"field\":\"smiles\",\"label\":\"SMILES\",\"value\":\"CCO\"}],\"files\":[{\"field\":\"upload_structure_file\",\"name\":\"ligand.sdf\",\"size\":123,\"sha256\":\"9a0364b9e99bb480dd25e1f0284c8555\"}],\"advanced_parameters_collapsed\":true,\"field_schema\":\"genoligand.webui.input_manifest.v0.9.1\"}",
         );
         assert!(input_saved.contains("\"status\":\"saved\""));
+        let project_after_input = fs::read_to_string(
+            options
+                .artifact_dir
+                .join("projects")
+                .join(&project_id)
+                .join("project.json"),
+        )
+        .unwrap();
+        assert!(project_after_input.contains("Production Study"));
         let input_manifest = fs::read_to_string(
             options
                 .artifact_dir
@@ -3665,7 +3696,9 @@ mod tests {
                 .join("input_manifest.json"),
         )
         .unwrap();
-        assert!(input_manifest.contains("\"SMILES\""));
+        assert!(input_manifest.contains("\"field\":\"smiles\""));
+        assert!(input_manifest.contains("field_schema"));
+        assert!(input_manifest.contains("sha256"));
         assert!(input_manifest.contains("ligand.sdf"));
 
         let (_, _, preflight) = route_http(
@@ -3685,7 +3718,7 @@ mod tests {
                 .join("input_manifest.json"),
         )
         .unwrap();
-        assert!(input_manifest_after_preflight.contains("\"SMILES\""));
+        assert!(input_manifest_after_preflight.contains("\"field\":\"smiles\""));
         assert!(input_manifest_after_preflight.contains("ligand.sdf"));
 
         let (_, _, run) = route_http(

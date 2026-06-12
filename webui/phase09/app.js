@@ -285,6 +285,15 @@ function pick(value) {
   return value;
 }
 
+function fieldKeyFromLabel(label) {
+  const raw = Array.isArray(label) ? label[1] || label[0] : label;
+  return String(raw || "")
+    .trim()
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, "_")
+    .replace(/^_+|_+$/g, "");
+}
+
 function t(key) {
   return labels[appState.lang][key] || labels.zh[key] || key;
 }
@@ -328,17 +337,22 @@ function dataTable(headers, rows, emptyMessage) {
 
 function formGrid(rows) {
   return `<div class="form-grid">${rows
-    .map(([label, value, hint, type = "text"]) => `<label><span>${pick(label)}</span><input type="${type}" value="${pick(value)}" aria-label="${pick(label)}"><small>${pick(hint)}</small></label>`)
+    .map(([label, value, hint, type = "text"]) => {
+      const field = fieldKeyFromLabel(label);
+      return `<label><span>${pick(label)}</span><input type="${type}" value="${pick(value)}" aria-label="${pick(label)}" data-field="${field}"><small>${pick(hint)}</small></label>`;
+    })
     .join("")}</div>`;
 }
 
 function textArea(label, value, hint) {
-  return `<label class="wide-field"><span>${pick(label)}</span><textarea rows="5" aria-label="${pick(label)}">${pick(value)}</textarea><small>${pick(hint)}</small></label>`;
+  const field = fieldKeyFromLabel(label);
+  return `<label class="wide-field"><span>${pick(label)}</span><textarea rows="5" aria-label="${pick(label)}" data-field="${field}">${pick(value)}</textarea><small>${pick(hint)}</small></label>`;
 }
 
 function fileDrop(label, hint, acceptText) {
   const labelText = pick(label);
-  return `<label class="file-drop"><strong>${labelText}</strong><span>${pick(hint)}</span><small>${pick(acceptText)}</small><input type="file" aria-label="${labelText}"></label>`;
+  const field = fieldKeyFromLabel(label);
+  return `<label class="file-drop"><strong>${labelText}</strong><span>${pick(hint)}</span><small>${pick(acceptText)}</small><input type="file" aria-label="${labelText}" data-field="${field}"></label>`;
 }
 
 function optionTiles(items) {
@@ -1426,48 +1440,75 @@ async function apiRequest(path, options = {}) {
 }
 
 function inputEntryKey(entry) {
-  return [entry.route, entry.label, entry.control_type || entry.type || ""].join("::");
+  return [entry.route, entry.field || entry.label, entry.control_type || entry.type || ""].join("::");
 }
 
-function captureVisibleInputs() {
+async function fileSha256(file) {
+  if (!window.crypto?.subtle || !file?.arrayBuffer) {
+    return "";
+  }
+  const digest = await window.crypto.subtle.digest("SHA-256", await file.arrayBuffer());
+  return Array.from(new Uint8Array(digest))
+    .map((byte) => byte.toString(16).padStart(2, "0"))
+    .join("");
+}
+
+async function captureVisibleInputs() {
   const activeRoute = routeFromLocation();
   const fieldNodes = Array.from(document.querySelectorAll("input, textarea, select")).filter((node) => node.type !== "file");
   const fileNodes = Array.from(document.querySelectorAll('input[type="file"]'));
   const inputs = fieldNodes.map((node) => ({
     route: activeRoute,
+    field: node.dataset.field || fieldKeyFromLabel(node.getAttribute("aria-label") || node.name || node.id || ""),
     label: node.getAttribute("aria-label") || node.closest("label")?.querySelector("span")?.textContent || node.name || node.id || "",
     value: node.value || "",
     control_type: node.tagName.toLowerCase(),
   }));
-  const files = fileNodes.flatMap((node) =>
-    Array.from(node.files || []).map((file) => ({
-      route: activeRoute,
-      label: node.getAttribute("aria-label") || "",
-      name: file.name,
-      size: file.size,
-      type: file.type || "application/octet-stream",
-      last_modified: file.lastModified,
-    }))
-  );
+  const files = (
+    await Promise.all(
+      fileNodes.map(async (node) =>
+        Promise.all(
+          Array.from(node.files || []).map(async (file) => ({
+            route: activeRoute,
+            field: node.dataset.field || fieldKeyFromLabel(node.getAttribute("aria-label") || ""),
+            label: node.getAttribute("aria-label") || "",
+            name: file.name,
+            size: file.size,
+            type: file.type || "application/octet-stream",
+            last_modified: file.lastModified,
+            sha256: await fileSha256(file),
+          }))
+        )
+      )
+    )
+  ).flat();
   return { inputs, files };
 }
 
-function mergeInputDraft(snapshot = captureVisibleInputs()) {
-  const visibleInputKeys = new Set(snapshot.inputs.map(inputEntryKey));
-  const visibleFileKeys = new Set(snapshot.files.map(inputEntryKey));
-  appState.inputDraft.inputs = appState.inputDraft.inputs.filter((entry) => !visibleInputKeys.has(inputEntryKey(entry))).concat(snapshot.inputs);
-  appState.inputDraft.files = appState.inputDraft.files.filter((entry) => !visibleFileKeys.has(inputEntryKey(entry))).concat(snapshot.files);
+async function mergeInputDraft(snapshot) {
+  const currentSnapshot = snapshot || (await captureVisibleInputs());
+  const visibleInputKeys = new Set(currentSnapshot.inputs.map(inputEntryKey));
+  const visibleFileKeys = new Set(currentSnapshot.files.map(inputEntryKey));
+  appState.inputDraft.inputs = appState.inputDraft.inputs.filter((entry) => !visibleInputKeys.has(inputEntryKey(entry))).concat(currentSnapshot.inputs);
+  appState.inputDraft.files = appState.inputDraft.files.filter((entry) => !visibleFileKeys.has(inputEntryKey(entry))).concat(currentSnapshot.files);
 }
 
-function collectInputManifest() {
-  mergeInputDraft();
+async function collectInputManifest() {
+  await mergeInputDraft();
   return {
     saved_at: new Date().toISOString(),
     route: routeFromLocation(),
     inputs: appState.inputDraft.inputs,
     files: appState.inputDraft.files,
     advanced_parameters_collapsed: true,
+    field_schema: "genoligand.webui.input_manifest.v0.9.1",
   };
+}
+
+function queueInputDraftMerge() {
+  mergeInputDraft().catch(() => {
+    setMessage("warn", "输入暂存未完成，请保存配置时重试。", "Input capture did not finish; retry when saving configuration.");
+  });
 }
 
 function setMessage(kind, zh, en) {
@@ -1621,7 +1662,7 @@ async function handleAction(action, dataset = {}) {
     } else if (action === "save-configuration") {
       const project = appState.selectedProject || (await apiRequest("/api/projects", { method: "POST" })).project;
       appState.selectedProject = project;
-      const manifest = collectInputManifest();
+      const manifest = await collectInputManifest();
       await apiRequest(`/api/projects/${project.project_id}/inputs`, {
         method: "POST",
         body: JSON.stringify(manifest),
@@ -1727,17 +1768,17 @@ function bindEvents() {
     const textAreaNode = document.querySelector("textarea");
     if (textAreaNode) {
       textAreaNode.value = peptide.dataset.insertPeptide;
-      mergeInputDraft();
+      queueInputDraftMerge();
     }
   });
   document.addEventListener("input", (event) => {
     if (event.target.matches("input, textarea, select")) {
-      mergeInputDraft();
+      queueInputDraftMerge();
     }
   });
   document.addEventListener("change", (event) => {
     if (event.target.matches("input, textarea, select")) {
-      mergeInputDraft();
+      queueInputDraftMerge();
     }
   });
 }
