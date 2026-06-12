@@ -1539,7 +1539,15 @@ fn manifest_inputs(manifest: &Value, hints: &[&str]) -> Vec<String> {
         .unwrap_or_default()
 }
 
-fn manifest_files(manifest: &Value) -> Vec<(String, u64)> {
+#[derive(Clone, Debug)]
+struct InputFileMetadata {
+    route: String,
+    name: String,
+    sha256: String,
+    persisted_path: String,
+}
+
+fn manifest_file_items(manifest: &Value) -> Vec<InputFileMetadata> {
     manifest
         .get("files")
         .and_then(Value::as_array)
@@ -1551,19 +1559,81 @@ fn manifest_files(manifest: &Value) -> Vec<(String, u64)> {
                     if name.is_empty() {
                         return None;
                     }
-                    let size = item.get("size").and_then(Value::as_u64).unwrap_or(0);
-                    Some((name.to_string(), size))
+                    Some(InputFileMetadata {
+                        route: item
+                            .get("route")
+                            .and_then(Value::as_str)
+                            .unwrap_or("")
+                            .to_string(),
+                        name: name.to_string(),
+                        sha256: item
+                            .get("sha256")
+                            .and_then(Value::as_str)
+                            .unwrap_or("")
+                            .to_string(),
+                        persisted_path: item
+                            .get("persisted_path")
+                            .and_then(Value::as_str)
+                            .unwrap_or("")
+                            .to_string(),
+                    })
                 })
                 .collect::<Vec<_>>()
         })
         .unwrap_or_default()
 }
 
-fn has_file_extension(files: &[(String, u64)], extensions: &[&str]) -> bool {
-    files.iter().any(|(name, _)| {
-        let lower = name.to_ascii_lowercase();
-        extensions.iter().any(|ext| lower.ends_with(ext))
-    })
+fn file_count_by_extension(files: &[InputFileMetadata], extensions: &[&str]) -> usize {
+    files
+        .iter()
+        .filter(|file| {
+            let lower = file.name.to_ascii_lowercase();
+            extensions.iter().any(|ext| lower.ends_with(ext))
+        })
+        .count()
+}
+
+fn file_count_by_route_and_extension(
+    files: &[InputFileMetadata],
+    route_hint: &str,
+    extensions: &[&str],
+) -> usize {
+    files
+        .iter()
+        .filter(|file| {
+            let lower_name = file.name.to_ascii_lowercase();
+            contains_hint(&file.route, &[route_hint])
+                && extensions.iter().any(|ext| lower_name.ends_with(ext))
+        })
+        .count()
+}
+
+fn file_count_by_route_name_and_extension(
+    files: &[InputFileMetadata],
+    route_hint: &str,
+    name_hints: &[&str],
+    extensions: &[&str],
+) -> usize {
+    files
+        .iter()
+        .filter(|file| {
+            let lower_name = file.name.to_ascii_lowercase();
+            contains_hint(&file.route, &[route_hint])
+                && contains_hint(&file.name, name_hints)
+                && extensions.iter().any(|ext| lower_name.ends_with(ext))
+        })
+        .count()
+}
+
+fn file_hash_coverage(files: &[InputFileMetadata]) -> usize {
+    files.iter().filter(|file| file.sha256.len() >= 32).count()
+}
+
+fn persisted_file_count(files: &[InputFileMetadata]) -> usize {
+    files
+        .iter()
+        .filter(|file| !file.persisted_path.trim().is_empty())
+        .count()
 }
 
 fn valid_smiles_screen(value: &str) -> bool {
@@ -1632,6 +1702,31 @@ fn valid_standard_peptide(value: &str) -> bool {
         })
 }
 
+fn standard_sequence_stats(values: &[String]) -> (usize, usize, usize, usize, usize) {
+    let mut valid = 0usize;
+    let mut invalid = 0usize;
+    let mut min_len = usize::MAX;
+    let mut max_len = 0usize;
+    for value in values {
+        let sequence = normalized_sequence(value);
+        if sequence.is_empty() {
+            invalid += 1;
+            continue;
+        }
+        min_len = min_len.min(sequence.len());
+        max_len = max_len.max(sequence.len());
+        if valid_standard_peptide(&sequence) {
+            valid += 1;
+        } else {
+            invalid += 1;
+        }
+    }
+    if values.is_empty() || min_len == usize::MAX {
+        min_len = 0;
+    }
+    (values.len(), valid, invalid, min_len, max_len)
+}
+
 fn command_probe(program: &str, args: &[&str]) -> bool {
     Command::new(program)
         .args(args)
@@ -1650,77 +1745,194 @@ fn read_input_manifest(dir: &Path) -> Value {
 fn build_preflight_checks(options: &ServerOptions, project_id: &str) -> (String, bool) {
     let dir = project_dir(options, project_id);
     let manifest = read_input_manifest(&dir);
-    let files = manifest_files(&manifest);
+    let file_items = manifest_file_items(&manifest);
     let smiles = manifest_inputs(&manifest, &["smiles"]);
-    let compound_refs = manifest_inputs(&manifest, &["compound", "cas", "化合物"]);
-    let peptide_sequences = manifest_inputs(&manifest, &["peptide", "多肽"]);
-    let fasta_sequences = manifest_inputs(&manifest, &["fasta", "sequence", "序列"]);
+    let compound_refs = manifest_inputs(&manifest, &["compound_name", "cas", "化合物名称"]);
+    let peptide_sequences = manifest_inputs(&manifest, &["peptide_sequence", "多肽序列"]);
+    let protein_sequences = manifest_inputs(&manifest, &["fasta_sequence", "FASTA 序列"]);
     let chain_ids = manifest_inputs(&manifest, &["chain", "链"]);
+    let residue_ranges = manifest_inputs(&manifest, &["residue_range", "残基编号范围"]);
+    let residue_names = manifest_inputs(&manifest, &["residue_name", "residue name"]);
+    let binding_regions = manifest_inputs(&manifest, &["binding_region", "结合区域"]);
+    let structure_sources = manifest_inputs(&manifest, &["structure_source", "结构来源"]);
+    let species_values = manifest_inputs(&manifest, &["species", "物种"]);
+    let genome_versions = manifest_inputs(&manifest, &["genome_version", "基因组版本"]);
     let genome_files = manifest_inputs(
         &manifest,
         &["genome", "gtf", "gff", "transcript", "vcf", "基因组"],
     );
 
-    let molecule_ready = smiles.iter().any(|value| valid_smiles_screen(value))
-        || has_file_extension(&files, &[".sdf", ".mol2", ".pdb"]);
+    let valid_smiles_count = smiles
+        .iter()
+        .filter(|value| valid_smiles_screen(value))
+        .count();
+    let invalid_smiles_count = smiles.len().saturating_sub(valid_smiles_count);
+    let small_structure_file_count = file_count_by_route_and_extension(
+        &file_items,
+        "input_wizard_small_molecule_page",
+        &[".sdf", ".mol2", ".pdb"],
+    );
+    let molecule_ready = valid_smiles_count > 0 || small_structure_file_count > 0;
     let molecule_status = if molecule_ready {
         "ready"
     } else if !compound_refs.is_empty() {
         "warning"
     } else {
-        "missing"
+        "waiting"
     };
-    let molecule_observed = if molecule_ready {
-        format!(
-            "smiles_count={};structure_file_count={};basic_format_screen=ready;three_dimensional_valence_conformer_checks=queued_for_scientific_worker",
-            smiles.len(),
-            files
-                .iter()
-                .filter(|(name, _)| {
-                    let lower = name.to_ascii_lowercase();
-                    [".sdf", ".mol2", ".pdb"]
-                        .iter()
-                        .any(|ext| lower.ends_with(ext))
-                })
-                .count()
-        )
-    } else if !compound_refs.is_empty() {
-        format!(
-            "name_or_cas_count={};structure_required_before_scientific_run",
-            compound_refs.len()
-        )
-    } else {
-        "no_small_molecule_structure_or_smiles_detected".to_string()
-    };
+    let molecule_observed = format!(
+        "smiles_count={};valid_smiles_count={valid_smiles_count};invalid_smiles_count={invalid_smiles_count};structure_file_count={small_structure_file_count};name_or_cas_count={};three_dimensional_structure_check={};valence_check={};conformer_generation_check={}",
+        smiles.len(),
+        compound_refs.len(),
+        if small_structure_file_count > 0 {
+            "file_present"
+        } else {
+            "scientific_worker_required"
+        },
+        if molecule_ready {
+            "queued_for_scientific_worker"
+        } else {
+            "waiting_for_structure_or_smiles"
+        },
+        if molecule_ready {
+            "queued_for_scientific_worker"
+        } else {
+            "waiting_for_structure_or_smiles"
+        }
+    );
 
-    let peptide_ready = peptide_sequences
-        .iter()
-        .chain(fasta_sequences.iter())
-        .any(|value| valid_standard_peptide(value));
+    let peptide_fasta_file_count = file_count_by_route_and_extension(
+        &file_items,
+        "input_wizard_peptide_page",
+        &[".fa", ".fasta", ".faa"],
+    );
+    let (peptide_count, peptide_valid, peptide_invalid, peptide_min_len, peptide_max_len) =
+        standard_sequence_stats(&peptide_sequences);
+    let peptide_ready = peptide_valid > 0 || peptide_fasta_file_count > 0;
     let peptide_status = if peptide_ready {
         "ready"
-    } else if peptide_sequences.is_empty() && fasta_sequences.is_empty() {
+    } else if peptide_sequences.is_empty() && peptide_fasta_file_count == 0 {
         "waiting"
     } else {
         "warning"
     };
-    let peptide_observed = if peptide_ready {
-        "standard_amino_acid_sequence_detected=true;length_and_character_screen=ready".to_string()
-    } else if peptide_sequences.is_empty() && fasta_sequences.is_empty() {
-        "no_peptide_or_fasta_sequence_supplied".to_string()
-    } else {
-        "sequence_present_but_contains_non_standard_or_empty_residues".to_string()
-    };
+    let peptide_observed = format!(
+        "sequence_count={peptide_count};valid_standard_sequence_count={peptide_valid};invalid_or_non_standard_sequence_count={peptide_invalid};min_length={peptide_min_len};max_length={peptide_max_len};fasta_file_count={peptide_fasta_file_count};modification_notes=recorded_when_supplied"
+    );
 
-    let structure_file_count = files
-        .iter()
-        .filter(|(name, _)| {
-            let lower = name.to_ascii_lowercase();
-            [".pdb", ".cif", ".mmcif", ".sdf", ".mol2"]
-                .iter()
-                .any(|ext| lower.ends_with(ext))
-        })
-        .count();
+    let protein_structure_file_count = file_count_by_route_and_extension(
+        &file_items,
+        "input_wizard_protein_page",
+        &[".pdb", ".cif", ".mmcif"],
+    );
+    let protein_fasta_file_count = file_count_by_route_and_extension(
+        &file_items,
+        "input_wizard_protein_page",
+        &[".fa", ".fasta", ".faa"],
+    );
+    let (protein_count, protein_valid, protein_invalid, protein_min_len, protein_max_len) =
+        standard_sequence_stats(&protein_sequences);
+    let protein_ready =
+        protein_valid > 0 || protein_structure_file_count > 0 || protein_fasta_file_count > 0;
+    let protein_status = if protein_ready {
+        "ready"
+    } else if !chain_ids.is_empty() || !residue_ranges.is_empty() {
+        "warning"
+    } else {
+        "waiting"
+    };
+    let protein_observed = format!(
+        "fasta_sequence_count={protein_count};valid_protein_sequence_count={protein_valid};invalid_sequence_count={protein_invalid};min_length={protein_min_len};max_length={protein_max_len};structure_file_count={protein_structure_file_count};fasta_file_count={protein_fasta_file_count};chain_id_count={};residue_range_count={};missing_residue_check=queued_for_structure_reader;structure_readability_check={}",
+        chain_ids.len(),
+        residue_ranges.len(),
+        if protein_structure_file_count > 0 {
+            "queued_for_structure_reader"
+        } else {
+            "waiting_for_structure_file"
+        }
+    );
+
+    let complex_structure_file_count = file_count_by_route_and_extension(
+        &file_items,
+        "input_wizard_complex_page",
+        &[".pdb", ".cif", ".mmcif"],
+    );
+    let complex_descriptor_count =
+        chain_ids.len() + residue_names.len() + binding_regions.len() + structure_sources.len();
+    let complex_ready = complex_structure_file_count > 0 && complex_descriptor_count > 0;
+    let complex_status = if complex_ready {
+        "ready"
+    } else if complex_structure_file_count > 0 || complex_descriptor_count > 0 {
+        "warning"
+    } else {
+        "waiting"
+    };
+    let complex_observed = format!(
+        "complex_structure_file_count={complex_structure_file_count};ligand_chain_count={};small_molecule_residue_name_count={};binding_region_count={};structure_source_count={};auth_label_mapping_check={};readability_check={}",
+        chain_ids.len(),
+        residue_names.len(),
+        binding_regions.len(),
+        structure_sources.len(),
+        if complex_structure_file_count > 0 {
+            "queued_for_structure_reader"
+        } else {
+            "waiting_for_complex_structure"
+        },
+        if complex_structure_file_count > 0 {
+            "queued_for_structure_reader"
+        } else {
+            "waiting_for_complex_structure"
+        }
+    );
+
+    let custom_genome_file_count = file_count_by_route_and_extension(
+        &file_items,
+        "input_wizard_genome_page",
+        &[
+            ".fa", ".fasta", ".fna", ".gtf", ".gff", ".gff3", ".vcf", ".vcf.gz",
+        ],
+    );
+    let genome_fasta_count = file_count_by_route_name_and_extension(
+        &file_items,
+        "input_wizard_genome_page",
+        &["genome", "dna", "assembly"],
+        &[".fa", ".fasta", ".fna"],
+    );
+    let annotation_count = file_count_by_route_name_and_extension(
+        &file_items,
+        "input_wizard_genome_page",
+        &["annotation", "gtf", "gff"],
+        &[".gtf", ".gff", ".gff3"],
+    );
+    let transcript_count = file_count_by_route_name_and_extension(
+        &file_items,
+        "input_wizard_genome_page",
+        &["transcript", "rna", "cdna"],
+        &[".fa", ".fasta", ".fna"],
+    );
+    let vcf_count = file_count_by_route_name_and_extension(
+        &file_items,
+        "input_wizard_genome_page",
+        &["vcf", "variant"],
+        &[".vcf", ".vcf.gz"],
+    );
+    let hash_covered_files = file_hash_coverage(&file_items);
+    let persisted_files = persisted_file_count(&file_items);
+    let species_status =
+        if !species_values.is_empty() || custom_genome_file_count > 0 || !genome_files.is_empty() {
+            "ready"
+        } else {
+            "waiting"
+        };
+    let species_observed = format!(
+        "species_value_count={};genome_version_count={};custom_genome_path_value_count={};custom_file_count={custom_genome_file_count};genome_fasta_file_count={genome_fasta_count};annotation_file_count={annotation_count};transcript_file_count={transcript_count};vcf_file_count={vcf_count};hash_covered_file_count={hash_covered_files};persisted_file_count={persisted_files};index_status=checked_during_database_profile_validation",
+        species_values.len(),
+        genome_versions.len(),
+        genome_files.len()
+    );
+
+    let structure_file_count =
+        file_count_by_extension(&file_items, &[".pdb", ".cif", ".mmcif", ".sdf", ".mol2"]);
     let structure_status = if structure_file_count > 0 {
         "ready"
     } else if !chain_ids.is_empty() {
@@ -1729,9 +1941,9 @@ fn build_preflight_checks(options: &ServerOptions, project_id: &str) -> (String,
         "waiting"
     };
     let structure_observed = format!(
-        "recognized_structure_file_count={structure_file_count};chain_id_count={};uploaded_file_count={}",
+        "recognized_structure_file_count={structure_file_count};chain_id_count={};uploaded_file_count={};hash_covered_file_count={hash_covered_files}",
         chain_ids.len(),
-        files.len()
+        file_items.len()
     );
 
     let database_config_count = [
@@ -1780,6 +1992,8 @@ fn build_preflight_checks(options: &ServerOptions, project_id: &str) -> (String,
     let java_ok = command_probe("java", &["-version"]);
     let nextflow_ok = command_probe("nextflow", &["-version"]);
     let python_ok = command_probe("python", &["--version"]);
+    let openmm_ok = command_probe("python", &["-c", "import openmm"]);
+    let cuda_probe_ok = command_probe("nvidia-smi", &["--query-gpu=name", "--format=csv,noheader"]);
     let runtime_status = if write_ok && gls_cli_exists && git_remote_ok {
         "ready"
     } else if write_ok {
@@ -1788,23 +2002,45 @@ fn build_preflight_checks(options: &ServerOptions, project_id: &str) -> (String,
         "missing"
     };
     let runtime_observed = format!(
-        "write_permission={write_ok};gls_cli_binary={gls_cli_exists};git_remote={git_remote_ok};java={java_ok};nextflow={nextflow_ok};python={python_ok}"
+        "write_permission={write_ok};gls_cli_binary={gls_cli_exists};git_remote={git_remote_ok};java={java_ok};nextflow={nextflow_ok};python={python_ok};openmm_python={openmm_ok};cuda_or_nvidia_smi={cuda_probe_ok};disk_probe_artifact_dir={}",
+        options.artifact_dir.display()
     );
 
     let checks = [
         preflight_check_json(
-            "molecule_format",
+            "small_molecule_input",
             molecule_status,
             "SMILES/SDF/MOL2/PDB, valence, 3D structure, conformers",
             &molecule_observed,
             "open_input_wizard",
         ),
         preflight_check_json(
-            "sequence_validity",
+            "peptide_input",
             peptide_status,
             "illegal characters, non-standard residues, length, modifications",
             &peptide_observed,
             "edit_sequence",
+        ),
+        preflight_check_json(
+            "protein_ligand_input",
+            protein_status,
+            "FASTA, PDB/mmCIF, chain ID, residue numbering, missing residues, readability",
+            &protein_observed,
+            "open_protein_input",
+        ),
+        preflight_check_json(
+            "complex_structure_input",
+            complex_status,
+            "receptor-ligand complex, ligand chain, residue name, binding region",
+            &complex_observed,
+            "open_complex_input",
+        ),
+        preflight_check_json(
+            "species_genome_input",
+            species_status,
+            "preset species, custom genome FASTA, GTF/GFF3, transcript FASTA, optional VCF",
+            &species_observed,
+            "open_species_genome",
         ),
         preflight_check_json(
             "structure_files",
@@ -1828,7 +2064,8 @@ fn build_preflight_checks(options: &ServerOptions, project_id: &str) -> (String,
             "run_diagnostics",
         ),
     ];
-    let hard_pass = molecule_status != "missing" && runtime_status != "missing";
+    let primary_input_ready = molecule_ready || peptide_ready || protein_ready || complex_ready;
+    let hard_pass = primary_input_ready && runtime_status != "missing";
     (format!("{{\"checks\":[{}]}}", checks.join(",")), hard_pass)
 }
 
@@ -3963,8 +4200,15 @@ mod tests {
             "",
         );
         assert!(preflight.contains("\"status\":\"preflight_passed\""));
-        assert!(preflight.contains("\"check_id\":\"molecule_format\""));
+        assert!(preflight.contains("\"check_id\":\"small_molecule_input\""));
+        assert!(preflight.contains("\"check_id\":\"peptide_input\""));
+        assert!(preflight.contains("\"check_id\":\"protein_ligand_input\""));
+        assert!(preflight.contains("\"check_id\":\"complex_structure_input\""));
+        assert!(preflight.contains("\"check_id\":\"species_genome_input\""));
         assert!(preflight.contains("smiles_count=1"));
+        assert!(preflight.contains("valid_smiles_count=1"));
+        assert!(preflight.contains("structure_file_count=1"));
+        assert!(preflight.contains("hash_covered_file_count=1"));
         let input_manifest_after_preflight = fs::read_to_string(
             options
                 .artifact_dir
