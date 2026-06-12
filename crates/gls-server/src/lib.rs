@@ -2459,20 +2459,266 @@ fn report_export_json(options: &ServerOptions) -> String {
 }
 
 fn cleanup_json(options: &ServerOptions) -> String {
-    let manifest = options
-        .artifact_dir
-        .join("cleanup")
-        .join("post_push_cleanup_manifest.tsv");
-    let text = "action\tpath\tstatus\nretain\tcurrent_code\tprotected\nretain\tcurrent_manifests\tprotected\ncleanup\told_runtime_cache\tcompleted_if_present\n";
-    match write_text(&manifest, text) {
-        Ok(()) => format!(
-            "{{\"status\":\"completed\",\"manifest\":\"{}\",\"scope\":\"runtime_artifacts_only\"}}",
-            escape_json(&manifest.display().to_string())
-        ),
-        Err(err) => format!(
+    let cleanup_dir = options.artifact_dir.join("cleanup");
+    let manifest = cleanup_dir.join("post_push_cleanup_execution_manifest.tsv");
+    let summary = cleanup_dir.join("post_push_cleanup_summary.tsv");
+    let _ = fs::create_dir_all(&cleanup_dir);
+    let candidates = cleanup_candidates(options);
+    let mut rows = Vec::new();
+    let mut deleted_files = 0usize;
+    let mut deleted_bytes = 0u64;
+    let mut unremoved = 0usize;
+    for candidate in candidates {
+        let before_files = file_count(&candidate.path);
+        let before_bytes = path_size(&candidate.path);
+        let status = if !candidate.path.exists() {
+            "not_present".to_string()
+        } else if !is_cleanup_allowed(options, &candidate.path) {
+            unremoved += 1;
+            "blocked_protected_path".to_string()
+        } else {
+            match remove_cleanup_path(&candidate.path) {
+                Ok(()) => {
+                    deleted_files = deleted_files.saturating_add(before_files.max(1));
+                    deleted_bytes = deleted_bytes.saturating_add(before_bytes);
+                    "deleted".to_string()
+                }
+                Err(err) => {
+                    unremoved += 1;
+                    format!("failed:{err}")
+                }
+            }
+        };
+        rows.push(format!(
+            "cleanup\t{}\t{}\t{}\t{}\t{}",
+            candidate.kind,
+            candidate.path.display(),
+            before_files,
+            before_bytes,
+            status
+        ));
+    }
+    rows.push(format!(
+        "retain\tcurrent_source\t{}\t0\t0\tprotected",
+        options.workspace_root.display()
+    ));
+    rows.push(format!(
+        "retain\tcurrent_artifact_manifests\t{}\t0\t0\tprotected",
+        options.artifact_dir.display()
+    ));
+    let manifest_text = format!(
+        "action\tclass\tpath\tbefore_files\tbefore_bytes\tstatus\n{}\n",
+        rows.join("\n")
+    );
+    let summary_text = format!(
+        "metric\tvalue\ncleanup_scope\tpost_push_allowlist\ndeleted_files_count\t{deleted_files}\ndeleted_bytes\t{deleted_bytes}\ncleanup_eligible_unremoved_count\t{unremoved}\nprotected_path_violation_count\t0\n"
+    );
+    let manifest_result = write_text(&manifest, &manifest_text);
+    let summary_result = write_text(&summary, &summary_text);
+    if let Err(err) = manifest_result.and(summary_result) {
+        return format!(
             "{{\"status\":\"failed\",\"error\":\"{}\"}}",
             escape_json(&err.to_string())
-        ),
+        );
+    }
+    format!(
+        "{{\"status\":\"completed\",\"manifest\":\"{}\",\"summary\":\"{}\",\"scope\":\"post_push_allowlist\",\"deleted_files_count\":{},\"deleted_bytes\":{},\"cleanup_eligible_unremoved_count\":{},\"protected_path_violation_count\":0}}",
+        escape_json(&manifest.display().to_string()),
+        escape_json(&summary.display().to_string()),
+        deleted_files,
+        deleted_bytes,
+        unremoved
+    )
+}
+
+#[derive(Clone, Debug)]
+struct CleanupCandidate {
+    path: PathBuf,
+    kind: &'static str,
+}
+
+fn cleanup_candidates(options: &ServerOptions) -> Vec<CleanupCandidate> {
+    let mut candidates = Vec::new();
+    for relative in [
+        "exports/report_export_manifest.json",
+        "gls-server.stdout.log",
+        "gls-server.stderr.log",
+        "server.log",
+        "tmp",
+        "work",
+        "run",
+        "cache",
+        ".cache",
+        "old_reports",
+        "old_screenshots",
+        "visual_audit_intermediate",
+        "webui_build_cache",
+        "nextflow_cache",
+        "release_bundle",
+    ] {
+        candidates.push(CleanupCandidate {
+            path: options.artifact_dir.join(relative),
+            kind: "artifact_runtime",
+        });
+    }
+    for path in collect_cleanup_files(
+        &options.artifact_dir.join("ui"),
+        &["html", "tmp", "log"],
+        500,
+    ) {
+        candidates.push(CleanupCandidate {
+            path,
+            kind: "visual_audit_intermediate",
+        });
+    }
+    for relative in [
+        ".nextflow/cache",
+        "webui/.cache",
+        "webui/playwright-report",
+        "webui/test-results",
+    ] {
+        candidates.push(CleanupCandidate {
+            path: options.workspace_root.join(relative),
+            kind: "workspace_cache",
+        });
+    }
+    for path in collect_named_files(&options.workspace_root, ".nextflow.log", 30) {
+        candidates.push(CleanupCandidate {
+            path,
+            kind: "nextflow_log",
+        });
+    }
+    candidates
+}
+
+fn collect_cleanup_files(root: &Path, extensions: &[&str], limit: usize) -> Vec<PathBuf> {
+    let mut files = Vec::new();
+    let mut stack = vec![root.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        if files.len() >= limit {
+            break;
+        }
+        let Ok(entries) = fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            if files.len() >= limit {
+                break;
+            }
+            let path = entry.path();
+            let Ok(file_type) = entry.file_type() else {
+                continue;
+            };
+            if file_type.is_dir() {
+                stack.push(path);
+            } else if file_type.is_file()
+                && path
+                    .extension()
+                    .and_then(|ext| ext.to_str())
+                    .map(|ext| {
+                        extensions
+                            .iter()
+                            .any(|allowed| ext.eq_ignore_ascii_case(allowed))
+                    })
+                    .unwrap_or(false)
+            {
+                files.push(path);
+            }
+        }
+    }
+    files
+}
+
+fn collect_named_files(root: &Path, prefix: &str, limit: usize) -> Vec<PathBuf> {
+    fs::read_dir(root)
+        .ok()
+        .into_iter()
+        .flat_map(|entries| entries.flatten())
+        .map(|entry| entry.path())
+        .filter(|path| {
+            path.file_name()
+                .and_then(|name| name.to_str())
+                .map(|name| name == prefix || name.starts_with(&format!("{prefix}.")))
+                .unwrap_or(false)
+        })
+        .take(limit)
+        .collect()
+}
+
+fn is_cleanup_allowed(options: &ServerOptions, path: &Path) -> bool {
+    let protected_roots = [
+        options.workspace_root.join("src"),
+        options.workspace_root.join("crates"),
+        options.workspace_root.join("configs"),
+        options.workspace_root.join("workflows"),
+        options.workspace_root.join("docs"),
+        options.workspace_root.join("schemas"),
+        options.workspace_root.join(".git"),
+    ];
+    if protected_roots.iter().any(|root| path.starts_with(root)) {
+        return false;
+    }
+    if path.starts_with(&options.artifact_dir) {
+        return true;
+    }
+    [
+        options.workspace_root.join(".nextflow"),
+        options.workspace_root.join("webui").join(".cache"),
+        options
+            .workspace_root
+            .join("webui")
+            .join("playwright-report"),
+        options.workspace_root.join("webui").join("test-results"),
+    ]
+    .iter()
+    .any(|root| path.starts_with(root))
+        || path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .map(|name| name == ".nextflow.log" || name.starts_with(".nextflow.log."))
+            .unwrap_or(false)
+}
+
+fn path_size(path: &Path) -> u64 {
+    if path.is_file() {
+        fs::metadata(path)
+            .map(|metadata| metadata.len())
+            .unwrap_or(0)
+    } else {
+        directory_size(path)
+    }
+}
+
+fn file_count(path: &Path) -> usize {
+    if path.is_file() {
+        return 1;
+    }
+    let mut count = 0usize;
+    let mut stack = vec![path.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        let Ok(entries) = fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let Ok(file_type) = entry.file_type() else {
+                continue;
+            };
+            if file_type.is_dir() {
+                stack.push(path);
+            } else if file_type.is_file() {
+                count = count.saturating_add(1);
+            }
+        }
+    }
+    count
+}
+
+fn remove_cleanup_path(path: &Path) -> Result<(), String> {
+    if path.is_dir() {
+        fs::remove_dir_all(path).map_err(|err| err.to_string())
+    } else {
+        fs::remove_file(path).map_err(|err| err.to_string())
     }
 }
 
@@ -2546,7 +2792,19 @@ fn git_action_json(options: &ServerOptions, args: &[&str]) -> String {
 fn git_push_json(options: &ServerOptions) -> String {
     let branch =
         git_value(options, &["branch", "--show-current"]).unwrap_or_else(|| "main".to_string());
-    git_action_json(options, &["push", "origin", &branch])
+    let (ok, text) = command_text(options, &["push", "origin", &branch]);
+    let cleanup = if ok {
+        cleanup_json(options)
+    } else {
+        "null".to_string()
+    };
+    format!(
+        "{{\"status\":\"{}\",\"command\":\"git push origin {}\",\"log\":{},\"post_push_cleanup\":{}}}",
+        if ok { "completed" } else { "failed" },
+        escape_json(&branch),
+        json_string_array(text.lines()),
+        cleanup
+    )
 }
 
 fn option_json(value: Option<&str>) -> String {
@@ -2853,6 +3111,30 @@ mod tests {
                 .artifact_dir
                 .join("exports")
                 .join("machine_readable_report.json")
+                .exists()
+        );
+        let legacy_export_manifest = options
+            .artifact_dir
+            .join("exports")
+            .join("report_export_manifest.json");
+        write_text(&legacy_export_manifest, "{}\n").unwrap();
+        let transient_dom = options
+            .artifact_dir
+            .join("ui")
+            .join("screenshots")
+            .join("final")
+            .join("old_visual_dom.html");
+        write_text(&transient_dom, "<html></html>\n").unwrap();
+        let (_, _, post_push_cleanup) = route_http("POST", "/api/cleanup/post-push", &options, "");
+        assert!(post_push_cleanup.contains("\"status\":\"completed\""));
+        assert!(post_push_cleanup.contains("\"deleted_files_count\":"));
+        assert!(!legacy_export_manifest.exists());
+        assert!(!transient_dom.exists());
+        assert!(
+            options
+                .artifact_dir
+                .join("cleanup")
+                .join("post_push_cleanup_summary.tsv")
                 .exists()
         );
 
