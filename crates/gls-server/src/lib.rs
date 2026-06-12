@@ -213,13 +213,14 @@ fn route_http(
         ("GET", "/api/guides") => guides_json(options),
         ("POST", "/api/reports/export") => report_export_json(options),
         ("GET", "/api/github/status") => github_status_json(options),
-        ("POST", "/api/github/add") => git_action_json(options, &["add", "-A"]),
+        ("POST", "/api/github/add") => git_action_json(options, "git_add", &["add", "-A"]),
         ("POST", "/api/github/commit") => git_action_json(
             options,
+            "git_commit",
             &["commit", "-m", "Update GenoLigand project state from WebUI"],
         ),
         ("POST", "/api/github/push") => git_push_json(options),
-        ("POST", "/api/github/verify") => github_status_json(options),
+        ("POST", "/api/github/verify") => github_verify_json(options),
         ("POST", "/api/cleanup/post-push") => cleanup_json(options),
         ("POST", "/api/projects") => create_project_json(options, false),
         _ => {
@@ -4383,33 +4384,126 @@ fn git_value(options: &ServerOptions, args: &[&str]) -> Option<String> {
     }
 }
 
-fn github_status_json(options: &ServerOptions) -> String {
+fn github_log_path(options: &ServerOptions, action: &str) -> PathBuf {
+    options
+        .artifact_dir
+        .join("github")
+        .join(format!("latest_{action}_log.tsv"))
+}
+
+fn write_github_log(
+    options: &ServerOptions,
+    action: &str,
+    command: &str,
+    ok: bool,
+    text: &str,
+) -> PathBuf {
+    let path = github_log_path(options, action);
+    let status = if ok { "completed" } else { "failed" };
+    let mut rows = vec!["action\tcommand\tstatus\tline_index\tline".to_string()];
+    let lines = if text.is_empty() {
+        vec![""]
+    } else {
+        text.lines().collect::<Vec<_>>()
+    };
+    for (index, line) in lines.iter().enumerate() {
+        rows.push(format!(
+            "{}\t{}\t{}\t{}\t{}",
+            tsv_cell(action),
+            tsv_cell(command),
+            status,
+            index + 1,
+            tsv_cell(line)
+        ));
+    }
+    let _ = write_text(&path, &(rows.join("\n") + "\n"));
+    path
+}
+
+fn tsv_cell(value: &str) -> String {
+    value.replace(['\t', '\r', '\n'], " ")
+}
+
+fn log_file_json(path: &Path) -> String {
+    fs::read_to_string(path)
+        .ok()
+        .map(|text| json_string_array(text.lines()))
+        .unwrap_or_else(|| "[]".to_string())
+}
+
+fn option_bool_json(value: Option<bool>) -> String {
+    value
+        .map(|value| value.to_string())
+        .unwrap_or_else(|| "null".to_string())
+}
+
+fn github_base_fields(
+    options: &ServerOptions,
+    push_status: &str,
+    remote_head_hash: Option<String>,
+    remote_match: Option<bool>,
+    remote_validation_status: &str,
+) -> String {
     let branch = git_value(options, &["branch", "--show-current"]);
-    let commit = git_value(options, &["rev-parse", "--short", "HEAD"]);
+    let short_commit = git_value(options, &["rev-parse", "--short", "HEAD"]);
+    let local_head = git_value(options, &["rev-parse", "HEAD"]);
     let remote = git_value(options, &["remote", "get-url", "origin"]);
-    let status = git_value(options, &["status", "--short"]).unwrap_or_default();
+    let status_text = git_value(options, &["status", "--short"]).unwrap_or_default();
+    let push_log_path = github_log_path(options, "git_push");
+    let verify_log_path = github_log_path(options, "remote_verify");
     format!(
-        "{{\"remote\":{},\"branch\":{},\"local_commit_hash\":{},\"remote_branch\":{},\"push_status\":\"idle\",\"push_log\":{},\"remote_head_matches_local_head\":null}}",
+        "\"remote\":{},\"branch\":{},\"local_commit_hash\":{},\"local_head_hash\":{},\"remote_branch\":{},\"remote_head_hash\":{},\"remote_head_matches_local_head\":{},\"remote_validation_status\":\"{}\",\"push_status\":\"{}\",\"push_log\":{},\"push_log_path\":{},\"remote_verify_log\":{},\"remote_verify_log_path\":{},\"working_tree_log\":{}",
         option_json(remote.as_deref()),
         option_json(branch.as_deref()),
-        option_json(commit.as_deref()),
+        option_json(short_commit.as_deref()),
+        option_json(local_head.as_deref()),
         option_json(
             branch
                 .as_deref()
                 .map(|value| format!("origin/{value}"))
                 .as_deref()
         ),
-        json_string_array(status.lines())
+        option_json(remote_head_hash.as_deref()),
+        option_bool_json(remote_match),
+        escape_json(remote_validation_status),
+        escape_json(push_status),
+        log_file_json(&push_log_path),
+        option_json(push_log_path.to_str()),
+        log_file_json(&verify_log_path),
+        option_json(verify_log_path.to_str()),
+        json_string_array(status_text.lines())
     )
 }
 
-fn git_action_json(options: &ServerOptions, args: &[&str]) -> String {
-    let (ok, text) = command_text(options, args);
+fn github_status_json(options: &ServerOptions) -> String {
+    let (ok, text) = command_text(options, &["status", "--short"]);
+    let log_path = write_github_log(options, "git_status", "git status --short", ok, &text);
     format!(
-        "{{\"status\":\"{}\",\"command\":\"git {}\",\"log\":{}}}",
+        "{{{},\"status\":\"{}\",\"command\":\"git status --short\",\"log\":{},\"log_path\":{}}}",
+        github_base_fields(options, "idle", None, None, "not_checked"),
         if ok { "completed" } else { "failed" },
-        escape_json(&args.join(" ")),
-        json_string_array(text.lines())
+        json_string_array(text.lines()),
+        option_json(log_path.to_str())
+    )
+}
+
+fn git_action_json(options: &ServerOptions, action: &str, args: &[&str]) -> String {
+    let (ok, text) = command_text(options, args);
+    let command = format!("git {}", args.join(" "));
+    let log_path = write_github_log(options, action, &command, ok, &text);
+    format!(
+        "{{{},\"status\":\"{}\",\"command\":\"{}\",\"log\":{},\"log_path\":{}}}",
+        github_base_fields(
+            options,
+            if ok { "idle" } else { "failed" },
+            None,
+            None,
+            "not_checked"
+        ),
+        if ok { "completed" } else { "failed" },
+        escape_json(&command),
+        json_string_array(text.lines()),
+        option_json(log_path.to_str())
     )
 }
 
@@ -4417,17 +4511,69 @@ fn git_push_json(options: &ServerOptions) -> String {
     let branch =
         git_value(options, &["branch", "--show-current"]).unwrap_or_else(|| "main".to_string());
     let (ok, text) = command_text(options, &["push", "origin", &branch]);
+    let command = format!("git push origin {branch}");
+    let log_path = write_github_log(options, "git_push", &command, ok, &text);
     let cleanup = if ok {
         cleanup_json(options)
     } else {
         "null".to_string()
     };
     format!(
-        "{{\"status\":\"{}\",\"command\":\"git push origin {}\",\"log\":{},\"post_push_cleanup\":{}}}",
+        "{{{},\"status\":\"{}\",\"command\":\"{}\",\"log\":{},\"log_path\":{},\"post_push_cleanup\":{}}}",
+        github_base_fields(
+            options,
+            if ok { "completed" } else { "failed" },
+            None,
+            None,
+            "not_checked_after_push"
+        ),
         if ok { "completed" } else { "failed" },
-        escape_json(&branch),
+        escape_json(&command),
         json_string_array(text.lines()),
+        option_json(log_path.to_str()),
         cleanup
+    )
+}
+
+fn github_verify_json(options: &ServerOptions) -> String {
+    let branch =
+        git_value(options, &["branch", "--show-current"]).unwrap_or_else(|| "main".to_string());
+    let local_head = git_value(options, &["rev-parse", "HEAD"]);
+    let remote_ref = format!("refs/heads/{branch}");
+    let args = ["ls-remote", "origin", remote_ref.as_str()];
+    let (ok, text) = command_text(options, &args);
+    let command = format!("git ls-remote origin {remote_ref}");
+    let log_path = write_github_log(options, "remote_verify", &command, ok, &text);
+    let remote_head = if ok {
+        text.lines()
+            .find_map(|line| line.split_whitespace().next())
+            .map(|hash| hash.to_string())
+    } else {
+        None
+    };
+    let remote_match = match (local_head.as_deref(), remote_head.as_deref()) {
+        (Some(local), Some(remote)) => Some(local == remote),
+        _ => None,
+    };
+    let validation_status = match (ok, remote_match) {
+        (true, Some(true)) => "remote_head_matches_local_head",
+        (true, Some(false)) => "remote_head_differs_from_local_head",
+        (true, None) => "remote_head_unavailable",
+        (false, _) => "remote_check_failed",
+    };
+    format!(
+        "{{{},\"status\":\"{}\",\"command\":\"{}\",\"log\":{},\"log_path\":{}}}",
+        github_base_fields(
+            options,
+            "idle",
+            remote_head,
+            remote_match,
+            validation_status
+        ),
+        if ok { "completed" } else { "failed" },
+        escape_json(&command),
+        json_string_array(text.lines()),
+        option_json(log_path.to_str())
     )
 }
 
@@ -5050,6 +5196,10 @@ mod tests {
         assert!(body.contains("\"push_status\":\"idle\""));
         assert!(body.contains("\"branch\":"));
         assert!(body.contains("\"local_commit_hash\":"));
+        assert!(body.contains("\"local_head_hash\":"));
+        assert!(body.contains("\"remote_validation_status\":\"not_checked\""));
+        assert!(body.contains("\"push_log_path\":"));
+        assert!(body.contains("\"remote_verify_log_path\":"));
     }
 
     fn extract_json_string(json: &str, key: &str) -> String {

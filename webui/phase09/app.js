@@ -1291,35 +1291,30 @@ function diagnostics() {
 
 function githubSync() {
   const github = appState.github || {};
+  const remoteChecked =
+    github.remote_head_matches_local_head !== null && github.remote_head_matches_local_head !== undefined;
+  const remoteVerification = remoteChecked
+    ? `${github.remote_head_matches_local_head} (${github.remote_validation_status || "checked"})`
+    : github.remote_validation_status || "not checked";
   const rows = [
+    [["Git remote", "Git remote"], valueOrDash(github.remote), github.remote ? statusPill("ready") : statusPill("waiting")],
     [["当前 branch", "Current branch"], valueOrDash(github.branch), github.branch ? statusPill("ready") : statusPill("waiting")],
     [["本地 commit hash", "Local commit hash"], valueOrDash(github.local_commit_hash), github.local_commit_hash ? statusPill("ready") : statusPill("waiting")],
+    [["本地 HEAD", "Local HEAD"], valueOrDash(github.local_head_hash), github.local_head_hash ? statusPill("ready") : statusPill("waiting")],
     [["远端 branch", "Remote branch"], valueOrDash(github.remote_branch), github.remote_branch ? statusPill("ready") : statusPill("waiting")],
+    [["远端 HEAD", "Remote HEAD"], valueOrDash(github.remote_head_hash), github.remote_head_hash ? statusPill("ready") : statusPill("idle")],
     [["push 状态", "Push state"], valueOrDash(github.push_status), statusPill(github.push_status === "completed" ? "completed" : "idle")],
+    [["push 日志路径", "Push log path"], valueOrDash(github.push_log_path), github.push_log_path ? statusPill("ready") : statusPill("idle")],
     [["push 日志", "Push log"], valueOrDash(github.push_log), statusPill(github.push_log?.length ? "ready" : "idle")],
-    [["远端验证", "Remote verification"], github.remote_head_matches_local_head === null || github.remote_head_matches_local_head === undefined ? "not checked" : String(github.remote_head_matches_local_head), statusPill(github.remote_head_matches_local_head ? "ready" : "idle")],
+    [["远端验证日志", "Remote verification log"], valueOrDash(github.remote_verify_log_path), github.remote_verify_log_path ? statusPill("ready") : statusPill("idle")],
+    [["远端验证", "Remote verification"], remoteVerification, statusPill(github.remote_head_matches_local_head ? "ready" : "idle")],
+    [["工作区摘要", "Working tree summary"], valueOrDash(github.working_tree_log), statusPill(github.working_tree_log?.length ? "warning" : "ready")],
   ];
   return card(
     [["GitHub 同步", "GitHub Sync"]],
     dataTable(
       [[["字段", "Field"], ["值", "Value"], ["状态", "State"]].map((x) => x)][0],
       rows,
-      [["尚未读取 Git 状态。", "Git state has not been read yet."]]
-    ) +
-      buttonRow([["git status", "", null], ["git add", "", null], ["git commit", "", null], ["git push", "primary", null], [["验证 remote HEAD", "Verify remote HEAD"], "", null]])
-  );
-  return card(
-    [["GitHub 同步", "GitHub Sync"]],
-    dataTable(
-      [[["字段", "Field"], ["值", "Value"], ["状态", "State"]].map((x) => x)][0],
-      [
-        [[["当前 branch", "Current branch"], ["", ""], statusPill("waiting")]],
-        [[["本地 commit hash", "Local commit hash"], ["", ""], statusPill("waiting")]],
-        [[["远端 branch", "Remote branch"], ["", ""], statusPill("waiting")]],
-        [[["push 状态", "Push state"], ["", ""], statusPill("idle")]],
-        [[["push 日志", "Push log"], ["", ""], statusPill("idle")]],
-        [[["远端验证", "Remote verification"], ["", ""], statusPill("idle")]],
-      ].map((row) => row[0]),
       [["尚未读取 Git 状态。", "Git state has not been read yet."]]
     ) +
       buttonRow([["git status", "", null], ["git add", "", null], ["git commit", "", null], ["git push", "primary", null], [["验证 remote HEAD", "Verify remote HEAD"], "", null]])
