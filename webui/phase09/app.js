@@ -194,6 +194,9 @@ const apiRoutes = [
   "GET /api/runs/{id}/logs",
   "GET /api/runs/{id}/candidates",
   "GET /api/runs/{id}/evidence",
+  "GET /api/runs/{id}/genome-context",
+  "GET /api/runs/{id}/structure",
+  "GET /api/runs/{id}/md-summary",
   "GET /api/databases",
   "GET /api/diagnostics",
   "GET /api/guides",
@@ -273,6 +276,9 @@ let appState = {
   runArtifacts: null,
   candidates: null,
   evidence: null,
+  genomeContext: null,
+  structureArtifacts: null,
+  mdSummary: null,
   projectRuns: [],
   selectedCandidateId: null,
   inputDraft: { inputs: [], files: [] },
@@ -694,6 +700,14 @@ function artifactRows(tokens) {
     .map((item) => [item.artifact_type || "", item.path || "", item.exists ? statusPill("ready") : statusPill("waiting")]);
 }
 
+function artifactObjectRows(items) {
+  return (items || []).map((item) => [
+    item.artifact_type || "",
+    item.path || "",
+    item.exists ? statusPill("ready") : statusPill("waiting"),
+  ]);
+}
+
 function currentRunNotice() {
   return appState.selectedRun
     ? `run_id=${appState.selectedRun.run_id}`
@@ -956,11 +970,13 @@ function candidateDetail() {
 }
 
 function genomeContext() {
-  const rows = candidateRows();
+  const payload = appState.genomeContext || {};
+  const rows = payload.genome_context?.length ? payload.genome_context : candidateRows();
   if (rows.length) {
     return card(
       [["Genome/ORF Context Viewer", "Genome/ORF Context Viewer"]],
       `<p class="mono">${currentRunNotice()}</p>` +
+        (payload.source_path ? `<p class="mono">source=${payload.source_path}</p>` : "") +
         dataTable(
           [[["候选", "Candidate"], ["基因", "Gene"], ["ORF", "ORF"], ["坐标", "Coordinates"], ["上下文", "Context"], ["阅读框", "Frame"], ["变异", "Variant"]].map((x) => x)][0],
           rows.map((row) => [
@@ -972,7 +988,7 @@ function genomeContext() {
             valueOrDash(firstRowValue(row, ["reading_frame", "frame", "orf_frame", "strand"])),
             valueOrDash(firstRowValue(row, ["variant_id", "variant", "allele"])),
           ]),
-          [["当前 run 尚未生成 Genome/ORF context 行。", "The selected run has not generated Genome/ORF context rows yet."]]
+          payload.message || [["当前 run 尚未生成 Genome/ORF context 行。", "The selected run has not generated Genome/ORF context rows yet."]]
         )
     );
   }
@@ -997,9 +1013,14 @@ function genomeContext() {
 }
 
 function structureViewer() {
-  const rows = artifactRows(["structure", "patch", "docking", "pose", ".pdb", ".cif", ".mmcif"]);
-  const candidate = selectedCandidate();
-  const evidenceRows = evidenceRowsForTokens(["structure", "patch", "docking", "pose", "residue"]);
+  const payload = appState.structureArtifacts || {};
+  const rows = payload.artifacts?.length
+    ? artifactObjectRows(payload.artifacts)
+    : artifactRows(["structure", "patch", "docking", "pose", ".pdb", ".cif", ".mmcif"]);
+  const candidate = selectedCandidate() || (payload.structure_rows || [])[0] || null;
+  const evidenceRows = payload.evidence?.length
+    ? payload.evidence
+    : evidenceRowsForTokens(["structure", "patch", "docking", "pose", "residue"]);
   return [
     `<section class="panel"><div class="panel-header"><h2>${pick(["结构视图", "Structure View"])}</h2>${statusPill(rows.length ? "ready" : "idle")}</div>
       <div class="structure-stage" aria-label="${pick(["结构产物查看区域", "Structure artifact viewer"])}">
@@ -1007,13 +1028,14 @@ function structureViewer() {
         <span>${rows.length ? pick(["已发现结构相关产物", "Structure-related artifacts detected"]) : pick(["等待真实结构产物", "Waiting for computed structure artifact"])}</span>
       </div>
       <p>${pick(["页面读取当前 run 的结构、patch、docking pose 和坐标产物索引。", "This page reads structure, patch, docking pose, and coordinate artifacts from the selected run index."])}</p>
+      ${payload.source_path ? `<p class="mono">source=${payload.source_path}</p>` : ""}
     </section>`,
     card(
       [["结构与 Patch 产物", "Structure and Patch Artifacts"]],
       dataTable(
         [[["产物类型", "Artifact type"], ["路径", "Path"], ["状态", "State"]].map((x) => x)][0],
         rows,
-        [["当前 run 尚未生成结构、patch 或 docking 产物。", "The selected run has not generated structure, patch, or docking artifacts yet."]]
+        payload.message || [["当前 run 尚未生成结构、patch 或 docking 产物。", "The selected run has not generated structure, patch, or docking artifacts yet."]]
       )
     ),
     card(
@@ -1044,16 +1066,22 @@ function structureViewer() {
 }
 
 function mdSummary() {
-  const rows = artifactRows(["md_summary", "short_md", "molecular_dynamics", "rmsd", "rmsf", "drift", "occupancy", "trajectory", "hbond", "contact"]);
-  const candidate = selectedCandidate();
-  const evidenceRows = evidenceRowsForTokens(["md_stability", "md_score", "rmsd", "rmsf", "drift", "occupancy", "trajectory", "hbond", "contact"]);
+  const payload = appState.mdSummary || {};
+  const rows = payload.artifacts?.length
+    ? artifactObjectRows(payload.artifacts)
+    : artifactRows(["md_summary", "short_md", "molecular_dynamics", "rmsd", "rmsf", "drift", "occupancy", "trajectory", "hbond", "contact"]);
+  const candidate = selectedCandidate() || (payload.md_rows || [])[0] || null;
+  const evidenceRows = payload.evidence?.length
+    ? payload.evidence
+    : evidenceRowsForTokens(["md_stability", "md_score", "rmsd", "rmsf", "drift", "occupancy", "trajectory", "hbond", "contact"]);
   return [
     card(
       [["MD 摘要产物", "MD Summary Artifacts"]],
+      (payload.source_path ? `<p class="mono">source=${payload.source_path}</p>` : "") +
       dataTable(
         [[["产物类型", "Artifact type"], ["路径", "Path"], ["状态", "State"]].map((x) => x)][0],
         rows,
-        [["当前 run 尚未生成 RMSD、RMSF、occupancy 或 score decomposition 产物。", "The selected run has not generated RMSD, RMSF, occupancy, or score decomposition artifacts yet."]]
+        payload.message || [["当前 run 尚未生成 RMSD、RMSF、occupancy 或 score decomposition 产物。", "The selected run has not generated RMSD, RMSF, occupancy, or score decomposition artifacts yet."]]
       )
     ),
     card(
@@ -1637,6 +1665,9 @@ async function refreshRunDetails(run = appState.selectedRun) {
     appState.runArtifacts = null;
     appState.candidates = null;
     appState.evidence = null;
+    appState.genomeContext = null;
+    appState.structureArtifacts = null;
+    appState.mdSummary = null;
     appState.selectedCandidateId = null;
     return;
   }
@@ -1665,6 +1696,21 @@ async function refreshRunDetails(run = appState.selectedRun) {
     appState.evidence = await apiRequest(`/api/runs/${run.run_id}/evidence`);
   } catch (_error) {
     appState.evidence = null;
+  }
+  try {
+    appState.genomeContext = await apiRequest(`/api/runs/${run.run_id}/genome-context`);
+  } catch (_error) {
+    appState.genomeContext = null;
+  }
+  try {
+    appState.structureArtifacts = await apiRequest(`/api/runs/${run.run_id}/structure`);
+  } catch (_error) {
+    appState.structureArtifacts = null;
+  }
+  try {
+    appState.mdSummary = await apiRequest(`/api/runs/${run.run_id}/md-summary`);
+  } catch (_error) {
+    appState.mdSummary = null;
   }
 }
 
@@ -1708,6 +1754,9 @@ async function handleAction(action, dataset = {}) {
       appState.runArtifacts = null;
       appState.candidates = null;
       appState.evidence = null;
+      appState.genomeContext = null;
+      appState.structureArtifacts = null;
+      appState.mdSummary = null;
       await refreshProjectRuns();
       setMessage("", "项目已打开。", "Project opened.");
     } else if (action === "select-run") {
@@ -1725,6 +1774,9 @@ async function handleAction(action, dataset = {}) {
       const payload = await apiRequest(path, { method: "POST" });
       appState.selectedProject = payload.project || null;
       appState.selectedRun = null;
+      appState.genomeContext = null;
+      appState.structureArtifacts = null;
+      appState.mdSummary = null;
       await refreshProjects();
       setMessage("", "项目已写入本地 manifest。", "Project manifest was written locally.");
     } else if (action === "open-project") {
@@ -1741,6 +1793,9 @@ async function handleAction(action, dataset = {}) {
       await apiRequest(`/api/projects/${project.project_id}`, { method: "DELETE" });
       appState.selectedProject = null;
       appState.selectedRun = null;
+      appState.genomeContext = null;
+      appState.structureArtifacts = null;
+      appState.mdSummary = null;
       await refreshProjects();
       setMessage("warn", "项目已从本地 artifact 项目目录删除。", "Project was deleted from the local artifact project directory.");
     } else if (action === "clean-project") {

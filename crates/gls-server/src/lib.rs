@@ -36,6 +36,17 @@ struct GuideSpec {
     coverage: &'static [&'static str],
 }
 
+#[derive(Clone, Debug)]
+struct RunDomainSpec<'a> {
+    rows_key: &'a str,
+    schema: &'a [&'a str],
+    row_markers: &'a [&'a str],
+    artifact_tokens: &'a [&'a str],
+    evidence_tokens: &'a [&'a str],
+    loaded_message: &'a str,
+    empty_message: &'a str,
+}
+
 impl GateMetric {
     fn new(id: &str, value: impl ToString, pass: bool) -> Self {
         Self {
@@ -301,6 +312,12 @@ fn route_run_resource(
         candidates_json(options, &run_id)
     } else if path.ends_with("/evidence") && method == "GET" {
         evidence_json(options, &run_id)
+    } else if path.ends_with("/genome-context") && method == "GET" {
+        genome_context_json(options, &run_id)
+    } else if path.ends_with("/structure") && method == "GET" {
+        structure_artifacts_json(options, &run_id)
+    } else if path.ends_with("/md-summary") && method == "GET" {
+        md_summary_json(options, &run_id)
     } else if method == "GET" {
         run_json(options, &run_id, "idle")
     } else {
@@ -2791,6 +2808,214 @@ fn evidence_json(options: &ServerOptions, run_id: &str) -> String {
     )
 }
 
+fn genome_context_json(options: &ServerOptions, run_id: &str) -> String {
+    let schema = [
+        "candidate_id",
+        "gene_name",
+        "orf_id",
+        "genomic_coordinates",
+        "context_class",
+        "reading_frame",
+        "strand",
+        "variant_id",
+    ];
+    run_domain_json(
+        options,
+        run_id,
+        RunDomainSpec {
+            rows_key: "genome_context",
+            schema: &schema,
+            row_markers: &["candidate", "ranking", "genome", "orf", "context"],
+            artifact_tokens: &[
+                "genome",
+                "orf",
+                "cds",
+                "utr",
+                "lncrna",
+                "intron",
+                "antisense",
+                "variant",
+            ],
+            evidence_tokens: &["genome", "orf", "context", "variant"],
+            loaded_message: "Genome/ORF context rows are read from the selected run artifacts.",
+            empty_message: "Genome/ORF context rows are available after candidate generation.",
+        },
+    )
+}
+
+fn structure_artifacts_json(options: &ServerOptions, run_id: &str) -> String {
+    let schema = [
+        "candidate_id",
+        "structure_score",
+        "structure_evidence",
+        "binding_patch",
+        "patch_evidence",
+        "key_residues",
+        "docking_score",
+        "docking_pose",
+        "ligand_position",
+        "interaction_residues",
+    ];
+    run_domain_json(
+        options,
+        run_id,
+        RunDomainSpec {
+            rows_key: "structure_rows",
+            schema: &schema,
+            row_markers: &["structure", "patch", "docking", "pose"],
+            artifact_tokens: &[
+                "structure",
+                "patch",
+                "docking",
+                "pose",
+                ".pdb",
+                ".cif",
+                ".mmcif",
+            ],
+            evidence_tokens: &["structure", "patch", "docking", "pose", "residue"],
+            loaded_message: "Structure, patch, docking, and interaction rows are read from the selected run artifacts.",
+            empty_message: "Structure, patch, docking, and interaction rows are available after structure evidence generation.",
+        },
+    )
+}
+
+fn md_summary_json(options: &ServerOptions, run_id: &str) -> String {
+    let schema = [
+        "candidate_id",
+        "rmsd",
+        "rmsf",
+        "ligand_drift",
+        "hydrogen_bond_occupancy",
+        "contact_occupancy",
+        "interaction_persistence",
+        "md_risk_flags",
+        "md_score_decomposition",
+        "md_stability_score",
+    ];
+    run_domain_json(
+        options,
+        run_id,
+        RunDomainSpec {
+            rows_key: "md_rows",
+            schema: &schema,
+            row_markers: &["md", "rmsd", "rmsf", "drift", "occupancy", "trajectory"],
+            artifact_tokens: &[
+                "md_summary",
+                "short_md",
+                "molecular_dynamics",
+                "rmsd",
+                "rmsf",
+                "drift",
+                "occupancy",
+                "trajectory",
+                "hbond",
+                "contact",
+            ],
+            evidence_tokens: &[
+                "md_stability",
+                "md_score",
+                "rmsd",
+                "rmsf",
+                "drift",
+                "occupancy",
+                "trajectory",
+                "hbond",
+                "contact",
+            ],
+            loaded_message: "MD summary rows are read from the selected run artifacts.",
+            empty_message: "MD summary rows are available after short-MD analysis artifacts are generated.",
+        },
+    )
+}
+
+fn run_domain_json(options: &ServerOptions, run_id: &str, spec: RunDomainSpec<'_>) -> String {
+    let Some(run_dir) = run_dir_for(options, run_id) else {
+        return format!(
+            "{{\"run_id\":\"{}\",\"source_path\":null,\"schema\":{},\"{}\":[],\"artifacts\":[],\"evidence\":[],\"artifact_backed\":false,\"message\":\"{}\"}}",
+            escape_json(run_id),
+            json_string_array(spec.schema.iter().copied()),
+            escape_json(spec.rows_key),
+            escape_json(spec.empty_message)
+        );
+    };
+    let (source_path, rows) = read_domain_rows(&run_dir, spec.schema, spec.row_markers);
+    let artifacts = run_artifacts_for_tokens(&run_dir, spec.artifact_tokens);
+    let evidence = run_evidence_for_tokens(&run_dir, spec.evidence_tokens);
+    let artifact_backed = source_path.is_some() || !artifacts.is_empty() || !evidence.is_empty();
+    let message = if artifact_backed {
+        spec.loaded_message
+    } else {
+        spec.empty_message
+    };
+    format!(
+        "{{\"run_id\":\"{}\",\"source_path\":{},\"schema\":{},\"{}\":{},\"row_count\":{},\"artifacts\":{},\"evidence\":{},\"artifact_backed\":{},\"message\":\"{}\"}}",
+        escape_json(run_id),
+        option_json(source_path.as_deref()),
+        json_string_array(spec.schema.iter().copied()),
+        escape_json(spec.rows_key),
+        Value::Array(rows.clone()),
+        rows.len(),
+        Value::Array(artifacts),
+        Value::Array(evidence),
+        artifact_backed,
+        escape_json(message)
+    )
+}
+
+fn read_domain_rows(
+    run_dir: &Path,
+    schema: &[&str],
+    markers: &[&str],
+) -> (Option<String>, Vec<Value>) {
+    read_result_table(run_dir, schema, markers)
+        .and_then(|(path, rows_json, _)| {
+            serde_json::from_str::<Value>(&rows_json)
+                .ok()
+                .and_then(|value| value.as_array().cloned())
+                .map(|rows| (Some(path.display().to_string()), rows))
+        })
+        .unwrap_or_else(|| (None, Vec::new()))
+}
+
+fn run_artifacts_for_tokens(run_dir: &Path, tokens: &[&str]) -> Vec<Value> {
+    let index = run_artifact_index_json(run_dir);
+    serde_json::from_str::<Value>(&index)
+        .ok()
+        .and_then(|value| value.get("items").cloned())
+        .and_then(|items| items.as_array().cloned())
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|item| value_contains_any(item, tokens))
+        .collect()
+}
+
+fn run_evidence_for_tokens(run_dir: &Path, tokens: &[&str]) -> Vec<Value> {
+    let schema = [
+        "report_item",
+        "source_file",
+        "manifest",
+        "schema",
+        "tool_version",
+        "artifact_hash",
+        "validation_state",
+        "report_section",
+    ];
+    read_result_table(run_dir, &schema, &["evidence", "ledger"])
+        .and_then(|(_, rows_json, _)| serde_json::from_str::<Value>(&rows_json).ok())
+        .and_then(|value| value.as_array().cloned())
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|item| value_contains_any(item, tokens))
+        .collect()
+}
+
+fn value_contains_any(value: &Value, tokens: &[&str]) -> bool {
+    let text = value.to_string().to_lowercase();
+    tokens
+        .iter()
+        .any(|token| text.contains(&token.to_lowercase()))
+}
+
 fn candidate_detail_json(options: &ServerOptions, candidate_id: &str) -> String {
     let candidate_schema = [
         "rank",
@@ -4415,6 +4640,16 @@ mod tests {
             "report_item\tsource_file\tmanifest\tschema\ttool_version\tartifact_hash\tvalidation_state\treport_section\nfinal_priority_score\tcandidate_ranking.tsv\trun_manifest.json\tcandidate.schema.json\tgls-cli 0.9.1\tsha256:abc\tvalidated\tcandidate ranking\n",
         )
         .unwrap();
+        write_text(
+            &run_dir.join("structure_patch_summary.tsv"),
+            "candidate_id\tstructure_score\tstructure_evidence\tbinding_patch\tpatch_evidence\tkey_residues\tdocking_score\tdocking_pose\tligand_position\tinteraction_residues\nGLS-ORF-001\t0.50\tstructure_manifest.tsv\tpatch-001\tsha256:patch\tA:10,A:12\t-7.1\tpose_001.pdb\tchain A near residue 10\tA:10,A:12\n",
+        )
+        .unwrap();
+        write_text(
+            &run_dir.join("md_summary.tsv"),
+            "candidate_id\trmsd\trmsf\tligand_drift\thydrogen_bond_occupancy\tcontact_occupancy\tinteraction_persistence\tmd_risk_flags\tmd_score_decomposition\tmd_stability_score\nGLS-ORF-001\t1.2\t0.4\t0.8\t0.62\t0.71\t0.69\tlow\trmsd=0.3;contact=0.4\t0.90\n",
+        )
+        .unwrap();
         let (_, _, candidates) = route_http(
             "GET",
             &format!("/api/runs/{run_id}/candidates"),
@@ -4431,6 +4666,30 @@ mod tests {
             route_http("GET", "/api/candidates/GLS-ORF-001", &options, "");
         assert!(candidate_detail.contains("\"selected\":true"));
         assert!(candidate_detail.contains("\"candidate_id\":\"GLS-ORF-001\""));
+        let (_, _, genome_context) = route_http(
+            "GET",
+            &format!("/api/runs/{run_id}/genome-context"),
+            &options,
+            "",
+        );
+        assert!(genome_context.contains("\"genome_context\":["));
+        assert!(genome_context.contains("\"artifact_backed\":true"));
+        let (_, _, structure) = route_http(
+            "GET",
+            &format!("/api/runs/{run_id}/structure"),
+            &options,
+            "",
+        );
+        assert!(structure.contains("\"structure_rows\":["));
+        assert!(structure.contains("\"binding_patch\":\"patch-001\""));
+        let (_, _, md_summary) = route_http(
+            "GET",
+            &format!("/api/runs/{run_id}/md-summary"),
+            &options,
+            "",
+        );
+        assert!(md_summary.contains("\"md_rows\":["));
+        assert!(md_summary.contains("\"md_stability_score\":\"0.90\""));
 
         let (_, _, diagnostics) = route_http("GET", "/api/diagnostics", &options, "");
         assert!(diagnostics.contains("\"check_id\":\"rust_binary\""));
