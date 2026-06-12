@@ -1,4 +1,0 @@
-﻿dependency	purpose	license_status	mandatory	status
-Open Web Platform	UI runtime	open_standard	true	PASS
-Rust standard library	HTTP server	Apache-2.0/MIT via Rust distribution	true	PASS
-Codex in-app Browser	PNG capture test harness	test_tool_not_runtime_dependency	false	PASS

@@ -1,310 +1,104 @@
-# GenoLigand Local WebUI
+# GenoLigand 0.9.1
 
-GenoLigand is a local, single-user scientific workflow app for ligand-aware target discovery research. The current user-facing entry point is the Phase 0.9 WebUI beta. It runs on your own machine, serves a browser interface from `gls-server`, and keeps the scientific chain behind Rust-owned `gls-cli` commands.
+GenoLigand 是本地运行的配体感知靶点发现科研工作台。0.9.1 提供正式 WebUI：用户在浏览器中创建项目、配置输入、管理数据库、启动本地工作流、查看候选与证据、导出报告、运行环境诊断，并在需要时同步到 GitHub。计算后端由本机 `gls-server` 提供服务，科学执行入口由 `gls-cli` 统一调度。
 
-GenoLigand is a method-validation and prioritization tool. It does not claim experimental binding, biological activity, mechanism, or clinical relevance.
+GenoLigand 输出的是候选优先级和证据整理，不直接声称实验结合、生物活性、机制或临床相关性。
 
-## What You Can Do
+## 启动本地 WebUI
 
-- Create or open a local GenoLigand project.
-- Enter small-molecule, peptide, protein-ligand, or existing-complex inputs.
-- Select organism/genome, database profile, search scope, and run profile.
-- Run preflight checks before starting a job.
-- Monitor a run with queue state, timeline, logs, and artifact status.
-- Review ranked candidates, structure/patch summaries, MD summaries, and evidence rows.
-- Export reports and inspect validation artifacts.
-- Push validated project state to GitHub when you explicitly choose to do so.
-
-## Requirements
-
-Install these before running the local WebUI:
-
-- Windows 11 with PowerShell, or Linux.
-- Rust toolchain with `cargo` in PATH.
-- Python 3.11 or newer in PATH.
-- For strict scientific validation on this machine: WSL2 project backend `GenoLigandPhase08` with CUDA/OpenMM evidence.
-
-This repository already contains the Phase 0.9 acceptance artifact used by the local WebUI:
-
-```text
-acceptance_artifacts_phase_0_9_webui_local_beta_strict/
-```
-
-## Start The WebUI
-
-From the repository root:
+在仓库根目录执行：
 
 ```powershell
 cd D:\Project\rust\GenoLigand
 python scripts\phase09\start_phase_0_9_webui.py
 ```
 
-The script does four things:
-
-1. Builds `gls-server`.
-2. Starts the local server on `127.0.0.1:19090`.
-3. Checks `/api/health`.
-4. Opens your default browser.
-
-If the browser does not open automatically, open:
+脚本会构建并启动 `gls-server`，默认监听：
 
 ```text
 http://127.0.0.1:19090/
 ```
 
-Keep the terminal open while using the WebUI. Press `Ctrl+C` in that terminal to stop the local server.
-
-## Start Without Rebuilding
-
-If `target\debug\gls-server.exe` already exists:
+如需使用现有二进制：
 
 ```powershell
 python scripts\phase09\start_phase_0_9_webui.py --no-build
 ```
 
-Use a different port if `19090` is busy:
+如端口被占用：
 
 ```powershell
 python scripts\phase09\start_phase_0_9_webui.py --port 19190
 ```
 
-Then open:
+保持启动终端开启即可使用 WebUI，按 `Ctrl+C` 停止服务。
+
+## WebUI 功能
+
+- 项目管理：创建、打开、复制、删除、清理研究项目，继续上次运行并查看历史运行摘要。
+- 输入向导：配置项目基本信息、分子类型、物种、数据库、搜索范围、运行模式、预检查和最终启动。
+- 小分子输入：支持 SMILES、SDF、MOL2、PDB、化合物名称和 CAS 号。
+- 多肽输入：支持单字母氨基酸序列和 FASTA，并提供 IKVAV、YIGSR、RGD 快速填入。
+- 蛋白质配体输入：支持 FASTA、PDB/mmCIF、已有预测结构和链选择。
+- 已有复合物输入：支持 receptor-ligand complex，并可指定配体链、小分子 residue name 或结合区域。
+- 物种与基因组：支持预设物种和自定义 genome FASTA、GTF/GFF3、transcript FASTA、可选 VCF。
+- 数据库管理：查看 genome、annotation、transcript、BioLiP2、UniProt、ChEMBL/BindingDB 和结构缓存的路径、版本、hash、索引、缺失项、空间和修复动作。
+- 运行模式：快速环境自检、标准靶点筛选、结构证据增强筛选、物理中筛完整运行。
+- 预检查：覆盖分子格式、序列合法性、结构文件、数据库、基因组索引、磁盘、写入权限、OpenMM、CUDA、Nextflow、Git remote 和 GitHub 权限。
+- 运行监控：显示阶段、命令、Nextflow run ID、日志尾部、CPU/GPU/显存/内存/磁盘占用、输出目录、失败原因和恢复状态。
+- 结果查看：候选排序、候选详情、Genome/ORF context、结构与 patch、MD 摘要、evidence ledger。
+- 报告导出：HTML、Markdown、CSV/TSV、JSON、artifact bundle、run manifest、tool version manifest、diagnostics report、GitHub push report。
+- 环境诊断：覆盖 WSL2、Linux、Rust binary、gls-cli、gls-server、Nextflow、Java、Python worker、OpenMM、CUDA、NVIDIA 设备、数据库路径、写入权限、磁盘、Git remote、GitHub 推送权限和示例项目模板。
+- GitHub 同步：显示 branch、commit hash、remote branch、push 状态、push 日志和 remote HEAD 验证。
+
+## 页面语言和界面配色
+
+WebUI 固定使用暗色界面。右上角提供 `中文 / EN` 按钮，所有主要页面都支持中文和 English。
+
+## 示例项目模板
+
+WebUI 提供示例项目模板，用于验证安装、数据库、GPU/OpenMM、Nextflow 恢复、WebUI 流程、输入、预检查、运行、监控、结果浏览、报告导出和诊断是否可用。模板不包含预计算候选、不包含实验结论，也不会替代用户自己的研究项目。
+
+## 安装指南
+
+更完整的使用说明位于：
 
 ```text
-http://127.0.0.1:19190/
+docs/local_webui_user_guide.md
+docs/windows_wsl2_installation_guide.md
+docs/linux_server_installation_guide.md
 ```
 
-## WebUI Walkthrough
+## 本地服务接口
 
-### 1. Dashboard
-
-Open the Dashboard first. Confirm these status blocks are visible:
-
-- `gls-server`
-- `Rust ownership`
-- `OpenMM CUDA`
-- `Phase 0.9 regression`
-
-The Dashboard also shows Active Run, Task Queue, Agent / Run Timeline, Runtime Logs, Run Details, API Contract, and Artifact Tree.
-
-### 2. Project
-
-Open **Project** to create a workspace. Fill or review:
-
-- Project name
-- Species
-- Remote
-- Claim boundary
-
-The default claim boundary is method-validation-only.
-
-### 3. Input Wizard
-
-Open **Input Wizard** and go through each step:
-
-- Project Basics
-- Molecule Type
-- Small Molecule
-- Peptide
-- Protein Ligand
-- Existing Complex
-- Species and Genome
-- Search Scope
-- Database Profile
-- Run Profile
-- Preflight Check
-- Review and Start
-
-Advanced scientific parameters should stay explicit and visible through preflight, not hidden in final reports.
-
-### 4. Run Monitor
-
-Open **Run Monitor** to check:
-
-- Queue state
-- Stage owner
-- Logs
-- Resume state
-- Artifact path
-
-The scientific workflow must enter through `gls-cli`; the WebUI must not call Python scientific workers directly.
-
-### 5. Candidates And Evidence
-
-Use these pages to inspect outputs:
-
-- **Candidates** for ranked hypotheses.
-- **Candidate Detail** for score decomposition.
-- **Genome and ORF Context** for genomic evidence.
-- **Structure and Patch Viewer** for structure/patch evidence.
-- **Short-MD Summary** for MD stability summaries.
-- **Evidence Ledger** for claim-to-evidence mapping.
-
-Treat all candidates as prioritization hypotheses until independently validated.
-
-### 6. Databases And Diagnostics
-
-Use **Databases** to inspect protected database and warehouse manifests.
-
-Use **Diagnostics** to check:
-
-- WSL2 backend
-- CUDA/OpenMM
-- Rust ownership
-- Nextflow
-- Database profile
-- GitHub remote
-
-### 7. Export And GitHub Sync
-
-Open **Report Export** to locate generated reports and machine-readable validation files.
-
-Open **GitHub Sync** only when you intend to push the current repository state. Remote push should remain an explicit user action.
-
-## Verify The Local Server
-
-Health endpoint:
-
-```powershell
-(Invoke-WebRequest -Uri http://127.0.0.1:19090/api/health -UseBasicParsing).Content
-```
-
-Expected response:
-
-```json
-{"status":"PASS","service":"gls-server","acceptance_mode":"phase_0_9_webui_local_beta_strict"}
-```
-
-Master validation file:
-
-```powershell
-Get-Content acceptance_artifacts_phase_0_9_webui_local_beta_strict\metrics\master_validation_phase_0_9.json -First 8
-```
-
-Expected values:
+常用本地接口：
 
 ```text
-final_verdict: PASS
-master_validation_p0_all_pass: true
-failed_gate_count: 0
+GET  /api/health
+GET  /api/version
+GET  /api/projects
+POST /api/projects
+GET  /api/databases
+GET  /api/diagnostics
+GET  /api/github/status
 ```
 
-## Run Full Phase 0.9 Acceptance
+健康接口返回 `ready` 表示本地服务已可响应浏览器请求。
 
-Use this when you need to regenerate screenshots, API checks, WebSocket checks, Nextflow first/resume evidence, and the acceptance report:
+## 停止服务
 
-```powershell
-python scripts\phase09\run_phase_0_9_webui_local_beta_strict_acceptance.py
-```
-
-Important outputs:
-
-```text
-acceptance_artifacts_phase_0_9_webui_local_beta_strict\acceptance_report_phase_0_9.md
-acceptance_artifacts_phase_0_9_webui_local_beta_strict\metrics\master_validation_phase_0_9.json
-acceptance_artifacts_phase_0_9_webui_local_beta_strict\ui\screenshots\final\
-acceptance_artifacts_phase_0_9_webui_local_beta_strict\server\api_contract_validation.tsv
-acceptance_artifacts_phase_0_9_webui_local_beta_strict\server\websocket_validation.tsv
-```
-
-## Developer Checks
-
-Before committing changes:
-
-```powershell
-cargo fmt --check
-cargo clippy --all-targets --all-features -- -D warnings
-cargo test --workspace
-python -m compileall scripts\phase09 scripts\validation\check_phase_0_9_master.py
-```
-
-If Windows denies access to Cargo or Git lock files, rerun the same command from an elevated shell. Do not treat that permission failure as a code regression until it reproduces with adequate permissions.
-
-## Stop The WebUI
-
-If you started with the Python launcher, press `Ctrl+C`.
-
-If a server is still running, find and stop it:
+在启动终端按 `Ctrl+C`。如需手动查找进程：
 
 ```powershell
 Get-Process gls-server
+```
+
+停止指定进程：
+
+```powershell
 Stop-Process -Name gls-server
 ```
 
-## Clean Local Runtime Files
+## 许可证
 
-These files are local runtime state and can be removed when the server is stopped:
-
-```powershell
-Remove-Item -Recurse -Force outputs\phase_0_9 -ErrorAction SilentlyContinue
-Remove-Item -Recurse -Force .nextflow,work -ErrorAction SilentlyContinue
-Remove-Item -Force .nextflow.log* -ErrorAction SilentlyContinue
-```
-
-Do not delete:
-
-```text
-acceptance_artifacts_phase_0_9_webui_local_beta_strict\
-configs\
-crates\
-scripts\
-webui\
-workflows\
-```
-
-These are source, configuration, or required validation artifacts.
-
-## Troubleshooting
-
-### Port 19090 Is Busy
-
-Start on a different port:
-
-```powershell
-python scripts\phase09\start_phase_0_9_webui.py --port 19190
-```
-
-### Browser Did Not Open
-
-Open the URL manually:
-
-```text
-http://127.0.0.1:19090/
-```
-
-### Health Check Fails
-
-Check whether the server process exists:
-
-```powershell
-Get-Process gls-server
-```
-
-Then inspect runtime logs:
-
-```powershell
-Get-Content outputs\phase_0_9\runtime\gls-server.stderr.log -Tail 80
-```
-
-### Nextflow Fails On Windows With `Unknown signal: HUP`
-
-Run Nextflow inside the project WSL2 backend. The Phase 0.9 acceptance runner already does this by using `GenoLigandPhase08` and the D-drive Nextflow distribution.
-
-### UI Looks Broken Or Text Overlaps
-
-Regenerate the Phase 0.9 screenshots and visual audit:
-
-```powershell
-python scripts\phase09\run_phase_0_9_webui_local_beta_strict_acceptance.py --skip-nextflow
-```
-
-Then inspect:
-
-```text
-acceptance_artifacts_phase_0_9_webui_local_beta_strict\ui\screenshots\final\
-acceptance_artifacts_phase_0_9_webui_local_beta_strict\ui\visual_audit\final_visual_audit_report.md
-```
-
-## License
-
-GenoLigand is distributed under the project EULA in `EULA.txt`.
+GenoLigand 按 `EULA.txt` 中的项目许可证分发。

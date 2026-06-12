@@ -1,9 +1,0 @@
-{
-  "schema_version": "phase_0_8_5",
-  "acceptance_mode": "phase_0_8_5_integrated_chain_rust_cleanup_strict",
-  "job_id": "openmm_smoke",
-  "worker": "openmm",
-  "operation": "smoke",
-  "inputs": {"example_count": 3},
-  "rust_owned_decision_logic": true
-}

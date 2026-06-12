@@ -1,4 +1,0 @@
-schema_path	referenced_by	validation_status
-schemas/worker_job.phase_0_8_5.schema.json	configs/tool_adapter_registry.phase_0_8_5.yml	PASS
-schemas/worker_result.phase_0_8_5.schema.json	configs/tool_adapter_registry.phase_0_8_5.yml	PASS
-schemas/md_score.phase_0_8_5.schema.json	e2e/score_decompositions/*.tsv	PASS

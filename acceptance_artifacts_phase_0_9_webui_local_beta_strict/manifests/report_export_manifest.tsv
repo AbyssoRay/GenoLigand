@@ -1,6 +1,0 @@
-export_type	file	status
-markdown	acceptance_report_phase_0_9.md	PASS
-html	phase_0_9_local_beta_report.html	PASS
-candidate_tsv	candidate_table.tsv	PASS
-json	master_validation_phase_0_9.json	PASS
-artifact_bundle	artifact_manifest.tsv	PASS

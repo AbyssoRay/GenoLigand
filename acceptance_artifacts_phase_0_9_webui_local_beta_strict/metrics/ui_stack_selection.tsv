@@ -1,6 +1,0 @@
-﻿category	selection	license	status
-framework	Open Web Platform	W3C/WHATWG standards	PASS
-server	Rust std TcpListener	Rust standard library	PASS
-styles	CSS Grid/Flexbox	open standard	PASS
-screenshots	Codex in-app Browser screenshot harness	test-only local browser automation; not bundled runtime dependency	PASS
-structure_viewer	CSS/SVG lightweight viewer	open standard	PASS

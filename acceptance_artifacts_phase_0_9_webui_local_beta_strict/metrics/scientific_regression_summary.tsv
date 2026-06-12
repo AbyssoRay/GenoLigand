@@ -1,7 +1,0 @@
-gate	value	status
-phase_0_8_5_regression_pass	True	PASS
-phase_0_7_1_regression_pass	True	PASS
-phase_0_8_3_regression_pass	True	PASS
-phase_0_8_4_openmm_regression_pass	True	PASS
-openmm_cuda_status	PASS	PASS
-compact_regression_pass	True	PASS

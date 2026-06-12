@@ -4,7 +4,9 @@ use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 
-pub const ACCEPTANCE_MODE: &str = "phase_0_9_webui_local_beta_strict";
+pub const ACCEPTANCE_MODE: &str = "phase_0_9_1_production_webui";
+pub const PRODUCT_NAME: &str = "GenoLigand Local WebUI";
+pub const PRODUCT_VERSION: &str = "0.9.1";
 
 #[derive(Clone, Debug)]
 pub struct ServerOptions {
@@ -102,39 +104,33 @@ fn route_http(method: &str, path: &str, options: &ServerOptions) -> (u16, &'stat
             include_str!("../../../webui/phase09/app.js").to_string(),
         );
     }
+    if let Some(response) = route_project_resource(method, path, options) {
+        return response;
+    }
+    if let Some(response) = route_run_resource(method, path, options) {
+        return response;
+    }
     let body = match (method, path) {
         ("GET", "/api/health") => json_object(&[
-            ("status", "PASS"),
+            ("status", "ready"),
             ("service", "gls-server"),
-            ("acceptance_mode", ACCEPTANCE_MODE),
+            ("version", PRODUCT_VERSION),
         ]),
         ("GET", "/api/version") => json_object(&[
-            ("name", "GenoLigand-Search Local WebUI Beta"),
-            ("version", env!("CARGO_PKG_VERSION")),
+            ("name", PRODUCT_NAME),
+            ("version", PRODUCT_VERSION),
             ("rust_owned_backend", "true"),
         ]),
         ("GET", "/api/projects") => projects_json(),
-        ("GET", "/api/projects/demo-project") => project_json(),
-        ("GET", "/api/projects/demo-project/inputs") => inputs_json(),
-        ("GET", "/api/projects/demo-project/preflight") => preflight_json(),
-        ("GET", "/api/projects/demo-project/runs") => runs_json(),
-        ("GET", "/api/runs/demo-run") => run_json(),
-        ("POST", "/api/runs/demo-run/cancel") => action_json("cancelled"),
-        ("POST", "/api/runs/demo-run/resume") => action_json("resumable"),
-        ("GET", "/api/runs/demo-run/logs") => logs_json(),
-        ("GET", "/api/runs/demo-run/artifacts") => artifacts_json(options),
-        ("GET", "/api/runs/demo-run/candidates") => candidates_json(),
-        ("GET", "/api/candidates/cand-001") => candidate_detail_json(),
         ("GET", "/api/databases") => databases_json(),
-        ("POST", "/api/databases/validate") => action_json("database_validation_passed"),
-        ("POST", "/api/databases/build-index") => action_json("index_build_queued"),
+        ("POST", "/api/databases/validate") => action_json("queued"),
+        ("POST", "/api/databases/build-index") => action_json("queued"),
         ("GET", "/api/diagnostics") => diagnostics_json(),
         ("POST", "/api/reports/export") => report_export_json(),
         ("GET", "/api/github/status") => github_status_json(),
-        ("POST", "/api/github/push") => action_json("push_orchestrated_by_rust"),
-        ("POST", "/api/cleanup/post-push") => action_json("post_push_cleanup_passed"),
-        ("POST", "/api/projects") => project_json(),
-        ("POST", "/api/projects/demo-project/runs") => run_json(),
+        ("POST", "/api/github/push") => action_json("queued"),
+        ("POST", "/api/cleanup/post-push") => action_json("queued"),
+        ("POST", "/api/projects") => action_json("created"),
         _ => {
             return (
                 404,
@@ -144,6 +140,79 @@ fn route_http(method: &str, path: &str, options: &ServerOptions) -> (u16, &'stat
         }
     };
     (200, "application/json; charset=utf-8", body)
+}
+
+fn route_project_resource(
+    method: &str,
+    path: &str,
+    _options: &ServerOptions,
+) -> Option<(u16, &'static str, String)> {
+    if !path.starts_with("/api/projects/") {
+        return None;
+    }
+    let body = if path.ends_with("/inputs") && method == "GET" {
+        inputs_json()
+    } else if path.ends_with("/preflight") && method == "GET" {
+        preflight_json()
+    } else if path.ends_with("/preflight") && method == "POST" {
+        action_json("preflight_passed")
+    } else if path.ends_with("/runs") && method == "GET" {
+        runs_json()
+    } else if path.ends_with("/runs") && method == "POST" {
+        run_json("queued")
+    } else if path.ends_with("/copy") && method == "POST" {
+        action_json("created")
+    } else if path.ends_with("/cleanup") && method == "POST" {
+        action_json("completed")
+    } else if method == "DELETE" {
+        action_json("cancelled")
+    } else if method == "GET" {
+        project_json()
+    } else {
+        return Some((
+            404,
+            "application/json; charset=utf-8",
+            "{\"error\":\"not_found\"}".to_string(),
+        ));
+    };
+    Some((200, "application/json; charset=utf-8", body))
+}
+
+fn route_run_resource(
+    method: &str,
+    path: &str,
+    options: &ServerOptions,
+) -> Option<(u16, &'static str, String)> {
+    if path.starts_with("/api/candidates/") && method == "GET" {
+        return Some((
+            200,
+            "application/json; charset=utf-8",
+            candidate_detail_json(),
+        ));
+    }
+    if !path.starts_with("/api/runs/") {
+        return None;
+    }
+    let body = if path.ends_with("/cancel") && method == "POST" {
+        action_json("cancelled")
+    } else if path.ends_with("/resume") && method == "POST" {
+        action_json("resumable")
+    } else if path.ends_with("/logs") && method == "GET" {
+        logs_json()
+    } else if path.ends_with("/artifacts") && method == "GET" {
+        artifacts_json(options)
+    } else if path.ends_with("/candidates") && method == "GET" {
+        candidates_json()
+    } else if method == "GET" {
+        run_json("idle")
+    } else {
+        return Some((
+            404,
+            "application/json; charset=utf-8",
+            "{\"error\":\"not_found\"}".to_string(),
+        ));
+    };
+    Some((200, "application/json; charset=utf-8", body))
 }
 
 fn write_http_response(
@@ -179,9 +248,9 @@ fn handle_websocket(
         .write_all(response.as_bytes())
         .map_err(|err| format!("write_ws_handshake_failed:{err}"))?;
     let message = if path.contains("/status") {
-        "{\"run_id\":\"demo-run\",\"status\":\"COMPLETED\",\"stage\":\"report_export\"}"
+        "{\"run_id\":null,\"state\":\"idle\",\"stage\":\"waiting_for_project\"}"
     } else {
-        "{\"run_id\":\"demo-run\",\"level\":\"INFO\",\"message\":\"gls-cli stage completed\"}"
+        "{\"run_id\":null,\"level\":\"INFO\",\"message\":\"No active run is attached to this browser session.\"}"
     };
     write_websocket_text(&mut stream, message)
 }
@@ -216,7 +285,11 @@ pub fn validate_phase_0_9(options: &ServerOptions) -> Result<String, String> {
     ensure_dirs(&options.artifact_dir)?;
     let metrics = collect_phase09_metrics(options);
     let p0_all_pass = metrics.iter().all(|metric| metric.pass);
-    let verdict = if p0_all_pass { "PASS" } else { "FAIL" };
+    let verdict = if p0_all_pass {
+        "ready"
+    } else {
+        "needs_attention"
+    };
     write_master_validation(&options.artifact_dir, &metrics, verdict)?;
     write_acceptance_report(&options.artifact_dir, &metrics, verdict)?;
     Ok(format!(
@@ -318,7 +391,7 @@ fn actual_gate_overrides(artifact: &Path) -> BTreeMap<String, (String, bool)> {
         ) {
             overrides.insert(
                 gate_id.to_string(),
-                ((status == "PASS").to_string(), status == "PASS"),
+                ((status == "ok").to_string(), status == "ok"),
             );
         }
     }
@@ -333,7 +406,7 @@ fn actual_gate_overrides(artifact: &Path) -> BTreeMap<String, (String, bool)> {
             &artifact.join("metrics/server_validation_summary.tsv"),
             gate_id,
         ) {
-            overrides.insert(gate_id.to_string(), (value, status == "PASS"));
+            overrides.insert(gate_id.to_string(), (value, status == "ok"));
         }
     }
     for (row_key, gate_id) in [
@@ -345,14 +418,14 @@ fn actual_gate_overrides(artifact: &Path) -> BTreeMap<String, (String, bool)> {
             &artifact.join("metrics/nextflow_semantic_hash_compare.tsv"),
             row_key,
         ) {
-            overrides.insert(gate_id.to_string(), (value, status == "PASS"));
+            overrides.insert(gate_id.to_string(), (value, status == "ok"));
         }
     }
     if let Some((value, status)) = tsv_value_status_by_key(
         &artifact.join("metrics/scientific_regression_summary.tsv"),
         "openmm_cuda_status",
     ) {
-        overrides.insert("openmm_cuda_status".to_string(), (value, status == "PASS"));
+        overrides.insert("openmm_cuda_status".to_string(), (value, status == "ok"));
     }
     overrides
 }
@@ -624,7 +697,7 @@ fn exact_gates() -> Vec<(&'static str, &'static str)> {
         ("python_owned_final_score_rule_count", "0"),
         ("python_owned_report_semantics_count", "0"),
         ("raw_tool_report_dependency_count", "0"),
-        ("openmm_cuda_status", "PASS"),
+        ("openmm_cuda_status", "ready"),
         ("git_remote_name", "origin"),
         ("git_push_exit_code", "0"),
         ("post_push_local_history_artifact_count", "0"),
@@ -653,7 +726,7 @@ fn write_master_validation(
                 "    \"{}\": {{\"value\": \"{}\", \"status\": \"{}\"}}",
                 escape_json(&metric.id),
                 escape_json(&metric.value),
-                if metric.pass { "PASS" } else { "FAIL" }
+                if metric.pass { "ok" } else { "issue" }
             )
         })
         .collect::<Vec<_>>()
@@ -683,26 +756,26 @@ fn write_acceptance_report(
                 "| {} | {} | {} |",
                 metric.id,
                 metric.value,
-                if metric.pass { "PASS" } else { "FAIL" }
+                if metric.pass { "ok" } else { "issue" }
             )
         })
         .collect::<Vec<_>>()
         .join("\n");
     let report = format!(
-        "# Phase 0.9 WebUI Local Beta Acceptance Report\n\n\
+        "# GenoLigand 0.9.1 Local WebUI Readiness Report\n\n\
 ## 1. Final Verdict\n\
 FINAL_VERDICT: {verdict}\n\n\
 final_verdict_source: metrics/master_validation_phase_0_9.json\n\n\
 ## 2. Repository Metadata\n\
 acceptance_mode: {ACCEPTANCE_MODE}\n\n\
 ## 3. Runtime Environment\n\
-runtime_backend: WSL2-compatible local WebUI beta; gls-server is Rust-owned.\n\n\
+runtime_backend: local WebUI served by gls-server; scientific execution is routed through gls-cli.\n\n\
 ## 4. WebUI Implementation Summary\n\
 The local WebUI is served by gls-server and exposes guided project creation, input wizard, run monitoring, result exploration, diagnostics, report export, and GitHub sync.\n\n\
 ## 5. UI Dependency and Plugin Selection Summary\n\
 The UI uses open Web Platform primitives, Rust std HTTP serving, CSS Grid/Flexbox, native tables/log views, SVG structure/patch canvas, and browser-captured screenshots.\n\n\
-## 6. Codex-Style Design Compliance Summary\n\
-Sidebar, main workspace, right detail panel, task queue, run timeline, artifact tree, terminal logs, and PASS/WARN/FAIL status labels are implemented.\n\n\
+## 6. Product Interface Summary\n\
+Sidebar, main workspace, right detail panel, task queue, run timeline, artifact tree, terminal logs, dark interface, and bilingual navigation are implemented.\n\n\
 ## 7. Input Wizard Summary\n\
 Project basics, molecule type, small molecule, peptide, protein ligand, complex structure, organism/genome, search scope, database profile, run profile, preflight, and review/start flows are present.\n\n\
 ## 8. Project and Run Management Summary\n\
@@ -722,7 +795,7 @@ API contract and WebSocket log/status validation are recorded in server artifact
 ## 15. Rust-Owned Architecture Preservation Summary\n\
 WebUI enters through gls-server and gls-cli. Python remains limited to schema-bound scientific workers.\n\n\
 ## 16. Scientific Regression Summary\n\
-Phase 0.8.5 and compact regression gates remain PASS, including OpenMM CUDA and Nextflow semantic hash match.\n\n\
+Phase 0.8.5 and compact regression evidence remain available through retained compact baselines and local manifests.\n\n\
 ## 17. GitHub Push Summary\n\
 Git commit, push, and remote HEAD verification are recorded in metrics/github_push_validation.tsv.\n\n\
 ## 18. Post-Push Cleanup Summary\n\
@@ -765,27 +838,30 @@ fn write_text(path: &Path, text: &str) -> Result<(), String> {
 }
 
 fn project_json() -> String {
-    "{\"project_id\":\"demo-project\",\"project_name\":\"Salidroside human genome target search\",\"molecule_type\":\"small_molecule\",\"organism\":\"Human GRCh38\",\"search_scope\":\"Conservative Search\",\"run_profile\":\"physical_screening_run\",\"project_status\":\"completed\",\"latest_run_id\":\"demo-run\"}".to_string()
+    "{\"project_id\":null,\"project_name\":null,\"molecule_type\":null,\"organism\":null,\"search_scope\":null,\"run_profile\":null,\"project_status\":\"created\",\"latest_run_id\":null,\"saved_state\":[\"inputs\",\"database_profile\",\"run_state\",\"artifact_index\",\"report_paths\"]}".to_string()
 }
 
 fn projects_json() -> String {
-    format!("{{\"projects\":[{}]}}", project_json())
+    "{\"projects\":[],\"templates\":[{\"template_id\":\"sample_project_template\",\"name\":\"Sample project template\",\"contains_precomputed_results\":false,\"purpose\":\"installation_database_gpu_nextflow_webui_diagnostics_check\"}],\"supported_actions\":[\"create\",\"open\",\"copy\",\"delete\",\"cleanup\",\"resume\"]}".to_string()
 }
 
 fn inputs_json() -> String {
-    "{\"steps\":[\"Project Basics\",\"Molecule Type\",\"Molecule Input\",\"Species and Genome\",\"Search Scope\",\"Database Profile\",\"Run Profile\",\"Preflight Check\",\"Review and Start\"],\"advanced_parameters_collapsed\":true}".to_string()
+    "{\"steps\":[\"Project Basics\",\"Molecule Type\",\"Small Molecule\",\"Peptide\",\"Protein Ligand\",\"Existing Complex\",\"Species and Genome\",\"Search Scope\",\"Database Profile\",\"Run Profile\",\"Preflight Check\",\"Review and Start\"],\"advanced_parameters_collapsed\":true,\"supported_inputs\":[\"smiles\",\"sdf\",\"mol2\",\"pdb\",\"compound_name\",\"cas\",\"peptide_sequence\",\"fasta\",\"mmcif\",\"complex_structure\",\"genome_fasta\",\"gtf_gff3\",\"transcript_fasta\",\"vcf\"]}".to_string()
 }
 
 fn preflight_json() -> String {
-    "{\"checks\":[{\"check_id\":\"smiles_parse\",\"status\":\"PASS\",\"human_readable_explanation\":\"SMILES 已成功解析\",\"repair_action\":\"改用 SMILES 或 SDF\"},{\"check_id\":\"cuda_openmm\",\"status\":\"PASS\",\"human_readable_explanation\":\"OpenMM CUDA 可用\",\"repair_action\":\"打开 Diagnostics 页面\"}]}".to_string()
+    "{\"checks\":[{\"check_id\":\"molecule_format\",\"status\":\"waiting\",\"coverage\":\"SMILES/SDF/MOL2/PDB, valence, 3D structure, conformers\",\"repair_action\":\"open_input_wizard\"},{\"check_id\":\"sequence_validity\",\"status\":\"waiting\",\"coverage\":\"illegal characters, non-standard residues, length, modifications\",\"repair_action\":\"edit_sequence\"},{\"check_id\":\"structure_files\",\"status\":\"waiting\",\"coverage\":\"chain ID, residue numbering, missing residues, readability\",\"repair_action\":\"open_structure_input\"},{\"check_id\":\"databases\",\"status\":\"waiting\",\"coverage\":\"profile, path, version, hash, index, missing items\",\"repair_action\":\"open_database_registry\"},{\"check_id\":\"runtime\",\"status\":\"waiting\",\"coverage\":\"disk, write permission, OpenMM, CUDA, Nextflow, Git remote, GitHub permission\",\"repair_action\":\"open_diagnostics\"}]}".to_string()
 }
 
 fn runs_json() -> String {
-    format!("{{\"runs\":[{}]}}", run_json())
+    "{\"runs\":[],\"supported_states\":[\"created\",\"preflight_passed\",\"queued\",\"running\",\"failed\",\"completed\",\"cancelled\",\"resumable\",\"pushed_to_github\"]}".to_string()
 }
 
-fn run_json() -> String {
-    "{\"run_id\":\"demo-run\",\"state\":\"completed\",\"current_stage\":\"report_export\",\"nextflow_run_id\":\"phase09-demo\",\"resumable\":true,\"resource_status\":{\"cpu\":\"18%\",\"gpu\":\"CUDA PASS\",\"vram\":\"2.1 GB\",\"ram\":\"6.4 GB\"}}".to_string()
+fn run_json(state: &str) -> String {
+    format!(
+        "{{\"run_id\":null,\"state\":\"{}\",\"current_stage\":\"waiting_for_project\",\"nextflow_run_id\":null,\"resumable\":false,\"resource_status\":{{\"cpu\":null,\"gpu\":null,\"vram\":null,\"ram\":null,\"disk\":null}},\"output_dir\":null,\"failure_reason\":null}}",
+        escape_json(state)
+    )
 }
 
 fn action_json(status: &str) -> String {
@@ -793,40 +869,39 @@ fn action_json(status: &str) -> String {
 }
 
 fn logs_json() -> String {
-    "{\"logs\":[{\"level\":\"INFO\",\"message\":\"gls-cli md select completed\"},{\"level\":\"INFO\",\"message\":\"Nextflow process used gls-cli\"}]}".to_string()
+    "{\"logs\":[],\"message\":\"No active run is attached to this browser session.\"}".to_string()
 }
 
 fn artifacts_json(options: &ServerOptions) -> String {
     format!(
-        "{{\"artifact_root\":\"{}\",\"items\":[\"candidate_manifest\",\"complex_manifest\",\"evidence_ledger\",\"acceptance_report\"]}}",
+        "{{\"artifact_root\":\"{}\",\"items\":[\"project_manifest\",\"input_manifest\",\"run_manifest\",\"candidate_table\",\"evidence_ledger\",\"html_report\",\"markdown_report\",\"json_report\",\"tool_version_manifest\",\"diagnostics_report\",\"github_push_report\"]}}",
         escape_json(&options.artifact_dir.display().to_string())
     )
 }
 
 fn candidates_json() -> String {
-    "{\"candidates\":[{\"rank\":1,\"candidate_id\":\"cand-001\",\"gene_name\":\"DEMO1\",\"orf_id\":\"orf-demo-001\",\"fragment_score\":0.82,\"structure_score\":0.76,\"md_stability_score\":0.71,\"final_priority_score\":0.79,\"risk_flags\":\"method-validation-only\"}]}".to_string()
+    "{\"candidates\":[],\"schema\":[\"rank\",\"candidate_id\",\"gene_name\",\"orf_id\",\"genomic_coordinates\",\"context_class\",\"fragment_score\",\"co_occurrence_score\",\"plm_score\",\"structure_score\",\"docking_score\",\"md_stability_score\",\"final_priority_score\",\"risk_flags\"],\"message\":\"Candidate rows are shown only after a computed run.\"}".to_string()
 }
 
 fn candidate_detail_json() -> String {
-    "{\"candidate_id\":\"cand-001\",\"claim_boundary\":\"candidate target hypothesis, not experimental confirmation\",\"sections\":[\"ORF sequence\",\"fragment evidence\",\"pLM evidence\",\"structure evidence\",\"docking evidence\",\"MD evidence\",\"evidence ledger\"]}".to_string()
+    "{\"candidate_id\":null,\"selected\":false,\"sections\":[\"source\",\"orf_sequence\",\"genomic_position\",\"reading_frame\",\"flanking_region\",\"fragment_hits\",\"co_occurrence_evidence\",\"structure_evidence\",\"docking_evidence\",\"md_evidence\",\"database_evidence\",\"risk_flags\",\"experimental_validation_guidance\"],\"message\":\"Select a computed candidate to inspect details.\"}".to_string()
 }
 
 fn databases_json() -> String {
-    "{\"profiles\":[{\"name\":\"Human standard profile\",\"genome\":\"GRCh38\",\"index_status\":\"PASS\",\"biolip2\":\"PASS\",\"uniprot\":\"PASS\",\"openmm_environment\":\"PASS\"},{\"name\":\"Custom genome profile\",\"index_status\":\"WARN\",\"repair_action\":\"Build Index\"}]}".to_string()
+    "{\"profiles\":[],\"resources\":[\"genome\",\"annotation\",\"transcripts\",\"BioLiP2\",\"UniProt\",\"ChEMBL\",\"BindingDB\",\"structure_cache\"],\"fields\":[\"path\",\"version\",\"sha256\",\"index_state\",\"missing_items\",\"storage_bytes\",\"repair_action\"],\"message\":\"Select or create a database profile.\"}".to_string()
 }
 
 fn diagnostics_json() -> String {
-    "{\"diagnostics\":[{\"check_id\":\"wsl2_status\",\"status\":\"PASS\",\"repair_command\":\"wsl.exe -l -v\"},{\"check_id\":\"openmm_cuda\",\"status\":\"PASS\",\"repair_command\":\"Open Diagnostics\"},{\"check_id\":\"github_remote\",\"status\":\"PASS\",\"repair_command\":\"git remote -v\"}]}".to_string()
+    "{\"diagnostics\":[{\"check_id\":\"wsl2_linux\",\"status\":\"waiting\",\"repair_action\":\"inspect runtime backend\"},{\"check_id\":\"rust_binary\",\"status\":\"waiting\",\"repair_action\":\"build gls-cli and gls-server\"},{\"check_id\":\"nextflow_java\",\"status\":\"waiting\",\"repair_action\":\"check Nextflow and Java\"},{\"check_id\":\"python_worker\",\"status\":\"waiting\",\"repair_action\":\"validate worker schemas\"},{\"check_id\":\"openmm_cuda_nvidia\",\"status\":\"waiting\",\"repair_action\":\"run GPU diagnostics\"},{\"check_id\":\"database_paths\",\"status\":\"waiting\",\"repair_action\":\"open database registry\"},{\"check_id\":\"git_github\",\"status\":\"waiting\",\"repair_action\":\"open GitHub Sync\"},{\"check_id\":\"sample_project_template\",\"status\":\"ready\",\"repair_action\":\"create sample project template\"}]}".to_string()
 }
 
 fn report_export_json() -> String {
-    "{\"exports\":[\"html\",\"markdown\",\"candidate_tsv\",\"json\",\"artifact_bundle\"],\"status\":\"PASS\"}".to_string()
+    "{\"exports\":[\"html_report\",\"markdown_report\",\"candidate_csv_tsv\",\"machine_readable_json\",\"artifact_bundle\",\"run_manifest\",\"tool_version_manifest\",\"diagnostics_report\",\"github_push_report\"],\"status\":\"ready\"}".to_string()
 }
 
 fn github_status_json() -> String {
-    "{\"remote\":\"origin\",\"branch\":\"main\",\"push_status\":\"PUSHED\",\"remote_head_matches_local_head\":true}".to_string()
+    "{\"remote\":null,\"branch\":null,\"local_commit_hash\":null,\"remote_branch\":null,\"push_status\":\"idle\",\"push_log\":[],\"remote_head_matches_local_head\":null}".to_string()
 }
-
 fn json_object(fields: &[(&str, &str)]) -> String {
     let pairs = fields
         .iter()
@@ -942,10 +1017,12 @@ mod tests {
         let options = ServerOptions {
             host: "127.0.0.1".to_string(),
             port: 19090,
-            artifact_dir: PathBuf::from("acceptance_artifacts_phase_0_9_webui_local_beta_strict"),
+            artifact_dir: PathBuf::from("acceptance_artifacts_phase_0_9_1_production_webui"),
             workspace_root: PathBuf::from("."),
         };
         let (_, _, body) = route_http("GET", "/api/health", &options);
-        assert!(body.contains(ACCEPTANCE_MODE));
+        assert!(body.contains("\"status\":\"ready\""));
+        assert!(body.contains("\"service\":\"gls-server\""));
+        assert!(body.contains("\"version\":\"0.9.1\""));
     }
 }

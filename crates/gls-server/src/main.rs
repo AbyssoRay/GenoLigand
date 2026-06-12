@@ -16,13 +16,13 @@ fn run() -> Result<(), String> {
     }
     let mut host = "127.0.0.1".to_string();
     let mut port = 19090u16;
-    let mut artifact_dir = PathBuf::from("acceptance_artifacts_phase_0_9_webui_local_beta_strict");
+    let mut artifact_dir = PathBuf::from("acceptance_artifacts_phase_0_9_1_production_webui");
     let mut workspace_root = std::env::current_dir().map_err(|err| err.to_string())?;
     let mut validate = false;
     let mut index = 0;
     while index < args.len() {
         match args[index].as_str() {
-            "validate-phase-0-9" => {
+            "validate-phase-0-9" | "validate-phase-0-9-1" => {
                 validate = true;
                 index += 1;
             }
@@ -75,5 +75,5 @@ fn run() -> Result<(), String> {
 
 fn help() -> &'static str {
     "gls-server [--host 127.0.0.1] [--port 19090] [--artifact-dir DIR]\n\
-     gls-server validate-phase-0-9 --artifact-dir DIR --workspace-root DIR"
+     gls-server validate-phase-0-9-1 --artifact-dir DIR --workspace-root DIR"
 }

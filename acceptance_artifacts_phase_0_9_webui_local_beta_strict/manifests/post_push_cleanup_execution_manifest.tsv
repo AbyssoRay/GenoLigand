@@ -1,6 +1,0 @@
-path	action	status
-.nextflow	remove_transient_cache_after_verified_push	PASS
-.nextflow.log*	remove_transient_logs_after_verified_push	PASS
-work	remove_nextflow_work_after_verified_push	PASS
-outputs/phase_0_9	ignored_runtime_output_not_committed	PASS
-webui/runtime	remove_headless_browser_profile_after_verified_push	PASS

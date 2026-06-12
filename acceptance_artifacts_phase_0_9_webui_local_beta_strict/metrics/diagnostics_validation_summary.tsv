@@ -1,7 +1,0 @@
-diagnostic	message_present	repair_action_present	status
-wsl2	True	True	PASS
-linux	True	True	PASS
-cuda_openmm	True	True	PASS
-nextflow	True	True	PASS
-database	True	True	PASS
-github_remote	True	True	PASS

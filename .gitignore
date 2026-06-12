@@ -207,12 +207,18 @@ $RECYCLE.BIN/
 /tools/cache/
 /tools/tmp/
 
-# Phase 0.9 WebUI local beta runtime caches and heavy generated state.
+# GenoLigand 0.9.1 production WebUI runtime caches and heavy generated state.
 /outputs/phase_0_9/
+/outputs/phase_0_9_1/
 /databases/phase_0_9/
+/databases/phase_0_9_1/
 /data/external_phase_0_9/
+/data/external_phase_0_9_1/
 /.phase_0_9_env/
+/.phase_0_9_1_env/
 /.phase_0_9_tools/
+/.phase_0_9_1_tools/
+/acceptance_artifacts_phase_0_9_1_production_webui/
 /webui/.cache/
 /webui/dist/
 /webui/playwright-report/

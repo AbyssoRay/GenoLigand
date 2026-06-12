@@ -1,38 +1,38 @@
 <!doctype html>
-<html lang="en" data-theme="dark">
+<html lang="zh-CN">
   <head>
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
-    <title>GenoLigand Local WebUI Beta</title>
-    <link rel="stylesheet" href="/styles.css?v=phase09-redesign-20260612" />
+    <title>GenoLigand 0.9.1</title>
+    <link rel="stylesheet" href="/styles.css?v=0.9.1-production" />
   </head>
   <body>
     <div class="app-shell">
-      <aside class="sidebar" aria-label="Primary navigation">
+      <aside class="sidebar" aria-label="GenoLigand navigation">
         <div class="brand">
           <div class="brand-mark">GL</div>
           <div>
             <strong>GenoLigand</strong>
-            <span>Local WebUI Beta</span>
+            <span data-i18n="brandSubtitle">本地科研工作台</span>
           </div>
         </div>
         <nav data-nav></nav>
         <div class="sidebar-footer">
-          <span class="status pass">PASS</span>
-          <span>Rust-owned chain</span>
+          <span class="status ready" data-i18n="versionBadge">0.9.1 正式版</span>
+          <span data-i18n="backendNote">本地 gls-server 提供服务</span>
         </div>
       </aside>
 
       <section class="workspace">
         <header class="topbar">
           <div>
-            <strong data-top-project>Salidroside human genome target search</strong>
-            <span data-top-run>Project: salidroside_search / Runtime: local WSL2 / API: 127.0.0.1:19090</span>
+            <strong data-top-project>GenoLigand 0.9.1</strong>
+            <span data-top-run>127.0.0.1:19090 / gls-server / local workspace</span>
           </div>
           <div class="top-actions">
-            <span class="status running">RUNNING</span>
-            <button data-theme-toggle type="button">Theme</button>
-            <a class="button" href="#/report_export_page">Export</a>
+            <span class="status ready" data-server-state>READY</span>
+            <button data-lang-toggle type="button">中文 / EN</button>
+            <a class="button primary" href="#/input_wizard_project_basics_page" data-i18n="startSetup">开始配置</a>
           </div>
         </header>
 
@@ -40,35 +40,26 @@
           <section class="main-panel">
             <div class="page-header">
               <div>
-                <span class="eyeless">Phase 0.9</span>
-                <h1 data-page-title>Command Center</h1>
-                <p>Local single-user WebUI beta through gls-server, gls-cli, and Rust-owned scientific semantics.</p>
+                <span class="eyeless" data-page-kicker>GenoLigand 0.9.1</span>
+                <h1 data-page-title>本地工作台</h1>
+                <p data-page-description>通过浏览器完成项目、输入、运行、结果、报告、诊断和代码同步。</p>
               </div>
-              <span class="status running" data-page-status>RUNNING</span>
+              <span class="status ready" data-page-status>READY</span>
             </div>
             <div class="grid" data-main></div>
           </section>
 
-          <aside class="detail-panel" aria-label="Detail panel" data-detail></aside>
+          <aside class="detail-panel" aria-label="Page details" data-detail></aside>
         </main>
 
         <section class="log-strip" aria-label="Run log">
-          <div class="timeline">
-            <div class="timeline-item"><span>00:00</span><strong>Project loaded</strong><span class="status pass">PASS</span></div>
-            <div class="timeline-item"><span>00:03</span><strong>Preflight complete</strong><span class="status pass">PASS</span></div>
-            <div class="timeline-item"><span>00:09</span><strong>Nextflow first/resume</strong><span class="status pass">PASS</span></div>
-            <div class="timeline-item"><span>00:12</span><strong>Report ready</strong><span class="status pushed">PUSHED</span></div>
-          </div>
-          <pre data-runtime-log>[INFO] gls-server health: PASS
-[INFO] API contract validation: PASS
-[INFO] WebSocket logs/status validation: PASS
-[INFO] WebUI visual audit: PASS
-[WARN] Short-MD runtime near threshold
-[INFO] FINAL_VERDICT source: metrics/master_validation_phase_0_9.json
-[INFO] Run completed successfully</pre>
+          <div class="timeline" data-runtime-timeline></div>
+          <pre data-runtime-log>GenoLigand 0.9.1 local console is ready.
+No active run is attached to this browser session.
+Create or open a project, complete preflight, then start a workflow.</pre>
         </section>
       </section>
     </div>
-    <script src="/app.js?v=phase09-redesign-20260612"></script>
+    <script src="/app.js?v=0.9.1-production"></script>
   </body>
 </html>

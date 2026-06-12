@@ -1,3 +1,0 @@
-claim_id	evidence_artifact	owner	claim_boundary
-phase085_redocked_control.score	e2e/score_decompositions/phase085_redocked_control.tsv	rust	computational_prior_only
-phase085_redocked_control.md_result	e2e/md_result_manifests/phase085_redocked_control.json	rust	short_md_screening_only

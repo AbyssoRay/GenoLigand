@@ -10,11 +10,11 @@ from pathlib import Path
 
 
 ROOT = Path(__file__).resolve().parents[2]
-DEFAULT_ARTIFACT = ROOT / "acceptance_artifacts_phase_0_9_webui_local_beta_strict"
+DEFAULT_ARTIFACT = ROOT / "acceptance_artifacts_phase_0_9_1_production_webui"
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(description="Start the GenoLigand Phase 0.9 local WebUI.")
+    parser = argparse.ArgumentParser(description="Start the GenoLigand 0.9.1 production local WebUI.")
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=19090)
     parser.add_argument("--artifact-dir", default=str(DEFAULT_ARTIFACT))
@@ -29,7 +29,7 @@ def main() -> int:
     if not server.exists():
         raise SystemExit(f"missing_gls_server_binary:{server}")
 
-    runtime_dir = ROOT / "outputs" / "phase_0_9" / "runtime"
+    runtime_dir = ROOT / "outputs" / "phase_0_9_1" / "runtime"
     runtime_dir.mkdir(parents=True, exist_ok=True)
     stdout = (runtime_dir / "gls-server.stdout.log").open("w", encoding="utf-8")
     stderr = (runtime_dir / "gls-server.stderr.log").open("w", encoding="utf-8")
@@ -48,7 +48,7 @@ def main() -> int:
     url = f"http://{args.host}:{args.port}/"
     try:
         wait_for_health(args.host, args.port, process)
-        print(f"GenoLigand WebUI is running: {url}", flush=True)
+        print(f"GenoLigand 0.9.1 WebUI is running: {url}", flush=True)
         print("Press Ctrl+C to stop the local server.", flush=True)
         if not args.no_open:
             webbrowser.open(url)
@@ -82,7 +82,7 @@ def wait_for_health(host: str, port: int, process: subprocess.Popen) -> None:
         try:
             with urllib.request.urlopen(url, timeout=2) as response:
                 body = response.read().decode("utf-8", errors="replace")
-                if response.status == 200 and '"status":"PASS"' in body:
+                if response.status == 200 and '"status":"ready"' in body:
                     return
         except Exception as err:  # noqa: BLE001
             last_error = str(err)

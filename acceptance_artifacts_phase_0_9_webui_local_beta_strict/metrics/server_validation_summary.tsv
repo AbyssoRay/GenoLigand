@@ -1,6 +1,0 @@
-check	value	status
-gls_server_starts_successfully	True	PASS
-api_health_check_pass	True	PASS
-api_contract_test_pass	True	PASS
-websocket_log_stream_pass	True	PASS
-websocket_status_stream_pass	True	PASS
