@@ -263,6 +263,7 @@ let appState = {
   selectedRun: null,
   message: null,
   diagnostics: null,
+  databases: null,
   github: null,
   exports: null,
   preflight: null,
@@ -368,6 +369,8 @@ function inferAction(label) {
     "Clean project": "clean-project",
     "Resume last run": "resume-last-run",
     "Run diagnostics": "run-diagnostics",
+    "Validate database profile": "validate-databases",
+    "Build database indexes": "build-database-indexes",
     "Run preflight": "run-preflight",
     "Start workflow": "start-workflow",
     "Submit run": "submit-run",
@@ -894,6 +897,24 @@ function evidenceLedger() {
 }
 
 function databaseRegistry() {
+  const payload = appState.databases || {};
+  const resources = payload.resources || [];
+  const rows = resources.map((resource) => [
+    resource,
+    payload.profiles?.length ? `${payload.profiles.length} profile(s)` : pick(["尚未选择 profile", "No profile selected"]),
+    "",
+    "",
+    statusPill("waiting"),
+    "",
+    pick(["选择路径并验证索引", "Select paths and validate indexes"]),
+  ]);
+  if (rows.length) {
+    return dataTable(
+      [[["资源", "Resource"], ["路径", "Path"], ["版本", "Version"], ["hash", "hash"], ["索引状态", "Index state"], ["空间", "Storage"], ["修复动作", "Repair action"]].map((x) => x)][0],
+      rows,
+      payload.message || pick(["尚未选择数据库 profile。", "No database profile selected."])
+    ) + buttonRow([[[ "验证数据库 profile", "Validate database profile" ], "", null], [[ "构建数据库索引", "Build database indexes" ], "primary", null]]);
+  }
   return dataTable(
     [[["资源", "Resource"], ["路径", "Path"], ["版本", "Version"], ["hash", "hash"], ["索引状态", "Index state"], ["空间", "Storage"], ["修复动作", "Repair action"]].map((x) => x)][0],
     [
@@ -910,6 +931,24 @@ function databaseRegistry() {
 }
 
 function diagnostics() {
+  const checks = appState.diagnostics?.diagnostics || [];
+  if (checks.length) {
+    return [
+      card(
+        [["诊断覆盖", "Diagnostic Coverage"]],
+        dataTable(
+          [[["检查项", "Check"], ["说明", "Description"], ["状态", "State"], ["修复入口", "Repair entry"]].map((x) => x)][0],
+          checks.map((check) => [
+            check.check_id || "",
+            check.description || check.check_id || "",
+            statusPill(check.status || "waiting"),
+            check.repair_action || "",
+          ]),
+          [["尚未运行诊断。", "Diagnostics have not run yet."]]
+        ) + buttonRow([[[ "运行环境诊断", "Run diagnostics" ], "primary", null]])
+      ),
+    ].join("");
+  }
   return [
     card(
       [["诊断覆盖", "Diagnostic Coverage"]],
@@ -932,6 +971,24 @@ function diagnostics() {
 }
 
 function githubSync() {
+  const github = appState.github || {};
+  const rows = [
+    [["当前 branch", "Current branch"], valueOrDash(github.branch), github.branch ? statusPill("ready") : statusPill("waiting")],
+    [["本地 commit hash", "Local commit hash"], valueOrDash(github.local_commit_hash), github.local_commit_hash ? statusPill("ready") : statusPill("waiting")],
+    [["远端 branch", "Remote branch"], valueOrDash(github.remote_branch), github.remote_branch ? statusPill("ready") : statusPill("waiting")],
+    [["push 状态", "Push state"], valueOrDash(github.push_status), statusPill(github.push_status === "completed" ? "completed" : "idle")],
+    [["push 日志", "Push log"], valueOrDash(github.push_log), statusPill(github.push_log?.length ? "ready" : "idle")],
+    [["远端验证", "Remote verification"], github.remote_head_matches_local_head === null || github.remote_head_matches_local_head === undefined ? "not checked" : String(github.remote_head_matches_local_head), statusPill(github.remote_head_matches_local_head ? "ready" : "idle")],
+  ];
+  return card(
+    [["GitHub 同步", "GitHub Sync"]],
+    dataTable(
+      [[["字段", "Field"], ["值", "Value"], ["状态", "State"]].map((x) => x)][0],
+      rows,
+      [["尚未读取 Git 状态。", "Git state has not been read yet."]]
+    ) +
+      buttonRow([["git status", "", null], ["git add", "", null], ["git commit", "", null], ["git push", "primary", null], [["验证 remote HEAD", "Verify remote HEAD"], "", null]])
+  );
   return card(
     [["GitHub 同步", "GitHub Sync"]],
     dataTable(
@@ -951,6 +1008,30 @@ function githubSync() {
 }
 
 function reportExport() {
+  const payload = appState.exports || {};
+  const exportRows = (payload.exports || [
+    "html_report",
+    "markdown_report",
+    "candidate_csv_tsv",
+    "machine_readable_json",
+    "artifact_bundle",
+    "run_manifest",
+    "tool_version_manifest",
+    "diagnostics_report",
+    "github_push_report",
+  ]).map((name) => [
+    name,
+    payload.export_dir || pick(["等待生成导出 manifest", "Waiting for export manifest"]),
+    statusPill(payload.status || "waiting"),
+  ]);
+  return card(
+    [["导出项目", "Export Targets"]],
+    dataTable(
+      [[["导出类型", "Export type"], ["输出位置", "Output location"], ["状态", "State"]].map((x) => x)][0],
+      exportRows,
+      [["尚未生成导出 manifest。", "No export manifest has been generated yet."]]
+    ) + buttonRow([[[ "生成导出 manifest", "Export candidate table" ], "primary", null]])
+  );
   return card(
     [["导出项目", "Export Targets"]],
     optionTiles([
@@ -1266,6 +1347,24 @@ async function refreshRunDetails(run = appState.selectedRun) {
   }
 }
 
+async function refreshWorkspaceState() {
+  try {
+    appState.databases = await apiRequest("/api/databases");
+  } catch (_error) {
+    appState.databases = null;
+  }
+  try {
+    appState.diagnostics = await apiRequest("/api/diagnostics");
+  } catch (_error) {
+    appState.diagnostics = null;
+  }
+  try {
+    appState.github = await apiRequest("/api/github/status");
+  } catch (_error) {
+    appState.github = null;
+  }
+}
+
 async function handleAction(action) {
   try {
     if (action === "create-project" || action === "create-sample-project") {
@@ -1337,6 +1436,14 @@ async function handleAction(action) {
     } else if (action === "run-diagnostics") {
       appState.diagnostics = await apiRequest("/api/diagnostics/run", { method: "POST" });
       setMessage("", "诊断结果已从本地服务读取。", "Diagnostics were read from the local service.");
+    } else if (action === "validate-databases") {
+      await apiRequest("/api/databases/validate", { method: "POST" });
+      await refreshWorkspaceState();
+      setMessage("", "数据库 profile 验证已提交到本地服务。", "Database profile validation was submitted to the local service.");
+    } else if (action === "build-database-indexes") {
+      await apiRequest("/api/databases/build-index", { method: "POST" });
+      await refreshWorkspaceState();
+      setMessage("", "数据库索引构建动作已提交到本地服务。", "Database index build action was submitted to the local service.");
     } else if (action === "export-report") {
       appState.exports = await apiRequest("/api/reports/export", { method: "POST" });
       setMessage("", "导出 manifest 已生成。", "Export manifest generated.");
@@ -1375,6 +1482,7 @@ async function hydrateServerState() {
       const version = await versionResponse.json();
       appState.server.version = version.version || APP_VERSION;
     }
+    await refreshWorkspaceState();
     await refreshProjects();
   } catch (error) {
     appState.server.state = "failed";
