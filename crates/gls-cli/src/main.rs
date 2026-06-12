@@ -17,6 +17,7 @@ use gls_cli::{
 use gls_report::{render_html, render_markdown};
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::process::Command;
 
 fn main() {
     let args = std::env::args().skip(1).collect::<Vec<_>>();
@@ -72,6 +73,7 @@ fn run_cli(args: &[String]) -> Result<Option<String>, String> {
         "sequence" => run_sequence_cli(&args[1..]).map(Some),
         "report" => run_report_cli(&args[1..]).map(Some),
         "validate" => run_validate_cli(&args[1..]).map(Some),
+        "md" => run_md_cli(&args[1..]).map(Some),
         "--help" | "-h" => Ok(Some(GLOBAL_HELP.to_string())),
         _ => Err(format!("unknown_command:{command}")),
     }
@@ -160,6 +162,47 @@ fn run_stats_cli(args: &[String]) -> Result<String, String> {
         }
         other => Err(format!("unknown_stats_command:{other}")),
     }
+}
+
+fn run_md_cli(args: &[String]) -> Result<String, String> {
+    if args.is_empty() || is_help(args) {
+        return Ok(MD_HELP.to_string());
+    }
+    let subcommand = match args[0].as_str() {
+        "select" => "select",
+        "prepare" => "prepare",
+        "run" => "run-md",
+        "analyze" => "analyze",
+        "score" => "score",
+        "report" => "render-report",
+        other => return Err(format!("unknown_md_command:{other}")),
+    };
+    let root = workspace_root_from_exe()?;
+    let python =
+        std::env::var("GENOLIGAND_PHASE084_PYTHON").unwrap_or_else(|_| "python".to_string());
+    let script = root
+        .join("scripts")
+        .join("phase084")
+        .join("phase084_cli.py");
+    let output = Command::new(&python)
+        .arg(script)
+        .arg(subcommand)
+        .args(&args[1..])
+        .output()
+        .map_err(|err| format!("md_python_spawn_failed:{python}:{err}"))?;
+    if !output.status.success() {
+        return Err(format!(
+            "md_command_failed:{}:{}",
+            subcommand,
+            String::from_utf8_lossy(&output.stderr)
+        ));
+    }
+    let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    Ok(if stdout.is_empty() {
+        format!("md {subcommand} ok")
+    } else {
+        stdout
+    })
 }
 
 fn run_orf_cli(args: &[String]) -> Result<String, String> {
@@ -1457,6 +1500,21 @@ fn write_text(path: &Path, text: &str) -> Result<(), String> {
     fs::write(path, text).map_err(|err| format!("write_failed:{}:{err}", path.display()))
 }
 
+fn workspace_root_from_exe() -> Result<PathBuf, String> {
+    let mut dir = std::env::current_dir().map_err(|err| format!("current_dir_failed:{err}"))?;
+    loop {
+        if dir.join("Cargo.toml").exists()
+            && dir.join("scripts").exists()
+            && dir.join("python").exists()
+        {
+            return Ok(dir);
+        }
+        if !dir.pop() {
+            return Err("workspace_root_not_found".to_string());
+        }
+    }
+}
+
 fn validate_leaf_help(kind: ValidateKind) -> &'static str {
     match kind {
         ValidateKind::Fasta => VALIDATE_FASTA_HELP,
@@ -1485,6 +1543,7 @@ commands:
   sequence export-fasta
   sequence features
   sequence score
+  md select|prepare|run|analyze|score|report
   report markdown
   report candidate
   report phase-0-4
@@ -1505,6 +1564,8 @@ const SEARCH_GENOME_HELP: &str =
     "usage: gls-cli search genome --genome PATH --fragments PATH --out PATH";
 const STATS_HELP: &str = "usage: gls-cli stats <score>\ncommands:\n  score";
 const STATS_SCORE_HELP: &str = "usage: gls-cli stats score --hits PATH --out PATH";
+const MD_HELP: &str =
+    "usage: gls-cli md <select|prepare|run|analyze|score|report> [--artifact-dir PATH]";
 const ORF_HELP: &str = "usage: gls-cli orf <extend>\ncommands:\n  extend";
 const ORF_EXTEND_HELP: &str = "usage: gls-cli orf extend --genome PATH --hits PATH --out PATH";
 const CLASSIFY_HELP: &str = "usage: gls-cli classify <loci>\ncommands:\n  loci";

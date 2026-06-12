@@ -1,0 +1,11 @@
+protein_forcefield: "amber14-all.xml"
+water_model: "amber14/tip3pfb.xml"
+small_molecule_forcefield_priority:
+  - "openff_unconstrained_sage"
+  - "gaff2_via_openmmforcefields"
+constraints: "HBonds"
+timestep_fs: 2.0
+nonbonded_method: "PME"
+nonbonded_cutoff_nm: 1.0
+rigid_water: true
+hydrogen_mass_repartitioning: false

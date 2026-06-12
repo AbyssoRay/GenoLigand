@@ -180,3 +180,18 @@ $RECYCLE.BIN/
 /databases/phase_0_8_3/
 /.phase_0_8_3_env/
 /.phase_0_8_3_tools/
+
+# Phase 0.8.4 OpenMM short-MD strict runtime artifacts
+/acceptance_artifacts_phase_0_8_4_openmm_short_md_strict/
+/outputs/phase_0_8_4/
+/databases/phase_0_8_4/
+/data/external_phase_0_8_4/
+/.phase_0_8_4_env/
+/.phase_0_8_4_tools/
+/tools/downloads/
+/acceptance_artifacts_phase_*/outputs/md_runs/trajectories/
+*.nc
+*.chk
+
+
+AGENTS.md

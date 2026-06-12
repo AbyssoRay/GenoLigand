@@ -1,0 +1,52 @@
+phase: "0.8.4"
+acceptance_mode: "phase_0_8_4_openmm_short_md_strict"
+runtime_scope:
+  primary: "windows_11_wsl2_linux"
+  retained_project_wsl: "GenoLigandPhase08"
+  protected_default_wsl: "Ubuntu-24.04"
+  webui_required: false
+  hpc_required: false
+gpu:
+  require_cuda_for_strict_pass: true
+  openmm_platform: "CUDA"
+  cuda_precision: "mixed"
+  allow_cpu_fallback_for_primary_md: false
+inputs:
+  phase_0_7_1_artifacts: "acceptance_artifacts_phase_0_7_1_audit_fix_strict"
+  phase_0_8_3_artifacts: "acceptance_artifacts_phase_0_8_3_biolip2_resolver_patch_strict"
+  allow_benchmark_control_complexes_from_database: true
+selection:
+  positive_native_controls_min: 1
+  redocked_controls_min: 1
+  candidate_or_benchmark_complexes_min: 3
+  decoy_complexes_min: 3
+  production_query_ligand_required: false
+forcefield:
+  protein_forcefield: "amber14-all.xml"
+  water_model: "amber14/tip3pfb.xml"
+  ligand_route_priority:
+    - "openff"
+    - "gaff2_openmmforcefields"
+  solvent_padding_nm: 1.0
+  ionic_strength_molar: 0.15
+  ph_for_hydrogens: 7.4
+md_protocol:
+  timestep_fs: 2.0
+  temperature_kelvin: 300
+  pressure_atm: 1
+  positive_control_production_ps: 1000
+  other_mandatory_production_ps: 100
+  trajectory_stride_ps: 2
+  state_stride_ps: 1
+  checkpoint_stride_ps: 10
+analysis:
+  pocket_cutoff_angstrom: 6.0
+  hbond_distance_cutoff_angstrom: 3.5
+  hbond_angle_cutoff_deg: 120
+  hydrophobic_cutoff_angstrom: 4.5
+  salt_bridge_cutoff_angstrom: 4.0
+storage:
+  keep_raw_trajectories: true
+  compress_trajectories: true
+  git_track_large_trajectories: false
+  artifact_store_dir: "data/external_phase_0_8_4/md_artifacts"
