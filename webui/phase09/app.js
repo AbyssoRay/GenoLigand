@@ -271,6 +271,7 @@ let appState = {
   runArtifacts: null,
   candidates: null,
   evidence: null,
+  projectRuns: [],
   selectedCandidateId: null,
   inputDraft: { inputs: [], files: [] },
 };
@@ -377,6 +378,8 @@ function inferAction(label) {
   const actions = {
     "Create project": "create-project",
     "Create environment validation project template": "create-validation-project",
+    "Select project": "select-project",
+    "Select run": "select-run",
     "Save configuration": "save-configuration",
     "Open project": "open-project",
     "Copy project": "copy-project",
@@ -455,9 +458,10 @@ function dashboard() {
 
 function projectRows() {
   return appState.projects.map((project) => [
+    `<button type="button" data-action="select-project" data-project-id="${encodeURIComponent(project.project_id || "")}">${pick(["打开", "Open"])}</button>`,
     project.project_id || "",
     project.project_name || "",
-    project.project_status || "",
+    statusPill(project.project_status || "created"),
     project.latest_run_id || "",
     (project.report_paths || []).join(", "),
   ]);
@@ -467,7 +471,7 @@ function projectListCard() {
   return card(
     [["本地项目", "Local Projects"]],
     dataTable(
-      [[["项目 ID", "Project ID"], ["名称", "Name"], ["状态", "State"], ["最近运行", "Latest run"], ["报告路径", "Report paths"]].map((x) => x)][0],
+      [[["操作", "Action"], ["项目 ID", "Project ID"], ["名称", "Name"], ["状态", "State"], ["最近运行", "Latest run"], ["报告路径", "Report paths"]].map((x) => x)][0],
       projectRows(),
       [["尚无本地项目。点击创建项目后会写入本地项目 manifest。", "No local project yet. Creating a project writes a local project manifest."]]
     ) +
@@ -477,9 +481,31 @@ function projectListCard() {
   );
 }
 
+function projectRunHistoryCard() {
+  const rows = appState.projectRuns.map((run) => [
+    `<button type="button" data-action="select-run" data-run-id="${encodeURIComponent(run.run_id || "")}">${pick(["查看", "View"])}</button>`,
+    run.run_id || "",
+    statusPill(run.state || "created"),
+    run.current_stage || "",
+    run.nextflow_run_id || "",
+    run.resumable ? "true" : "false",
+    run.output_dir || "",
+  ]);
+  return card(
+    [["历史运行摘要", "Run History Summary"]],
+    dataTable(
+      [[["操作", "Action"], ["Run ID", "Run ID"], ["状态", "State"], ["当前阶段", "Current stage"], ["Nextflow run ID", "Nextflow run ID"], ["可恢复", "Resumable"], ["输出目录", "Output directory"]].map((x) => x)][0],
+      rows,
+      [["当前项目尚无运行记录。", "The selected project has no run records yet."]]
+    ) +
+      buttonRow([[[ "继续上次运行", "Resume last run" ], "", null], [[ "打开运行监控", "Open run monitor" ], "primary", "#/run_monitor_page"]])
+  );
+}
+
 function projectPage() {
   return [
     projectListCard(),
+    projectRunHistoryCard(),
     card(
       [["项目生命周期", "Project Lifecycle"]],
       formGrid([
@@ -1548,18 +1574,29 @@ async function refreshProjects() {
     } catch (_error) {
       // Project lists remain usable even if an older project has no preflight artifact yet.
     }
+    await refreshProjectRuns();
+  } else {
+    appState.projectRuns = [];
+  }
+}
+
+async function refreshProjectRuns() {
+  if (!appState.selectedProject?.project_id) {
+    appState.projectRuns = [];
+    return;
+  }
+  try {
+    const runs = await apiRequest(`/api/projects/${appState.selectedProject.project_id}/runs`);
+    appState.projectRuns = runs.runs || [];
     if (!appState.selectedRun && appState.selectedProject.latest_run_id) {
-      try {
-        const runs = await apiRequest(`/api/projects/${appState.selectedProject.project_id}/runs`);
-        const latest = (runs.runs || []).find((run) => run.run_id === appState.selectedProject.latest_run_id);
-        if (latest) {
-          appState.selectedRun = latest;
-          await refreshRunDetails(latest);
-        }
-      } catch (_error) {
-        appState.selectedRun = null;
+      const latest = appState.projectRuns.find((run) => run.run_id === appState.selectedProject.latest_run_id);
+      if (latest) {
+        appState.selectedRun = latest;
+        await refreshRunDetails(latest);
       }
     }
+  } catch (_error) {
+    appState.projectRuns = [];
   }
 }
 
@@ -1637,10 +1674,35 @@ async function handleAction(action, dataset = {}) {
     if (action === "select-candidate") {
       appState.selectedCandidateId = dataset.candidateId ? decodeURIComponent(dataset.candidateId) : null;
       setMessage("", "候选已选中。", "Candidate selected.");
+    } else if (action === "select-project") {
+      const projectId = dataset.projectId ? decodeURIComponent(dataset.projectId) : "";
+      const project = appState.projects.find((entry) => entry.project_id === projectId);
+      if (!project) {
+        throw new Error(appState.lang === "zh" ? "项目未找到。" : "Project was not found.");
+      }
+      appState.selectedProject = project;
+      appState.selectedRun = null;
+      appState.runLogs = [];
+      appState.runArtifacts = null;
+      appState.candidates = null;
+      appState.evidence = null;
+      await refreshProjectRuns();
+      setMessage("", "项目已打开。", "Project opened.");
+    } else if (action === "select-run") {
+      const runId = dataset.runId ? decodeURIComponent(dataset.runId) : "";
+      const run = appState.projectRuns.find((entry) => entry.run_id === runId);
+      if (!run) {
+        throw new Error(appState.lang === "zh" ? "运行记录未找到。" : "Run record was not found.");
+      }
+      appState.selectedRun = run;
+      await refreshRunDetails(run);
+      window.location.hash = "#/run_monitor_page";
+      setMessage("", "运行记录已打开。", "Run record opened.");
     } else if (action === "create-project" || action === "create-validation-project") {
       const path = action === "create-validation-project" ? "/api/projects/environment-validation" : "/api/projects";
       const payload = await apiRequest(path, { method: "POST" });
       appState.selectedProject = payload.project || null;
+      appState.selectedRun = null;
       await refreshProjects();
       setMessage("", "项目已写入本地 manifest。", "Project manifest was written locally.");
     } else if (action === "open-project") {
@@ -1689,6 +1751,7 @@ async function handleAction(action, dataset = {}) {
       appState.selectedRun = payload.run || null;
       await refreshRunDetails(appState.selectedRun);
       await refreshProjects();
+      await refreshProjectRuns();
       window.location.hash = "#/run_monitor_page";
       setMessage("", "运行已创建并排队，等待本地 gls-cli/Nextflow 执行。", "Run created and queued for local gls-cli/Nextflow execution.");
     } else if (action === "cancel-run") {
@@ -1698,6 +1761,10 @@ async function handleAction(action, dataset = {}) {
       await refreshRunDetails(appState.selectedRun);
       setMessage("warn", "运行已取消。", "Run cancelled.");
     } else if (action === "resume-run" || action === "resume-last-run") {
+      if (!appState.selectedRun && appState.selectedProject?.latest_run_id) {
+        await refreshProjectRuns();
+        appState.selectedRun = appState.projectRuns.find((entry) => entry.run_id === appState.selectedProject.latest_run_id) || null;
+      }
       const run = requireRun();
       const payload = await apiRequest(`/api/runs/${run.run_id}/resume`, { method: "POST" });
       appState.selectedRun = payload.run || appState.selectedRun;
