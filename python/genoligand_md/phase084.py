@@ -82,6 +82,9 @@ P0_GATES = [
     "external_tool_cleanup_policy_pass",
     "stale_path_reference_audit_pass",
     "git_cleanliness_audit_pass",
+    "external_resource_manifest_present",
+    "tool_versions_manifest_present",
+    "cleanup_resource_manifest_present",
     "post_cleanup_cargo_test_pass",
     "post_cleanup_nextflow_resume_pass",
     "post_cleanup_openmm_validation_pass",
@@ -1487,6 +1490,84 @@ def cleanup_audits(artifact_dir: Path) -> int:
     return 0
 
 
+def write_resource_manifests(artifact_dir: Path) -> int:
+    probe = read_json(artifact_dir / "metrics/openmm_platform_probe.json")
+    compliance = read_tsv(artifact_dir / "outputs/compliance/open_source_tool_compliance.tsv")
+    external_rows = []
+    tool_rows = []
+    for idx, row in enumerate(compliance, start=1):
+        tool_name = row.get("tool_name", "")
+        external_rows.append({
+            "resource_id": f"phase084_tool_{idx:03d}",
+            "resource_type": "open_source_tool",
+            "name": tool_name,
+            "version": row.get("version", ""),
+            "source_url": row.get("source_url", ""),
+            "local_path": probe.get("python_executable", ""),
+            "license_name": row.get("license_name", ""),
+            "required_for_pass": row.get("mandatory_for_pass", ""),
+            "sha256_or_manifest_hash": sha256_text(json.dumps(row, sort_keys=True)),
+            "status": row.get("license_compatibility_status", ""),
+            "notes": row.get("notes", ""),
+        })
+        tool_rows.append({
+            "tool_name": tool_name,
+            "version": row.get("version", ""),
+            "runtime_target": "wsl2_linux_cuda",
+            "python_executable": probe.get("python_executable", ""),
+            "source_url": row.get("source_url", ""),
+            "required_for_pass": row.get("mandatory_for_pass", ""),
+            "status": row.get("license_compatibility_status", ""),
+        })
+    write_tsv(
+        artifact_dir / "external_resource_manifest.tsv",
+        external_rows,
+        ["resource_id", "resource_type", "name", "version", "source_url", "local_path", "license_name", "required_for_pass", "sha256_or_manifest_hash", "status", "notes"],
+    )
+    write_tsv(
+        artifact_dir / "tool_versions.tsv",
+        tool_rows,
+        ["tool_name", "version", "runtime_target", "python_executable", "source_url", "required_for_pass", "status"],
+    )
+    cleanup_files = [
+        "outputs/cleanup/project_tree_inventory_before.tsv",
+        "outputs/cleanup/project_tree_inventory_after.tsv",
+        "outputs/cleanup/repository_cleanup_plan.tsv",
+        "outputs/cleanup/cleanup_plan_dry_run.tsv",
+        "outputs/cleanup/repository_cleanup_execution.tsv",
+        "outputs/cleanup/cleanup_execution_manifest.tsv",
+        "outputs/cleanup/wsl_distribution_inventory.tsv",
+        "outputs/cleanup/wsl_cleanup_plan.tsv",
+        "outputs/cleanup/wsl_cleanup_execution.tsv",
+        "outputs/cleanup/wsl_cleanup_manifest.tsv",
+        "outputs/cleanup/wsl_cleanup_execution_manifest.tsv",
+        "outputs/cleanup/external_tool_inventory.tsv",
+        "outputs/cleanup/external_tool_cleanup_plan.tsv",
+        "outputs/cleanup/external_tool_cleanup_execution.tsv",
+        "outputs/cleanup/external_tool_cleanup_manifest.tsv",
+        "outputs/cleanup/external_tool_cleanup_execution_manifest.tsv",
+        "outputs/cleanup/stale_path_reference_audit.tsv",
+        "outputs/cleanup/storage_delta_summary.tsv",
+    ]
+    cleanup_rows = []
+    for idx, rel in enumerate(cleanup_files, start=1):
+        path = artifact_dir / rel
+        cleanup_rows.append({
+            "resource_id": f"phase084_cleanup_{idx:03d}",
+            "artifact_path": rel,
+            "resource_kind": "cleanup_manifest",
+            "bytes": path.stat().st_size if path.exists() else 0,
+            "sha256": sha256_file(path) if path.exists() and path.is_file() else "missing",
+            "status": "PASS" if path.exists() else "FAIL",
+        })
+    write_tsv(
+        artifact_dir / "cleanup_resource_manifest.tsv",
+        cleanup_rows,
+        ["resource_id", "artifact_path", "resource_kind", "bytes", "sha256", "status"],
+    )
+    return 0 if external_rows and tool_rows and all(row["status"] == "PASS" for row in cleanup_rows) else 1
+
+
 def write_phase_regression_summaries(artifact_dir: Path) -> int:
     p071 = read_json(ROOT / PHASE071_DIRNAME / "metrics/master_validation_phase_0_7_1.json")
     p083 = read_json(ROOT / PHASE083_DIRNAME / "metrics/master_validation_phase_0_8_3.json")
@@ -1505,6 +1586,9 @@ def write_evidence_ledger(artifact_dir: Path) -> int:
         "outputs/md_analysis/decoy_calibrated_md_summary.tsv",
         "outputs/compliance/open_source_tool_compliance.tsv",
         "outputs/cleanup/wsl_distribution_inventory.tsv",
+        "external_resource_manifest.tsv",
+        "tool_versions.tsv",
+        "cleanup_resource_manifest.tsv",
         "metrics/master_validation_phase_0_8_4.json",
     ]
     for idx, rel in enumerate(evidence_files, start=1):
@@ -1626,6 +1710,9 @@ def validate_phase084(artifact_dir: Path, strict: bool = True) -> tuple[bool, di
         "external_tool_cleanup_policy_pass": (artifact_dir / "outputs/cleanup/external_tool_cleanup_execution.tsv").exists(),
         "stale_path_reference_audit_pass": all(row.get("status") in {"PASS", "NOT_REFERENCED"} for row in read_tsv(artifact_dir / "outputs/cleanup/stale_path_reference_audit.tsv")),
         "git_cleanliness_audit_pass": (artifact_dir / "outputs/cleanup/git_cleanliness_audit.tsv").exists(),
+        "external_resource_manifest_present": bool(read_tsv(artifact_dir / "external_resource_manifest.tsv")),
+        "tool_versions_manifest_present": bool(read_tsv(artifact_dir / "tool_versions.tsv")),
+        "cleanup_resource_manifest_present": bool(read_tsv(artifact_dir / "cleanup_resource_manifest.tsv")) and all(row.get("status") == "PASS" for row in read_tsv(artifact_dir / "cleanup_resource_manifest.tsv")),
         "post_cleanup_cargo_test_pass": (artifact_dir / "metrics/post_cleanup_validation.tsv").exists() and any(row.get("check") == "cargo_test" and row.get("status") == "PASS" for row in read_tsv(artifact_dir / "metrics/post_cleanup_validation.tsv")),
         "post_cleanup_nextflow_resume_pass": (artifact_dir / "metrics/nextflow_trace_resume.tsv").exists(),
         "post_cleanup_openmm_validation_pass": bool(probe.get("test_installation_pass")),
@@ -1692,6 +1779,8 @@ Phase 0.8.4 adds a short-MD physical-stability worker after the Phase 0.8.3 BioL
 - OpenEye required: False
 - commercial Amber required: False
 - compliance status: {bool_text(bool(master.get("gates", {}).get("open_source_compliance_pass")))}
+- external_resource_manifest: {bool_text(bool(master.get("gates", {}).get("external_resource_manifest_present")))}
+- tool_versions_manifest: {bool_text(bool(master.get("gates", {}).get("tool_versions_manifest_present")))}
 
 ## MD Execution Gates
 - mandatory complexes selected: {bool_text(bool(master.get("gates", {}).get("mandatory_complexes_selected")))}
@@ -1711,6 +1800,7 @@ Phase 0.8.4 adds a short-MD physical-stability worker after the Phase 0.8.3 BioL
 - stale references: {sum(1 for row in read_tsv(artifact_dir / "outputs/cleanup/stale_path_reference_audit.tsv") if row.get("status") not in {"PASS", "NOT_REFERENCED"})}
 - .gitignore updated: True
 - git cleanliness status: {bool_text(bool(master.get("gates", {}).get("git_cleanliness_audit_pass")))}
+- cleanup_resource_manifest: {bool_text(bool(master.get("gates", {}).get("cleanup_resource_manifest_present")))}
 
 ## WSL Distribution Cleanup Gates
 - WSL distributions before: {len(wsl_rows)}
@@ -1758,6 +1848,7 @@ def run_acceptance(artifact_dir: Path, execute_cleanup: bool = False) -> int:
     execute_wsl_cleanup(artifact_dir, execute=execute_cleanup)
     inventory_project_tree(artifact_dir, "after")
     cleanup_audits(artifact_dir)
+    write_resource_manifests(artifact_dir)
     compare_semantic_hashes(artifact_dir)
     post_cleanup = artifact_dir / "metrics/post_cleanup_validation.tsv"
     if not post_cleanup.exists():
@@ -1787,7 +1878,7 @@ def workflow_step(artifact_dir: Path, stage: str) -> int:
         "SUMMARIZE_MD_STABILITY": lambda: score_md_stability(artifact_dir),
         "COMPARE_DECOY_MD": lambda: score_md_stability(artifact_dir),
         "RENDER_MD_REPORT": lambda: render_acceptance_report(artifact_dir),
-        "MASTER_VALIDATE_PHASE084": lambda: 0 if validate_phase084(artifact_dir)[1] else 1,
+        "MASTER_VALIDATE_PHASE084": lambda: 0 if (write_resource_manifests(artifact_dir) == 0 and validate_phase084(artifact_dir)[0]) else 1,
         "COLLECT_ACCEPTANCE_ARCHIVE": lambda: write_evidence_ledger(artifact_dir),
     }
     if stage not in stage_map:
