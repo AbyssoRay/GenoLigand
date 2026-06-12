@@ -6,7 +6,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use serde_json::Value;
+use serde_json::{Number, Value};
 
 pub const ACCEPTANCE_MODE: &str = "phase_0_9_1_production_webui";
 pub const PRODUCT_NAME: &str = "GenoLigand Local WebUI";
@@ -915,6 +915,14 @@ fn write_text(path: &Path, text: &str) -> Result<(), String> {
     fs::write(path, text).map_err(|err| format!("write_failed:{}:{err}", path.display()))
 }
 
+fn write_bytes(path: &Path, bytes: &[u8]) -> Result<(), String> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)
+            .map_err(|err| format!("create_parent_failed:{}:{err}", parent.display()))?;
+    }
+    fs::write(path, bytes).map_err(|err| format!("write_failed:{}:{err}", path.display()))
+}
+
 fn projects_root(options: &ServerOptions) -> PathBuf {
     options.artifact_dir.join("projects")
 }
@@ -930,6 +938,26 @@ fn safe_id(raw: &str) -> String {
     raw.chars()
         .filter(|ch| ch.is_ascii_alphanumeric() || *ch == '-' || *ch == '_')
         .collect::<String>()
+}
+
+fn safe_file_name(raw: &str) -> String {
+    let name = raw
+        .chars()
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() || matches!(ch, '.' | '-' | '_') {
+                ch
+            } else {
+                '_'
+            }
+        })
+        .collect::<String>()
+        .trim_matches('.')
+        .to_string();
+    if name.is_empty() {
+        "uploaded_file".to_string()
+    } else {
+        name
+    }
 }
 
 fn parse_project_path(path: &str) -> Option<(String, String)> {
@@ -1230,6 +1258,57 @@ fn inputs_json() -> String {
     "{\"steps\":[\"Project Basics\",\"Molecule Type\",\"Small Molecule\",\"Peptide\",\"Protein Ligand\",\"Existing Complex\",\"Species and Genome\",\"Search Scope\",\"Database Profile\",\"Run Profile\",\"Preflight Check\",\"Review and Start\"],\"advanced_parameters_collapsed\":true,\"supported_inputs\":[\"smiles\",\"sdf\",\"mol2\",\"pdb\",\"compound_name\",\"cas\",\"peptide_sequence\",\"fasta\",\"mmcif\",\"complex_structure\",\"genome_fasta\",\"gtf_gff3\",\"transcript_fasta\",\"vcf\"]}".to_string()
 }
 
+fn persist_uploaded_files(project_dir: &Path, manifest: &mut Value) -> usize {
+    let Some(files) = manifest.get_mut("files").and_then(Value::as_array_mut) else {
+        return 0;
+    };
+    let mut persisted = 0usize;
+    for file in files {
+        let Some(file_object) = file.as_object_mut() else {
+            continue;
+        };
+        let content = file_object
+            .remove("content_base64")
+            .and_then(|value| value.as_str().map(ToString::to_string));
+        let Some(content) = content else {
+            continue;
+        };
+        let name = file_object
+            .get("name")
+            .and_then(Value::as_str)
+            .unwrap_or("uploaded_file");
+        let field = file_object
+            .get("field")
+            .and_then(Value::as_str)
+            .unwrap_or("uploaded_file");
+        let target_name = format!("{}_{}", safe_id(field), safe_file_name(name));
+        let target_path = project_dir.join("inputs").join("files").join(target_name);
+        match base64_decode(&content).and_then(|bytes| {
+            let byte_len = bytes.len();
+            write_bytes(&target_path, &bytes)?;
+            Ok(byte_len)
+        }) {
+            Ok(byte_len) => {
+                persisted += 1;
+                file_object.insert(
+                    "persisted_path".to_string(),
+                    Value::String(target_path.display().to_string()),
+                );
+                file_object.insert(
+                    "persisted_bytes".to_string(),
+                    Value::Number(Number::from(byte_len as u64)),
+                );
+                file_object.insert("content_persisted".to_string(), Value::Bool(true));
+            }
+            Err(err) => {
+                file_object.insert("content_persisted".to_string(), Value::Bool(false));
+                file_object.insert("persistence_error".to_string(), Value::String(err));
+            }
+        }
+    }
+    persisted
+}
+
 fn write_project_inputs_json(
     options: &ServerOptions,
     project_id: &str,
@@ -1248,12 +1327,21 @@ fn write_project_inputs_json(
     } else {
         body.to_string()
     };
+    let mut parsed_manifest = serde_json::from_str::<Value>(&manifest).ok();
+    let persisted_files = parsed_manifest
+        .as_mut()
+        .map(|value| persist_uploaded_files(&dir, value))
+        .unwrap_or(0);
+    let manifest_to_write = parsed_manifest
+        .as_ref()
+        .map(Value::to_string)
+        .unwrap_or_else(|| manifest.clone());
     let path = dir.join("input_manifest.json");
-    match write_text(&path, &(manifest.clone() + "\n")) {
+    match write_text(&path, &(manifest_to_write.clone() + "\n")) {
         Ok(()) => {
-            if let Ok(parsed) = serde_json::from_str::<Value>(&manifest) {
+            if let Some(parsed) = parsed_manifest.as_ref() {
                 let project_name =
-                    manifest_inputs(&parsed, &["project_name", "Project name", "项目名称"])
+                    manifest_inputs(parsed, &["project_name", "Project name", "项目名称"])
                         .into_iter()
                         .next()
                         .filter(|value| !value.trim().is_empty())
@@ -1274,10 +1362,11 @@ fn write_project_inputs_json(
                 );
             }
             format!(
-                "{{\"status\":\"saved\",\"project_id\":\"{}\",\"input_manifest\":\"{}\",\"bytes\":{}}}",
+                "{{\"status\":\"saved\",\"project_id\":\"{}\",\"input_manifest\":\"{}\",\"bytes\":{},\"persisted_files\":{}}}",
                 escape_json(project_id),
                 escape_json(&path.display().to_string()),
-                manifest.len()
+                manifest_to_write.len(),
+                persisted_files
             )
         }
         Err(err) => format!(
@@ -3614,6 +3703,46 @@ fn base64_encode(bytes: &[u8]) -> String {
     output
 }
 
+fn base64_decode(input: &str) -> Result<Vec<u8>, String> {
+    let content = input
+        .split_once(',')
+        .map(|(_, value)| value)
+        .unwrap_or(input)
+        .chars()
+        .filter(|ch| !ch.is_whitespace())
+        .collect::<String>();
+    if content.len() % 4 != 0 {
+        return Err("invalid_base64_length".to_string());
+    }
+    let mut output = Vec::new();
+    for chunk in content.as_bytes().chunks(4) {
+        let mut values = [0u8; 4];
+        let mut padding = 0usize;
+        for (index, byte) in chunk.iter().enumerate() {
+            values[index] = match *byte {
+                b'A'..=b'Z' => byte - b'A',
+                b'a'..=b'z' => byte - b'a' + 26,
+                b'0'..=b'9' => byte - b'0' + 52,
+                b'+' => 62,
+                b'/' => 63,
+                b'=' => {
+                    padding += 1;
+                    0
+                }
+                _ => return Err("invalid_base64_character".to_string()),
+            };
+        }
+        output.push((values[0] << 2) | (values[1] >> 4));
+        if padding < 2 {
+            output.push((values[1] << 4) | (values[2] >> 2));
+        }
+        if padding < 1 {
+            output.push((values[2] << 6) | values[3]);
+        }
+    }
+    Ok(output)
+}
+
 fn escape_json(value: &str) -> String {
     value.replace('\\', "\\\\").replace('"', "\\\"")
 }
@@ -3676,9 +3805,10 @@ mod tests {
             "POST",
             &format!("/api/projects/{project_id}/inputs"),
             &options,
-            "{\"inputs\":[{\"field\":\"project_name\",\"label\":\"Project name\",\"value\":\"Production Study\"},{\"field\":\"smiles\",\"label\":\"SMILES\",\"value\":\"CCO\"}],\"files\":[{\"field\":\"upload_structure_file\",\"name\":\"ligand.sdf\",\"size\":123,\"sha256\":\"9a0364b9e99bb480dd25e1f0284c8555\"}],\"advanced_parameters_collapsed\":true,\"field_schema\":\"genoligand.webui.input_manifest.v0.9.1\"}",
+            "{\"inputs\":[{\"field\":\"project_name\",\"label\":\"Project name\",\"value\":\"Production Study\"},{\"field\":\"smiles\",\"label\":\"SMILES\",\"value\":\"CCO\"}],\"files\":[{\"field\":\"upload_structure_file\",\"name\":\"ligand.sdf\",\"size\":7,\"sha256\":\"9a0364b9e99bb480dd25e1f0284c8555\",\"content_base64\":\"bGlnYW5kCg==\"}],\"advanced_parameters_collapsed\":true,\"field_schema\":\"genoligand.webui.input_manifest.v0.9.1\"}",
         );
         assert!(input_saved.contains("\"status\":\"saved\""));
+        assert!(input_saved.contains("\"persisted_files\":1"));
         let project_after_input = fs::read_to_string(
             options
                 .artifact_dir
@@ -3699,7 +3829,20 @@ mod tests {
         assert!(input_manifest.contains("\"field\":\"smiles\""));
         assert!(input_manifest.contains("field_schema"));
         assert!(input_manifest.contains("sha256"));
+        assert!(input_manifest.contains("content_persisted"));
+        assert!(input_manifest.contains("persisted_path"));
+        assert!(!input_manifest.contains("content_base64"));
         assert!(input_manifest.contains("ligand.sdf"));
+        assert!(
+            options
+                .artifact_dir
+                .join("projects")
+                .join(&project_id)
+                .join("inputs")
+                .join("files")
+                .join("upload_structure_file_ligand.sdf")
+                .exists()
+        );
 
         let (_, _, preflight) = route_http(
             "POST",

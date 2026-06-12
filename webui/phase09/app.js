@@ -1453,6 +1453,19 @@ async function fileSha256(file) {
     .join("");
 }
 
+async function fileBase64(file) {
+  if (!file?.arrayBuffer) {
+    return "";
+  }
+  const bytes = new Uint8Array(await file.arrayBuffer());
+  let binary = "";
+  const chunkSize = 0x8000;
+  for (let index = 0; index < bytes.length; index += chunkSize) {
+    binary += String.fromCharCode(...bytes.subarray(index, index + chunkSize));
+  }
+  return btoa(binary);
+}
+
 async function captureVisibleInputs() {
   const activeRoute = routeFromLocation();
   const fieldNodes = Array.from(document.querySelectorAll("input, textarea, select")).filter((node) => node.type !== "file");
@@ -1477,6 +1490,7 @@ async function captureVisibleInputs() {
             type: file.type || "application/octet-stream",
             last_modified: file.lastModified,
             sha256: await fileSha256(file),
+            content_base64: await fileBase64(file),
           }))
         )
       )
