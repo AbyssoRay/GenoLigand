@@ -365,9 +365,26 @@ function fileDrop(label, hint, acceptText) {
   return `<label class="file-drop"><strong>${labelText}</strong><span>${pick(hint)}</span><small>${pick(acceptText)}</small><input type="file" aria-label="${labelText}" data-field="${field}"></label>`;
 }
 
-function optionTiles(items) {
+function selectedChoiceValue(field) {
+  const entries = appState.inputDraft.inputs.filter((entry) => entry.field === field);
+  return entries.length ? entries[entries.length - 1].value : "";
+}
+
+function optionTiles(items, choiceField = "") {
+  const selectedChoice = choiceField ? selectedChoiceValue(choiceField) : "";
   return `<div class="option-tiles">${items
-    .map(([title, text, status]) => `<button class="option-tile ${status === "configured" ? "selected" : ""}" type="button"><strong>${pick(title)}</strong><span>${pick(text)}</span>${status ? statusPill(status) : ""}</button>`)
+    .map(([title, text, status, explicitValue]) => {
+      const value = explicitValue || fieldKeyFromLabel(title);
+      const isSelected = choiceField
+        ? selectedChoice
+          ? selectedChoice === value
+          : status === "configured"
+        : status === "configured";
+      const choiceAttrs = choiceField
+        ? `data-choice-field="${choiceField}" data-choice-label="${escapeHtml(pick(title))}" data-choice-value="${escapeHtml(value)}" aria-pressed="${isSelected}"`
+        : "";
+      return `<button class="option-tile ${isSelected ? "selected" : ""}" type="button" ${choiceAttrs}><strong>${pick(title)}</strong><span>${pick(text)}</span>${status ? statusPill(status) : ""}</button>`;
+    })
     .join("")}</div>`;
 }
 
@@ -564,7 +581,7 @@ function wizardPage(id) {
       [["多肽", "Peptide"], ["单字母序列、FASTA、长度、非法字符、非标准氨基酸和修饰信息。", "One-letter sequence, FASTA, length, invalid characters, non-standard residues, and modifications."], "ready"],
       [["蛋白质配体", "Protein ligand"], ["FASTA、PDB/mmCIF、预测结构和链选择。", "FASTA, PDB/mmCIF, predicted structure, and chain selection."], "ready"],
       [["已有复合物", "Existing complex"], ["晶体结构、冷冻电镜、预测复合物或对接复合物。", "Crystal, cryo-EM, predicted complex, or docked complex."], "ready"],
-    ]),
+    ], "molecule_type"),
     input_wizard_small_molecule_page: [
       textArea([["SMILES", "SMILES"]], [["", ""]], [["可直接粘贴；系统会检查格式、价态、三维结构和构象生成需求", "Paste directly; the system checks format, valence, 3D structure, and conformer needs"]]),
       fileDrop([["上传结构文件", "Upload structure file"]], [["拖入或选择 SDF/MOL2/PDB 文件", "Drop or choose SDF/MOL2/PDB file"]], [["支持本地文件；hash 会写入项目 manifest", "Local files are supported; hashes are written to the project manifest"]]),
@@ -603,7 +620,7 @@ function wizardPage(id) {
       optionTiles([
         [["预设物种", "Preset species"], ["选择已配置的 genome/annotation/transcript profile。", "Choose a configured genome/annotation/transcript profile."], "configured"],
         [["自定义物种", "Custom species"], ["上传 genome FASTA、GTF/GFF3、transcript FASTA 和可选 VCF。", "Upload genome FASTA, GTF/GFF3, transcript FASTA, and optional VCF."], "ready"],
-      ]),
+      ], "species_mode"),
       formGrid([
         [["物种", "Species"], ["Homo sapiens", "Homo sapiens"], ["可改为自定义物种名称", "Can be changed to a custom species name"]],
         [["基因组版本", "Genome version"], ["GRCh38", "GRCh38"], ["写入版本字段", "Written to version metadata"]],
@@ -614,14 +631,14 @@ function wizardPage(id) {
       [["保守搜索", "Conservative search"], ["面向已知 CDS 和高可信注释。", "Known CDS and high-confidence annotation."], "configured"],
       [["扩展转录本搜索", "Expanded transcript search"], ["面向非经典转录本 ORF。", "Non-canonical transcript ORFs."], "ready"],
       [["全基因组发现搜索", "Whole-genome discovery search"], ["六框翻译候选空间，计算量最高。", "Six-frame translated candidate space, highest compute cost."], "ready"],
-    ]),
+    ], "search_scope"),
     input_wizard_database_profile_page: databaseRegistry(),
     input_wizard_run_profile_page: optionTiles([
       [["快速环境自检", "Quick environment check"], ["低成本；验证服务、数据库路径、OpenMM/CUDA 和 Nextflow 可用性。", "Low cost; verifies service, database paths, OpenMM/CUDA, and Nextflow."], "configured"],
       [["标准靶点筛选", "Standard target screening"], ["生成候选排序和基础证据链。", "Produces candidate ranking and base evidence ledger."], "ready"],
       [["结构证据增强筛选", "Structure-enhanced screening"], ["增加结构、binding patch 和 docking evidence。", "Adds structure, binding patch, and docking evidence."], "ready"],
       [["物理中筛完整运行", "Physical mid-screen full run"], ["需要 GPU；增加 short-MD 摘要和稳定性评分。", "Requires GPU; adds short-MD summary and stability scoring."], "ready"],
-    ]),
+    ], "run_profile"),
     input_wizard_preflight_page: preflightTable(),
     input_wizard_review_start_page: [
       card([["启动摘要", "Launch Summary"]], metricGrid([
@@ -1614,6 +1631,7 @@ async function mergeInputDraft(snapshot) {
 
 async function collectInputManifest() {
   await mergeInputDraft();
+  ensureDefaultChoices();
   return {
     saved_at: new Date().toISOString(),
     route: routeFromLocation(),
@@ -1624,10 +1642,46 @@ async function collectInputManifest() {
   };
 }
 
+function ensureDefaultChoices() {
+  const defaults = [
+    ["input_wizard_molecule_type_page", "molecule_type", "Molecule Type", "small_molecule"],
+    ["input_wizard_genome_page", "species_mode", "Species mode", "preset_species"],
+    ["input_wizard_search_scope_page", "search_scope", "Search scope", "conservative_search"],
+    ["input_wizard_run_profile_page", "run_profile", "Run profile", "quick_environment_check"],
+  ];
+  for (const [route, field, label, value] of defaults) {
+    const hasChoice = appState.inputDraft.inputs.some((entry) => entry.field === field && entry.control_type === "choice");
+    if (!hasChoice) {
+      appState.inputDraft.inputs.push({ route, field, label, value, control_type: "choice" });
+    }
+  }
+}
+
 function queueInputDraftMerge() {
   mergeInputDraft().catch(() => {
     setMessage("warn", "输入暂存未完成，请保存配置时重试。", "Input capture did not finish; retry when saving configuration.");
   });
+}
+
+function storeChoiceSelection(node) {
+  const field = node.dataset.choiceField || "";
+  const value = node.dataset.choiceValue || "";
+  if (!field || !value) {
+    return;
+  }
+  const route = routeFromLocation();
+  const label = node.dataset.choiceLabel || value;
+  const entry = {
+    route,
+    field,
+    label,
+    value,
+    control_type: "choice",
+  };
+  appState.inputDraft.inputs = appState.inputDraft.inputs
+    .filter((existing) => !(existing.route === route && existing.field === field && existing.control_type === "choice"))
+    .concat(entry);
+  setMessage("", "选择已写入当前输入配置。", "Selection was written to the current input configuration.");
 }
 
 function setMessage(kind, zh, en) {
@@ -1951,6 +2005,12 @@ function bindEvents() {
     const actionButton = event.target.closest("[data-action]");
     if (actionButton) {
       handleAction(actionButton.dataset.action, actionButton.dataset);
+      return;
+    }
+    const choiceButton = event.target.closest("[data-choice-field]");
+    if (choiceButton) {
+      storeChoiceSelection(choiceButton);
+      render();
       return;
     }
     const peptide = event.target.closest("[data-insert-peptide]");
