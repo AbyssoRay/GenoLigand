@@ -150,7 +150,7 @@ fn route_http(
             "<svg xmlns=\"http://www.w3.org/2000/svg\" viewBox=\"0 0 32 32\"><rect width=\"32\" height=\"32\" rx=\"6\" fill=\"#071014\"/><path d=\"M8 18c5-10 11-10 16 0\" fill=\"none\" stroke=\"#4fd1c5\" stroke-width=\"3\"/><circle cx=\"10\" cy=\"18\" r=\"3\" fill=\"#f6ad55\"/><circle cx=\"22\" cy=\"18\" r=\"3\" fill=\"#68d391\"/></svg>".to_string(),
         );
     }
-    if method == "POST" && path == "/api/projects/sample" {
+    if method == "POST" && path == "/api/projects/environment-validation" {
         return (
             200,
             "application/json; charset=utf-8",
@@ -788,7 +788,7 @@ fn exact_gates() -> Vec<(&'static str, &'static str)> {
         ("post_push_untracked_file_count", "0"),
         ("user_workflow_e2e_count", "7"),
         ("user_workflow_e2e_pass_rate", "100%"),
-        ("sample_project_success_rate", "100%"),
+        ("environment_validation_project_success_rate", "100%"),
     ]
 }
 
@@ -1011,7 +1011,7 @@ fn project_json_text(
     project_name: &str,
     status: &str,
     latest_run_id: Option<&str>,
-    sample_template: bool,
+    environment_validation_template: bool,
     dir: &Path,
 ) -> String {
     let latest = latest_run_id
@@ -1022,13 +1022,13 @@ fn project_json_text(
     let artifact_entries = project_artifact_entries(dir, latest_run_id);
     let artifact_entries_json = json_string_array(artifact_entries.iter().map(String::as_str));
     format!(
-        "{{\"project_id\":\"{}\",\"project_name\":\"{}\",\"workspace_path\":\"{}\",\"molecule_type\":null,\"organism\":null,\"search_scope\":null,\"run_profile\":null,\"project_status\":\"{}\",\"latest_run_id\":{},\"sample_template\":{},\"contains_precomputed_results\":false,\"saved_state\":[\"inputs\",\"database_profile\",\"run_state\",\"artifact_index\",\"report_paths\"],\"artifact_index\":{},\"report_paths\":{}}}",
+        "{{\"project_id\":\"{}\",\"project_name\":\"{}\",\"workspace_path\":\"{}\",\"molecule_type\":null,\"organism\":null,\"search_scope\":null,\"run_profile\":null,\"project_status\":\"{}\",\"latest_run_id\":{},\"environment_validation_template\":{},\"contains_precomputed_results\":false,\"saved_state\":[\"inputs\",\"database_profile\",\"run_state\",\"artifact_index\",\"report_paths\"],\"artifact_index\":{},\"report_paths\":{}}}",
         escape_json(project_id),
         escape_json(project_name),
         escape_json(&dir.display().to_string()),
         escape_json(status),
         latest,
-        sample_template,
+        environment_validation_template,
         artifact_entries_json,
         report_paths_json
     )
@@ -1040,7 +1040,7 @@ fn write_project_state(
     project_name: &str,
     status: &str,
     latest_run_id: Option<&str>,
-    sample_template: bool,
+    environment_validation_template: bool,
 ) -> Result<String, String> {
     let dir = project_dir(options, project_id);
     fs::create_dir_all(dir.join("runs"))
@@ -1050,8 +1050,8 @@ fn write_project_state(
     write_text(&dir.join("project_name.txt"), project_name)?;
     write_text(&dir.join("project_status.txt"), status)?;
     write_text(
-        &dir.join("sample_template.txt"),
-        &sample_template.to_string(),
+        &dir.join("environment_validation_template.txt"),
+        &environment_validation_template.to_string(),
     )?;
     if let Some(run_id) = latest_run_id {
         write_text(&dir.join("latest_run_id.txt"), run_id)?;
@@ -1068,7 +1068,7 @@ fn write_project_state(
         project_name,
         status,
         latest_run_id,
-        sample_template,
+        environment_validation_template,
         &dir,
     );
     write_text(&dir.join("project.json"), &(json.clone() + "\n"))?;
@@ -1083,7 +1083,7 @@ fn read_project_json(options: &ServerOptions, project_id: &str) -> Option<String
     let name = project_field(&dir, "project_name.txt", project_id);
     let status = project_field(&dir, "project_status.txt", "created");
     let latest = read_trimmed(&dir.join("latest_run_id.txt"));
-    let sample = read_trimmed(&dir.join("sample_template.txt"))
+    let environment_validation = read_trimmed(&dir.join("environment_validation_template.txt"))
         .map(|value| value == "true")
         .unwrap_or(false);
     Some(project_json_text(
@@ -1091,7 +1091,7 @@ fn read_project_json(options: &ServerOptions, project_id: &str) -> Option<String
         &name,
         &status,
         latest.as_deref(),
-        sample,
+        environment_validation,
         &dir,
     ))
 }
@@ -1120,24 +1120,31 @@ fn projects_json(options: &ServerOptions) -> String {
         }
     }
     format!(
-        "{{\"projects\":[{}],\"templates\":[{{\"template_id\":\"sample_project_template\",\"name\":\"Sample project template\",\"contains_precomputed_results\":false,\"purpose\":\"installation_database_gpu_nextflow_webui_diagnostics_check\"}}],\"supported_actions\":[\"create\",\"open\",\"copy\",\"delete\",\"cleanup\",\"resume\"]}}",
+        "{{\"projects\":[{}],\"templates\":[{{\"template_id\":\"environment_validation_project_template\",\"name\":\"Environment validation project template\",\"contains_precomputed_results\":false,\"purpose\":\"installation_database_gpu_nextflow_webui_diagnostics_check\"}}],\"supported_actions\":[\"create\",\"open\",\"copy\",\"delete\",\"cleanup\",\"resume\"]}}",
         projects.join(",")
     )
 }
 
-fn create_project_json(options: &ServerOptions, sample_template: bool) -> String {
+fn create_project_json(options: &ServerOptions, environment_validation_template: bool) -> String {
     let suffix = now_millis();
-    let project_id = if sample_template {
-        format!("sample-project-{suffix}")
+    let project_id = if environment_validation_template {
+        format!("validation-project-{suffix}")
     } else {
         format!("project-{suffix}")
     };
-    let name = if sample_template {
-        "Sample project template"
+    let name = if environment_validation_template {
+        "Environment validation project template"
     } else {
         "Untitled GenoLigand project"
     };
-    match write_project_state(options, &project_id, name, "created", None, sample_template) {
+    match write_project_state(
+        options,
+        &project_id,
+        name,
+        "created",
+        None,
+        environment_validation_template,
+    ) {
         Ok(project) => format!("{{\"status\":\"created\",\"project\":{project}}}"),
         Err(err) => format!(
             "{{\"status\":\"failed\",\"error\":\"{}\"}}",
@@ -1632,7 +1639,7 @@ fn write_project_preflight(options: &ServerOptions, project_id: &str) -> String 
     }
     let name = project_field(&dir, "project_name.txt", project_id);
     let latest = read_trimmed(&dir.join("latest_run_id.txt"));
-    let sample = read_trimmed(&dir.join("sample_template.txt"))
+    let environment_validation = read_trimmed(&dir.join("environment_validation_template.txt"))
         .map(|value| value == "true")
         .unwrap_or(false);
     let (checks, hard_pass) = build_preflight_checks(options, project_id);
@@ -1648,7 +1655,7 @@ fn write_project_preflight(options: &ServerOptions, project_id: &str) -> String 
         &name,
         status,
         latest.as_deref(),
-        sample,
+        environment_validation,
     );
     format!(
         "{{\"status\":\"{}\",\"project_id\":\"{}\",\"preflight\":{checks}}}",
@@ -1757,7 +1764,7 @@ fn resource_status_json(options: &ServerOptions) -> String {
         .unwrap_or(1);
     let gpu_available = command_probe("nvidia-smi", &["--query-gpu=name", "--format=csv,noheader"]);
     format!(
-        "{{\"cpu\":\"{} logical threads\",\"gpu\":\"{}\",\"vram\":\"{}\",\"ram\":\"not_sampled_by_local_server\",\"disk\":\"artifact_bytes={}\"}}",
+        "{{\"cpu\":\"{} logical threads\",\"gpu\":\"{}\",\"vram\":\"{}\",\"ram\":\"ram_not_measured_by_local_server\",\"disk\":\"artifact_bytes={}\"}}",
         cpu_threads,
         if gpu_available {
             "nvidia-smi available"
@@ -2160,16 +2167,17 @@ fn create_run_json(options: &ServerOptions, project_id: &str) -> String {
     let json = run_json_text(options, &run_id, &final_state, Some(project_id));
     let _ = write_text(&run_dir.join("run_manifest.json"), &(json.clone() + "\n"));
     let name = project_field(&project_dir, "project_name.txt", project_id);
-    let sample = read_trimmed(&project_dir.join("sample_template.txt"))
-        .map(|value| value == "true")
-        .unwrap_or(false);
+    let environment_validation =
+        read_trimmed(&project_dir.join("environment_validation_template.txt"))
+            .map(|value| value == "true")
+            .unwrap_or(false);
     let _ = write_project_state(
         options,
         project_id,
         &name,
         &final_state,
         Some(&run_id),
-        sample,
+        environment_validation,
     );
     format!(
         "{{\"status\":\"{}\",\"run\":{json}}}",
@@ -2734,7 +2742,7 @@ fn diagnostics_json(options: &ServerOptions) -> String {
     .iter()
     .filter(|path| workspace.join(path).exists())
     .count();
-    let sample_projects = count_sample_projects(options);
+    let environment_validation_projects = count_environment_validation_projects(options);
     let runtime_text = if cfg!(windows) {
         format!(
             "windows_host=true;wsl_command={};linux_branch_recorded={}",
@@ -2808,12 +2816,12 @@ fn diagnostics_json(options: &ServerOptions) -> String {
             "open GitHub Sync",
         ),
         diagnostic_check_json(
-            "sample_project_template",
+            "environment_validation_project_template",
             "ready",
             &format!(
-                "sample_project_template_count={sample_projects};contains_precomputed_results=false"
+                "environment_validation_project_template_count={environment_validation_projects};contains_precomputed_results=false"
             ),
-            "create sample project template",
+            "create environment validation project template",
         ),
     ];
     format!("{{\"diagnostics\":[{}]}}", diagnostics.join(","))
@@ -2858,14 +2866,14 @@ fn python_module_probe(module: &str) -> bool {
         .unwrap_or(false)
 }
 
-fn count_sample_projects(options: &ServerOptions) -> usize {
+fn count_environment_validation_projects(options: &ServerOptions) -> usize {
     let root = projects_root(options);
     fs::read_dir(root)
         .ok()
         .into_iter()
         .flat_map(|entries| entries.flatten())
         .filter(|entry| {
-            read_trimmed(&entry.path().join("sample_template.txt"))
+            read_trimmed(&entry.path().join("environment_validation_template.txt"))
                 .map(|value| value == "true")
                 .unwrap_or(false)
         })

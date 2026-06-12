@@ -116,8 +116,8 @@ const labels = {
     noCandidates: "尚无真实计算候选。完成运行后这里会显示排序表。",
     notSelected: "尚未选择候选。请先在候选排序表中选择一行。",
     noLedger: "尚无证据链条目。报告生成后会显示映射关系。",
-    sampleProject: "示例项目模板",
-    sampleProjectText: "用于验证安装、数据库、GPU/OpenMM、Nextflow 恢复、WebUI 流程、输入、预检查、运行、监控、结果浏览、报告导出和诊断。模板不包含预计算候选或生物学结论。",
+    validationProject: "环境验证项目模板",
+    validationProjectText: "用于验证安装、数据库、GPU/OpenMM、Nextflow 恢复、WebUI 流程、输入、预检查、运行监控、结果浏览、报告导出和诊断。模板只保存验证配置，不包含预计算候选或生物学结论。",
     apiOwner: "服务接口",
     scienceOwner: "科学执行",
     storageOwner: "本地存储",
@@ -150,8 +150,8 @@ const labels = {
     noCandidates: "No computed candidates yet. Ranking appears after a completed run.",
     notSelected: "No candidate is selected. Select a row from the ranking table first.",
     noLedger: "No evidence ledger rows yet. Mappings appear after report generation.",
-    sampleProject: "Sample project template",
-    sampleProjectText: "Use it to verify installation, databases, GPU/OpenMM, Nextflow resume, WebUI flow, inputs, preflight, run, monitoring, result browsing, exports, and diagnostics. The template contains no precomputed candidates or biological conclusions.",
+    validationProject: "Environment validation project template",
+    validationProjectText: "Use it to verify installation, databases, GPU/OpenMM, Nextflow resume, WebUI flow, inputs, preflight, run monitoring, result browsing, exports, and diagnostics. The template stores validation configuration only and contains no precomputed candidates or biological conclusions.",
     apiOwner: "Service API",
     scienceOwner: "Scientific execution",
     storageOwner: "Local storage",
@@ -362,7 +362,7 @@ function inferAction(label) {
   const key = Array.isArray(label) ? label[1] : label;
   const actions = {
     "Create project": "create-project",
-    "Create sample project template": "create-sample-project",
+    "Create environment validation project template": "create-validation-project",
     "Save configuration": "save-configuration",
     "Open project": "open-project",
     "Copy project": "copy-project",
@@ -424,8 +424,8 @@ function dashboard() {
         )
       )}
       ${card(
-        [[t("sampleProject"), t("sampleProject")]],
-        `<p>${t("sampleProjectText")}</p>${buttonRow([[[ "创建示例项目模板", "Create sample project template" ], "", null], [[ "运行环境诊断", "Run diagnostics" ], "primary", "#/diagnostics_page"]])}`
+        [[t("validationProject"), t("validationProject")]],
+        `<p>${t("validationProjectText")}</p>${buttonRow([[[ "创建环境验证项目模板", "Create environment validation project template" ], "", null], [[ "运行环境诊断", "Run diagnostics" ], "primary", "#/diagnostics_page"]])}`
       )}
     </div>`,
     card(
@@ -1160,7 +1160,7 @@ function diagnostics() {
           [["OpenMM / CUDA / NVIDIA", ["检查平台、GPU、显存和驱动", "Checks platform, GPU, VRAM, and driver"], statusPill("waiting"), ["运行 GPU 诊断", "Run GPU diagnostics"]]],
           [[["数据库路径", "Database paths"], ["检查路径、hash、索引、空间和写权限", "Checks paths, hashes, indexes, space, and write permission"], statusPill("waiting"), ["打开数据库页", "Open databases"]]],
           [["Git / GitHub", ["检查 remote、权限、push 日志和远端 HEAD", "Checks remote, permission, push log, and remote HEAD"], statusPill("optional"), ["打开 GitHub 同步", "Open GitHub sync"]]],
-          [[t("sampleProject"), t("sampleProject")], [t("sampleProjectText"), t("sampleProjectText")], statusPill("ready"), ["创建模板", "Create template"]],
+          [[t("validationProject"), t("validationProject")], [t("validationProjectText"), t("validationProjectText")], statusPill("ready"), ["创建模板", "Create template"]],
         ].map((row) => row[0]),
         [["尚未运行诊断。", "Diagnostics have not run yet."]]
       )
@@ -1582,8 +1582,8 @@ async function handleAction(action, dataset = {}) {
     if (action === "select-candidate") {
       appState.selectedCandidateId = dataset.candidateId ? decodeURIComponent(dataset.candidateId) : null;
       setMessage("", "候选已选中。", "Candidate selected.");
-    } else if (action === "create-project" || action === "create-sample-project") {
-      const path = action === "create-sample-project" ? "/api/projects/sample" : "/api/projects";
+    } else if (action === "create-project" || action === "create-validation-project") {
+      const path = action === "create-validation-project" ? "/api/projects/environment-validation" : "/api/projects";
       const payload = await apiRequest(path, { method: "POST" });
       appState.selectedProject = payload.project || null;
       await refreshProjects();

@@ -57,8 +57,8 @@ If no GPU is available, choose a run profile that does not require GPU-backed MD
 8. Export reports and machine-readable artifacts.
 9. Use GitHub Sync when the repository state should be committed and pushed.
 
-## 6. Sample Project 模板 / Sample Project Template
+## 6. 环境验证项目模板 / Environment Validation Project Template
 
-The sample project template verifies service startup, database wiring, GPU/OpenMM discovery, Nextflow resume behavior, WebUI flow, inputs, preflight, run creation, monitoring, result browsing, export generation, and diagnostics.
+The environment validation project template verifies service startup, database wiring, GPU/OpenMM discovery, Nextflow resume behavior, WebUI flow, inputs, preflight, run creation, monitoring, result browsing, export generation, and diagnostics.
 
-It contains no precomputed candidates and no biological conclusions.
+It stores validation configuration only and contains no precomputed candidates or biological conclusions.

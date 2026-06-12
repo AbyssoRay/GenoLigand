@@ -48,16 +48,16 @@ python scripts\phase09\start_phase_0_9_webui.py --port 19190
 - 运行监控：显示阶段、命令、Nextflow run ID、日志尾部、CPU/GPU/显存/内存/磁盘占用、输出目录、失败原因和恢复状态。
 - 结果查看：候选排序、候选详情、Genome/ORF context、结构与 patch、MD 摘要、evidence ledger。
 - 报告导出：HTML、Markdown、CSV/TSV、JSON、artifact bundle、run manifest、tool version manifest、diagnostics report、GitHub push report。
-- 环境诊断：覆盖 WSL2、Linux、Rust binary、gls-cli、gls-server、Nextflow、Java、Python worker、OpenMM、CUDA、NVIDIA 设备、数据库路径、写入权限、磁盘、Git remote、GitHub 推送权限和示例项目模板。
+- 环境诊断：覆盖 WSL2、Linux、Rust binary、gls-cli、gls-server、Nextflow、Java、Python worker、OpenMM、CUDA、NVIDIA 设备、数据库路径、写入权限、磁盘、Git remote、GitHub 推送权限和环境验证项目模板。
 - GitHub 同步：显示 branch、commit hash、remote branch、push 状态、push 日志和 remote HEAD 验证。
 
 ## 页面语言和界面配色
 
 WebUI 固定使用暗色界面。右上角提供 `中文 / EN` 按钮，所有主要页面都支持中文和 English。
 
-## 示例项目模板
+## 环境验证项目模板
 
-WebUI 提供示例项目模板，用于验证安装、数据库、GPU/OpenMM、Nextflow 恢复、WebUI 流程、输入、预检查、运行、监控、结果浏览、报告导出和诊断是否可用。模板不包含预计算候选、不包含实验结论，也不会替代用户自己的研究项目。
+WebUI 提供环境验证项目模板，用于验证安装、数据库、GPU/OpenMM、Nextflow 恢复、WebUI 流程、输入、预检查、运行、监控、结果浏览、报告导出和诊断是否可用。模板只保存验证配置，不包含预计算候选、不包含实验结论，也不会替代用户自己的研究项目。
 
 ## 安装指南
 

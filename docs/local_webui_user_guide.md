@@ -84,12 +84,12 @@ Generated files are local artifacts. Keep the exported bundle together with the 
 
 ## 8. 环境诊断和 GitHub 同步 / Diagnostics And GitHub Sync
 
-Diagnostics checks WSL2, Linux, Rust binary, `gls-cli`, `gls-server`, Nextflow, Java, Python worker, OpenMM, CUDA, NVIDIA device, database paths, write permission, disk space, Git remote, GitHub push permission, and sample project template status.
+Diagnostics checks WSL2, Linux, Rust binary, `gls-cli`, `gls-server`, Nextflow, Java, Python worker, OpenMM, CUDA, NVIDIA device, database paths, write permission, disk space, Git remote, GitHub push permission, and environment validation project template status.
 
 GitHub Sync shows branch, local commit hash, remote branch, push state, push log, and remote HEAD verification. Use it only when you intend to record and push the current project state.
 
-## 9. Sample Project 模板 / Sample Project Template
+## 9. 环境验证项目模板 / Environment Validation Project Template
 
-The sample project template verifies installation, database wiring, GPU/OpenMM discovery, Nextflow resume behavior, WebUI flow, input capture, preflight, run creation, monitoring, result browsing, report export, and diagnostics.
+The environment validation project template verifies installation, database wiring, GPU/OpenMM discovery, Nextflow resume behavior, WebUI flow, input capture, preflight, run creation, monitoring, result browsing, report export, and diagnostics.
 
-It contains no precomputed candidates and no biological conclusions. Use it for environment verification, then create a separate research project for real input data.
+It stores validation configuration only, contains no precomputed candidates, and contains no biological conclusions. Use it for environment verification, then create a separate research project for real input data.

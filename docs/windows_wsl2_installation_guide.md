@@ -62,13 +62,13 @@ Use absolute Windows paths for Windows-hosted files and mounted Linux paths for 
 
 ## 5. 运行诊断 / Run Diagnostics
 
-Diagnostics covers WSL2, Linux kernel, Rust binary, `gls-cli`, `gls-server`, Nextflow, Java, Python worker, OpenMM, CUDA, NVIDIA device, database paths, write permission, disk space, Git remote, GitHub push permission, and sample project template status.
+Diagnostics covers WSL2, Linux kernel, Rust binary, `gls-cli`, `gls-server`, Nextflow, Java, Python worker, OpenMM, CUDA, NVIDIA device, database paths, write permission, disk space, Git remote, GitHub push permission, and environment validation project template status.
 
 Resolve environment warnings before launching expensive workflows.
 
-## 6. 运行 sample project 模板 / Run The Sample Project Template
+## 6. 运行环境验证项目模板 / Run The Environment Validation Project Template
 
-Use the sample project template to verify installation and workflow plumbing. It does not include precomputed candidates or biological conclusions.
+Use the environment validation project template to verify installation and workflow plumbing. It stores validation configuration only and does not include precomputed candidates or biological conclusions.
 
 After the template run creates manifests and artifact indexes, inspect Candidate Ranking, Candidate Detail, Genome/ORF Context, Structure and Patch Viewer, MD Summary, Evidence Ledger, Report Export, Diagnostics, and GitHub Sync.
 
