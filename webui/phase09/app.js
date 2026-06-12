@@ -222,9 +222,13 @@ let appState = {
   diagnostics: null,
   github: null,
   exports: null,
+  inputDraft: { inputs: [], files: [] },
 };
 
 function pick(value) {
+  if (Array.isArray(value) && value.length === 1 && Array.isArray(value[0])) {
+    return pick(value[0]);
+  }
   if (Array.isArray(value)) {
     return appState.lang === "zh" ? value[0] : value[1];
   }
@@ -283,7 +287,8 @@ function textArea(label, value, hint) {
 }
 
 function fileDrop(label, hint, acceptText) {
-  return `<div class="file-drop" role="button" tabindex="0"><strong>${pick(label)}</strong><span>${pick(hint)}</span><small>${pick(acceptText)}</small></div>`;
+  const labelText = pick(label);
+  return `<label class="file-drop"><strong>${labelText}</strong><span>${pick(hint)}</span><small>${pick(acceptText)}</small><input type="file" aria-label="${labelText}"></label>`;
 }
 
 function optionTiles(items) {
@@ -917,12 +922,58 @@ async function apiRequest(path, options = {}) {
     method: options.method || "GET",
     cache: "no-store",
     headers: { "Content-Type": "application/json" },
+    body: options.body,
   });
   const payload = await response.json();
   if (!response.ok) {
     throw new Error(payload.error || `http_${response.status}`);
   }
   return payload;
+}
+
+function inputEntryKey(entry) {
+  return [entry.route, entry.label, entry.control_type || entry.type || ""].join("::");
+}
+
+function captureVisibleInputs() {
+  const activeRoute = routeFromLocation();
+  const fieldNodes = Array.from(document.querySelectorAll("input, textarea, select")).filter((node) => node.type !== "file");
+  const fileNodes = Array.from(document.querySelectorAll('input[type="file"]'));
+  const inputs = fieldNodes.map((node) => ({
+    route: activeRoute,
+    label: node.getAttribute("aria-label") || node.closest("label")?.querySelector("span")?.textContent || node.name || node.id || "",
+    value: node.value || "",
+    control_type: node.tagName.toLowerCase(),
+  }));
+  const files = fileNodes.flatMap((node) =>
+    Array.from(node.files || []).map((file) => ({
+      route: activeRoute,
+      label: node.getAttribute("aria-label") || "",
+      name: file.name,
+      size: file.size,
+      type: file.type || "application/octet-stream",
+      last_modified: file.lastModified,
+    }))
+  );
+  return { inputs, files };
+}
+
+function mergeInputDraft(snapshot = captureVisibleInputs()) {
+  const visibleInputKeys = new Set(snapshot.inputs.map(inputEntryKey));
+  const visibleFileKeys = new Set(snapshot.files.map(inputEntryKey));
+  appState.inputDraft.inputs = appState.inputDraft.inputs.filter((entry) => !visibleInputKeys.has(inputEntryKey(entry))).concat(snapshot.inputs);
+  appState.inputDraft.files = appState.inputDraft.files.filter((entry) => !visibleFileKeys.has(inputEntryKey(entry))).concat(snapshot.files);
+}
+
+function collectInputManifest() {
+  mergeInputDraft();
+  return {
+    saved_at: new Date().toISOString(),
+    route: routeFromLocation(),
+    inputs: appState.inputDraft.inputs,
+    files: appState.inputDraft.files,
+    advanced_parameters_collapsed: true,
+  };
 }
 
 function setMessage(kind, zh, en) {
@@ -993,6 +1044,11 @@ async function handleAction(action) {
     } else if (action === "save-configuration") {
       const project = appState.selectedProject || (await apiRequest("/api/projects", { method: "POST" })).project;
       appState.selectedProject = project;
+      const manifest = collectInputManifest();
+      await apiRequest(`/api/projects/${project.project_id}/inputs`, {
+        method: "POST",
+        body: JSON.stringify(manifest),
+      });
       await refreshProjects();
       setMessage("", "配置已保存到本地项目 manifest。", "Configuration saved to the local project manifest.");
     } else if (action === "start-workflow" || action === "submit-run") {
@@ -1082,6 +1138,17 @@ function bindEvents() {
     const textAreaNode = document.querySelector("textarea");
     if (textAreaNode) {
       textAreaNode.value = peptide.dataset.insertPeptide;
+      mergeInputDraft();
+    }
+  });
+  document.addEventListener("input", (event) => {
+    if (event.target.matches("input, textarea, select")) {
+      mergeInputDraft();
+    }
+  });
+  document.addEventListener("change", (event) => {
+    if (event.target.matches("input, textarea, select")) {
+      mergeInputDraft();
     }
   });
 }

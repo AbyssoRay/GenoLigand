@@ -61,11 +61,7 @@ pub fn run_server(options: &ServerOptions) -> Result<(), String> {
 }
 
 fn handle_connection(mut stream: TcpStream, options: &ServerOptions) -> Result<(), String> {
-    let mut buffer = [0u8; 8192];
-    let n = stream
-        .read(&mut buffer)
-        .map_err(|err| format!("read_request_failed:{err}"))?;
-    let request = String::from_utf8_lossy(&buffer[..n]).to_string();
+    let request = read_http_request(&mut stream)?;
     let mut lines = request.lines();
     let first = lines
         .next()
@@ -80,11 +76,50 @@ fn handle_connection(mut stream: TcpStream, options: &ServerOptions) -> Result<(
     if path.starts_with("/ws/") {
         return handle_websocket(stream, path, &headers);
     }
-    let (status, content_type, body) = route_http(method, path, options);
+    let body_start = request
+        .find("\r\n\r\n")
+        .map(|index| index + 4)
+        .unwrap_or(request.len());
+    let request_body = &request[body_start..];
+    let (status, content_type, body) = route_http(method, path, options, request_body);
     write_http_response(&mut stream, status, content_type, body.as_bytes())
 }
 
-fn route_http(method: &str, path: &str, options: &ServerOptions) -> (u16, &'static str, String) {
+fn read_http_request(stream: &mut TcpStream) -> Result<String, String> {
+    let mut bytes = Vec::new();
+    let mut buffer = [0u8; 8192];
+    loop {
+        let n = stream
+            .read(&mut buffer)
+            .map_err(|err| format!("read_request_failed:{err}"))?;
+        if n == 0 {
+            break;
+        }
+        bytes.extend_from_slice(&buffer[..n]);
+        let request = String::from_utf8_lossy(&bytes).to_string();
+        if let Some(header_end) = request.find("\r\n\r\n") {
+            let headers = parse_headers(&request);
+            let content_length = headers
+                .get("content-length")
+                .and_then(|value| value.parse::<usize>().ok())
+                .unwrap_or(0);
+            if bytes.len() >= header_end + 4 + content_length {
+                return Ok(request);
+            }
+        }
+        if bytes.len() > 2_000_000 {
+            return Err("http_request_too_large".to_string());
+        }
+    }
+    Ok(String::from_utf8_lossy(&bytes).to_string())
+}
+
+fn route_http(
+    method: &str,
+    path: &str,
+    options: &ServerOptions,
+    request_body: &str,
+) -> (u16, &'static str, String) {
     if method == "GET" && (path == "/" || path == "/index.html") {
         return (
             200,
@@ -113,7 +148,7 @@ fn route_http(method: &str, path: &str, options: &ServerOptions) -> (u16, &'stat
             create_project_json(options, true),
         );
     }
-    if let Some(response) = route_project_resource(method, path, options) {
+    if let Some(response) = route_project_resource(method, path, options, request_body) {
         return response;
     }
     if let Some(response) = route_run_resource(method, path, options) {
@@ -162,6 +197,7 @@ fn route_project_resource(
     method: &str,
     path: &str,
     options: &ServerOptions,
+    request_body: &str,
 ) -> Option<(u16, &'static str, String)> {
     if !path.starts_with("/api/projects/") {
         return None;
@@ -169,6 +205,8 @@ fn route_project_resource(
     let (project_id, suffix) = parse_project_path(path)?;
     let body = if path.ends_with("/inputs") && method == "GET" {
         inputs_json()
+    } else if path.ends_with("/inputs") && method == "POST" {
+        write_project_inputs_json(options, &project_id, request_body)
     } else if path.ends_with("/preflight") && method == "GET" {
         preflight_json()
     } else if path.ends_with("/preflight") && method == "POST" {
@@ -1106,6 +1144,39 @@ fn inputs_json() -> String {
     "{\"steps\":[\"Project Basics\",\"Molecule Type\",\"Small Molecule\",\"Peptide\",\"Protein Ligand\",\"Existing Complex\",\"Species and Genome\",\"Search Scope\",\"Database Profile\",\"Run Profile\",\"Preflight Check\",\"Review and Start\"],\"advanced_parameters_collapsed\":true,\"supported_inputs\":[\"smiles\",\"sdf\",\"mol2\",\"pdb\",\"compound_name\",\"cas\",\"peptide_sequence\",\"fasta\",\"mmcif\",\"complex_structure\",\"genome_fasta\",\"gtf_gff3\",\"transcript_fasta\",\"vcf\"]}".to_string()
 }
 
+fn write_project_inputs_json(
+    options: &ServerOptions,
+    project_id: &str,
+    request_body: &str,
+) -> String {
+    let dir = project_dir(options, project_id);
+    if !dir.exists() {
+        return format!(
+            "{{\"status\":\"failed\",\"error\":\"project_not_found\",\"project_id\":\"{}\"}}",
+            escape_json(project_id)
+        );
+    }
+    let body = request_body.trim();
+    let manifest = if body.is_empty() {
+        "{\"inputs\":[],\"files\":[],\"advanced_parameters_collapsed\":true,\"status\":\"saved_without_form_values\"}".to_string()
+    } else {
+        body.to_string()
+    };
+    let path = dir.join("input_manifest.json");
+    match write_text(&path, &(manifest.clone() + "\n")) {
+        Ok(()) => format!(
+            "{{\"status\":\"saved\",\"project_id\":\"{}\",\"input_manifest\":\"{}\",\"bytes\":{}}}",
+            escape_json(project_id),
+            escape_json(&path.display().to_string()),
+            manifest.len()
+        ),
+        Err(err) => format!(
+            "{{\"status\":\"failed\",\"error\":\"{}\"}}",
+            escape_json(&err)
+        ),
+    }
+}
+
 fn preflight_json() -> String {
     "{\"checks\":[{\"check_id\":\"molecule_format\",\"status\":\"waiting\",\"coverage\":\"SMILES/SDF/MOL2/PDB, valence, 3D structure, conformers\",\"repair_action\":\"open_input_wizard\"},{\"check_id\":\"sequence_validity\",\"status\":\"waiting\",\"coverage\":\"illegal characters, non-standard residues, length, modifications\",\"repair_action\":\"edit_sequence\"},{\"check_id\":\"structure_files\",\"status\":\"waiting\",\"coverage\":\"chain ID, residue numbering, missing residues, readability\",\"repair_action\":\"open_structure_input\"},{\"check_id\":\"databases\",\"status\":\"waiting\",\"coverage\":\"profile, path, version, hash, index, missing items\",\"repair_action\":\"open_database_registry\"},{\"check_id\":\"runtime\",\"status\":\"waiting\",\"coverage\":\"disk, write permission, OpenMM, CUDA, Nextflow, Git remote, GitHub permission\",\"repair_action\":\"open_diagnostics\"}]}".to_string()
 }
@@ -1534,7 +1605,7 @@ mod tests {
             artifact_dir: PathBuf::from("acceptance_artifacts_phase_0_9_1_production_webui"),
             workspace_root: PathBuf::from("."),
         };
-        let (_, _, body) = route_http("GET", "/api/health", &options);
+        let (_, _, body) = route_http("GET", "/api/health", &options, "");
         assert!(body.contains("\"status\":\"ready\""));
         assert!(body.contains("\"service\":\"gls-server\""));
         assert!(body.contains("\"version\":\"0.9.1\""));
@@ -1554,7 +1625,7 @@ mod tests {
             workspace_root: PathBuf::from("."),
         };
 
-        let (_, _, created) = route_http("POST", "/api/projects", &options);
+        let (_, _, created) = route_http("POST", "/api/projects", &options, "");
         assert!(created.contains("\"status\":\"created\""));
         let project_id = extract_json_string(&created, "project_id");
         assert!(!project_id.is_empty());
@@ -1571,27 +1642,50 @@ mod tests {
             "POST",
             &format!("/api/projects/{project_id}/preflight"),
             &options,
+            "",
         );
         assert!(preflight.contains("\"status\":\"preflight_passed\""));
+
+        let (_, _, input_saved) = route_http(
+            "POST",
+            &format!("/api/projects/{project_id}/inputs"),
+            &options,
+            "{\"inputs\":[{\"field\":\"SMILES\",\"value\":\"CCO\"}],\"files\":[{\"name\":\"ligand.sdf\",\"size\":123}],\"advanced_parameters_collapsed\":true}",
+        );
+        assert!(input_saved.contains("\"status\":\"saved\""));
+        let input_manifest = fs::read_to_string(
+            options
+                .artifact_dir
+                .join("projects")
+                .join(&project_id)
+                .join("input_manifest.json"),
+        )
+        .unwrap();
+        assert!(input_manifest.contains("\"SMILES\""));
+        assert!(input_manifest.contains("ligand.sdf"));
 
         let (_, _, run) = route_http(
             "POST",
             &format!("/api/projects/{project_id}/runs"),
             &options,
+            "",
         );
         assert!(run.contains("\"status\":\"queued\""));
         let run_id = extract_json_string(&run, "run_id");
         assert!(!run_id.is_empty());
 
-        let (_, _, cancel) = route_http("POST", &format!("/api/runs/{run_id}/cancel"), &options);
+        let (_, _, cancel) =
+            route_http("POST", &format!("/api/runs/{run_id}/cancel"), &options, "");
         assert!(cancel.contains("\"status\":\"cancelled\""));
-        let (_, _, resume) = route_http("POST", &format!("/api/runs/{run_id}/resume"), &options);
+        let (_, _, resume) =
+            route_http("POST", &format!("/api/runs/{run_id}/resume"), &options, "");
         assert!(resume.contains("\"status\":\"resumable\""));
 
         let (_, _, copy) = route_http(
             "POST",
             &format!("/api/projects/{project_id}/copy"),
             &options,
+            "",
         );
         assert!(copy.contains("\"status\":\"created\""));
 
@@ -1599,11 +1693,16 @@ mod tests {
             "POST",
             &format!("/api/projects/{project_id}/cleanup"),
             &options,
+            "",
         );
         assert!(cleanup.contains("\"status\":\"completed\""));
 
-        let (_, _, deleted) =
-            route_http("DELETE", &format!("/api/projects/{project_id}"), &options);
+        let (_, _, deleted) = route_http(
+            "DELETE",
+            &format!("/api/projects/{project_id}"),
+            &options,
+            "",
+        );
         assert!(deleted.contains("\"status\":\"deleted\""));
         let _ = fs::remove_dir_all(root);
     }
@@ -1616,7 +1715,7 @@ mod tests {
             artifact_dir: std::env::temp_dir().join("genoligand_phase091_git_status"),
             workspace_root: std::env::current_dir().unwrap(),
         };
-        let (_, _, body) = route_http("GET", "/api/github/status", &options);
+        let (_, _, body) = route_http("GET", "/api/github/status", &options, "");
         assert!(body.contains("\"push_status\":\"idle\""));
         assert!(body.contains("\"branch\":"));
         assert!(body.contains("\"local_commit_hash\":"));
