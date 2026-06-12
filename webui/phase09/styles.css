@@ -839,6 +839,25 @@ textarea {
   margin-top: 14px;
 }
 
+.candidate-selector {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-top: 14px;
+}
+
+.candidate-chip {
+  max-width: 220px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.candidate-chip.selected {
+  border-color: rgba(50, 227, 123, 0.72);
+  background: rgba(50, 227, 123, 0.14);
+  color: var(--ready);
+}
+
 .option-tile {
   width: min(262px, 100%);
   min-height: 92px;

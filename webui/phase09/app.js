@@ -271,6 +271,7 @@ let appState = {
   runArtifacts: null,
   candidates: null,
   evidence: null,
+  selectedCandidateId: null,
   inputDraft: { inputs: [], files: [] },
 };
 
@@ -657,6 +658,78 @@ function currentRunNotice() {
     : pick(["当前浏览器会话没有绑定运行。", "No run is attached to this browser session."]);
 }
 
+function candidateRows() {
+  return appState.candidates?.candidates || [];
+}
+
+function candidateKey(row) {
+  return (
+    rowValue(row, "candidate_id") ||
+    rowValue(row, "orf_id") ||
+    rowValue(row, "gene_name") ||
+    rowValue(row, "rank") ||
+    ""
+  );
+}
+
+function selectedCandidate() {
+  const rows = candidateRows();
+  if (!rows.length) {
+    return null;
+  }
+  const wanted = appState.selectedCandidateId;
+  return rows.find((row) => candidateKey(row) === wanted) || rows[0];
+}
+
+function firstRowValue(row, keys) {
+  for (const key of keys) {
+    const value = rowValue(row, key);
+    if (value !== null && value !== undefined && value !== "") {
+      return value;
+    }
+  }
+  return "";
+}
+
+function rowContains(row, tokens) {
+  const text = Object.values(row || {}).join(" ").toLowerCase();
+  return tokens.some((token) => token && text.includes(String(token).toLowerCase()));
+}
+
+function evidenceRowsForCandidate(row) {
+  const rows = appState.evidence?.evidence || [];
+  const tokens = [candidateKey(row), rowValue(row, "orf_id"), rowValue(row, "gene_name")].filter(Boolean);
+  if (!tokens.length) {
+    return [];
+  }
+  return rows.filter((entry) => rowContains(entry, tokens));
+}
+
+function evidenceRowsForTokens(tokens) {
+  return (appState.evidence?.evidence || []).filter((entry) => rowContains(entry, tokens));
+}
+
+function rowsFromFields(row, fields) {
+  return fields.map(([label, keys]) => [label, valueOrDash(firstRowValue(row, keys))]);
+}
+
+function detailEvidenceTable(rows, emptyMessage) {
+  return dataTable(
+    evidenceHeaders,
+    rows.map((row) => evidenceFieldKeys.map((key) => valueOrDash(rowValue(row, key)))),
+    emptyMessage
+  );
+}
+
+function escapeHtml(value) {
+  return String(value ?? "")
+    .replaceAll("&", "&amp;")
+    .replaceAll("<", "&lt;")
+    .replaceAll(">", "&gt;")
+    .replaceAll('"', "&quot;")
+    .replaceAll("'", "&#39;");
+}
+
 function runMonitor() {
   const run = appState.selectedRun;
   const resource = run?.resource_status || {};
@@ -734,42 +807,98 @@ function runMonitor() {
 
 function candidateRanking() {
   const payload = appState.candidates || {};
-  const rows = payload.candidates || [];
+  const rows = candidateRows();
   const tableRows = rows.map((row) => candidateFieldKeys.map((key) => valueOrDash(rowValue(row, key))));
+  const selector = rows.length
+    ? `<div class="candidate-selector">${rows
+        .slice(0, 24)
+        .map((row) => {
+          const key = candidateKey(row);
+          const selected = key === candidateKey(selectedCandidate()) ? " selected" : "";
+          return `<button class="candidate-chip${selected}" type="button" data-action="select-candidate" data-candidate-id="${encodeURIComponent(key)}">${escapeHtml(valueOrDash(rowValue(row, "rank")))} ${escapeHtml(key)}</button>`;
+        })
+        .join("")}</div>`
+    : "";
   return card(
     [["候选排序表", "Candidate Ranking Table"]],
     `<p class="mono">${currentRunNotice()}</p>` +
       (payload.source_path ? `<p class="mono">source=${payload.source_path}</p>` : "") +
       dataTable(candidateHeaders, tableRows, payload.message || t("noCandidates")) +
-      buttonRow([[[ "打开候选详情", "Open candidate detail" ], "", "#/candidate_detail_page"], [[ "导出候选表", "Export candidate table" ], "primary", "#/report_export_page"]])
-  );
-  return card(
-    [["候选排序表", "Candidate Ranking Table"]],
-    dataTable(candidateHeaders, [], [t("noCandidates"), t("noCandidates")]) +
+      selector +
       buttonRow([[[ "打开候选详情", "Open candidate detail" ], "", "#/candidate_detail_page"], [[ "导出候选表", "Export candidate table" ], "primary", "#/report_export_page"]])
   );
 }
 
 function candidateDetail() {
-  const first = appState.candidates?.candidates?.[0] || null;
-  if (first) {
-    return card(
-      [["候选详情", "Candidate Detail"]],
-      dataTable(
-        [[["字段", "Field"], ["值", "Value"]].map((x) => x)][0],
-        [
-          [["candidate_id", "candidate_id"], valueOrDash(rowValue(first, "candidate_id"))],
-          [["gene_name", "gene_name"], valueOrDash(rowValue(first, "gene_name"))],
-          [["orf_id", "orf_id"], valueOrDash(rowValue(first, "orf_id"))],
-          [["genomic_coordinates", "genomic_coordinates"], valueOrDash(rowValue(first, "genomic_coordinates"))],
-          [["context_class", "context_class"], valueOrDash(rowValue(first, "context_class"))],
-          [["risk_flags", "risk_flags"], valueOrDash(rowValue(first, "risk_flags"))],
-          [["source_artifact", "source_artifact"], valueOrDash(appState.candidates?.source_path)],
-        ],
-        [["当前候选行缺少可显示字段。", "The current candidate row has no displayable fields."]]
-      ) +
-        buttonRow([[[ "返回候选排序", "Back to ranking" ], "", "#/candidate_ranking_page"]])
-    );
+  const candidate = selectedCandidate();
+  if (candidate) {
+    const evidenceRows = evidenceRowsForCandidate(candidate);
+    const structureRows = artifactRows(["structure", "patch", "docking", "pose", ".pdb", ".cif", ".mmcif"]);
+    const mdRows = artifactRows(["md_summary", "short_md", "molecular_dynamics", "rmsd", "rmsf", "drift", "occupancy", "trajectory", "hbond", "contact"]);
+    return [
+      card(
+        [["候选详情", "Candidate Detail"]],
+        `<p class="mono">${currentRunNotice()}</p>` +
+          dataTable(
+            [[["字段", "Field"], ["值", "Value"]].map((x) => x)][0],
+            rowsFromFields(candidate, [
+              [["candidate_id", "candidate_id"], ["candidate_id"]],
+              [["gene_name", "gene_name"], ["gene_name", "gene"]],
+              [["orf_id", "orf_id"], ["orf_id", "orf"]],
+              [["source_artifact", "source_artifact"], ["source_artifact", "source_file", "artifact"]],
+              [["candidate_source", "candidate_source"], ["candidate_source", "source", "origin"]],
+              [["database_evidence", "database_evidence"], ["database_evidence", "database_source", "known_database_hit"]],
+              [["risk_flags", "risk_flags"], ["risk_flags", "risk_flag"]],
+              [["experimental_validation_guidance", "experimental_validation_guidance"], ["experimental_validation_guidance", "validation_guidance", "experimental_guidance"]],
+            ]),
+            [["当前候选行缺少可显示字段。", "The current candidate row has no displayable fields."]]
+          )
+      ),
+      card(
+        [["ORF 与基因组位置", "ORF and Genomic Location"]],
+        dataTable(
+          [[["字段", "Field"], ["值", "Value"]].map((x) => x)][0],
+          rowsFromFields(candidate, [
+            [["ORF sequence", "ORF sequence"], ["orf_sequence", "protein_sequence", "sequence", "translated_sequence"]],
+            [["genomic_coordinates", "genomic_coordinates"], ["genomic_coordinates", "coordinates", "genome_location"]],
+            [["reading_frame", "reading_frame"], ["reading_frame", "frame", "orf_frame"]],
+            [["strand", "strand"], ["strand"]],
+            [["flanking_region", "flanking_region"], ["flanking_region", "flank", "upstream_downstream_region"]],
+            [["upstream_region", "upstream_region"], ["upstream_region", "upstream_sequence"]],
+            [["downstream_region", "downstream_region"], ["downstream_region", "downstream_sequence"]],
+          ]),
+          [["候选行尚未包含 ORF 或基因组字段。", "The candidate row does not yet include ORF or genomic fields."]]
+        )
+      ),
+      card(
+        [["证据模块", "Evidence Modules"]],
+        dataTable(
+          [[["字段", "Field"], ["值", "Value"]].map((x) => x)][0],
+          rowsFromFields(candidate, [
+            [["fragment_hits", "fragment_hits"], ["fragment_hits", "fragment_evidence", "fragment_score"]],
+            [["co_occurrence_evidence", "co_occurrence_evidence"], ["co_occurrence_evidence", "co_occurrence_score"]],
+            [["pLM evidence", "pLM evidence"], ["plm_evidence", "plm_score"]],
+            [["structure_evidence", "structure_evidence"], ["structure_evidence", "structure_score", "patch_evidence"]],
+            [["docking_evidence", "docking_evidence"], ["docking_evidence", "docking_score", "docking_pose"]],
+            [["MD evidence", "MD evidence"], ["md_evidence", "md_stability_score", "md_score_decomposition"]],
+          ]).concat([[[ "linked_evidence_rows", "linked_evidence_rows" ], String(evidenceRows.length)]]),
+          [["候选行尚未包含证据字段。", "The candidate row does not yet include evidence fields."]]
+        )
+      ),
+      card(
+        [["结构、Docking 与 MD 产物", "Structure, Docking, and MD Artifacts"]],
+        dataTable(
+          [[["类型", "Type"], ["路径", "Path"], ["状态", "State"]].map((x) => x)][0],
+          [...structureRows, ...mdRows],
+          [["当前候选没有关联结构或 MD 产物。", "The selected candidate has no linked structure or MD artifacts yet."]]
+        )
+      ),
+      card(
+        [["候选证据 Ledger 行", "Candidate Evidence Ledger Rows"]],
+        detailEvidenceTable(evidenceRows, [["当前候选没有匹配的 evidence ledger 行。", "No evidence ledger row currently matches this candidate."]])
+      ),
+      buttonRow([[[ "返回候选排序", "Back to ranking" ], "", "#/candidate_ranking_page"]]),
+    ].join("");
   }
   return [
     stateBlock("", [["未选择候选", "No Candidate Selected"]], [t("notSelected"), t("notSelected")], "#/candidate_ranking_page"),
@@ -785,6 +914,26 @@ function candidateDetail() {
 }
 
 function genomeContext() {
+  const rows = candidateRows();
+  if (rows.length) {
+    return card(
+      [["Genome/ORF Context Viewer", "Genome/ORF Context Viewer"]],
+      `<p class="mono">${currentRunNotice()}</p>` +
+        dataTable(
+          [[["候选", "Candidate"], ["基因", "Gene"], ["ORF", "ORF"], ["坐标", "Coordinates"], ["上下文", "Context"], ["阅读框", "Frame"], ["变异", "Variant"]].map((x) => x)][0],
+          rows.map((row) => [
+            valueOrDash(candidateKey(row)),
+            valueOrDash(rowValue(row, "gene_name")),
+            valueOrDash(rowValue(row, "orf_id")),
+            valueOrDash(rowValue(row, "genomic_coordinates")),
+            valueOrDash(rowValue(row, "context_class")),
+            valueOrDash(firstRowValue(row, ["reading_frame", "frame", "orf_frame", "strand"])),
+            valueOrDash(firstRowValue(row, ["variant_id", "variant", "allele"])),
+          ]),
+          [["当前 run 尚未生成 Genome/ORF context 行。", "The selected run has not generated Genome/ORF context rows yet."]]
+        )
+    );
+  }
   return card(
     [["Genome/ORF Context Viewer", "Genome/ORF Context Viewer"]],
     dataTable(
@@ -807,6 +956,8 @@ function genomeContext() {
 
 function structureViewer() {
   const rows = artifactRows(["structure", "patch", "docking", "pose", ".pdb", ".cif", ".mmcif"]);
+  const candidate = selectedCandidate();
+  const evidenceRows = evidenceRowsForTokens(["structure", "patch", "docking", "pose", "residue"]);
   return [
     `<section class="panel"><div class="panel-header"><h2>${pick(["结构视图", "Structure View"])}</h2>${statusPill(rows.length ? "ready" : "idle")}</div>
       <div class="structure-stage" aria-label="${pick(["结构产物查看区域", "Structure artifact viewer"])}">
@@ -823,57 +974,71 @@ function structureViewer() {
         [["当前 run 尚未生成结构、patch 或 docking 产物。", "The selected run has not generated structure, patch, or docking artifacts yet."]]
       )
     ),
-  ].join("");
-  return [
-    `<section class="panel"><div class="panel-header"><h2>${pick(["结构视图", "Structure View"])}</h2>${statusPill("idle")}</div>
-      <div class="structure-stage" aria-label="Structure artifact viewer">
-        <div class="pocket-cloud"></div><div class="ligand-stick"></div><div class="patch-ring"></div>
-        <span>${pick(["等待真实结构产物", "Waiting for computed structure artifact"])}</span>
-      </div>
-      <p>${pick(["真实运行完成后展示候选结构、binding patch、关键残基、docking pose、配体位置和相互作用残基。", "After a computed run, this view shows candidate structure, binding patch, key residues, docking pose, ligand location, and interacting residues."])}</p>
-    </section>`,
     card(
-      [["Patch Evidence 字段", "Patch Evidence Fields"]],
+      [["结构与 Patch 字段", "Structure and Patch Fields"]],
       dataTable(
-        [[["字段", "Field"], ["说明", "Description"]].map((x) => x)][0],
-        [
-          [[["binding patch", "binding patch"], ["局部结构区域和 descriptor hash", "local structural region and descriptor hash"]]],
-          [[["关键残基", "key residues"], ["残基编号、链、距离和相互作用类型", "residue number, chain, distance, and interaction type"]]],
-          [[["docking pose", "docking pose"], ["pose 文件、配体坐标和评分来源", "pose file, ligand coordinates, and score source"]]],
-        ].map((row) => row[0]),
-        [["等待结构产物。", "Waiting for structure artifacts."]]
+        [[["字段", "Field"], ["值", "Value"]].map((x) => x)][0],
+        candidate
+          ? rowsFromFields(candidate, [
+              [["candidate_id", "candidate_id"], ["candidate_id"]],
+              [["structure_score", "structure_score"], ["structure_score"]],
+              [["structure_evidence", "structure_evidence"], ["structure_evidence"]],
+              [["binding_patch", "binding_patch"], ["binding_patch", "patch", "patch_id"]],
+              [["patch_evidence", "patch_evidence"], ["patch_evidence", "patch_descriptor_hash"]],
+              [["key_residues", "key_residues"], ["key_residues", "interaction_residues", "residues"]],
+              [["docking_score", "docking_score"], ["docking_score"]],
+              [["docking_pose", "docking_pose"], ["docking_pose", "pose_file"]],
+              [["ligand_position", "ligand_position"], ["ligand_position", "ligand_coordinates"]],
+            ])
+          : [],
+        [["选择候选后显示结构、patch、pose 和相互作用字段。", "Select a candidate to show structure, patch, pose, and interaction fields."]]
       )
+    ),
+    card(
+      [["结构证据 Ledger 行", "Structure Evidence Ledger Rows"]],
+      detailEvidenceTable(evidenceRows, [["当前 run 尚未生成结构相关 evidence ledger 行。", "The selected run has no structure-related evidence ledger rows yet."]])
     ),
   ].join("");
 }
 
 function mdSummary() {
-  const rows = artifactRows(["md", "rmsd", "rmsf", "drift", "occupancy", "trajectory", "hbond", "contact"]);
-  return card(
-    [["MD 摘要产物", "MD Summary Artifacts"]],
-    dataTable(
-      [[["产物类型", "Artifact type"], ["路径", "Path"], ["状态", "State"]].map((x) => x)][0],
-      rows,
-      [["当前 run 尚未生成 RMSD、RMSF、occupancy 或 score decomposition 产物。", "The selected run has not generated RMSD, RMSF, occupancy, or score decomposition artifacts yet."]]
-    )
-  );
-  return card(
-    [["MD 摘要字段", "MD Summary Fields"]],
-    dataTable(
-      [[["指标", "Metric"], ["来源", "Source"], ["显示方式", "Display"]].map((x) => x)][0],
-      [
-        [["RMSD", "trajectory summary", "time-series and median"]],
-        [["RMSF", "trajectory summary", "per-residue table"]],
-        [["ligand drift", "ligand trajectory", "distance distribution"]],
-        [["hydrogen bond occupancy", "interaction features", "occupancy table"]],
-        [["contact occupancy", "interaction features", "occupancy table"]],
-        [["interaction persistence", "feature aggregation", "persistence flags"]],
-        [["MD risk flags", "score model", "risk list"]],
-        [["MD score decomposition", "Rust score model", "weighted components"]],
-      ],
-      [["MD 完成后显示摘要。", "MD summary appears after MD completes."]]
-    )
-  );
+  const rows = artifactRows(["md_summary", "short_md", "molecular_dynamics", "rmsd", "rmsf", "drift", "occupancy", "trajectory", "hbond", "contact"]);
+  const candidate = selectedCandidate();
+  const evidenceRows = evidenceRowsForTokens(["md_stability", "md_score", "rmsd", "rmsf", "drift", "occupancy", "trajectory", "hbond", "contact"]);
+  return [
+    card(
+      [["MD 摘要产物", "MD Summary Artifacts"]],
+      dataTable(
+        [[["产物类型", "Artifact type"], ["路径", "Path"], ["状态", "State"]].map((x) => x)][0],
+        rows,
+        [["当前 run 尚未生成 RMSD、RMSF、occupancy 或 score decomposition 产物。", "The selected run has not generated RMSD, RMSF, occupancy, or score decomposition artifacts yet."]]
+      )
+    ),
+    card(
+      [["MD 摘要字段", "MD Summary Fields"]],
+      dataTable(
+        [[["指标", "Metric"], ["值", "Value"]].map((x) => x)][0],
+        candidate
+          ? rowsFromFields(candidate, [
+              [["RMSD", "RMSD"], ["rmsd", "md_rmsd", "rmsd_summary"]],
+              [["RMSF", "RMSF"], ["rmsf", "md_rmsf", "rmsf_summary"]],
+              [["ligand drift", "ligand drift"], ["ligand_drift", "drift"]],
+              [["hydrogen bond occupancy", "hydrogen bond occupancy"], ["hydrogen_bond_occupancy", "hbond_occupancy"]],
+              [["contact occupancy", "contact occupancy"], ["contact_occupancy"]],
+              [["interaction persistence", "interaction persistence"], ["interaction_persistence"]],
+              [["MD risk flags", "MD risk flags"], ["md_risk_flags", "risk_flags"]],
+              [["MD score decomposition", "MD score decomposition"], ["md_score_decomposition", "score_decomposition"]],
+              [["MD stability score", "MD stability score"], ["md_stability_score"]],
+            ])
+          : [],
+        [["选择候选后显示 MD 摘要字段。", "Select a candidate to show MD summary fields."]]
+      )
+    ),
+    card(
+      [["MD 证据 Ledger 行", "MD Evidence Ledger Rows"]],
+      detailEvidenceTable(evidenceRows, [["当前 run 尚未生成 MD 相关 evidence ledger 行。", "The selected run has no MD-related evidence ledger rows yet."]])
+    ),
+  ].join("");
 }
 
 function evidenceLedger() {
@@ -1330,6 +1495,7 @@ async function refreshRunDetails(run = appState.selectedRun) {
     appState.runArtifacts = null;
     appState.candidates = null;
     appState.evidence = null;
+    appState.selectedCandidateId = null;
     return;
   }
   try {
@@ -1345,8 +1511,13 @@ async function refreshRunDetails(run = appState.selectedRun) {
   }
   try {
     appState.candidates = await apiRequest(`/api/runs/${run.run_id}/candidates`);
+    const rows = appState.candidates?.candidates || [];
+    if (!rows.some((row) => candidateKey(row) === appState.selectedCandidateId)) {
+      appState.selectedCandidateId = rows.length ? candidateKey(rows[0]) : null;
+    }
   } catch (_error) {
     appState.candidates = null;
+    appState.selectedCandidateId = null;
   }
   try {
     appState.evidence = await apiRequest(`/api/runs/${run.run_id}/evidence`);
@@ -1373,9 +1544,12 @@ async function refreshWorkspaceState() {
   }
 }
 
-async function handleAction(action) {
+async function handleAction(action, dataset = {}) {
   try {
-    if (action === "create-project" || action === "create-sample-project") {
+    if (action === "select-candidate") {
+      appState.selectedCandidateId = dataset.candidateId ? decodeURIComponent(dataset.candidateId) : null;
+      setMessage("", "候选已选中。", "Candidate selected.");
+    } else if (action === "create-project" || action === "create-sample-project") {
       const path = action === "create-sample-project" ? "/api/projects/sample" : "/api/projects";
       const payload = await apiRequest(path, { method: "POST" });
       appState.selectedProject = payload.project || null;
@@ -1510,7 +1684,7 @@ function bindEvents() {
     }
     const actionButton = event.target.closest("[data-action]");
     if (actionButton) {
-      handleAction(actionButton.dataset.action);
+      handleAction(actionButton.dataset.action, actionButton.dataset);
       return;
     }
     const peptide = event.target.closest("[data-insert-peptide]");

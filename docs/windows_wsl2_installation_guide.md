@@ -1,6 +1,6 @@
 # GenoLigand 0.9.1 Windows + WSL2 Installation Guide
 
-## 1. Windows Requirements
+## 1. Windows 前置条件 / Windows Requirements
 
 - Windows 11
 - PowerShell
@@ -8,20 +8,28 @@
 - Python 3.11 or newer
 - Git
 - A WSL2 Linux backend for scientific engines
+- NVIDIA driver with WSL CUDA support when physical mid-screen mode is required
 
-## 2. WSL2 Runtime
+Keep your default personal WSL distribution unchanged unless you explicitly decide to use it for GenoLigand. A dedicated project backend is preferred for scientific tools and database mounts.
 
-Use the project WSL2 backend configured for GenoLigand scientific tools. Keep the default personal WSL distribution unchanged unless you explicitly decide to use it for this project.
+## 2. WSL2 科学后端 / WSL2 Scientific Backend
 
-The Linux backend should provide:
+The Linux backend should provide Java, Nextflow, Python worker environment, OpenMM, and CUDA device visibility when GPU-backed MD is selected.
 
-- Java and Nextflow
-- Python worker environment
-- OpenMM
-- CUDA and NVIDIA device access when physical mid-screen mode is selected
-- Database mounts or local paths for genome, annotation, transcript, BioLiP2, UniProt, ChEMBL/BindingDB, and structure cache
+Mount or configure paths for:
 
-## 3. Start The WebUI From Windows
+- genome FASTA
+- GTF/GFF3 annotation
+- transcript FASTA
+- optional VCF
+- BioLiP2
+- UniProt
+- ChEMBL/BindingDB warehouse
+- RCSB/AFDB structure cache
+
+Run Diagnostics in the WebUI after any WSL path or environment change.
+
+## 3. 从 Windows 启动 WebUI / Start From Windows
 
 ```powershell
 cd D:\Project\rust\GenoLigand
@@ -34,14 +42,41 @@ Open:
 http://127.0.0.1:19090/
 ```
 
-## 4. Configure Databases
+To reuse an existing binary:
 
-Open Databases in the WebUI and select or create a database profile. Check path, version, hash, index state, missing items, storage use, and repair action.
+```powershell
+python scripts\phase09\start_phase_0_9_webui.py --no-build
+```
 
-## 5. Run Diagnostics
+To choose another local port:
 
-Open Diagnostics and check WSL2, Rust binary, gls-cli, gls-server, Nextflow, Java, Python worker, OpenMM, CUDA, NVIDIA device, database paths, write permission, disk space, Git remote, and GitHub permission.
+```powershell
+python scripts\phase09\start_phase_0_9_webui.py --port 19190
+```
 
-## 6. Run The Sample Project Template
+## 4. 配置数据库 / Configure Databases
 
-Use the sample project template only to verify installation and workflow plumbing. It does not contain precomputed candidates or biological conclusions.
+Open Database Registry. Select or create a profile, then review path, release/version, hash, index status, missing item count, storage use, and repair action for every required source.
+
+Use absolute Windows paths for Windows-hosted files and mounted Linux paths for WSL-hosted files. Keep the same profile for a run so evidence ledgers can map claims to exact database versions.
+
+## 5. 运行诊断 / Run Diagnostics
+
+Diagnostics covers WSL2, Linux kernel, Rust binary, `gls-cli`, `gls-server`, Nextflow, Java, Python worker, OpenMM, CUDA, NVIDIA device, database paths, write permission, disk space, Git remote, GitHub push permission, and sample project template status.
+
+Resolve environment warnings before launching expensive workflows.
+
+## 6. 运行 sample project 模板 / Run The Sample Project Template
+
+Use the sample project template to verify installation and workflow plumbing. It does not include precomputed candidates or biological conclusions.
+
+After the template run creates manifests and artifact indexes, inspect Candidate Ranking, Candidate Detail, Genome/ORF Context, Structure and Patch Viewer, MD Summary, Evidence Ledger, Report Export, Diagnostics, and GitHub Sync.
+
+## 7. 停止服务 / Stop The Service
+
+Press `Ctrl+C` in the service terminal. If the process was started in a background window:
+
+```powershell
+Get-Process gls-server
+Stop-Process -Name gls-server
+```
