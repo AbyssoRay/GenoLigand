@@ -1,0 +1,71 @@
+<!doctype html>
+<html lang="en" data-theme="dark">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>GenoLigand Local WebUI Beta</title>
+    <link rel="stylesheet" href="/styles.css" />
+  </head>
+  <body>
+    <div class="app-shell">
+      <aside class="sidebar" aria-label="Primary navigation">
+        <div class="brand">
+          <div class="brand-mark">GL</div>
+          <div>
+            <strong>GenoLigand</strong>
+            <span>Local WebUI Beta</span>
+          </div>
+        </div>
+        <nav data-nav></nav>
+        <div class="sidebar-footer">
+          <span class="status pass">PASS</span>
+          <span>Rust-owned chain</span>
+        </div>
+      </aside>
+
+      <section class="workspace">
+        <header class="topbar">
+          <div>
+            <strong>Salidroside human genome target search</strong>
+            <span>demo-run / WSL2 / CUDA PASS / main / pushed</span>
+          </div>
+          <div class="top-actions">
+            <button data-theme-toggle type="button">Theme</button>
+            <a class="button" href="#/report_export_page">Export</a>
+          </div>
+        </header>
+
+        <main class="main-grid">
+          <section class="main-panel">
+            <div class="page-header">
+              <div>
+                <span class="eyeless">Phase 0.9</span>
+                <h1 data-page-title>Command Center</h1>
+                <p>Local single-user WebUI beta through gls-server, gls-cli, and Rust-owned scientific semantics.</p>
+              </div>
+              <span class="status running">RUNNING</span>
+            </div>
+            <div class="grid" data-main></div>
+          </section>
+
+          <aside class="detail-panel" aria-label="Detail panel" data-detail></aside>
+        </main>
+
+        <section class="log-strip" aria-label="Run log">
+          <div class="timeline">
+            <div class="timeline-item"><span>00:00</span><strong>Project loaded</strong><span class="status pass">PASS</span></div>
+            <div class="timeline-item"><span>00:03</span><strong>Preflight complete</strong><span class="status pass">PASS</span></div>
+            <div class="timeline-item"><span>00:09</span><strong>Nextflow first/resume</strong><span class="status pass">PASS</span></div>
+            <div class="timeline-item"><span>00:12</span><strong>Report ready</strong><span class="status pushed">PUSHED</span></div>
+          </div>
+          <pre>[INFO] gls-server health: PASS
+[INFO] API contract validation: PASS
+[INFO] WebSocket logs/status validation: PASS
+[INFO] WebUI visual audit: PASS
+[INFO] FINAL_VERDICT source: metrics/master_validation_phase_0_9.json</pre>
+        </section>
+      </section>
+    </div>
+    <script src="/app.js"></script>
+  </body>
+</html>

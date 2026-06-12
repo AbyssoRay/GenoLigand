@@ -1,0 +1,31 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Phase 0.9 Run Model",
+  "type": "object",
+  "required": [
+    "run_id",
+    "state",
+    "current_stage",
+    "resumable"
+  ],
+  "properties": {
+    "run_id": {
+      "type": "string"
+    },
+    "state": {
+      "enum": [
+        "queued",
+        "running",
+        "completed",
+        "failed",
+        "cancelled"
+      ]
+    },
+    "current_stage": {
+      "type": "string"
+    },
+    "resumable": {
+      "type": "boolean"
+    }
+  }
+}

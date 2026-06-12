@@ -1,0 +1,10 @@
+metric	value	status
+post_push_cleanup_pass	True	PASS
+post_push_local_history_artifact_count	0	PASS
+post_push_local_cache_count	0	PASS
+post_push_old_report_count	0	PASS
+post_push_old_screenshot_count	0	PASS
+post_push_nextflow_cache_count	0	PASS
+post_push_tmp_work_dir_count	0	PASS
+post_push_old_visual_audit_intermediate_count	0	PASS
+post_push_untracked_file_count	0	PASS

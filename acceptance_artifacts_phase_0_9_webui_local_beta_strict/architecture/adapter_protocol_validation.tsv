@@ -1,0 +1,7 @@
+tool_name	adapter_registry_entry	license_record	job_schema	result_schema	owned_by_rust_decision_logic	status
+OpenMM	yes	MIT/LGPL/BSD mixed open-source record	schemas/worker_job.phase_0_8_5.schema.json	schemas/worker_result.phase_0_8_5.schema.json	true	PASS
+PDBFixer	yes	MIT	schemas/worker_job.phase_0_8_5.schema.json	schemas/worker_result.phase_0_8_5.schema.json	true	PASS
+OpenFF Toolkit	yes	MIT	schemas/worker_job.phase_0_8_5.schema.json	schemas/worker_result.phase_0_8_5.schema.json	true	PASS
+RDKit	yes	BSD-3-Clause	schemas/worker_job.phase_0_8_5.schema.json	schemas/worker_result.phase_0_8_5.schema.json	true	PASS
+MDTraj	yes	LGPL-2.1-or-later	schemas/worker_job.phase_0_8_5.schema.json	schemas/worker_result.phase_0_8_5.schema.json	true	PASS
+MDAnalysis	yes	GPL-2.0-or-later	schemas/worker_job.phase_0_8_5.schema.json	schemas/worker_result.phase_0_8_5.schema.json	true	PASS

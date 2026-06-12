@@ -1,0 +1,2 @@
+workflow	md_process_count	gls_cli_call_count	direct_python_md_call_count	nextflow_md_process_gls_cli_call_rate	status
+/mnt/d/Project/rust/GenoLigand/workflows/phase_0_8_5_integrated_chain_rust_cleanup_strict.nf	6	9	0	100%	PASS

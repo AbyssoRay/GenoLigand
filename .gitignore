@@ -207,5 +207,17 @@ $RECYCLE.BIN/
 /tools/cache/
 /tools/tmp/
 
+# Phase 0.9 WebUI local beta runtime caches and heavy generated state.
+/outputs/phase_0_9/
+/databases/phase_0_9/
+/data/external_phase_0_9/
+/.phase_0_9_env/
+/.phase_0_9_tools/
+/webui/.cache/
+/webui/dist/
+/webui/playwright-report/
+/webui/test-results/
+/webui/node_modules/
+
 
 AGENTS.md

@@ -1,0 +1,6 @@
+category	selection	license	status
+framework	Open Web Platform	W3C/WHATWG standards	PASS
+server	Rust std TcpListener	Rust standard library	PASS
+styles	CSS Grid/Flexbox	open standard	PASS
+screenshots	Microsoft Edge headless	Microsoft Edge WebView terms recorded as local tool	PASS
+structure_viewer	CSS/SVG lightweight viewer	open standard	PASS

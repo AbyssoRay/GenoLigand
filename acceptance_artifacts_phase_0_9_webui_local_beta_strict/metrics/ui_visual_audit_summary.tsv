@@ -1,0 +1,10 @@
+check_id	value	status
+ui_visual_defect_count	0	PASS
+ui_layout_overflow_count	0	PASS
+ui_unreadable_text_count	0	PASS
+ui_broken_component_count	0	PASS
+ui_missing_empty_state_count	0	PASS
+ui_missing_error_state_count	0	PASS
+ui_screenshot_metadata_completion_rate	100%	PASS
+ui_dark_mode_visual_pass	True	PASS
+ui_light_mode_visual_pass	True	PASS

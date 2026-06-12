@@ -1,0 +1,11 @@
+component	page_count	status
+sidebar	29	PASS
+main_workspace	29	PASS
+detail_panel	29	PASS
+task_queue	29	PASS
+timeline	29	PASS
+artifact_tree	29	PASS
+terminal_logs	29	PASS
+status_labels	29	PASS
+dark_mode	29	PASS
+light_mode	29	PASS

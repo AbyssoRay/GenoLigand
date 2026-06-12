@@ -1,0 +1,8 @@
+workflow	status
+project_create	PASS
+input_wizard	PASS
+run_monitor	PASS
+candidate_review	PASS
+report_export	PASS
+diagnostics	PASS
+github_sync	PASS

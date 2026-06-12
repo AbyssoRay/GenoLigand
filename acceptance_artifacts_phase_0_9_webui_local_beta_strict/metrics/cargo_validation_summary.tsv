@@ -1,0 +1,6 @@
+check	status
+cargo_fmt	PASS
+cargo_clippy	PASS
+cargo_test	PASS
+build_gls_cli	PASS
+build_gls_server	PASS

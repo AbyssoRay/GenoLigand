@@ -22,6 +22,7 @@ members = [
   "crates/gls-md",
   "crates/gls-maintain",
   "crates/gls-architecture",
+  "crates/gls-server",
   "crates/gls-cli",
 ]
 

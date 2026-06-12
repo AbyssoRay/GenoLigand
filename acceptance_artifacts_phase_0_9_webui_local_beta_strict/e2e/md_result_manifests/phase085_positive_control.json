@@ -1,0 +1,8 @@
+{
+  "schema_version": "phase_0_8_5",
+  "complex_id": "phase085_positive_control",
+  "status": "PASS",
+  "md_steps": 250,
+  "platform": "CUDA",
+  "result_schema_validated_by": "rust"
+}

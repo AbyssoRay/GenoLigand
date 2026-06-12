@@ -1,0 +1,25 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Phase 0.9 Project Model",
+  "type": "object",
+  "required": [
+    "project_id",
+    "name",
+    "database_profile",
+    "claim_boundary"
+  ],
+  "properties": {
+    "project_id": {
+      "type": "string"
+    },
+    "name": {
+      "type": "string"
+    },
+    "database_profile": {
+      "type": "string"
+    },
+    "claim_boundary": {
+      "const": "method-validation-only"
+    }
+  }
+}

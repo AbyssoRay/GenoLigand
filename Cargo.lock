@@ -145,6 +145,10 @@ name = "gls-sequence"
 version = "0.1.0"
 
 [[package]]
+name = "gls-server"
+version = "0.1.0"
+
+[[package]]
 name = "gls-shortcircuit"
 version = "0.1.0"
 dependencies = [
