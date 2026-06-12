@@ -193,6 +193,7 @@ const apiRoutes = [
   "POST /api/runs/{id}/resume",
   "GET /api/runs/{id}/logs",
   "GET /api/runs/{id}/candidates",
+  "GET /api/runs/{id}/evidence",
   "GET /api/databases",
   "GET /api/diagnostics",
   "POST /api/github/push",
@@ -215,6 +216,45 @@ const candidateHeaders = [
   ["risk flags", "risk flags"],
 ];
 
+const candidateFieldKeys = [
+  "rank",
+  "candidate_id",
+  "gene_name",
+  "orf_id",
+  "genomic_coordinates",
+  "context_class",
+  "fragment_score",
+  "co_occurrence_score",
+  "plm_score",
+  "structure_score",
+  "docking_score",
+  "md_stability_score",
+  "final_priority_score",
+  "risk_flags",
+];
+
+const evidenceHeaders = [
+  ["报告项", "Report item"],
+  ["原始文件", "Source file"],
+  ["manifest", "manifest"],
+  ["schema", "schema"],
+  ["工具版本", "tool version"],
+  ["artifact hash", "artifact hash"],
+  ["验证状态", "validation state"],
+  ["报告 section", "report section"],
+];
+
+const evidenceFieldKeys = [
+  "report_item",
+  "source_file",
+  "manifest",
+  "schema",
+  "tool_version",
+  "artifact_hash",
+  "validation_state",
+  "report_section",
+];
+
 let appState = {
   lang: readSavedLanguage(),
   server: { state: "idle", version: APP_VERSION },
@@ -228,6 +268,8 @@ let appState = {
   preflight: null,
   runLogs: [],
   runArtifacts: null,
+  candidates: null,
+  evidence: null,
   inputDraft: { inputs: [], files: [] },
 };
 
@@ -584,6 +626,34 @@ function valueOrDash(value) {
   return String(value);
 }
 
+function rowValue(row, key) {
+  if (!row || typeof row !== "object") {
+    return "";
+  }
+  return row[key] ?? row[key.replace(/_/g, " ")] ?? row[key.replace(/_/g, "-")] ?? "";
+}
+
+function artifactItems() {
+  return appState.runArtifacts?.items || appState.selectedRun?.artifact_index?.items || [];
+}
+
+function artifactMatches(item, tokens) {
+  const text = `${item.artifact_type || ""} ${item.path || ""}`.toLowerCase();
+  return tokens.some((token) => text.includes(token));
+}
+
+function artifactRows(tokens) {
+  return artifactItems()
+    .filter((item) => artifactMatches(item, tokens))
+    .map((item) => [item.artifact_type || "", item.path || "", item.exists ? statusPill("ready") : statusPill("waiting")]);
+}
+
+function currentRunNotice() {
+  return appState.selectedRun
+    ? `run_id=${appState.selectedRun.run_id}`
+    : pick(["当前浏览器会话没有绑定运行。", "No run is attached to this browser session."]);
+}
+
 function runMonitor() {
   const run = appState.selectedRun;
   const resource = run?.resource_status || {};
@@ -660,6 +730,16 @@ function runMonitor() {
 }
 
 function candidateRanking() {
+  const payload = appState.candidates || {};
+  const rows = payload.candidates || [];
+  const tableRows = rows.map((row) => candidateFieldKeys.map((key) => valueOrDash(rowValue(row, key))));
+  return card(
+    [["候选排序表", "Candidate Ranking Table"]],
+    `<p class="mono">${currentRunNotice()}</p>` +
+      (payload.source_path ? `<p class="mono">source=${payload.source_path}</p>` : "") +
+      dataTable(candidateHeaders, tableRows, payload.message || t("noCandidates")) +
+      buttonRow([[[ "打开候选详情", "Open candidate detail" ], "", "#/candidate_detail_page"], [[ "导出候选表", "Export candidate table" ], "primary", "#/report_export_page"]])
+  );
   return card(
     [["候选排序表", "Candidate Ranking Table"]],
     dataTable(candidateHeaders, [], [t("noCandidates"), t("noCandidates")]) +
@@ -668,6 +748,26 @@ function candidateRanking() {
 }
 
 function candidateDetail() {
+  const first = appState.candidates?.candidates?.[0] || null;
+  if (first) {
+    return card(
+      [["候选详情", "Candidate Detail"]],
+      dataTable(
+        [[["字段", "Field"], ["值", "Value"]].map((x) => x)][0],
+        [
+          [["candidate_id", "candidate_id"], valueOrDash(rowValue(first, "candidate_id"))],
+          [["gene_name", "gene_name"], valueOrDash(rowValue(first, "gene_name"))],
+          [["orf_id", "orf_id"], valueOrDash(rowValue(first, "orf_id"))],
+          [["genomic_coordinates", "genomic_coordinates"], valueOrDash(rowValue(first, "genomic_coordinates"))],
+          [["context_class", "context_class"], valueOrDash(rowValue(first, "context_class"))],
+          [["risk_flags", "risk_flags"], valueOrDash(rowValue(first, "risk_flags"))],
+          [["source_artifact", "source_artifact"], valueOrDash(appState.candidates?.source_path)],
+        ],
+        [["当前候选行缺少可显示字段。", "The current candidate row has no displayable fields."]]
+      ) +
+        buttonRow([[[ "返回候选排序", "Back to ranking" ], "", "#/candidate_ranking_page"]])
+    );
+  }
   return [
     stateBlock("", [["未选择候选", "No Candidate Selected"]], [t("notSelected"), t("notSelected")], "#/candidate_ranking_page"),
     card(
@@ -703,9 +803,27 @@ function genomeContext() {
 }
 
 function structureViewer() {
+  const rows = artifactRows(["structure", "patch", "docking", "pose", ".pdb", ".cif", ".mmcif"]);
+  return [
+    `<section class="panel"><div class="panel-header"><h2>${pick(["结构视图", "Structure View"])}</h2>${statusPill(rows.length ? "ready" : "idle")}</div>
+      <div class="structure-stage" aria-label="${pick(["结构产物查看区域", "Structure artifact viewer"])}">
+        <div class="pocket-cloud"></div><div class="ligand-stick"></div><div class="patch-ring"></div>
+        <span>${rows.length ? pick(["已发现结构相关产物", "Structure-related artifacts detected"]) : pick(["等待真实结构产物", "Waiting for computed structure artifact"])}</span>
+      </div>
+      <p>${pick(["页面读取当前 run 的结构、patch、docking pose 和坐标产物索引。", "This page reads structure, patch, docking pose, and coordinate artifacts from the selected run index."])}</p>
+    </section>`,
+    card(
+      [["结构与 Patch 产物", "Structure and Patch Artifacts"]],
+      dataTable(
+        [[["产物类型", "Artifact type"], ["路径", "Path"], ["状态", "State"]].map((x) => x)][0],
+        rows,
+        [["当前 run 尚未生成结构、patch 或 docking 产物。", "The selected run has not generated structure, patch, or docking artifacts yet."]]
+      )
+    ),
+  ].join("");
   return [
     `<section class="panel"><div class="panel-header"><h2>${pick(["结构视图", "Structure View"])}</h2>${statusPill("idle")}</div>
-      <div class="structure-stage" aria-label="Structure viewer placeholder">
+      <div class="structure-stage" aria-label="Structure artifact viewer">
         <div class="pocket-cloud"></div><div class="ligand-stick"></div><div class="patch-ring"></div>
         <span>${pick(["等待真实结构产物", "Waiting for computed structure artifact"])}</span>
       </div>
@@ -727,6 +845,15 @@ function structureViewer() {
 }
 
 function mdSummary() {
+  const rows = artifactRows(["md", "rmsd", "rmsf", "drift", "occupancy", "trajectory", "hbond", "contact"]);
+  return card(
+    [["MD 摘要产物", "MD Summary Artifacts"]],
+    dataTable(
+      [[["产物类型", "Artifact type"], ["路径", "Path"], ["状态", "State"]].map((x) => x)][0],
+      rows,
+      [["当前 run 尚未生成 RMSD、RMSF、occupancy 或 score decomposition 产物。", "The selected run has not generated RMSD, RMSF, occupancy, or score decomposition artifacts yet."]]
+    )
+  );
   return card(
     [["MD 摘要字段", "MD Summary Fields"]],
     dataTable(
@@ -747,6 +874,15 @@ function mdSummary() {
 }
 
 function evidenceLedger() {
+  const payload = appState.evidence || {};
+  const rows = payload.evidence || [];
+  const tableRows = rows.map((row) => evidenceFieldKeys.map((key) => valueOrDash(rowValue(row, key))));
+  return card(
+    [["Evidence Ledger", "Evidence Ledger"]],
+    `<p class="mono">${currentRunNotice()}</p>` +
+      (payload.source_path ? `<p class="mono">source=${payload.source_path}</p>` : "") +
+      dataTable(evidenceHeaders, tableRows, payload.message || t("noLedger"))
+  );
   return card(
     [["Evidence Ledger", "Evidence Ledger"]],
     dataTable(
@@ -1103,6 +1239,8 @@ async function refreshRunDetails(run = appState.selectedRun) {
   if (!run?.run_id) {
     appState.runLogs = [];
     appState.runArtifacts = null;
+    appState.candidates = null;
+    appState.evidence = null;
     return;
   }
   try {
@@ -1115,6 +1253,16 @@ async function refreshRunDetails(run = appState.selectedRun) {
     appState.runArtifacts = await apiRequest(`/api/runs/${run.run_id}/artifacts`);
   } catch (_error) {
     appState.runArtifacts = null;
+  }
+  try {
+    appState.candidates = await apiRequest(`/api/runs/${run.run_id}/candidates`);
+  } catch (_error) {
+    appState.candidates = null;
+  }
+  try {
+    appState.evidence = await apiRequest(`/api/runs/${run.run_id}/evidence`);
+  } catch (_error) {
+    appState.evidence = null;
   }
 }
 

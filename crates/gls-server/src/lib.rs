@@ -143,6 +143,13 @@ fn route_http(
             include_str!("../../../webui/phase09/app.js").to_string(),
         );
     }
+    if method == "GET" && path == "/favicon.ico" {
+        return (
+            200,
+            "image/svg+xml; charset=utf-8",
+            "<svg xmlns=\"http://www.w3.org/2000/svg\" viewBox=\"0 0 32 32\"><rect width=\"32\" height=\"32\" rx=\"6\" fill=\"#071014\"/><path d=\"M8 18c5-10 11-10 16 0\" fill=\"none\" stroke=\"#4fd1c5\" stroke-width=\"3\"/><circle cx=\"10\" cy=\"18\" r=\"3\" fill=\"#f6ad55\"/><circle cx=\"22\" cy=\"18\" r=\"3\" fill=\"#68d391\"/></svg>".to_string(),
+        );
+    }
     if method == "POST" && path == "/api/projects/sample" {
         return (
             200,
@@ -265,7 +272,9 @@ fn route_run_resource(
     } else if path.ends_with("/artifacts") && method == "GET" {
         artifacts_json(options, &run_id)
     } else if path.ends_with("/candidates") && method == "GET" {
-        candidates_json()
+        candidates_json(options, &run_id)
+    } else if path.ends_with("/evidence") && method == "GET" {
+        evidence_json(options, &run_id)
     } else if method == "GET" {
         run_json(options, &run_id, "idle")
     } else {
@@ -1669,23 +1678,91 @@ fn directory_size(path: &Path) -> u64 {
 }
 
 fn run_artifact_index_json(run_dir: &Path) -> String {
-    let items = [
+    let mut artifacts = BTreeMap::new();
+    for (artifact_type, path) in [
         ("run_manifest", run_dir.join("run_manifest.json")),
         ("run_log", run_dir.join("run.log")),
         ("resource_status", run_dir.join("resource_status.json")),
         ("artifact_index", run_dir.join("artifact_index.json")),
-    ]
-    .iter()
-    .map(|(artifact_type, path)| {
-        format!(
-            "{{\"artifact_type\":\"{}\",\"path\":\"{}\",\"exists\":{}}}",
-            escape_json(artifact_type),
-            escape_json(&path.display().to_string()),
-            path.exists()
-        )
-    })
-    .collect::<Vec<_>>();
+    ] {
+        artifacts.insert(path.display().to_string(), artifact_type.to_string());
+    }
+    for path in collect_run_files(run_dir, 200) {
+        let key = path.display().to_string();
+        artifacts
+            .entry(key)
+            .or_insert_with(|| classify_artifact_path(&path).to_string());
+    }
+    let items = artifacts
+        .into_iter()
+        .map(|(path, artifact_type)| {
+            format!(
+                "{{\"artifact_type\":\"{}\",\"path\":\"{}\",\"exists\":{}}}",
+                escape_json(&artifact_type),
+                escape_json(&path),
+                Path::new(&path).exists()
+            )
+        })
+        .collect::<Vec<_>>();
     format!("{{\"items\":[{}]}}", items.join(","))
+}
+
+fn collect_run_files(root: &Path, limit: usize) -> Vec<PathBuf> {
+    let mut files = Vec::new();
+    let mut stack = vec![root.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        if files.len() >= limit {
+            break;
+        }
+        let Ok(entries) = fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            if files.len() >= limit {
+                break;
+            }
+            let path = entry.path();
+            let Ok(file_type) = entry.file_type() else {
+                continue;
+            };
+            if file_type.is_dir() {
+                stack.push(path);
+            } else if file_type.is_file() {
+                files.push(path);
+            }
+        }
+    }
+    files
+}
+
+fn classify_artifact_path(path: &Path) -> &'static str {
+    let text = path.display().to_string().to_lowercase();
+    if text.contains("candidate") || text.contains("ranking") {
+        "candidate_table"
+    } else if text.contains("evidence") || text.contains("ledger") {
+        "evidence_ledger"
+    } else if text.contains("rmsd")
+        || text.contains("rmsf")
+        || text.contains("md_")
+        || text.contains("trajectory")
+        || text.contains("occupancy")
+    {
+        "md_summary"
+    } else if text.contains("structure")
+        || text.contains("patch")
+        || text.contains("docking")
+        || text.contains("pose")
+    {
+        "structure_artifact"
+    } else if text.contains("report") {
+        "report"
+    } else if text.contains("diagnostic") {
+        "diagnostic"
+    } else if text.contains("manifest") {
+        "manifest"
+    } else {
+        "run_artifact"
+    }
 }
 
 fn run_json_text(
@@ -1887,12 +1964,197 @@ fn artifacts_json(options: &ServerOptions, run_id: &str) -> String {
     }
 }
 
-fn candidates_json() -> String {
-    "{\"candidates\":[],\"schema\":[\"rank\",\"candidate_id\",\"gene_name\",\"orf_id\",\"genomic_coordinates\",\"context_class\",\"fragment_score\",\"co_occurrence_score\",\"plm_score\",\"structure_score\",\"docking_score\",\"md_stability_score\",\"final_priority_score\",\"risk_flags\"],\"message\":\"Candidate rows are shown only after a computed run.\"}".to_string()
+fn candidates_json(options: &ServerOptions, run_id: &str) -> String {
+    let schema = [
+        "rank",
+        "candidate_id",
+        "gene_name",
+        "orf_id",
+        "genomic_coordinates",
+        "context_class",
+        "fragment_score",
+        "co_occurrence_score",
+        "plm_score",
+        "structure_score",
+        "docking_score",
+        "md_stability_score",
+        "final_priority_score",
+        "risk_flags",
+    ];
+    result_table_json(
+        options,
+        run_id,
+        &schema,
+        &["candidate", "ranking"],
+        "candidates",
+        "Candidate rows are loaded from the selected run artifact directory.",
+        "Candidate rows are available after the workflow writes a ranking artifact.",
+    )
+}
+
+fn evidence_json(options: &ServerOptions, run_id: &str) -> String {
+    let schema = [
+        "report_item",
+        "source_file",
+        "manifest",
+        "schema",
+        "tool_version",
+        "artifact_hash",
+        "validation_state",
+        "report_section",
+    ];
+    result_table_json(
+        options,
+        run_id,
+        &schema,
+        &["evidence", "ledger"],
+        "evidence",
+        "Evidence rows are loaded from the selected run artifact directory.",
+        "Evidence ledger rows are available after report generation.",
+    )
 }
 
 fn candidate_detail_json() -> String {
     "{\"candidate_id\":null,\"selected\":false,\"sections\":[\"source\",\"orf_sequence\",\"genomic_position\",\"reading_frame\",\"flanking_region\",\"fragment_hits\",\"co_occurrence_evidence\",\"structure_evidence\",\"docking_evidence\",\"md_evidence\",\"database_evidence\",\"risk_flags\",\"experimental_validation_guidance\"],\"message\":\"Select a computed candidate to inspect details.\"}".to_string()
+}
+
+fn result_table_json(
+    options: &ServerOptions,
+    run_id: &str,
+    schema: &[&str],
+    path_markers: &[&str],
+    rows_key: &str,
+    loaded_message: &str,
+    empty_message: &str,
+) -> String {
+    if let Some(run_dir) = run_dir_for(options, run_id)
+        && let Some((source_path, rows_json, row_count)) =
+            read_result_table(&run_dir, schema, path_markers)
+    {
+        return format!(
+            "{{\"run_id\":\"{}\",\"source_path\":\"{}\",\"schema\":{},\"{}\":{},\"row_count\":{},\"artifact_backed\":true,\"message\":\"{}\"}}",
+            escape_json(run_id),
+            escape_json(&source_path.display().to_string()),
+            json_string_array(schema.iter().copied()),
+            escape_json(rows_key),
+            rows_json,
+            row_count,
+            escape_json(loaded_message)
+        );
+    }
+    format!(
+        "{{\"run_id\":\"{}\",\"source_path\":null,\"schema\":{},\"{}\":[],\"row_count\":0,\"artifact_backed\":false,\"message\":\"{}\"}}",
+        escape_json(run_id),
+        json_string_array(schema.iter().copied()),
+        escape_json(rows_key),
+        escape_json(empty_message)
+    )
+}
+
+fn read_result_table(
+    run_dir: &Path,
+    schema: &[&str],
+    path_markers: &[&str],
+) -> Option<(PathBuf, String, usize)> {
+    let mut files = collect_run_files(run_dir, 500);
+    files.sort();
+    for path in files {
+        let text = path.display().to_string().to_lowercase();
+        if !path_markers.iter().any(|marker| text.contains(marker)) {
+            continue;
+        }
+        if let Some((rows, count)) = read_json_rows(&path, schema) {
+            return Some((path, rows, count));
+        }
+        if let Some((rows, count)) = read_delimited_rows(&path, schema) {
+            return Some((path, rows, count));
+        }
+    }
+    None
+}
+
+fn read_json_rows(path: &Path, schema: &[&str]) -> Option<(String, usize)> {
+    if path.extension().and_then(|ext| ext.to_str()) != Some("json") {
+        return None;
+    }
+    let value = serde_json::from_str::<Value>(&fs::read_to_string(path).ok()?).ok()?;
+    let rows = if let Some(array) = value.as_array() {
+        array.clone()
+    } else {
+        value
+            .get("candidates")
+            .and_then(Value::as_array)
+            .cloned()
+            .or_else(|| value.get("evidence").and_then(Value::as_array).cloned())
+            .or_else(|| value.get("rows").and_then(Value::as_array).cloned())
+            .or_else(|| value.get("items").and_then(Value::as_array).cloned())
+            .or_else(|| {
+                schema
+                    .iter()
+                    .find_map(|key| value.get(*key).and_then(Value::as_array))
+                    .cloned()
+            })?
+    };
+    let rows = rows.into_iter().take(500).collect::<Vec<_>>();
+    let count = rows.len();
+    Some((serde_json::Value::Array(rows).to_string(), count))
+}
+
+fn read_delimited_rows(path: &Path, schema: &[&str]) -> Option<(String, usize)> {
+    let extension = path.extension().and_then(|ext| ext.to_str()).unwrap_or("");
+    let delimiter = match extension {
+        "tsv" => '\t',
+        "csv" => ',',
+        _ => return None,
+    };
+    let text = fs::read_to_string(path).ok()?;
+    let mut lines = text.lines().filter(|line| !line.trim().is_empty());
+    let header = lines.next()?;
+    let headers = split_delimited_line(header, delimiter);
+    if !headers.iter().any(|header| {
+        schema
+            .iter()
+            .any(|field| header.eq_ignore_ascii_case(field))
+    }) {
+        return None;
+    }
+    let mut rows = Vec::new();
+    for line in lines.take(500) {
+        let values = split_delimited_line(line, delimiter);
+        let mut row = serde_json::Map::new();
+        for (index, header) in headers.iter().enumerate() {
+            let key = normalize_field_name(header);
+            if key.is_empty() {
+                continue;
+            }
+            row.insert(
+                key,
+                Value::String(values.get(index).cloned().unwrap_or_default()),
+            );
+        }
+        rows.push(Value::Object(row));
+    }
+    let count = rows.len();
+    Some((Value::Array(rows).to_string(), count))
+}
+
+fn split_delimited_line(line: &str, delimiter: char) -> Vec<String> {
+    line.split(delimiter)
+        .map(|value| value.trim().trim_matches('"').to_string())
+        .collect()
+}
+
+fn normalize_field_name(value: &str) -> String {
+    value
+        .trim()
+        .to_lowercase()
+        .chars()
+        .map(|ch| if ch.is_ascii_alphanumeric() { ch } else { '_' })
+        .collect::<String>()
+        .split('_')
+        .filter(|part| !part.is_empty())
+        .collect::<Vec<_>>()
+        .join("_")
 }
 
 fn databases_json() -> String {
@@ -2246,6 +2508,35 @@ mod tests {
         );
         assert!(artifacts.contains("\"artifact_type\":\"run_manifest\""));
         assert!(artifacts.contains("\"artifact_type\":\"run_log\""));
+
+        let run_dir = options
+            .artifact_dir
+            .join("projects")
+            .join(&project_id)
+            .join("runs")
+            .join(&run_id);
+        write_text(
+            &run_dir.join("candidate_ranking.tsv"),
+            "rank\tcandidate_id\tgene_name\torf_id\tgenomic_coordinates\tcontext_class\tfragment_score\tco_occurrence_score\tplm_score\tstructure_score\tdocking_score\tmd_stability_score\tfinal_priority_score\trisk_flags\n1\tGLS-ORF-001\tGENE1\tORF1\tchr1:10-90:+\tCDS\t0.80\t0.70\t0.60\t0.50\t-7.1\t0.90\t0.82\tlow\n",
+        )
+        .unwrap();
+        write_text(
+            &run_dir.join("evidence_ledger.tsv"),
+            "report_item\tsource_file\tmanifest\tschema\ttool_version\tartifact_hash\tvalidation_state\treport_section\nfinal_priority_score\tcandidate_ranking.tsv\trun_manifest.json\tcandidate.schema.json\tgls-cli 0.9.1\tsha256:abc\tvalidated\tcandidate ranking\n",
+        )
+        .unwrap();
+        let (_, _, candidates) = route_http(
+            "GET",
+            &format!("/api/runs/{run_id}/candidates"),
+            &options,
+            "",
+        );
+        assert!(candidates.contains("\"artifact_backed\":true"));
+        assert!(candidates.contains("\"candidate_id\":\"GLS-ORF-001\""));
+        let (_, _, evidence) =
+            route_http("GET", &format!("/api/runs/{run_id}/evidence"), &options, "");
+        assert!(evidence.contains("\"artifact_backed\":true"));
+        assert!(evidence.contains("\"report_item\":\"final_priority_score\""));
 
         let (_, _, cancel) =
             route_http("POST", &format!("/api/runs/{run_id}/cancel"), &options, "");
