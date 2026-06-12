@@ -1240,18 +1240,130 @@ fn delete_project_json(options: &ServerOptions, project_id: &str) -> String {
 fn project_cleanup_json(options: &ServerOptions, project_id: &str) -> String {
     let dir = project_dir(options, project_id);
     let manifest = dir.join("cleanup_manifest.tsv");
-    let text = "action\tpath\tstatus\nretain\tproject.json\tprotected\nretain\tinput_manifest.json\tprotected\ncleanup\ttmp\tcompleted_if_present\n";
-    match write_text(&manifest, text) {
+    let summary = dir.join("cleanup_summary.tsv");
+    let mut rows = Vec::new();
+    let mut deleted_files = 0usize;
+    let mut deleted_bytes = 0u64;
+    let mut unremoved = 0usize;
+    for candidate in project_cleanup_candidates(&dir) {
+        let before_files = file_count(&candidate.path);
+        let before_bytes = path_size(&candidate.path);
+        let status = if !candidate.path.exists() {
+            "not_present".to_string()
+        } else if !is_project_cleanup_allowed(&dir, &candidate.path) {
+            unremoved += 1;
+            "blocked_protected_path".to_string()
+        } else {
+            match remove_cleanup_path(&candidate.path) {
+                Ok(()) => {
+                    deleted_files = deleted_files.saturating_add(before_files.max(1));
+                    deleted_bytes = deleted_bytes.saturating_add(before_bytes);
+                    "deleted".to_string()
+                }
+                Err(err) => {
+                    unremoved += 1;
+                    format!("failed:{err}")
+                }
+            }
+        };
+        rows.push(format!(
+            "cleanup\t{}\t{}\t{}\t{}\t{}",
+            candidate.kind,
+            candidate.path.display(),
+            before_files,
+            before_bytes,
+            status
+        ));
+    }
+    rows.push(format!(
+        "retain\tproject_manifest\t{}\t0\t0\tprotected",
+        dir.join("project.json").display()
+    ));
+    rows.push(format!(
+        "retain\tinput_manifest\t{}\t0\t0\tprotected",
+        dir.join("input_manifest.json").display()
+    ));
+    rows.push(format!(
+        "retain\tinput_files\t{}\t0\t0\tprotected",
+        dir.join("inputs").display()
+    ));
+    rows.push(format!(
+        "retain\treports\t{}\t0\t0\tprotected",
+        dir.join("reports").display()
+    ));
+    let manifest_text = format!(
+        "action\tclass\tpath\tbefore_files\tbefore_bytes\tstatus\n{}\n",
+        rows.join("\n")
+    );
+    let summary_text = format!(
+        "metric\tvalue\ncleanup_scope\tproject_allowlist\ndeleted_files_count\t{deleted_files}\ndeleted_bytes\t{deleted_bytes}\ncleanup_eligible_unremoved_count\t{unremoved}\nprotected_path_violation_count\t0\n"
+    );
+    match write_text(&manifest, &manifest_text).and_then(|_| write_text(&summary, &summary_text)) {
         Ok(()) => format!(
-            "{{\"status\":\"completed\",\"project_id\":\"{}\",\"manifest\":\"{}\"}}",
+            "{{\"status\":\"completed\",\"project_id\":\"{}\",\"manifest\":\"{}\",\"summary\":\"{}\",\"scope\":\"project_allowlist\",\"deleted_files_count\":{},\"deleted_bytes\":{},\"cleanup_eligible_unremoved_count\":{},\"protected_path_violation_count\":0}}",
             escape_json(project_id),
-            escape_json(&manifest.display().to_string())
+            escape_json(&manifest.display().to_string()),
+            escape_json(&summary.display().to_string()),
+            deleted_files,
+            deleted_bytes,
+            unremoved
         ),
         Err(err) => format!(
             "{{\"status\":\"failed\",\"error\":\"{}\"}}",
             escape_json(&err.to_string())
         ),
     }
+}
+
+fn project_cleanup_candidates(project_dir: &Path) -> Vec<CleanupCandidate> {
+    let mut candidates = Vec::new();
+    for relative in [
+        "tmp",
+        "work",
+        "run",
+        "cache",
+        ".cache",
+        "nextflow_cache",
+        "webui_build_cache",
+        "old_reports",
+        "old_screenshots",
+        "visual_audit_intermediate",
+        "release_bundle",
+    ] {
+        candidates.push(CleanupCandidate {
+            path: project_dir.join(relative),
+            kind: "project_runtime",
+        });
+    }
+    for name in [
+        "server.log",
+        "gls-server.stdout.log",
+        "gls-server.stderr.log",
+        ".nextflow.log",
+    ] {
+        candidates.push(CleanupCandidate {
+            path: project_dir.join(name),
+            kind: "project_log",
+        });
+    }
+    candidates
+}
+
+fn is_project_cleanup_allowed(project_dir: &Path, path: &Path) -> bool {
+    if !path.starts_with(project_dir) {
+        return false;
+    }
+    let protected = [
+        project_dir.join("project.json"),
+        project_dir.join("project_name.txt"),
+        project_dir.join("input_manifest.json"),
+        project_dir.join("inputs"),
+        project_dir.join("reports"),
+        project_dir.join("runs"),
+    ];
+    !protected
+        .iter()
+        .any(|protected_path| path.starts_with(protected_path))
 }
 
 fn inputs_json() -> String {
@@ -4068,6 +4180,20 @@ mod tests {
         assert!(copied_manifest.contains("\"SMILES\""));
         assert!(copied_manifest.contains("ligand.sdf"));
 
+        let project_runtime_tmp = options
+            .artifact_dir
+            .join("projects")
+            .join(&project_id)
+            .join("tmp")
+            .join("scratch.log");
+        let project_runtime_cache = options
+            .artifact_dir
+            .join("projects")
+            .join(&project_id)
+            .join("cache")
+            .join("obsolete.bin");
+        write_text(&project_runtime_tmp, "temporary runtime log\n").unwrap();
+        write_text(&project_runtime_cache, "rebuildable cache\n").unwrap();
         let (_, _, cleanup) = route_http(
             "POST",
             &format!("/api/projects/{project_id}/cleanup"),
@@ -4075,6 +4201,36 @@ mod tests {
             "",
         );
         assert!(cleanup.contains("\"status\":\"completed\""));
+        assert!(cleanup.contains("\"scope\":\"project_allowlist\""));
+        assert!(cleanup.contains("\"deleted_files_count\":2"));
+        assert!(!project_runtime_tmp.exists());
+        assert!(!project_runtime_cache.exists());
+        assert!(
+            options
+                .artifact_dir
+                .join("projects")
+                .join(&project_id)
+                .join("project.json")
+                .exists()
+        );
+        assert!(
+            options
+                .artifact_dir
+                .join("projects")
+                .join(&project_id)
+                .join("input_manifest.json")
+                .exists()
+        );
+        assert!(
+            options
+                .artifact_dir
+                .join("projects")
+                .join(&project_id)
+                .join("runs")
+                .join(&run_id)
+                .join("run_manifest.json")
+                .exists()
+        );
 
         let (_, _, deleted) = route_http(
             "DELETE",
