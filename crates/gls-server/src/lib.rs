@@ -6,6 +6,8 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use serde_json::Value;
+
 pub const ACCEPTANCE_MODE: &str = "phase_0_9_1_production_webui";
 pub const PRODUCT_NAME: &str = "GenoLigand Local WebUI";
 pub const PRODUCT_VERSION: &str = "0.9.1";
@@ -208,7 +210,7 @@ fn route_project_resource(
     } else if path.ends_with("/inputs") && method == "POST" {
         write_project_inputs_json(options, &project_id, request_body)
     } else if path.ends_with("/preflight") && method == "GET" {
-        preflight_json()
+        project_preflight_json(options, &project_id)
     } else if path.ends_with("/preflight") && method == "POST" {
         write_project_preflight(options, &project_id)
     } else if path.ends_with("/runs") && method == "GET" {
@@ -986,10 +988,13 @@ fn write_project_state(
     if let Some(run_id) = latest_run_id {
         write_text(&dir.join("latest_run_id.txt"), run_id)?;
     }
-    write_text(
-        &dir.join("input_manifest.json"),
-        "{\"inputs\":[],\"advanced_parameters_collapsed\":true,\"status\":\"waiting_for_user_input\"}\n",
-    )?;
+    let input_manifest = dir.join("input_manifest.json");
+    if !input_manifest.exists() {
+        write_text(
+            &input_manifest,
+            "{\"inputs\":[],\"advanced_parameters_collapsed\":true,\"status\":\"waiting_for_user_input\"}\n",
+        )?;
+    }
     let json = project_json_text(
         project_id,
         project_name,
@@ -1092,10 +1097,16 @@ fn copy_project_json(options: &ServerOptions, source_project_id: &str) -> String
         false,
     ) {
         Ok(project) => {
-            let _ = write_text(
-                &project_dir(options, &project_id).join("source_project_id.txt"),
-                source_project_id,
+            let target_dir = project_dir(options, &project_id);
+            let _ = fs::copy(
+                source_dir.join("input_manifest.json"),
+                target_dir.join("input_manifest.json"),
             );
+            let _ = fs::copy(
+                source_dir.join("preflight_checks.json"),
+                target_dir.join("preflight_checks.json"),
+            );
+            let _ = write_text(&target_dir.join("source_project_id.txt"), source_project_id);
             format!("{{\"status\":\"created\",\"project\":{project}}}")
         }
         Err(err) => format!(
@@ -1177,29 +1188,403 @@ fn write_project_inputs_json(
     }
 }
 
-fn preflight_json() -> String {
-    "{\"checks\":[{\"check_id\":\"molecule_format\",\"status\":\"waiting\",\"coverage\":\"SMILES/SDF/MOL2/PDB, valence, 3D structure, conformers\",\"repair_action\":\"open_input_wizard\"},{\"check_id\":\"sequence_validity\",\"status\":\"waiting\",\"coverage\":\"illegal characters, non-standard residues, length, modifications\",\"repair_action\":\"edit_sequence\"},{\"check_id\":\"structure_files\",\"status\":\"waiting\",\"coverage\":\"chain ID, residue numbering, missing residues, readability\",\"repair_action\":\"open_structure_input\"},{\"check_id\":\"databases\",\"status\":\"waiting\",\"coverage\":\"profile, path, version, hash, index, missing items\",\"repair_action\":\"open_database_registry\"},{\"check_id\":\"runtime\",\"status\":\"waiting\",\"coverage\":\"disk, write permission, OpenMM, CUDA, Nextflow, Git remote, GitHub permission\",\"repair_action\":\"open_diagnostics\"}]}".to_string()
+fn preflight_check_json(
+    check_id: &str,
+    status: &str,
+    coverage: &str,
+    observed: &str,
+    repair_action: &str,
+) -> String {
+    format!(
+        "{{\"check_id\":\"{}\",\"status\":\"{}\",\"coverage\":\"{}\",\"observed\":\"{}\",\"repair_action\":\"{}\"}}",
+        escape_json(check_id),
+        escape_json(status),
+        escape_json(coverage),
+        escape_json(observed),
+        escape_json(repair_action)
+    )
+}
+
+fn contains_hint(value: &str, hints: &[&str]) -> bool {
+    let value_lower = value.to_ascii_lowercase();
+    hints
+        .iter()
+        .any(|hint| value_lower.contains(&hint.to_ascii_lowercase()) || value.contains(hint))
+}
+
+fn manifest_inputs(manifest: &Value, hints: &[&str]) -> Vec<String> {
+    manifest
+        .get("inputs")
+        .and_then(Value::as_array)
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(|item| {
+                    let label = item
+                        .get("label")
+                        .or_else(|| item.get("field"))
+                        .and_then(Value::as_str)
+                        .unwrap_or("");
+                    let value = item
+                        .get("value")
+                        .and_then(Value::as_str)
+                        .unwrap_or("")
+                        .trim();
+                    if !value.is_empty() && contains_hint(label, hints) {
+                        Some(value.to_string())
+                    } else {
+                        None
+                    }
+                })
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default()
+}
+
+fn manifest_files(manifest: &Value) -> Vec<(String, u64)> {
+    manifest
+        .get("files")
+        .and_then(Value::as_array)
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(|item| {
+                    let name = item.get("name").and_then(Value::as_str)?.trim();
+                    if name.is_empty() {
+                        return None;
+                    }
+                    let size = item.get("size").and_then(Value::as_u64).unwrap_or(0);
+                    Some((name.to_string(), size))
+                })
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default()
+}
+
+fn has_file_extension(files: &[(String, u64)], extensions: &[&str]) -> bool {
+    files.iter().any(|(name, _)| {
+        let lower = name.to_ascii_lowercase();
+        extensions.iter().any(|ext| lower.ends_with(ext))
+    })
+}
+
+fn valid_smiles_screen(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 2048
+        && value.chars().all(|ch| {
+            ch.is_ascii_alphanumeric()
+                || matches!(
+                    ch,
+                    '[' | ']'
+                        | '('
+                        | ')'
+                        | '='
+                        | '#'
+                        | '-'
+                        | '+'
+                        | '@'
+                        | '/'
+                        | '\\'
+                        | '.'
+                        | '%'
+                        | ':'
+                        | '*'
+                )
+        })
+}
+
+fn normalized_sequence(value: &str) -> String {
+    value
+        .lines()
+        .filter(|line| !line.trim_start().starts_with('>'))
+        .collect::<Vec<_>>()
+        .join("")
+        .chars()
+        .filter(|ch| !ch.is_whitespace())
+        .collect::<String>()
+        .to_ascii_uppercase()
+}
+
+fn valid_standard_peptide(value: &str) -> bool {
+    let sequence = normalized_sequence(value);
+    !sequence.is_empty()
+        && sequence.chars().all(|ch| {
+            matches!(
+                ch,
+                'A' | 'C'
+                    | 'D'
+                    | 'E'
+                    | 'F'
+                    | 'G'
+                    | 'H'
+                    | 'I'
+                    | 'K'
+                    | 'L'
+                    | 'M'
+                    | 'N'
+                    | 'P'
+                    | 'Q'
+                    | 'R'
+                    | 'S'
+                    | 'T'
+                    | 'V'
+                    | 'W'
+                    | 'Y'
+            )
+        })
+}
+
+fn command_probe(program: &str, args: &[&str]) -> bool {
+    Command::new(program)
+        .args(args)
+        .output()
+        .map(|output| output.status.success())
+        .unwrap_or(false)
+}
+
+fn read_input_manifest(dir: &Path) -> Value {
+    fs::read_to_string(dir.join("input_manifest.json"))
+        .ok()
+        .and_then(|text| serde_json::from_str::<Value>(&text).ok())
+        .unwrap_or_else(|| serde_json::json!({"inputs":[],"files":[]}))
+}
+
+fn build_preflight_checks(options: &ServerOptions, project_id: &str) -> (String, bool) {
+    let dir = project_dir(options, project_id);
+    let manifest = read_input_manifest(&dir);
+    let files = manifest_files(&manifest);
+    let smiles = manifest_inputs(&manifest, &["smiles"]);
+    let compound_refs = manifest_inputs(&manifest, &["compound", "cas", "化合物"]);
+    let peptide_sequences = manifest_inputs(&manifest, &["peptide", "多肽"]);
+    let fasta_sequences = manifest_inputs(&manifest, &["fasta", "sequence", "序列"]);
+    let chain_ids = manifest_inputs(&manifest, &["chain", "链"]);
+    let genome_files = manifest_inputs(
+        &manifest,
+        &["genome", "gtf", "gff", "transcript", "vcf", "基因组"],
+    );
+
+    let molecule_ready = smiles.iter().any(|value| valid_smiles_screen(value))
+        || has_file_extension(&files, &[".sdf", ".mol2", ".pdb"]);
+    let molecule_status = if molecule_ready {
+        "ready"
+    } else if !compound_refs.is_empty() {
+        "warning"
+    } else {
+        "missing"
+    };
+    let molecule_observed = if molecule_ready {
+        format!(
+            "smiles_count={};structure_file_count={};basic_format_screen=ready;three_dimensional_valence_conformer_checks=queued_for_scientific_worker",
+            smiles.len(),
+            files
+                .iter()
+                .filter(|(name, _)| {
+                    let lower = name.to_ascii_lowercase();
+                    [".sdf", ".mol2", ".pdb"]
+                        .iter()
+                        .any(|ext| lower.ends_with(ext))
+                })
+                .count()
+        )
+    } else if !compound_refs.is_empty() {
+        format!(
+            "name_or_cas_count={};structure_required_before_scientific_run",
+            compound_refs.len()
+        )
+    } else {
+        "no_small_molecule_structure_or_smiles_detected".to_string()
+    };
+
+    let peptide_ready = peptide_sequences
+        .iter()
+        .chain(fasta_sequences.iter())
+        .any(|value| valid_standard_peptide(value));
+    let peptide_status = if peptide_ready {
+        "ready"
+    } else if peptide_sequences.is_empty() && fasta_sequences.is_empty() {
+        "waiting"
+    } else {
+        "warning"
+    };
+    let peptide_observed = if peptide_ready {
+        "standard_amino_acid_sequence_detected=true;length_and_character_screen=ready".to_string()
+    } else if peptide_sequences.is_empty() && fasta_sequences.is_empty() {
+        "no_peptide_or_fasta_sequence_supplied".to_string()
+    } else {
+        "sequence_present_but_contains_non_standard_or_empty_residues".to_string()
+    };
+
+    let structure_file_count = files
+        .iter()
+        .filter(|(name, _)| {
+            let lower = name.to_ascii_lowercase();
+            [".pdb", ".cif", ".mmcif", ".sdf", ".mol2"]
+                .iter()
+                .any(|ext| lower.ends_with(ext))
+        })
+        .count();
+    let structure_status = if structure_file_count > 0 {
+        "ready"
+    } else if !chain_ids.is_empty() {
+        "warning"
+    } else {
+        "waiting"
+    };
+    let structure_observed = format!(
+        "recognized_structure_file_count={structure_file_count};chain_id_count={};uploaded_file_count={}",
+        chain_ids.len(),
+        files.len()
+    );
+
+    let database_config_count = [
+        "configs/database_sources.yml",
+        "configs/database_thresholds.yml",
+        "configs/phase_0_8_full_database_strict.yml",
+    ]
+    .iter()
+    .filter(|path| options.workspace_root.join(path).exists())
+    .count();
+    let database_status = if database_config_count > 0 {
+        "ready"
+    } else {
+        "warning"
+    };
+    let database_observed = format!(
+        "database_config_count={database_config_count};custom_genome_input_count={};artifact_dir={}",
+        genome_files.len(),
+        options.artifact_dir.display()
+    );
+
+    let write_probe = dir.join(".preflight_write_probe");
+    let write_ok = write_text(&write_probe, "ok\n").is_ok();
+    let _ = fs::remove_file(&write_probe);
+    let gls_cli_exists = options
+        .workspace_root
+        .join("target")
+        .join("debug")
+        .join(if cfg!(windows) {
+            "gls-cli.exe"
+        } else {
+            "gls-cli"
+        })
+        .exists()
+        || options
+            .workspace_root
+            .join("target")
+            .join("release")
+            .join(if cfg!(windows) {
+                "gls-cli.exe"
+            } else {
+                "gls-cli"
+            })
+            .exists();
+    let git_remote_ok = command_probe("git", &["remote", "get-url", "origin"]);
+    let java_ok = command_probe("java", &["-version"]);
+    let nextflow_ok = command_probe("nextflow", &["-version"]);
+    let python_ok = command_probe("python", &["--version"]);
+    let runtime_status = if write_ok && gls_cli_exists && git_remote_ok {
+        "ready"
+    } else if write_ok {
+        "warning"
+    } else {
+        "missing"
+    };
+    let runtime_observed = format!(
+        "write_permission={write_ok};gls_cli_binary={gls_cli_exists};git_remote={git_remote_ok};java={java_ok};nextflow={nextflow_ok};python={python_ok}"
+    );
+
+    let checks = [
+        preflight_check_json(
+            "molecule_format",
+            molecule_status,
+            "SMILES/SDF/MOL2/PDB, valence, 3D structure, conformers",
+            &molecule_observed,
+            "open_input_wizard",
+        ),
+        preflight_check_json(
+            "sequence_validity",
+            peptide_status,
+            "illegal characters, non-standard residues, length, modifications",
+            &peptide_observed,
+            "edit_sequence",
+        ),
+        preflight_check_json(
+            "structure_files",
+            structure_status,
+            "chain ID, residue numbering, missing residues, readability",
+            &structure_observed,
+            "open_structure_input",
+        ),
+        preflight_check_json(
+            "databases",
+            database_status,
+            "profile, paths, versions, hashes, indexes, missing items",
+            &database_observed,
+            "open_databases",
+        ),
+        preflight_check_json(
+            "runtime",
+            runtime_status,
+            "disk, write permission, OpenMM, CUDA, Nextflow, Git remote, GitHub permission",
+            &runtime_observed,
+            "run_diagnostics",
+        ),
+    ];
+    let hard_pass = molecule_status != "missing" && runtime_status != "missing";
+    (format!("{{\"checks\":[{}]}}", checks.join(",")), hard_pass)
+}
+
+fn project_preflight_json(options: &ServerOptions, project_id: &str) -> String {
+    let dir = project_dir(options, project_id);
+    if !dir.exists() {
+        return format!(
+            "{{\"checks\":[],\"status\":\"failed\",\"error\":\"project_not_found\",\"project_id\":\"{}\"}}",
+            escape_json(project_id)
+        );
+    }
+    let (checks, hard_pass) = build_preflight_checks(options, project_id);
+    let status = if hard_pass {
+        "preflight_passed"
+    } else {
+        "failed"
+    };
+    format!(
+        "{{\"status\":\"{status}\",\"project_id\":\"{}\",\"preflight\":{checks}}}",
+        escape_json(project_id)
+    )
 }
 
 fn write_project_preflight(options: &ServerOptions, project_id: &str) -> String {
     let dir = project_dir(options, project_id);
+    if !dir.exists() {
+        return format!(
+            "{{\"status\":\"failed\",\"error\":\"project_not_found\",\"project_id\":\"{}\"}}",
+            escape_json(project_id)
+        );
+    }
     let name = project_field(&dir, "project_name.txt", project_id);
     let latest = read_trimmed(&dir.join("latest_run_id.txt"));
     let sample = read_trimmed(&dir.join("sample_template.txt"))
         .map(|value| value == "true")
         .unwrap_or(false);
-    let checks = preflight_json();
+    let (checks, hard_pass) = build_preflight_checks(options, project_id);
     let _ = write_text(&dir.join("preflight_checks.json"), &(checks.clone() + "\n"));
+    let status = if hard_pass {
+        "preflight_passed"
+    } else {
+        "failed"
+    };
     let _ = write_project_state(
         options,
         project_id,
         &name,
-        "preflight_passed",
+        status,
         latest.as_deref(),
         sample,
     );
     format!(
-        "{{\"status\":\"preflight_passed\",\"project_id\":\"{}\",\"preflight\":{checks}}}",
+        "{{\"status\":\"{}\",\"project_id\":\"{}\",\"preflight\":{checks}}}",
+        status,
         escape_json(project_id)
     )
 }
@@ -1638,14 +2023,6 @@ mod tests {
                 .exists()
         );
 
-        let (_, _, preflight) = route_http(
-            "POST",
-            &format!("/api/projects/{project_id}/preflight"),
-            &options,
-            "",
-        );
-        assert!(preflight.contains("\"status\":\"preflight_passed\""));
-
         let (_, _, input_saved) = route_http(
             "POST",
             &format!("/api/projects/{project_id}/inputs"),
@@ -1663,6 +2040,26 @@ mod tests {
         .unwrap();
         assert!(input_manifest.contains("\"SMILES\""));
         assert!(input_manifest.contains("ligand.sdf"));
+
+        let (_, _, preflight) = route_http(
+            "POST",
+            &format!("/api/projects/{project_id}/preflight"),
+            &options,
+            "",
+        );
+        assert!(preflight.contains("\"status\":\"preflight_passed\""));
+        assert!(preflight.contains("\"check_id\":\"molecule_format\""));
+        assert!(preflight.contains("smiles_count=1"));
+        let input_manifest_after_preflight = fs::read_to_string(
+            options
+                .artifact_dir
+                .join("projects")
+                .join(&project_id)
+                .join("input_manifest.json"),
+        )
+        .unwrap();
+        assert!(input_manifest_after_preflight.contains("\"SMILES\""));
+        assert!(input_manifest_after_preflight.contains("ligand.sdf"));
 
         let (_, _, run) = route_http(
             "POST",
@@ -1688,6 +2085,17 @@ mod tests {
             "",
         );
         assert!(copy.contains("\"status\":\"created\""));
+        let copied_project_id = extract_json_string(&copy, "project_id");
+        let copied_manifest = fs::read_to_string(
+            options
+                .artifact_dir
+                .join("projects")
+                .join(&copied_project_id)
+                .join("input_manifest.json"),
+        )
+        .unwrap();
+        assert!(copied_manifest.contains("\"SMILES\""));
+        assert!(copied_manifest.contains("ligand.sdf"));
 
         let (_, _, cleanup) = route_http(
             "POST",

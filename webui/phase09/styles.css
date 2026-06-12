@@ -507,6 +507,46 @@ td:nth-child(2) {
   white-space: nowrap;
 }
 
+.preflight-table .data-table {
+  min-width: 0;
+  table-layout: fixed;
+}
+
+.preflight-table th,
+.preflight-table td,
+.preflight-table td:nth-child(1),
+.preflight-table td:nth-child(2) {
+  white-space: normal;
+  overflow-wrap: anywhere;
+}
+
+.preflight-table th:nth-child(1),
+.preflight-table td:nth-child(1) {
+  width: 16%;
+}
+
+.preflight-table th:nth-child(2),
+.preflight-table td:nth-child(2) {
+  width: 28%;
+}
+
+.preflight-table th:nth-child(3),
+.preflight-table td:nth-child(3) {
+  width: 12%;
+}
+
+.preflight-table th:nth-child(4),
+.preflight-table td:nth-child(4) {
+  width: 32%;
+  font-family: "SFMono-Regular", Consolas, "Liberation Mono", monospace;
+  font-size: 11px;
+}
+
+.preflight-table th:nth-child(5),
+.preflight-table td:nth-child(5) {
+  width: 12%;
+}
+
 .task-list {
   display: grid;
   gap: 8px;

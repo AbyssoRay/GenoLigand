@@ -101,6 +101,7 @@ const labels = {
     required: "必填",
     optional: "可选",
     waiting: "待检查",
+    warning: "需注意",
     missing: "缺失",
     created: "已创建",
     preflight_passed: "预检查已通过",
@@ -134,6 +135,7 @@ const labels = {
     required: "Required",
     optional: "Optional",
     waiting: "Waiting",
+    warning: "Needs attention",
     missing: "Missing",
     created: "Created",
     preflight_passed: "Preflight passed",
@@ -164,6 +166,7 @@ const statusClass = {
   required: "warn",
   optional: "info",
   waiting: "warn",
+  warning: "warn",
   missing: "failed",
   created: "info",
   preflight_passed: "ready",
@@ -222,6 +225,7 @@ let appState = {
   diagnostics: null,
   github: null,
   exports: null,
+  preflight: null,
   inputDraft: { inputs: [], files: [] },
 };
 
@@ -536,7 +540,21 @@ function wizardPage(id) {
 }
 
 function preflightTable() {
-  return dataTable(
+  const checks = appState.preflight?.checks || [];
+  if (checks.length) {
+    return `<div class="preflight-table">${dataTable(
+      [[["检查项", "Check"], ["覆盖范围", "Coverage"], ["状态", "State"], ["实际结果", "Observed"], ["修复动作", "Repair action"]].map((x) => x)][0],
+      checks.map((check) => [
+        check.check_id || "",
+        check.coverage || "",
+        statusPill(check.status || "waiting"),
+        check.observed || "",
+        check.repair_action || "",
+      ]),
+      [["尚未执行预检查。", "Preflight has not run yet."]]
+    )}</div>`;
+  }
+  return `<div class="preflight-table">${dataTable(
     [[["检查项", "Check"], ["覆盖范围", "Coverage"], ["状态", "State"], ["修复动作", "Repair action"]].map((x) => x)][0],
     [
       [[["分子格式", "Molecule format"], ["SMILES/SDF/MOL2/PDB、价态、三维结构、构象生成", "SMILES/SDF/MOL2/PDB, valence, 3D structure, conformers"], statusPill("waiting"), ["查看输入向导", "Open input wizard"]]],
@@ -546,7 +564,7 @@ function preflightTable() {
       [[["运行环境", "Runtime"], ["磁盘、写入权限、OpenMM、CUDA、Nextflow、Git remote、GitHub 权限", "disk, write permission, OpenMM, CUDA, Nextflow, Git remote, GitHub permission"], statusPill("waiting"), ["运行诊断", "Run diagnostics"]]],
     ].map((row) => row[0]),
     [["尚未执行预检查。", "Preflight has not run yet."]]
-  );
+  )}</div>`;
 }
 
 function runMonitor() {
@@ -992,6 +1010,14 @@ async function refreshProjects() {
       appState.selectedProject = fresh;
     }
   }
+  if (appState.selectedProject) {
+    try {
+      const preflight = await apiRequest(`/api/projects/${appState.selectedProject.project_id}/preflight`);
+      appState.preflight = preflight.preflight || appState.preflight;
+    } catch (_error) {
+      // Project lists remain usable even if an older project has no preflight artifact yet.
+    }
+  }
 }
 
 function requireProject() {
@@ -1038,9 +1064,14 @@ async function handleAction(action) {
       setMessage("", "项目清理 manifest 已生成。", "Project cleanup manifest generated.");
     } else if (action === "run-preflight") {
       const project = requireProject();
-      await apiRequest(`/api/projects/${project.project_id}/preflight`, { method: "POST" });
+      const payload = await apiRequest(`/api/projects/${project.project_id}/preflight`, { method: "POST" });
+      appState.preflight = payload.preflight || null;
       await refreshProjects();
-      setMessage("", "预检查已写入项目状态。", "Preflight state was written to the project.");
+      if (payload.status === "preflight_passed") {
+        setMessage("", "预检查已写入项目状态。", "Preflight state was written to the project.");
+      } else {
+        setMessage("warn", "预检查已完成，存在需要处理的项目。", "Preflight completed with items that need attention.");
+      }
     } else if (action === "save-configuration") {
       const project = appState.selectedProject || (await apiRequest("/api/projects", { method: "POST" })).project;
       appState.selectedProject = project;
