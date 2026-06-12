@@ -268,6 +268,7 @@ let appState = {
   message: null,
   diagnostics: null,
   databases: null,
+  databaseAction: null,
   guides: null,
   github: null,
   exports: null,
@@ -1134,6 +1135,31 @@ function evidenceLedger() {
 function databaseRegistry() {
   const payload = appState.databases || {};
   const resources = payload.resources || [];
+  const actionRows = [];
+  if (payload.latest_validation) {
+    actionRows.push([
+      ["数据库验证", "Database validation"],
+      valueOrDash(payload.latest_validation.path),
+      valueOrDash(payload.latest_validation.bytes),
+      statusPill(payload.latest_validation.exists ? "ready" : "waiting"),
+    ]);
+  }
+  if (payload.latest_index_action) {
+    actionRows.push([
+      ["索引行动清单", "Index action manifest"],
+      valueOrDash(payload.latest_index_action.path),
+      valueOrDash(payload.latest_index_action.bytes),
+      statusPill(payload.latest_index_action.exists ? "ready" : "waiting"),
+    ]);
+  }
+  if (appState.databaseAction) {
+    actionRows.push([
+      ["最近动作", "Latest action"],
+      valueOrDash(appState.databaseAction.manifest || appState.databaseAction.summary),
+      valueOrDash(appState.databaseAction.source_count),
+      statusPill(appState.databaseAction.status || "waiting"),
+    ]);
+  }
   const rows = resources.map((resource) => {
     if (typeof resource === "string") {
       return [
@@ -1180,6 +1206,14 @@ function databaseRegistry() {
           rows,
           payload.message || pick(["尚未选择数据库 profile。", "No database profile selected."])
         ) + buttonRow([[[ "验证数据库 profile", "Validate database profile" ], "", null], [[ "构建数据库索引", "Build database indexes" ], "primary", null]])
+      ),
+      card(
+        [["数据库动作记录", "Database Action Records"]],
+        dataTable(
+          [[["动作", "Action"], ["manifest", "manifest"], ["计数或 bytes", "count or bytes"], ["状态", "State"]].map((x) => x)][0],
+          actionRows,
+          [["尚未执行数据库验证或索引动作。", "No database validation or index action has been executed yet."]]
+        )
       ),
     ].join("");
   }
@@ -1851,13 +1885,13 @@ async function handleAction(action, dataset = {}) {
       appState.diagnostics = await apiRequest("/api/diagnostics/run", { method: "POST" });
       setMessage("", "诊断结果已从本地服务读取。", "Diagnostics were read from the local service.");
     } else if (action === "validate-databases") {
-      await apiRequest("/api/databases/validate", { method: "POST" });
+      appState.databaseAction = await apiRequest("/api/databases/validate", { method: "POST" });
       await refreshWorkspaceState();
-      setMessage("", "数据库 profile 验证已提交到本地服务。", "Database profile validation was submitted to the local service.");
+      setMessage("", "数据库 profile 验证 manifest 已生成。", "Database profile validation manifest generated.");
     } else if (action === "build-database-indexes") {
-      await apiRequest("/api/databases/build-index", { method: "POST" });
+      appState.databaseAction = await apiRequest("/api/databases/build-index", { method: "POST" });
       await refreshWorkspaceState();
-      setMessage("", "数据库索引构建动作已提交到本地服务。", "Database index build action was submitted to the local service.");
+      setMessage("", "数据库索引行动清单已生成。", "Database index action manifest generated.");
     } else if (action === "export-report") {
       appState.exports = await apiRequest("/api/reports/export", { method: "POST" });
       setMessage("", "导出 manifest 已生成。", "Export manifest generated.");

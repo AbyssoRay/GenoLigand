@@ -206,8 +206,8 @@ fn route_http(
         ]),
         ("GET", "/api/projects") => projects_json(options),
         ("GET", "/api/databases") => databases_json(options),
-        ("POST", "/api/databases/validate") => action_json("queued"),
-        ("POST", "/api/databases/build-index") => action_json("queued"),
+        ("POST", "/api/databases/validate") => database_validation_json(options),
+        ("POST", "/api/databases/build-index") => database_index_action_json(options),
         ("GET", "/api/diagnostics") => diagnostics_json(options),
         ("POST", "/api/diagnostics/run") => diagnostics_json(options),
         ("GET", "/api/guides") => guides_json(options),
@@ -3362,6 +3362,22 @@ fn database_index_state(root: &Path) -> &'static str {
     }
 }
 
+fn database_action_dir(options: &ServerOptions) -> PathBuf {
+    options.artifact_dir.join("databases")
+}
+
+fn database_action_file_json(options: &ServerOptions, file_name: &str) -> String {
+    let path = database_action_dir(options).join(file_name);
+    format!(
+        "{{\"path\":\"{}\",\"exists\":{},\"bytes\":{}}}",
+        escape_json(&path.display().to_string()),
+        path.exists(),
+        fs::metadata(&path)
+            .map(|metadata| metadata.len())
+            .unwrap_or(0)
+    )
+}
+
 fn databases_json(options: &ServerOptions) -> String {
     let config_path = options.workspace_root.join("configs/database_sources.yml");
     let sources = parse_database_sources(&config_path);
@@ -3411,11 +3427,136 @@ fn databases_json(options: &ServerOptions) -> String {
             "loaded"
         }
     );
+    let latest_validation = database_action_file_json(options, "database_validation_manifest.tsv");
+    let latest_index_action =
+        database_action_file_json(options, "database_index_action_manifest.tsv");
     format!(
-        "{{\"profiles\":[{}],\"resources\":[{}],\"fields\":[\"path\",\"version\",\"sha256\",\"index_state\",\"missing_items\",\"storage_bytes\",\"repair_action\"],\"source_config\":\"{}\",\"message\":\"Database resources are read from configs/database_sources.yml and checked against local paths.\"}}",
+        "{{\"profiles\":[{}],\"resources\":[{}],\"fields\":[\"path\",\"version\",\"sha256\",\"index_state\",\"missing_items\",\"storage_bytes\",\"repair_action\"],\"source_config\":\"{}\",\"latest_validation\":{},\"latest_index_action\":{},\"message\":\"Database resources are read from configs/database_sources.yml and checked against local paths.\"}}",
         profiles,
         resources,
-        escape_json(&config_path.display().to_string())
+        escape_json(&config_path.display().to_string()),
+        latest_validation,
+        latest_index_action
+    )
+}
+
+fn database_validation_json(options: &ServerOptions) -> String {
+    let action_dir = database_action_dir(options);
+    let manifest = action_dir.join("database_validation_manifest.tsv");
+    let summary = action_dir.join("database_validation_summary.tsv");
+    let _ = fs::create_dir_all(&action_dir);
+    let config_path = options.workspace_root.join("configs/database_sources.yml");
+    let sources = parse_database_sources(&config_path);
+    let mut rows = Vec::new();
+    let mut available_count = 0usize;
+    let mut required_missing_count = 0usize;
+    for source in &sources {
+        let root = local_glob_root(&options.workspace_root, &source.local_glob);
+        let exists = root.exists();
+        let files = if exists { file_count(&root) } else { 0 };
+        let bytes = if exists { path_size(&root) } else { 0 };
+        let index_state = database_index_state(&root);
+        let status = if exists && files > 0 {
+            available_count += 1;
+            "available"
+        } else if source.required_for_pass {
+            required_missing_count += 1;
+            "required_source_missing"
+        } else {
+            "optional_source_missing"
+        };
+        rows.push(format!(
+            "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
+            source.id,
+            source.role,
+            source.required_for_pass,
+            root.display(),
+            exists,
+            files,
+            bytes,
+            index_state,
+            source.license_note.replace(['\t', '\r', '\n'], " "),
+            status
+        ));
+    }
+    let manifest_text = format!(
+        "resource\trole\trequired\tpath\texists\tfile_count\tstorage_bytes\tindex_state\tlicense_note\tstatus\n{}\n",
+        rows.join("\n")
+    );
+    let summary_text = format!(
+        "metric\tvalue\nsource_count\t{}\navailable_source_count\t{available_count}\nrequired_missing_count\t{required_missing_count}\nconfig_path\t{}\n",
+        sources.len(),
+        config_path.display()
+    );
+    let write_result =
+        write_text(&manifest, &manifest_text).and(write_text(&summary, &summary_text));
+    if let Err(err) = write_result {
+        return format!(
+            "{{\"status\":\"failed\",\"error\":\"{}\"}}",
+            escape_json(&err)
+        );
+    }
+    format!(
+        "{{\"status\":\"completed\",\"manifest\":\"{}\",\"summary\":\"{}\",\"source_count\":{},\"available_source_count\":{},\"required_missing_count\":{}}}",
+        escape_json(&manifest.display().to_string()),
+        escape_json(&summary.display().to_string()),
+        sources.len(),
+        available_count,
+        required_missing_count
+    )
+}
+
+fn database_index_action_json(options: &ServerOptions) -> String {
+    let action_dir = database_action_dir(options);
+    let manifest = action_dir.join("database_index_action_manifest.tsv");
+    let _ = fs::create_dir_all(&action_dir);
+    let config_path = options.workspace_root.join("configs/database_sources.yml");
+    let sources = parse_database_sources(&config_path);
+    let mut rows = Vec::new();
+    let mut build_required_count = 0usize;
+    let mut already_indexed_count = 0usize;
+    for source in &sources {
+        let root = local_glob_root(&options.workspace_root, &source.local_glob);
+        let files = if root.exists() { file_count(&root) } else { 0 };
+        let index_state = database_index_state(&root);
+        let action = match index_state {
+            "indexed" => {
+                already_indexed_count += 1;
+                "no_action_index_detected"
+            }
+            "data_present_index_not_detected" => {
+                build_required_count += 1;
+                "index_build_required"
+            }
+            "empty" => "wait_for_data_files",
+            _ => "wait_for_source_path",
+        };
+        rows.push(format!(
+            "{}\t{}\t{}\t{}\t{}\t{}",
+            source.id,
+            source.role,
+            root.display(),
+            files,
+            index_state,
+            action
+        ));
+    }
+    let manifest_text = format!(
+        "resource\trole\tpath\tfile_count\tindex_state\taction\n{}\n",
+        rows.join("\n")
+    );
+    if let Err(err) = write_text(&manifest, &manifest_text) {
+        return format!(
+            "{{\"status\":\"failed\",\"error\":\"{}\"}}",
+            escape_json(&err)
+        );
+    }
+    format!(
+        "{{\"status\":\"completed\",\"manifest\":\"{}\",\"source_count\":{},\"build_required_count\":{},\"already_indexed_count\":{}}}",
+        escape_json(&manifest.display().to_string()),
+        sources.len(),
+        build_required_count,
+        already_indexed_count
     )
 }
 
@@ -4698,6 +4839,28 @@ mod tests {
         assert!(databases.contains("\"profile_id\":\"database_sources_yml\""));
         assert!(databases.contains("\"source_config\":"));
         assert!(databases.contains("\"fields\":[\"path\",\"version\",\"sha256\""));
+        let (_, _, database_validation) =
+            route_http("POST", "/api/databases/validate", &options, "");
+        assert!(database_validation.contains("\"status\":\"completed\""));
+        assert!(database_validation.contains("database_validation_manifest.tsv"));
+        assert!(
+            options
+                .artifact_dir
+                .join("databases")
+                .join("database_validation_manifest.tsv")
+                .exists()
+        );
+        let (_, _, database_index_action) =
+            route_http("POST", "/api/databases/build-index", &options, "");
+        assert!(database_index_action.contains("\"status\":\"completed\""));
+        assert!(database_index_action.contains("database_index_action_manifest.tsv"));
+        assert!(
+            options
+                .artifact_dir
+                .join("databases")
+                .join("database_index_action_manifest.tsv")
+                .exists()
+        );
         let (_, _, guides) = route_http("GET", "/api/guides", &options, "");
         assert!(guides.contains("\"guide_count\":3"));
         assert!(guides.contains("\"available_guide_count\":3"));
