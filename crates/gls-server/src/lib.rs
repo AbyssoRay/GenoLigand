@@ -175,7 +175,7 @@ fn route_http(
             ("rust_owned_backend", "true"),
         ]),
         ("GET", "/api/projects") => projects_json(options),
-        ("GET", "/api/databases") => databases_json(),
+        ("GET", "/api/databases") => databases_json(options),
         ("POST", "/api/databases/validate") => action_json("queued"),
         ("POST", "/api/databases/build-index") => action_json("queued"),
         ("GET", "/api/diagnostics") => diagnostics_json(options),
@@ -2385,8 +2385,148 @@ fn normalize_field_name(value: &str) -> String {
         .join("_")
 }
 
-fn databases_json() -> String {
-    "{\"profiles\":[],\"resources\":[\"genome\",\"annotation\",\"transcripts\",\"BioLiP2\",\"UniProt\",\"ChEMBL\",\"BindingDB\",\"structure_cache\"],\"fields\":[\"path\",\"version\",\"sha256\",\"index_state\",\"missing_items\",\"storage_bytes\",\"repair_action\"],\"message\":\"Select or create a database profile.\"}".to_string()
+#[derive(Default)]
+struct DatabaseSource {
+    id: String,
+    role: String,
+    required_for_pass: bool,
+    official_page: String,
+    acquisition: String,
+    local_glob: String,
+    license_note: String,
+}
+
+fn parse_database_sources(config_path: &Path) -> Vec<DatabaseSource> {
+    let Ok(text) = fs::read_to_string(config_path) else {
+        return Vec::new();
+    };
+    let mut sources = Vec::new();
+    let mut current: Option<DatabaseSource> = None;
+    for raw_line in text.lines() {
+        let line = raw_line.trim_end();
+        if line.starts_with("  ") && !line.starts_with("    ") && line.trim_end().ends_with(':') {
+            if let Some(source) = current.take()
+                && !source.id.is_empty()
+            {
+                sources.push(source);
+            }
+            current = Some(DatabaseSource {
+                id: line.trim().trim_end_matches(':').to_string(),
+                ..DatabaseSource::default()
+            });
+            continue;
+        }
+        let Some(source) = current.as_mut() else {
+            continue;
+        };
+        let trimmed = line.trim();
+        let Some((key, value)) = trimmed.split_once(':') else {
+            continue;
+        };
+        let value = value.trim().trim_matches('"').to_string();
+        match key {
+            "role" => source.role = value,
+            "required_for_pass" => source.required_for_pass = value == "true",
+            "official_page" => source.official_page = value,
+            "acquisition" => source.acquisition = value,
+            "local_glob" => source.local_glob = value,
+            "license_note" => source.license_note = value,
+            _ => {}
+        }
+    }
+    if let Some(source) = current.take()
+        && !source.id.is_empty()
+    {
+        sources.push(source);
+    }
+    sources
+}
+
+fn local_glob_root(workspace_root: &Path, local_glob: &str) -> PathBuf {
+    let prefix = local_glob
+        .split("**")
+        .next()
+        .unwrap_or(local_glob)
+        .trim_end_matches(['/', '\\', '*']);
+    workspace_root.join(prefix)
+}
+
+fn database_index_state(root: &Path) -> &'static str {
+    if !root.exists() {
+        return "missing";
+    }
+    let files = collect_run_files(root, 1000);
+    if files.iter().any(|path| {
+        let text = path.display().to_string().to_ascii_lowercase();
+        text.contains("index")
+            || text.ends_with(".duckdb")
+            || text.ends_with(".parquet")
+            || text.ends_with(".dmnd")
+            || text.ends_with(".m8")
+    }) {
+        "indexed"
+    } else if files.is_empty() {
+        "empty"
+    } else {
+        "data_present_index_not_detected"
+    }
+}
+
+fn databases_json(options: &ServerOptions) -> String {
+    let config_path = options.workspace_root.join("configs/database_sources.yml");
+    let sources = parse_database_sources(&config_path);
+    let resources = sources
+        .iter()
+        .map(|source| {
+            let root = local_glob_root(&options.workspace_root, &source.local_glob);
+            let exists = root.exists();
+            let files = if exists { file_count(&root) } else { 0 };
+            let bytes = if exists { path_size(&root) } else { 0 };
+            let index_state = database_index_state(&root);
+            let missing_items = if exists && files > 0 { 0 } else { 1 };
+            let repair_action = if exists && files > 0 {
+                "validate_manifest_and_hash"
+            } else if source.required_for_pass {
+                "mount_or_download_required_source"
+            } else {
+                "optional_source_not_configured"
+            };
+            format!(
+                "{{\"resource\":\"{}\",\"role\":\"{}\",\"required\":{},\"official_page\":\"{}\",\"path\":\"{}\",\"local_glob\":\"{}\",\"version\":\"{}\",\"sha256\":\"{}\",\"index_state\":\"{}\",\"missing_items\":{},\"storage_bytes\":{},\"file_count\":{},\"repair_action\":\"{}\",\"license_note\":\"{}\"}}",
+                escape_json(&source.id),
+                escape_json(&source.role),
+                source.required_for_pass,
+                escape_json(&source.official_page),
+                escape_json(&root.display().to_string()),
+                escape_json(&source.local_glob),
+                escape_json(&source.acquisition),
+                if exists { "manifest_required" } else { "not_available" },
+                escape_json(index_state),
+                missing_items,
+                bytes,
+                files,
+                escape_json(repair_action),
+                escape_json(&source.license_note)
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(",");
+    let profiles = format!(
+        "{{\"profile_id\":\"database_sources_yml\",\"path\":\"{}\",\"source_count\":{},\"status\":\"{}\"}}",
+        escape_json(&config_path.display().to_string()),
+        sources.len(),
+        if sources.is_empty() {
+            "configuration_missing"
+        } else {
+            "loaded"
+        }
+    );
+    format!(
+        "{{\"profiles\":[{}],\"resources\":[{}],\"fields\":[\"path\",\"version\",\"sha256\",\"index_state\",\"missing_items\",\"storage_bytes\",\"repair_action\"],\"source_config\":\"{}\",\"message\":\"Database resources are read from configs/database_sources.yml and checked against local paths.\"}}",
+        profiles,
+        resources,
+        escape_json(&config_path.display().to_string())
+    )
 }
 
 fn diagnostics_json(options: &ServerOptions) -> String {
@@ -3437,6 +3577,10 @@ mod tests {
         let (_, _, diagnostics) = route_http("GET", "/api/diagnostics", &options, "");
         assert!(diagnostics.contains("\"check_id\":\"rust_binary\""));
         assert!(diagnostics.contains("\"observed\":"));
+        let (_, _, databases) = route_http("GET", "/api/databases", &options, "");
+        assert!(databases.contains("\"profile_id\":\"database_sources_yml\""));
+        assert!(databases.contains("\"source_config\":"));
+        assert!(databases.contains("\"fields\":[\"path\",\"version\",\"sha256\""));
 
         let (_, _, exports) = route_http("POST", "/api/reports/export", &options, "");
         assert!(exports.contains("\"html_report\""));

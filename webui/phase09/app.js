@@ -1064,21 +1064,54 @@ function evidenceLedger() {
 function databaseRegistry() {
   const payload = appState.databases || {};
   const resources = payload.resources || [];
-  const rows = resources.map((resource) => [
-    resource,
-    payload.profiles?.length ? `${payload.profiles.length} profile(s)` : pick(["尚未选择 profile", "No profile selected"]),
-    "",
-    "",
-    statusPill("waiting"),
-    "",
-    pick(["选择路径并验证索引", "Select paths and validate indexes"]),
-  ]);
+  const rows = resources.map((resource) => {
+    if (typeof resource === "string") {
+      return [
+        resource,
+        payload.profiles?.length ? `${payload.profiles.length} profile(s)` : pick(["尚未选择 profile", "No profile selected"]),
+        "",
+        "",
+        statusPill("waiting"),
+        "",
+        pick(["选择路径并验证索引", "Select paths and validate indexes"]),
+      ];
+    }
+    const state = resource.index_state === "indexed" || resource.index_state === "data_present_index_not_detected" ? "ready" : resource.required ? "waiting" : "optional";
+    return [
+      `${resource.resource || ""}${resource.required ? " *" : ""}`,
+      valueOrDash(resource.path),
+      valueOrDash(resource.version || resource.acquisition),
+      valueOrDash(resource.sha256),
+      statusPill(state, valueOrDash(resource.index_state)),
+      `${valueOrDash(resource.storage_bytes)} bytes / ${valueOrDash(resource.file_count)} files`,
+      valueOrDash(resource.repair_action),
+    ];
+  });
   if (rows.length) {
-    return dataTable(
-      [[["资源", "Resource"], ["路径", "Path"], ["版本", "Version"], ["hash", "hash"], ["索引状态", "Index state"], ["空间", "Storage"], ["修复动作", "Repair action"]].map((x) => x)][0],
-      rows,
-      payload.message || pick(["尚未选择数据库 profile。", "No database profile selected."])
-    ) + buttonRow([[[ "验证数据库 profile", "Validate database profile" ], "", null], [[ "构建数据库索引", "Build database indexes" ], "primary", null]]);
+    const profileRows = (payload.profiles || []).map((profile) => [
+      valueOrDash(profile.profile_id),
+      valueOrDash(profile.path),
+      statusPill(profile.status === "loaded" ? "ready" : "waiting", valueOrDash(profile.status)),
+      valueOrDash(profile.source_count),
+    ]);
+    return [
+      card(
+        [["数据库 Profile", "Database Profile"]],
+        dataTable(
+          [[["profile", "profile"], ["配置路径", "Config path"], ["状态", "State"], ["source count", "source count"]].map((x) => x)][0],
+          profileRows,
+          payload.message || pick(["尚未选择数据库 profile。", "No database profile selected."])
+        )
+      ),
+      card(
+        [["数据库资源", "Database Resources"]],
+        dataTable(
+          [[["资源", "Resource"], ["路径", "Path"], ["版本", "Version"], ["hash", "hash"], ["索引状态", "Index state"], ["空间", "Storage"], ["修复动作", "Repair action"]].map((x) => x)][0],
+          rows,
+          payload.message || pick(["尚未选择数据库 profile。", "No database profile selected."])
+        ) + buttonRow([[[ "验证数据库 profile", "Validate database profile" ], "", null], [[ "构建数据库索引", "Build database indexes" ], "primary", null]])
+      ),
+    ].join("");
   }
   return dataTable(
     [[["资源", "Resource"], ["路径", "Path"], ["版本", "Version"], ["hash", "hash"], ["索引状态", "Index state"], ["空间", "Storage"], ["修复动作", "Repair action"]].map((x) => x)][0],
