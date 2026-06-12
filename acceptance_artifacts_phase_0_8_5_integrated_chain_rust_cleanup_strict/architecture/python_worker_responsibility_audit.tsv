@@ -1,0 +1,5 @@
+worker_module	primitive_role	final_score_rule_count	report_semantics_count	job_schema	result_schema	status
+python/genoligand_workers/openmm_worker.py	OpenMM primitive execution	0	0	schemas/worker_job.phase_0_8_5.schema.json	schemas/worker_result.phase_0_8_5.schema.json	PASS
+python/genoligand_workers/pdbfixer_worker.py	PDBFixer repair primitive	0	0	schemas/worker_job.phase_0_8_5.schema.json	schemas/worker_result.phase_0_8_5.schema.json	PASS
+python/genoligand_workers/openff_worker.py	OpenFF/RDKit parameterization primitive	0	0	schemas/worker_job.phase_0_8_5.schema.json	schemas/worker_result.phase_0_8_5.schema.json	PASS
+python/genoligand_workers/trajectory_worker.py	MDTraj/MDAnalysis feature primitive	0	0	schemas/worker_job.phase_0_8_5.schema.json	schemas/worker_result.phase_0_8_5.schema.json	PASS

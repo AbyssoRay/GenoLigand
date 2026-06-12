@@ -1,3 +1,4 @@
+use gls_architecture::{ArchitectureCommand, ArchitectureOptions, run_architecture_command};
 use gls_cli::stages::{
     ClassifyLociOptions, CooccurScoreOptions, DockOptions, FoldgateOptions, GatePlmOptions,
     GateShortCircuitOptions, OrfExtendOptions, PatchOptions, PhaseGateShortCircuitOptions,
@@ -14,10 +15,11 @@ use gls_cli::{
     DevSmokeInputs, WorkerCommandSet, run_calibrate_patch_tolerance_json,
     run_dev_smoke_with_worker_commands_and_inputs, run_worker_command,
 };
+use gls_maintain::{MaintainCommand, MaintainOptions, run_maintain_command, validate_phase_0_8_5};
+use gls_md::{MdCommand, MdOptions, run_md_command};
 use gls_report::{render_html, render_markdown};
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::process::Command;
 
 fn main() {
     let args = std::env::args().skip(1).collect::<Vec<_>>();
@@ -74,6 +76,8 @@ fn run_cli(args: &[String]) -> Result<Option<String>, String> {
         "report" => run_report_cli(&args[1..]).map(Some),
         "validate" => run_validate_cli(&args[1..]).map(Some),
         "md" => run_md_cli(&args[1..]).map(Some),
+        "maintain" => run_maintain_cli(&args[1..]).map(Some),
+        "architecture" => run_architecture_cli(&args[1..]).map(Some),
         "--help" | "-h" => Ok(Some(GLOBAL_HELP.to_string())),
         _ => Err(format!("unknown_command:{command}")),
     }
@@ -168,41 +172,47 @@ fn run_md_cli(args: &[String]) -> Result<String, String> {
     if args.is_empty() || is_help(args) {
         return Ok(MD_HELP.to_string());
     }
-    let subcommand = match args[0].as_str() {
-        "select" => "select",
-        "prepare" => "prepare",
-        "run" => "run-md",
-        "analyze" => "analyze",
-        "score" => "score",
-        "report" => "render-report",
-        other => return Err(format!("unknown_md_command:{other}")),
-    };
-    let root = workspace_root_from_exe()?;
-    let python =
-        std::env::var("GENOLIGAND_PHASE084_PYTHON").unwrap_or_else(|_| "python".to_string());
-    let script = root
-        .join("scripts")
-        .join("phase084")
-        .join("phase084_cli.py");
-    let output = Command::new(&python)
-        .arg(script)
-        .arg(subcommand)
-        .args(&args[1..])
-        .output()
-        .map_err(|err| format!("md_python_spawn_failed:{python}:{err}"))?;
-    if !output.status.success() {
-        return Err(format!(
-            "md_command_failed:{}:{}",
-            subcommand,
-            String::from_utf8_lossy(&output.stderr)
-        ));
+    let command = MdCommand::parse(&args[0])?;
+    let common = Phase085CommonArgs::parse(&args[1..])?;
+    run_md_command(
+        command,
+        &MdOptions {
+            artifact_dir: common.artifact_dir,
+            workspace_root: common.workspace_root,
+        },
+    )
+}
+
+fn run_maintain_cli(args: &[String]) -> Result<String, String> {
+    if args.is_empty() || is_help(args) {
+        return Ok(MAINTAIN_HELP.to_string());
     }
-    let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
-    Ok(if stdout.is_empty() {
-        format!("md {subcommand} ok")
-    } else {
-        stdout
-    })
+    let command = MaintainCommand::parse(&args[0])?;
+    let common = Phase085CommonArgs::parse(&args[1..])?;
+    run_maintain_command(
+        command,
+        &MaintainOptions {
+            artifact_dir: common.artifact_dir,
+            workspace_root: common.workspace_root,
+            external_tools_root: common.external_tools_root,
+            when: common.when,
+        },
+    )
+}
+
+fn run_architecture_cli(args: &[String]) -> Result<String, String> {
+    if args.is_empty() || is_help(args) {
+        return Ok(ARCHITECTURE_HELP.to_string());
+    }
+    let command = ArchitectureCommand::parse(&args[0])?;
+    let common = Phase085CommonArgs::parse(&args[1..])?;
+    run_architecture_command(
+        command,
+        &ArchitectureOptions {
+            artifact_dir: common.artifact_dir,
+            workspace_root: common.workspace_root,
+        },
+    )
 }
 
 fn run_orf_cli(args: &[String]) -> Result<String, String> {
@@ -541,6 +551,15 @@ fn run_report_cli(args: &[String]) -> Result<String, String> {
 fn run_validate_cli(args: &[String]) -> Result<String, String> {
     if args.is_empty() || is_help(args) {
         return Ok(VALIDATE_HELP.to_string());
+    }
+    if args[0] == "phase-0-8-5" {
+        let common = Phase085CommonArgs::parse(&args[1..])?;
+        return validate_phase_0_8_5(&MaintainOptions {
+            artifact_dir: common.artifact_dir,
+            workspace_root: common.workspace_root,
+            external_tools_root: common.external_tools_root,
+            when: common.when,
+        });
     }
     let kind = match args[0].as_str() {
         "fasta" => ValidateKind::Fasta,
@@ -1439,6 +1458,60 @@ struct ValidateArgs {
     input: PathBuf,
 }
 
+struct Phase085CommonArgs {
+    artifact_dir: PathBuf,
+    workspace_root: PathBuf,
+    external_tools_root: PathBuf,
+    when: String,
+}
+
+impl Phase085CommonArgs {
+    fn parse(args: &[String]) -> Result<Self, String> {
+        let default_root = workspace_root_from_exe()?;
+        let mut artifact_dir = None;
+        let mut workspace_root = None;
+        let mut external_tools_root = None;
+        let mut when = "before".to_string();
+        parse_options(args, |flag, args, index| match flag {
+            "--artifact-dir" => {
+                artifact_dir = Some(take_path(args, index, flag)?);
+                Ok(())
+            }
+            "--workspace-root" => {
+                workspace_root = Some(take_path(args, index, flag)?);
+                Ok(())
+            }
+            "--external-tools-root" => {
+                external_tools_root = Some(take_path(args, index, flag)?);
+                Ok(())
+            }
+            "--when" => {
+                when = take_string(args, index, flag)?;
+                Ok(())
+            }
+            other => Err(format!("unknown_phase_0_8_5_option:{other}")),
+        })?;
+        let workspace_root = workspace_root.unwrap_or(default_root);
+        let artifact_dir = artifact_dir.unwrap_or_else(|| {
+            workspace_root
+                .join("acceptance_artifacts_phase_0_8_5_integrated_chain_rust_cleanup_strict")
+        });
+        let external_tools_root = external_tools_root
+            .or_else(|| {
+                std::env::var("GENOLIGAND_EXTERNAL_TOOLS_ROOT")
+                    .ok()
+                    .map(PathBuf::from)
+            })
+            .unwrap_or_else(|| PathBuf::from("D:\\user\\codex\\tools"));
+        Ok(Self {
+            artifact_dir,
+            workspace_root,
+            external_tools_root,
+            when,
+        })
+    }
+}
+
 impl ValidateArgs {
     fn parse(args: &[String]) -> Result<Self, String> {
         let mut input = None;
@@ -1544,11 +1617,13 @@ commands:
   sequence features
   sequence score
   md select|prepare|run|analyze|score|report
+  maintain inventory|cleanup-plan|cleanup-execute|external-tools-inventory|external-tools-cleanup|wsl-inventory|wsl-cleanup|stale-reference-audit|git-state-audit
+  architecture audit-md-ownership|audit-nextflow-calls|audit-python-workers|audit-adapter-protocol
   report markdown
   report candidate
   report phase-0-4
   report phase-0-5
-  validate fasta|gff|fragment-kernel|ligand
+  validate fasta|gff|fragment-kernel|ligand|phase-0-8-5
   gls-calibrate-patch-tolerance
 ";
 
@@ -1566,6 +1641,8 @@ const STATS_HELP: &str = "usage: gls-cli stats <score>\ncommands:\n  score";
 const STATS_SCORE_HELP: &str = "usage: gls-cli stats score --hits PATH --out PATH";
 const MD_HELP: &str =
     "usage: gls-cli md <select|prepare|run|analyze|score|report> [--artifact-dir PATH]";
+const MAINTAIN_HELP: &str = "usage: gls-cli maintain <inventory|cleanup-plan|cleanup-execute|external-tools-inventory|external-tools-cleanup|wsl-inventory|wsl-cleanup|stale-reference-audit|git-state-audit> [--artifact-dir PATH] [--workspace-root PATH] [--external-tools-root PATH] [--when before|after]";
+const ARCHITECTURE_HELP: &str = "usage: gls-cli architecture <audit-md-ownership|audit-nextflow-calls|audit-python-workers|audit-adapter-protocol> [--artifact-dir PATH] [--workspace-root PATH]";
 const ORF_HELP: &str = "usage: gls-cli orf <extend>\ncommands:\n  extend";
 const ORF_EXTEND_HELP: &str = "usage: gls-cli orf extend --genome PATH --hits PATH --out PATH";
 const CLASSIFY_HELP: &str = "usage: gls-cli classify <loci>\ncommands:\n  loci";
@@ -1597,8 +1674,7 @@ const REPORT_MARKDOWN_HELP: &str = "usage: gls-cli report markdown --hits PATH -
 const REPORT_CANDIDATE_HELP: &str = "usage: gls-cli report candidate --hits PATH --stats PATH --orfs PATH --context PATH --cooccur PATH --gate PATH --evidence PATH --out PATH";
 const REPORT_PHASE_0_4_HELP: &str = "usage: gls-cli report phase-0-4 --candidates PATH --features PATH --embeddings PATH --similarity PATH --evidence PATH --out PATH";
 const REPORT_PHASE_0_5_HELP: &str = "usage: gls-cli report phase-0-5 --candidates PATH --sequence-evidence PATH --plm-gpu PATH --structure-manifest PATH --structure-quality PATH --patches PATH --out PATH --score-out PATH";
-const VALIDATE_HELP: &str =
-    "usage: gls-cli validate <fasta|gff|fragment-kernel|ligand> --input PATH";
+const VALIDATE_HELP: &str = "usage: gls-cli validate <fasta|gff|fragment-kernel|ligand> --input PATH\n       gls-cli validate phase-0-8-5 [--artifact-dir PATH]";
 const VALIDATE_FASTA_HELP: &str = "usage: gls-cli validate fasta --input PATH";
 const VALIDATE_GFF_HELP: &str = "usage: gls-cli validate gff --input PATH";
 const VALIDATE_FRAGMENT_KERNEL_HELP: &str = "usage: gls-cli validate fragment-kernel --input PATH";

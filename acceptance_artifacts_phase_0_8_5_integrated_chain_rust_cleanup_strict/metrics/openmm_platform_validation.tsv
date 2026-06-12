@@ -1,0 +1,7 @@
+metric	value	status
+active_runtime_backend	WSL2	PASS
+runtime_backend_type	WSL2	PASS
+project_wsl_backend	GenoLigandPhase08	PASS
+openmm_version	8.5.2.dev-36a30cb	PASS
+openmm_cuda_status	PASS	PASS
+kept_project_wsl_cuda_openmm_evidence	True	PASS

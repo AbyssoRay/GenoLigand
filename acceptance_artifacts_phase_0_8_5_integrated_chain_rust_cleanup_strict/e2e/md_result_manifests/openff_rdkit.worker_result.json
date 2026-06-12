@@ -1,0 +1,10 @@
+{
+  "engine_version": "OpenFF Toolkit 0.18.1; RDKit 2025.09.5",
+  "job_id": "openff_rdkit_smoke",
+  "primitive_execution_only": true,
+  "python_owns_final_score": false,
+  "python_owns_report_semantics": false,
+  "schema_version": "phase_0_8_5",
+  "status": "PASS",
+  "worker": "openff_rdkit"
+}

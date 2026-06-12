@@ -19,6 +19,9 @@ members = [
   "crates/gls-report",
   "crates/gls-geometry-bench",
   "crates/gls-sequence",
+  "crates/gls-md",
+  "crates/gls-maintain",
+  "crates/gls-architecture",
   "crates/gls-cli",
 ]
 

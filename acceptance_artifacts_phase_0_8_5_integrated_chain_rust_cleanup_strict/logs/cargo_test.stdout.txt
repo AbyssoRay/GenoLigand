@@ -1,0 +1,328 @@
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+
+running 1 test
+test phase085_architecture_audit_records_rust_ownership ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+
+running 1 test
+test tests::artifact_json_line_carries_hash_and_provenance ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+
+running 8 tests
+test benjamini_hochberg_q_values_are_monotonic_by_sorted_p_value ... ok
+test six_frame_translations_are_total_for_short_and_ambiguous_dna ... ok
+test phase_0_2_nextflow_resume_hash_record_is_consistent_when_present ... ok
+test validators_accept_minimal_valid_contract_files ... ok
+test split_stage_toy_pipeline_passes_yhedlv_and_filters_ala_rich_decoy ... ok
+test phase_0_3_fixture_covers_context_evidence_and_decoy_semantics ... ok
+test phase_0_2_pipeline_preserves_context_ranking_and_stop_boundaries ... ok
+test phase_0_4_sequence_layer_exports_features_scores_and_report_controls ... ok
+
+test result: ok. 8 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.02s
+
+
+running 11 tests
+test docking_contract_keeps_non_pass_l2_out_of_worker_results ... ok
+test plm_gate_contract_rejects_any_non_pass_plm_input ... ok
+test v16_contract_files_exist_with_positive_and_negative_examples ... ok
+test dev_smoke_runs_l0_to_l2_and_reports_every_required_layer ... ok
+test v16_schema_examples_validate_and_reject ... ok
+test cli_external_worker_override_fails_loudly_when_missing ... ok
+test cli_calibrate_patch_tolerance_accepts_curated_fixture_tsv ... ok
+test cli_calibrate_patch_tolerance_outputs_schema_valid_report ... ok
+test cli_plm_budget_profile_is_enforced_from_yaml ... ok
+test cli_dev_smoke_uses_persistent_worker_subprocess_protocol ... ok
+test cli_dev_smoke_accepts_ligand_and_genome_files ... ok
+
+test result: ok. 11 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.02s
+
+
+running 5 tests
+test tests::docking_manifest_only_contains_pass_l2_candidates ... ok
+test tests::vina_result_parser_accepts_remark_format ... ok
+test tests::docking_worker_is_persistent_across_batch ... ok
+test tests::docking_only_processes_pass_l2_candidates ... ok
+test tests::vina_result_parser_extracts_best_affinity ... ok
+
+test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+
+running 5 tests
+test tests::hard_negative_positive_leakage_is_rejected ... ok
+test tests::curated_fixture_tsv_imports_manifest_with_metrics ... ok
+test tests::dev_manifest_covers_all_required_fixture_types ... ok
+test tests::dev_manifest_has_required_hash_source_license_and_split ... ok
+test tests::dev_manifest_covers_required_calibration_sources_and_contexts ... ok
+
+test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+
+running 3 tests
+test tests::g0_g1_candidates_cannot_enter_l15 ... ok
+test tests::l15_records_orf_extension_before_worker_boundary ... ok
+test tests::pocket_worker_failure_is_machine_readable ... ok
+
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+
+running 1 test
+test tests::exact_and_category_hits_are_reported ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+
+running 4 tests
+test tests::reverse_complement_round_trips_canonical_bases ... ok
+test tests::six_frames_keep_expected_frame_labels ... ok
+test tests::stop_to_stop_orf_boundaries_are_frame_aware ... ok
+test tests::genome_search_returns_hits_with_q_values ... ok
+
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+
+running 2 tests
+test tests::geometry_hash_guard_triggers_on_bucket_occupancy ... ok
+test tests::kabsch_rmsd_recovers_translated_points ... ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+
+running 1 test
+test tests::recall_curve_reports_memory_seed_and_profile_order ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+
+running 1 test
+test tests::idp_report_is_trend_only_without_macro_free_energy ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+
+running 1 test
+test tests::ligand_yaml_generates_stable_kernel_artifacts ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+
+running 1 test
+test phase085_validator_writes_master_json_even_for_incomplete_artifact ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+
+running 1 test
+test phase085_md_generates_three_complete_examples ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.04s
+
+
+running 7 tests
+test tests::high_occlusion_patch_is_rejected_before_l2 ... ok
+test tests::hard_negative_same_residue_geometry_is_rejected ... ok
+test tests::coarse_to_fine_relaxation_is_audited ... ok
+test tests::occlusion_threshold_is_taken_from_tolerance_profile ... ok
+test tests::missing_tolerance_profile_is_rejected ... ok
+test tests::positive_fixture_like_patch_passes_l2 ... ok
+test tests::uncalibrated_profile_is_rejected ... ok
+
+test result: ok. 7 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+
+running 6 tests
+test tests::budget_exhaustion_is_stable_failure_before_worker ... ok
+test tests::gpu_semaphore_zero_permits_fails_before_worker ... ok
+test tests::duplicate_sequence_uses_one_embedding_cache_entry ... ok
+test tests::boundary_candidates_use_upgraded_versioned_cache_key ... ok
+test tests::rejected_or_hold_candidates_cannot_enter_plm_gate ... ok
+test tests::versioned_embedding_cache_is_reused_across_runs ... ok
+
+test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+
+running 1 test
+test tests::report_shows_layer_counts_failures_and_resources ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+
+running 4 tests
+test tests::fasta_header_round_trip_preserves_fields ... ok
+test tests::sha256_known_vector_matches_standard ... ok
+test tests::low_complexity_and_homopolymer_are_flagged ... ok
+test tests::scoring_penalizes_controls ... ok
+
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+
+running 6 tests
+test tests::low_complexity_candidate_never_passes_plm ... ok
+test tests::dark_candidates_are_held_not_deleted_when_annotation_is_absent ... ok
+test tests::plm_budget_yaml_profile_updates_runtime_config ... ok
+test tests::duplicate_sequence_only_allows_canonical_representative ... ok
+test tests::plm_budget_zero_is_stable_and_machine_readable ... ok
+test tests::one_hundred_thousand_candidates_are_budgeted_on_cpu ... ok
+
+test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 3.06s
+
+
+running 2 tests
+test tests::bh_q_values_are_monotonic_by_rank ... ok
+test tests::high_frequency_fragments_receive_weaker_scores ... ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+
+running 4 tests
+test tests::calibration_rejects_seed_triplet_explosion ... ok
+test tests::runtime_selection_is_coarse_to_fine ... ok
+test tests::calibration_profiles_carry_fixture_derived_surface_thresholds ... ok
+test tests::calibration_generates_fixture_backed_profiles_for_required_contexts ... ok
+
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+
+running 2 tests
+test tests::hashes_are_stable_hex ... ok
+test tests::uncalibrated_profile_is_rejected_for_runtime ... ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+

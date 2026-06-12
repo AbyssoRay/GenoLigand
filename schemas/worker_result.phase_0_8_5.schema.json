@@ -1,0 +1,29 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://genoligand.local/schemas/worker_result.phase_0_8_5.schema.json",
+  "title": "GenoLigand Phase 0.8.5 Worker Result",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "job_id",
+    "worker",
+    "status",
+    "engine_version",
+    "python_owns_final_score",
+    "python_owns_report_semantics",
+    "primitive_execution_only"
+  ],
+  "properties": {
+    "schema_version": { "const": "phase_0_8_5" },
+    "job_id": { "type": "string", "minLength": 1 },
+    "worker": {
+      "enum": ["openmm", "pdbfixer", "openff_rdkit", "trajectory_features"]
+    },
+    "status": { "enum": ["PASS", "FAIL"] },
+    "engine_version": { "type": "string" },
+    "python_owns_final_score": { "const": false },
+    "python_owns_report_semantics": { "const": false },
+    "primitive_execution_only": { "const": true }
+  }
+}

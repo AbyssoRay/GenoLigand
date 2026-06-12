@@ -1,0 +1,9 @@
+tool_name	license_record	mandatory	status
+OpenMM	MIT/LGPL/BSD mixed open-source record	true	PASS
+PDBFixer	MIT	true	PASS
+OpenFF Toolkit	MIT	true	PASS
+RDKit	BSD-3-Clause	true	PASS
+MDTraj	LGPL-2.1-or-later	true	PASS
+MDAnalysis	GPL-2.0-or-later	true	PASS
+mandatory_tool_license_record_completion_rate	100%	true	PASS
+proprietary_mandatory_dependency_count	0	true	PASS

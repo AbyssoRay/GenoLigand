@@ -1,0 +1,10 @@
+{
+  "engine_version": "PDBFixer version_not_exposed",
+  "job_id": "pdbfixer_smoke",
+  "primitive_execution_only": true,
+  "python_owns_final_score": false,
+  "python_owns_report_semantics": false,
+  "schema_version": "phase_0_8_5",
+  "status": "PASS",
+  "worker": "pdbfixer"
+}

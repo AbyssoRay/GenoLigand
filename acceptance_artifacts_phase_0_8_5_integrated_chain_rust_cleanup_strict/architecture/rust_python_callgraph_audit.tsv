@@ -1,0 +1,5 @@
+caller	callee	call_kind	input_schema	output_schema	rust_owns_decision	python_owns_primitive_execution	allowed_by_adapter_registry	artifact_id	status
+crates/gls-md/src/lib.rs	python/genoligand_workers/openmm_worker.py	schema_bound_worker	schemas/worker_job.phase_0_8_5.schema.json	schemas/worker_result.phase_0_8_5.schema.json	true	true	true	openmm_smoke	PASS
+crates/gls-md/src/lib.rs	python/genoligand_workers/pdbfixer_worker.py	schema_bound_worker	schemas/worker_job.phase_0_8_5.schema.json	schemas/worker_result.phase_0_8_5.schema.json	true	true	true	pdbfixer_smoke	PASS
+crates/gls-md/src/lib.rs	python/genoligand_workers/openff_worker.py	schema_bound_worker	schemas/worker_job.phase_0_8_5.schema.json	schemas/worker_result.phase_0_8_5.schema.json	true	true	true	openff_rdkit_smoke	PASS
+crates/gls-md/src/lib.rs	python/genoligand_workers/trajectory_worker.py	schema_bound_worker	schemas/worker_job.phase_0_8_5.schema.json	schemas/worker_result.phase_0_8_5.schema.json	true	true	true	trajectory_features_smoke	PASS

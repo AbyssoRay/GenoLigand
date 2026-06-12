@@ -1,0 +1,8 @@
+tool_name	version	status
+OpenMM	8.5.2.dev-36a30cb	PASS
+PDBFixer	version_not_exposed	PASS
+OpenFF Toolkit	0.18.1	PASS
+RDKit	2025.09.5	PASS
+MDTraj	1.11.1	PASS
+MDAnalysis	2.10.0	PASS
+tool_versions_manifest_complete	True	PASS

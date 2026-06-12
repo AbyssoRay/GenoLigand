@@ -193,5 +193,19 @@ $RECYCLE.BIN/
 *.nc
 *.chk
 
+# Phase 0.8.5 integrated-chain runtime caches and non-committed heavy state.
+/outputs/phase_0_8_5/
+/databases/phase_0_8_5/
+/data/external_phase_0_8_5/
+/.phase_0_8_5_env/
+/.phase_0_8_5_tools/
+/tools/*_src_old/
+/tools/*_download_old/
+/tools/*.zip
+/tools/*.tar.gz
+/tools/*.tgz
+/tools/cache/
+/tools/tmp/
+
 
 AGENTS.md

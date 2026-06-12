@@ -1,0 +1,67 @@
+acceptance_mode: phase_0_8_5_integrated_chain_rust_cleanup_strict
+registry_owner: rust
+worker_job_schema: schemas/worker_job.phase_0_8_5.schema.json
+worker_result_schema: schemas/worker_result.phase_0_8_5.schema.json
+tools:
+  - tool_name: OpenMM
+    tool_role: molecular_dynamics_primitive
+    license: MIT/LGPL/BSD mixed open-source record
+    runtime: WSL2 CUDA
+    adapter_kind: schema_bound_python_worker
+    worker_module: python/genoligand_workers/openmm_worker.py
+    input_schema: schemas/worker_job.phase_0_8_5.schema.json
+    output_schema: schemas/worker_result.phase_0_8_5.schema.json
+    owned_by_rust_decision_logic: true
+    artifact_policy: primitive_result_only
+  - tool_name: PDBFixer
+    tool_role: structure_repair_primitive
+    license: MIT
+    runtime: WSL2
+    adapter_kind: schema_bound_python_worker
+    worker_module: python/genoligand_workers/pdbfixer_worker.py
+    input_schema: schemas/worker_job.phase_0_8_5.schema.json
+    output_schema: schemas/worker_result.phase_0_8_5.schema.json
+    owned_by_rust_decision_logic: true
+    artifact_policy: primitive_result_only
+  - tool_name: OpenFF Toolkit
+    tool_role: ligand_parameterization_primitive
+    license: MIT
+    runtime: WSL2
+    adapter_kind: schema_bound_python_worker
+    worker_module: python/genoligand_workers/openff_worker.py
+    input_schema: schemas/worker_job.phase_0_8_5.schema.json
+    output_schema: schemas/worker_result.phase_0_8_5.schema.json
+    owned_by_rust_decision_logic: true
+    artifact_policy: primitive_result_only
+  - tool_name: RDKit
+    tool_role: cheminformatics_primitive
+    license: BSD-3-Clause
+    runtime: WSL2
+    adapter_kind: schema_bound_python_worker
+    worker_module: python/genoligand_workers/openff_worker.py
+    input_schema: schemas/worker_job.phase_0_8_5.schema.json
+    output_schema: schemas/worker_result.phase_0_8_5.schema.json
+    owned_by_rust_decision_logic: true
+    artifact_policy: primitive_result_only
+  - tool_name: MDTraj
+    tool_role: trajectory_feature_primitive
+    license: LGPL-2.1-or-later
+    runtime: WSL2
+    adapter_kind: schema_bound_python_worker
+    worker_module: python/genoligand_workers/trajectory_worker.py
+    input_schema: schemas/worker_job.phase_0_8_5.schema.json
+    output_schema: schemas/worker_result.phase_0_8_5.schema.json
+    owned_by_rust_decision_logic: true
+    artifact_policy: primitive_result_only
+  - tool_name: MDAnalysis
+    tool_role: trajectory_feature_primitive
+    license: GPL-2.0-or-later
+    runtime: WSL2
+    adapter_kind: schema_bound_python_worker
+    worker_module: python/genoligand_workers/trajectory_worker.py
+    input_schema: schemas/worker_job.phase_0_8_5.schema.json
+    output_schema: schemas/worker_result.phase_0_8_5.schema.json
+    owned_by_rust_decision_logic: true
+    artifact_policy: primitive_result_only
+mandatory_tool_license_record_completion_rate: 100%
+proprietary_mandatory_dependency_count: 0

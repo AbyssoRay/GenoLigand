@@ -1,0 +1,15 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://genoligand.local/schemas/cleanup_manifest.phase_0_8_5.schema.json",
+  "title": "GenoLigand Phase 0.8.5 Cleanup Manifest",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "path", "action", "allowlist_reason", "protected_path_violation_count"],
+  "properties": {
+    "schema_version": { "const": "phase_0_8_5" },
+    "path": { "type": "string" },
+    "action": { "enum": ["delete", "keep", "skip"] },
+    "allowlist_reason": { "type": "string" },
+    "protected_path_violation_count": { "const": 0 }
+  }
+}

@@ -1,0 +1,8 @@
+{
+  "schema_version": "phase_0_8_5",
+  "candidate_id": "benchmark_candidate",
+  "target_uniprot": "Q9Y233",
+  "ligand_id": "benchmark_ligand",
+  "selection_owner": "rust",
+  "evidence_scope": "computational_candidate_prior"
+}

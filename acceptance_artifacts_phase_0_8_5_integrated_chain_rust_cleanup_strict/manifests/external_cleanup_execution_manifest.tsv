@@ -1,0 +1,3 @@
+path	kind	action	bytes	files	execution_status	error
+D:\user\codex\tools\genoligand-phase07	directory	delete	567285305	12111	DELETED	carried_forward_observed_deleted_obsolete_phase07_external_tool_root
+SUMMARY	summary	delete	567285305	12111	PASS	failed_items=0

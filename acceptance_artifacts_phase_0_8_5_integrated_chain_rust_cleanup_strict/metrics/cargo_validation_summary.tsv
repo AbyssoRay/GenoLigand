@@ -1,0 +1,5 @@
+check	status	exit_code
+cargo_build_gls_cli	PASS	0
+cargo_fmt	PASS	0
+cargo_clippy	PASS	0
+cargo_test	PASS	0

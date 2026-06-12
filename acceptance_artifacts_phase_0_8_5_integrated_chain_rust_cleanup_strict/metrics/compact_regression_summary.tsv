@@ -1,0 +1,5 @@
+phase	baseline	status
+phase_0_7_1	D:\Project\rust\GenoLigand\tests\regression\phase_0_7_1\expected_master_validation.compact.json	PASS
+phase_0_8_3	D:\Project\rust\GenoLigand\tests\regression\phase_0_8_3\expected_master_validation.compact.json	PASS
+phase_0_8_4	D:\Project\rust\GenoLigand\tests\regression\phase_0_8_4\expected_master_validation.compact.json	PASS
+compact_regression_pass	True	PASS

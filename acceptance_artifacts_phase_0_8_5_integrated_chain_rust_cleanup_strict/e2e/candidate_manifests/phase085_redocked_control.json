@@ -1,0 +1,8 @@
+{
+  "schema_version": "phase_0_8_5",
+  "candidate_id": "redocked_pose_candidate",
+  "target_uniprot": "P00918",
+  "ligand_id": "acetazolamide_control",
+  "selection_owner": "rust",
+  "evidence_scope": "computational_candidate_prior"
+}

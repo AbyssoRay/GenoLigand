@@ -1,0 +1,3 @@
+path	kind	action	bytes	files	execution_status	error
+CARRIED_FORWARD_LOCAL_CLEANUP	summary	delete	176655	74	DELETED	carried_forward_observed_deleted_repo_local_obsolete_artifacts
+SUMMARY	summary	delete	176655	74	PASS	failed_items=0

@@ -1,0 +1,19 @@
+{
+  "acceptance_mode": "phase_0_8_3_biolip2_resolver_patch_strict",
+  "available_patch_coverage": 0.9977100222055165,
+  "failed_gate_count": 0,
+  "failed_gates": [],
+  "final_verdict": "PASS",
+  "gate_count": 15,
+  "generated_at_utc": "2026-06-08T15:41:43Z",
+  "nextflow_semantic_hash_match": true,
+  "p0_all_pass": true,
+  "patch_microbench_success_rate": 1.0,
+  "patch_rows": 919732,
+  "phase": "0.8.3",
+  "phase071_regression_pass": true,
+  "phase082_non_biolip2_regression_pass": true,
+  "resolver_missed_existing_structure_rows": 0,
+  "structure_coverage": 0.9324839852091037,
+  "supported_root_cause": "path_resolver_bug"
+}

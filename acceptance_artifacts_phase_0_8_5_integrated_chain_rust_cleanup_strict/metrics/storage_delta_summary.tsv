@@ -1,0 +1,10 @@
+metric	value	status
+deleted_files_count	74	PASS
+deleted_bytes	176655	PASS
+external_deleted_files_count	12111	PASS
+external_deleted_bytes	567285305	PASS
+cleanup_eligible_unremoved_count	0	PASS
+external_cleanup_eligible_unremoved_count	0	PASS
+backup_directory_count	0	PASS
+backup_archive_count	0	PASS
+backup_bytes	0	PASS

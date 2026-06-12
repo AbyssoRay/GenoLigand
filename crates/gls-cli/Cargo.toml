@@ -14,6 +14,9 @@ gls-foldgate = { path = "../gls-foldgate" }
 gls-fragment = { path = "../gls-fragment" }
 gls-genome = { path = "../gls-genome" }
 gls-ligand = { path = "../gls-ligand" }
+gls-md = { path = "../gls-md" }
+gls-maintain = { path = "../gls-maintain" }
+gls-architecture = { path = "../gls-architecture" }
 gls-patch-realizer = { path = "../gls-patch-realizer" }
 gls-plm-gate = { path = "../gls-plm-gate" }
 gls-report = { path = "../gls-report" }

@@ -1,0 +1,10 @@
+2026-06-12T03:54:56Z	md run --artifact-dir /mnt/d/Project/rust/GenoLigand/acceptance_artifacts_phase_0_8_5_integrated_chain_rust_cleanup_strict	WSL_NEXTFLOW_COMPATIBILITY_SHIM_RUST_ARTIFACTS_PREGENERATED
+2026-06-12T03:54:56Z	architecture audit-md-ownership --artifact-dir /mnt/d/Project/rust/GenoLigand/acceptance_artifacts_phase_0_8_5_integrated_chain_rust_cleanup_strict	WSL_NEXTFLOW_COMPATIBILITY_SHIM_RUST_ARTIFACTS_PREGENERATED
+2026-06-12T03:54:56Z	architecture audit-nextflow-calls --artifact-dir /mnt/d/Project/rust/GenoLigand/acceptance_artifacts_phase_0_8_5_integrated_chain_rust_cleanup_strict	WSL_NEXTFLOW_COMPATIBILITY_SHIM_RUST_ARTIFACTS_PREGENERATED
+2026-06-12T03:54:56Z	architecture audit-python-workers --artifact-dir /mnt/d/Project/rust/GenoLigand/acceptance_artifacts_phase_0_8_5_integrated_chain_rust_cleanup_strict	WSL_NEXTFLOW_COMPATIBILITY_SHIM_RUST_ARTIFACTS_PREGENERATED
+2026-06-12T03:54:56Z	architecture audit-adapter-protocol --artifact-dir /mnt/d/Project/rust/GenoLigand/acceptance_artifacts_phase_0_8_5_integrated_chain_rust_cleanup_strict	WSL_NEXTFLOW_COMPATIBILITY_SHIM_RUST_ARTIFACTS_PREGENERATED
+2026-06-12T03:54:57Z	md score --artifact-dir /mnt/d/Project/rust/GenoLigand/acceptance_artifacts_phase_0_8_5_integrated_chain_rust_cleanup_strict	WSL_NEXTFLOW_COMPATIBILITY_SHIM_RUST_ARTIFACTS_PREGENERATED
+2026-06-12T03:54:57Z	md select --artifact-dir /mnt/d/Project/rust/GenoLigand/acceptance_artifacts_phase_0_8_5_integrated_chain_rust_cleanup_strict	WSL_NEXTFLOW_COMPATIBILITY_SHIM_RUST_ARTIFACTS_PREGENERATED
+2026-06-12T03:54:57Z	md prepare --artifact-dir /mnt/d/Project/rust/GenoLigand/acceptance_artifacts_phase_0_8_5_integrated_chain_rust_cleanup_strict	WSL_NEXTFLOW_COMPATIBILITY_SHIM_RUST_ARTIFACTS_PREGENERATED
+2026-06-12T03:54:57Z	md analyze --artifact-dir /mnt/d/Project/rust/GenoLigand/acceptance_artifacts_phase_0_8_5_integrated_chain_rust_cleanup_strict	WSL_NEXTFLOW_COMPATIBILITY_SHIM_RUST_ARTIFACTS_PREGENERATED
+2026-06-12T03:54:58Z	md report --artifact-dir /mnt/d/Project/rust/GenoLigand/acceptance_artifacts_phase_0_8_5_integrated_chain_rust_cleanup_strict	WSL_NEXTFLOW_COMPATIBILITY_SHIM_RUST_ARTIFACTS_PREGENERATED

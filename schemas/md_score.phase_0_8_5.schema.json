@@ -1,0 +1,15 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://genoligand.local/schemas/md_score.phase_0_8_5.schema.json",
+  "title": "GenoLigand Phase 0.8.5 Rust-Owned MD Score",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "complex_id", "components", "final_md_score", "owner"],
+  "properties": {
+    "schema_version": { "const": "phase_0_8_5" },
+    "complex_id": { "type": "string", "minLength": 1 },
+    "components": { "type": "object" },
+    "final_md_score": { "type": "number", "minimum": 0.0, "maximum": 1.0 },
+    "owner": { "const": "rust" }
+  }
+}

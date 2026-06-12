@@ -1,0 +1,27 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://genoligand.local/schemas/worker_job.phase_0_8_5.schema.json",
+  "title": "GenoLigand Phase 0.8.5 Worker Job",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "acceptance_mode",
+    "job_id",
+    "worker",
+    "operation",
+    "inputs",
+    "rust_owned_decision_logic"
+  ],
+  "properties": {
+    "schema_version": { "const": "phase_0_8_5" },
+    "acceptance_mode": { "const": "phase_0_8_5_integrated_chain_rust_cleanup_strict" },
+    "job_id": { "type": "string", "minLength": 1 },
+    "worker": {
+      "enum": ["openmm", "pdbfixer", "openff_rdkit", "trajectory_features"]
+    },
+    "operation": { "type": "string", "minLength": 1 },
+    "inputs": { "type": "object" },
+    "rust_owned_decision_logic": { "const": true }
+  }
+}

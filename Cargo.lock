@@ -3,6 +3,10 @@
 version = 4
 
 [[package]]
+name = "gls-architecture"
+version = "0.1.0"
+
+[[package]]
 name = "gls-artifacts"
 version = "0.1.0"
 dependencies = [
@@ -13,12 +17,15 @@ dependencies = [
 name = "gls-cli"
 version = "0.1.0"
 dependencies = [
+ "gls-architecture",
  "gls-dock",
  "gls-fixtures",
  "gls-foldgate",
  "gls-fragment",
  "gls-genome",
  "gls-ligand",
+ "gls-maintain",
+ "gls-md",
  "gls-patch-realizer",
  "gls-plm-gate",
  "gls-report",
@@ -97,6 +104,18 @@ dependencies = [
  "gls-artifacts",
  "gls-types",
 ]
+
+[[package]]
+name = "gls-maintain"
+version = "0.1.0"
+dependencies = [
+ "gls-architecture",
+ "gls-md",
+]
+
+[[package]]
+name = "gls-md"
+version = "0.1.0"
 
 [[package]]
 name = "gls-patch-realizer"

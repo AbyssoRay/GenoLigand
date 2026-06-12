@@ -1,0 +1,4 @@
+example_id	example_kind	candidate_manifest	complex_manifest	md_result_manifest	rmsd_summary	interaction_occupancy_summary	score_decomposition	evidence_ledger	report_section	completion_rate	status
+phase085_positive_control	known_positive_control	yes	yes	yes	yes	yes	yes	yes	yes	100%	PASS
+phase085_redocked_control	redocked_control	yes	yes	yes	yes	yes	yes	yes	yes	100%	PASS
+phase085_candidate_benchmark	candidate_benchmark	yes	yes	yes	yes	yes	yes	yes	yes	100%	PASS
