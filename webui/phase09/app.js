@@ -226,6 +226,8 @@ let appState = {
   github: null,
   exports: null,
   preflight: null,
+  runLogs: [],
+  runArtifacts: null,
   inputDraft: { inputs: [], files: [] },
 };
 
@@ -567,7 +569,27 @@ function preflightTable() {
   )}</div>`;
 }
 
+function valueOrDash(value) {
+  if (value === null || value === undefined || value === "") {
+    return "—";
+  }
+  if (Array.isArray(value)) {
+    return value.length ? value.join(", ") : "—";
+  }
+  if (typeof value === "object") {
+    return Object.entries(value)
+      .map(([key, entry]) => `${key}: ${entry ?? "—"}`)
+      .join("; ");
+  }
+  return String(value);
+}
+
 function runMonitor() {
+  const run = appState.selectedRun;
+  const resource = run?.resource_status || {};
+  const completedSteps = run?.completed_steps || [];
+  const logTail = appState.runLogs.length ? appState.runLogs : run?.log_tail || [];
+  const artifactItems = appState.runArtifacts?.items || run?.artifact_index?.items || [];
   return [
     card(
       [["运行状态机", "Run State Machine"]],
@@ -583,14 +605,26 @@ function runMonitor() {
       [["当前运行", "Current Run"]],
       dataTable(
         [[["字段", "Field"], ["值", "Value"]].map((x) => x)][0],
-        [
-          [[["当前阶段", "Current stage"], [t("noActiveRun"), t("noActiveRun")]]],
-          [[["正在执行的命令", "Command"], ["", ""]]],
-          [["Nextflow run ID", ""]],
-          [[["输出目录", "Output directory"], ["", ""]]],
-          [[["失败原因", "Failure reason"], ["", ""]]],
-          [[["恢复状态", "Resume state"], [t("idle"), t("idle")]]],
-        ].map((row) => row[0]),
+        run
+          ? [
+              [[["Run ID", "Run ID"], run.run_id]],
+              [[["状态", "State"], run.state]],
+              [[["当前阶段", "Current stage"], run.current_stage]],
+              [[["已完成步骤", "Completed steps"], valueOrDash(completedSteps)]],
+              [[["正在执行的命令", "Command"], run.current_command || "—"]],
+              [["Nextflow run ID", run.nextflow_run_id || "—"]],
+              [[["输出目录", "Output directory"], run.output_dir || "—"]],
+              [[["失败原因", "Failure reason"], run.failure_reason || "—"]],
+              [[["恢复状态", "Resume state"], run.resumable ? "resumable" : "not resumable"]],
+            ].map((row) => row[0])
+          : [
+              [[["当前阶段", "Current stage"], [t("noActiveRun"), t("noActiveRun")]]],
+              [[["正在执行的命令", "Command"], ["", ""]]],
+              [["Nextflow run ID", ""]],
+              [[["输出目录", "Output directory"], ["", ""]]],
+              [[["失败原因", "Failure reason"], ["", ""]]],
+              [[["恢复状态", "Resume state"], [t("idle"), t("idle")]]],
+            ].map((row) => row[0]),
         [[t("noActiveRun"), t("noActiveRun")]]
       ) +
         buttonRow([[[ "提交任务", "Submit run" ], "primary", null], [[ "取消任务", "Cancel run" ], "", null], [[ "恢复中断任务", "Resume interrupted run" ], "", null]])
@@ -599,8 +633,27 @@ function runMonitor() {
       [["资源监控", "Resource Monitor"]],
       dataTable(
         [["CPU", "GPU", "VRAM", ["内存", "Memory"], ["磁盘", "Disk"], ["日志尾部", "Log tail"]]],
-        [],
+        run
+          ? [
+              [
+                resource.cpu || "—",
+                resource.gpu || "—",
+                resource.vram || "—",
+                resource.ram || "—",
+                resource.disk || "—",
+                valueOrDash(logTail),
+              ],
+            ]
+          : [],
         [["运行开始后显示资源占用。", "Resource usage appears after the run starts."]]
+      )
+    ),
+    card(
+      [["运行产物索引", "Run Artifact Index"]],
+      dataTable(
+        [[["产物类型", "Artifact type"], ["路径", "Path"], ["状态", "State"]].map((x) => x)][0],
+        artifactItems.map((item) => [item.artifact_type || "", item.path || "", item.exists ? statusPill("ready") : statusPill("waiting")]),
+        [["尚未创建运行产物。", "No run artifacts have been created yet."]]
       )
     ),
   ].join("");
@@ -1017,6 +1070,18 @@ async function refreshProjects() {
     } catch (_error) {
       // Project lists remain usable even if an older project has no preflight artifact yet.
     }
+    if (!appState.selectedRun && appState.selectedProject.latest_run_id) {
+      try {
+        const runs = await apiRequest(`/api/projects/${appState.selectedProject.project_id}/runs`);
+        const latest = (runs.runs || []).find((run) => run.run_id === appState.selectedProject.latest_run_id);
+        if (latest) {
+          appState.selectedRun = latest;
+          await refreshRunDetails(latest);
+        }
+      } catch (_error) {
+        appState.selectedRun = null;
+      }
+    }
   }
 }
 
@@ -1032,6 +1097,25 @@ function requireRun() {
     throw new Error(appState.lang === "zh" ? "当前没有可操作的运行。" : "No run is selected.");
   }
   return appState.selectedRun;
+}
+
+async function refreshRunDetails(run = appState.selectedRun) {
+  if (!run?.run_id) {
+    appState.runLogs = [];
+    appState.runArtifacts = null;
+    return;
+  }
+  try {
+    const logs = await apiRequest(`/api/runs/${run.run_id}/logs`);
+    appState.runLogs = logs.logs || [];
+  } catch (_error) {
+    appState.runLogs = [];
+  }
+  try {
+    appState.runArtifacts = await apiRequest(`/api/runs/${run.run_id}/artifacts`);
+  } catch (_error) {
+    appState.runArtifacts = null;
+  }
 }
 
 async function handleAction(action) {
@@ -1086,6 +1170,7 @@ async function handleAction(action) {
       const project = requireProject();
       const payload = await apiRequest(`/api/projects/${project.project_id}/runs`, { method: "POST" });
       appState.selectedRun = payload.run || null;
+      await refreshRunDetails(appState.selectedRun);
       await refreshProjects();
       window.location.hash = "#/run_monitor_page";
       setMessage("", "运行已创建并排队，等待本地 gls-cli/Nextflow 执行。", "Run created and queued for local gls-cli/Nextflow execution.");
@@ -1093,11 +1178,13 @@ async function handleAction(action) {
       const run = requireRun();
       const payload = await apiRequest(`/api/runs/${run.run_id}/cancel`, { method: "POST" });
       appState.selectedRun = payload.run || appState.selectedRun;
+      await refreshRunDetails(appState.selectedRun);
       setMessage("warn", "运行已取消。", "Run cancelled.");
     } else if (action === "resume-run" || action === "resume-last-run") {
       const run = requireRun();
       const payload = await apiRequest(`/api/runs/${run.run_id}/resume`, { method: "POST" });
       appState.selectedRun = payload.run || appState.selectedRun;
+      await refreshRunDetails(appState.selectedRun);
       setMessage("", "运行已标记为可恢复。", "Run marked as resumable.");
     } else if (action === "run-diagnostics") {
       appState.diagnostics = await apiRequest("/api/diagnostics/run", { method: "POST" });

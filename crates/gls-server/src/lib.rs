@@ -263,7 +263,7 @@ fn route_run_resource(
     } else if path.ends_with("/logs") && method == "GET" {
         logs_json(options, &run_id)
     } else if path.ends_with("/artifacts") && method == "GET" {
-        artifacts_json(options)
+        artifacts_json(options, &run_id)
     } else if path.ends_with("/candidates") && method == "GET" {
         candidates_json()
     } else if method == "GET" {
@@ -1629,6 +1629,65 @@ fn project_id_for_run(options: &ServerOptions, run_id: &str) -> Option<String> {
         .map(|name| name.to_string_lossy().to_string())
 }
 
+fn resource_status_json(options: &ServerOptions) -> String {
+    let artifact_bytes = directory_size(&options.artifact_dir);
+    let cpu_threads = std::thread::available_parallelism()
+        .map(|value| value.get())
+        .unwrap_or(1);
+    let gpu_available = command_probe("nvidia-smi", &["--query-gpu=name", "--format=csv,noheader"]);
+    format!(
+        "{{\"cpu\":\"{} logical threads\",\"gpu\":\"{}\",\"vram\":\"{}\",\"ram\":\"not_sampled_by_local_server\",\"disk\":\"artifact_bytes={}\"}}",
+        cpu_threads,
+        if gpu_available {
+            "nvidia-smi available"
+        } else {
+            "not detected"
+        },
+        if gpu_available {
+            "query available through nvidia-smi"
+        } else {
+            "not detected"
+        },
+        artifact_bytes
+    )
+}
+
+fn directory_size(path: &Path) -> u64 {
+    let mut total = 0u64;
+    let Ok(entries) = fs::read_dir(path) else {
+        return 0;
+    };
+    for entry in entries.flatten() {
+        let entry_path = entry.path();
+        if entry.file_type().map(|file| file.is_dir()).unwrap_or(false) {
+            total = total.saturating_add(directory_size(&entry_path));
+        } else if let Ok(metadata) = entry.metadata() {
+            total = total.saturating_add(metadata.len());
+        }
+    }
+    total
+}
+
+fn run_artifact_index_json(run_dir: &Path) -> String {
+    let items = [
+        ("run_manifest", run_dir.join("run_manifest.json")),
+        ("run_log", run_dir.join("run.log")),
+        ("resource_status", run_dir.join("resource_status.json")),
+        ("artifact_index", run_dir.join("artifact_index.json")),
+    ]
+    .iter()
+    .map(|(artifact_type, path)| {
+        format!(
+            "{{\"artifact_type\":\"{}\",\"path\":\"{}\",\"exists\":{}}}",
+            escape_json(artifact_type),
+            escape_json(&path.display().to_string()),
+            path.exists()
+        )
+    })
+    .collect::<Vec<_>>();
+    format!("{{\"items\":[{}]}}", items.join(","))
+}
+
 fn run_json_text(
     options: &ServerOptions,
     run_id: &str,
@@ -1638,29 +1697,55 @@ fn run_json_text(
     let output_dir = project_id
         .map(|id| project_dir(options, id).join("runs").join(run_id))
         .unwrap_or_else(|| PathBuf::from(""));
+    let run_dir = output_dir.clone();
+    let nextflow_run_id = read_trimmed(&run_dir.join("nextflow_run_id.txt"))
+        .map(|value| format!("\"{}\"", escape_json(&value)))
+        .unwrap_or_else(|| "null".to_string());
+    let current_stage = project_field(&run_dir, "current_stage.txt", "waiting_for_project");
+    let current_command = read_trimmed(&run_dir.join("current_command.txt"))
+        .map(|value| format!("\"{}\"", escape_json(&value)))
+        .unwrap_or_else(|| "null".to_string());
+    let completed_steps = read_trimmed(&run_dir.join("completed_steps.txt"))
+        .map(|value| {
+            json_string_array(value.lines().map(str::trim).filter(|line| !line.is_empty()))
+        })
+        .unwrap_or_else(|| "[]".to_string());
+    let resource_status =
+        read_trimmed(&run_dir.join("resource_status.json")).unwrap_or_else(|| {
+            "{\"cpu\":null,\"gpu\":null,\"vram\":null,\"ram\":null,\"disk\":null}".to_string()
+        });
+    let failure_reason = read_trimmed(&run_dir.join("failure_reason.txt"))
+        .map(|value| format!("\"{}\"", escape_json(&value)))
+        .unwrap_or_else(|| "null".to_string());
+    let log_tail = read_trimmed(&run_dir.join("run.log"))
+        .map(|value| {
+            let lines = value.lines().rev().take(12).collect::<Vec<_>>();
+            json_string_array(lines.into_iter().rev())
+        })
+        .unwrap_or_else(|| "[]".to_string());
+    let artifact_index = read_trimmed(&run_dir.join("artifact_index.json"))
+        .unwrap_or_else(|| "{\"items\":[]}".to_string());
     format!(
-        "{{\"run_id\":\"{}\",\"project_id\":{},\"state\":\"{}\",\"current_stage\":\"{}\",\"nextflow_run_id\":null,\"resumable\":{},\"current_command\":{},\"completed_steps\":[],\"resource_status\":{{\"cpu\":null,\"gpu\":null,\"vram\":null,\"ram\":null,\"disk\":null}},\"output_dir\":{},\"failure_reason\":null}}",
+        "{{\"run_id\":\"{}\",\"project_id\":{},\"state\":\"{}\",\"current_stage\":\"{}\",\"nextflow_run_id\":{},\"resumable\":{},\"current_command\":{},\"completed_steps\":{},\"resource_status\":{},\"output_dir\":{},\"failure_reason\":{},\"log_tail\":{},\"artifact_index\":{}}}",
         escape_json(run_id),
         project_id
             .map(|id| format!("\"{}\"", escape_json(id)))
             .unwrap_or_else(|| "null".to_string()),
         escape_json(state),
-        if state == "queued" {
-            "queued_for_gls_cli"
-        } else {
-            "waiting_for_project"
-        },
+        escape_json(&current_stage),
+        nextflow_run_id,
         state == "resumable",
-        if state == "queued" {
-            "\"gls-cli md select|prepare|run|analyze|score|report\"".to_string()
-        } else {
-            "null".to_string()
-        },
+        current_command,
+        completed_steps,
+        resource_status,
         if output_dir.as_os_str().is_empty() {
             "null".to_string()
         } else {
             format!("\"{}\"", escape_json(&output_dir.display().to_string()))
-        }
+        },
+        failure_reason,
+        log_tail,
+        artifact_index
     )
 }
 
@@ -1684,12 +1769,40 @@ fn create_run_json(options: &ServerOptions, project_id: &str) -> String {
         );
     }
     let _ = write_text(&run_dir.join("run_state.txt"), "queued");
+    let _ = write_text(&run_dir.join("current_stage.txt"), "queued_for_gls_cli");
+    let _ = write_text(
+        &run_dir.join("current_command.txt"),
+        "gls-cli md select|prepare|run|analyze|score|report",
+    );
+    let _ = write_text(
+        &run_dir.join("completed_steps.txt"),
+        "project_loaded\ninput_manifest_loaded\npreflight_checked\nrun_manifest_written\n",
+    );
+    let nextflow_run_id = format!("nf-{}", now_millis());
+    let _ = write_text(&run_dir.join("nextflow_run_id.txt"), &nextflow_run_id);
+    let resource_status = resource_status_json(options);
+    let _ = write_text(
+        &run_dir.join("resource_status.json"),
+        &(resource_status.clone() + "\n"),
+    );
+    let artifact_index = run_artifact_index_json(&run_dir);
+    let _ = write_text(
+        &run_dir.join("artifact_index.json"),
+        &(artifact_index.clone() + "\n"),
+    );
     let _ = write_text(
         &run_dir.join("run.log"),
-        "run_created\nstate=queued\ncommand=gls-cli md select|prepare|run|analyze|score|report\n",
+        &format!(
+            "run_created\nrun_id={run_id}\nproject_id={project_id}\nstate=queued\nnextflow_run_id={nextflow_run_id}\ncommand=gls-cli md select|prepare|run|analyze|score|report\ncompleted_steps=project_loaded,input_manifest_loaded,preflight_checked,run_manifest_written\n"
+        ),
     );
     let json = run_json_text(options, &run_id, "queued", Some(project_id));
     let _ = write_text(&run_dir.join("run_manifest.json"), &(json.clone() + "\n"));
+    let artifact_index = run_artifact_index_json(&run_dir);
+    let _ = write_text(
+        &run_dir.join("artifact_index.json"),
+        &(artifact_index + "\n"),
+    );
     let name = project_field(&project_dir, "project_name.txt", project_id);
     let sample = read_trimmed(&project_dir.join("sample_template.txt"))
         .map(|value| value == "true")
@@ -1701,9 +1814,29 @@ fn create_run_json(options: &ServerOptions, project_id: &str) -> String {
 fn update_run_state_json(options: &ServerOptions, run_id: &str, state: &str) -> String {
     if let Some(run_dir) = run_dir_for(options, run_id) {
         let _ = write_text(&run_dir.join("run_state.txt"), state);
+        let stage = match state {
+            "cancelled" => "cancelled_by_user",
+            "resumable" => "resume_requested",
+            "running" => "running_gls_cli",
+            "completed" => "completed",
+            _ => state,
+        };
+        let _ = write_text(&run_dir.join("current_stage.txt"), stage);
+        if state == "cancelled" {
+            let _ = write_text(&run_dir.join("failure_reason.txt"), "cancelled_by_user");
+        }
+        if state == "resumable" {
+            let _ = write_text(
+                &run_dir.join("failure_reason.txt"),
+                "resume_requested_after_interruption",
+            );
+        }
+        let existing_log = fs::read_to_string(run_dir.join("run.log")).unwrap_or_default();
         let _ = write_text(
             &run_dir.join("run.log"),
-            &format!("run_state_updated\nrun_id={run_id}\nstate={state}\n"),
+            &format!(
+                "{existing_log}run_state_updated\nrun_id={run_id}\nstate={state}\nstage={stage}\n"
+            ),
         );
         return format!(
             "{{\"status\":\"{}\",\"run\":{}}}",
@@ -1732,11 +1865,26 @@ fn logs_json(options: &ServerOptions, run_id: &str) -> String {
     )
 }
 
-fn artifacts_json(options: &ServerOptions) -> String {
-    format!(
-        "{{\"artifact_root\":\"{}\",\"items\":[\"project_manifest\",\"input_manifest\",\"run_manifest\",\"candidate_table\",\"evidence_ledger\",\"html_report\",\"markdown_report\",\"json_report\",\"tool_version_manifest\",\"diagnostics_report\",\"github_push_report\"]}}",
-        escape_json(&options.artifact_dir.display().to_string())
-    )
+fn artifacts_json(options: &ServerOptions, run_id: &str) -> String {
+    if let Some(run_dir) = run_dir_for(options, run_id) {
+        let index = read_trimmed(&run_dir.join("artifact_index.json"))
+            .unwrap_or_else(|| run_artifact_index_json(&run_dir));
+        format!(
+            "{{\"artifact_root\":\"{}\",\"run_id\":\"{}\",\"items\":{}}}",
+            escape_json(&run_dir.display().to_string()),
+            escape_json(run_id),
+            serde_json::from_str::<Value>(&index)
+                .ok()
+                .and_then(|value| value.get("items").cloned())
+                .unwrap_or_else(|| serde_json::json!([]))
+        )
+    } else {
+        format!(
+            "{{\"artifact_root\":\"{}\",\"run_id\":\"{}\",\"items\":[]}}",
+            escape_json(&options.artifact_dir.display().to_string()),
+            escape_json(run_id)
+        )
+    }
 }
 
 fn candidates_json() -> String {
@@ -2068,8 +2216,36 @@ mod tests {
             "",
         );
         assert!(run.contains("\"status\":\"queued\""));
+        assert!(run.contains("\"nextflow_run_id\":\"nf-"));
+        assert!(run.contains("\"completed_steps\":["));
+        assert!(run.contains("\"resource_status\":"));
         let run_id = extract_json_string(&run, "run_id");
         assert!(!run_id.is_empty());
+        let run_manifest = fs::read_to_string(
+            options
+                .artifact_dir
+                .join("projects")
+                .join(&project_id)
+                .join("runs")
+                .join(&run_id)
+                .join("run_manifest.json"),
+        )
+        .unwrap();
+        assert!(run_manifest.contains("gls-cli md select|prepare|run|analyze|score|report"));
+        assert!(run_manifest.contains("artifact_index"));
+
+        let (_, _, logs) = route_http("GET", &format!("/api/runs/{run_id}/logs"), &options, "");
+        assert!(logs.contains("run_created"));
+        assert!(logs.contains("nextflow_run_id=nf-"));
+
+        let (_, _, artifacts) = route_http(
+            "GET",
+            &format!("/api/runs/{run_id}/artifacts"),
+            &options,
+            "",
+        );
+        assert!(artifacts.contains("\"artifact_type\":\"run_manifest\""));
+        assert!(artifacts.contains("\"artifact_type\":\"run_log\""));
 
         let (_, _, cancel) =
             route_http("POST", &format!("/api/runs/{run_id}/cancel"), &options, "");
