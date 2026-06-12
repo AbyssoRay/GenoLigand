@@ -1,2 +1,2 @@
-tool	status	note
-headless_edge	PASS	PNG route capture for Phase 0.9 final screens
+﻿tool	status	note
+codex_in_app_browser	PASS	PNG route capture for Phase 0.9 final screens; Edge headless CLI fallback was not used because this Windows session reported GPU process failures

@@ -4,7 +4,7 @@
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <title>GenoLigand Local WebUI Beta</title>
-    <link rel="stylesheet" href="/styles.css" />
+    <link rel="stylesheet" href="/styles.css?v=phase09-redesign-20260612" />
   </head>
   <body>
     <div class="app-shell">
@@ -26,10 +26,11 @@
       <section class="workspace">
         <header class="topbar">
           <div>
-            <strong>Salidroside human genome target search</strong>
-            <span>demo-run / WSL2 / CUDA PASS / main / pushed</span>
+            <strong data-top-project>Salidroside human genome target search</strong>
+            <span data-top-run>Project: salidroside_search / Runtime: local WSL2 / API: 127.0.0.1:19090</span>
           </div>
           <div class="top-actions">
+            <span class="status running">RUNNING</span>
             <button data-theme-toggle type="button">Theme</button>
             <a class="button" href="#/report_export_page">Export</a>
           </div>
@@ -43,7 +44,7 @@
                 <h1 data-page-title>Command Center</h1>
                 <p>Local single-user WebUI beta through gls-server, gls-cli, and Rust-owned scientific semantics.</p>
               </div>
-              <span class="status running">RUNNING</span>
+              <span class="status running" data-page-status>RUNNING</span>
             </div>
             <div class="grid" data-main></div>
           </section>
@@ -58,14 +59,16 @@
             <div class="timeline-item"><span>00:09</span><strong>Nextflow first/resume</strong><span class="status pass">PASS</span></div>
             <div class="timeline-item"><span>00:12</span><strong>Report ready</strong><span class="status pushed">PUSHED</span></div>
           </div>
-          <pre>[INFO] gls-server health: PASS
+          <pre data-runtime-log>[INFO] gls-server health: PASS
 [INFO] API contract validation: PASS
 [INFO] WebSocket logs/status validation: PASS
 [INFO] WebUI visual audit: PASS
-[INFO] FINAL_VERDICT source: metrics/master_validation_phase_0_9.json</pre>
+[WARN] Short-MD runtime near threshold
+[INFO] FINAL_VERDICT source: metrics/master_validation_phase_0_9.json
+[INFO] Run completed successfully</pre>
         </section>
       </section>
     </div>
-    <script src="/app.js"></script>
+    <script src="/app.js?v=phase09-redesign-20260612"></script>
   </body>
 </html>

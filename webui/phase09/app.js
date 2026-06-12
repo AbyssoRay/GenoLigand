@@ -31,15 +31,15 @@ const screenshotPages = [
 ];
 
 const navItems = [
-  ["dashboard_page", "Dashboard", "Run overview"],
-  ["project_create_page", "Project", "Create workspace"],
-  ["input_wizard_project_basics_page", "Input Wizard", "Guided setup"],
-  ["run_monitor_page", "Run Monitor", "Queue and logs"],
-  ["candidate_ranking_page", "Candidates", "Ranked evidence"],
-  ["database_registry_page", "Databases", "Profiles"],
-  ["diagnostics_page", "Diagnostics", "Local checks"],
-  ["github_sync_page", "GitHub Sync", "Push and cleanup"],
-  ["settings_page", "Settings", "Local beta"],
+  ["dashboard_page", "01", "Dashboard", "Command center"],
+  ["project_create_page", "02", "Project", "Workspace overview"],
+  ["input_wizard_project_basics_page", "03", "Input Wizard", "Guided setup"],
+  ["run_monitor_page", "04", "Run Monitor", "Queue and logs"],
+  ["candidate_ranking_page", "05", "Candidates", "Ranked evidence"],
+  ["database_registry_page", "06", "Databases", "Profiles and sources"],
+  ["diagnostics_page", "07", "Diagnostics", "Health and checks"],
+  ["github_sync_page", "08", "GitHub Sync", "Push and cleanup"],
+  ["settings_page", "09", "Settings", "Local beta settings"],
 ];
 
 const wizardPages = [
@@ -122,7 +122,7 @@ function statusPill(text, kind = "pass") {
 }
 
 function card(title, body, footer = "") {
-  return `<section class="panel"><h2>${title}</h2><div>${body}</div>${footer}</section>`;
+  return `<section class="panel"><div class="panel-header"><h2>${title}</h2>${footer}</div><div>${body}</div></section>`;
 }
 
 function metricGrid(items) {
@@ -132,9 +132,9 @@ function metricGrid(items) {
 }
 
 function dataTable(headers, rows) {
-  return `<table class="data-table"><thead><tr>${headers.map((h) => `<th>${h}</th>`).join("")}</tr></thead><tbody>${rows
+  return `<div class="data-table-wrap"><table class="data-table"><thead><tr>${headers.map((h) => `<th>${h}</th>`).join("")}</tr></thead><tbody>${rows
     .map((row) => `<tr>${row.map((cell) => `<td>${cell}</td>`).join("")}</tr>`)
-    .join("")}</tbody></table>`;
+    .join("")}</tbody></table></div>`;
 }
 
 function wizardRail(activeId) {
@@ -158,23 +158,45 @@ function optionTiles(items) {
 function dashboard() {
   return [
     card(
-      "Local Beta Runtime",
+      "Command Center",
       metricGrid([
         ["gls-server", "127.0.0.1", "PASS"],
         ["Rust ownership", "gls-server -> gls-cli", "PASS"],
-        ["OpenMM CUDA", "WSL2 evidence retained", "PASS"],
-        ["Phase 0.8.5 regression", "Compact baseline", "PASS"],
-      ])
+        ["OpenMM CUDA", "WSL2 evidence", "PASS"],
+        ["Phase 0.9 regression", "Compact baseline", "PASS"],
+      ]),
+      `<a class="button" href="#/run_monitor_page">View Run Monitor</a>`
     ),
-    card(
-      "Active Run",
-      dataTable(["Stage", "Owner", "Status", "Evidence"], [
-        ["Input normalization", "Rust", statusPill("PASS"), "schemas/input_wizard_schema.json"],
-        ["Candidate selection", "Rust", statusPill("PASS"), "candidate_manifest.tsv"],
-        ["Short-MD primitive", "Python worker", statusPill("PASS"), "schema-bound result"],
-        ["Report semantics", "Rust", statusPill("PASS"), "master_validation_phase_0_9.json"],
-      ])
-    ),
+    `<div class="dashboard-run-grid">
+      ${card(
+        "Active Run",
+        dataTable(["Stage", "Owner", "Status", "Evidence / Output"], [
+          ["Input normalization", "Rust", statusPill("PASS"), "schemas/input_wizard_schema.json"],
+          ["Candidate selection", "Rust", statusPill("PASS"), "candidate_manifest.tsv"],
+          ["Short-MD primitive", "Python worker", statusPill("PASS"), "schema-bound result"],
+          ["Report semantics", "Rust", statusPill("PASS"), "master_validation_phase_0_9.json"],
+        ])
+      )}
+      ${card(
+        "Task Queue",
+        `<div class="task-list">
+          <div class="task-row"><strong>Generate final summary</strong><span>Normal</span>${statusPill("RUNNING", "running")}</div>
+          <div class="task-row"><strong>Compile artifacts</strong><span>Normal</span>${statusPill("PENDING", "info")}</div>
+          <div class="task-row"><strong>Generate visual report</strong><span>Low</span>${statusPill("WAITING", "warn")}</div>
+          <div class="task-row"><strong>Cleanup temp files</strong><span>Low</span>${statusPill("WAITING", "warn")}</div>
+        </div>`
+      )}
+    </div>`,
+    `<section class="panel timeline-panel">
+      <div class="panel-header"><h2>Agent / Run Timeline</h2>${statusPill("4 / 4", "pass")}</div>
+      <div class="run-timeline">
+        <div class="timeline-node"><div class="timeline-dot">1</div><span>00:00:00</span><small>Project loaded</small></div>
+        <div class="timeline-node"><div class="timeline-dot">2</div><span>00:00:03</span><small>Preflight complete</small></div>
+        <div class="timeline-node current"><div class="timeline-dot">3</div><span>00:00:09</span><small>Nextflow first/resume</small></div>
+        <div class="timeline-node"><div class="timeline-dot">4</div><span>00:00:12</span><small>Report ready</small></div>
+        <div class="timeline-node"><div class="timeline-dot">5</div><span>00:00:12</span><small>Run complete</small></div>
+      </div>
+    </section>`,
   ].join("");
 }
 
@@ -419,22 +441,29 @@ function pageBody(id) {
 function renderNavigation(activeId) {
   const nav = document.querySelector("[data-nav]");
   nav.innerHTML = navItems
-    .map(([id, title, subtitle]) => `<a class="nav-item ${id === activeId ? "active" : ""}" href="#/${id}"><span>${title}</span><small>${subtitle}</small></a>`)
+    .map(
+      ([id, icon, title, subtitle]) => `<a class="nav-item ${id === activeId ? "active" : ""}" href="#/${id}">
+        <span class="nav-icon">${icon}</span>
+        <span class="nav-copy"><strong>${title}</strong><small>${subtitle}</small></span>
+      </a>`
+    )
     .join("");
 }
 
 function renderDetail(activeId) {
   document.querySelector("[data-detail]").innerHTML = `
     <h2>Run Details</h2>
-    ${metricGrid([
-      ["Current page", pageTitles[activeId], "PASS"],
-      ["Route id", activeId, "PASS"],
-      ["API owner", "gls-server", "PASS"],
-      ["Scientific owner", "gls-cli", "PASS"],
-    ])}
-    <h3>API Contract</h3>
-    <ul class="compact-list">${apiContracts.map((item) => `<li>${item}</li>`).join("")}</ul>
-    <h3>Artifact Tree</h3>
+    <div class="detail-grid">
+      <div class="detail-card"><span class="detail-label">Current page</span><strong class="detail-value" title="${pageTitles[activeId]}">${pageTitles[activeId]}</strong>${statusPill("PASS")}</div>
+      <div class="detail-card"><span class="detail-label">Route ID</span><strong class="detail-value mono" title="${activeId}">${activeId}</strong>${statusPill("PASS")}</div>
+      <div class="detail-card"><span class="detail-label">API owner</span><strong class="detail-value">gls-server</strong>${statusPill("PASS")}</div>
+      <div class="detail-card"><span class="detail-label">Scientific owner</span><strong class="detail-value">gls-cli</strong>${statusPill("PASS")}</div>
+      <div class="detail-card"><span class="detail-label">gls-server</span><strong class="detail-value mono">127.0.0.1</strong>${statusPill("PASS")}</div>
+      <div class="detail-card"><span class="detail-label">OpenMM CUDA</span><strong class="detail-value">WSL2</strong>${statusPill("PASS")}</div>
+    </div>
+    <h2>API Contract</h2>
+    <ul class="api-list">${apiContracts.map((item) => `<li>${item}</li>`).join("")}</ul>
+    <h2>Artifact Tree</h2>
     <ul class="artifact-tree">
       <li>metrics/master_validation_phase_0_9.json</li>
       <li>server/api_schema.openapi.json</li>
@@ -443,12 +472,26 @@ function renderDetail(activeId) {
     </ul>`;
 }
 
+function renderTopContext(activeId) {
+  const run = document.querySelector("[data-top-run]");
+  const pageStatus = document.querySelector("[data-page-status]");
+  if (run) {
+    run.textContent = `Route: ${activeId.replace(/_page$/, "")} / Runtime: local WSL2 / API: 127.0.0.1:19090`;
+  }
+  if (pageStatus) {
+    const warning = activeId === "error_state_page";
+    pageStatus.textContent = warning ? "WARN" : "RUNNING";
+    pageStatus.className = `status ${warning ? "warn" : "running"}`;
+  }
+}
+
 function render() {
   const activeId = routeFromLocation();
   document.querySelector("[data-page-title]").textContent = pageTitles[activeId];
   document.querySelector("[data-main]").innerHTML = pageBody(activeId);
   renderNavigation(activeId);
   renderDetail(activeId);
+  renderTopContext(activeId);
 }
 
 document.addEventListener("DOMContentLoaded", () => {

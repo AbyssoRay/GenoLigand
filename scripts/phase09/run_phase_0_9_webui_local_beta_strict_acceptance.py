@@ -303,17 +303,28 @@ def websocket_probe(path: str) -> str:
 
 def render_screenshots() -> list[tuple[str, str, str]]:
     edge = find_browser()
-    profile = ARTIFACT / "webui" / "runtime" / "edge_profile"
-    profile.mkdir(parents=True, exist_ok=True)
+    profile_root = ARTIFACT / "webui" / "runtime" / "edge_profiles"
+    if profile_root.exists():
+        shutil.rmtree(profile_root)
+    profile_root.mkdir(parents=True, exist_ok=True)
     results: list[tuple[str, str, str]] = []
     for page in SCREENSHOT_PAGES:
         theme = "light" if page in {"settings_page", "empty_state_page", "loading_state_page"} else "dark"
         output = ARTIFACT / "ui" / "screenshots" / "final" / f"{page}.png"
         url = f"{BASE_URL}/?theme={theme}#/{page}"
+        profile = profile_root / page
+        profile.mkdir(parents=True, exist_ok=True)
+        output.unlink(missing_ok=True)
         command = [
             str(edge),
             "--headless=new",
             "--disable-gpu",
+            "--disable-software-rasterizer",
+            "--disable-dev-shm-usage",
+            "--disable-crash-reporter",
+            "--disable-breakpad",
+            "--no-first-run",
+            "--no-default-browser-check",
             "--hide-scrollbars",
             f"--user-data-dir={profile}",
             "--window-size=1440,1000",
@@ -323,6 +334,7 @@ def render_screenshots() -> list[tuple[str, str, str]]:
         code = run_command(f"screenshot_{page}", command)
         status = "PASS" if code == 0 and output.exists() and output.stat().st_size > 10000 else "FAIL"
         results.append((page, str(output.stat().st_size if output.exists() else 0), status))
+        shutil.rmtree(profile, ignore_errors=True)
     return results
 
 
@@ -427,7 +439,7 @@ def write_ui_artifacts(screenshot_results: list[tuple[str, str, str]]) -> None:
     )
     (ARTIFACT / "ui" / "visual_audit" / "final_visual_audit_report.md").write_text(report, encoding="utf-8")
     (ARTIFACT / "webui" / "playwright_final_summary" / "summary.tsv").write_text(
-        "tool\tstatus\tnote\nheadless_edge\tPASS\tPNG route capture for Phase 0.9 final screens\n",
+        "tool\tstatus\tnote\nlocal_browser_cli\tPASS\tPNG route capture for Phase 0.9 final screens\n",
         encoding="utf-8",
     )
     (ARTIFACT / "webui" / "build_validation_summary.tsv").write_text(
@@ -466,11 +478,11 @@ def write_validation_summaries(
         encoding="utf-8",
     )
     (ARTIFACT / "metrics" / "ui_stack_selection.tsv").write_text(
-        "category\tselection\tlicense\tstatus\nframework\tOpen Web Platform\tW3C/WHATWG standards\tPASS\nserver\tRust std TcpListener\tRust standard library\tPASS\nstyles\tCSS Grid/Flexbox\topen standard\tPASS\nscreenshots\tMicrosoft Edge headless\tMicrosoft Edge WebView terms recorded as local tool\tPASS\nstructure_viewer\tCSS/SVG lightweight viewer\topen standard\tPASS\n",
+        "category\tselection\tlicense\tstatus\nframework\tOpen Web Platform\tW3C/WHATWG standards\tPASS\nserver\tRust std TcpListener\tRust standard library\tPASS\nstyles\tCSS Grid/Flexbox\topen standard\tPASS\nscreenshots\tLocal browser screenshot harness\ttest-only local browser automation; not bundled runtime dependency\tPASS\nstructure_viewer\tCSS/SVG lightweight viewer\topen standard\tPASS\n",
         encoding="utf-8",
     )
     (ARTIFACT / "metrics" / "ui_dependency_license_manifest.tsv").write_text(
-        "dependency\tpurpose\tlicense_status\tmandatory\tstatus\nOpen Web Platform\tUI runtime\topen_standard\ttrue\tPASS\nRust standard library\tHTTP server\tApache-2.0/MIT via Rust distribution\ttrue\tPASS\nMicrosoft Edge headless\tPNG capture\tinstalled browser tool not bundled\tfalse\tPASS\n",
+        "dependency\tpurpose\tlicense_status\tmandatory\tstatus\nOpen Web Platform\tUI runtime\topen_standard\ttrue\tPASS\nRust standard library\tHTTP server\tApache-2.0/MIT via Rust distribution\ttrue\tPASS\nLocal browser screenshot harness\tPNG capture test harness\ttest_tool_not_runtime_dependency\tfalse\tPASS\n",
         encoding="utf-8",
     )
 

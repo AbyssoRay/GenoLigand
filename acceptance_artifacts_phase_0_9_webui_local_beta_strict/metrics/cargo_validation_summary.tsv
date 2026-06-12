@@ -1,4 +1,4 @@
-check	status
+﻿check	status
 cargo_fmt	PASS
 cargo_clippy	PASS
 cargo_test	PASS

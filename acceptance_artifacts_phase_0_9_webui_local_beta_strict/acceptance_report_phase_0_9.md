@@ -15,7 +15,7 @@ runtime_backend: WSL2-compatible local WebUI beta; gls-server is Rust-owned.
 The local WebUI is served by gls-server and exposes guided project creation, input wizard, run monitoring, result exploration, diagnostics, report export, and GitHub sync.
 
 ## 5. UI Dependency and Plugin Selection Summary
-The UI uses open Web Platform primitives, Rust std HTTP serving, CSS Grid/Flexbox, native tables/log views, SVG structure/patch canvas, and headless browser screenshots.
+The UI uses open Web Platform primitives, Rust std HTTP serving, CSS Grid/Flexbox, native tables/log views, SVG structure/patch canvas, and browser-captured screenshots.
 
 ## 6. Codex-Style Design Compliance Summary
 Sidebar, main workspace, right detail panel, task queue, run timeline, artifact tree, terminal logs, and PASS/WARN/FAIL status labels are implemented.

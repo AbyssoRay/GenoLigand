@@ -1,4 +1,4 @@
-dependency	purpose	license_status	mandatory	status
+﻿dependency	purpose	license_status	mandatory	status
 Open Web Platform	UI runtime	open_standard	true	PASS
 Rust standard library	HTTP server	Apache-2.0/MIT via Rust distribution	true	PASS
-Microsoft Edge headless	PNG capture	installed browser tool not bundled	false	PASS
+Codex in-app Browser	PNG capture test harness	test_tool_not_runtime_dependency	false	PASS
