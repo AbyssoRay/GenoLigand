@@ -248,10 +248,16 @@ fn route_run_resource(
     options: &ServerOptions,
 ) -> Option<(u16, &'static str, String)> {
     if path.starts_with("/api/candidates/") && method == "GET" {
+        let candidate_id = safe_id(
+            path.trim_start_matches("/api/candidates/")
+                .split('/')
+                .next()
+                .unwrap_or(""),
+        );
         return Some((
             200,
             "application/json; charset=utf-8",
-            candidate_detail_json(),
+            candidate_detail_json(options, &candidate_id),
         ));
     }
     if !path.starts_with("/api/runs/") {
@@ -1629,6 +1635,59 @@ fn run_dir_for(options: &ServerOptions, run_id: &str) -> Option<PathBuf> {
     None
 }
 
+fn latest_run_dir(options: &ServerOptions) -> Option<(String, PathBuf)> {
+    let root = projects_root(options);
+    let mut latest: Option<(SystemTime, String, PathBuf)> = None;
+    let entries = fs::read_dir(root).ok()?;
+    for project in entries.flatten() {
+        if !project
+            .file_type()
+            .map(|file| file.is_dir())
+            .unwrap_or(false)
+        {
+            continue;
+        }
+        let runs_dir = project.path().join("runs");
+        if !runs_dir.exists() {
+            continue;
+        }
+        if let Some(run_id) = read_trimmed(&project.path().join("latest_run_id.txt")) {
+            let run_dir = runs_dir.join(&run_id);
+            if run_dir.exists() {
+                let modified = fs::metadata(&run_dir)
+                    .and_then(|metadata| metadata.modified())
+                    .unwrap_or(UNIX_EPOCH);
+                if latest
+                    .as_ref()
+                    .map(|(time, _, _)| modified > *time)
+                    .unwrap_or(true)
+                {
+                    latest = Some((modified, run_id, run_dir));
+                }
+            }
+        }
+        if let Ok(runs) = fs::read_dir(&runs_dir) {
+            for run in runs.flatten() {
+                if !run.file_type().map(|file| file.is_dir()).unwrap_or(false) {
+                    continue;
+                }
+                let run_id = run.file_name().to_string_lossy().to_string();
+                let modified = fs::metadata(run.path())
+                    .and_then(|metadata| metadata.modified())
+                    .unwrap_or(UNIX_EPOCH);
+                if latest
+                    .as_ref()
+                    .map(|(time, _, _)| modified > *time)
+                    .unwrap_or(true)
+                {
+                    latest = Some((modified, run_id, run.path()));
+                }
+            }
+        }
+    }
+    latest.map(|(_, run_id, run_dir)| (run_id, run_dir))
+}
+
 fn project_id_for_run(options: &ServerOptions, run_id: &str) -> Option<String> {
     let run_dir = run_dir_for(options, run_id)?;
     run_dir
@@ -2014,8 +2073,87 @@ fn evidence_json(options: &ServerOptions, run_id: &str) -> String {
     )
 }
 
-fn candidate_detail_json() -> String {
-    "{\"candidate_id\":null,\"selected\":false,\"sections\":[\"source\",\"orf_sequence\",\"genomic_position\",\"reading_frame\",\"flanking_region\",\"fragment_hits\",\"co_occurrence_evidence\",\"structure_evidence\",\"docking_evidence\",\"md_evidence\",\"database_evidence\",\"risk_flags\",\"experimental_validation_guidance\"],\"message\":\"Select a computed candidate to inspect details.\"}".to_string()
+fn candidate_detail_json(options: &ServerOptions, candidate_id: &str) -> String {
+    let candidate_schema = [
+        "rank",
+        "candidate_id",
+        "gene_name",
+        "orf_id",
+        "genomic_coordinates",
+        "context_class",
+        "fragment_score",
+        "co_occurrence_score",
+        "plm_score",
+        "structure_score",
+        "docking_score",
+        "md_stability_score",
+        "final_priority_score",
+        "risk_flags",
+    ];
+    let evidence_schema = [
+        "report_item",
+        "source_file",
+        "manifest",
+        "schema",
+        "tool_version",
+        "artifact_hash",
+        "validation_state",
+        "report_section",
+    ];
+    let Some((run_id, run_dir)) = latest_run_dir(options) else {
+        return format!(
+            "{{\"candidate_id\":\"{}\",\"selected\":false,\"sections\":[\"source\",\"orf_sequence\",\"genomic_position\",\"reading_frame\",\"flanking_region\",\"fragment_hits\",\"co_occurrence_evidence\",\"structure_evidence\",\"docking_evidence\",\"md_evidence\",\"database_evidence\",\"risk_flags\",\"experimental_validation_guidance\"],\"message\":\"candidate_artifact_not_found\"}}",
+            escape_json(candidate_id)
+        );
+    };
+    let Some((source_path, rows_json, _)) =
+        read_result_table(&run_dir, &candidate_schema, &["candidate", "ranking"])
+    else {
+        return format!(
+            "{{\"candidate_id\":\"{}\",\"selected\":false,\"run_id\":\"{}\",\"sections\":[\"source\",\"orf_sequence\",\"genomic_position\",\"reading_frame\",\"flanking_region\",\"fragment_hits\",\"co_occurrence_evidence\",\"structure_evidence\",\"docking_evidence\",\"md_evidence\",\"database_evidence\",\"risk_flags\",\"experimental_validation_guidance\"],\"message\":\"candidate_artifact_not_found\"}}",
+            escape_json(candidate_id),
+            escape_json(&run_id)
+        );
+    };
+    let rows = serde_json::from_str::<Value>(&rows_json)
+        .ok()
+        .and_then(|value| value.as_array().cloned())
+        .unwrap_or_default();
+    let candidate = rows.into_iter().find(|row| {
+        ["candidate_id", "orf_id", "gene_name", "rank"]
+            .iter()
+            .any(|field| json_row_field_text(row, field) == candidate_id)
+    });
+    let Some(candidate) = candidate else {
+        return format!(
+            "{{\"candidate_id\":\"{}\",\"selected\":false,\"run_id\":\"{}\",\"source_path\":\"{}\",\"message\":\"candidate_id_not_found\"}}",
+            escape_json(candidate_id),
+            escape_json(&run_id),
+            escape_json(&source_path.display().to_string())
+        );
+    };
+    let evidence_rows = read_result_table(&run_dir, &evidence_schema, &["evidence", "ledger"])
+        .and_then(|(_, evidence_json, _)| serde_json::from_str::<Value>(&evidence_json).ok())
+        .and_then(|value| value.as_array().cloned())
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|row| {
+            let text = row.to_string().to_lowercase();
+            ["candidate_id", "orf_id", "gene_name"]
+                .iter()
+                .map(|field| json_row_field_text(&candidate, field).to_lowercase())
+                .filter(|value| !value.is_empty())
+                .any(|token| text.contains(&token))
+        })
+        .collect::<Vec<_>>();
+    format!(
+        "{{\"candidate_id\":\"{}\",\"selected\":true,\"run_id\":\"{}\",\"source_path\":\"{}\",\"candidate\":{},\"evidence\":{},\"sections\":[\"source\",\"orf_sequence\",\"genomic_position\",\"reading_frame\",\"flanking_region\",\"fragment_hits\",\"co_occurrence_evidence\",\"structure_evidence\",\"docking_evidence\",\"md_evidence\",\"database_evidence\",\"risk_flags\",\"experimental_validation_guidance\"]}}",
+        escape_json(candidate_id),
+        escape_json(&run_id),
+        escape_json(&source_path.display().to_string()),
+        candidate,
+        Value::Array(evidence_rows)
+    )
 }
 
 fn result_table_json(
@@ -2142,6 +2280,43 @@ fn split_delimited_line(line: &str, delimiter: char) -> Vec<String> {
     line.split(delimiter)
         .map(|value| value.trim().trim_matches('"').to_string())
         .collect()
+}
+
+fn json_scalar_to_text(value: &Value) -> String {
+    match value {
+        Value::String(text) => text.clone(),
+        Value::Number(number) => number.to_string(),
+        Value::Bool(flag) => flag.to_string(),
+        Value::Null => String::new(),
+        other => other.to_string(),
+    }
+}
+
+fn json_row_field_text(row: &Value, field: &str) -> String {
+    let space_key = field.replace('_', " ");
+    let dash_key = field.replace('_', "-");
+    row.get(field)
+        .or_else(|| row.get(space_key.as_str()))
+        .or_else(|| row.get(dash_key.as_str()))
+        .map(json_scalar_to_text)
+        .unwrap_or_default()
+}
+
+fn json_rows_to_tsv(rows_json: &str, schema: &[&str]) -> String {
+    let mut lines = Vec::new();
+    lines.push(schema.join("\t"));
+    let rows = serde_json::from_str::<Value>(rows_json)
+        .ok()
+        .and_then(|value| value.as_array().cloned())
+        .unwrap_or_default();
+    for row in rows {
+        let values = schema
+            .iter()
+            .map(|field| json_row_field_text(&row, field).replace(['\t', '\r', '\n'], " "))
+            .collect::<Vec<_>>();
+        lines.push(values.join("\t"));
+    }
+    lines.join("\n") + "\n"
 }
 
 fn normalize_field_name(value: &str) -> String {
@@ -2333,6 +2508,73 @@ fn report_export_json(options: &ServerOptions) -> String {
     let diagnostics = diagnostics_json(options);
     let github = github_status_json(options);
     let projects = projects_json(options);
+    let candidate_schema = [
+        "rank",
+        "candidate_id",
+        "gene_name",
+        "orf_id",
+        "genomic_coordinates",
+        "context_class",
+        "fragment_score",
+        "co_occurrence_score",
+        "plm_score",
+        "structure_score",
+        "docking_score",
+        "md_stability_score",
+        "final_priority_score",
+        "risk_flags",
+    ];
+    let evidence_schema = [
+        "report_item",
+        "source_file",
+        "manifest",
+        "schema",
+        "tool_version",
+        "artifact_hash",
+        "validation_state",
+        "report_section",
+    ];
+    let latest_run = latest_run_dir(options);
+    let candidate_result = latest_run.as_ref().and_then(|(_, run_dir)| {
+        read_result_table(run_dir, &candidate_schema, &["candidate", "ranking"])
+    });
+    let evidence_result = latest_run.as_ref().and_then(|(_, run_dir)| {
+        read_result_table(run_dir, &evidence_schema, &["evidence", "ledger"])
+    });
+    let candidate_rows_json = candidate_result
+        .as_ref()
+        .map(|(_, rows, _)| rows.clone())
+        .unwrap_or_else(|| "[]".to_string());
+    let evidence_rows_json = evidence_result
+        .as_ref()
+        .map(|(_, rows, _)| rows.clone())
+        .unwrap_or_else(|| "[]".to_string());
+    let candidate_row_count = candidate_result
+        .as_ref()
+        .map(|(_, _, count)| *count)
+        .unwrap_or(0);
+    let evidence_row_count = evidence_result
+        .as_ref()
+        .map(|(_, _, count)| *count)
+        .unwrap_or(0);
+    let current_run_json = latest_run
+        .as_ref()
+        .map(|(run_id, run_dir)| {
+            format!(
+                "{{\"run_id\":\"{}\",\"run_dir\":\"{}\"}}",
+                escape_json(run_id),
+                escape_json(&run_dir.display().to_string())
+            )
+        })
+        .unwrap_or_else(|| "null".to_string());
+    let candidate_source_path = candidate_result
+        .as_ref()
+        .map(|(path, _, _)| path.display().to_string())
+        .unwrap_or_default();
+    let evidence_source_path = evidence_result
+        .as_ref()
+        .map(|(path, _, _)| path.display().to_string())
+        .unwrap_or_default();
     let html_report = export_dir.join("genoligand_report.html");
     let markdown_report = export_dir.join("genoligand_report.md");
     let candidate_table = export_dir.join("candidate_table.tsv");
@@ -2347,43 +2589,77 @@ fn report_export_json(options: &ServerOptions) -> String {
     let _ = write_text(
         &html_report,
         &format!(
-            "<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\"><title>GenoLigand {}</title></head><body><h1>GenoLigand {}</h1><p>Local production report generated by gls-server.</p><p>Computed candidate rows are included only when workflow artifacts exist.</p></body></html>\n",
-            PRODUCT_VERSION, PRODUCT_VERSION
+            "<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\"><title>GenoLigand {}</title></head><body><h1>GenoLigand {}</h1><p>Local production report generated by gls-server.</p><p>Current run: {}</p><p>Candidate rows: {}</p><p>Evidence rows: {}</p></body></html>\n",
+            PRODUCT_VERSION,
+            PRODUCT_VERSION,
+            escape_json(&current_run_json),
+            candidate_row_count,
+            evidence_row_count
         ),
     );
     let _ = write_text(
         &markdown_report,
         &format!(
-            "# GenoLigand {}\n\nLocal production report generated by `gls-server`.\n\nComputed candidate rows are included only when workflow artifacts exist.\n\n",
-            PRODUCT_VERSION
+            "# GenoLigand {}\n\nLocal production report generated by `gls-server`.\n\nCurrent run: `{}`\n\nCandidate rows: `{}`\n\nEvidence rows: `{}`\n\nCandidate source: `{}`\n\nEvidence source: `{}`\n\n",
+            PRODUCT_VERSION,
+            current_run_json,
+            candidate_row_count,
+            evidence_row_count,
+            candidate_source_path,
+            evidence_source_path
         ),
     );
     let _ = write_text(
         &candidate_table,
-        "rank\tcandidate_id\tgene_name\torf_id\tgenomic_coordinates\tcontext_class\tfragment_score\tco_occurrence_score\tplm_score\tstructure_score\tdocking_score\tmd_stability_score\tfinal_priority_score\trisk_flags\n",
+        &json_rows_to_tsv(&candidate_rows_json, &candidate_schema),
     );
     let _ = write_text(
         &machine_json,
         &format!(
-            "{{\"product\":\"{}\",\"version\":\"{}\",\"projects\":{},\"diagnostics\":{},\"github\":{},\"contains_computed_candidates\":false}}\n",
+            "{{\"product\":\"{}\",\"version\":\"{}\",\"projects\":{},\"diagnostics\":{},\"github\":{},\"current_run\":{},\"candidate_source_path\":\"{}\",\"evidence_source_path\":\"{}\",\"candidate_row_count\":{},\"evidence_row_count\":{},\"contains_computed_candidates\":{},\"candidates\":{},\"evidence\":{}}}\n",
             escape_json(PRODUCT_NAME),
             escape_json(PRODUCT_VERSION),
             projects,
             diagnostics,
-            github
+            github,
+            current_run_json,
+            escape_json(&candidate_source_path),
+            escape_json(&evidence_source_path),
+            candidate_row_count,
+            evidence_row_count,
+            candidate_row_count > 0,
+            candidate_rows_json,
+            evidence_rows_json
         ),
     );
     let _ = write_text(
         &artifact_bundle,
-        "artifact_type\tpath\tstatus\nhtml_report\tgenoligand_report.html\tcreated\nmarkdown_report\tgenoligand_report.md\tcreated\ncandidate_table\tcandidate_table.tsv\tcreated\nmachine_readable_json\tmachine_readable_report.json\tcreated\n",
+        &format!(
+            "artifact_type\tpath\tstatus\nhtml_report\tgenoligand_report.html\tcreated\nmarkdown_report\tgenoligand_report.md\tcreated\ncandidate_table\tcandidate_table.tsv\tcreated\nmachine_readable_json\tmachine_readable_report.json\tcreated\ncandidate_source\t{}\t{}\nevidence_source\t{}\t{}\n",
+            candidate_source_path,
+            if candidate_row_count > 0 {
+                "linked"
+            } else {
+                "not_available"
+            },
+            evidence_source_path,
+            if evidence_row_count > 0 {
+                "linked"
+            } else {
+                "not_available"
+            }
+        ),
     );
     let _ = write_text(
         &run_manifest,
         &format!(
-            "{{\"product\":\"{}\",\"version\":\"{}\",\"export_dir\":\"{}\",\"current_run\":null,\"source\":\"gls-server\"}}\n",
+            "{{\"product\":\"{}\",\"version\":\"{}\",\"export_dir\":\"{}\",\"current_run\":{},\"candidate_row_count\":{},\"evidence_row_count\":{},\"source\":\"gls-server\"}}\n",
             escape_json(PRODUCT_NAME),
             escape_json(PRODUCT_VERSION),
-            escape_json(&export_dir.display().to_string())
+            escape_json(&export_dir.display().to_string()),
+            current_run_json,
+            candidate_row_count,
+            evidence_row_count
         ),
     );
     let _ = write_text(
@@ -2450,11 +2726,15 @@ fn report_export_json(options: &ServerOptions) -> String {
         .collect::<Vec<_>>()
         .join(",");
     format!(
-        "{{\"exports\":{},\"status\":\"ready\",\"export_dir\":\"{}\",\"manifest\":\"{}\",\"files\":[{}],\"contains_computed_candidates\":false}}",
+        "{{\"exports\":{},\"status\":\"ready\",\"export_dir\":\"{}\",\"manifest\":\"{}\",\"files\":[{}],\"current_run\":{},\"candidate_row_count\":{},\"evidence_row_count\":{},\"contains_computed_candidates\":{}}}",
         exports,
         escape_json(&export_dir.display().to_string()),
         escape_json(&manifest.display().to_string()),
-        files
+        files,
+        current_run_json,
+        candidate_row_count,
+        evidence_row_count,
+        candidate_row_count > 0
     )
 }
 
@@ -3077,6 +3357,10 @@ mod tests {
             route_http("GET", &format!("/api/runs/{run_id}/evidence"), &options, "");
         assert!(evidence.contains("\"artifact_backed\":true"));
         assert!(evidence.contains("\"report_item\":\"final_priority_score\""));
+        let (_, _, candidate_detail) =
+            route_http("GET", "/api/candidates/GLS-ORF-001", &options, "");
+        assert!(candidate_detail.contains("\"selected\":true"));
+        assert!(candidate_detail.contains("\"candidate_id\":\"GLS-ORF-001\""));
 
         let (_, _, diagnostics) = route_http("GET", "/api/diagnostics", &options, "");
         assert!(diagnostics.contains("\"check_id\":\"rust_binary\""));
@@ -3085,6 +3369,8 @@ mod tests {
         let (_, _, exports) = route_http("POST", "/api/reports/export", &options, "");
         assert!(exports.contains("\"html_report\""));
         assert!(exports.contains("\"files\":["));
+        assert!(exports.contains("\"candidate_row_count\":1"));
+        assert!(exports.contains("\"contains_computed_candidates\":true"));
         assert!(
             options
                 .artifact_dir
@@ -3113,6 +3399,23 @@ mod tests {
                 .join("machine_readable_report.json")
                 .exists()
         );
+        let exported_candidates = fs::read_to_string(
+            options
+                .artifact_dir
+                .join("exports")
+                .join("candidate_table.tsv"),
+        )
+        .unwrap();
+        assert!(exported_candidates.contains("GLS-ORF-001"));
+        let machine_report = fs::read_to_string(
+            options
+                .artifact_dir
+                .join("exports")
+                .join("machine_readable_report.json"),
+        )
+        .unwrap();
+        assert!(machine_report.contains("\"candidate_row_count\":1"));
+        assert!(machine_report.contains("\"contains_computed_candidates\":true"));
         let legacy_export_manifest = options
             .artifact_dir
             .join("exports")
