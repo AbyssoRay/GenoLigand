@@ -959,6 +959,53 @@ fn project_field(project_dir: &Path, name: &str, fallback: &str) -> String {
     read_trimmed(&project_dir.join(name)).unwrap_or_else(|| fallback.to_string())
 }
 
+fn project_report_paths(dir: &Path) -> Vec<String> {
+    let mut paths = Vec::new();
+    let ledger = dir.join("report_paths.tsv");
+    if let Ok(text) = fs::read_to_string(&ledger) {
+        for line in text.lines().skip(1) {
+            let fields = split_delimited_line(line, '\t');
+            if let Some(path) = fields.get(1)
+                && !path.is_empty()
+            {
+                paths.push(path.clone());
+            }
+        }
+    }
+    let reports_dir = dir.join("reports");
+    if let Ok(entries) = fs::read_dir(&reports_dir) {
+        for entry in entries.flatten() {
+            if entry
+                .file_type()
+                .map(|file| file.is_file())
+                .unwrap_or(false)
+            {
+                paths.push(entry.path().display().to_string());
+            }
+        }
+    }
+    paths.sort();
+    paths.dedup();
+    paths
+}
+
+fn project_artifact_entries(dir: &Path, latest_run_id: Option<&str>) -> Vec<String> {
+    let mut entries = vec![
+        "project.json".to_string(),
+        "input_manifest.json".to_string(),
+        "runs".to_string(),
+        "reports".to_string(),
+    ];
+    if let Some(run_id) = latest_run_id {
+        entries.push(format!("runs/{run_id}/run_manifest.json"));
+        entries.push(format!("runs/{run_id}/artifact_index.json"));
+    }
+    if !project_report_paths(dir).is_empty() {
+        entries.push("report_paths.tsv".to_string());
+    }
+    entries
+}
+
 fn project_json_text(
     project_id: &str,
     project_name: &str,
@@ -970,14 +1017,20 @@ fn project_json_text(
     let latest = latest_run_id
         .map(|value| format!("\"{}\"", escape_json(value)))
         .unwrap_or_else(|| "null".to_string());
+    let report_paths = project_report_paths(dir);
+    let report_paths_json = json_string_array(report_paths.iter().map(String::as_str));
+    let artifact_entries = project_artifact_entries(dir, latest_run_id);
+    let artifact_entries_json = json_string_array(artifact_entries.iter().map(String::as_str));
     format!(
-        "{{\"project_id\":\"{}\",\"project_name\":\"{}\",\"workspace_path\":\"{}\",\"molecule_type\":null,\"organism\":null,\"search_scope\":null,\"run_profile\":null,\"project_status\":\"{}\",\"latest_run_id\":{},\"sample_template\":{},\"contains_precomputed_results\":false,\"saved_state\":[\"inputs\",\"database_profile\",\"run_state\",\"artifact_index\",\"report_paths\"],\"artifact_index\":[\"project.json\",\"input_manifest.json\",\"runs\",\"reports\"],\"report_paths\":[]}}",
+        "{{\"project_id\":\"{}\",\"project_name\":\"{}\",\"workspace_path\":\"{}\",\"molecule_type\":null,\"organism\":null,\"search_scope\":null,\"run_profile\":null,\"project_status\":\"{}\",\"latest_run_id\":{},\"sample_template\":{},\"contains_precomputed_results\":false,\"saved_state\":[\"inputs\",\"database_profile\",\"run_state\",\"artifact_index\",\"report_paths\"],\"artifact_index\":{},\"report_paths\":{}}}",
         escape_json(project_id),
         escape_json(project_name),
         escape_json(&dir.display().to_string()),
         escape_json(status),
         latest,
-        sample_template
+        sample_template,
+        artifact_entries_json,
+        report_paths_json
     )
 }
 
@@ -2709,6 +2762,25 @@ fn report_export_json(options: &ServerOptions) -> String {
         &manifest,
         &format!("export_type\tpath\tbytes\tstatus\n{manifest_text}\n"),
     );
+    if let Some((_, run_dir)) = latest_run.as_ref()
+        && let Some(project_dir) = run_dir.parent().and_then(Path::parent)
+    {
+        let reports_dir = project_dir.join("reports");
+        let _ = fs::create_dir_all(&reports_dir);
+        let report_paths_text = export_files
+            .iter()
+            .map(|(kind, path)| format!("{kind}\t{}", path.display()))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let _ = write_text(
+            &project_dir.join("report_paths.tsv"),
+            &format!("report_type\tpath\n{report_paths_text}\n"),
+        );
+        let _ = write_text(
+            &reports_dir.join("latest_report_export_manifest.tsv"),
+            &format!("export_type\tpath\tbytes\tstatus\n{manifest_text}\n"),
+        );
+    }
     let exports = json_string_array(export_files.iter().map(|(kind, _)| *kind));
     let files = export_files
         .iter()
@@ -3416,6 +3488,10 @@ mod tests {
         .unwrap();
         assert!(machine_report.contains("\"candidate_row_count\":1"));
         assert!(machine_report.contains("\"contains_computed_candidates\":true"));
+        let (_, _, project_after_export) =
+            route_http("GET", &format!("/api/projects/{project_id}"), &options, "");
+        assert!(project_after_export.contains("report_paths.tsv"));
+        assert!(project_after_export.contains("candidate_table.tsv"));
         let legacy_export_manifest = options
             .artifact_dir
             .join("exports")
