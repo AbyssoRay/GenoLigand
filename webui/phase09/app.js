@@ -196,6 +196,7 @@ const apiRoutes = [
   "GET /api/runs/{id}/evidence",
   "GET /api/databases",
   "GET /api/diagnostics",
+  "GET /api/guides",
   "POST /api/github/push",
 ];
 
@@ -264,6 +265,7 @@ let appState = {
   message: null,
   diagnostics: null,
   databases: null,
+  guides: null,
   github: null,
   exports: null,
   preflight: null,
@@ -1294,6 +1296,21 @@ function reportExport() {
   );
 }
 
+function guideRegistry() {
+  const guides = appState.guides?.guides || [];
+  return dataTable(
+    [[["指南", "Guide"], ["路径", "Path"], ["bytes", "bytes"], ["覆盖项", "Coverage"], ["状态", "State"]].map((x) => x)][0],
+    guides.map((guide) => [
+      [guide.title_zh || guide.guide_id || "", guide.title_en || guide.guide_id || ""],
+      guide.link ? `<a href="${guide.link}" target="_blank" rel="noopener">${guide.path || guide.link}</a>` : valueOrDash(guide.path),
+      valueOrDash(guide.bytes),
+      valueOrDash(guide.coverage),
+      statusPill(guide.exists ? "ready" : "missing", guide.status || (guide.exists ? t("ready") : t("missing"))),
+    ]),
+    [["尚未读取指南清单。", "Guide manifest has not loaded yet."]]
+  );
+}
+
 function settings() {
   return [
     card(
@@ -1311,7 +1328,7 @@ function settings() {
     ),
     card(
       [["安装指南", "Installation Guides"]],
-      optionTiles([
+      guideRegistry() || optionTiles([
         [["用户指南", "User guide"], ["启动服务、打开 WebUI、配置输入、运行、查看结果和导出报告。", "Start service, open WebUI, configure input, run, inspect results, and export reports."], "ready"],
         [["Windows + WSL2 安装指南", "Windows + WSL2 guide"], ["配置 WSL2、GPU/OpenMM、数据库挂载和 GitHub 同步。", "Configure WSL2, GPU/OpenMM, database mounts, and GitHub sync."], "ready"],
         [["Linux server 安装指南", "Linux server guide"], ["在 Linux 服务器上部署本地服务和浏览器入口。", "Deploy local service and browser entry on a Linux server."], "ready"],
@@ -1661,6 +1678,11 @@ async function refreshWorkspaceState() {
     appState.diagnostics = await apiRequest("/api/diagnostics");
   } catch (_error) {
     appState.diagnostics = null;
+  }
+  try {
+    appState.guides = await apiRequest("/api/guides");
+  } catch (_error) {
+    appState.guides = null;
   }
   try {
     appState.github = await apiRequest("/api/github/status");

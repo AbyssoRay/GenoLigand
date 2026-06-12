@@ -27,6 +27,15 @@ struct GateMetric {
     pass: bool,
 }
 
+#[derive(Clone, Debug)]
+struct GuideSpec {
+    id: &'static str,
+    title_zh: &'static str,
+    title_en: &'static str,
+    file_name: &'static str,
+    coverage: &'static [&'static str],
+}
+
 impl GateMetric {
     fn new(id: &str, value: impl ToString, pass: bool) -> Self {
         Self {
@@ -150,6 +159,16 @@ fn route_http(
             "<svg xmlns=\"http://www.w3.org/2000/svg\" viewBox=\"0 0 32 32\"><rect width=\"32\" height=\"32\" rx=\"6\" fill=\"#071014\"/><path d=\"M8 18c5-10 11-10 16 0\" fill=\"none\" stroke=\"#4fd1c5\" stroke-width=\"3\"/><circle cx=\"10\" cy=\"18\" r=\"3\" fill=\"#f6ad55\"/><circle cx=\"22\" cy=\"18\" r=\"3\" fill=\"#68d391\"/></svg>".to_string(),
         );
     }
+    if method == "GET" && path.starts_with("/docs/") {
+        return match guide_markdown(options, path) {
+            Some(markdown) => (200, "text/markdown; charset=utf-8", markdown),
+            None => (
+                404,
+                "application/json; charset=utf-8",
+                "{\"error\":\"guide_not_found\"}".to_string(),
+            ),
+        };
+    }
     if method == "POST" && path == "/api/projects/environment-validation" {
         return (
             200,
@@ -180,6 +199,7 @@ fn route_http(
         ("POST", "/api/databases/build-index") => action_json("queued"),
         ("GET", "/api/diagnostics") => diagnostics_json(options),
         ("POST", "/api/diagnostics/run") => diagnostics_json(options),
+        ("GET", "/api/guides") => guides_json(options),
         ("POST", "/api/reports/export") => report_export_json(options),
         ("GET", "/api/github/status") => github_status_json(options),
         ("POST", "/api/github/add") => git_action_json(options, &["add", "-A"]),
@@ -3287,6 +3307,107 @@ fn diagnostics_json(options: &ServerOptions) -> String {
     format!("{{\"diagnostics\":[{}]}}", diagnostics.join(","))
 }
 
+fn guide_specs() -> [GuideSpec; 3] {
+    [
+        GuideSpec {
+            id: "local_webui_user_guide",
+            title_zh: "用户指南",
+            title_en: "User guide",
+            file_name: "local_webui_user_guide.md",
+            coverage: &[
+                "local_service",
+                "webui",
+                "project_management",
+                "input_wizard",
+                "preflight",
+                "run_monitor",
+                "result_review",
+                "report_export",
+                "diagnostics",
+                "github_sync",
+            ],
+        },
+        GuideSpec {
+            id: "windows_wsl2_installation_guide",
+            title_zh: "Windows + WSL2 安装指南",
+            title_en: "Windows + WSL2 installation guide",
+            file_name: "windows_wsl2_installation_guide.md",
+            coverage: &[
+                "windows",
+                "wsl2",
+                "gpu_openmm",
+                "database_mounts",
+                "diagnostics",
+                "environment_validation_template",
+                "service_stop",
+            ],
+        },
+        GuideSpec {
+            id: "linux_server_installation_guide",
+            title_zh: "Linux server 安装指南",
+            title_en: "Linux server installation guide",
+            file_name: "linux_server_installation_guide.md",
+            coverage: &[
+                "linux",
+                "service_start",
+                "ssh_tunnel",
+                "database_paths",
+                "gpu_openmm",
+                "workflow",
+                "environment_validation_template",
+            ],
+        },
+    ]
+}
+
+fn guide_path(options: &ServerOptions, file_name: &str) -> PathBuf {
+    options.workspace_root.join("docs").join(file_name)
+}
+
+fn guide_markdown(options: &ServerOptions, path: &str) -> Option<String> {
+    let requested = path.trim_start_matches("/docs/");
+    let spec = guide_specs()
+        .into_iter()
+        .find(|spec| spec.file_name == requested)?;
+    fs::read_to_string(guide_path(options, spec.file_name)).ok()
+}
+
+fn guides_json(options: &ServerOptions) -> String {
+    let specs = guide_specs();
+    let guides = specs
+        .iter()
+        .map(|spec| {
+            let path = guide_path(options, spec.file_name);
+            let exists = path.is_file();
+            let bytes = fs::metadata(&path).map(|metadata| metadata.len()).unwrap_or(0);
+            let status = if exists { "ready" } else { "missing" };
+            format!(
+                "{{\"guide_id\":\"{}\",\"title_zh\":\"{}\",\"title_en\":\"{}\",\"path\":\"docs/{}\",\"link\":\"/docs/{}\",\"exists\":{},\"bytes\":{},\"coverage\":{},\"status\":\"{}\"}}",
+                escape_json(spec.id),
+                escape_json(spec.title_zh),
+                escape_json(spec.title_en),
+                escape_json(spec.file_name),
+                escape_json(spec.file_name),
+                exists,
+                bytes,
+                json_string_array(spec.coverage.iter().copied()),
+                status
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(",");
+    let available_guide_count = specs
+        .iter()
+        .filter(|spec| guide_path(options, spec.file_name).is_file())
+        .count();
+    format!(
+        "{{\"guide_count\":{},\"required_guide_count\":3,\"available_guide_count\":{},\"guides\":[{}]}}",
+        specs.len(),
+        available_guide_count,
+        guides
+    )
+}
+
 fn diagnostic_check_json(
     check_id: &str,
     status: &str,
@@ -4134,7 +4255,7 @@ mod tests {
             host: "127.0.0.1".to_string(),
             port: 19090,
             artifact_dir: root.join("artifacts"),
-            workspace_root: PathBuf::from("."),
+            workspace_root: PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../.."),
         };
 
         let (_, _, created) = route_http("POST", "/api/projects", &options, "");
@@ -4318,6 +4439,15 @@ mod tests {
         assert!(databases.contains("\"profile_id\":\"database_sources_yml\""));
         assert!(databases.contains("\"source_config\":"));
         assert!(databases.contains("\"fields\":[\"path\",\"version\",\"sha256\""));
+        let (_, _, guides) = route_http("GET", "/api/guides", &options, "");
+        assert!(guides.contains("\"guide_count\":3"));
+        assert!(guides.contains("\"available_guide_count\":3"));
+        assert!(guides.contains("local_webui_user_guide.md"));
+        let (guide_status, guide_type, guide_doc) =
+            route_http("GET", "/docs/local_webui_user_guide.md", &options, "");
+        assert_eq!(guide_status, 200);
+        assert_eq!(guide_type, "text/markdown; charset=utf-8");
+        assert!(guide_doc.contains("GenoLigand 0.9.1 Local WebUI User Guide"));
 
         let (_, _, exports) = route_http("POST", "/api/reports/export", &options, "");
         assert!(exports.contains("\"html_report\""));
