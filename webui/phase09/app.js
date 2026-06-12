@@ -1009,25 +1009,33 @@ function githubSync() {
 
 function reportExport() {
   const payload = appState.exports || {};
-  const exportRows = (payload.exports || [
-    "html_report",
-    "markdown_report",
-    "candidate_csv_tsv",
-    "machine_readable_json",
-    "artifact_bundle",
-    "run_manifest",
-    "tool_version_manifest",
-    "diagnostics_report",
-    "github_push_report",
-  ]).map((name) => [
-    name,
-    payload.export_dir || pick(["等待生成导出 manifest", "Waiting for export manifest"]),
-    statusPill(payload.status || "waiting"),
-  ]);
+  const exportRows = payload.files?.length
+    ? payload.files.map((file) => [
+        file.export_type || "",
+        file.path || "",
+        valueOrDash(file.bytes),
+        file.exists ? statusPill("ready") : statusPill("warning"),
+      ])
+    : (payload.exports || [
+        "html_report",
+        "markdown_report",
+        "candidate_csv_tsv",
+        "machine_readable_json",
+        "artifact_bundle",
+        "run_manifest",
+        "tool_version_manifest",
+        "diagnostics_report",
+        "github_push_report",
+      ]).map((name) => [
+        name,
+        payload.export_dir || pick(["等待生成导出 manifest", "Waiting for export manifest"]),
+        "",
+        statusPill(payload.status || "waiting"),
+      ]);
   return card(
     [["导出项目", "Export Targets"]],
     dataTable(
-      [[["导出类型", "Export type"], ["输出位置", "Output location"], ["状态", "State"]].map((x) => x)][0],
+      [[["导出类型", "Export type"], ["输出位置", "Output location"], ["bytes", "bytes"], ["状态", "State"]].map((x) => x)][0],
       exportRows,
       [["尚未生成导出 manifest。", "No export manifest has been generated yet."]]
     ) + buttonRow([[[ "生成导出 manifest", "Export candidate table" ], "primary", null]])

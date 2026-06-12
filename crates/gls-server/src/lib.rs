@@ -178,8 +178,8 @@ fn route_http(
         ("GET", "/api/databases") => databases_json(),
         ("POST", "/api/databases/validate") => action_json("queued"),
         ("POST", "/api/databases/build-index") => action_json("queued"),
-        ("GET", "/api/diagnostics") => diagnostics_json(),
-        ("POST", "/api/diagnostics/run") => diagnostics_json(),
+        ("GET", "/api/diagnostics") => diagnostics_json(options),
+        ("POST", "/api/diagnostics/run") => diagnostics_json(options),
         ("POST", "/api/reports/export") => report_export_json(options),
         ("GET", "/api/github/status") => github_status_json(options),
         ("POST", "/api/github/add") => git_action_json(options, &["add", "-A"]),
@@ -2161,19 +2161,301 @@ fn databases_json() -> String {
     "{\"profiles\":[],\"resources\":[\"genome\",\"annotation\",\"transcripts\",\"BioLiP2\",\"UniProt\",\"ChEMBL\",\"BindingDB\",\"structure_cache\"],\"fields\":[\"path\",\"version\",\"sha256\",\"index_state\",\"missing_items\",\"storage_bytes\",\"repair_action\"],\"message\":\"Select or create a database profile.\"}".to_string()
 }
 
-fn diagnostics_json() -> String {
-    "{\"diagnostics\":[{\"check_id\":\"wsl2_linux\",\"status\":\"waiting\",\"repair_action\":\"inspect runtime backend\"},{\"check_id\":\"rust_binary\",\"status\":\"waiting\",\"repair_action\":\"build gls-cli and gls-server\"},{\"check_id\":\"nextflow_java\",\"status\":\"waiting\",\"repair_action\":\"check Nextflow and Java\"},{\"check_id\":\"python_worker\",\"status\":\"waiting\",\"repair_action\":\"validate worker schemas\"},{\"check_id\":\"openmm_cuda_nvidia\",\"status\":\"waiting\",\"repair_action\":\"run GPU diagnostics\"},{\"check_id\":\"database_paths\",\"status\":\"waiting\",\"repair_action\":\"open database registry\"},{\"check_id\":\"git_github\",\"status\":\"waiting\",\"repair_action\":\"open GitHub Sync\"},{\"check_id\":\"sample_project_template\",\"status\":\"ready\",\"repair_action\":\"create sample project template\"}]}".to_string()
+fn diagnostics_json(options: &ServerOptions) -> String {
+    let workspace = &options.workspace_root;
+    let gls_cli = binary_exists(workspace, "gls-cli");
+    let gls_server = binary_exists(workspace, "gls-server");
+    let rust_binary_status = if gls_cli && gls_server {
+        "ready"
+    } else {
+        "warning"
+    };
+    let java_ok = command_probe("java", &["-version"]);
+    let nextflow_ok = command_probe("nextflow", &["-version"]);
+    let python_ok = command_probe("python", &["--version"]);
+    let openmm_ok = python_module_probe("openmm");
+    let nvidia_ok = command_probe("nvidia-smi", &["--query-gpu=name", "--format=csv,noheader"]);
+    let git_remote_ok = command_probe("git", &["remote", "get-url", "origin"]);
+    let github_permission_known = git_remote_ok && command_probe("git", &["status", "--short"]);
+    let write_probe = options.artifact_dir.join(".diagnostics_write_probe");
+    let write_ok = write_text(&write_probe, "ok\n").is_ok();
+    let _ = fs::remove_file(&write_probe);
+    let disk_bytes = directory_size(&options.artifact_dir);
+    let database_config_count = [
+        "configs/database_sources.yml",
+        "configs/database_thresholds.yml",
+        "configs/phase_0_8_full_database_strict.yml",
+    ]
+    .iter()
+    .filter(|path| workspace.join(path).exists())
+    .count();
+    let sample_projects = count_sample_projects(options);
+    let runtime_text = if cfg!(windows) {
+        format!(
+            "windows_host=true;wsl_command={};linux_branch_recorded={}",
+            command_probe("wsl.exe", &["--status"]),
+            cfg!(target_os = "linux")
+        )
+    } else {
+        format!(
+            "linux_host=true;kernel_probe={}",
+            command_probe("uname", &["-a"])
+        )
+    };
+    let diagnostics = [
+        diagnostic_check_json(
+            "wsl2_linux",
+            if cfg!(windows) { "warning" } else { "ready" },
+            &runtime_text,
+            "inspect runtime backend",
+        ),
+        diagnostic_check_json(
+            "rust_binary",
+            rust_binary_status,
+            &format!("gls_cli_binary={gls_cli};gls_server_binary={gls_server}"),
+            "build gls-cli and gls-server",
+        ),
+        diagnostic_check_json(
+            "nextflow_java",
+            if java_ok && nextflow_ok {
+                "ready"
+            } else {
+                "warning"
+            },
+            &format!("java={java_ok};nextflow={nextflow_ok}"),
+            "check Nextflow and Java",
+        ),
+        diagnostic_check_json(
+            "python_worker",
+            if python_ok { "ready" } else { "warning" },
+            &format!("python={python_ok};schema_bound_worker_boundary=rust_validated"),
+            "validate worker schemas",
+        ),
+        diagnostic_check_json(
+            "openmm_cuda_nvidia",
+            if openmm_ok && nvidia_ok {
+                "ready"
+            } else {
+                "warning"
+            },
+            &format!("openmm_python_module={openmm_ok};nvidia_smi={nvidia_ok}"),
+            "run GPU diagnostics",
+        ),
+        diagnostic_check_json(
+            "database_paths",
+            if database_config_count > 0 {
+                "ready"
+            } else {
+                "warning"
+            },
+            &format!(
+                "database_config_count={database_config_count};artifact_dir={};artifact_bytes={disk_bytes};write_permission={write_ok}",
+                options.artifact_dir.display()
+            ),
+            "open database registry",
+        ),
+        diagnostic_check_json(
+            "git_github",
+            if git_remote_ok { "ready" } else { "warning" },
+            &format!(
+                "git_remote={git_remote_ok};github_push_permission_probe={github_permission_known}"
+            ),
+            "open GitHub Sync",
+        ),
+        diagnostic_check_json(
+            "sample_project_template",
+            "ready",
+            &format!(
+                "sample_project_template_count={sample_projects};contains_precomputed_results=false"
+            ),
+            "create sample project template",
+        ),
+    ];
+    format!("{{\"diagnostics\":[{}]}}", diagnostics.join(","))
+}
+
+fn diagnostic_check_json(
+    check_id: &str,
+    status: &str,
+    observed: &str,
+    repair_action: &str,
+) -> String {
+    format!(
+        "{{\"check_id\":\"{}\",\"status\":\"{}\",\"description\":\"{}\",\"observed\":\"{}\",\"repair_action\":\"{}\"}}",
+        escape_json(check_id),
+        escape_json(status),
+        escape_json(observed),
+        escape_json(observed),
+        escape_json(repair_action)
+    )
+}
+
+fn binary_exists(workspace: &Path, name: &str) -> bool {
+    let executable = if cfg!(windows) {
+        format!("{name}.exe")
+    } else {
+        name.to_string()
+    };
+    ["debug", "release"].iter().any(|profile| {
+        workspace
+            .join("target")
+            .join(profile)
+            .join(&executable)
+            .exists()
+    })
+}
+
+fn python_module_probe(module: &str) -> bool {
+    Command::new("python")
+        .args(["-c", &format!("import {module}")])
+        .output()
+        .map(|output| output.status.success())
+        .unwrap_or(false)
+}
+
+fn count_sample_projects(options: &ServerOptions) -> usize {
+    let root = projects_root(options);
+    fs::read_dir(root)
+        .ok()
+        .into_iter()
+        .flat_map(|entries| entries.flatten())
+        .filter(|entry| {
+            read_trimmed(&entry.path().join("sample_template.txt"))
+                .map(|value| value == "true")
+                .unwrap_or(false)
+        })
+        .count()
 }
 
 fn report_export_json(options: &ServerOptions) -> String {
     let export_dir = options.artifact_dir.join("exports");
-    let manifest = export_dir.join("report_export_manifest.json");
-    let json = format!(
-        "{{\"exports\":[\"html_report\",\"markdown_report\",\"candidate_csv_tsv\",\"machine_readable_json\",\"artifact_bundle\",\"run_manifest\",\"tool_version_manifest\",\"diagnostics_report\",\"github_push_report\"],\"status\":\"ready\",\"export_dir\":\"{}\",\"contains_computed_candidates\":false}}",
-        escape_json(&export_dir.display().to_string())
+    let _ = fs::create_dir_all(&export_dir);
+    let diagnostics = diagnostics_json(options);
+    let github = github_status_json(options);
+    let projects = projects_json(options);
+    let html_report = export_dir.join("genoligand_report.html");
+    let markdown_report = export_dir.join("genoligand_report.md");
+    let candidate_table = export_dir.join("candidate_table.tsv");
+    let machine_json = export_dir.join("machine_readable_report.json");
+    let artifact_bundle = export_dir.join("artifact_bundle_manifest.tsv");
+    let run_manifest = export_dir.join("run_manifest.json");
+    let tool_versions = export_dir.join("tool_version_manifest.tsv");
+    let diagnostics_report = export_dir.join("diagnostics_report.json");
+    let github_report = export_dir.join("github_push_report.json");
+    let manifest = export_dir.join("report_export_manifest.tsv");
+
+    let _ = write_text(
+        &html_report,
+        &format!(
+            "<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\"><title>GenoLigand {}</title></head><body><h1>GenoLigand {}</h1><p>Local production report generated by gls-server.</p><p>Computed candidate rows are included only when workflow artifacts exist.</p></body></html>\n",
+            PRODUCT_VERSION, PRODUCT_VERSION
+        ),
     );
-    let _ = write_text(&manifest, &(json.clone() + "\n"));
-    json
+    let _ = write_text(
+        &markdown_report,
+        &format!(
+            "# GenoLigand {}\n\nLocal production report generated by `gls-server`.\n\nComputed candidate rows are included only when workflow artifacts exist.\n\n",
+            PRODUCT_VERSION
+        ),
+    );
+    let _ = write_text(
+        &candidate_table,
+        "rank\tcandidate_id\tgene_name\torf_id\tgenomic_coordinates\tcontext_class\tfragment_score\tco_occurrence_score\tplm_score\tstructure_score\tdocking_score\tmd_stability_score\tfinal_priority_score\trisk_flags\n",
+    );
+    let _ = write_text(
+        &machine_json,
+        &format!(
+            "{{\"product\":\"{}\",\"version\":\"{}\",\"projects\":{},\"diagnostics\":{},\"github\":{},\"contains_computed_candidates\":false}}\n",
+            escape_json(PRODUCT_NAME),
+            escape_json(PRODUCT_VERSION),
+            projects,
+            diagnostics,
+            github
+        ),
+    );
+    let _ = write_text(
+        &artifact_bundle,
+        "artifact_type\tpath\tstatus\nhtml_report\tgenoligand_report.html\tcreated\nmarkdown_report\tgenoligand_report.md\tcreated\ncandidate_table\tcandidate_table.tsv\tcreated\nmachine_readable_json\tmachine_readable_report.json\tcreated\n",
+    );
+    let _ = write_text(
+        &run_manifest,
+        &format!(
+            "{{\"product\":\"{}\",\"version\":\"{}\",\"export_dir\":\"{}\",\"current_run\":null,\"source\":\"gls-server\"}}\n",
+            escape_json(PRODUCT_NAME),
+            escape_json(PRODUCT_VERSION),
+            escape_json(&export_dir.display().to_string())
+        ),
+    );
+    let _ = write_text(
+        &tool_versions,
+        &format!(
+            "tool\tstatus\nGenoLigand\t{}\ngls-server\t{}\ngit\t{}\njava\t{}\nnextflow\t{}\npython\t{}\nopenmm\t{}\nnvidia-smi\t{}\n",
+            PRODUCT_VERSION,
+            PRODUCT_VERSION,
+            command_probe("git", &["--version"]),
+            command_probe("java", &["-version"]),
+            command_probe("nextflow", &["-version"]),
+            command_probe("python", &["--version"]),
+            python_module_probe("openmm"),
+            command_probe("nvidia-smi", &["--query-gpu=name", "--format=csv,noheader"])
+        ),
+    );
+    let _ = write_text(&diagnostics_report, &(diagnostics + "\n"));
+    let _ = write_text(&github_report, &(github + "\n"));
+
+    let export_files = [
+        ("html_report", &html_report),
+        ("markdown_report", &markdown_report),
+        ("candidate_csv_tsv", &candidate_table),
+        ("machine_readable_json", &machine_json),
+        ("artifact_bundle", &artifact_bundle),
+        ("run_manifest", &run_manifest),
+        ("tool_version_manifest", &tool_versions),
+        ("diagnostics_report", &diagnostics_report),
+        ("github_push_report", &github_report),
+    ];
+    let manifest_text = export_files
+        .iter()
+        .map(|(kind, path)| {
+            format!(
+                "{}\t{}\t{}\t{}",
+                kind,
+                path.display(),
+                fs::metadata(path)
+                    .map(|metadata| metadata.len())
+                    .unwrap_or(0),
+                if path.exists() { "created" } else { "failed" }
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    let _ = write_text(
+        &manifest,
+        &format!("export_type\tpath\tbytes\tstatus\n{manifest_text}\n"),
+    );
+    let exports = json_string_array(export_files.iter().map(|(kind, _)| *kind));
+    let files = export_files
+        .iter()
+        .map(|(kind, path)| {
+            format!(
+                "{{\"export_type\":\"{}\",\"path\":\"{}\",\"bytes\":{},\"exists\":{}}}",
+                escape_json(kind),
+                escape_json(&path.display().to_string()),
+                fs::metadata(path)
+                    .map(|metadata| metadata.len())
+                    .unwrap_or(0),
+                path.exists()
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(",");
+    format!(
+        "{{\"exports\":{},\"status\":\"ready\",\"export_dir\":\"{}\",\"manifest\":\"{}\",\"files\":[{}],\"contains_computed_candidates\":false}}",
+        exports,
+        escape_json(&export_dir.display().to_string()),
+        escape_json(&manifest.display().to_string()),
+        files
+    )
 }
 
 fn cleanup_json(options: &ServerOptions) -> String {
@@ -2537,6 +2819,42 @@ mod tests {
             route_http("GET", &format!("/api/runs/{run_id}/evidence"), &options, "");
         assert!(evidence.contains("\"artifact_backed\":true"));
         assert!(evidence.contains("\"report_item\":\"final_priority_score\""));
+
+        let (_, _, diagnostics) = route_http("GET", "/api/diagnostics", &options, "");
+        assert!(diagnostics.contains("\"check_id\":\"rust_binary\""));
+        assert!(diagnostics.contains("\"observed\":"));
+
+        let (_, _, exports) = route_http("POST", "/api/reports/export", &options, "");
+        assert!(exports.contains("\"html_report\""));
+        assert!(exports.contains("\"files\":["));
+        assert!(
+            options
+                .artifact_dir
+                .join("exports")
+                .join("genoligand_report.html")
+                .exists()
+        );
+        assert!(
+            options
+                .artifact_dir
+                .join("exports")
+                .join("genoligand_report.md")
+                .exists()
+        );
+        assert!(
+            options
+                .artifact_dir
+                .join("exports")
+                .join("candidate_table.tsv")
+                .exists()
+        );
+        assert!(
+            options
+                .artifact_dir
+                .join("exports")
+                .join("machine_readable_report.json")
+                .exists()
+        );
 
         let (_, _, cancel) =
             route_http("POST", &format!("/api/runs/{run_id}/cancel"), &options, "");
