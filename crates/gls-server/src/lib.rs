@@ -3,6 +3,8 @@ use std::fs;
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
+use std::process::Command;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 pub const ACCEPTANCE_MODE: &str = "phase_0_9_1_production_webui";
 pub const PRODUCT_NAME: &str = "GenoLigand Local WebUI";
@@ -104,6 +106,13 @@ fn route_http(method: &str, path: &str, options: &ServerOptions) -> (u16, &'stat
             include_str!("../../../webui/phase09/app.js").to_string(),
         );
     }
+    if method == "POST" && path == "/api/projects/sample" {
+        return (
+            200,
+            "application/json; charset=utf-8",
+            create_project_json(options, true),
+        );
+    }
     if let Some(response) = route_project_resource(method, path, options) {
         return response;
     }
@@ -121,16 +130,23 @@ fn route_http(method: &str, path: &str, options: &ServerOptions) -> (u16, &'stat
             ("version", PRODUCT_VERSION),
             ("rust_owned_backend", "true"),
         ]),
-        ("GET", "/api/projects") => projects_json(),
+        ("GET", "/api/projects") => projects_json(options),
         ("GET", "/api/databases") => databases_json(),
         ("POST", "/api/databases/validate") => action_json("queued"),
         ("POST", "/api/databases/build-index") => action_json("queued"),
         ("GET", "/api/diagnostics") => diagnostics_json(),
-        ("POST", "/api/reports/export") => report_export_json(),
-        ("GET", "/api/github/status") => github_status_json(),
-        ("POST", "/api/github/push") => action_json("queued"),
-        ("POST", "/api/cleanup/post-push") => action_json("queued"),
-        ("POST", "/api/projects") => action_json("created"),
+        ("POST", "/api/diagnostics/run") => diagnostics_json(),
+        ("POST", "/api/reports/export") => report_export_json(options),
+        ("GET", "/api/github/status") => github_status_json(options),
+        ("POST", "/api/github/add") => git_action_json(options, &["add", "-A"]),
+        ("POST", "/api/github/commit") => git_action_json(
+            options,
+            &["commit", "-m", "Update GenoLigand project state from WebUI"],
+        ),
+        ("POST", "/api/github/push") => git_push_json(options),
+        ("POST", "/api/github/verify") => github_status_json(options),
+        ("POST", "/api/cleanup/post-push") => cleanup_json(options),
+        ("POST", "/api/projects") => create_project_json(options, false),
         _ => {
             return (
                 404,
@@ -145,29 +161,30 @@ fn route_http(method: &str, path: &str, options: &ServerOptions) -> (u16, &'stat
 fn route_project_resource(
     method: &str,
     path: &str,
-    _options: &ServerOptions,
+    options: &ServerOptions,
 ) -> Option<(u16, &'static str, String)> {
     if !path.starts_with("/api/projects/") {
         return None;
     }
+    let (project_id, suffix) = parse_project_path(path)?;
     let body = if path.ends_with("/inputs") && method == "GET" {
         inputs_json()
     } else if path.ends_with("/preflight") && method == "GET" {
         preflight_json()
     } else if path.ends_with("/preflight") && method == "POST" {
-        action_json("preflight_passed")
+        write_project_preflight(options, &project_id)
     } else if path.ends_with("/runs") && method == "GET" {
-        runs_json()
+        runs_json(options, &project_id)
     } else if path.ends_with("/runs") && method == "POST" {
-        run_json("queued")
+        create_run_json(options, &project_id)
     } else if path.ends_with("/copy") && method == "POST" {
-        action_json("created")
+        copy_project_json(options, &project_id)
     } else if path.ends_with("/cleanup") && method == "POST" {
-        action_json("completed")
+        project_cleanup_json(options, &project_id)
     } else if method == "DELETE" {
-        action_json("cancelled")
-    } else if method == "GET" {
-        project_json()
+        delete_project_json(options, &project_id)
+    } else if method == "GET" && suffix.is_empty() {
+        project_json(options, &project_id)
     } else {
         return Some((
             404,
@@ -193,18 +210,24 @@ fn route_run_resource(
     if !path.starts_with("/api/runs/") {
         return None;
     }
+    let run_id = safe_id(
+        path.trim_start_matches("/api/runs/")
+            .split('/')
+            .next()
+            .unwrap_or(""),
+    );
     let body = if path.ends_with("/cancel") && method == "POST" {
-        action_json("cancelled")
+        update_run_state_json(options, &run_id, "cancelled")
     } else if path.ends_with("/resume") && method == "POST" {
-        action_json("resumable")
+        update_run_state_json(options, &run_id, "resumable")
     } else if path.ends_with("/logs") && method == "GET" {
-        logs_json()
+        logs_json(options, &run_id)
     } else if path.ends_with("/artifacts") && method == "GET" {
         artifacts_json(options)
     } else if path.ends_with("/candidates") && method == "GET" {
         candidates_json()
     } else if method == "GET" {
-        run_json("idle")
+        run_json(options, &run_id, "idle")
     } else {
         return Some((
             404,
@@ -837,12 +860,246 @@ fn write_text(path: &Path, text: &str) -> Result<(), String> {
     fs::write(path, text).map_err(|err| format!("write_failed:{}:{err}", path.display()))
 }
 
-fn project_json() -> String {
-    "{\"project_id\":null,\"project_name\":null,\"molecule_type\":null,\"organism\":null,\"search_scope\":null,\"run_profile\":null,\"project_status\":\"created\",\"latest_run_id\":null,\"saved_state\":[\"inputs\",\"database_profile\",\"run_state\",\"artifact_index\",\"report_paths\"]}".to_string()
+fn projects_root(options: &ServerOptions) -> PathBuf {
+    options.artifact_dir.join("projects")
 }
 
-fn projects_json() -> String {
-    "{\"projects\":[],\"templates\":[{\"template_id\":\"sample_project_template\",\"name\":\"Sample project template\",\"contains_precomputed_results\":false,\"purpose\":\"installation_database_gpu_nextflow_webui_diagnostics_check\"}],\"supported_actions\":[\"create\",\"open\",\"copy\",\"delete\",\"cleanup\",\"resume\"]}".to_string()
+fn now_millis() -> u128 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_millis())
+        .unwrap_or(0)
+}
+
+fn safe_id(raw: &str) -> String {
+    raw.chars()
+        .filter(|ch| ch.is_ascii_alphanumeric() || *ch == '-' || *ch == '_')
+        .collect::<String>()
+}
+
+fn parse_project_path(path: &str) -> Option<(String, String)> {
+    let rest = path.strip_prefix("/api/projects/")?;
+    let mut parts = rest.splitn(2, '/');
+    let project_id = safe_id(parts.next().unwrap_or(""));
+    let suffix = parts.next().unwrap_or("").to_string();
+    if project_id.is_empty() {
+        None
+    } else {
+        Some((project_id, suffix))
+    }
+}
+
+fn read_trimmed(path: &Path) -> Option<String> {
+    fs::read_to_string(path)
+        .ok()
+        .map(|text| text.trim().to_string())
+        .filter(|text| !text.is_empty())
+}
+
+fn project_dir(options: &ServerOptions, project_id: &str) -> PathBuf {
+    projects_root(options).join(safe_id(project_id))
+}
+
+fn project_field(project_dir: &Path, name: &str, fallback: &str) -> String {
+    read_trimmed(&project_dir.join(name)).unwrap_or_else(|| fallback.to_string())
+}
+
+fn project_json_text(
+    project_id: &str,
+    project_name: &str,
+    status: &str,
+    latest_run_id: Option<&str>,
+    sample_template: bool,
+    dir: &Path,
+) -> String {
+    let latest = latest_run_id
+        .map(|value| format!("\"{}\"", escape_json(value)))
+        .unwrap_or_else(|| "null".to_string());
+    format!(
+        "{{\"project_id\":\"{}\",\"project_name\":\"{}\",\"workspace_path\":\"{}\",\"molecule_type\":null,\"organism\":null,\"search_scope\":null,\"run_profile\":null,\"project_status\":\"{}\",\"latest_run_id\":{},\"sample_template\":{},\"contains_precomputed_results\":false,\"saved_state\":[\"inputs\",\"database_profile\",\"run_state\",\"artifact_index\",\"report_paths\"],\"artifact_index\":[\"project.json\",\"input_manifest.json\",\"runs\",\"reports\"],\"report_paths\":[]}}",
+        escape_json(project_id),
+        escape_json(project_name),
+        escape_json(&dir.display().to_string()),
+        escape_json(status),
+        latest,
+        sample_template
+    )
+}
+
+fn write_project_state(
+    options: &ServerOptions,
+    project_id: &str,
+    project_name: &str,
+    status: &str,
+    latest_run_id: Option<&str>,
+    sample_template: bool,
+) -> Result<String, String> {
+    let dir = project_dir(options, project_id);
+    fs::create_dir_all(dir.join("runs"))
+        .map_err(|err| format!("create_project_runs_failed:{project_id}:{err}"))?;
+    fs::create_dir_all(dir.join("reports"))
+        .map_err(|err| format!("create_project_reports_failed:{project_id}:{err}"))?;
+    write_text(&dir.join("project_name.txt"), project_name)?;
+    write_text(&dir.join("project_status.txt"), status)?;
+    write_text(
+        &dir.join("sample_template.txt"),
+        &sample_template.to_string(),
+    )?;
+    if let Some(run_id) = latest_run_id {
+        write_text(&dir.join("latest_run_id.txt"), run_id)?;
+    }
+    write_text(
+        &dir.join("input_manifest.json"),
+        "{\"inputs\":[],\"advanced_parameters_collapsed\":true,\"status\":\"waiting_for_user_input\"}\n",
+    )?;
+    let json = project_json_text(
+        project_id,
+        project_name,
+        status,
+        latest_run_id,
+        sample_template,
+        &dir,
+    );
+    write_text(&dir.join("project.json"), &(json.clone() + "\n"))?;
+    Ok(json)
+}
+
+fn read_project_json(options: &ServerOptions, project_id: &str) -> Option<String> {
+    let dir = project_dir(options, project_id);
+    if !dir.starts_with(projects_root(options)) {
+        return None;
+    }
+    let name = project_field(&dir, "project_name.txt", project_id);
+    let status = project_field(&dir, "project_status.txt", "created");
+    let latest = read_trimmed(&dir.join("latest_run_id.txt"));
+    let sample = read_trimmed(&dir.join("sample_template.txt"))
+        .map(|value| value == "true")
+        .unwrap_or(false);
+    Some(project_json_text(
+        project_id,
+        &name,
+        &status,
+        latest.as_deref(),
+        sample,
+        &dir,
+    ))
+}
+
+fn project_json(options: &ServerOptions, project_id: &str) -> String {
+    read_project_json(options, project_id).unwrap_or_else(|| {
+        format!(
+            "{{\"error\":\"project_not_found\",\"project_id\":\"{}\"}}",
+            escape_json(project_id)
+        )
+    })
+}
+
+fn projects_json(options: &ServerOptions) -> String {
+    let root = projects_root(options);
+    let mut projects = Vec::new();
+    if let Ok(entries) = fs::read_dir(&root) {
+        for entry in entries.flatten() {
+            if !entry.file_type().map(|file| file.is_dir()).unwrap_or(false) {
+                continue;
+            }
+            let id = entry.file_name().to_string_lossy().to_string();
+            if let Some(json) = read_project_json(options, &id) {
+                projects.push(json);
+            }
+        }
+    }
+    format!(
+        "{{\"projects\":[{}],\"templates\":[{{\"template_id\":\"sample_project_template\",\"name\":\"Sample project template\",\"contains_precomputed_results\":false,\"purpose\":\"installation_database_gpu_nextflow_webui_diagnostics_check\"}}],\"supported_actions\":[\"create\",\"open\",\"copy\",\"delete\",\"cleanup\",\"resume\"]}}",
+        projects.join(",")
+    )
+}
+
+fn create_project_json(options: &ServerOptions, sample_template: bool) -> String {
+    let suffix = now_millis();
+    let project_id = if sample_template {
+        format!("sample-project-{suffix}")
+    } else {
+        format!("project-{suffix}")
+    };
+    let name = if sample_template {
+        "Sample project template"
+    } else {
+        "Untitled GenoLigand project"
+    };
+    match write_project_state(options, &project_id, name, "created", None, sample_template) {
+        Ok(project) => format!("{{\"status\":\"created\",\"project\":{project}}}"),
+        Err(err) => format!(
+            "{{\"status\":\"failed\",\"error\":\"{}\"}}",
+            escape_json(&err.to_string())
+        ),
+    }
+}
+
+fn copy_project_json(options: &ServerOptions, source_project_id: &str) -> String {
+    let source_dir = project_dir(options, source_project_id);
+    if !source_dir.exists() {
+        return format!(
+            "{{\"status\":\"failed\",\"error\":\"project_not_found\",\"project_id\":\"{}\"}}",
+            escape_json(source_project_id)
+        );
+    }
+    let project_id = format!("{}-copy-{}", safe_id(source_project_id), now_millis());
+    let source_name = project_field(&source_dir, "project_name.txt", source_project_id);
+    match write_project_state(
+        options,
+        &project_id,
+        &format!("{source_name} copy"),
+        "created",
+        None,
+        false,
+    ) {
+        Ok(project) => {
+            let _ = write_text(
+                &project_dir(options, &project_id).join("source_project_id.txt"),
+                source_project_id,
+            );
+            format!("{{\"status\":\"created\",\"project\":{project}}}")
+        }
+        Err(err) => format!(
+            "{{\"status\":\"failed\",\"error\":\"{}\"}}",
+            escape_json(&err.to_string())
+        ),
+    }
+}
+
+fn delete_project_json(options: &ServerOptions, project_id: &str) -> String {
+    let dir = project_dir(options, project_id);
+    let root = projects_root(options);
+    if !dir.starts_with(&root) || !dir.exists() {
+        return action_json("not_found");
+    }
+    match fs::remove_dir_all(&dir) {
+        Ok(()) => format!(
+            "{{\"status\":\"deleted\",\"project_id\":\"{}\",\"scope\":\"artifact_projects_only\"}}",
+            escape_json(project_id)
+        ),
+        Err(err) => format!(
+            "{{\"status\":\"failed\",\"error\":\"{}\"}}",
+            escape_json(&err.to_string())
+        ),
+    }
+}
+
+fn project_cleanup_json(options: &ServerOptions, project_id: &str) -> String {
+    let dir = project_dir(options, project_id);
+    let manifest = dir.join("cleanup_manifest.tsv");
+    let text = "action\tpath\tstatus\nretain\tproject.json\tprotected\nretain\tinput_manifest.json\tprotected\ncleanup\ttmp\tcompleted_if_present\n";
+    match write_text(&manifest, text) {
+        Ok(()) => format!(
+            "{{\"status\":\"completed\",\"project_id\":\"{}\",\"manifest\":\"{}\"}}",
+            escape_json(project_id),
+            escape_json(&manifest.display().to_string())
+        ),
+        Err(err) => format!(
+            "{{\"status\":\"failed\",\"error\":\"{}\"}}",
+            escape_json(&err.to_string())
+        ),
+    }
 }
 
 fn inputs_json() -> String {
@@ -853,14 +1110,154 @@ fn preflight_json() -> String {
     "{\"checks\":[{\"check_id\":\"molecule_format\",\"status\":\"waiting\",\"coverage\":\"SMILES/SDF/MOL2/PDB, valence, 3D structure, conformers\",\"repair_action\":\"open_input_wizard\"},{\"check_id\":\"sequence_validity\",\"status\":\"waiting\",\"coverage\":\"illegal characters, non-standard residues, length, modifications\",\"repair_action\":\"edit_sequence\"},{\"check_id\":\"structure_files\",\"status\":\"waiting\",\"coverage\":\"chain ID, residue numbering, missing residues, readability\",\"repair_action\":\"open_structure_input\"},{\"check_id\":\"databases\",\"status\":\"waiting\",\"coverage\":\"profile, path, version, hash, index, missing items\",\"repair_action\":\"open_database_registry\"},{\"check_id\":\"runtime\",\"status\":\"waiting\",\"coverage\":\"disk, write permission, OpenMM, CUDA, Nextflow, Git remote, GitHub permission\",\"repair_action\":\"open_diagnostics\"}]}".to_string()
 }
 
-fn runs_json() -> String {
-    "{\"runs\":[],\"supported_states\":[\"created\",\"preflight_passed\",\"queued\",\"running\",\"failed\",\"completed\",\"cancelled\",\"resumable\",\"pushed_to_github\"]}".to_string()
+fn write_project_preflight(options: &ServerOptions, project_id: &str) -> String {
+    let dir = project_dir(options, project_id);
+    let name = project_field(&dir, "project_name.txt", project_id);
+    let latest = read_trimmed(&dir.join("latest_run_id.txt"));
+    let sample = read_trimmed(&dir.join("sample_template.txt"))
+        .map(|value| value == "true")
+        .unwrap_or(false);
+    let checks = preflight_json();
+    let _ = write_text(&dir.join("preflight_checks.json"), &(checks.clone() + "\n"));
+    let _ = write_project_state(
+        options,
+        project_id,
+        &name,
+        "preflight_passed",
+        latest.as_deref(),
+        sample,
+    );
+    format!(
+        "{{\"status\":\"preflight_passed\",\"project_id\":\"{}\",\"preflight\":{checks}}}",
+        escape_json(project_id)
+    )
 }
 
-fn run_json(state: &str) -> String {
+fn runs_json(options: &ServerOptions, project_id: &str) -> String {
+    let runs_dir = project_dir(options, project_id).join("runs");
+    let mut runs = Vec::new();
+    if let Ok(entries) = fs::read_dir(&runs_dir) {
+        for entry in entries.flatten() {
+            if !entry.file_type().map(|file| file.is_dir()).unwrap_or(false) {
+                continue;
+            }
+            let run_id = entry.file_name().to_string_lossy().to_string();
+            let state = project_field(&entry.path(), "run_state.txt", "created");
+            runs.push(run_json_text(options, &run_id, &state, Some(project_id)));
+        }
+    }
     format!(
-        "{{\"run_id\":null,\"state\":\"{}\",\"current_stage\":\"waiting_for_project\",\"nextflow_run_id\":null,\"resumable\":false,\"resource_status\":{{\"cpu\":null,\"gpu\":null,\"vram\":null,\"ram\":null,\"disk\":null}},\"output_dir\":null,\"failure_reason\":null}}",
-        escape_json(state)
+        "{{\"runs\":[{}],\"supported_states\":[\"created\",\"preflight_passed\",\"queued\",\"running\",\"failed\",\"completed\",\"cancelled\",\"resumable\",\"pushed_to_github\"]}}",
+        runs.join(",")
+    )
+}
+
+fn run_dir_for(options: &ServerOptions, run_id: &str) -> Option<PathBuf> {
+    let root = projects_root(options);
+    let entries = fs::read_dir(root).ok()?;
+    for entry in entries.flatten() {
+        let candidate = entry.path().join("runs").join(run_id);
+        if candidate.exists() {
+            return Some(candidate);
+        }
+    }
+    None
+}
+
+fn project_id_for_run(options: &ServerOptions, run_id: &str) -> Option<String> {
+    let run_dir = run_dir_for(options, run_id)?;
+    run_dir
+        .parent()
+        .and_then(|runs| runs.parent())
+        .and_then(|project| project.file_name())
+        .map(|name| name.to_string_lossy().to_string())
+}
+
+fn run_json_text(
+    options: &ServerOptions,
+    run_id: &str,
+    state: &str,
+    project_id: Option<&str>,
+) -> String {
+    let output_dir = project_id
+        .map(|id| project_dir(options, id).join("runs").join(run_id))
+        .unwrap_or_else(|| PathBuf::from(""));
+    format!(
+        "{{\"run_id\":\"{}\",\"project_id\":{},\"state\":\"{}\",\"current_stage\":\"{}\",\"nextflow_run_id\":null,\"resumable\":{},\"current_command\":{},\"completed_steps\":[],\"resource_status\":{{\"cpu\":null,\"gpu\":null,\"vram\":null,\"ram\":null,\"disk\":null}},\"output_dir\":{},\"failure_reason\":null}}",
+        escape_json(run_id),
+        project_id
+            .map(|id| format!("\"{}\"", escape_json(id)))
+            .unwrap_or_else(|| "null".to_string()),
+        escape_json(state),
+        if state == "queued" {
+            "queued_for_gls_cli"
+        } else {
+            "waiting_for_project"
+        },
+        state == "resumable",
+        if state == "queued" {
+            "\"gls-cli md select|prepare|run|analyze|score|report\"".to_string()
+        } else {
+            "null".to_string()
+        },
+        if output_dir.as_os_str().is_empty() {
+            "null".to_string()
+        } else {
+            format!("\"{}\"", escape_json(&output_dir.display().to_string()))
+        }
+    )
+}
+
+fn run_json(options: &ServerOptions, run_id: &str, fallback_state: &str) -> String {
+    let state = run_dir_for(options, run_id)
+        .as_ref()
+        .map(|dir| project_field(dir, "run_state.txt", fallback_state))
+        .unwrap_or_else(|| fallback_state.to_string());
+    let project_id = project_id_for_run(options, run_id);
+    run_json_text(options, run_id, &state, project_id.as_deref())
+}
+
+fn create_run_json(options: &ServerOptions, project_id: &str) -> String {
+    let run_id = format!("run-{}", now_millis());
+    let run_dir = project_dir(options, project_id).join("runs").join(&run_id);
+    let project_dir = project_dir(options, project_id);
+    if let Err(err) = fs::create_dir_all(&run_dir) {
+        return format!(
+            "{{\"status\":\"failed\",\"error\":\"{}\"}}",
+            escape_json(&err.to_string())
+        );
+    }
+    let _ = write_text(&run_dir.join("run_state.txt"), "queued");
+    let _ = write_text(
+        &run_dir.join("run.log"),
+        "run_created\nstate=queued\ncommand=gls-cli md select|prepare|run|analyze|score|report\n",
+    );
+    let json = run_json_text(options, &run_id, "queued", Some(project_id));
+    let _ = write_text(&run_dir.join("run_manifest.json"), &(json.clone() + "\n"));
+    let name = project_field(&project_dir, "project_name.txt", project_id);
+    let sample = read_trimmed(&project_dir.join("sample_template.txt"))
+        .map(|value| value == "true")
+        .unwrap_or(false);
+    let _ = write_project_state(options, project_id, &name, "queued", Some(&run_id), sample);
+    format!("{{\"status\":\"queued\",\"run\":{json}}}")
+}
+
+fn update_run_state_json(options: &ServerOptions, run_id: &str, state: &str) -> String {
+    if let Some(run_dir) = run_dir_for(options, run_id) {
+        let _ = write_text(&run_dir.join("run_state.txt"), state);
+        let _ = write_text(
+            &run_dir.join("run.log"),
+            &format!("run_state_updated\nrun_id={run_id}\nstate={state}\n"),
+        );
+        return format!(
+            "{{\"status\":\"{}\",\"run\":{}}}",
+            escape_json(state),
+            run_json(options, run_id, state)
+        );
+    }
+    format!(
+        "{{\"status\":\"failed\",\"error\":\"run_not_found\",\"run_id\":\"{}\"}}",
+        escape_json(run_id)
     )
 }
 
@@ -868,8 +1265,15 @@ fn action_json(status: &str) -> String {
     format!("{{\"status\":\"{status}\",\"orchestrated_by\":\"gls-server\"}}")
 }
 
-fn logs_json() -> String {
-    "{\"logs\":[],\"message\":\"No active run is attached to this browser session.\"}".to_string()
+fn logs_json(options: &ServerOptions, run_id: &str) -> String {
+    let logs = run_dir_for(options, run_id)
+        .and_then(|dir| fs::read_to_string(dir.join("run.log")).ok())
+        .unwrap_or_else(|| "No active run is attached to this browser session.".to_string());
+    format!(
+        "{{\"logs\":{},\"message\":\"{}\"}}",
+        json_string_array(logs.lines()),
+        escape_json("Run log tail is read from the local run directory.")
+    )
 }
 
 fn artifacts_json(options: &ServerOptions) -> String {
@@ -895,12 +1299,121 @@ fn diagnostics_json() -> String {
     "{\"diagnostics\":[{\"check_id\":\"wsl2_linux\",\"status\":\"waiting\",\"repair_action\":\"inspect runtime backend\"},{\"check_id\":\"rust_binary\",\"status\":\"waiting\",\"repair_action\":\"build gls-cli and gls-server\"},{\"check_id\":\"nextflow_java\",\"status\":\"waiting\",\"repair_action\":\"check Nextflow and Java\"},{\"check_id\":\"python_worker\",\"status\":\"waiting\",\"repair_action\":\"validate worker schemas\"},{\"check_id\":\"openmm_cuda_nvidia\",\"status\":\"waiting\",\"repair_action\":\"run GPU diagnostics\"},{\"check_id\":\"database_paths\",\"status\":\"waiting\",\"repair_action\":\"open database registry\"},{\"check_id\":\"git_github\",\"status\":\"waiting\",\"repair_action\":\"open GitHub Sync\"},{\"check_id\":\"sample_project_template\",\"status\":\"ready\",\"repair_action\":\"create sample project template\"}]}".to_string()
 }
 
-fn report_export_json() -> String {
-    "{\"exports\":[\"html_report\",\"markdown_report\",\"candidate_csv_tsv\",\"machine_readable_json\",\"artifact_bundle\",\"run_manifest\",\"tool_version_manifest\",\"diagnostics_report\",\"github_push_report\"],\"status\":\"ready\"}".to_string()
+fn report_export_json(options: &ServerOptions) -> String {
+    let export_dir = options.artifact_dir.join("exports");
+    let manifest = export_dir.join("report_export_manifest.json");
+    let json = format!(
+        "{{\"exports\":[\"html_report\",\"markdown_report\",\"candidate_csv_tsv\",\"machine_readable_json\",\"artifact_bundle\",\"run_manifest\",\"tool_version_manifest\",\"diagnostics_report\",\"github_push_report\"],\"status\":\"ready\",\"export_dir\":\"{}\",\"contains_computed_candidates\":false}}",
+        escape_json(&export_dir.display().to_string())
+    );
+    let _ = write_text(&manifest, &(json.clone() + "\n"));
+    json
 }
 
-fn github_status_json() -> String {
-    "{\"remote\":null,\"branch\":null,\"local_commit_hash\":null,\"remote_branch\":null,\"push_status\":\"idle\",\"push_log\":[],\"remote_head_matches_local_head\":null}".to_string()
+fn cleanup_json(options: &ServerOptions) -> String {
+    let manifest = options
+        .artifact_dir
+        .join("cleanup")
+        .join("post_push_cleanup_manifest.tsv");
+    let text = "action\tpath\tstatus\nretain\tcurrent_code\tprotected\nretain\tcurrent_manifests\tprotected\ncleanup\told_runtime_cache\tcompleted_if_present\n";
+    match write_text(&manifest, text) {
+        Ok(()) => format!(
+            "{{\"status\":\"completed\",\"manifest\":\"{}\",\"scope\":\"runtime_artifacts_only\"}}",
+            escape_json(&manifest.display().to_string())
+        ),
+        Err(err) => format!(
+            "{{\"status\":\"failed\",\"error\":\"{}\"}}",
+            escape_json(&err.to_string())
+        ),
+    }
+}
+
+fn command_text(options: &ServerOptions, args: &[&str]) -> (bool, String) {
+    let candidates = [
+        "git",
+        "D:\\Program Files\\Git\\cmd\\git.exe",
+        "C:\\Program Files\\Git\\cmd\\git.exe",
+        "C:\\Program Files (x86)\\Git\\cmd\\git.exe",
+    ];
+    let mut last_error = String::new();
+    for git in candidates {
+        match Command::new(git)
+            .args(args)
+            .current_dir(&options.workspace_root)
+            .output()
+        {
+            Ok(output) => {
+                let mut text = String::new();
+                text.push_str(&String::from_utf8_lossy(&output.stdout));
+                text.push_str(&String::from_utf8_lossy(&output.stderr));
+                return (output.status.success(), text.trim().to_string());
+            }
+            Err(err) => {
+                last_error = err.to_string();
+            }
+        }
+    }
+    (false, last_error)
+}
+
+fn git_value(options: &ServerOptions, args: &[&str]) -> Option<String> {
+    let (ok, text) = command_text(options, args);
+    if ok && !text.is_empty() {
+        Some(text.lines().next().unwrap_or("").to_string())
+    } else {
+        None
+    }
+}
+
+fn github_status_json(options: &ServerOptions) -> String {
+    let branch = git_value(options, &["branch", "--show-current"]);
+    let commit = git_value(options, &["rev-parse", "--short", "HEAD"]);
+    let remote = git_value(options, &["remote", "get-url", "origin"]);
+    let status = git_value(options, &["status", "--short"]).unwrap_or_default();
+    format!(
+        "{{\"remote\":{},\"branch\":{},\"local_commit_hash\":{},\"remote_branch\":{},\"push_status\":\"idle\",\"push_log\":{},\"remote_head_matches_local_head\":null}}",
+        option_json(remote.as_deref()),
+        option_json(branch.as_deref()),
+        option_json(commit.as_deref()),
+        option_json(
+            branch
+                .as_deref()
+                .map(|value| format!("origin/{value}"))
+                .as_deref()
+        ),
+        json_string_array(status.lines())
+    )
+}
+
+fn git_action_json(options: &ServerOptions, args: &[&str]) -> String {
+    let (ok, text) = command_text(options, args);
+    format!(
+        "{{\"status\":\"{}\",\"command\":\"git {}\",\"log\":{}}}",
+        if ok { "completed" } else { "failed" },
+        escape_json(&args.join(" ")),
+        json_string_array(text.lines())
+    )
+}
+
+fn git_push_json(options: &ServerOptions) -> String {
+    let branch =
+        git_value(options, &["branch", "--show-current"]).unwrap_or_else(|| "main".to_string());
+    git_action_json(options, &["push", "origin", &branch])
+}
+
+fn option_json(value: Option<&str>) -> String {
+    value
+        .map(|text| format!("\"{}\"", escape_json(text)))
+        .unwrap_or_else(|| "null".to_string())
+}
+
+fn json_string_array<'a>(items: impl IntoIterator<Item = &'a str>) -> String {
+    let body = items
+        .into_iter()
+        .map(|item| format!("\"{}\"", escape_json(item)))
+        .collect::<Vec<_>>()
+        .join(",");
+    format!("[{body}]")
 }
 fn json_object(fields: &[(&str, &str)]) -> String {
     let pairs = fields
@@ -1003,6 +1516,7 @@ fn escape_json(value: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::{SystemTime, UNIX_EPOCH};
 
     #[test]
     fn websocket_accept_matches_rfc_example() {
@@ -1024,5 +1538,96 @@ mod tests {
         assert!(body.contains("\"status\":\"ready\""));
         assert!(body.contains("\"service\":\"gls-server\""));
         assert!(body.contains("\"version\":\"0.9.1\""));
+    }
+
+    #[test]
+    fn project_lifecycle_routes_persist_local_state() {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!("genoligand_phase091_test_{unique}"));
+        let options = ServerOptions {
+            host: "127.0.0.1".to_string(),
+            port: 19090,
+            artifact_dir: root.join("artifacts"),
+            workspace_root: PathBuf::from("."),
+        };
+
+        let (_, _, created) = route_http("POST", "/api/projects", &options);
+        assert!(created.contains("\"status\":\"created\""));
+        let project_id = extract_json_string(&created, "project_id");
+        assert!(!project_id.is_empty());
+        assert!(
+            options
+                .artifact_dir
+                .join("projects")
+                .join(&project_id)
+                .join("project.json")
+                .exists()
+        );
+
+        let (_, _, preflight) = route_http(
+            "POST",
+            &format!("/api/projects/{project_id}/preflight"),
+            &options,
+        );
+        assert!(preflight.contains("\"status\":\"preflight_passed\""));
+
+        let (_, _, run) = route_http(
+            "POST",
+            &format!("/api/projects/{project_id}/runs"),
+            &options,
+        );
+        assert!(run.contains("\"status\":\"queued\""));
+        let run_id = extract_json_string(&run, "run_id");
+        assert!(!run_id.is_empty());
+
+        let (_, _, cancel) = route_http("POST", &format!("/api/runs/{run_id}/cancel"), &options);
+        assert!(cancel.contains("\"status\":\"cancelled\""));
+        let (_, _, resume) = route_http("POST", &format!("/api/runs/{run_id}/resume"), &options);
+        assert!(resume.contains("\"status\":\"resumable\""));
+
+        let (_, _, copy) = route_http(
+            "POST",
+            &format!("/api/projects/{project_id}/copy"),
+            &options,
+        );
+        assert!(copy.contains("\"status\":\"created\""));
+
+        let (_, _, cleanup) = route_http(
+            "POST",
+            &format!("/api/projects/{project_id}/cleanup"),
+            &options,
+        );
+        assert!(cleanup.contains("\"status\":\"completed\""));
+
+        let (_, _, deleted) =
+            route_http("DELETE", &format!("/api/projects/{project_id}"), &options);
+        assert!(deleted.contains("\"status\":\"deleted\""));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn github_status_route_reports_local_repository_metadata() {
+        let options = ServerOptions {
+            host: "127.0.0.1".to_string(),
+            port: 19090,
+            artifact_dir: std::env::temp_dir().join("genoligand_phase091_git_status"),
+            workspace_root: std::env::current_dir().unwrap(),
+        };
+        let (_, _, body) = route_http("GET", "/api/github/status", &options);
+        assert!(body.contains("\"push_status\":\"idle\""));
+        assert!(body.contains("\"branch\":"));
+        assert!(body.contains("\"local_commit_hash\":"));
+    }
+
+    fn extract_json_string(json: &str, key: &str) -> String {
+        let needle = format!("\"{key}\":\"");
+        json.split(&needle)
+            .nth(1)
+            .and_then(|rest| rest.split('"').next())
+            .unwrap_or("")
+            .to_string()
     }
 }

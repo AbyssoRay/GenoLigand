@@ -215,6 +215,13 @@ const candidateHeaders = [
 let appState = {
   lang: readSavedLanguage(),
   server: { state: "idle", version: APP_VERSION },
+  projects: [],
+  selectedProject: null,
+  selectedRun: null,
+  message: null,
+  diagnostics: null,
+  github: null,
+  exports: null,
 };
 
 function pick(value) {
@@ -287,8 +294,40 @@ function optionTiles(items) {
 
 function buttonRow(items) {
   return `<div class="button-row">${items
-    .map(([label, variant, href]) => (href ? `<a class="button ${variant || ""}" href="${href}">${pick(label)}</a>` : `<button class="${variant || ""}" type="button">${pick(label)}</button>`))
+    .map(([label, variant, href]) => {
+      const action = inferAction(label);
+      return href
+        ? `<a class="button ${variant || ""}" href="${href}">${pick(label)}</a>`
+        : `<button class="${variant || ""}" type="button" ${action ? `data-action="${action}"` : ""}>${pick(label)}</button>`;
+    })
     .join("")}</div>`;
+}
+
+function inferAction(label) {
+  const key = Array.isArray(label) ? label[1] : label;
+  const actions = {
+    "Create project": "create-project",
+    "Create sample project template": "create-sample-project",
+    "Save configuration": "save-configuration",
+    "Open project": "open-project",
+    "Copy project": "copy-project",
+    "Delete project": "delete-project",
+    "Clean project": "clean-project",
+    "Resume last run": "resume-last-run",
+    "Run diagnostics": "run-diagnostics",
+    "Run preflight": "run-preflight",
+    "Start workflow": "start-workflow",
+    "Submit run": "submit-run",
+    "Cancel run": "cancel-run",
+    "Resume interrupted run": "resume-run",
+    "Export candidate table": "export-report",
+    "git status": "git-status",
+    "git add": "git-add",
+    "git commit": "git-commit",
+    "git push": "git-push",
+    "Verify remote HEAD": "git-verify",
+  };
+  return actions[key] || "";
 }
 
 function wizardRail(activeId) {
@@ -343,8 +382,33 @@ function dashboard() {
   ].join("");
 }
 
+function projectRows() {
+  return appState.projects.map((project) => [
+    project.project_id || "",
+    project.project_name || "",
+    project.project_status || "",
+    project.latest_run_id || "",
+    (project.report_paths || []).join(", "),
+  ]);
+}
+
+function projectListCard() {
+  return card(
+    [["本地项目", "Local Projects"]],
+    dataTable(
+      [[["项目 ID", "Project ID"], ["名称", "Name"], ["状态", "State"], ["最近运行", "Latest run"], ["报告路径", "Report paths"]].map((x) => x)][0],
+      projectRows(),
+      [["尚无本地项目。点击创建项目后会写入本地项目 manifest。", "No local project yet. Creating a project writes a local project manifest."]]
+    ) +
+      (appState.selectedProject
+        ? `<p class="mono">${pick(["当前项目", "Selected project"])}: ${appState.selectedProject.project_id}</p>`
+        : "")
+  );
+}
+
 function projectPage() {
   return [
+    projectListCard(),
     card(
       [["项目生命周期", "Project Lifecycle"]],
       formGrid([
@@ -460,7 +524,7 @@ function wizardPage(id) {
         [["运行模式", "Run mode"], [["快速环境自检", "Quick environment check"], ["Quick environment check", "Quick environment check"]][appState.lang === "zh" ? 0 : 1], "configured"],
         [["提交状态", "Submit state"], [["尚未提交", "Not submitted"], ["Not submitted", "Not submitted"]][appState.lang === "zh" ? 0 : 1], "idle"],
       ])),
-      buttonRow([[[ "保存配置", "Save configuration" ], "", null], [[ "执行预检查", "Run preflight" ], "", "#/input_wizard_preflight_page"], [[ "启动任务", "Start workflow" ], "primary", "#/run_monitor_page"]]),
+      buttonRow([[[ "保存配置", "Save configuration" ], "", null], [[ "执行预检查", "Run preflight" ], "", null], [[ "启动任务", "Start workflow" ], "primary", null]]),
     ].join(""),
   }[id];
   return `<div class="wizard-layout">${wizardRail(id)}<section class="wizard-card">${body}</section></div>`;
@@ -767,18 +831,27 @@ function renderNav(activeId) {
 }
 
 function renderRuntime() {
+  const state = appState.selectedRun?.state || "idle";
   const steps = [
-    [["项目", "Project"], "idle"],
-    [["预检查", "Preflight"], "waiting"],
-    [["运行", "Run"], "waiting"],
-    [["结果", "Results"], "waiting"],
-    [["同步", "Sync"], "optional"],
+    [["项目", "Project"], appState.selectedProject ? "ready" : "idle"],
+    [["预检查", "Preflight"], appState.selectedProject?.project_status === "preflight_passed" ? "ready" : "waiting"],
+    [["运行", "Run"], state],
+    [["结果", "Results"], state === "completed" ? "ready" : "waiting"],
+    [["同步", "Sync"], state === "pushed_to_github" ? "pushed_to_github" : "optional"],
   ];
   document.querySelector("[data-runtime-timeline]").innerHTML = steps
     .map(([label, status], index) => `<div class="timeline-item"><span>0${index}</span><strong>${pick(label)}</strong>${statusPill(status)}</div>`)
     .join("");
   document.querySelector("[data-runtime-log]").textContent =
-    appState.lang === "zh"
+    appState.selectedRun
+      ? [
+          `run_id=${appState.selectedRun.run_id}`,
+          `state=${appState.selectedRun.state}`,
+          `stage=${appState.selectedRun.current_stage}`,
+          `command=${appState.selectedRun.current_command || "not_started"}`,
+          `output_dir=${appState.selectedRun.output_dir || "not_created"}`,
+        ].join("\n")
+      : appState.lang === "zh"
       ? "GenoLigand 0.9.1 本地工作台已就绪。\n当前浏览器会话没有绑定运行。\n请创建或打开项目，完成预检查后启动任务。"
       : "GenoLigand 0.9.1 local console is ready.\nNo active run is attached to this browser session.\nCreate or open a project, complete preflight, then start a workflow.";
 }
@@ -805,6 +878,13 @@ function renderDetail(activeId) {
   `;
 }
 
+function actionBanner() {
+  if (!appState.message) {
+    return "";
+  }
+  return `<div class="state-block ${appState.message.kind || ""}"><h3>${pick(["操作状态", "Action State"])}</h3><p>${appState.message.text}</p></div>`;
+}
+
 function applyStaticText() {
   document.querySelectorAll("[data-i18n]").forEach((node) => {
     node.textContent = t(node.dataset.i18n);
@@ -827,9 +907,137 @@ function render() {
   document.querySelector("[data-page-title]").textContent = pick(title);
   document.querySelector("[data-page-description]").textContent = pick(desc);
   setStatusNode(document.querySelector("[data-page-status]"), activeId === "run_monitor_page" ? "idle" : "ready");
-  document.querySelector("[data-main]").innerHTML = renderPage(activeId);
+  document.querySelector("[data-main]").innerHTML = `${actionBanner()}${renderPage(activeId)}`;
   renderDetail(activeId);
   renderRuntime();
+}
+
+async function apiRequest(path, options = {}) {
+  const response = await fetch(path, {
+    method: options.method || "GET",
+    cache: "no-store",
+    headers: { "Content-Type": "application/json" },
+  });
+  const payload = await response.json();
+  if (!response.ok) {
+    throw new Error(payload.error || `http_${response.status}`);
+  }
+  return payload;
+}
+
+function setMessage(kind, zh, en) {
+  appState.message = { kind, text: appState.lang === "zh" ? zh : en };
+}
+
+async function refreshProjects() {
+  const payload = await apiRequest("/api/projects");
+  appState.projects = payload.projects || [];
+  if (!appState.selectedProject && appState.projects.length) {
+    appState.selectedProject = appState.projects[0];
+  }
+  if (appState.selectedProject) {
+    const fresh = appState.projects.find((project) => project.project_id === appState.selectedProject.project_id);
+    if (fresh) {
+      appState.selectedProject = fresh;
+    }
+  }
+}
+
+function requireProject() {
+  if (!appState.selectedProject) {
+    throw new Error(appState.lang === "zh" ? "请先创建或打开项目。" : "Create or open a project first.");
+  }
+  return appState.selectedProject;
+}
+
+function requireRun() {
+  if (!appState.selectedRun) {
+    throw new Error(appState.lang === "zh" ? "当前没有可操作的运行。" : "No run is selected.");
+  }
+  return appState.selectedRun;
+}
+
+async function handleAction(action) {
+  try {
+    if (action === "create-project" || action === "create-sample-project") {
+      const path = action === "create-sample-project" ? "/api/projects/sample" : "/api/projects";
+      const payload = await apiRequest(path, { method: "POST" });
+      appState.selectedProject = payload.project || null;
+      await refreshProjects();
+      setMessage("", "项目已写入本地 manifest。", "Project manifest was written locally.");
+    } else if (action === "open-project") {
+      await refreshProjects();
+      setMessage("", "已刷新本地项目列表。", "Local project list refreshed.");
+    } else if (action === "copy-project") {
+      const project = requireProject();
+      const payload = await apiRequest(`/api/projects/${project.project_id}/copy`, { method: "POST" });
+      appState.selectedProject = payload.project || appState.selectedProject;
+      await refreshProjects();
+      setMessage("", "项目副本已创建。", "Project copy created.");
+    } else if (action === "delete-project") {
+      const project = requireProject();
+      await apiRequest(`/api/projects/${project.project_id}`, { method: "DELETE" });
+      appState.selectedProject = null;
+      appState.selectedRun = null;
+      await refreshProjects();
+      setMessage("warn", "项目已从本地 artifact 项目目录删除。", "Project was deleted from the local artifact project directory.");
+    } else if (action === "clean-project") {
+      const project = requireProject();
+      await apiRequest(`/api/projects/${project.project_id}/cleanup`, { method: "POST" });
+      setMessage("", "项目清理 manifest 已生成。", "Project cleanup manifest generated.");
+    } else if (action === "run-preflight") {
+      const project = requireProject();
+      await apiRequest(`/api/projects/${project.project_id}/preflight`, { method: "POST" });
+      await refreshProjects();
+      setMessage("", "预检查已写入项目状态。", "Preflight state was written to the project.");
+    } else if (action === "save-configuration") {
+      const project = appState.selectedProject || (await apiRequest("/api/projects", { method: "POST" })).project;
+      appState.selectedProject = project;
+      await refreshProjects();
+      setMessage("", "配置已保存到本地项目 manifest。", "Configuration saved to the local project manifest.");
+    } else if (action === "start-workflow" || action === "submit-run") {
+      const project = requireProject();
+      const payload = await apiRequest(`/api/projects/${project.project_id}/runs`, { method: "POST" });
+      appState.selectedRun = payload.run || null;
+      await refreshProjects();
+      window.location.hash = "#/run_monitor_page";
+      setMessage("", "运行已创建并排队，等待本地 gls-cli/Nextflow 执行。", "Run created and queued for local gls-cli/Nextflow execution.");
+    } else if (action === "cancel-run") {
+      const run = requireRun();
+      const payload = await apiRequest(`/api/runs/${run.run_id}/cancel`, { method: "POST" });
+      appState.selectedRun = payload.run || appState.selectedRun;
+      setMessage("warn", "运行已取消。", "Run cancelled.");
+    } else if (action === "resume-run" || action === "resume-last-run") {
+      const run = requireRun();
+      const payload = await apiRequest(`/api/runs/${run.run_id}/resume`, { method: "POST" });
+      appState.selectedRun = payload.run || appState.selectedRun;
+      setMessage("", "运行已标记为可恢复。", "Run marked as resumable.");
+    } else if (action === "run-diagnostics") {
+      appState.diagnostics = await apiRequest("/api/diagnostics/run", { method: "POST" });
+      setMessage("", "诊断结果已从本地服务读取。", "Diagnostics were read from the local service.");
+    } else if (action === "export-report") {
+      appState.exports = await apiRequest("/api/reports/export", { method: "POST" });
+      setMessage("", "导出 manifest 已生成。", "Export manifest generated.");
+    } else if (action === "git-status") {
+      appState.github = await apiRequest("/api/github/status");
+      setMessage("", "Git 状态已读取。", "Git status loaded.");
+    } else if (action === "git-add") {
+      appState.github = await apiRequest("/api/github/add", { method: "POST" });
+      setMessage("", "git add 已执行。", "git add completed.");
+    } else if (action === "git-commit") {
+      appState.github = await apiRequest("/api/github/commit", { method: "POST" });
+      setMessage("", "git commit 已执行或返回当前状态。", "git commit completed or returned the current state.");
+    } else if (action === "git-push") {
+      appState.github = await apiRequest("/api/github/push", { method: "POST" });
+      setMessage("", "git push 已执行并记录日志。", "git push completed and logged.");
+    } else if (action === "git-verify") {
+      appState.github = await apiRequest("/api/github/verify", { method: "POST" });
+      setMessage("", "远端状态已读取。", "Remote state loaded.");
+    }
+  } catch (error) {
+    setMessage("error", error.message, error.message);
+  }
+  render();
 }
 
 async function hydrateServerState() {
@@ -845,6 +1053,7 @@ async function hydrateServerState() {
       const version = await versionResponse.json();
       appState.server.version = version.version || APP_VERSION;
     }
+    await refreshProjects();
   } catch (error) {
     appState.server.state = "failed";
   }
@@ -859,6 +1068,11 @@ function bindEvents() {
       appState.lang = appState.lang === "zh" ? "en" : "zh";
       saveLanguage(appState.lang);
       render();
+      return;
+    }
+    const actionButton = event.target.closest("[data-action]");
+    if (actionButton) {
+      handleAction(actionButton.dataset.action);
       return;
     }
     const peptide = event.target.closest("[data-insert-peptide]");

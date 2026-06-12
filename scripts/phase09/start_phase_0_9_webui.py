@@ -6,6 +6,7 @@ import sys
 import time
 import urllib.request
 import webbrowser
+import os
 from pathlib import Path
 
 
@@ -44,7 +45,10 @@ def main() -> int:
         "--workspace-root",
         str(ROOT),
     ]
-    process = subprocess.Popen(command, cwd=ROOT, stdout=stdout, stderr=stderr)
+    env = dict(os.environ)
+    if "Path" in env and "PATH" in env:
+        env.pop("PATH", None)
+    process = subprocess.Popen(command, cwd=ROOT, stdout=stdout, stderr=stderr, env=env)
     url = f"http://{args.host}:{args.port}/"
     try:
         wait_for_health(args.host, args.port, process)
