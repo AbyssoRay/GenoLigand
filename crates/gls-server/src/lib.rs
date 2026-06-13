@@ -2298,6 +2298,7 @@ fn run_artifact_index_json(run_dir: &Path) -> String {
     let mut artifacts = BTreeMap::new();
     for (artifact_type, path) in [
         ("run_manifest", run_dir.join("run_manifest.json")),
+        ("run_launch_plan", run_dir.join("run_launch_plan.json")),
         ("run_log", run_dir.join("run.log")),
         ("resource_status", run_dir.join("resource_status.json")),
         ("artifact_index", run_dir.join("artifact_index.json")),
@@ -2482,6 +2483,42 @@ fn configured_webui_run_command(
     }
 }
 
+fn run_command_text(command: Option<&[String]>) -> String {
+    command.map(|parts| parts.join(" ")).unwrap_or_else(|| {
+        "production_run_command_not_configured_set_GENOLIGAND_WEBUI_RUN_COMMAND".to_string()
+    })
+}
+
+fn write_run_launch_plan(
+    options: &ServerOptions,
+    project_id: &str,
+    run_id: &str,
+    run_dir: &Path,
+    nextflow_run_id: &str,
+    command: Option<&[String]>,
+) {
+    let command_json = command
+        .map(|parts| json_string_array(parts.iter().map(String::as_str)))
+        .unwrap_or_else(|| "[]".to_string());
+    let status = if command.is_some() {
+        "configured"
+    } else {
+        "not_configured"
+    };
+    let launch_plan = format!(
+        "{{\"schema\":\"genoligand.webui.run_launch_plan.v0.9.1\",\"status\":\"{}\",\"project_id\":\"{}\",\"run_id\":\"{}\",\"run_dir\":\"{}\",\"nextflow_run_id\":\"{}\",\"execution_boundary\":\"gls-server launches configured local scientific command\",\"configuration_env\":\"GENOLIGAND_WEBUI_RUN_COMMAND\",\"resolved_command_text\":\"{}\",\"resolved_command_parts\":{},\"workspace_root\":\"{}\"}}",
+        status,
+        escape_json(project_id),
+        escape_json(run_id),
+        escape_json(&run_dir.display().to_string()),
+        escape_json(nextflow_run_id),
+        escape_json(&run_command_text(command)),
+        command_json,
+        escape_json(&options.workspace_root.display().to_string())
+    );
+    let _ = write_text(&run_dir.join("run_launch_plan.json"), &(launch_plan + "\n"));
+}
+
 fn execute_webui_run(
     options: &ServerOptions,
     project_id: &str,
@@ -2620,16 +2657,23 @@ fn create_run_json(options: &ServerOptions, project_id: &str) -> String {
         &run_dir.join("current_stage.txt"),
         "queued_for_production_command",
     );
-    let _ = write_text(
-        &run_dir.join("current_command.txt"),
-        "GENOLIGAND_WEBUI_RUN_COMMAND",
-    );
+    let configured_command = configured_webui_run_command(options, project_id, &run_dir);
+    let initial_command_text = run_command_text(configured_command.as_deref());
+    let _ = write_text(&run_dir.join("current_command.txt"), &initial_command_text);
     let _ = write_text(
         &run_dir.join("completed_steps.txt"),
         "project_loaded\ninput_manifest_loaded\npreflight_checked\nrun_manifest_written\n",
     );
     let nextflow_run_id = format!("nf-{}", now_millis());
     let _ = write_text(&run_dir.join("nextflow_run_id.txt"), &nextflow_run_id);
+    write_run_launch_plan(
+        options,
+        project_id,
+        &run_id,
+        &run_dir,
+        &nextflow_run_id,
+        configured_command.as_deref(),
+    );
     let resource_status = resource_status_json(options);
     let _ = write_text(
         &run_dir.join("resource_status.json"),
@@ -2643,7 +2687,7 @@ fn create_run_json(options: &ServerOptions, project_id: &str) -> String {
     let _ = write_text(
         &run_dir.join("run.log"),
         &format!(
-            "run_created\nrun_id={run_id}\nproject_id={project_id}\nstate=queued\nnextflow_run_id={nextflow_run_id}\ncommand=GENOLIGAND_WEBUI_RUN_COMMAND\ncompleted_steps=project_loaded,input_manifest_loaded,preflight_checked,run_manifest_written\n"
+            "run_created\nrun_id={run_id}\nproject_id={project_id}\nstate=queued\nnextflow_run_id={nextflow_run_id}\ncommand={initial_command_text}\ncompleted_steps=project_loaded,input_manifest_loaded,preflight_checked,run_manifest_written\n"
         ),
     );
     let initial_json = run_json_text(options, &run_id, "queued", Some(project_id));
@@ -4879,8 +4923,21 @@ mod tests {
                 .join("run_manifest.json"),
         )
         .unwrap();
-        assert!(run_manifest.contains("GENOLIGAND_WEBUI_RUN_COMMAND"));
         assert!(run_manifest.contains("artifact_index"));
+        let run_launch_plan = fs::read_to_string(
+            options
+                .artifact_dir
+                .join("projects")
+                .join(&project_id)
+                .join("runs")
+                .join(&run_id)
+                .join("run_launch_plan.json"),
+        )
+        .unwrap();
+        assert!(run_launch_plan.contains("genoligand.webui.run_launch_plan.v0.9.1"));
+        assert!(run_launch_plan.contains("\"status\":\"not_configured\""));
+        assert!(!run_manifest.contains("\"current_command\":\"GENOLIGAND_WEBUI_RUN_COMMAND\""));
+        assert!(!run_manifest.contains("command=GENOLIGAND_WEBUI_RUN_COMMAND"));
         let command_status = options
             .artifact_dir
             .join("projects")
@@ -4909,6 +4966,7 @@ mod tests {
             "",
         );
         assert!(artifacts.contains("\"artifact_type\":\"run_manifest\""));
+        assert!(artifacts.contains("\"artifact_type\":\"run_launch_plan\""));
         assert!(artifacts.contains("\"artifact_type\":\"run_log\""));
 
         let run_dir = options
