@@ -1780,6 +1780,14 @@ fn read_input_manifest(dir: &Path) -> Value {
         .unwrap_or_else(|| serde_json::json!({"inputs":[],"files":[]}))
 }
 
+fn project_run_profile(options: &ServerOptions, project_id: &str) -> String {
+    let manifest = read_input_manifest(&project_dir(options, project_id));
+    manifest_inputs(&manifest, &["run_profile", "Run profile", "运行模式"])
+        .into_iter()
+        .next()
+        .unwrap_or_else(|| "quick_environment_check".to_string())
+}
+
 fn build_preflight_checks(options: &ServerOptions, project_id: &str) -> (String, bool) {
     let dir = project_dir(options, project_id);
     let manifest = read_input_manifest(&dir);
@@ -2503,36 +2511,101 @@ fn gls_cli_program(options: &ServerOptions) -> String {
     "gls-cli".to_string()
 }
 
-fn default_webui_run_commands(options: &ServerOptions, run_dir: &Path) -> Vec<Vec<String>> {
-    let gls_cli = gls_cli_program(options);
+fn gls_cli_md_command(options: &ServerOptions, artifact_dir: &str, command: &str) -> Vec<String> {
+    vec![
+        gls_cli_program(options),
+        "md".to_string(),
+        command.to_string(),
+        "--artifact-dir".to_string(),
+        artifact_dir.to_string(),
+        "--workspace-root".to_string(),
+        options.workspace_root.display().to_string(),
+    ]
+}
+
+fn gls_cli_maintain_command(
+    options: &ServerOptions,
+    artifact_dir: &str,
+    command: &str,
+) -> Vec<String> {
+    vec![
+        gls_cli_program(options),
+        "maintain".to_string(),
+        command.to_string(),
+        "--artifact-dir".to_string(),
+        artifact_dir.to_string(),
+        "--workspace-root".to_string(),
+        options.workspace_root.display().to_string(),
+    ]
+}
+
+fn gls_cli_validate_phase085_command(options: &ServerOptions, artifact_dir: &str) -> Vec<String> {
+    vec![
+        gls_cli_program(options),
+        "validate".to_string(),
+        "phase-0-8-5".to_string(),
+        "--artifact-dir".to_string(),
+        artifact_dir.to_string(),
+        "--workspace-root".to_string(),
+        options.workspace_root.display().to_string(),
+    ]
+}
+
+fn normalized_run_profile(value: &str) -> &'static str {
+    let lower = value.to_ascii_lowercase();
+    if lower.contains("physical") || lower.contains("mid_screen") || lower.contains("full") {
+        "physical_mid_screen_full_run"
+    } else if lower.contains("structure") || lower.contains("enhanced") {
+        "structure_enhanced_screening"
+    } else if lower.contains("standard") || lower.contains("target") {
+        "standard_target_screening"
+    } else {
+        "quick_environment_check"
+    }
+}
+
+fn default_webui_run_commands(
+    options: &ServerOptions,
+    run_dir: &Path,
+    run_profile: &str,
+) -> Vec<Vec<String>> {
     let artifact_dir = run_dir.join("science_artifacts").display().to_string();
-    ["select", "prepare", "run", "analyze", "score", "report"]
-        .into_iter()
-        .map(|command| {
-            vec![
-                gls_cli.clone(),
-                "md".to_string(),
-                command.to_string(),
-                "--artifact-dir".to_string(),
-                artifact_dir.clone(),
-                "--workspace-root".to_string(),
-                options.workspace_root.display().to_string(),
-            ]
-        })
-        .collect()
+    match normalized_run_profile(run_profile) {
+        "quick_environment_check" => vec![
+            gls_cli_maintain_command(options, &artifact_dir, "inventory"),
+            gls_cli_validate_phase085_command(options, &artifact_dir),
+        ],
+        "standard_target_screening" => ["select", "score", "report"]
+            .into_iter()
+            .map(|command| gls_cli_md_command(options, &artifact_dir, command))
+            .collect(),
+        "structure_enhanced_screening" => ["select", "prepare", "analyze", "score", "report"]
+            .into_iter()
+            .map(|command| gls_cli_md_command(options, &artifact_dir, command))
+            .collect(),
+        _ => ["select", "prepare", "run", "analyze", "score", "report"]
+            .into_iter()
+            .map(|command| gls_cli_md_command(options, &artifact_dir, command))
+            .collect(),
+    }
 }
 
 fn webui_run_commands(
     options: &ServerOptions,
     project_id: &str,
     run_dir: &Path,
-) -> (String, Vec<Vec<String>>) {
+) -> (String, String, Vec<Vec<String>>) {
+    let run_profile = project_run_profile(options, project_id);
     if let Some(commands) = configured_webui_run_commands(options, project_id, run_dir) {
-        ("environment_override".to_string(), commands)
+        ("environment_override".to_string(), run_profile, commands)
     } else {
         (
-            "built_in_gls_cli_md_sequence".to_string(),
-            default_webui_run_commands(options, run_dir),
+            format!(
+                "built_in_gls_cli_sequence_for_{}",
+                normalized_run_profile(&run_profile)
+            ),
+            run_profile.clone(),
+            default_webui_run_commands(options, run_dir, &run_profile),
         )
     }
 }
@@ -2554,27 +2627,35 @@ fn command_sequence_json(commands: &[Vec<String>]) -> String {
     format!("[{body}]")
 }
 
-fn write_run_launch_plan(
-    options: &ServerOptions,
-    project_id: &str,
-    run_id: &str,
-    run_dir: &Path,
-    nextflow_run_id: &str,
-    command_source: &str,
-    commands: &[Vec<String>],
-) {
+struct RunLaunchPlan<'a> {
+    options: &'a ServerOptions,
+    project_id: &'a str,
+    run_id: &'a str,
+    run_dir: &'a Path,
+    nextflow_run_id: &'a str,
+    command_source: &'a str,
+    run_profile: &'a str,
+    commands: &'a [Vec<String>],
+}
+
+fn write_run_launch_plan(plan: &RunLaunchPlan<'_>) {
     let launch_plan = format!(
-        "{{\"schema\":\"genoligand.webui.run_launch_plan.v0.9.1\",\"status\":\"configured\",\"project_id\":\"{}\",\"run_id\":\"{}\",\"run_dir\":\"{}\",\"nextflow_run_id\":\"{}\",\"execution_boundary\":\"gls-server launches local scientific command sequence\",\"command_source\":\"{}\",\"configuration_env\":\"GENOLIGAND_WEBUI_RUN_COMMAND\",\"resolved_command_text\":\"{}\",\"resolved_command_sequence\":{},\"workspace_root\":\"{}\"}}",
-        escape_json(project_id),
-        escape_json(run_id),
-        escape_json(&run_dir.display().to_string()),
-        escape_json(nextflow_run_id),
-        escape_json(command_source),
-        escape_json(&run_command_text(commands)),
-        command_sequence_json(commands),
-        escape_json(&options.workspace_root.display().to_string())
+        "{{\"schema\":\"genoligand.webui.run_launch_plan.v0.9.1\",\"status\":\"configured\",\"project_id\":\"{}\",\"run_id\":\"{}\",\"run_dir\":\"{}\",\"nextflow_run_id\":\"{}\",\"run_profile\":\"{}\",\"normalized_run_profile\":\"{}\",\"execution_boundary\":\"gls-server launches local scientific command sequence\",\"command_source\":\"{}\",\"configuration_env\":\"GENOLIGAND_WEBUI_RUN_COMMAND\",\"resolved_command_text\":\"{}\",\"resolved_command_sequence\":{},\"workspace_root\":\"{}\"}}",
+        escape_json(plan.project_id),
+        escape_json(plan.run_id),
+        escape_json(&plan.run_dir.display().to_string()),
+        escape_json(plan.nextflow_run_id),
+        escape_json(plan.run_profile),
+        escape_json(normalized_run_profile(plan.run_profile)),
+        escape_json(plan.command_source),
+        escape_json(&run_command_text(plan.commands)),
+        command_sequence_json(plan.commands),
+        escape_json(&plan.options.workspace_root.display().to_string())
     );
-    let _ = write_text(&run_dir.join("run_launch_plan.json"), &(launch_plan + "\n"));
+    let _ = write_text(
+        &plan.run_dir.join("run_launch_plan.json"),
+        &(launch_plan + "\n"),
+    );
 }
 
 fn execute_webui_run(
@@ -2745,7 +2826,8 @@ fn create_run_json(options: &ServerOptions, project_id: &str) -> String {
         &run_dir.join("current_stage.txt"),
         "queued_for_production_command",
     );
-    let (command_source, command_sequence) = webui_run_commands(options, project_id, &run_dir);
+    let (command_source, run_profile, command_sequence) =
+        webui_run_commands(options, project_id, &run_dir);
     let initial_command_text = run_command_text(&command_sequence);
     let _ = write_text(&run_dir.join("current_command.txt"), &initial_command_text);
     let _ = write_text(
@@ -2754,15 +2836,16 @@ fn create_run_json(options: &ServerOptions, project_id: &str) -> String {
     );
     let nextflow_run_id = format!("nf-{}", now_millis());
     let _ = write_text(&run_dir.join("nextflow_run_id.txt"), &nextflow_run_id);
-    write_run_launch_plan(
+    write_run_launch_plan(&RunLaunchPlan {
         options,
         project_id,
-        &run_id,
-        &run_dir,
-        &nextflow_run_id,
-        &command_source,
-        &command_sequence,
-    );
+        run_id: &run_id,
+        run_dir: &run_dir,
+        nextflow_run_id: &nextflow_run_id,
+        command_source: &command_source,
+        run_profile: &run_profile,
+        commands: &command_sequence,
+    });
     let resource_status = resource_status_json(options);
     let _ = write_text(
         &run_dir.join("resource_status.json"),
@@ -4920,7 +5003,7 @@ mod tests {
             "POST",
             &format!("/api/projects/{project_id}/inputs"),
             &options,
-            "{\"inputs\":[{\"field\":\"project_name\",\"label\":\"Project name\",\"value\":\"Production Study\"},{\"field\":\"smiles\",\"label\":\"SMILES\",\"value\":\"CCO\"}],\"files\":[{\"field\":\"upload_structure_file\",\"name\":\"ligand.sdf\",\"size\":7,\"sha256\":\"9a0364b9e99bb480dd25e1f0284c8555\",\"content_base64\":\"bGlnYW5kCg==\"}],\"advanced_parameters_collapsed\":true,\"field_schema\":\"genoligand.webui.input_manifest.v0.9.1\"}",
+            "{\"inputs\":[{\"field\":\"project_name\",\"label\":\"Project name\",\"value\":\"Production Study\"},{\"field\":\"smiles\",\"label\":\"SMILES\",\"value\":\"CCO\"},{\"field\":\"run_profile\",\"label\":\"Run profile\",\"value\":\"physical_mid_screen_full_run\",\"control_type\":\"choice\"}],\"files\":[{\"field\":\"upload_structure_file\",\"name\":\"ligand.sdf\",\"size\":7,\"sha256\":\"9a0364b9e99bb480dd25e1f0284c8555\",\"content_base64\":\"bGlnYW5kCg==\"}],\"advanced_parameters_collapsed\":true,\"field_schema\":\"genoligand.webui.input_manifest.v0.9.1\"}",
         );
         assert!(input_saved.contains("\"status\":\"saved\""));
         assert!(input_saved.contains("\"persisted_files\":1"));
@@ -5025,7 +5108,13 @@ mod tests {
         .unwrap();
         assert!(run_launch_plan.contains("genoligand.webui.run_launch_plan.v0.9.1"));
         assert!(run_launch_plan.contains("\"status\":\"configured\""));
-        assert!(run_launch_plan.contains("\"command_source\":\"built_in_gls_cli_md_sequence\""));
+        assert!(run_launch_plan.contains("\"run_profile\":\"physical_mid_screen_full_run\""));
+        assert!(
+            run_launch_plan.contains("\"normalized_run_profile\":\"physical_mid_screen_full_run\"")
+        );
+        assert!(run_launch_plan.contains(
+            "\"command_source\":\"built_in_gls_cli_sequence_for_physical_mid_screen_full_run\""
+        ));
         assert!(run_launch_plan.contains("\"md\",\"select\""));
         assert!(run_launch_plan.contains("\"md\",\"report\""));
         let configured_command_env = "GENOLIGAND_WEBUI_RUN_COMMAND";
