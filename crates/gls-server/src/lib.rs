@@ -2459,11 +2459,11 @@ fn append_run_log(run_dir: &Path, text: &str) {
     let _ = write_text(&log_path, &format!("{existing}{text}"));
 }
 
-fn configured_webui_run_command(
+fn configured_webui_run_commands(
     options: &ServerOptions,
     project_id: &str,
     run_dir: &Path,
-) -> Option<Vec<String>> {
+) -> Option<Vec<Vec<String>>> {
     let raw = std::env::var("GENOLIGAND_WEBUI_RUN_COMMAND").ok()?;
     let command = raw
         .split_whitespace()
@@ -2479,14 +2479,79 @@ fn configured_webui_run_command(
     if command.is_empty() {
         None
     } else {
-        Some(command)
+        Some(vec![command])
     }
 }
 
-fn run_command_text(command: Option<&[String]>) -> String {
-    command.map(|parts| parts.join(" ")).unwrap_or_else(|| {
-        "production_run_command_not_configured_set_GENOLIGAND_WEBUI_RUN_COMMAND".to_string()
-    })
+fn gls_cli_program(options: &ServerOptions) -> String {
+    for candidate in [
+        options
+            .workspace_root
+            .join("target")
+            .join("debug")
+            .join("gls-cli.exe"),
+        options
+            .workspace_root
+            .join("target")
+            .join("debug")
+            .join("gls-cli"),
+    ] {
+        if candidate.exists() {
+            return candidate.display().to_string();
+        }
+    }
+    "gls-cli".to_string()
+}
+
+fn default_webui_run_commands(options: &ServerOptions, run_dir: &Path) -> Vec<Vec<String>> {
+    let gls_cli = gls_cli_program(options);
+    let artifact_dir = run_dir.join("science_artifacts").display().to_string();
+    ["select", "prepare", "run", "analyze", "score", "report"]
+        .into_iter()
+        .map(|command| {
+            vec![
+                gls_cli.clone(),
+                "md".to_string(),
+                command.to_string(),
+                "--artifact-dir".to_string(),
+                artifact_dir.clone(),
+                "--workspace-root".to_string(),
+                options.workspace_root.display().to_string(),
+            ]
+        })
+        .collect()
+}
+
+fn webui_run_commands(
+    options: &ServerOptions,
+    project_id: &str,
+    run_dir: &Path,
+) -> (String, Vec<Vec<String>>) {
+    if let Some(commands) = configured_webui_run_commands(options, project_id, run_dir) {
+        ("environment_override".to_string(), commands)
+    } else {
+        (
+            "built_in_gls_cli_md_sequence".to_string(),
+            default_webui_run_commands(options, run_dir),
+        )
+    }
+}
+
+fn run_command_text(commands: &[Vec<String>]) -> String {
+    commands
+        .iter()
+        .map(|parts| parts.join(" "))
+        .collect::<Vec<_>>()
+        .join(" ; ")
+}
+
+fn command_sequence_json(commands: &[Vec<String>]) -> String {
+    let body = commands
+        .iter()
+        .map(|parts| json_string_array(parts.iter().map(String::as_str)))
+        .collect::<Vec<_>>()
+        .join(",");
+    format!("[{body}]")
 }
 
 fn write_run_launch_plan(
@@ -2495,25 +2560,18 @@ fn write_run_launch_plan(
     run_id: &str,
     run_dir: &Path,
     nextflow_run_id: &str,
-    command: Option<&[String]>,
+    command_source: &str,
+    commands: &[Vec<String>],
 ) {
-    let command_json = command
-        .map(|parts| json_string_array(parts.iter().map(String::as_str)))
-        .unwrap_or_else(|| "[]".to_string());
-    let status = if command.is_some() {
-        "configured"
-    } else {
-        "not_configured"
-    };
     let launch_plan = format!(
-        "{{\"schema\":\"genoligand.webui.run_launch_plan.v0.9.1\",\"status\":\"{}\",\"project_id\":\"{}\",\"run_id\":\"{}\",\"run_dir\":\"{}\",\"nextflow_run_id\":\"{}\",\"execution_boundary\":\"gls-server launches configured local scientific command\",\"configuration_env\":\"GENOLIGAND_WEBUI_RUN_COMMAND\",\"resolved_command_text\":\"{}\",\"resolved_command_parts\":{},\"workspace_root\":\"{}\"}}",
-        status,
+        "{{\"schema\":\"genoligand.webui.run_launch_plan.v0.9.1\",\"status\":\"configured\",\"project_id\":\"{}\",\"run_id\":\"{}\",\"run_dir\":\"{}\",\"nextflow_run_id\":\"{}\",\"execution_boundary\":\"gls-server launches local scientific command sequence\",\"command_source\":\"{}\",\"configuration_env\":\"GENOLIGAND_WEBUI_RUN_COMMAND\",\"resolved_command_text\":\"{}\",\"resolved_command_sequence\":{},\"workspace_root\":\"{}\"}}",
         escape_json(project_id),
         escape_json(run_id),
         escape_json(&run_dir.display().to_string()),
         escape_json(nextflow_run_id),
-        escape_json(&run_command_text(command)),
-        command_json,
+        escape_json(command_source),
+        escape_json(&run_command_text(commands)),
+        command_sequence_json(commands),
         escape_json(&options.workspace_root.display().to_string())
     );
     let _ = write_text(&run_dir.join("run_launch_plan.json"), &(launch_plan + "\n"));
@@ -2521,9 +2579,9 @@ fn write_run_launch_plan(
 
 fn execute_webui_run(
     options: &ServerOptions,
-    project_id: &str,
     run_dir: &Path,
     run_id: &str,
+    commands: &[Vec<String>],
 ) -> String {
     let _ = write_text(&run_dir.join("run_state.txt"), "running");
     let _ = write_text(
@@ -2538,8 +2596,8 @@ fn execute_webui_run(
     ];
     let mut status_rows =
         String::from("step\tcommand\tstatus\texit_code\tstdout_bytes\tstderr_bytes\n");
-    let Some(command) = configured_webui_run_command(options, project_id, run_dir) else {
-        let reason = "production_run_command_not_configured_set_GENOLIGAND_WEBUI_RUN_COMMAND";
+    if commands.is_empty() {
+        let reason = "production_run_command_sequence_empty";
         let _ = write_text(&run_dir.join("run_state.txt"), "failed");
         let _ = write_text(&run_dir.join("current_stage.txt"), "failed_before_launch");
         let _ = write_text(&run_dir.join("current_command.txt"), reason);
@@ -2551,84 +2609,114 @@ fn execute_webui_run(
             &format!("run_launch_failed\nrun_id={run_id}\nreason={reason}\n"),
         );
         return "failed".to_string();
-    };
-    let program = &command[0];
-    let args = &command[1..];
-    let command_text = command.join(" ");
-    let _ = write_text(&run_dir.join("current_command.txt"), &command_text);
-    let _ = write_text(
-        &run_dir.join("current_stage.txt"),
-        "running_production_command",
-    );
-    append_run_log(
-        run_dir,
-        &format!("command_start\nstep=production_launch\ncommand={command_text}\n"),
-    );
-    let output = Command::new(program)
-        .args(args)
-        .current_dir(&options.workspace_root)
-        .output();
-    match output {
-        Ok(output) => {
-            let exit_code = output.status.code().unwrap_or(-1);
-            let status = if output.status.success() {
-                "completed"
-            } else {
-                "failed"
-            };
-            let _ = fs::write(run_dir.join("command_stdout.txt"), &output.stdout);
-            let _ = fs::write(run_dir.join("command_stderr.txt"), &output.stderr);
-            append_run_log(
-                run_dir,
-                &format!(
-                    "command_finish\nstep=production_launch\nstatus={status}\nexit_code={exit_code}\nstdout_bytes={}\nstderr_bytes={}\n",
-                    output.stdout.len(),
-                    output.stderr.len()
-                ),
-            );
-            status_rows.push_str(&format!(
-                "production_launch\t{}\t{status}\t{exit_code}\t{}\t{}\n",
-                command_text.replace('\t', " "),
-                output.stdout.len(),
-                output.stderr.len()
-            ));
-            let _ = write_text(&run_dir.join("run_command_status.tsv"), &status_rows);
-            if output.status.success() {
-                completed_steps.push("production_command_completed".to_string());
-                let _ = write_text(
-                    &run_dir.join("completed_steps.txt"),
-                    &completed_steps.join("\n"),
-                );
-            } else {
-                let reason = format!("production_command_failed_exit_code_{exit_code}");
-                let _ = write_text(&run_dir.join("run_state.txt"), "failed");
-                let _ = write_text(
-                    &run_dir.join("current_stage.txt"),
-                    "failed_production_command",
-                );
-                let _ = write_text(&run_dir.join("failure_reason.txt"), &reason);
-                return "failed".to_string();
-            }
-        }
-        Err(err) => {
-            let reason = format!("production_command_launch_failed:{err}");
+    }
+    for (index, command) in commands.iter().enumerate() {
+        let step_index = index + 1;
+        let step_name = format!("production_launch_{step_index}");
+        let Some(program) = command.first() else {
+            let reason = format!("production_command_empty_at_step_{step_index}");
             let _ = write_text(&run_dir.join("run_state.txt"), "failed");
             let _ = write_text(
                 &run_dir.join("current_stage.txt"),
                 "failed_production_command",
             );
             let _ = write_text(&run_dir.join("failure_reason.txt"), &reason);
-            status_rows.push_str(&format!(
-                "production_launch\t{}\tfailed\t-1\t0\t{}\n",
-                command_text.replace('\t', " "),
-                reason.len()
-            ));
+            status_rows.push_str(&format!("{step_name}\t{reason}\tfailed\t-1\t0\t0\n",));
             let _ = write_text(&run_dir.join("run_command_status.tsv"), &status_rows);
             append_run_log(
                 run_dir,
-                &format!("command_launch_failed\nstep=production_launch\nreason={reason}\n"),
+                &format!("command_launch_failed\nstep={step_name}\nreason={reason}\n"),
             );
             return "failed".to_string();
+        };
+        let args = &command[1..];
+        let command_text = command.join(" ");
+        let safe_step = safe_id(&step_name);
+        let _ = write_text(&run_dir.join("current_command.txt"), &command_text);
+        let _ = write_text(
+            &run_dir.join("current_stage.txt"),
+            &format!("running_{step_name}"),
+        );
+        append_run_log(
+            run_dir,
+            &format!("command_start\nstep={step_name}\ncommand={command_text}\n"),
+        );
+        let output = Command::new(program)
+            .args(args)
+            .current_dir(&options.workspace_root)
+            .output();
+        match output {
+            Ok(output) => {
+                let exit_code = output.status.code().unwrap_or(-1);
+                let status = if output.status.success() {
+                    "completed"
+                } else {
+                    "failed"
+                };
+                let _ = fs::write(
+                    run_dir.join(format!("command_stdout_{safe_step}.txt")),
+                    &output.stdout,
+                );
+                let _ = fs::write(
+                    run_dir.join(format!("command_stderr_{safe_step}.txt")),
+                    &output.stderr,
+                );
+                append_run_log(
+                    run_dir,
+                    &format!(
+                        "command_finish\nstep={step_name}\nstatus={status}\nexit_code={exit_code}\nstdout_bytes={}\nstderr_bytes={}\n",
+                        output.stdout.len(),
+                        output.stderr.len()
+                    ),
+                );
+                status_rows.push_str(&format!(
+                    "{}\t{}\t{status}\t{exit_code}\t{}\t{}\n",
+                    step_name,
+                    command_text.replace('\t', " "),
+                    output.stdout.len(),
+                    output.stderr.len()
+                ));
+                let _ = write_text(&run_dir.join("run_command_status.tsv"), &status_rows);
+                if output.status.success() {
+                    completed_steps.push(format!("{step_name}_completed"));
+                    let _ = write_text(
+                        &run_dir.join("completed_steps.txt"),
+                        &completed_steps.join("\n"),
+                    );
+                } else {
+                    let reason = format!(
+                        "production_command_failed_step_{step_index}_exit_code_{exit_code}"
+                    );
+                    let _ = write_text(&run_dir.join("run_state.txt"), "failed");
+                    let _ = write_text(
+                        &run_dir.join("current_stage.txt"),
+                        "failed_production_command",
+                    );
+                    let _ = write_text(&run_dir.join("failure_reason.txt"), &reason);
+                    return "failed".to_string();
+                }
+            }
+            Err(err) => {
+                let reason = format!("production_command_launch_failed_step_{step_index}:{err}");
+                let _ = write_text(&run_dir.join("run_state.txt"), "failed");
+                let _ = write_text(
+                    &run_dir.join("current_stage.txt"),
+                    "failed_production_command",
+                );
+                let _ = write_text(&run_dir.join("failure_reason.txt"), &reason);
+                status_rows.push_str(&format!(
+                    "{}\t{}\tfailed\t-1\t0\t{}\n",
+                    step_name,
+                    command_text.replace('\t', " "),
+                    reason.len()
+                ));
+                let _ = write_text(&run_dir.join("run_command_status.tsv"), &status_rows);
+                append_run_log(
+                    run_dir,
+                    &format!("command_launch_failed\nstep={step_name}\nreason={reason}\n"),
+                );
+                return "failed".to_string();
+            }
         }
     }
     let _ = write_text(&run_dir.join("run_command_status.tsv"), &status_rows);
@@ -2657,8 +2745,8 @@ fn create_run_json(options: &ServerOptions, project_id: &str) -> String {
         &run_dir.join("current_stage.txt"),
         "queued_for_production_command",
     );
-    let configured_command = configured_webui_run_command(options, project_id, &run_dir);
-    let initial_command_text = run_command_text(configured_command.as_deref());
+    let (command_source, command_sequence) = webui_run_commands(options, project_id, &run_dir);
+    let initial_command_text = run_command_text(&command_sequence);
     let _ = write_text(&run_dir.join("current_command.txt"), &initial_command_text);
     let _ = write_text(
         &run_dir.join("completed_steps.txt"),
@@ -2672,7 +2760,8 @@ fn create_run_json(options: &ServerOptions, project_id: &str) -> String {
         &run_id,
         &run_dir,
         &nextflow_run_id,
-        configured_command.as_deref(),
+        &command_source,
+        &command_sequence,
     );
     let resource_status = resource_status_json(options);
     let _ = write_text(
@@ -2695,7 +2784,7 @@ fn create_run_json(options: &ServerOptions, project_id: &str) -> String {
         &run_dir.join("run_manifest.json"),
         &(initial_json.clone() + "\n"),
     );
-    let final_state = execute_webui_run(options, project_id, &run_dir, &run_id);
+    let final_state = execute_webui_run(options, &run_dir, &run_id, &command_sequence);
     let artifact_index = run_artifact_index_json(&run_dir);
     let _ = write_text(
         &run_dir.join("artifact_index.json"),
@@ -4935,9 +5024,15 @@ mod tests {
         )
         .unwrap();
         assert!(run_launch_plan.contains("genoligand.webui.run_launch_plan.v0.9.1"));
-        assert!(run_launch_plan.contains("\"status\":\"not_configured\""));
-        assert!(!run_manifest.contains("\"current_command\":\"GENOLIGAND_WEBUI_RUN_COMMAND\""));
-        assert!(!run_manifest.contains("command=GENOLIGAND_WEBUI_RUN_COMMAND"));
+        assert!(run_launch_plan.contains("\"status\":\"configured\""));
+        assert!(run_launch_plan.contains("\"command_source\":\"built_in_gls_cli_md_sequence\""));
+        assert!(run_launch_plan.contains("\"md\",\"select\""));
+        assert!(run_launch_plan.contains("\"md\",\"report\""));
+        let configured_command_env = "GENOLIGAND_WEBUI_RUN_COMMAND";
+        assert!(
+            !run_manifest.contains(&format!("\"current_command\":\"{configured_command_env}\""))
+        );
+        assert!(!run_manifest.contains(&format!("command={configured_command_env}")));
         let command_status = options
             .artifact_dir
             .join("projects")
