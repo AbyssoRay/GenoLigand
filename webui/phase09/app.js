@@ -420,6 +420,7 @@ function inferAction(label) {
     "Submit run": "submit-run",
     "Cancel run": "cancel-run",
     "Resume interrupted run": "resume-run",
+    "Generate export files": "export-report",
     "Export candidate table": "export-report",
     "git status": "git-status",
     "git add": "git-add",
@@ -1333,7 +1334,8 @@ function reportExport() {
     : (payload.exports || [
         "html_report",
         "markdown_report",
-        "candidate_csv_tsv",
+        "candidate_table_tsv",
+        "candidate_table_csv",
         "machine_readable_json",
         "artifact_bundle",
         "run_manifest",
@@ -1352,21 +1354,7 @@ function reportExport() {
       [[["导出类型", "Export type"], ["输出位置", "Output location"], ["bytes", "bytes"], ["状态", "State"]].map((x) => x)][0],
       exportRows,
       [["尚未生成导出 manifest。", "No export manifest has been generated yet."]]
-    ) + buttonRow([[[ "生成导出 manifest", "Export candidate table" ], "primary", null]])
-  );
-  return card(
-    [["导出项目", "Export Targets"]],
-    optionTiles([
-      [["HTML report", "HTML report"], ["适合浏览器查看和分享。", "For browser viewing and sharing."], "ready"],
-      [["Markdown report", "Markdown report"], ["适合版本控制和文本审阅。", "For version control and text review."], "ready"],
-      [["CSV/TSV candidate table", "CSV/TSV candidate table"], ["候选排序和分数明细。", "Candidate ranking and score details."], "ready"],
-      [["JSON machine-readable report", "JSON machine-readable report"], ["供脚本和下游系统读取。", "For scripts and downstream systems."], "ready"],
-      [["artifact bundle", "artifact bundle"], ["打包产物、manifest 和 hash。", "Bundles artifacts, manifests, and hashes."], "ready"],
-      [["run manifest", "run manifest"], ["记录命令、输入、资源和输出路径。", "Records commands, inputs, resources, and output paths."], "ready"],
-      [["tool version manifest", "tool version manifest"], ["记录本地工具版本和 license。", "Records local tool versions and licenses."], "ready"],
-      [["diagnostics report", "diagnostics report"], ["环境诊断和修复建议。", "Environment diagnostics and repair guidance."], "ready"],
-      [["GitHub push report", "GitHub push report"], ["同步操作和远端验证记录。", "Sync operation and remote verification record."], "ready"],
-    ])
+    ) + buttonRow([[[ "生成导出文件", "Generate export files" ], "primary", null]])
   );
 }
 

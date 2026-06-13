@@ -3479,6 +3479,40 @@ fn json_rows_to_tsv(rows_json: &str, schema: &[&str]) -> String {
     lines.join("\n") + "\n"
 }
 
+fn csv_escape(value: &str) -> String {
+    if value
+        .chars()
+        .any(|ch| matches!(ch, ',' | '"' | '\r' | '\n'))
+    {
+        format!("\"{}\"", value.replace('"', "\"\""))
+    } else {
+        value.to_string()
+    }
+}
+
+fn json_rows_to_csv(rows_json: &str, schema: &[&str]) -> String {
+    let mut lines = Vec::new();
+    lines.push(
+        schema
+            .iter()
+            .map(|field| csv_escape(field))
+            .collect::<Vec<_>>()
+            .join(","),
+    );
+    let rows = serde_json::from_str::<Value>(rows_json)
+        .ok()
+        .and_then(|value| value.as_array().cloned())
+        .unwrap_or_default();
+    for row in rows {
+        let values = schema
+            .iter()
+            .map(|field| csv_escape(&json_row_field_text(&row, field)))
+            .collect::<Vec<_>>();
+        lines.push(values.join(","));
+    }
+    lines.join("\n") + "\n"
+}
+
 fn normalize_field_name(value: &str) -> String {
     value
         .trim()
@@ -4119,7 +4153,8 @@ fn report_export_json(options: &ServerOptions) -> String {
         .unwrap_or_default();
     let html_report = export_dir.join("genoligand_report.html");
     let markdown_report = export_dir.join("genoligand_report.md");
-    let candidate_table = export_dir.join("candidate_table.tsv");
+    let candidate_table_tsv = export_dir.join("candidate_table.tsv");
+    let candidate_table_csv = export_dir.join("candidate_table.csv");
     let machine_json = export_dir.join("machine_readable_report.json");
     let artifact_bundle = export_dir.join("artifact_bundle_manifest.tsv");
     let run_manifest = export_dir.join("run_manifest.json");
@@ -4152,8 +4187,12 @@ fn report_export_json(options: &ServerOptions) -> String {
         ),
     );
     let _ = write_text(
-        &candidate_table,
+        &candidate_table_tsv,
         &json_rows_to_tsv(&candidate_rows_json, &candidate_schema),
+    );
+    let _ = write_text(
+        &candidate_table_csv,
+        &json_rows_to_csv(&candidate_rows_json, &candidate_schema),
     );
     let _ = write_text(
         &machine_json,
@@ -4177,7 +4216,7 @@ fn report_export_json(options: &ServerOptions) -> String {
     let _ = write_text(
         &artifact_bundle,
         &format!(
-            "artifact_type\tpath\tstatus\nhtml_report\tgenoligand_report.html\tcreated\nmarkdown_report\tgenoligand_report.md\tcreated\ncandidate_table\tcandidate_table.tsv\tcreated\nmachine_readable_json\tmachine_readable_report.json\tcreated\ncandidate_source\t{}\t{}\nevidence_source\t{}\t{}\n",
+            "artifact_type\tpath\tstatus\nhtml_report\tgenoligand_report.html\tcreated\nmarkdown_report\tgenoligand_report.md\tcreated\ncandidate_table_tsv\tcandidate_table.tsv\tcreated\ncandidate_table_csv\tcandidate_table.csv\tcreated\nmachine_readable_json\tmachine_readable_report.json\tcreated\ncandidate_source\t{}\t{}\nevidence_source\t{}\t{}\n",
             candidate_source_path,
             if candidate_row_count > 0 {
                 "linked"
@@ -4224,7 +4263,8 @@ fn report_export_json(options: &ServerOptions) -> String {
     let export_files = [
         ("html_report", &html_report),
         ("markdown_report", &markdown_report),
-        ("candidate_csv_tsv", &candidate_table),
+        ("candidate_table_tsv", &candidate_table_tsv),
+        ("candidate_table_csv", &candidate_table_csv),
         ("machine_readable_json", &machine_json),
         ("artifact_bundle", &artifact_bundle),
         ("run_manifest", &run_manifest),
@@ -5289,6 +5329,13 @@ mod tests {
             options
                 .artifact_dir
                 .join("exports")
+                .join("candidate_table.csv")
+                .exists()
+        );
+        assert!(
+            options
+                .artifact_dir
+                .join("exports")
                 .join("machine_readable_report.json")
                 .exists()
         );
@@ -5300,6 +5347,15 @@ mod tests {
         )
         .unwrap();
         assert!(exported_candidates.contains("GLS-ORF-001"));
+        let exported_candidates_csv = fs::read_to_string(
+            options
+                .artifact_dir
+                .join("exports")
+                .join("candidate_table.csv"),
+        )
+        .unwrap();
+        assert!(exported_candidates_csv.contains("GLS-ORF-001"));
+        assert!(exported_candidates_csv.starts_with("rank,candidate_id,gene_name"));
         let machine_report = fs::read_to_string(
             options
                 .artifact_dir
@@ -5313,6 +5369,7 @@ mod tests {
             route_http("GET", &format!("/api/projects/{project_id}"), &options, "");
         assert!(project_after_export.contains("report_paths.tsv"));
         assert!(project_after_export.contains("candidate_table.tsv"));
+        assert!(project_after_export.contains("candidate_table.csv"));
         let legacy_export_manifest = options
             .artifact_dir
             .join("exports")
