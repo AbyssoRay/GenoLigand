@@ -3031,14 +3031,24 @@ fn candidates_json(options: &ServerOptions, run_id: &str) -> String {
         "final_priority_score",
         "risk_flags",
     ];
-    result_table_json(
-        options,
-        run_id,
-        &schema,
-        &["candidate", "ranking"],
-        "candidates",
-        "Candidate rows are loaded from the selected run artifact directory.",
-        "Candidate rows are available after the workflow writes a ranking artifact.",
+    if let Some(run_dir) = run_dir_for(options, run_id)
+        && let Some((source_path, rows_json, row_count)) = candidate_result_table(&run_dir, &schema)
+    {
+        return format!(
+            "{{\"run_id\":\"{}\",\"source_path\":\"{}\",\"schema\":{},\"candidates\":{},\"row_count\":{},\"artifact_backed\":true,\"message\":\"{}\"}}",
+            escape_json(run_id),
+            escape_json(&source_path.display().to_string()),
+            json_string_array(schema.iter().copied()),
+            rows_json,
+            row_count,
+            escape_json("Candidate rows are loaded from the selected run artifact directory.")
+        );
+    }
+    format!(
+        "{{\"run_id\":\"{}\",\"source_path\":null,\"schema\":{},\"candidates\":[],\"row_count\":0,\"artifact_backed\":false,\"message\":\"{}\"}}",
+        escape_json(run_id),
+        json_string_array(schema.iter().copied()),
+        escape_json("Candidate rows are available after the workflow writes a ranking artifact.")
     )
 }
 
@@ -3053,14 +3063,24 @@ fn evidence_json(options: &ServerOptions, run_id: &str) -> String {
         "validation_state",
         "report_section",
     ];
-    result_table_json(
-        options,
-        run_id,
-        &schema,
-        &["evidence", "ledger"],
-        "evidence",
-        "Evidence rows are loaded from the selected run artifact directory.",
-        "Evidence ledger rows are available after report generation.",
+    if let Some(run_dir) = run_dir_for(options, run_id)
+        && let Some((source_path, rows_json, row_count)) = evidence_result_table(&run_dir, &schema)
+    {
+        return format!(
+            "{{\"run_id\":\"{}\",\"source_path\":\"{}\",\"schema\":{},\"evidence\":{},\"row_count\":{},\"artifact_backed\":true,\"message\":\"{}\"}}",
+            escape_json(run_id),
+            escape_json(&source_path.display().to_string()),
+            json_string_array(schema.iter().copied()),
+            rows_json,
+            row_count,
+            escape_json("Evidence rows are loaded from the selected run artifact directory.")
+        );
+    }
+    format!(
+        "{{\"run_id\":\"{}\",\"source_path\":null,\"schema\":{},\"evidence\":[],\"row_count\":0,\"artifact_backed\":false,\"message\":\"{}\"}}",
+        escape_json(run_id),
+        json_string_array(schema.iter().copied()),
+        escape_json("Evidence ledger rows are available after report generation.")
     )
 }
 
@@ -3194,7 +3214,8 @@ fn run_domain_json(options: &ServerOptions, run_id: &str, spec: RunDomainSpec<'_
             escape_json(spec.empty_message)
         );
     };
-    let (source_path, rows) = read_domain_rows(&run_dir, spec.schema, spec.row_markers);
+    let (source_path, rows) =
+        read_domain_rows(&run_dir, spec.rows_key, spec.schema, spec.row_markers);
     let artifacts = run_artifacts_for_tokens(&run_dir, spec.artifact_tokens);
     let evidence = run_evidence_for_tokens(&run_dir, spec.evidence_tokens);
     let artifact_backed = source_path.is_some() || !artifacts.is_empty() || !evidence.is_empty();
@@ -3220,16 +3241,28 @@ fn run_domain_json(options: &ServerOptions, run_id: &str, spec: RunDomainSpec<'_
 
 fn read_domain_rows(
     run_dir: &Path,
+    domain: &str,
     schema: &[&str],
     markers: &[&str],
 ) -> (Option<String>, Vec<Value>) {
-    read_result_table(run_dir, schema, markers)
-        .and_then(|(path, rows_json, _)| {
+    if let Some(result) =
+        read_result_table(run_dir, schema, markers).and_then(|(path, rows_json, _)| {
             serde_json::from_str::<Value>(&rows_json)
                 .ok()
                 .and_then(|value| value.as_array().cloned())
                 .map(|rows| (Some(path.display().to_string()), rows))
         })
+    {
+        return result;
+    }
+    let fallback = match domain {
+        "genome_context" => e2e_candidate_rows(run_dir),
+        "structure_rows" => e2e_structure_rows(run_dir),
+        "md_rows" => e2e_md_rows(run_dir),
+        _ => None,
+    };
+    fallback
+        .map(|(path, rows)| (Some(path.display().to_string()), rows))
         .unwrap_or_else(|| (None, Vec::new()))
 }
 
@@ -3272,6 +3305,402 @@ fn value_contains_any(value: &Value, tokens: &[&str]) -> bool {
         .any(|token| text.contains(&token.to_lowercase()))
 }
 
+fn candidate_result_table(run_dir: &Path, schema: &[&str]) -> Option<(PathBuf, String, usize)> {
+    read_result_table(run_dir, schema, &["candidate", "ranking"]).or_else(|| {
+        e2e_candidate_rows(run_dir).map(|(path, rows)| {
+            let count = rows.len();
+            (path, Value::Array(rows).to_string(), count)
+        })
+    })
+}
+
+fn evidence_result_table(run_dir: &Path, schema: &[&str]) -> Option<(PathBuf, String, usize)> {
+    read_result_table(run_dir, schema, &["evidence", "ledger"]).or_else(|| {
+        e2e_evidence_rows(run_dir).map(|(path, rows)| {
+            let count = rows.len();
+            (path, Value::Array(rows).to_string(), count)
+        })
+    })
+}
+
+fn e2e_root(run_dir: &Path) -> PathBuf {
+    run_dir.join("science_artifacts").join("e2e")
+}
+
+fn e2e_summary_path(run_dir: &Path) -> PathBuf {
+    e2e_root(run_dir).join("e2e_examples_summary.tsv")
+}
+
+fn read_table_rows_unchecked(path: &Path) -> Option<Vec<Value>> {
+    let extension = path.extension().and_then(|ext| ext.to_str()).unwrap_or("");
+    let delimiter = match extension {
+        "tsv" => '\t',
+        "csv" => ',',
+        _ => return None,
+    };
+    let text = fs::read_to_string(path).ok()?;
+    let mut lines = text.lines().filter(|line| !line.trim().is_empty());
+    let headers = split_delimited_line(lines.next()?, delimiter)
+        .into_iter()
+        .map(|header| normalize_field_name(&header))
+        .collect::<Vec<_>>();
+    let mut rows = Vec::new();
+    for line in lines.take(500) {
+        let values = split_delimited_line(line, delimiter);
+        let mut row = serde_json::Map::new();
+        for (index, header) in headers.iter().enumerate() {
+            if header.is_empty() {
+                continue;
+            }
+            row.insert(
+                header.clone(),
+                Value::String(values.get(index).cloned().unwrap_or_default()),
+            );
+        }
+        rows.push(Value::Object(row));
+    }
+    Some(rows)
+}
+
+fn read_json_object(path: &Path) -> Option<Value> {
+    let value = serde_json::from_str::<Value>(&fs::read_to_string(path).ok()?).ok()?;
+    value.as_object()?;
+    Some(value)
+}
+
+fn e2e_example_ids(run_dir: &Path) -> Vec<String> {
+    let summary = e2e_summary_path(run_dir);
+    let mut ids = read_table_rows_unchecked(&summary)
+        .unwrap_or_default()
+        .into_iter()
+        .map(|row| json_row_field_text(&row, "example_id"))
+        .filter(|value| !value.is_empty())
+        .collect::<Vec<_>>();
+    if ids.is_empty() {
+        let manifest_dir = e2e_root(run_dir).join("candidate_manifests");
+        if let Ok(entries) = fs::read_dir(manifest_dir) {
+            ids.extend(entries.flatten().filter_map(|entry| {
+                entry
+                    .path()
+                    .file_stem()
+                    .map(|stem| stem.to_string_lossy().to_string())
+            }));
+        }
+    }
+    ids.sort();
+    ids.dedup();
+    ids
+}
+
+fn e2e_result_example_ids(run_dir: &Path) -> Vec<String> {
+    e2e_example_ids(run_dir)
+        .into_iter()
+        .filter(|example_id| {
+            e2e_summary_field(run_dir, example_id, "example_kind") == "candidate_benchmark"
+        })
+        .collect()
+}
+
+fn e2e_json_field(run_dir: &Path, subdir: &str, example_id: &str, field: &str) -> String {
+    read_json_object(
+        &e2e_root(run_dir)
+            .join(subdir)
+            .join(format!("{example_id}.json")),
+    )
+    .map(|value| json_row_field_text(&value, field))
+    .unwrap_or_default()
+}
+
+fn e2e_summary_field(run_dir: &Path, example_id: &str, field: &str) -> String {
+    read_table_rows_unchecked(&e2e_summary_path(run_dir))
+        .unwrap_or_default()
+        .into_iter()
+        .find(|row| json_row_field_text(row, "example_id") == example_id)
+        .map(|row| json_row_field_text(&row, field))
+        .unwrap_or_default()
+}
+
+fn e2e_metric_values(run_dir: &Path, subdir: &str, example_id: &str) -> BTreeMap<String, String> {
+    let path = e2e_root(run_dir)
+        .join(subdir)
+        .join(format!("{example_id}.tsv"));
+    let mut values = BTreeMap::new();
+    for row in read_table_rows_unchecked(&path).unwrap_or_default() {
+        let key = first_non_empty_field(&row, &["component", "metric", "interaction"]);
+        let value = first_non_empty_field(&row, &["value", "occupancy", "status"]);
+        if !key.is_empty() && !value.is_empty() {
+            values.insert(key, value);
+        }
+    }
+    values
+}
+
+fn first_non_empty_field(row: &Value, fields: &[&str]) -> String {
+    fields
+        .iter()
+        .map(|field| json_row_field_text(row, field))
+        .find(|value| !value.is_empty())
+        .unwrap_or_default()
+}
+
+fn e2e_candidate_rows(run_dir: &Path) -> Option<(PathBuf, Vec<Value>)> {
+    let summary = e2e_summary_path(run_dir);
+    if !summary.exists() {
+        return None;
+    }
+    let mut rows = Vec::new();
+    for (index, example_id) in e2e_result_example_ids(run_dir).into_iter().enumerate() {
+        let candidate_manifest = e2e_root(run_dir)
+            .join("candidate_manifests")
+            .join(format!("{example_id}.json"));
+        let manifest = read_json_object(&candidate_manifest).unwrap_or(Value::Null);
+        let score = e2e_metric_values(run_dir, "score_decompositions", &example_id);
+        let md_score = score.get("final_md_score").cloned().unwrap_or_default();
+        let candidate_id = json_row_field_text(&manifest, "candidate_id");
+        let mut row = serde_json::Map::new();
+        row.insert("rank".to_string(), Value::String((index + 1).to_string()));
+        row.insert(
+            "candidate_id".to_string(),
+            Value::String(if candidate_id.is_empty() {
+                example_id.clone()
+            } else {
+                candidate_id
+            }),
+        );
+        row.insert(
+            "gene_name".to_string(),
+            Value::String(json_row_field_text(&manifest, "target_uniprot")),
+        );
+        row.insert("orf_id".to_string(), Value::String(String::new()));
+        row.insert(
+            "genomic_coordinates".to_string(),
+            Value::String(String::new()),
+        );
+        row.insert(
+            "context_class".to_string(),
+            Value::String(e2e_summary_field(run_dir, &example_id, "example_kind")),
+        );
+        row.insert("fragment_score".to_string(), Value::String(String::new()));
+        row.insert(
+            "co_occurrence_score".to_string(),
+            Value::String(String::new()),
+        );
+        row.insert("plm_score".to_string(), Value::String(String::new()));
+        row.insert("structure_score".to_string(), Value::String(String::new()));
+        row.insert("docking_score".to_string(), Value::String(String::new()));
+        row.insert(
+            "md_stability_score".to_string(),
+            Value::String(md_score.clone()),
+        );
+        row.insert("final_priority_score".to_string(), Value::String(md_score));
+        row.insert(
+            "risk_flags".to_string(),
+            Value::String(json_row_field_text(&manifest, "evidence_scope")),
+        );
+        row.insert(
+            "source_artifact".to_string(),
+            Value::String(candidate_manifest.display().to_string()),
+        );
+        row.insert(
+            "database_evidence".to_string(),
+            Value::String(format!(
+                "target_uniprot={};ligand_id={}",
+                json_row_field_text(&manifest, "target_uniprot"),
+                json_row_field_text(&manifest, "ligand_id")
+            )),
+        );
+        row.insert(
+            "experimental_validation_guidance".to_string(),
+            Value::String(
+                "computational_prior_only;requires_independent_experimental_validation".to_string(),
+            ),
+        );
+        rows.push(Value::Object(row));
+    }
+    Some((summary, rows))
+}
+
+fn e2e_evidence_rows(run_dir: &Path) -> Option<(PathBuf, Vec<Value>)> {
+    let evidence_dir = e2e_root(run_dir).join("evidence_ledgers");
+    if !evidence_dir.exists() {
+        return None;
+    }
+    let mut rows = Vec::new();
+    let mut first_path = None;
+    let result_ids = e2e_result_example_ids(run_dir);
+    let mut paths = fs::read_dir(&evidence_dir)
+        .ok()?
+        .flatten()
+        .map(|entry| entry.path())
+        .collect::<Vec<_>>();
+    paths.sort();
+    for path in paths {
+        if path.extension().and_then(|ext| ext.to_str()) != Some("tsv") {
+            continue;
+        }
+        let Some(stem) = path.file_stem().and_then(|stem| stem.to_str()) else {
+            continue;
+        };
+        if !result_ids.iter().any(|example_id| example_id == stem) {
+            continue;
+        }
+        first_path.get_or_insert_with(|| path.clone());
+        for source in read_table_rows_unchecked(&path).unwrap_or_default() {
+            let mut row = serde_json::Map::new();
+            row.insert(
+                "report_item".to_string(),
+                Value::String(json_row_field_text(&source, "claim_id")),
+            );
+            row.insert(
+                "source_file".to_string(),
+                Value::String(json_row_field_text(&source, "evidence_artifact")),
+            );
+            row.insert(
+                "manifest".to_string(),
+                Value::String("science_artifacts/e2e/e2e_examples_summary.tsv".to_string()),
+            );
+            row.insert(
+                "schema".to_string(),
+                Value::String("phase_0_8_5_e2e_evidence_ledger".to_string()),
+            );
+            row.insert(
+                "tool_version".to_string(),
+                Value::String(format!("gls-cli {PRODUCT_VERSION}")),
+            );
+            row.insert("artifact_hash".to_string(), Value::String(String::new()));
+            row.insert(
+                "validation_state".to_string(),
+                Value::String(json_row_field_text(&source, "owner")),
+            );
+            row.insert(
+                "report_section".to_string(),
+                Value::String(json_row_field_text(&source, "claim_boundary")),
+            );
+            rows.push(Value::Object(row));
+        }
+    }
+    first_path.map(|path| (path, rows))
+}
+
+fn e2e_structure_rows(run_dir: &Path) -> Option<(PathBuf, Vec<Value>)> {
+    let summary = e2e_summary_path(run_dir);
+    if !summary.exists() {
+        return None;
+    }
+    let mut rows = Vec::new();
+    for example_id in e2e_result_example_ids(run_dir) {
+        let complex_manifest = e2e_root(run_dir)
+            .join("complex_manifests")
+            .join(format!("{example_id}.json"));
+        let manifest = read_json_object(&complex_manifest).unwrap_or(Value::Null);
+        let occupancy = e2e_metric_values(run_dir, "interaction_occupancy_summaries", &example_id);
+        let mut row = serde_json::Map::new();
+        row.insert(
+            "candidate_id".to_string(),
+            Value::String(json_row_field_text(&manifest, "candidate_id")),
+        );
+        row.insert("structure_score".to_string(), Value::String(String::new()));
+        row.insert(
+            "structure_evidence".to_string(),
+            Value::String(complex_manifest.display().to_string()),
+        );
+        row.insert(
+            "binding_patch".to_string(),
+            Value::String(json_row_field_text(&manifest, "complex_id")),
+        );
+        row.insert(
+            "patch_evidence".to_string(),
+            Value::String(format!(
+                "target_uniprot={};ligand_id={}",
+                json_row_field_text(&manifest, "target_uniprot"),
+                json_row_field_text(&manifest, "ligand_id")
+            )),
+        );
+        row.insert("key_residues".to_string(), Value::String(String::new()));
+        row.insert("docking_score".to_string(), Value::String(String::new()));
+        row.insert("docking_pose".to_string(), Value::String(String::new()));
+        row.insert(
+            "ligand_position".to_string(),
+            Value::String(json_row_field_text(&manifest, "ligand_id")),
+        );
+        row.insert(
+            "interaction_residues".to_string(),
+            Value::String(
+                occupancy
+                    .iter()
+                    .map(|(key, value)| format!("{key}={value}"))
+                    .collect::<Vec<_>>()
+                    .join(";"),
+            ),
+        );
+        rows.push(Value::Object(row));
+    }
+    Some((summary, rows))
+}
+
+fn e2e_md_rows(run_dir: &Path) -> Option<(PathBuf, Vec<Value>)> {
+    let summary = e2e_summary_path(run_dir);
+    if !summary.exists() {
+        return None;
+    }
+    let mut rows = Vec::new();
+    for example_id in e2e_result_example_ids(run_dir) {
+        let candidate_id =
+            e2e_json_field(run_dir, "candidate_manifests", &example_id, "candidate_id");
+        let score = e2e_metric_values(run_dir, "score_decompositions", &example_id);
+        let rmsd = e2e_metric_values(run_dir, "rmsd_summaries", &example_id);
+        let occupancy = e2e_metric_values(run_dir, "interaction_occupancy_summaries", &example_id);
+        let md_status = e2e_json_field(run_dir, "md_result_manifests", &example_id, "status");
+        let md_risk_flags = if md_status.eq_ignore_ascii_case("pass") {
+            "md_result_schema_validated".to_string()
+        } else {
+            md_status
+        };
+        let mut row = serde_json::Map::new();
+        row.insert("candidate_id".to_string(), Value::String(candidate_id));
+        row.insert(
+            "rmsd".to_string(),
+            Value::String(rmsd.get("ligand_rmsd_max").cloned().unwrap_or_default()),
+        );
+        row.insert("rmsf".to_string(), Value::String(String::new()));
+        row.insert("ligand_drift".to_string(), Value::String(String::new()));
+        row.insert(
+            "hydrogen_bond_occupancy".to_string(),
+            Value::String(occupancy.get("hbond").cloned().unwrap_or_default()),
+        );
+        row.insert(
+            "contact_occupancy".to_string(),
+            Value::String(occupancy.get("hydrophobic").cloned().unwrap_or_default()),
+        );
+        row.insert(
+            "interaction_persistence".to_string(),
+            Value::String(
+                score
+                    .get("interaction_persistence")
+                    .cloned()
+                    .unwrap_or_default(),
+            ),
+        );
+        row.insert("md_risk_flags".to_string(), Value::String(md_risk_flags));
+        row.insert(
+            "md_score_decomposition".to_string(),
+            Value::String(
+                score
+                    .iter()
+                    .map(|(key, value)| format!("{key}={value}"))
+                    .collect::<Vec<_>>()
+                    .join(";"),
+            ),
+        );
+        row.insert(
+            "md_stability_score".to_string(),
+            Value::String(score.get("final_md_score").cloned().unwrap_or_default()),
+        );
+        rows.push(Value::Object(row));
+    }
+    Some((summary, rows))
+}
+
 fn candidate_detail_json(options: &ServerOptions, candidate_id: &str) -> String {
     let candidate_schema = [
         "rank",
@@ -3305,8 +3734,7 @@ fn candidate_detail_json(options: &ServerOptions, candidate_id: &str) -> String 
             escape_json(candidate_id)
         );
     };
-    let Some((source_path, rows_json, _)) =
-        read_result_table(&run_dir, &candidate_schema, &["candidate", "ranking"])
+    let Some((source_path, rows_json, _)) = candidate_result_table(&run_dir, &candidate_schema)
     else {
         return format!(
             "{{\"candidate_id\":\"{}\",\"selected\":false,\"run_id\":\"{}\",\"sections\":[\"source\",\"orf_sequence\",\"genomic_position\",\"reading_frame\",\"flanking_region\",\"fragment_hits\",\"co_occurrence_evidence\",\"structure_evidence\",\"docking_evidence\",\"md_evidence\",\"database_evidence\",\"risk_flags\",\"experimental_validation_guidance\"],\"message\":\"candidate_artifact_not_found\"}}",
@@ -3331,7 +3759,7 @@ fn candidate_detail_json(options: &ServerOptions, candidate_id: &str) -> String 
             escape_json(&source_path.display().to_string())
         );
     };
-    let evidence_rows = read_result_table(&run_dir, &evidence_schema, &["evidence", "ledger"])
+    let evidence_rows = evidence_result_table(&run_dir, &evidence_schema)
         .and_then(|(_, evidence_json, _)| serde_json::from_str::<Value>(&evidence_json).ok())
         .and_then(|value| value.as_array().cloned())
         .unwrap_or_default()
@@ -3352,39 +3780,6 @@ fn candidate_detail_json(options: &ServerOptions, candidate_id: &str) -> String 
         escape_json(&source_path.display().to_string()),
         candidate,
         Value::Array(evidence_rows)
-    )
-}
-
-fn result_table_json(
-    options: &ServerOptions,
-    run_id: &str,
-    schema: &[&str],
-    path_markers: &[&str],
-    rows_key: &str,
-    loaded_message: &str,
-    empty_message: &str,
-) -> String {
-    if let Some(run_dir) = run_dir_for(options, run_id)
-        && let Some((source_path, rows_json, row_count)) =
-            read_result_table(&run_dir, schema, path_markers)
-    {
-        return format!(
-            "{{\"run_id\":\"{}\",\"source_path\":\"{}\",\"schema\":{},\"{}\":{},\"row_count\":{},\"artifact_backed\":true,\"message\":\"{}\"}}",
-            escape_json(run_id),
-            escape_json(&source_path.display().to_string()),
-            json_string_array(schema.iter().copied()),
-            escape_json(rows_key),
-            rows_json,
-            row_count,
-            escape_json(loaded_message)
-        );
-    }
-    format!(
-        "{{\"run_id\":\"{}\",\"source_path\":null,\"schema\":{},\"{}\":[],\"row_count\":0,\"artifact_backed\":false,\"message\":\"{}\"}}",
-        escape_json(run_id),
-        json_string_array(schema.iter().copied()),
-        escape_json(rows_key),
-        escape_json(empty_message)
     )
 }
 
@@ -4150,12 +4545,12 @@ fn report_export_json(options: &ServerOptions, request_body: &str) -> String {
         "report_section",
     ];
     let export_target = export_target_run_dir(options, request_body);
-    let candidate_result = export_target.as_ref().and_then(|(_, run_dir)| {
-        read_result_table(run_dir, &candidate_schema, &["candidate", "ranking"])
-    });
-    let evidence_result = export_target.as_ref().and_then(|(_, run_dir)| {
-        read_result_table(run_dir, &evidence_schema, &["evidence", "ledger"])
-    });
+    let candidate_result = export_target
+        .as_ref()
+        .and_then(|(_, run_dir)| candidate_result_table(run_dir, &candidate_schema));
+    let evidence_result = export_target
+        .as_ref()
+        .and_then(|(_, run_dir)| evidence_result_table(run_dir, &evidence_schema));
     let candidate_rows_json = candidate_result
         .as_ref()
         .map(|(_, rows, _)| rows.clone())
@@ -5231,6 +5626,24 @@ mod tests {
         assert!(artifacts.contains("\"artifact_type\":\"run_manifest\""));
         assert!(artifacts.contains("\"artifact_type\":\"run_launch_plan\""));
         assert!(artifacts.contains("\"artifact_type\":\"run_log\""));
+        let (_, _, e2e_candidates) = route_http(
+            "GET",
+            &format!("/api/runs/{run_id}/candidates"),
+            &options,
+            "",
+        );
+        assert!(e2e_candidates.contains("\"artifact_backed\":true"));
+        assert!(e2e_candidates.contains("\"candidate_id\":\"benchmark_candidate\""));
+        let (_, _, e2e_evidence) =
+            route_http("GET", &format!("/api/runs/{run_id}/evidence"), &options, "");
+        assert!(e2e_evidence.contains("computational_prior_only"));
+        let (_, _, e2e_md_summary) = route_http(
+            "GET",
+            &format!("/api/runs/{run_id}/md-summary"),
+            &options,
+            "",
+        );
+        assert!(e2e_md_summary.contains("\"md_stability_score\":\"0.78\""));
 
         let run_dir = options
             .artifact_dir
