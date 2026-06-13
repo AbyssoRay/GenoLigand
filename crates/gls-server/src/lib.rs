@@ -211,7 +211,7 @@ fn route_http(
         ("GET", "/api/diagnostics") => diagnostics_json(options),
         ("POST", "/api/diagnostics/run") => diagnostics_json(options),
         ("GET", "/api/guides") => guides_json(options),
-        ("POST", "/api/reports/export") => report_export_json(options),
+        ("POST", "/api/reports/export") => report_export_json(options, request_body),
         ("GET", "/api/github/status") => github_status_json(options),
         ("POST", "/api/github/add") => git_action_json(options, "git_add", &["add", "-A"]),
         ("POST", "/api/github/commit") => git_action_json(
@@ -2254,6 +2254,45 @@ fn latest_run_dir(options: &ServerOptions) -> Option<(String, PathBuf)> {
     latest.map(|(_, run_id, run_dir)| (run_id, run_dir))
 }
 
+fn export_target_run_dir(options: &ServerOptions, request_body: &str) -> Option<(String, PathBuf)> {
+    let body = request_body.trim();
+    if !body.is_empty()
+        && let Ok(value) = serde_json::from_str::<Value>(body)
+    {
+        let project_id = value
+            .get("project_id")
+            .and_then(Value::as_str)
+            .map(safe_id)
+            .filter(|id| !id.is_empty());
+        let run_id = value
+            .get("run_id")
+            .and_then(Value::as_str)
+            .map(safe_id)
+            .filter(|id| !id.is_empty());
+        if let Some(run_id) = run_id {
+            if let Some(project_id) = project_id.as_deref() {
+                let run_dir = project_dir(options, project_id).join("runs").join(&run_id);
+                if run_dir.exists() {
+                    return Some((run_id, run_dir));
+                }
+            }
+            if let Some(run_dir) = run_dir_for(options, &run_id) {
+                return Some((run_id, run_dir));
+            }
+        }
+        if let Some(project_id) = project_id
+            && let Some(run_id) =
+                read_trimmed(&project_dir(options, &project_id).join("latest_run_id.txt"))
+        {
+            let run_dir = project_dir(options, &project_id).join("runs").join(&run_id);
+            if run_dir.exists() {
+                return Some((run_id, run_dir));
+            }
+        }
+    }
+    latest_run_dir(options)
+}
+
 fn project_id_for_run(options: &ServerOptions, run_id: &str) -> Option<String> {
     let run_dir = run_dir_for(options, run_id)?;
     run_dir
@@ -4078,7 +4117,7 @@ fn count_environment_validation_projects(options: &ServerOptions) -> usize {
         .count()
 }
 
-fn report_export_json(options: &ServerOptions) -> String {
+fn report_export_json(options: &ServerOptions, request_body: &str) -> String {
     let export_dir = options.artifact_dir.join("exports");
     let _ = fs::create_dir_all(&export_dir);
     let diagnostics = diagnostics_json(options);
@@ -4110,11 +4149,11 @@ fn report_export_json(options: &ServerOptions) -> String {
         "validation_state",
         "report_section",
     ];
-    let latest_run = latest_run_dir(options);
-    let candidate_result = latest_run.as_ref().and_then(|(_, run_dir)| {
+    let export_target = export_target_run_dir(options, request_body);
+    let candidate_result = export_target.as_ref().and_then(|(_, run_dir)| {
         read_result_table(run_dir, &candidate_schema, &["candidate", "ranking"])
     });
-    let evidence_result = latest_run.as_ref().and_then(|(_, run_dir)| {
+    let evidence_result = export_target.as_ref().and_then(|(_, run_dir)| {
         read_result_table(run_dir, &evidence_schema, &["evidence", "ledger"])
     });
     let candidate_rows_json = candidate_result
@@ -4133,7 +4172,7 @@ fn report_export_json(options: &ServerOptions) -> String {
         .as_ref()
         .map(|(_, _, count)| *count)
         .unwrap_or(0);
-    let current_run_json = latest_run
+    let current_run_json = export_target
         .as_ref()
         .map(|(run_id, run_dir)| {
             format!(
@@ -4291,7 +4330,7 @@ fn report_export_json(options: &ServerOptions) -> String {
         &manifest,
         &format!("export_type\tpath\tbytes\tstatus\n{manifest_text}\n"),
     );
-    if let Some((_, run_dir)) = latest_run.as_ref()
+    if let Some((_, run_dir)) = export_target.as_ref()
         && let Some(project_dir) = run_dir.parent().and_then(Path::parent)
     {
         let reports_dir = project_dir.join("reports");
@@ -5299,9 +5338,29 @@ mod tests {
         assert_eq!(guide_type, "text/markdown; charset=utf-8");
         assert!(guide_doc.contains("GenoLigand 0.9.1 Local WebUI User Guide"));
 
-        let (_, _, exports) = route_http("POST", "/api/reports/export", &options, "");
+        let other_project_dir = options.artifact_dir.join("projects").join("project-other");
+        let other_run_dir = other_project_dir.join("runs").join("run-newer-empty");
+        fs::create_dir_all(&other_run_dir).unwrap();
+        write_text(
+            &other_project_dir.join("project_name.txt"),
+            "Other Project\n",
+        )
+        .unwrap();
+        write_text(
+            &other_project_dir.join("latest_run_id.txt"),
+            "run-newer-empty\n",
+        )
+        .unwrap();
+        write_text(&other_run_dir.join("run_state.txt"), "completed\n").unwrap();
+        let export_request = format!(
+            "{{\"project_id\":\"{}\",\"run_id\":\"{}\"}}",
+            escape_json(&project_id),
+            escape_json(&run_id)
+        );
+        let (_, _, exports) = route_http("POST", "/api/reports/export", &options, &export_request);
         assert!(exports.contains("\"html_report\""));
         assert!(exports.contains("\"files\":["));
+        assert!(exports.contains(&format!("\"run_id\":\"{}\"", run_id)));
         assert!(exports.contains("\"candidate_row_count\":1"));
         assert!(exports.contains("\"contains_computed_candidates\":true"));
         assert!(

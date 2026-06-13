@@ -1930,7 +1930,13 @@ async function handleAction(action, dataset = {}) {
       await refreshWorkspaceState();
       setMessage("", "数据库索引行动清单已生成。", "Database index action manifest generated.");
     } else if (action === "export-report") {
-      appState.exports = await apiRequest("/api/reports/export", { method: "POST" });
+      appState.exports = await apiRequest("/api/reports/export", {
+        method: "POST",
+        body: JSON.stringify({
+          project_id: appState.selectedProject?.project_id || null,
+          run_id: appState.selectedRun?.run_id || appState.selectedProject?.latest_run_id || null,
+        }),
+      });
       setMessage("", "导出 manifest 已生成。", "Export manifest generated.");
     } else if (action === "git-status") {
       appState.github = await apiRequest("/api/github/status");
