@@ -194,6 +194,7 @@ $RECYCLE.BIN/
 *.chk
 
 # Phase 0.8.5 integrated-chain runtime caches and non-committed heavy state.
+/acceptance_artifacts_phase_0_8_5_integrated_chain_rust_cleanup_strict/
 /outputs/phase_0_8_5/
 /databases/phase_0_8_5/
 /data/external_phase_0_8_5/
@@ -208,6 +209,7 @@ $RECYCLE.BIN/
 /tools/tmp/
 
 # GenoLigand 0.9.1 production WebUI runtime caches and heavy generated state.
+/acceptance_artifacts_phase_0_9_webui_local_beta_strict/
 /outputs/phase_0_9/
 /outputs/phase_0_9_1/
 /databases/phase_0_9/
@@ -224,6 +226,8 @@ $RECYCLE.BIN/
 /webui/playwright-report/
 /webui/test-results/
 /webui/node_modules/
+/genoligand_webui_*_review_packet.docx
+/genoligand_webui_*_review_packet.pdf
 
 
 AGENTS.md

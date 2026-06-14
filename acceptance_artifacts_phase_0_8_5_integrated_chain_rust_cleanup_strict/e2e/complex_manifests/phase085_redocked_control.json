@@ -1,8 +1,0 @@
-{
-  "schema_version": "phase_0_8_5",
-  "complex_id": "phase085_redocked_control",
-  "candidate_id": "redocked_pose_candidate",
-  "target_uniprot": "P00918",
-  "ligand_id": "acetazolamide_control",
-  "complex_schema_owner": "rust"
-}

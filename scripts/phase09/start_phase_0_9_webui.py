@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import subprocess
 import sys
+import tempfile
 import time
 import urllib.request
 import webbrowser
@@ -19,18 +20,34 @@ def main() -> int:
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=19090)
     parser.add_argument("--artifact-dir", default=str(DEFAULT_ARTIFACT))
+    parser.add_argument(
+        "--target-dir",
+        default=os.environ.get("CARGO_TARGET_DIR", str(ROOT / "target")),
+        help="Cargo target directory to build/use. Use an isolated directory when the default server binary is locked.",
+    )
+    parser.add_argument(
+        "--pid-file",
+        default="",
+        help="Optional file path where the child gls-server PID is written after startup.",
+    )
+    parser.add_argument(
+        "--runtime-dir",
+        default="",
+        help="Directory for transient stdout/stderr logs. Defaults to the system temp directory, not the repo.",
+    )
     parser.add_argument("--no-build", action="store_true", help="Skip cargo build and use the existing gls-server binary.")
     parser.add_argument("--no-open", action="store_true", help="Do not open the browser automatically.")
     args = parser.parse_args()
 
+    target_dir = Path(args.target_dir).resolve()
     if not args.no_build:
-        run(["cargo", "build", "-p", "gls-server"])
+        run(["cargo", "build", "-p", "gls-server"], target_dir)
 
-    server = ROOT / "target" / "debug" / ("gls-server.exe" if sys.platform.startswith("win") else "gls-server")
+    server = target_dir / "debug" / ("gls-server.exe" if sys.platform.startswith("win") else "gls-server")
     if not server.exists():
         raise SystemExit(f"missing_gls_server_binary:{server}")
 
-    runtime_dir = ROOT / "outputs" / "phase_0_9_1" / "runtime"
+    runtime_dir = Path(args.runtime_dir).resolve() if args.runtime_dir else Path(tempfile.gettempdir()) / "genoligand_phase_0_9_1" / "runtime"
     runtime_dir.mkdir(parents=True, exist_ok=True)
     stdout = (runtime_dir / "gls-server.stdout.log").open("w", encoding="utf-8")
     stderr = (runtime_dir / "gls-server.stderr.log").open("w", encoding="utf-8")
@@ -52,6 +69,10 @@ def main() -> int:
     url = f"http://{args.host}:{args.port}/"
     try:
         wait_for_health(args.host, args.port, process)
+        if args.pid_file:
+            pid_file = Path(args.pid_file).resolve()
+            pid_file.parent.mkdir(parents=True, exist_ok=True)
+            pid_file.write_text(str(process.pid) + "\n", encoding="utf-8")
         print(f"GenoLigand 0.9.1 WebUI is running: {url}", flush=True)
         print("Press Ctrl+C to stop the local server.", flush=True)
         if not args.no_open:
@@ -70,8 +91,10 @@ def main() -> int:
     return 0
 
 
-def run(command: list[str]) -> None:
-    result = subprocess.run(command, cwd=ROOT)
+def run(command: list[str], target_dir: Path) -> None:
+    env = dict(os.environ)
+    env["CARGO_TARGET_DIR"] = str(target_dir)
+    result = subprocess.run(command, cwd=ROOT, env=env)
     if result.returncode != 0:
         raise SystemExit(result.returncode)
 

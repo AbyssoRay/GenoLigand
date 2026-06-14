@@ -1,5 +1,0 @@
-component	value	owner
-rmsd_stability	0.30	rust
-interaction_persistence	0.35	rust
-energy_sanity	0.20	rust
-final_md_score	0.78	rust

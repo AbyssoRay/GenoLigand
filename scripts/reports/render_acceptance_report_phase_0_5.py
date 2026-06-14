@@ -49,7 +49,7 @@ def main() -> int:
         "",
         "## 2. Repository Metadata",
         f"- Commit: {git_text(['rev-parse', 'HEAD'])}",
-        f"- Branch: {git_text(['branch', '--show-current'])}",
+        f"- Branch: {git_text(['rev-parse', '--abbrev-ref', 'HEAD'])}",
         f"- OS: {platform.platform()}",
         f"- Rust version: {command_text(['rustc', '--version'])}",
         f"- Python orchestration version: {cuda.get('python', 'unknown')}",

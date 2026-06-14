@@ -1856,7 +1856,7 @@ def render_acceptance_report(artifact_dir: Path, out: Path, verdict: str, failur
         "",
         "## 2. Repository Metadata",
         f"- Commit: {command_text(['git', 'rev-parse', 'HEAD'])[1].strip()}",
-        f"- Branch: {command_text(['git', 'branch', '--show-current'])[1].strip()}",
+        f"- Branch: {command_text(['git', 'rev-parse', '--abbrev-ref', 'HEAD'])[1].strip()}",
         f"- Date: {utc_now()}",
         f"- OS: {os.name}; {sys.platform}",
         f"- Rust version: {command_text(['rustc', '--version'])[1].strip()}",

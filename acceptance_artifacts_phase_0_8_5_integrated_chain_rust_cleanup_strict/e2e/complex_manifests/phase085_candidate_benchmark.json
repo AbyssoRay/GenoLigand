@@ -1,8 +1,0 @@
-{
-  "schema_version": "phase_0_8_5",
-  "complex_id": "phase085_candidate_benchmark",
-  "candidate_id": "benchmark_candidate",
-  "target_uniprot": "Q9Y233",
-  "ligand_id": "benchmark_ligand",
-  "complex_schema_owner": "rust"
-}

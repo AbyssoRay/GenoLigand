@@ -1,8 +1,0 @@
-{
-  "schema_version": "phase_0_8_5",
-  "complex_id": "phase085_positive_control",
-  "candidate_id": "positive_control_candidate",
-  "target_uniprot": "P0DTC2",
-  "ligand_id": "N3_control",
-  "complex_schema_owner": "rust"
-}

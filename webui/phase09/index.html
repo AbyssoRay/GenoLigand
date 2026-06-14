@@ -4,7 +4,7 @@
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <title>GenoLigand 0.9.1</title>
-    <link rel="stylesheet" href="/styles.css?v=0.9.1-production" />
+    <link rel="stylesheet" href="/styles.css?v=0.9.1-pipeline" />
   </head>
   <body>
     <div class="app-shell">
@@ -19,7 +19,7 @@
         <nav data-nav></nav>
         <div class="sidebar-footer">
           <span class="status ready" data-i18n="versionBadge">0.9.1 正式版</span>
-          <span data-i18n="backendNote">本地 gls-server 提供服务</span>
+          <span data-i18n="backendNote">本地科研工作台已就绪</span>
         </div>
       </aside>
 
@@ -27,12 +27,11 @@
         <header class="topbar">
           <div>
             <strong data-top-project>GenoLigand 0.9.1</strong>
-            <span data-top-run>127.0.0.1:19090 / gls-server / local workspace</span>
+            <span data-top-run>本地工作台已就绪 / 等待项目</span>
           </div>
           <div class="top-actions">
             <span class="status ready" data-server-state>READY</span>
             <button data-lang-toggle type="button">中文 / EN</button>
-            <a class="button primary" href="#/input_wizard_project_basics_page" data-i18n="startSetup">开始配置</a>
           </div>
         </header>
 
@@ -42,7 +41,7 @@
               <div>
                 <span class="eyeless" data-page-kicker>GenoLigand 0.9.1</span>
                 <h1 data-page-title>本地工作台</h1>
-                <p data-page-description>通过浏览器完成项目、输入、运行、结果、报告、诊断和代码同步。</p>
+                <p data-page-description>通过浏览器完成项目、输入、运行、结果、报告和诊断。</p>
               </div>
               <span class="status ready" data-page-status>READY</span>
             </div>
@@ -54,12 +53,10 @@
 
         <section class="log-strip" aria-label="Run log">
           <div class="timeline" data-runtime-timeline></div>
-          <pre data-runtime-log>GenoLigand 0.9.1 本地工作台已就绪。
-当前浏览器会话没有绑定运行。
-请创建或打开项目，完成预检查后启动任务。</pre>
+          <pre data-runtime-log>GenoLigand 0.9.1 本地工作台已就绪。当前浏览器会话尚未绑定运行。请创建或打开项目，完成预检查后启动任务。</pre>
         </section>
       </section>
     </div>
-    <script src="/app.js?v=0.9.1-production"></script>
+    <script src="/app.js?v=0.9.1-pipeline"></script>
   </body>
 </html>

@@ -1,3 +1,0 @@
-metric	value	unit	status
-ligand_rmsd_max	1.25	angstrom	PASS
-protein_backbone_rmsd_max	1.80	angstrom	PASS

@@ -1,8 +1,0 @@
-Ubuntu-24.04
-
-raw_status:
-默认分发: Ubuntu-24.04
-默认版本: 2
-当前计算机配置不支持 WSL1。
-若要使用 WSL1，请启用“Windows Subsystem for Linux”可选组件。
-

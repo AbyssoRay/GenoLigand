@@ -1,1 +1,0 @@
-phase_0_8_5_maintain_ok	command=CleanupPlan	artifact_dir=D:\Project\rust\GenoLigand\acceptance_artifacts_phase_0_8_5_integrated_chain_rust_cleanup_strict

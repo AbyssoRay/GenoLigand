@@ -1,6 +1,0 @@
-﻿path	was_present	is_admin	operation	exit_code	result	message
-D:\Project\rust\GenoLigand\.phase_0_6_tools\pytest_tmp	True	True	acl_repair_and_delete	0	DELETED	deleted_after_acl_repair
-D:\Project\rust\GenoLigand\acceptance_artifacts_phase_0_4\pytest_cache	True	True	acl_repair_and_delete	0	DELETED	deleted_after_acl_repair
-D:\Project\rust\GenoLigand\acceptance_artifacts_phase_0_4\pytest_tmp	True	True	acl_repair_and_delete	0	DELETED	deleted_after_acl_repair
-D:\Project\rust\GenoLigand\.phase_0_6_tools	True	True	acl_repair_and_delete	0	DELETED	deleted_after_acl_repair
-D:\Project\rust\GenoLigand\acceptance_artifacts_phase_0_4	True	True	acl_repair_and_delete	0	DELETED	deleted_after_acl_repair
