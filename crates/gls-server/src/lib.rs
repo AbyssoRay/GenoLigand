@@ -638,35 +638,13 @@ fn databases_json(options: &ServerOptions) -> Value {
 
 fn user_databases_json(options: &ServerOptions) -> Value {
     let store = science_store_path(options);
-    let required = [
-        ("science_store", "science_store_manifest.tsv", "科学仓库"),
-        (
-            "known_database",
-            "indexes/known_targets.tsv",
-            "已知蛋白索引",
-        ),
-        (
-            "metagenome",
-            "indexes/metagenome_targets.tsv",
-            "宏基因组索引",
-        ),
-        ("tools", "indexes/tool_versions.tsv", "计算工具"),
-    ];
-    let rows = required
-        .iter()
-        .map(|(id, rel, label)| {
-            let path = store.join(rel);
-            let ready = if *rel == "indexes/tool_versions.tsv" {
-                tool_versions_ready(&path)
-            } else {
-                path.exists()
-            };
-            json!({"id":id,"label":label,"ready":ready})
-        })
-        .collect::<Vec<_>>();
+    let rows = required_resource_rows(&store);
+    let missing = missing_resource_rows(&rows);
     json!({
         "required": rows,
         "sources": source_status_rows(&store),
+        "missing": missing,
+        "summary": if preflight_store_ready(options) {"科学仓库已就绪"} else {"需要运行安装/修复"},
         "repair_actions_available": store.join("repair_actions.tsv").exists(),
         "user_configures_paths": false
     })
@@ -688,6 +666,7 @@ fn user_diagnostics_json(options: &ServerOptions) -> Value {
     let cargo = capture("cargo", &["--version"], &options.workspace_root);
     let gls_cli = capture_command(&gls_cli_help_command(options), &options.workspace_root);
     let database_ready = preflight_store_ready(options);
+    let missing = missing_resource_rows(&required_resource_rows(&science_store_path(options)));
     let checks = vec![
         json!({"label":"服务", "ready":true, "next_action":"继续"}),
         json!({"label":"命令行工具", "ready":gls_cli.0, "next_action": if gls_cli.0 {"继续"} else {"重新安装 GenoLigand 命令行工具"}}),
@@ -698,19 +677,22 @@ fn user_diagnostics_json(options: &ServerOptions) -> Value {
         "status": if cargo.0 && gls_cli.0 && database_ready {"ready"} else {"warning"},
         "runtime": std::env::consts::OS,
         "checks": checks,
+        "missing": missing,
         "science_store": user_databases_json(options)
     })
 }
 
 fn user_setup_status_json(options: &ServerOptions) -> Value {
     let ready = preflight_store_ready(options);
+    let required = required_resource_rows(&science_store_path(options));
     json!({
         "status": if ready {"ready"} else {"needs_repair"},
         "database_ready": ready,
         "runtime": std::env::consts::OS,
         "can_run_repair": true,
         "repair_action": if ready {"继续"} else {"运行安装/修复"},
-        "checks": user_databases_json(options)["required"].clone()
+        "checks": required,
+        "missing": missing_resource_rows(&required)
     })
 }
 
@@ -743,11 +725,13 @@ fn run_setup_repair_json(options: &ServerOptions) -> Value {
         Err(err) => (false, format!("修复动作无法启动：{err}"), None),
     };
     let ready = preflight_store_ready(options);
+    let required = required_resource_rows(&science_store_path(options));
     let mut payload = json!({
         "status": if executed {"repair_executed"} else {"repair_failed"},
         "database_ready": ready,
         "message": if ready {"科学仓库已就绪。"} else {message.as_str()},
-        "checks": user_databases_json(options)["required"].clone()
+        "checks": required,
+        "missing": missing_resource_rows(&required)
     });
     if let Some(installer_payload) = installer_payload {
         payload["installer"] = installer_payload;
@@ -850,6 +834,66 @@ fn preflight_store_ready(options: &ServerOptions) -> bool {
         && store.join("indexes/known_targets.tsv").exists()
         && store.join("indexes/metagenome_targets.tsv").exists()
         && tool_versions_ready(&store.join("indexes/tool_versions.tsv"))
+}
+
+fn required_resource_rows(store: &Path) -> Vec<Value> {
+    let required = [
+        (
+            "science_store",
+            "science_store_manifest.tsv",
+            "科学仓库",
+            "运行安装/修复以生成科学仓库记录",
+        ),
+        (
+            "known_database",
+            "indexes/known_targets.tsv",
+            "已知蛋白索引",
+            "运行安装/修复以准备已知蛋白索引",
+        ),
+        (
+            "metagenome",
+            "indexes/metagenome_targets.tsv",
+            "宏基因组索引",
+            "运行安装/修复以准备宏基因组索引",
+        ),
+        (
+            "tools",
+            "indexes/tool_versions.tsv",
+            "计算工具",
+            "运行安装/修复以准备计算工具记录",
+        ),
+    ];
+    required
+        .iter()
+        .map(|(id, rel, label, next_action)| {
+            let path = store.join(rel);
+            let ready = if *rel == "indexes/tool_versions.tsv" {
+                tool_versions_ready(&path)
+            } else {
+                path.exists()
+            };
+            json!({
+                "id": id,
+                "label": label,
+                "ready": ready,
+                "status": if ready {"就绪"} else {"需要准备"},
+                "next_action": if ready {"继续"} else {*next_action}
+            })
+        })
+        .collect()
+}
+
+fn missing_resource_rows(rows: &[Value]) -> Vec<Value> {
+    rows.iter()
+        .filter(|row| !row.get("ready").and_then(Value::as_bool).unwrap_or(false))
+        .map(|row| {
+            json!({
+                "id": row.get("id").cloned().unwrap_or_else(|| json!("resource")),
+                "label": row.get("label").cloned().unwrap_or_else(|| json!("科学资源")),
+                "next_action": row.get("next_action").cloned().unwrap_or_else(|| json!("运行安装/修复"))
+            })
+        })
+        .collect()
 }
 
 fn tool_versions_ready(path: &Path) -> bool {
@@ -1481,6 +1525,26 @@ mod tests {
             !friendly_source_next_action("download_and_index_chembl", "missing")
                 .contains("download_and_index")
         );
+    }
+
+    #[test]
+    fn missing_resource_summary_is_user_facing() {
+        let root =
+            std::env::temp_dir().join(format!("genoligand-missing-summary-{}", now_millis()));
+        let rows = required_resource_rows(&root);
+        let missing = missing_resource_rows(&rows);
+        let text = serde_json::to_string(&missing).expect("missing json");
+
+        assert_eq!(missing.len(), 4);
+        assert!(text.contains("科学仓库"));
+        assert!(text.contains("已知蛋白索引"));
+        assert!(text.contains("宏基因组索引"));
+        assert!(text.contains("计算工具"));
+        assert!(text.contains("运行安装/修复"));
+        assert!(!text.contains("science_store_manifest"));
+        assert!(!text.contains("known_targets.tsv"));
+        assert!(!text.contains("tool_versions.tsv"));
+        assert!(!text.contains(&root.display().to_string()));
     }
 
     #[test]

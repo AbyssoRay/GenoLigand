@@ -345,6 +345,7 @@ function renderCheck() {
           <span class="status-pill ${setupReady ? "ready" : "blocked"}">${setupReady ? "已就绪" : "需要准备"}</span>
         </div>
         ${setupRepairSummary()}
+        ${missingResourceSummary()}
         ${diagnosticsSummary()}
         ${sourceStatusTable()}
       </section>
@@ -375,6 +376,25 @@ function setupRepairSummary() {
   return `
     <div class="notice ${ready ? "" : "warn"}">
       ${escapeHtml(state.setupRepair.message || (ready ? "科学仓库已就绪。" : "修复动作已执行，但仍有缺项。"))}
+    </div>`;
+}
+
+function missingResourceSummary() {
+  const missing = state.setupRepair?.missing || state.setup?.missing || state.databases?.missing || [];
+  if (!missing.length) {
+    return `<div class="notice">数据库、索引和工具记录已满足当前运行要求。</div>`;
+  }
+  return `
+    <div class="notice warn">
+      <strong>还需要准备 ${missing.length} 项：</strong>
+      <ul class="compact-list">
+        ${missing
+          .map(
+            (item) =>
+              `<li>${escapeHtml(item.label || "科学资源")}：${escapeHtml(item.next_action || "运行安装/修复")}</li>`
+          )
+          .join("")}
+      </ul>
     </div>`;
 }
 

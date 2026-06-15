@@ -157,6 +157,16 @@ p {
   color: var(--muted);
 }
 
+.compact-list {
+  margin: 8px 0 0;
+  padding-left: 18px;
+  color: var(--muted);
+}
+
+.compact-list li + li {
+  margin-top: 4px;
+}
+
 .page {
   min-width: 0;
 }
