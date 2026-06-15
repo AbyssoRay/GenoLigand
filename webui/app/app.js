@@ -603,6 +603,7 @@ function renderExport() {
   page.className = "page";
   const artifacts = state.run?.artifact_index?.items || [];
   const available = artifacts.filter((item) => item.exists);
+  const runId = state.run?.run_id || "";
   page.innerHTML = `
     <div class="panel-grid">
       <section class="panel full">
@@ -614,22 +615,23 @@ function renderExport() {
           <span class="status-pill ${available.length ? "ready" : "blocked"}">${available.length ? `${available.length} 项可用` : "暂无可导出项"}</span>
         </div>
       </section>
-      ${exportCard("科研报告", "research_report.md", artifacts)}
-      ${exportCard("候选表", "target_candidate_ranking.tsv", artifacts)}
-      ${exportCard("证据链", "evidence_ledger.tsv", artifacts)}
-      ${exportCard("复现材料", "input_normalized_manifest.json", artifacts)}
-      ${exportCard("结构与口袋摘要", "structure_patch_summary.tsv", artifacts)}
-      ${exportCard("动力学摘要", "md_summary.tsv", artifacts)}
+      ${exportCard("科研报告", "research_report.md", artifacts, runId)}
+      ${exportCard("候选表", "target_candidate_ranking.tsv", artifacts, runId)}
+      ${exportCard("证据链", "evidence_ledger.tsv", artifacts, runId)}
+      ${exportCard("复现材料", "input_normalized_manifest.json", artifacts, runId)}
+      ${exportCard("结构与口袋摘要", "structure_patch_summary.tsv", artifacts, runId)}
+      ${exportCard("动力学摘要", "md_summary.tsv", artifacts, runId)}
     </div>`;
 }
 
-function exportCard(title, artifactName, artifacts) {
-  const exists = artifacts.some((item) => item.path === artifactName && item.exists);
+function exportCard(title, artifactName, artifacts, runId) {
+  const exists = Boolean(runId) && artifacts.some((item) => item.path === artifactName && item.exists);
+  const href = `/api/runs/${encodeURIComponent(runId)}/download/${encodeURIComponent(artifactName)}`;
   return `
     <section class="panel third">
       <h2>${title}</h2>
       <p>${exists ? "当前运行已生成。" : "当前运行未生成。"}</p>
-      <button class="button ${exists ? "secondary" : "disabled"}" disabled>${exists ? "可在运行目录中获取" : "不可用"}</button>
+      ${exists ? `<a class="button secondary" href="${href}" download="${escapeAttr(artifactName)}">下载</a>` : `<button class="button disabled" disabled>不可用</button>`}
     </section>`;
 }
 

@@ -212,7 +212,14 @@ fn route_run(
         ("GET", "md-summary") => table_endpoint_json(options, &run_id, "md_summary.tsv", "md_rows"),
         ("POST", "cancel") => update_run_state(options, &run_id, "cancelled"),
         ("POST", "resume") => update_run_state(options, &run_id, "resumable"),
-        _ => json!({"error":"not_found"}),
+        _ => {
+            if method == "GET"
+                && let Some(file) = suffix.strip_prefix("download/")
+            {
+                return Some(download_artifact_response(options, &run_id, file));
+            }
+            json!({"error":"not_found"})
+        }
     };
     Some((200, "application/json; charset=utf-8", value.to_string()))
 }
@@ -574,6 +581,28 @@ fn artifacts_json(options: &ServerOptions, run_id: &str) -> Value {
     find_run_dir(options, run_id)
         .map(|dir| json!({"run_id":run_id,"artifact_root":dir.display().to_string(),"items":artifact_index(&dir)["items"].clone()}))
         .unwrap_or_else(|| json!({"run_id":run_id,"items":[]}))
+}
+
+fn download_artifact_response(
+    options: &ServerOptions,
+    run_id: &str,
+    requested: &str,
+) -> (u16, &'static str, String) {
+    let file = requested.split('?').next().unwrap_or(requested);
+    if !artifact_names().contains(&file) {
+        return json_response(404, json!({"error":"artifact_not_available"}));
+    }
+    let Some(run_dir) = find_run_dir(options, run_id) else {
+        return json_response(404, json!({"error":"run_not_found"}));
+    };
+    let path = run_dir.join(file);
+    if !path.exists() {
+        return json_response(404, json!({"error":"artifact_not_available"}));
+    }
+    match fs::read_to_string(&path) {
+        Ok(text) => (200, artifact_content_type(file), text),
+        Err(_) => json_response(404, json!({"error":"artifact_not_available"})),
+    }
 }
 
 fn table_endpoint_json(options: &ServerOptions, run_id: &str, file: &str, key: &str) -> Value {
@@ -1035,7 +1064,15 @@ fn read_json_or(path: &Path, fallback: Value) -> Value {
 
 fn artifact_index(run_dir: &Path) -> Value {
     let mut items = Vec::new();
-    for name in [
+    for name in artifact_names() {
+        let path = run_dir.join(name);
+        items.push(json!({"path":name,"exists":path.exists()}));
+    }
+    json!({"items":items})
+}
+
+fn artifact_names() -> &'static [&'static str] {
+    &[
         "run_context.json",
         "run_context.tsv",
         "artifact_source_map.tsv",
@@ -1051,11 +1088,19 @@ fn artifact_index(run_dir: &Path) -> Value {
         "score_decomposition.tsv",
         "evidence_ledger.tsv",
         "research_report.md",
-    ] {
-        let path = run_dir.join(name);
-        items.push(json!({"path":name,"exists":path.exists()}));
+    ]
+}
+
+fn artifact_content_type(file: &str) -> &'static str {
+    if file.ends_with(".json") {
+        "application/json; charset=utf-8"
+    } else if file.ends_with(".tsv") {
+        "text/tab-separated-values; charset=utf-8"
+    } else if file.ends_with(".md") {
+        "text/markdown; charset=utf-8"
+    } else {
+        "text/plain; charset=utf-8"
     }
-    json!({"items":items})
 }
 
 fn read_tsv_rows(path: &Path) -> Vec<Value> {
@@ -1186,5 +1231,32 @@ mod tests {
         assert_eq!(payload["downloads"]["ready"], 2);
         assert!(payload.get("command").is_none());
         assert!(payload.get("stdout").is_none());
+    }
+
+    #[test]
+    fn artifact_download_is_limited_to_current_run_allowlist() {
+        let root = std::env::temp_dir().join(format!("genoligand-download-{}", now_millis()));
+        let options = server_options(root.clone());
+        let run_dir = projects_root(&options)
+            .join("project-1")
+            .join("runs")
+            .join("run-1");
+        fs::create_dir_all(&run_dir).expect("create run dir");
+        fs::write(run_dir.join("research_report.md"), "# Report\n").expect("write report");
+        fs::write(run_dir.join("secret.txt"), "hidden\n").expect("write secret");
+
+        let (status, content_type, body) =
+            download_artifact_response(&options, "run-1", "research_report.md");
+        assert_eq!(status, 200);
+        assert_eq!(content_type, "text/markdown; charset=utf-8");
+        assert!(body.contains("# Report"));
+
+        let (status, _, _) = download_artifact_response(&options, "run-1", "secret.txt");
+        assert_eq!(status, 404);
+
+        let (status, _, _) = download_artifact_response(&options, "run-1", "../secret.txt");
+        assert_eq!(status, 404);
+
+        fs::remove_dir_all(&root).ok();
     }
 }
