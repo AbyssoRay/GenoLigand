@@ -179,7 +179,7 @@ function renderInput() {
             <h2>选择输入类型</h2>
             <p>可以填写一种或多种输入。只有用户填写的内容会进入计算。</p>
           </div>
-          <span class="status-pill ${inputsReadyToSave() ? "ready" : "blocked"}" data-input-status>${inputStatusLabel()}</span>
+          <span class="status-pill ${inputStatusClass()}" data-input-status>${inputStatusLabel()}</span>
         </div>
         <div class="input-grid">
           ${inputSpecs.map(renderInputTypeCard).join("")}
@@ -240,7 +240,7 @@ function renderInputTypeCard(spec) {
     <button class="input-card ${selected ? "selected" : ""}" data-select-input="${spec.kind}">
       <h3>${spec.title}</h3>
       <p>${spec.minimum}</p>
-      <span class="status-pill ${usable ? "ready" : "blocked"}" data-input-card-status="${spec.field}">${usable ? "可用" : filled ? "需检查" : "未填写"}</span>
+      <span class="status-pill ${inputCardStatusClass(usable, filled)}" data-input-card-status="${spec.field}">${usable ? "可用" : filled ? "需检查" : "未填写"}</span>
     </button>`;
 }
 
@@ -279,7 +279,7 @@ function updateInputValidationUi() {
   const status = page.querySelector("[data-input-status]");
   if (status) {
     status.textContent = inputStatusLabel();
-    status.className = `status-pill ${inputsReadyToSave() ? "ready" : "blocked"}`;
+    status.className = `status-pill ${inputStatusClass()}`;
   }
   const activeHelp = page.querySelector("[data-active-validation]");
   if (activeHelp) {
@@ -295,7 +295,7 @@ function updateInputValidationUi() {
     const value = (state.form[spec.field] || "").trim();
     const usable = inputValueUsable(spec.field, value);
     statusNode.textContent = usable ? "可用" : value ? "需检查" : "未填写";
-    statusNode.className = `status-pill ${usable ? "ready" : "blocked"}`;
+    statusNode.className = `status-pill ${inputCardStatusClass(usable, Boolean(value))}`;
   });
 }
 
@@ -696,7 +696,7 @@ function resultSection(title, rows, kind) {
           <h2>${title}</h2>
           <p>${rows.length ? "数据来自当前运行输出。" : emptyText}</p>
         </div>
-        <span class="status-pill ${rows.length ? "ready" : "blocked"}">${rows.length ? `${rows.length} 行` : "空"}</span>
+        <span class="status-pill ${outputStatusClass(rows)}">${rows.length ? `${rows.length} 行` : "空"}</span>
       </div>
       ${rows.length ? table(rows, columnsFor(kind)) : `<div class="empty">${emptyText}</div>`}
     </section>`;
@@ -744,7 +744,7 @@ function structureSection(rows) {
           <h2>结构/口袋</h2>
           <p>${rows.length ? "结构和口袋摘要来自当前运行输出。" : "当前运行没有结构或口袋摘要。"}</p>
         </div>
-        <span class="status-pill ${rows.length ? "ready" : "blocked"}">${rows.length ? `${rows.length} 行` : "未就绪"}</span>
+        <span class="status-pill ${outputStatusClass(rows)}">${rows.length ? `${rows.length} 行` : "未就绪"}</span>
       </div>
       ${visualStatus([
         { label: "摘要表", value: rows.length ? "已生成" : "未生成", ready: rows.length > 0 },
@@ -763,7 +763,7 @@ function mdSection(rows) {
           <h2>动力学摘要</h2>
           <p>${rows.length ? "动力学摘要来自当前运行输出。" : "当前运行没有轨迹摘要。"}</p>
         </div>
-        <span class="status-pill ${rows.length ? "ready" : "blocked"}">${rows.length ? `${rows.length} 行` : "未就绪"}</span>
+        <span class="status-pill ${outputStatusClass(rows)}">${rows.length ? `${rows.length} 行` : "未就绪"}</span>
       </div>
       ${visualStatus([
         { label: "摘要表", value: rows.length ? "已生成" : "未生成", ready: rows.length > 0 },
@@ -802,7 +802,7 @@ function renderExport() {
             <h2>导出材料</h2>
             <p>导出项只在当前运行生成相应输出后启用。</p>
           </div>
-          <span class="status-pill ${available.length ? "ready" : "blocked"}">${available.length ? `${available.length} 项可用` : "暂无可导出项"}</span>
+          <span class="status-pill ${outputStatusClass(available)}">${available.length ? `${available.length} 项可用` : "暂无可导出项"}</span>
         </div>
       </section>
       ${exportCard("科研报告", "research_report", artifacts, runId)}
@@ -976,6 +976,22 @@ function inputStatusLabel() {
   if (inputsReadyToSave()) return "输入可保存";
   if (hasAnyInput()) return "需要检查输入";
   return "等待输入";
+}
+
+function inputStatusClass() {
+  if (inputsReadyToSave()) return "ready";
+  if (hasAnyInput()) return "blocked";
+  return "waiting";
+}
+
+function inputCardStatusClass(usable, filled) {
+  if (usable) return "ready";
+  if (filled) return "blocked";
+  return "waiting";
+}
+
+function outputStatusClass(rows) {
+  return rows.length ? "ready" : "waiting";
 }
 
 function inputValidation(spec) {
@@ -1213,7 +1229,7 @@ function artifactRows() {
       <table>
         <thead><tr><th>输出</th><th>状态</th></tr></thead>
         <tbody>
-          ${items.map((item) => `<tr><td>${friendlyArtifact(item.id || item.path)}</td><td><span class="status-pill ${item.exists ? "ready" : "blocked"}">${item.exists ? "已生成" : "未生成"}</span></td></tr>`).join("")}
+          ${items.map((item) => `<tr><td>${friendlyArtifact(item.id || item.path)}</td><td><span class="status-pill ${item.exists ? "ready" : "waiting"}">${item.exists ? "已生成" : "未生成"}</span></td></tr>`).join("")}
         </tbody>
       </table>
     </div>`;
