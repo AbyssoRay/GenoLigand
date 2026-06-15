@@ -345,6 +345,7 @@ function renderCheck() {
           <span class="status-pill ${setupReady ? "ready" : "blocked"}">${setupReady ? "已就绪" : "需要准备"}</span>
         </div>
         ${setupRepairSummary()}
+        ${installerResourceSummary()}
         ${missingResourceSummary()}
         ${diagnosticsSummary()}
         ${sourceStatusTable()}
@@ -376,6 +377,24 @@ function setupRepairSummary() {
   return `
     <div class="notice ${ready ? "" : "warn"}">
       ${escapeHtml(state.setupRepair.message || (ready ? "科学仓库已就绪。" : "修复动作已执行，但仍有缺项。"))}
+    </div>`;
+}
+
+function installerResourceSummary() {
+  const resources = state.setupRepair?.installer?.resources;
+  const items = resources?.items || [];
+  if (!resources || !items.length) return "";
+  return `
+    <div class="notice ${resources.needs_action ? "warn" : ""}">
+      <strong>科学资源：${resources.ready || 0} / ${resources.total || items.length} 就绪</strong>
+      <ul class="compact-list">
+        ${items
+          .map(
+            (item) =>
+              `<li>${escapeHtml(item.label || "科学资源")}：${escapeHtml(item.status || "需要检查")}；${escapeHtml(item.next_action || "运行安装/修复")}</li>`
+          )
+          .join("")}
+      </ul>
     </div>`;
 }
 

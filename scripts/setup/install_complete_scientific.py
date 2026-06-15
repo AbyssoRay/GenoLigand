@@ -118,6 +118,16 @@ def load_json(path: Path) -> dict[str, object]:
         return {"status": "unreadable"}
 
 
+def read_tsv(path: Path) -> list[dict[str, str]]:
+    if not path.exists():
+        return []
+    with path.open("r", encoding="utf-8-sig", newline="") as handle:
+        return [
+            {key: (value or "").strip() for key, value in row.items()}
+            for row in csv.DictReader(handle, delimiter="\t")
+        ]
+
+
 def default_source_catalog(workspace_root: Path, science_store: Path) -> Path:
     store_catalog = science_store / "source_catalog.tsv"
     if store_catalog.exists():
@@ -286,6 +296,60 @@ def download_summary(download_result: dict[str, object]) -> dict[str, object]:
     }
 
 
+def friendly_source_status(raw: str) -> str:
+    return {
+        "ready": "就绪",
+        "downloaded_needs_index": "已下载，需重建索引",
+        "missing": "需要准备",
+        "download_required": "需要下载",
+        "index_required": "需要重建索引",
+        "waiting_for_download": "等待下载",
+    }.get(raw, "需要检查")
+
+
+def friendly_source_action(raw: str, status: str) -> str:
+    if status == "ready":
+        return "继续"
+    return {
+        "download_and_index_chembl": "准备 ChEMBL 活性数据",
+        "download_and_index_bindingdb": "准备 BindingDB 活性数据",
+        "download_and_index_uniprot_human": "准备 UniProt 人类蛋白索引",
+        "download_and_index_rcsb_ligand_bound": "准备 RCSB 结构数据",
+        "download_and_index_biolip2": "准备 BioLiP2 互作数据",
+        "download_and_index_plinder": "准备 PLINDER 结构数据",
+        "download_and_index_binding_moad": "准备 Binding MOAD 结构数据",
+        "download_and_index_metagenome_sources": "准备宏基因组序列索引",
+        "install_or_repair_scientific_tools": "准备计算工具",
+        "build_known_database_index": "重建已知蛋白索引",
+        "build_metagenome_potential_index": "重建宏基因组索引",
+    }.get(raw, "准备科学资源")
+
+
+def resource_summary(science_store: Path) -> dict[str, object]:
+    rows = read_tsv(science_store / "source_requirements.tsv")
+    items: list[dict[str, object]] = []
+    for row in rows:
+        raw_status = row.get("status", "")
+        raw_action = row.get("repair_action", "")
+        ready = raw_status == "ready"
+        items.append(
+            {
+                "label": row.get("label", row.get("source_id", "科学资源")),
+                "status": friendly_source_status(raw_status),
+                "ready": ready,
+                "next_action": friendly_source_action(raw_action, raw_status),
+            }
+        )
+    ready_count = sum(1 for item in items if item["ready"])
+    return {
+        "status": "ready" if items and ready_count == len(items) else "needs_repair",
+        "ready": ready_count,
+        "total": len(items),
+        "needs_action": len(items) - ready_count,
+        "items": items,
+    }
+
+
 def installation_status(science_store: Path, completed: subprocess.CompletedProcess[str]) -> dict[str, object]:
     status_payload = load_json(science_store / "install_status.json")
     store_status = str(status_payload.get("status", "")).strip()
@@ -365,6 +429,7 @@ def main() -> int:
         **install_status,
         "returncode": completed.returncode,
         "downloads": download_summary(download_result),
+        "resources": resource_summary(science_store),
         "runtime_backend": runtime_backend(),
         "access_url": f"http://{args.host}:{args.port}/",
     }

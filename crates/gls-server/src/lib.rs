@@ -806,6 +806,10 @@ fn setup_installer_summary(stdout: &str) -> Option<Value> {
         .get("downloads")
         .cloned()
         .unwrap_or_else(|| json!({}));
+    let resources = payload
+        .get("resources")
+        .cloned()
+        .unwrap_or_else(|| json!({}));
     Some(json!({
         "status": payload.get("status").cloned().unwrap_or_else(|| json!("unknown")),
         "runtime_backend": payload.get("runtime_backend").cloned().unwrap_or_else(|| json!("unknown")),
@@ -816,7 +820,8 @@ fn setup_installer_summary(stdout: &str) -> Option<Value> {
             "status": downloads.get("status").cloned().unwrap_or_else(|| json!("unknown")),
             "ready": downloads.get("ready").cloned().unwrap_or_else(|| json!(0)),
             "failed": downloads.get("failed").cloned().unwrap_or_else(|| json!(0))
-        }
+        },
+        "resources": resources
     }))
 }
 
@@ -1573,6 +1578,7 @@ mod tests {
         assert_eq!(payload["next_action"], "补齐缺失资源后重新运行安装/修复");
         assert_eq!(payload["downloads"]["status"], "ready");
         assert_eq!(payload["downloads"]["ready"], 2);
+        assert!(payload.get("resources").is_some());
         assert!(payload.get("debug").is_none());
         assert!(payload.get("command").is_none());
         assert!(payload.get("stdout").is_none());
