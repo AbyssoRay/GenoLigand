@@ -1112,20 +1112,27 @@ function columnsFor(kind) {
     return [
       { key: "candidate_id", label: "候选编号" },
       { key: "target_id", label: "目标编号" },
+      { key: "target_name", label: "目标名称" },
       { key: "structure_score", label: "结构分数" },
       { key: "docking_score", label: "对接分数" },
-      { key: "evidence_summary", label: "结构证据" },
+      { key: "summary", label: "结构证据" },
       { key: "status", label: "状态" },
+      { key: "viewer_status", label: "查看器" },
     ];
   }
   if (kind === "md") {
     return [
       { key: "candidate_id", label: "候选编号" },
       { key: "target_id", label: "目标编号" },
+      { key: "target_name", label: "目标名称" },
       { key: "md_score", label: "动力学分数" },
       { key: "rmsd", label: "RMSD" },
+      { key: "rmsf", label: "RMSF" },
+      { key: "ligand_drift", label: "配体漂移" },
       { key: "contact_occupancy", label: "接触占有率" },
+      { key: "summary", label: "摘要" },
       { key: "status", label: "状态" },
+      { key: "trajectory_status", label: "轨迹图" },
     ];
   }
   return common;

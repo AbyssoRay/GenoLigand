@@ -202,13 +202,8 @@ fn route_run(
             "metagenome_potential_matches.tsv",
             "genome_context",
         ),
-        ("GET", "structure") => table_endpoint_json(
-            options,
-            &run_id,
-            "structure_patch_summary.tsv",
-            "structure_rows",
-        ),
-        ("GET", "md-summary") => table_endpoint_json(options, &run_id, "md_summary.tsv", "md_rows"),
+        ("GET", "structure") => structure_endpoint_json(options, &run_id),
+        ("GET", "md-summary") => md_endpoint_json(options, &run_id),
         ("POST", "cancel") => update_run_state(options, &run_id, "cancelled"),
         ("POST", "resume") => update_run_state(options, &run_id, "resumable"),
         _ => {
@@ -662,6 +657,42 @@ fn candidate_detail_json(options: &ServerOptions, run_id: &str) -> Value {
     })
 }
 
+fn structure_endpoint_json(options: &ServerOptions, run_id: &str) -> Value {
+    let Some(run_dir) = find_run_dir(options, run_id) else {
+        return json!({"run_id":run_id,"structure_rows":[],"row_count":0,"has_output":false});
+    };
+    let path = run_dir.join("structure_patch_summary.tsv");
+    let targets = candidate_target_lookup(&run_dir);
+    let rows = read_tsv_rows(&path)
+        .into_iter()
+        .map(|row| user_structure_row(&row, &targets))
+        .collect::<Vec<_>>();
+    json!({
+        "run_id": run_id,
+        "structure_rows": rows,
+        "row_count": rows_len(&path),
+        "has_output": path.exists()
+    })
+}
+
+fn md_endpoint_json(options: &ServerOptions, run_id: &str) -> Value {
+    let Some(run_dir) = find_run_dir(options, run_id) else {
+        return json!({"run_id":run_id,"md_rows":[],"row_count":0,"has_output":false});
+    };
+    let path = run_dir.join("md_summary.tsv");
+    let targets = candidate_target_lookup(&run_dir);
+    let rows = read_tsv_rows(&path)
+        .into_iter()
+        .map(|row| user_md_row(&row, &targets))
+        .collect::<Vec<_>>();
+    json!({
+        "run_id": run_id,
+        "md_rows": rows,
+        "row_count": rows_len(&path),
+        "has_output": path.exists()
+    })
+}
+
 fn user_candidate_detail_row(row: &Value) -> Value {
     let scores = row.get("scores").unwrap_or(&Value::Null);
     json!({
@@ -679,6 +710,81 @@ fn user_candidate_detail_row(row: &Value) -> Value {
         "evidence_summary": row.get("evidence_summary").cloned().unwrap_or_else(|| json!("")),
         "status": "\u{8ba1}\u{7b97}\u{5019}\u{9009}",
         "detail_source": "\u{5f53}\u{524d}\u{8fd0}\u{884c}\u{7684}\u{5019}\u{9009}\u{8be6}\u{60c5}\u{8f93}\u{51fa}"
+    })
+}
+
+fn user_structure_row(row: &Value, targets: &BTreeMap<String, (String, String)>) -> Value {
+    let candidate_id = row_text(row, "candidate_id");
+    let (fallback_target_id, fallback_target_name) = targets
+        .get(candidate_id)
+        .map(|value| (value.0.as_str(), value.1.as_str()))
+        .unwrap_or(("", ""));
+    let target_id = first_non_empty(row_text(row, "target_id"), fallback_target_id);
+    let target_name = first_non_empty(row_text(row, "target_name"), fallback_target_name);
+    let structure_score = row_text(row, "structure_score");
+    let docking_score = row_text(row, "docking_score");
+    let summary = first_non_empty(
+        row_text(row, "evidence_summary"),
+        first_non_empty(
+            row_text(row, "structure_evidence"),
+            first_non_empty(
+                row_text(row, "patch_evidence"),
+                row_text(row, "key_residues"),
+            ),
+        ),
+    );
+    json!({
+        "candidate_id": candidate_id,
+        "target_id": target_id,
+        "target_name": target_name,
+        "structure_score": structure_score,
+        "docking_score": docking_score,
+        "summary": summary,
+        "status": if structure_score.is_empty() && docking_score.is_empty() {
+            "\u{7b49}\u{5f85}\u{7ed3}\u{6784}\u{8f93}\u{51fa}"
+        } else {
+            "\u{5df2}\u{751f}\u{6210}\u{7ed3}\u{6784}\u{6458}\u{8981}"
+        },
+        "viewer_status": "\u{672a}\u{63a5}\u{5165}\u{53ef}\u{7528}\u{4e09}\u{7ef4}\u{67e5}\u{770b}\u{8f93}\u{51fa}"
+    })
+}
+
+fn user_md_row(row: &Value, targets: &BTreeMap<String, (String, String)>) -> Value {
+    let candidate_id = row_text(row, "candidate_id");
+    let (fallback_target_id, fallback_target_name) = targets
+        .get(candidate_id)
+        .map(|value| (value.0.as_str(), value.1.as_str()))
+        .unwrap_or(("", ""));
+    let target_id = first_non_empty(row_text(row, "target_id"), fallback_target_id);
+    let target_name = first_non_empty(row_text(row, "target_name"), fallback_target_name);
+    let md_score = first_non_empty(
+        row_text(row, "md_score"),
+        row_text(row, "md_stability_score"),
+    );
+    let contact_occupancy = row_text(row, "contact_occupancy");
+    let hydrogen_bond_occupancy = row_text(row, "hydrogen_bond_occupancy");
+    let interaction_persistence = row_text(row, "interaction_persistence");
+    let summary = md_summary_text(
+        contact_occupancy,
+        hydrogen_bond_occupancy,
+        interaction_persistence,
+    );
+    json!({
+        "candidate_id": candidate_id,
+        "target_id": target_id,
+        "target_name": target_name,
+        "md_score": md_score,
+        "rmsd": row_text(row, "rmsd"),
+        "rmsf": row_text(row, "rmsf"),
+        "ligand_drift": row_text(row, "ligand_drift"),
+        "contact_occupancy": contact_occupancy,
+        "summary": summary,
+        "status": if md_score.is_empty() && row_text(row, "rmsd").is_empty() {
+            "\u{7b49}\u{5f85}\u{52a8}\u{529b}\u{5b66}\u{8f93}\u{51fa}"
+        } else {
+            "\u{5df2}\u{751f}\u{6210}\u{52a8}\u{529b}\u{5b66}\u{6458}\u{8981}"
+        },
+        "trajectory_status": "\u{672a}\u{63a5}\u{5165}\u{53ef}\u{7528}\u{8f68}\u{8ff9}\u{56fe}\u{8f93}\u{51fa}"
     })
 }
 
@@ -702,6 +808,58 @@ fn user_evidence_row(row: Value) -> Value {
         "status": evidence_status_label(status),
         "summary": evidence_note_summary(notes)
     })
+}
+
+fn candidate_target_lookup(run_dir: &Path) -> BTreeMap<String, (String, String)> {
+    read_tsv_rows(&run_dir.join("target_candidate_ranking.tsv"))
+        .into_iter()
+        .filter_map(|row| {
+            let candidate_id = row_text(&row, "candidate_id");
+            if candidate_id.is_empty() {
+                None
+            } else {
+                Some((
+                    candidate_id.to_string(),
+                    (
+                        row_text(&row, "target_id").to_string(),
+                        row_text(&row, "target_name").to_string(),
+                    ),
+                ))
+            }
+        })
+        .collect()
+}
+
+fn row_text<'a>(row: &'a Value, key: &str) -> &'a str {
+    row.get(key).and_then(Value::as_str).unwrap_or_default()
+}
+
+fn first_non_empty<'a>(primary: &'a str, fallback: &'a str) -> &'a str {
+    if primary.trim().is_empty() {
+        fallback
+    } else {
+        primary
+    }
+}
+
+fn md_summary_text(contact: &str, hydrogen_bond: &str, persistence: &str) -> String {
+    let mut parts = Vec::new();
+    if !contact.trim().is_empty() {
+        parts.push(format!(
+            "\u{63a5}\u{89e6}\u{5360}\u{6709}\u{7387} {contact}"
+        ));
+    }
+    if !hydrogen_bond.trim().is_empty() {
+        parts.push(format!(
+            "\u{6c22}\u{952e}\u{5360}\u{6709}\u{7387} {hydrogen_bond}"
+        ));
+    }
+    if !persistence.trim().is_empty() {
+        parts.push(format!(
+            "\u{76f8}\u{4e92}\u{4f5c}\u{7528}\u{6301}\u{7eed}\u{6027} {persistence}"
+        ));
+    }
+    parts.join("\u{ff1b}")
 }
 
 fn evidence_type_label(claim: &str, artifact: &str) -> &'static str {
@@ -2136,6 +2294,16 @@ mod tests {
             r#"{"candidate_count":1,"candidates":[{"candidate_id":"C1","target_id":"P24941","target_name":"CDK2","candidate_scope":"known_database","organism":"Homo sapiens","scores":{"final":0.8,"known_database":0.7,"metagenome":0.0,"structure":0.1,"docking":0.0,"md":0.0},"evidence_summary":"matched current run","source_artifacts":["target_candidate_ranking.tsv"],"sha256":"abc123","path":"D:/hidden"}]}"#,
         )
         .expect("candidate detail");
+        fs::write(
+            run_dir.join("structure_patch_summary.tsv"),
+            "candidate_id\tstructure_score\tstructure_evidence\tbinding_patch\tpatch_evidence\tkey_residues\tdocking_score\tdocking_pose\tligand_position\tinteraction_residues\nC1\t0.60\tworker_structure\tpatch_internal\tworker_patch\tHIS57\t0.50\tpose_internal\tligand_internal\tHIS57\n",
+        )
+        .expect("structure");
+        fs::write(
+            run_dir.join("md_summary.tsv"),
+            "candidate_id\trmsd\trmsf\tligand_drift\thydrogen_bond_occupancy\tcontact_occupancy\tinteraction_persistence\tmd_risk_flags\tmd_score_decomposition\tmd_stability_score\nC1\t1.2\t0.4\t0.6\t0.72\t0.81\t0.77\tstable_internal\tscore_internal\t0.8\n",
+        )
+        .expect("md");
         fs::write(run_dir.join("run_context.json"), r#"{"path":"hidden"}"#).expect("context");
         fs::write(run_dir.join("artifact_source_map.tsv"), "hidden\n").expect("source trace");
         fs::write(run_dir.join("research_report.md"), "# Report\n").expect("report");
@@ -2157,6 +2325,8 @@ mod tests {
             logs_json(&options, "run-1"),
             candidate_detail_json(&options, "run-1"),
             evidence_endpoint_json(&options, "run-1"),
+            structure_endpoint_json(&options, "run-1"),
+            md_endpoint_json(&options, "run-1"),
             table_endpoint_json(
                 &options,
                 "run-1",
@@ -2183,6 +2353,16 @@ mod tests {
             assert!(!text.contains("evidence_artifact"));
             assert!(!text.contains("sha256"));
             assert!(!text.contains("abc123"));
+            assert!(!text.contains("binding_patch"));
+            assert!(!text.contains("patch_internal"));
+            assert!(!text.contains("docking_pose"));
+            assert!(!text.contains("pose_internal"));
+            assert!(!text.contains("ligand_position"));
+            assert!(!text.contains("ligand_internal"));
+            assert!(!text.contains("md_risk_flags"));
+            assert!(!text.contains("stable_internal"));
+            assert!(!text.contains("md_score_decomposition"));
+            assert!(!text.contains("score_internal"));
             assert!(!text.contains("prepare_science_store"));
             assert!(!text.contains("download_and_index"));
             assert!(!text.contains("install_or_repair"));
