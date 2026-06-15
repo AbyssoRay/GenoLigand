@@ -123,6 +123,7 @@ fn route(
             json!({"name":PRODUCT_NAME,"version":PRODUCT_VERSION,"science_flow":"scientific_pipeline"})
         }
         ("GET", "/api/user/projects") => user_projects_json(options),
+        ("POST", "/api/user/projects") => create_user_project(options),
         ("GET", "/api/projects") => projects_json(options),
         ("POST", "/api/projects") => create_project(options),
         ("GET", "/api/user/databases") => user_databases_json(options),
@@ -240,12 +241,7 @@ fn user_projects_json(options: &ServerOptions) -> Value {
             if entry.file_type().map(|file| file.is_dir()).unwrap_or(false) {
                 let id = entry.file_name().to_string_lossy().to_string();
                 let project = read_project(options, &id);
-                projects.push(json!({
-                    "project_id": project.get("project_id").cloned().unwrap_or(Value::Null),
-                    "project_name": project.get("project_name").cloned().unwrap_or(Value::Null),
-                    "project_status": project.get("project_status").cloned().unwrap_or(Value::Null),
-                    "latest_run_id": project.get("latest_run_id").cloned().unwrap_or(Value::Null)
-                }));
+                projects.push(user_project_summary(&project));
             }
         }
     }
@@ -263,17 +259,55 @@ fn user_projects_json(options: &ServerOptions) -> Value {
 }
 
 fn create_project(options: &ServerOptions) -> Value {
+    match create_project_record(options) {
+        Ok(project) => json!({"status":"created","project":project}),
+        Err(err) => json!({"status":"failed","error":err}),
+    }
+}
+
+fn create_user_project(options: &ServerOptions) -> Value {
+    match create_project_record(options) {
+        Ok(project) => {
+            json!({"project":user_project_summary(&project),"message":"空白工作台已创建"})
+        }
+        Err(_) => json!({"project":Value::Null,"message":"无法创建空白工作台，请检查安装目录权限"}),
+    }
+}
+
+fn create_project_record(options: &ServerOptions) -> Result<Value, String> {
     let project_id = format!("project-{}", now_millis());
     let dir = project_dir(options, &project_id);
     if let Err(err) = fs::create_dir_all(dir.join("runs")) {
-        return json!({"status":"failed","error":err.to_string()});
+        return Err(err.to_string());
     }
     let _ = write_text(
         &dir.join("input_manifest.json"),
         "{\"inputs\":[],\"files\":[],\"status\":\"waiting_for_user_input\"}\n",
     );
-    let project = read_project(options, &project_id);
-    json!({"status":"created","project":project})
+    Ok(read_project(options, &project_id))
+}
+
+fn user_project_summary(project: &Value) -> Value {
+    let status = project
+        .get("project_status")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    json!({
+        "project_id": project.get("project_id").cloned().unwrap_or(Value::Null),
+        "project_name": project.get("project_name").cloned().unwrap_or(Value::Null),
+        "project_state": friendly_project_state(status),
+        "latest_run_id": project.get("latest_run_id").cloned().unwrap_or(Value::Null)
+    })
+}
+
+fn friendly_project_state(status: &str) -> &'static str {
+    match status {
+        "completed" => "已完成运行",
+        "running" => "运行中",
+        "failed" => "需要处理",
+        "blocked" => "等待处理",
+        _ => "等待输入",
+    }
 }
 
 fn read_project(options: &ServerOptions, project_id: &str) -> Value {
@@ -2404,6 +2438,26 @@ mod tests {
         assert!(!text.contains("remote"));
         assert!(!text.contains("supported_actions"));
         assert!(!text.contains("preflight"));
+
+        fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn user_project_creation_hides_internal_status_and_actions() {
+        let root = std::env::temp_dir().join(format!("genoligand-user-create-{}", now_millis()));
+        let options = server_options(root.clone());
+
+        let payload = create_user_project(&options);
+        let text = payload.to_string();
+
+        assert!(payload.get("project").is_some());
+        assert!(payload["project"].get("project_id").is_some());
+        assert!(payload.get("message").is_some());
+        assert!(payload.get("status").is_none());
+        assert!(!text.contains("created"));
+        assert!(!text.contains("supported_actions"));
+        assert!(!text.contains("preflight"));
+        assert!(!text.contains("export"));
 
         fs::remove_dir_all(&root).ok();
     }

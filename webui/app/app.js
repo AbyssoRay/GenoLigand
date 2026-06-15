@@ -838,7 +838,7 @@ async function saveInput() {
   }
   state.alert = "";
   if (!state.project) {
-    const created = await api("/api/projects", { method: "POST", body: "{}" });
+    const created = await api("/api/user/projects", { method: "POST", body: "{}" });
     state.project = created.project;
   }
   const inputPayload = {
@@ -1228,7 +1228,7 @@ function artifactRows() {
       <table>
         <thead><tr><th>输出</th><th>状态</th></tr></thead>
         <tbody>
-          ${items.map((item) => `<tr><td>${friendlyArtifact(item.id || item.path)}</td><td><span class="status-pill ${item.exists ? "ready" : "waiting"}">${item.exists ? "已生成" : "未生成"}</span></td></tr>`).join("")}
+          ${items.map((item) => `<tr><td>${friendlyArtifact(item.label || item.id)}</td><td><span class="status-pill ${item.exists ? "ready" : "waiting"}">${item.exists ? "已生成" : "未生成"}</span></td></tr>`).join("")}
         </tbody>
       </table>
     </div>`;
