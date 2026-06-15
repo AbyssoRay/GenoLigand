@@ -188,20 +188,10 @@ fn route_run(
         ("GET", "") => run_json(options, &run_id),
         ("GET", "logs") => logs_json(options, &run_id),
         ("GET", "artifacts") => artifacts_json(options, &run_id),
-        ("GET", "candidates") => table_endpoint_json(
-            options,
-            &run_id,
-            "target_candidate_ranking.tsv",
-            "candidates",
-        ),
+        ("GET", "candidates") => candidates_endpoint_json(options, &run_id),
         ("GET", "candidate-detail") => candidate_detail_json(options, &run_id),
         ("GET", "evidence") => evidence_endpoint_json(options, &run_id),
-        ("GET", "genome-context") => table_endpoint_json(
-            options,
-            &run_id,
-            "metagenome_potential_matches.tsv",
-            "genome_context",
-        ),
+        ("GET", "genome-context") => genome_endpoint_json(options, &run_id),
         ("GET", "structure") => structure_endpoint_json(options, &run_id),
         ("GET", "md-summary") => md_endpoint_json(options, &run_id),
         ("POST", "cancel") => update_run_state(options, &run_id, "cancelled"),
@@ -601,20 +591,6 @@ fn download_artifact_response(
     }
 }
 
-fn table_endpoint_json(options: &ServerOptions, run_id: &str, file: &str, key: &str) -> Value {
-    let Some(run_dir) = find_run_dir(options, run_id) else {
-        return json!({"run_id":run_id,key:[],"row_count":0,"has_output":false});
-    };
-    let path = run_dir.join(file);
-    let rows = read_tsv_rows(&path);
-    json!({
-        "run_id": run_id,
-        key: rows,
-        "row_count": rows_len(&path),
-        "has_output": path.exists()
-    })
-}
-
 fn evidence_endpoint_json(options: &ServerOptions, run_id: &str) -> Value {
     let Some(run_dir) = find_run_dir(options, run_id) else {
         return json!({"run_id":run_id,"evidence":[],"row_count":0,"has_output":false});
@@ -627,6 +603,23 @@ fn evidence_endpoint_json(options: &ServerOptions, run_id: &str) -> Value {
     json!({
         "run_id": run_id,
         "evidence": rows,
+        "row_count": rows_len(&path),
+        "has_output": path.exists()
+    })
+}
+
+fn candidates_endpoint_json(options: &ServerOptions, run_id: &str) -> Value {
+    let Some(run_dir) = find_run_dir(options, run_id) else {
+        return json!({"run_id":run_id,"candidates":[],"row_count":0,"has_output":false});
+    };
+    let path = run_dir.join("target_candidate_ranking.tsv");
+    let rows = read_tsv_rows(&path)
+        .into_iter()
+        .map(|row| user_candidate_row(&row))
+        .collect::<Vec<_>>();
+    json!({
+        "run_id": run_id,
+        "candidates": rows,
         "row_count": rows_len(&path),
         "has_output": path.exists()
     })
@@ -690,6 +683,54 @@ fn md_endpoint_json(options: &ServerOptions, run_id: &str) -> Value {
         "md_rows": rows,
         "row_count": rows_len(&path),
         "has_output": path.exists()
+    })
+}
+
+fn genome_endpoint_json(options: &ServerOptions, run_id: &str) -> Value {
+    let Some(run_dir) = find_run_dir(options, run_id) else {
+        return json!({"run_id":run_id,"genome_context":[],"row_count":0,"has_output":false});
+    };
+    let path = run_dir.join("metagenome_potential_matches.tsv");
+    let rows = read_tsv_rows(&path)
+        .into_iter()
+        .map(|row| user_genome_row(&row))
+        .collect::<Vec<_>>();
+    json!({
+        "run_id": run_id,
+        "genome_context": rows,
+        "row_count": rows_len(&path),
+        "has_output": path.exists()
+    })
+}
+
+fn user_candidate_row(row: &Value) -> Value {
+    json!({
+        "rank": row_text(row, "rank"),
+        "candidate_id": row_text(row, "candidate_id"),
+        "target_id": row_text(row, "target_id"),
+        "target_name": row_text(row, "target_name"),
+        "candidate_scope": row_text(row, "candidate_scope"),
+        "organism": row_text(row, "organism"),
+        "final_score": row_text(row, "final_score"),
+        "known_database_score": row_text(row, "known_database_score"),
+        "metagenome_score": row_text(row, "metagenome_score"),
+        "structure_score": row_text(row, "structure_score"),
+        "docking_score": row_text(row, "docking_score"),
+        "md_score": row_text(row, "md_score"),
+        "evidence_summary": row_text(row, "evidence_summary"),
+        "status": first_non_empty(row_text(row, "status"), "computed_prediction")
+    })
+}
+
+fn user_genome_row(row: &Value) -> Value {
+    json!({
+        "source": friendly_match_source(row_text(row, "source")),
+        "target_id": row_text(row, "target_id"),
+        "target_name": row_text(row, "target_name"),
+        "organism": row_text(row, "organism"),
+        "target_class": row_text(row, "target_class"),
+        "match_score": row_text(row, "match_score"),
+        "evidence": row_text(row, "evidence")
     })
 }
 
@@ -860,6 +901,28 @@ fn md_summary_text(contact: &str, hydrogen_bond: &str, persistence: &str) -> Str
         ));
     }
     parts.join("\u{ff1b}")
+}
+
+fn friendly_match_source(source: &str) -> String {
+    let trimmed = source.trim();
+    let lowered = trimmed.to_ascii_lowercase();
+    if lowered.contains("metagenome") || lowered.contains("orf") {
+        "\u{5b8f}\u{57fa}\u{56e0}\u{7ec4}\u{6f5c}\u{5728}\u{5e8f}\u{5217}\u{7d22}\u{5f15}"
+            .to_string()
+    } else if lowered.contains("chembl")
+        || lowered.contains("bindingdb")
+        || lowered.contains("uniprot")
+    {
+        "\u{5df2}\u{77e5}\u{86cb}\u{767d}\u{6570}\u{636e}\u{5e93}".to_string()
+    } else if trimmed.contains('/')
+        || trimmed.contains('\\')
+        || trimmed.ends_with(".tsv")
+        || trimmed.ends_with(".json")
+    {
+        "\u{79d1}\u{5b66}\u{6570}\u{636e}\u{5e93}".to_string()
+    } else {
+        trimmed.to_string()
+    }
 }
 
 fn evidence_type_label(claim: &str, artifact: &str) -> &'static str {
@@ -2281,9 +2344,14 @@ mod tests {
         fs::write(run_dir.join("current_command.txt"), "cargo run hidden\n").expect("command");
         fs::write(
             run_dir.join("target_candidate_ranking.tsv"),
-            "candidate_id\nC1\n",
+            "rank\tcandidate_id\ttarget_id\ttarget_name\tcandidate_scope\torganism\tfinal_score\tknown_database_score\tmetagenome_score\tstructure_score\tdocking_score\tmd_score\tevidence_summary\tstatus\tsha256\tdebug_path\n1\tC1\tP24941\tCDK2\tknown_database\tHomo sapiens\t0.80\t0.70\t0.00\t0.10\t0.00\t0.00\tmatched current run\tcomputed_prediction\tabc123\tD:/hidden\n",
         )
         .expect("candidate table");
+        fs::write(
+            run_dir.join("metagenome_potential_matches.tsv"),
+            "input_id\tsource\ttarget_id\ttarget_name\torganism\ttarget_class\tmatch_score\tmatched_features\tevidence\tsha256\tdebug_path\ninput_1\tD:/hidden/metagenome_targets.tsv\tMG1\tPotential ORF\tunknown\tprotein\t0.66\tmotif\tsequence evidence\tabc123\tD:/hidden\n",
+        )
+        .expect("genome context");
         fs::write(
             run_dir.join("evidence_ledger.tsv"),
             "claim_id\tevidence_artifact\towner\tstatus\tnotes\nscore_decomposition\tscore_decomposition.tsv\tGenoLigand\tavailable\tsha256:abc123\n",
@@ -2325,14 +2393,10 @@ mod tests {
             logs_json(&options, "run-1"),
             candidate_detail_json(&options, "run-1"),
             evidence_endpoint_json(&options, "run-1"),
+            candidates_endpoint_json(&options, "run-1"),
+            genome_endpoint_json(&options, "run-1"),
             structure_endpoint_json(&options, "run-1"),
             md_endpoint_json(&options, "run-1"),
-            table_endpoint_json(
-                &options,
-                "run-1",
-                "target_candidate_ranking.tsv",
-                "candidates",
-            ),
         ];
         for response in responses {
             let text = response.to_string();
@@ -2344,6 +2408,9 @@ mod tests {
             assert!(!text.contains("artifact_backed"));
             assert!(!text.contains("source_path"));
             assert!(!text.contains("cargo run hidden"));
+            assert!(!text.contains("D:/hidden"));
+            assert!(!text.contains("debug_path"));
+            assert!(!text.contains("matched_features"));
             assert!(!text.contains(&root.display().to_string()));
             assert!(!text.contains("input_manifest"));
             assert!(!text.contains("science_store_manifest"));
