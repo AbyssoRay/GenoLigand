@@ -436,8 +436,7 @@ function installCatalogSummary() {
 function installerDownloadSummary() {
   const downloads = state.setupRepair?.installer?.downloads;
   if (!downloads) return "";
-  const status = downloads.status || "unknown";
-  const ok = status === "ready" || status === "skipped";
+  const ok = downloads.completed === true;
   const message = downloads.message || (ok ? "科学资源下载步骤已完成。" : "科学资源下载状态需要检查。");
   const next = downloads.next_action || (ok ? "继续" : "重新运行安装/修复");
   return `

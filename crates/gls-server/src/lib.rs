@@ -1372,14 +1372,15 @@ fn setup_installer_summary(stdout: &str) -> Option<Value> {
         .unwrap_or_else(|| json!({}));
     let resources = setup_user_resources(payload.get("resources"));
     let external_sources = setup_user_external_sources(payload.get("external_sources"));
+    let download_status = downloads
+        .get("status")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
     Some(json!({
-        "status": payload.get("status").cloned().unwrap_or_else(|| json!("unknown")),
-        "runtime_backend": payload.get("runtime_backend").cloned().unwrap_or_else(|| json!("unknown")),
         "summary": payload.get("summary").cloned().unwrap_or_else(|| json!("")),
         "next_action": payload.get("next_action").cloned().unwrap_or_else(|| json!("运行安装/修复")),
-        "missing_components_count": payload.get("missing_components_count").cloned().unwrap_or_else(|| json!(0)),
         "downloads": {
-            "status": downloads.get("status").cloned().unwrap_or_else(|| json!("unknown")),
+            "completed": matches!(download_status, "ready" | "skipped"),
             "ready": downloads.get("ready").cloned().unwrap_or_else(|| json!(0)),
             "failed": downloads.get("failed").cloned().unwrap_or_else(|| json!(0)),
             "message": downloads.get("message").cloned().unwrap_or_else(|| json!("")),
@@ -1497,11 +1498,9 @@ fn setup_user_external_sources(external_sources: Option<&Value>) -> Value {
         .and_then(Value::as_u64)
         .unwrap_or(total.saturating_sub(ready));
     json!({
-        "status": external_sources.get("status").cloned().unwrap_or_else(|| json!("unknown")),
         "ready": ready,
         "total": total,
         "needs_action": needs_action,
-        "message": external_sources.get("message").cloned().unwrap_or_else(|| json!("")),
         "next_action": external_sources.get("next_action").cloned().unwrap_or_else(|| json!("运行安装/修复")),
         "items": items
     })
@@ -2292,14 +2291,12 @@ mod tests {
     #[test]
     fn setup_installer_summary_keeps_user_relevant_fields_only() {
         let payload = setup_installer_summary(
-            r#"{"status":"needs_repair","summary":"安装/修复已执行，但仍有资源需要准备。","next_action":"补齐缺失资源后重新运行安装/修复","missing_components_count":3,"debug":{"command":["cargo","run"],"stdout":"raw"},"downloads":{"status":"not_configured","ready":0,"failed":0,"message":"安装包未包含科学资源下载清单，科学仓库尚未准备完成。","next_action":"使用包含科学资源清单的完整安装包重新运行安装/修复"}}"#,
+            r#"{"status":"needs_repair","runtime_backend":"WSL2","summary":"安装/修复已执行，但仍有资源需要准备。","next_action":"补齐缺失资源后重新运行安装/修复","missing_components_count":3,"debug":{"command":["cargo","run"],"stdout":"raw"},"downloads":{"status":"not_configured","ready":0,"failed":0,"message":"安装包未包含科学资源下载清单，科学仓库尚未准备完成。","next_action":"使用包含科学资源清单的完整安装包重新运行安装/修复"}}"#,
         )
         .expect("installer json");
 
-        assert_eq!(payload["status"], "needs_repair");
-        assert_eq!(payload["missing_components_count"], 3);
         assert_eq!(payload["next_action"], "补齐缺失资源后重新运行安装/修复");
-        assert_eq!(payload["downloads"]["status"], "not_configured");
+        assert_eq!(payload["downloads"]["completed"], false);
         assert_eq!(payload["downloads"]["ready"], 0);
         assert_eq!(
             payload["downloads"]["message"],
@@ -2313,6 +2310,11 @@ mod tests {
         assert!(payload.get("debug").is_none());
         assert!(payload.get("command").is_none());
         assert!(payload.get("stdout").is_none());
+        let text = payload.to_string();
+        assert!(!text.contains("needs_repair"));
+        assert!(!text.contains("runtime_backend"));
+        assert!(!text.contains("missing_components_count"));
+        assert!(!text.contains("not_configured"));
     }
 
     #[test]
@@ -2352,6 +2354,8 @@ mod tests {
             "运行安装/修复以同步 PLINDER 结构数据"
         );
         let text = payload.to_string();
+        assert!(!text.contains("needs_sync"));
+        assert!(!text.contains("大型科学资源同步状态已检查"));
         assert!(!text.contains("gs://"));
         assert!(!text.contains("landing_url"));
         assert!(!text.contains("target_path"));
