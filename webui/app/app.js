@@ -484,11 +484,33 @@ function renderRun() {
         <h2>运行摘要</h2>
         ${metricRow("当前状态", runStateLabel(runState))}
         ${metricRow("下一步", nextActionText())}
-        ${metricRow("候选数量", `${candidateRows().length}`)}
+        ${metricRow("候选数量", candidateCountText())}
         ${metricRow("阻塞原因", state.run?.failure_summary || "无")}
       </section>
+      <section class="panel">
+        <h2>资源计划</h2>
+        ${metricRow("候选量", candidateForecastText())}
+        ${metricRow("时间等级", runtimeClassText())}
+        ${metricRow("GPU 建议", gpuAdviceText())}
+        ${metricRow("CPU 路径", cpuPathText())}
+        ${metricRow("磁盘需求", storageNeedText())}
+      </section>
+      <section class="panel">
+        <h2>当前资源</h2>
+        ${resourceStatusRows()}
+      </section>
       <section class="panel full">
-        <h2>输出文件</h2>
+        <div class="panel-header">
+          <div>
+            <h2>恢复建议</h2>
+            <p>如果运行被阻塞，先处理这里列出的下一步，再重新检查。</p>
+          </div>
+          <span class="status-pill ${blockedActionRows().length ? "blocked" : "ready"}">${blockedActionRows().length ? "需要处理" : "无需处理"}</span>
+        </div>
+        ${failureRecoveryRows()}
+      </section>
+      <section class="panel full">
+        <h2>可导出结果</h2>
         ${artifactRows()}
       </section>
       <section class="panel full">
@@ -1020,6 +1042,83 @@ function nextActionText() {
   if (state.run.state === "blocked") return "查看阻塞原因";
   if (state.run.state === "failed") return "查看日志并修复";
   return "等待当前阶段完成";
+}
+
+function candidateCountText() {
+  const count = candidateRows().length;
+  if (count > 0) return `${count}`;
+  if (state.run?.state === "completed") return "0";
+  return "运行完成后计算";
+}
+
+function candidateForecastText() {
+  if (!state.project) return "保存输入后评估";
+  if (!state.preflight) return "预检查后评估";
+  if (!canStartRun()) return "资源补齐后评估";
+  return "由数据库命中和结构证据决定";
+}
+
+function runtimeClassText() {
+  if (!state.project) return "未评估";
+  const filled = usableInputs().length;
+  const structureReady = sourceReady("structure");
+  if (filled > 2 || structureReady) return "中到高";
+  return "低到中";
+}
+
+function gpuAdviceText() {
+  if (!sourceReady("structure")) return "结构和动力学工具未就绪时不启动相关计算";
+  return "可用于对接和短动力学筛选";
+}
+
+function cpuPathText() {
+  if (!state.project) return "等待输入";
+  return "输入整理、特征计算和数据库比对可先执行";
+}
+
+function storageNeedText() {
+  const available = state.setup?.database_ready === true;
+  if (available) return "科学仓库已由安装流程维护";
+  return "先运行安装/修复以准备数据库和索引";
+}
+
+function resourceStatusRows() {
+  const rows = [
+    ["研究输入", state.project ? "已保存" : "未保存"],
+    ["科学仓库", sourceReady("known") || sourceReady("metagenome") ? "已读取状态" : "需要准备"],
+    ["已知蛋白索引", sourceReady("known") ? "就绪" : "需要准备"],
+    ["宏基因组索引", sourceReady("metagenome") ? "就绪" : "需要准备"],
+    ["结构/动力学工具", sourceReady("structure") ? "就绪" : "需要准备"],
+  ];
+  return rows.map(([label, value]) => metricRow(label, value)).join("");
+}
+
+function blockedActionRows() {
+  return preflightGroups()
+    .flatMap((group) =>
+      group.rows
+        .filter((row) => !row.ready)
+        .map((row) => ({
+          group: group.title,
+          label: row.label,
+          next: row.next,
+        }))
+    );
+}
+
+function failureRecoveryRows() {
+  const rows = blockedActionRows();
+  if (!rows.length) {
+    return `<div class="empty">当前没有阻塞项。可以开始运行，或等待当前运行完成后查看结果。</div>`;
+  }
+  return table(
+    rows,
+    [
+      { key: "group", label: "分组" },
+      { key: "label", label: "项目" },
+      { key: "next", label: "下一步" },
+    ],
+  );
 }
 
 function candidateRows() {
