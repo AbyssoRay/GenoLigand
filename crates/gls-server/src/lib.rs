@@ -599,7 +599,7 @@ fn download_artifact_response(
 
 fn table_endpoint_json(options: &ServerOptions, run_id: &str, file: &str, key: &str) -> Value {
     let Some(run_dir) = find_run_dir(options, run_id) else {
-        return json!({"run_id":run_id,key:[],"row_count":0,"artifact_backed":false});
+        return json!({"run_id":run_id,key:[],"row_count":0,"has_output":false});
     };
     let path = run_dir.join(file);
     let rows = read_tsv_rows(&path);
@@ -607,7 +607,7 @@ fn table_endpoint_json(options: &ServerOptions, run_id: &str, file: &str, key: &
         "run_id": run_id,
         key: rows,
         "row_count": rows_len(&path),
-        "artifact_backed": path.exists()
+        "has_output": path.exists()
     })
 }
 
@@ -1409,6 +1409,7 @@ mod tests {
             assert!(!text.contains("current_command"));
             assert!(!text.contains("failure_reason"));
             assert!(!text.contains("artifact_root"));
+            assert!(!text.contains("artifact_backed"));
             assert!(!text.contains("source_path"));
             assert!(!text.contains("cargo run hidden"));
             assert!(!text.contains(&root.display().to_string()));

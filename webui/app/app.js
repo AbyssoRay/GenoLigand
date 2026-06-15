@@ -525,7 +525,7 @@ function resultTracePanel() {
       ${metricRow("运行编号", runId)}
       ${metricRow("数据库状态", databaseReady ? "就绪" : "未就绪")}
       ${metricRow("候选来源", candidateRows().length ? "候选排序输出" : "暂无候选输出")}
-      ${metricRow("证据来源", state.runData?.evidence?.artifact_backed ? "证据链输出" : "暂无证据输出")}
+      ${metricRow("证据来源", state.runData?.evidence?.has_output ? "证据链输出" : "暂无证据输出")}
     </section>`;
 }
 
