@@ -177,7 +177,7 @@ function renderInput() {
             <h2>选择输入类型</h2>
             <p>可以填写一种或多种输入。只有用户填写的内容会进入计算。</p>
           </div>
-          <span class="status-pill ${inputsReadyToSave() ? "ready" : "blocked"}">${inputStatusLabel()}</span>
+          <span class="status-pill ${inputsReadyToSave() ? "ready" : "blocked"}" data-input-status>${inputStatusLabel()}</span>
         </div>
         <div class="input-grid">
           ${inputSpecs.map(renderInputTypeCard).join("")}
@@ -198,11 +198,11 @@ function renderInput() {
         <div class="field">
           <label for="${active.field}">${active.label}</label>
           <textarea id="${active.field}" data-form="${active.field}" placeholder="${escapeAttr(active.placeholder)}">${escapeHtml(state.form[active.field])}</textarea>
-          <div class="field-help ${activeValidation.ready ? "ready-text" : activeValidation.value ? "blocked-text" : ""}">${escapeHtml(activeValidation.message)}</div>
+          <div class="field-help ${activeValidation.ready ? "ready-text" : activeValidation.value ? "blocked-text" : ""}" data-active-validation>${escapeHtml(activeValidation.message)}</div>
         </div>
         <div class="actions">
-          <button class="button" data-action="save-input" ${saveDisabled}>保存输入</button>
-          <button class="button secondary" data-action="save-and-check" ${saveDisabled}>保存并检查</button>
+          <button class="button" data-action="save-input" data-save-button ${saveDisabled}>保存输入</button>
+          <button class="button secondary" data-action="save-and-check" data-save-button ${saveDisabled}>保存并检查</button>
           <button class="button ghost" data-action="clear-input">清空当前输入</button>
         </div>
       </section>
@@ -238,7 +238,7 @@ function renderInputTypeCard(spec) {
     <button class="input-card ${selected ? "selected" : ""}" data-select-input="${spec.kind}">
       <h3>${spec.title}</h3>
       <p>${spec.minimum}</p>
-      <span class="status-pill ${usable ? "ready" : "blocked"}">${usable ? "可用" : filled ? "需检查" : "未填写"}</span>
+      <span class="status-pill ${usable ? "ready" : "blocked"}" data-input-card-status="${spec.field}">${usable ? "可用" : filled ? "需检查" : "未填写"}</span>
     </button>`;
 }
 
@@ -251,7 +251,10 @@ function bindInputEvents() {
     });
   });
   page.querySelectorAll("[data-form]").forEach((field) => {
-    field.addEventListener("input", collectForm);
+    field.addEventListener("input", () => {
+      collectForm();
+      updateInputValidationUi();
+    });
   });
   page.querySelector("[data-action='save-input']").addEventListener("click", saveInput);
   page.querySelector("[data-action='save-and-check']").addEventListener("click", async () => {
@@ -265,6 +268,32 @@ function bindInputEvents() {
     const active = inputSpecs.find((item) => item.kind === state.selectedInput);
     state.form[active.field] = "";
     renderInput();
+  });
+}
+
+function updateInputValidationUi() {
+  const active = inputSpecs.find((item) => item.kind === state.selectedInput) || inputSpecs[0];
+  const validation = inputValidation(active);
+  const status = page.querySelector("[data-input-status]");
+  if (status) {
+    status.textContent = inputStatusLabel();
+    status.className = `status-pill ${inputsReadyToSave() ? "ready" : "blocked"}`;
+  }
+  const activeHelp = page.querySelector("[data-active-validation]");
+  if (activeHelp) {
+    activeHelp.textContent = validation.message;
+    activeHelp.className = `field-help ${validation.ready ? "ready-text" : validation.value ? "blocked-text" : ""}`;
+  }
+  page.querySelectorAll("[data-save-button]").forEach((button) => {
+    button.disabled = !inputsReadyToSave();
+  });
+  inputSpecs.forEach((spec) => {
+    const statusNode = page.querySelector(`[data-input-card-status="${spec.field}"]`);
+    if (!statusNode) return;
+    const value = (state.form[spec.field] || "").trim();
+    const usable = inputValueUsable(spec.field, value);
+    statusNode.textContent = usable ? "可用" : value ? "需检查" : "未填写";
+    statusNode.className = `status-pill ${usable ? "ready" : "blocked"}`;
   });
 }
 
