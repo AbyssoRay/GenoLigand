@@ -566,6 +566,16 @@ fn build_store_indexes(
             &mut manifest,
         )?;
     }
+    let chembl_dir = options.science_store.join("downloads/chembl");
+    for path in discover_chembl_sqlite_sources(&chembl_dir)? {
+        append_canonical_rows(
+            "known_targets",
+            &options.science_store,
+            &path,
+            &mut known_rows,
+            &mut manifest,
+        )?;
+    }
     let uniprot_dir = options.science_store.join("downloads/uniprot");
     for path in discover_sequence_files(&uniprot_dir)? {
         let rows = parse_fasta_targets(
@@ -651,11 +661,11 @@ fn append_canonical_rows(
         ));
         return Ok(());
     }
-    let parsed = read_store_rows(path, index_name)?;
+    let (parsed, notes) = read_source_rows(path, index_name)?;
     let count = parsed.len();
     rows.extend(parsed);
     manifest.push_str(&format!(
-        "{index_name}\t{}\t{}\t{count}\t{}\tcanonical_target_rows\n",
+        "{index_name}\t{}\t{}\t{count}\t{}\t{notes}\n",
         relative_display(root, path),
         if count > 0 { "used" } else { "empty" },
         index_output_for(index_name)
@@ -713,6 +723,48 @@ fn discover_sequence_files_inner(root: &Path, out: &mut Vec<PathBuf>) -> Result<
         }
     }
     Ok(())
+}
+
+fn discover_chembl_sqlite_sources(root: &Path) -> Result<Vec<PathBuf>, String> {
+    let mut out = Vec::new();
+    if !root.exists() {
+        return Ok(out);
+    }
+    discover_chembl_sqlite_sources_inner(root, &mut out)?;
+    out.sort();
+    Ok(out)
+}
+
+fn discover_chembl_sqlite_sources_inner(root: &Path, out: &mut Vec<PathBuf>) -> Result<(), String> {
+    for entry in
+        fs::read_dir(root).map_err(|err| format!("read_dir_failed:{}:{err}", root.display()))?
+    {
+        let entry =
+            entry.map_err(|err| format!("read_dir_entry_failed:{}:{err}", root.display()))?;
+        let path = entry.path();
+        if path.is_dir() {
+            discover_chembl_sqlite_sources_inner(&path, out)?;
+        } else if is_chembl_sqlite_source(&path) {
+            out.push(path);
+        }
+    }
+    Ok(())
+}
+
+fn is_chembl_sqlite_source(path: &Path) -> bool {
+    let name = path
+        .file_name()
+        .and_then(|value| value.to_str())
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    is_sqlite_name(&name) || (name.ends_with(".tar.gz") && name.contains("chembl"))
+}
+
+fn is_sqlite_name(name: &str) -> bool {
+    name.ends_with(".sqlite")
+        || name.ends_with(".sqlite3")
+        || name.ends_with(".db")
+        || name.ends_with(".db3")
 }
 
 fn is_sequence_file(path: &Path) -> bool {
@@ -920,9 +972,39 @@ fn dedupe_store_rows(rows: Vec<StoreRow>) -> Vec<StoreRow> {
     for row in rows {
         by_key
             .entry((row.source.clone(), row.target_id.clone()))
+            .and_modify(|existing: &mut StoreRow| merge_store_row(existing, &row))
             .or_insert(row);
     }
     by_key.into_values().collect()
+}
+
+fn merge_store_row(existing: &mut StoreRow, row: &StoreRow) {
+    if existing.target_name == "unknown" && row.target_name != "unknown" {
+        existing.target_name = row.target_name.clone();
+    }
+    if existing.organism == "unknown" && row.organism != "unknown" {
+        existing.organism = row.organism.clone();
+    }
+    if existing.target_class != "known_human_protein" && row.target_class == "known_human_protein" {
+        existing.target_class = row.target_class.clone();
+    }
+    existing
+        .ligand_tokens
+        .extend(row.ligand_tokens.iter().cloned());
+    existing
+        .sequence_tokens
+        .extend(row.sequence_tokens.iter().cloned());
+    existing
+        .structure_tokens
+        .extend(row.structure_tokens.iter().cloned());
+    if !existing
+        .evidence
+        .split(';')
+        .any(|item| item == row.evidence)
+    {
+        existing.evidence.push(';');
+        existing.evidence.push_str(&row.evidence);
+    }
 }
 
 fn write_store_rows(path: &Path, rows: &[StoreRow]) -> Result<(), String> {
@@ -1069,17 +1151,21 @@ fn source_local_available(options: &StoreOptions, source: &RequiredSource) -> bo
         return true;
     }
     match source.id {
-        "chembl" => any_source_path_exists(
-            store,
-            &[
-                "imports/known_targets.tsv",
-                "imports/known_targets.tsv.gz",
-                "imports/known_targets.zip",
-                "downloads/chembl/known_targets.tsv",
-                "downloads/chembl/known_targets.tsv.gz",
-                "downloads/chembl/known_targets.zip",
-            ],
-        ),
+        "chembl" => {
+            any_source_path_exists(
+                store,
+                &[
+                    "imports/known_targets.tsv",
+                    "imports/known_targets.tsv.gz",
+                    "imports/known_targets.zip",
+                    "downloads/chembl/known_targets.tsv",
+                    "downloads/chembl/known_targets.tsv.gz",
+                    "downloads/chembl/known_targets.zip",
+                ],
+            ) || discover_chembl_sqlite_sources(&store.join("downloads/chembl"))
+                .map(|files| !files.is_empty())
+                .unwrap_or(false)
+        }
         "bindingdb" => any_source_path_exists(
             store,
             &[
@@ -2097,6 +2183,21 @@ fn read_normalized_inputs(path: &Path) -> Result<Vec<NormalizedInput>, String> {
     Ok(out)
 }
 
+fn read_source_rows(path: &Path, label: &str) -> Result<(Vec<StoreRow>, &'static str), String> {
+    let name = path
+        .file_name()
+        .and_then(|value| value.to_str())
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    if is_sqlite_name(&name) {
+        return parse_chembl_sqlite(path).map(|rows| (rows, "chembl_sqlite_rows"));
+    }
+    if name.ends_with(".tar.gz") && name.contains("chembl") {
+        return parse_chembl_sqlite_archive(path).map(|rows| (rows, "chembl_sqlite_archive_rows"));
+    }
+    read_store_rows(path, label).map(|rows| (rows, "canonical_or_source_table_rows"))
+}
+
 fn read_store_rows(path: &Path, label: &str) -> Result<Vec<StoreRow>, String> {
     let text = read_table_text(path).map_err(|err| format!("{label}_missing:{err}"))?;
     let mut lines = text.lines();
@@ -2127,6 +2228,178 @@ fn read_store_rows(path: &Path, label: &str) -> Result<Vec<StoreRow>, String> {
         });
     }
     Ok(rows)
+}
+
+fn parse_chembl_sqlite_archive(path: &Path) -> Result<Vec<StoreRow>, String> {
+    let file =
+        fs::File::open(path).map_err(|err| format!("open_failed:{}:{err}", path.display()))?;
+    let decoder = GzDecoder::new(file);
+    let mut archive = tar::Archive::new(decoder);
+    let entries = archive
+        .entries()
+        .map_err(|err| format!("tar_entries_failed:{}:{err}", path.display()))?;
+    for entry in entries {
+        let mut entry =
+            entry.map_err(|err| format!("tar_entry_failed:{}:{err}", path.display()))?;
+        let member_path = entry
+            .path()
+            .map_err(|err| format!("tar_member_path_failed:{}:{err}", path.display()))?;
+        let member_name = member_path
+            .file_name()
+            .and_then(|value| value.to_str())
+            .unwrap_or_default()
+            .to_ascii_lowercase();
+        if !is_sqlite_name(&member_name) {
+            continue;
+        }
+        let tmp_path = std::env::temp_dir().join(format!(
+            "genoligand_chembl_{}_{}_{}",
+            std::process::id(),
+            stable_hash(&path.display().to_string()),
+            safe_id(&member_name)
+        ));
+        entry
+            .unpack(&tmp_path)
+            .map_err(|err| format!("tar_unpack_failed:{}:{err}", path.display()))?;
+        let result = parse_chembl_sqlite(&tmp_path);
+        let _ = fs::remove_file(&tmp_path);
+        return result;
+    }
+    Err(format!("chembl_sqlite_member_missing:{}", path.display()))
+}
+
+fn parse_chembl_sqlite(path: &Path) -> Result<Vec<StoreRow>, String> {
+    let mut rows = Vec::new();
+    let output = run_python_script(
+        chembl_sqlite_query_script(),
+        &[path.display().to_string()],
+        "chembl_sqlite_query",
+    )?;
+    for line in output.lines() {
+        let cols = split_tsv(line);
+        if cols.len() < 12 {
+            continue;
+        }
+        rows.push(chembl_store_row(ChEMBLActivityRow {
+            target_id: cols[0].clone(),
+            target_name: cols[1].clone(),
+            organism: cols[2].clone(),
+            target_type: cols[3].clone(),
+            canonical_smiles: cols[4].clone(),
+            compound_name: cols[5].clone(),
+            standard_type: cols[6].clone(),
+            standard_relation: cols[7].clone(),
+            standard_value: cols[8].clone(),
+            standard_units: cols[9].clone(),
+            accessions: cols[10].clone(),
+            sequences: cols[11].clone(),
+        }));
+    }
+    Ok(rows)
+}
+
+fn chembl_sqlite_query_script() -> &'static str {
+    r#"
+import csv
+import sqlite3
+import sys
+
+query = """
+SELECT
+    t.chembl_id AS target_id,
+    COALESCE(t.pref_name, t.chembl_id) AS target_name,
+    COALESCE(t.organism, '') AS organism,
+    COALESCE(t.target_type, '') AS target_type,
+    COALESCE(cs.canonical_smiles, '') AS canonical_smiles,
+    COALESCE(md.pref_name, '') AS compound_name,
+    COALESCE(act.standard_type, '') AS standard_type,
+    COALESCE(act.standard_relation, '') AS standard_relation,
+    COALESCE(CAST(act.standard_value AS TEXT), '') AS standard_value,
+    COALESCE(act.standard_units, '') AS standard_units,
+    COALESCE(GROUP_CONCAT(DISTINCT cseq.accession), '') AS accessions,
+    COALESCE(GROUP_CONCAT(DISTINCT cseq.sequence), '') AS sequences
+FROM activities act
+JOIN assays a ON act.assay_id = a.assay_id
+JOIN target_dictionary t ON a.tid = t.tid
+LEFT JOIN molecule_dictionary md ON act.molregno = md.molregno
+LEFT JOIN compound_structures cs ON act.molregno = cs.molregno
+LEFT JOIN target_components tc ON t.tid = tc.tid
+LEFT JOIN component_sequences cseq ON tc.component_id = cseq.component_id
+WHERE act.standard_type IN ('Ki', 'Kd', 'IC50', 'EC50')
+  AND act.standard_value IS NOT NULL
+  AND (act.standard_units IS NULL OR act.standard_units = '' OR act.standard_units = 'nM')
+  AND (cs.canonical_smiles IS NOT NULL OR cseq.sequence IS NOT NULL)
+GROUP BY
+    t.chembl_id,
+    t.pref_name,
+    t.organism,
+    t.target_type,
+    cs.canonical_smiles,
+    md.pref_name,
+    act.standard_type,
+    act.standard_relation,
+    act.standard_value,
+    act.standard_units
+LIMIT 200000
+"""
+
+connection = sqlite3.connect(sys.argv[1])
+writer = csv.writer(sys.stdout, delimiter="\t", lineterminator="\n")
+for row in connection.execute(query):
+    writer.writerow(["" if value is None else value for value in row])
+"#
+}
+
+#[derive(Clone, Debug)]
+struct ChEMBLActivityRow {
+    target_id: String,
+    target_name: String,
+    organism: String,
+    target_type: String,
+    canonical_smiles: String,
+    compound_name: String,
+    standard_type: String,
+    standard_relation: String,
+    standard_value: String,
+    standard_units: String,
+    accessions: String,
+    sequences: String,
+}
+
+fn chembl_store_row(row: ChEMBLActivityRow) -> StoreRow {
+    let mut ligand_tokens = tokenize(&row.canonical_smiles);
+    ligand_tokens.extend(tokenize(&row.compound_name));
+    ligand_tokens.extend(tokenize(&row.standard_type));
+    ligand_tokens.extend(tokenize(&row.standard_relation));
+    ligand_tokens.extend(tokenize(&row.standard_value));
+    ligand_tokens.extend(tokenize(&row.standard_units));
+    let mut sequence_tokens = tokenize(&row.target_id);
+    sequence_tokens.extend(tokenize(&row.target_name));
+    sequence_tokens.extend(tokenize(&row.accessions));
+    sequence_tokens.extend(tokenize(&row.sequences));
+    let organism = if row.organism.trim().is_empty() {
+        "unknown".to_string()
+    } else {
+        row.organism
+    };
+    let target_class = if organism.to_ascii_lowercase().contains("homo sapiens")
+        || organism.to_ascii_lowercase().contains("human")
+    {
+        "known_human_protein"
+    } else {
+        "known_protein"
+    };
+    StoreRow {
+        source: "ChEMBL".to_string(),
+        target_id: row.target_id,
+        target_name: row.target_name,
+        organism,
+        target_class: target_class.to_string(),
+        ligand_tokens,
+        sequence_tokens,
+        structure_tokens: tokenize(&row.target_type),
+        evidence: "chembl_activity_row".to_string(),
+    }
 }
 
 fn is_bindingdb_header(headers: &[String]) -> bool {
@@ -2458,6 +2731,38 @@ fn clean_cell(value: &str) -> String {
     value.replace(['\t', '\r', '\n'], " ")
 }
 
+fn run_python_script(script: &str, args: &[String], context: &str) -> Result<String, String> {
+    let candidates: [(&str, &[&str]); 3] = [("python", &[]), ("python3", &[]), ("py", &["-3"])];
+    let mut errors = Vec::new();
+    for (program, prefix_args) in candidates {
+        let mut command = Command::new(program);
+        for arg in prefix_args {
+            command.arg(arg);
+        }
+        command.arg("-c").arg(script);
+        for arg in args {
+            command.arg(arg);
+        }
+        match command.output() {
+            Ok(output) if output.status.success() => {
+                return Ok(String::from_utf8_lossy(&output.stdout).to_string());
+            }
+            Ok(output) => errors.push(format!(
+                "{program}:{}",
+                String::from_utf8_lossy(&output.stderr)
+                    .lines()
+                    .next()
+                    .unwrap_or("script_failed")
+            )),
+            Err(err) => errors.push(format!("{program}:{err}")),
+        }
+    }
+    Err(format!(
+        "{context}_python_failed:{}",
+        clean_cell(&errors.join(" | "))
+    ))
+}
+
 fn safe_id(value: &str) -> String {
     let id = value
         .chars()
@@ -2660,7 +2965,7 @@ mod tests {
             read_text(&store.join("index_build_manifest.tsv")).expect("build manifest");
         assert!(known.contains("CHEMBL_T1"));
         assert!(metagenome.contains("MG_ORF_1"));
-        assert!(build_manifest.contains("canonical_target_rows"));
+        assert!(build_manifest.contains("canonical_or_source_table_rows"));
         assert!(build_manifest.contains("fasta_sequence_rows"));
         fs::remove_dir_all(&root).expect("cleanup temp root");
         assert!(!root.exists());
@@ -2741,6 +3046,69 @@ mod tests {
     }
 
     #[test]
+    fn prepare_science_store_builds_known_index_from_chembl_sqlite() {
+        let root = temp_root("build_chembl_sqlite");
+        let store = root.join("science_store");
+        write_chembl_sqlite(&store.join("downloads/chembl/chembl.sqlite"))
+            .expect("write chembl sqlite");
+        let options = StoreOptions {
+            workspace_root: root.clone(),
+            science_store: store.clone(),
+        };
+        let _ = run_store_command(ScienceCommand::PrepareScienceStore, &options)
+            .expect("prepare store");
+        let known = read_text(&store.join("indexes/known_targets.tsv")).expect("known index");
+        let requirements =
+            read_text(&store.join("source_requirements.tsv")).expect("source requirements");
+        let build_manifest =
+            read_text(&store.join("index_build_manifest.tsv")).expect("build manifest");
+
+        assert!(known.contains("ChEMBL"));
+        assert!(known.contains("CHEMBL_T1"));
+        assert!(known.contains("Cyclin-dependent kinase 2"));
+        assert!(known.contains("known_human_protein"));
+        assert!(known.contains("chembl_activity_row"));
+        assert!(known.contains("cco"));
+        assert!(known.contains("ccn"));
+        assert!(known.contains("p24"));
+        assert!(known.contains("249"));
+        assert!(known.contains("mkt"));
+        assert!(requirements.contains("chembl\tChEMBL\tknown_activity\tready"));
+        assert!(build_manifest.contains("chembl_sqlite_rows"));
+        fs::remove_dir_all(&root).expect("cleanup temp root");
+        assert!(!root.exists());
+    }
+
+    #[test]
+    fn prepare_science_store_builds_known_index_from_chembl_sqlite_archive() {
+        let root = temp_root("build_chembl_sqlite_archive");
+        let store = root.join("science_store");
+        let source_sqlite = root.join("chembl_source.sqlite");
+        write_chembl_sqlite(&source_sqlite).expect("write chembl sqlite");
+        write_tar_gzip_file(
+            &store.join("downloads/chembl/chembl_sqlite.tar.gz"),
+            "chembl_36/chembl_36_sqlite/chembl_36.db",
+            &source_sqlite,
+        )
+        .expect("write chembl archive");
+        let options = StoreOptions {
+            workspace_root: root.clone(),
+            science_store: store.clone(),
+        };
+        let _ = run_store_command(ScienceCommand::PrepareScienceStore, &options)
+            .expect("prepare store");
+        let known = read_text(&store.join("indexes/known_targets.tsv")).expect("known index");
+        let build_manifest =
+            read_text(&store.join("index_build_manifest.tsv")).expect("build manifest");
+
+        assert!(known.contains("ChEMBL"));
+        assert!(known.contains("CHEMBL_T1"));
+        assert!(build_manifest.contains("chembl_sqlite_archive_rows"));
+        fs::remove_dir_all(&root).expect("cleanup temp root");
+        assert!(!root.exists());
+    }
+
+    #[test]
     fn prepare_science_store_builds_known_index_from_bindingdb_activity_tsv() {
         let root = temp_root("build_bindingdb_table");
         let store = root.join("science_store");
@@ -2815,6 +3183,108 @@ mod tests {
             .finish()
             .map_err(|err| format!("zip_finish_failed:{}:{err}", path.display()))?;
         Ok(())
+    }
+
+    fn write_tar_gzip_file(
+        path: &Path,
+        member_name: &str,
+        source_path: &Path,
+    ) -> Result<(), String> {
+        use flate2::Compression;
+        use flate2::write::GzEncoder;
+
+        if let Some(parent) = path.parent() {
+            ensure_dir(parent)?;
+        }
+        let file = fs::File::create(path)
+            .map_err(|err| format!("create_failed:{}:{err}", path.display()))?;
+        let encoder = GzEncoder::new(file, Compression::default());
+        let mut builder = tar::Builder::new(encoder);
+        builder
+            .append_path_with_name(source_path, member_name)
+            .map_err(|err| format!("tar_append_failed:{}:{err}", path.display()))?;
+        let encoder = builder
+            .into_inner()
+            .map_err(|err| format!("tar_finish_failed:{}:{err}", path.display()))?;
+        encoder
+            .finish()
+            .map_err(|err| format!("gzip_finish_failed:{}:{err}", path.display()))?;
+        Ok(())
+    }
+
+    fn write_chembl_sqlite(path: &Path) -> Result<(), String> {
+        if let Some(parent) = path.parent() {
+            ensure_dir(parent)?;
+        }
+        run_python_script(
+            r#"
+import pathlib
+import sqlite3
+import sys
+
+path = pathlib.Path(sys.argv[1])
+path.parent.mkdir(parents=True, exist_ok=True)
+connection = sqlite3.connect(path)
+connection.executescript("""
+CREATE TABLE target_dictionary (
+    tid INTEGER PRIMARY KEY,
+    chembl_id TEXT NOT NULL,
+    pref_name TEXT,
+    organism TEXT,
+    target_type TEXT
+);
+CREATE TABLE assays (
+    assay_id INTEGER PRIMARY KEY,
+    tid INTEGER NOT NULL
+);
+CREATE TABLE molecule_dictionary (
+    molregno INTEGER PRIMARY KEY,
+    pref_name TEXT
+);
+CREATE TABLE compound_structures (
+    molregno INTEGER PRIMARY KEY,
+    canonical_smiles TEXT
+);
+CREATE TABLE activities (
+    activity_id INTEGER PRIMARY KEY,
+    assay_id INTEGER NOT NULL,
+    molregno INTEGER NOT NULL,
+    standard_type TEXT,
+    standard_relation TEXT,
+    standard_value REAL,
+    standard_units TEXT
+);
+CREATE TABLE target_components (
+    tid INTEGER NOT NULL,
+    component_id INTEGER NOT NULL
+);
+CREATE TABLE component_sequences (
+    component_id INTEGER PRIMARY KEY,
+    accession TEXT,
+    sequence TEXT
+);
+INSERT INTO target_dictionary VALUES
+    (1, 'CHEMBL_T1', 'Cyclin-dependent kinase 2', 'Homo sapiens', 'SINGLE PROTEIN');
+INSERT INTO assays VALUES (100, 1);
+INSERT INTO molecule_dictionary VALUES
+    (10, 'compound one'),
+    (11, 'compound two');
+INSERT INTO compound_structures VALUES
+    (10, 'CCO'),
+    (11, 'CCN');
+INSERT INTO activities VALUES
+    (1000, 100, 10, 'IC50', '=', 42, 'nM'),
+    (1001, 100, 11, 'Ki', '=', 12, 'nM');
+INSERT INTO target_components VALUES (1, 900);
+INSERT INTO component_sequences VALUES
+    (900, 'P24941', 'MKTAYIAKQRQISFVKSHFSRQDILDLWQ');
+""")
+connection.commit()
+"#,
+            &[path.display().to_string()],
+            "chembl_sqlite_fixture",
+        )
+        .map(|_| ())
     }
 
     fn temp_root(label: &str) -> PathBuf {
