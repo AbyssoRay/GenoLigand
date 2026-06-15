@@ -1159,7 +1159,14 @@ fn friendly_failure_summary(raw: Option<&str>) -> String {
 fn user_run_events(run_dir: &Path, run_id: &str) -> Vec<String> {
     let state = run_state(run_dir);
     let mut events = vec![
-        format!("运行编号：{run_id}"),
+        format!(
+            "运行记录：{}",
+            if run_id.is_empty() {
+                "未创建"
+            } else {
+                "已创建"
+            }
+        ),
         format!("当前状态：{}", run_state_user_label(&state)),
     ];
     let stage = read_trimmed(&run_dir.join("current_stage.txt"))

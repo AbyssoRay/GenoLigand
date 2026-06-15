@@ -420,7 +420,7 @@ function renderRun() {
       <section class="panel full">
         <div class="panel-header">
           <div>
-            <h2>Run Monitor</h2>
+            <h2>运行中心</h2>
             <p>这里显示当前运行阶段、下一步动作、资源状态和日志。</p>
           </div>
           <span class="status-pill ${runStateClass(runState)}">${runStateLabel(runState)}</span>
@@ -507,10 +507,10 @@ function renderResults() {
 }
 
 function resultTracePanel() {
-  const runId = state.run?.run_id || "未运行";
-  const projectId = state.project?.project_id || "未创建";
+  const projectText = state.project?.project_name || (state.project ? "当前项目" : "未创建");
+  const runText = state.run ? runStateLabel(state.run.state) : "未运行";
   const databaseReady = state.setup?.database_ready === true || preflightGroups()
-    .find((group) => group.title === "Database")
+    .find((group) => group.title === "数据库和索引")
     ?.rows.every((row) => row.ready);
   return `
     <section class="panel full">
@@ -521,8 +521,8 @@ function resultTracePanel() {
         </div>
         <span class="status-pill ${state.run ? "ready" : "blocked"}">${state.run ? "已选择运行" : "未运行"}</span>
       </div>
-      ${metricRow("项目编号", projectId)}
-      ${metricRow("运行编号", runId)}
+      ${metricRow("当前项目", projectText)}
+      ${metricRow("当前运行", runText)}
       ${metricRow("数据库状态", databaseReady ? "就绪" : "未就绪")}
       ${metricRow("候选来源", candidateRows().length ? "候选排序输出" : "暂无候选输出")}
       ${metricRow("证据来源", state.runData?.evidence?.has_output ? "证据链输出" : "暂无证据输出")}
@@ -811,7 +811,7 @@ function preflightGroups() {
   const inputReady = state.project && byId.get("input")?.ready;
   return [
     {
-      title: "Input",
+      title: "输入",
       rows: [
         {
           label: "研究输入",
@@ -821,7 +821,7 @@ function preflightGroups() {
       ],
     },
     {
-      title: "Database",
+      title: "数据库和索引",
       rows: [
         checkRow(byId, "science_store", "科学仓库", "运行安装/修复"),
         checkRow(byId, "known_database", "已知蛋白索引", "准备数据库索引"),
@@ -829,11 +829,11 @@ function preflightGroups() {
       ],
     },
     {
-      title: "Runtime",
+      title: "运行环境",
       rows: [checkRow(byId, "tools", "计算工具", "准备运行环境")],
     },
     {
-      title: "Storage",
+      title: "存储",
       rows: [
         {
           label: "项目空间",
@@ -843,7 +843,7 @@ function preflightGroups() {
       ],
     },
     {
-      title: "Export",
+      title: "导出",
       rows: [
         {
           label: "报告输出",
