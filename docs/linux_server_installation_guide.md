@@ -31,6 +31,8 @@ python scripts/setup/install_complete_scientific.py --start-webui
 http://127.0.0.1:19090/
 ```
 
+如果科学仓库、索引、工具记录或大型资源尚未闭合，安装命令会返回需要处理的资源和下一步动作，WebUI 不会启动。
+
 ## 主流程
 
 GenoLigand 的工作流是：

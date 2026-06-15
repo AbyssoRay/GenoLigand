@@ -35,6 +35,8 @@ python scripts\setup\install_complete_scientific.py --start-webui
 http://127.0.0.1:19090/
 ```
 
+如果科学仓库、索引、工具记录或大型资源尚未闭合，安装命令会返回需要处理的资源和下一步动作，WebUI 不会启动。
+
 ## 阻塞策略
 
 如果输入、科学仓库、已知数据库索引、宏基因组索引、必要工具、安装状态或科学资源状态缺失，GenoLigand 只显示阻塞原因，候选数量保持为 0。

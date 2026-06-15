@@ -430,6 +430,21 @@ def resource_summary(science_store: Path) -> dict[str, object]:
     }
 
 
+def install_ready(payload: dict[str, object]) -> bool:
+    downloads = payload.get("downloads")
+    external_sources = payload.get("external_sources")
+    resources = payload.get("resources")
+    download_status = downloads.get("status") if isinstance(downloads, dict) else None
+    external_status = external_sources.get("status") if isinstance(external_sources, dict) else None
+    resource_status = resources.get("status") if isinstance(resources, dict) else None
+    return (
+        payload.get("status") == "ready"
+        and resource_status == "ready"
+        and external_status == "ready"
+        and download_status in {"ready", "skipped"}
+    )
+
+
 def installation_status(
     science_store: Path,
     completed: subprocess.CompletedProcess[str],
@@ -528,6 +543,7 @@ def main() -> int:
         "runtime_backend": runtime_backend(),
         "access_url": f"http://{args.host}:{args.port}/",
     }
+    payload["install_ready"] = install_ready(payload)
     if args.debug_output:
         payload["debug"] = {
             "command": command,
@@ -541,8 +557,24 @@ def main() -> int:
             "source_sync_plan": str(source_sync_plan),
         }
     print(json.dumps(payload, ensure_ascii=False, indent=2))
-    if completed.returncode != 0 or not args.start_webui:
-        return completed.returncode
+    exit_code = 0 if payload["install_ready"] else 2
+    if completed.returncode != 0:
+        exit_code = completed.returncode
+    if not args.start_webui:
+        return exit_code
+    if exit_code != 0:
+        print(
+            json.dumps(
+                {
+                    "status": "webui_not_started",
+                    "summary": "安装尚未闭合，WebUI 未启动。",
+                    "next_action": payload.get("next_action", "重新运行安装/修复"),
+                },
+                ensure_ascii=False,
+                indent=2,
+            )
+        )
+        return exit_code
 
     runtime_dir.mkdir(parents=True, exist_ok=True)
     server_command = resolve_binary_command(
