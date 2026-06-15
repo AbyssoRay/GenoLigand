@@ -1597,29 +1597,45 @@ fn build_evidence(options: &ScienceOptions) -> Result<String, String> {
 
 fn render_report(options: &ScienceOptions) -> Result<String, String> {
     let candidates = read_candidates(&options.run_dir.join("target_candidate_ranking.tsv"))?;
-    let mut text = String::from("# GenoLigand Scientific Report\n\n");
-    text.push_str("This report contains computational predictions only. It does not claim experimental validation.\n\n");
-    text.push_str("## Candidate targets\n\n");
+    let mut text = String::from("# GenoLigand 科研报告\n\n");
+    text.push_str(
+        "本报告只包含计算预测和证据优先级，不代表实验验证、体内结合、药效或作用机制确认。\n\n",
+    );
+    text.push_str("## 候选靶点\n\n");
     if candidates.is_empty() {
-        text.push_str("No candidate target was generated. The run either had no matching evidence or was blocked before computation.\n");
+        text.push_str(
+            "当前运行没有生成候选靶点。可能原因是没有匹配证据，或计算在开始前被运行条件阻塞。\n",
+        );
     } else {
-        text.push_str("| rank | target | scope | organism | score | evidence |\n");
+        text.push_str("| 排序 | 靶点 | 候选范围 | 物种 | 综合分数 | 证据摘要 |\n");
         text.push_str("| --- | --- | --- | --- | --- | --- |\n");
         for (index, candidate) in candidates.iter().enumerate() {
             text.push_str(&format!(
                 "| {} | {} ({}) | {} | {} | {:.4} | {} |\n",
                 index + 1,
-                candidate.target_name,
-                candidate.target_id,
-                candidate.candidate_scope,
-                candidate.organism,
+                clean_cell(&candidate.target_name),
+                clean_cell(&candidate.target_id),
+                report_scope_label(&candidate.candidate_scope),
+                clean_cell(&candidate.organism),
                 candidate.final_score,
-                candidate.evidence
+                clean_cell(&candidate.evidence)
             ));
         }
+        text.push_str(
+            "\n建议把排序靠前的候选作为后续实验验证的优先对象，而不是直接视为已确认靶点。\n",
+        );
     }
     write_text(&options.run_dir.join("research_report.md"), &text)?;
     Ok("report_rendered".to_string())
+}
+
+fn report_scope_label(value: &str) -> &'static str {
+    match value {
+        "known_database" | "known_human_protein" => "已知蛋白数据库",
+        "metagenome_potential" | "metagenome_potential_protein" => "宏基因组潜在序列",
+        "structure_interaction" => "结构互作证据",
+        _ => "计算候选",
+    }
 }
 
 fn write_run_context(
@@ -2262,11 +2278,20 @@ mod tests {
         let context = read_text(&run.join("run_context.json")).expect("run context");
         let source_map = read_text(&run.join("artifact_source_map.tsv")).expect("source map");
         let evidence = read_text(&run.join("evidence_ledger.tsv")).expect("evidence ledger");
+        let report = read_text(&run.join("research_report.md")).expect("research report");
         assert!(detail.contains("\"candidates\""));
         assert!(detail.contains("\"candidate_id\""));
         assert!(context.contains("\"state\":\"completed\""));
         assert!(source_map.contains("research_report.md"));
         assert!(evidence.contains("score_decomposition"));
+        assert!(report.contains("# GenoLigand 科研报告"));
+        assert!(report.contains("计算预测"));
+        assert!(report.contains("建议把排序靠前的候选作为后续实验验证的优先对象"));
+        assert!(report.contains("已知蛋白数据库") || report.contains("宏基因组潜在序列"));
+        assert!(!report.contains("GenoLigand Scientific Report"));
+        assert!(!report.contains("No candidate target"));
+        assert!(!report.contains("known_database"));
+        assert!(!report.contains("metagenome_potential"));
         fs::remove_dir_all(&root).expect("cleanup temp root");
         assert!(!root.exists());
     }

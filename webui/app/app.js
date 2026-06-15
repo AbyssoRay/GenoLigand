@@ -683,7 +683,7 @@ async function saveInput() {
     inputs: [
       {
         field: "project_name",
-        value: state.form.project_name.trim() || "GenoLigand research project",
+        value: state.form.project_name.trim() || "未命名研究项目",
       },
       ...filledInputs().map((item) => ({ field: item.field, value: item.value })),
     ],

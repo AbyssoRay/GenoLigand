@@ -301,7 +301,7 @@ fn read_project(options: &ServerOptions, project_id: &str) -> Value {
         .unwrap_or_else(|| "created".to_string());
     json!({
         "project_id": project_id,
-        "project_name": read_trimmed(&dir.join("project_name.txt")).unwrap_or_else(|| "GenoLigand research project".to_string()),
+        "project_name": read_trimmed(&dir.join("project_name.txt")).unwrap_or_else(|| "未命名研究项目".to_string()),
         "project_status": status,
         "latest_run_id": latest_run_id
     })
