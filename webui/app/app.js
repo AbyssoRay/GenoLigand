@@ -797,22 +797,21 @@ function renderExport() {
           <span class="status-pill ${outputStatusClass(available)}">${available.length ? `${available.length} 项可用` : "暂无可导出项"}</span>
         </div>
       </section>
-      ${exportCard("科研报告", "research_report", artifacts, runId)}
-      ${exportCard("候选表", "candidate_ranking", artifacts, runId)}
-      ${exportCard("证据链", "evidence", artifacts, runId)}
-      ${exportCard("结构与口袋摘要", "structure_patch", artifacts, runId)}
-      ${exportCard("动力学摘要", "md_summary", artifacts, runId)}
+      ${
+        available.length
+          ? available.map((item) => exportCard(friendlyArtifact(item.label || item.id), item.id, runId)).join("")
+          : `<section class="panel full"><div class="empty">当前运行还没有可导出材料。完成运行并生成输出后才会显示下载项。</div></section>`
+      }
     </div>`;
 }
 
-function exportCard(title, artifactId, artifacts, runId) {
-  const exists = Boolean(runId) && artifacts.some((item) => item.id === artifactId && item.exists);
+function exportCard(title, artifactId, runId) {
   const href = `/api/user/runs/${encodeURIComponent(runId)}/download/${encodeURIComponent(artifactId)}`;
   return `
     <section class="panel third">
       <h2>${title}</h2>
-      <p>${exists ? "当前运行已生成。" : "当前运行未生成。"}</p>
-      ${exists ? `<a class="button secondary" href="${href}">下载</a>` : `<button class="button disabled" disabled>不可用</button>`}
+      <p>当前运行已生成。</p>
+      <a class="button secondary" href="${href}">下载</a>
     </section>`;
 }
 

@@ -2657,6 +2657,20 @@ mod tests {
     }
 
     #[test]
+    fn export_view_only_renders_downloadable_artifacts() {
+        let app = include_str!("../../../webui/app/app.js");
+        let start = app.find("function renderExport()").expect("renderExport");
+        let end = app.find("function collectForm()").expect("collectForm");
+        let export_view = &app[start..end];
+
+        assert!(export_view.contains("available.map"));
+        assert!(export_view.contains("当前运行还没有可导出材料"));
+        assert!(export_view.contains("下载"));
+        assert!(!export_view.contains("当前运行未生成"));
+        assert!(!export_view.contains("不可用"));
+    }
+
+    #[test]
     fn visual_result_sections_use_clear_not_ready_language() {
         let app = include_str!("../../../webui/app/app.js");
         assert!(app.contains("图形查看未就绪"));
