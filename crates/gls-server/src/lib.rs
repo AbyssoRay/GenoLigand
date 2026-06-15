@@ -612,6 +612,7 @@ fn download_artifact_response(
                 ("\u{52a8}\u{529b}\u{5b66}\u{5206}\u{6570}", "md_score"),
                 ("\u{8bc1}\u{636e}\u{6458}\u{8981}", "evidence_summary"),
                 ("\u{72b6}\u{6001}", "status_label"),
+                ("\u{8f93}\u{51fa}\u{6750}\u{6599}", "result_source"),
             ],
         ),
         "evidence" => user_tsv_download(
@@ -621,6 +622,7 @@ fn download_artifact_response(
                 ("\u{6765}\u{6e90}", "source"),
                 ("\u{72b6}\u{6001}", "status"),
                 ("\u{8bf4}\u{660e}", "summary"),
+                ("\u{8f93}\u{51fa}\u{6750}\u{6599}", "result_source"),
             ],
         ),
         "structure_patch" => user_tsv_download(
@@ -634,6 +636,7 @@ fn download_artifact_response(
                 ("\u{7ed3}\u{6784}\u{8bc1}\u{636e}", "summary"),
                 ("\u{72b6}\u{6001}", "status"),
                 ("\u{67e5}\u{770b}\u{5668}", "viewer_status"),
+                ("\u{8f93}\u{51fa}\u{6750}\u{6599}", "result_source"),
             ],
         ),
         "md_summary" => user_tsv_download(
@@ -653,6 +656,7 @@ fn download_artifact_response(
                 ("\u{6458}\u{8981}", "summary"),
                 ("\u{72b6}\u{6001}", "status"),
                 ("\u{8f68}\u{8ff9}\u{56fe}", "trajectory_status"),
+                ("\u{8f93}\u{51fa}\u{6750}\u{6599}", "result_source"),
             ],
         ),
         _ => json_response(404, json!({"error":"artifact_not_available"})),
@@ -2648,6 +2652,7 @@ mod tests {
                 download_artifact_response(&options, "run-1", artifact_id);
             assert_eq!(status, 200);
             assert_eq!(content_type, "text/tab-separated-values; charset=utf-8");
+            assert!(body.contains("输出材料"));
             assert!(!body.contains("sha256"));
             assert!(!body.contains("debug_path"));
             assert!(!body.contains("D:/hidden"));
