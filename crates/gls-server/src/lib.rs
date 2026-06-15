@@ -1188,8 +1188,7 @@ fn user_databases_json(options: &ServerOptions) -> Value {
         "sources": source_status_rows(&store),
         "missing": missing,
         "summary": if preflight_store_ready(options) {"科学仓库已就绪"} else {"需要运行安装/修复"},
-        "repair_actions_available": store.join("repair_actions.tsv").exists(),
-        "user_configures_paths": false
+        "repair_actions_available": store.join("repair_actions.tsv").exists()
     })
 }
 
@@ -2520,6 +2519,21 @@ mod tests {
         assert!(!text.contains("known_targets.tsv"));
         assert!(!text.contains("tool_versions.tsv"));
         assert!(!text.contains(&root.display().to_string()));
+    }
+
+    #[test]
+    fn user_database_status_hides_path_configuration_fields() {
+        let root = std::env::temp_dir().join(format!("genoligand-user-databases-{}", now_millis()));
+        let options = server_options(root.clone());
+
+        let payload = user_databases_json(&options);
+        let text = payload.to_string();
+
+        assert!(!text.contains("user_configures_paths"));
+        assert!(!text.contains("science_store_manifest"));
+        assert!(!text.contains(&root.display().to_string()));
+
+        fs::remove_dir_all(&root).ok();
     }
 
     #[test]
