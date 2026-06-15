@@ -2630,6 +2630,21 @@ mod tests {
     }
 
     #[test]
+    fn first_launch_input_view_does_not_render_resource_status_panels() {
+        let app = include_str!("../../../webui/app/app.js");
+        let start = app.find("function renderInput()").expect("renderInput");
+        let end = app
+            .find("function renderInputTypeCard")
+            .expect("renderInputTypeCard");
+        let render_input = &app[start..end];
+
+        assert!(!render_input.contains("storeStatusRows()"));
+        assert!(!render_input.contains("sourceStatusTable()"));
+        assert!(!render_input.contains("数据库状态"));
+        assert!(!render_input.contains("科学资源"));
+    }
+
+    #[test]
     fn user_project_creation_hides_internal_status_and_actions() {
         let root = std::env::temp_dir().join(format!("genoligand-user-create-{}", now_millis()));
         let options = server_options(root.clone());

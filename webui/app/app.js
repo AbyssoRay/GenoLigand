@@ -219,14 +219,6 @@ function renderInput() {
         <h2>下一步</h2>
         <p>${inputsReadyToSave() ? "保存后进入配置和检查。" : "先完成当前输入检查。"}</p>
       </section>
-      <section class="panel third">
-        <h2>数据库状态</h2>
-        ${storeStatusRows()}
-      </section>
-      <section class="panel full">
-        <h2>科学资源</h2>
-        ${sourceStatusTable()}
-      </section>
     </div>`;
   bindInputEvents();
 }
