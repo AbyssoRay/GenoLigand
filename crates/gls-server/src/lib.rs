@@ -563,10 +563,10 @@ fn run_json(options: &ServerOptions, run_id: &str) -> Value {
 }
 
 fn logs_json(options: &ServerOptions, run_id: &str) -> Value {
-    let text = find_run_dir(options, run_id)
-        .and_then(|dir| fs::read_to_string(dir.join("run.log")).ok())
-        .unwrap_or_default();
-    json!({"logs":text.lines().collect::<Vec<_>>()})
+    let Some(run_dir) = find_run_dir(options, run_id) else {
+        return json!({"logs":[]});
+    };
+    json!({"logs":user_run_events(&run_dir, run_id)})
 }
 
 fn artifacts_json(options: &ServerOptions, run_id: &str) -> Value {
@@ -1156,6 +1156,64 @@ fn friendly_failure_summary(raw: Option<&str>) -> String {
         .join("；")
 }
 
+fn user_run_events(run_dir: &Path, run_id: &str) -> Vec<String> {
+    let state = run_state(run_dir);
+    let mut events = vec![
+        format!("运行编号：{run_id}"),
+        format!("当前状态：{}", run_state_user_label(&state)),
+    ];
+    let stage = read_trimmed(&run_dir.join("current_stage.txt"))
+        .map(|value| stage_user_label(&value).to_string())
+        .unwrap_or_else(|| "等待开始".to_string());
+    events.push(format!("当前阶段：{stage}"));
+    let failure =
+        friendly_failure_summary(read_trimmed(&run_dir.join("failure_reason.txt")).as_deref());
+    if !failure.is_empty() {
+        events.push(format!("处理提示：{failure}"));
+    }
+    let generated = artifact_index(run_dir)["items"]
+        .as_array()
+        .map(|items| {
+            items
+                .iter()
+                .filter(|item| item.get("exists").and_then(Value::as_bool).unwrap_or(false))
+                .count()
+        })
+        .unwrap_or(0);
+    events.push(format!("已生成输出：{generated} 项"));
+    events
+}
+
+fn run_state_user_label(state: &str) -> &'static str {
+    match state {
+        "created" => "已创建",
+        "running" => "运行中",
+        "completed" => "已完成",
+        "blocked" => "已阻塞",
+        "failed" => "失败",
+        "cancelled" => "已取消",
+        "resumable" => "可恢复",
+        "not_found" => "未找到",
+        _ => "未开始",
+    }
+}
+
+fn stage_user_label(stage: &str) -> &'static str {
+    match stage {
+        "pipeline_run" => "完整流程",
+        "input_normalize" => "输入归一化",
+        "features_compute" => "特征计算",
+        "database_match_known" => "已知数据库比对",
+        "metagenome_match_potential" => "宏基因组潜在序列比对",
+        "structure_evaluate" => "结构与口袋评估",
+        "dynamics_screen" => "短动力学筛选",
+        "target_rank" => "候选排序",
+        "evidence_build" => "证据链整理",
+        "report_render" => "报告生成",
+        _ => "运行准备",
+    }
+}
+
 fn read_tsv_rows(path: &Path) -> Vec<Value> {
     let Ok(text) = fs::read_to_string(path) else {
         return Vec::new();
@@ -1336,6 +1394,7 @@ mod tests {
             artifacts_json(&options, "run-1"),
             user_databases_json(&options),
             preflight_json(&options, "project-1"),
+            logs_json(&options, "run-1"),
             table_endpoint_json(
                 &options,
                 "run-1",

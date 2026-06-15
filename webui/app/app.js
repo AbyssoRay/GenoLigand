@@ -448,8 +448,8 @@ function renderRun() {
       </section>
       <section class="panel full">
         <details>
-          <summary>运行日志</summary>
-          <pre>${escapeHtml((state.runData?.logs?.logs || []).join("\n") || "暂无日志。")}</pre>
+          <summary>运行事件</summary>
+          <pre>${escapeHtml((state.runData?.logs?.logs || []).join("\n") || "暂无运行事件。")}</pre>
         </details>
       </section>
     </div>`;
