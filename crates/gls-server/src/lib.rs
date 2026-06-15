@@ -690,24 +690,39 @@ fn run_setup_repair_json(options: &ServerOptions) -> Value {
         .args(&command[1..])
         .current_dir(&options.workspace_root)
         .output();
-    let (executed, message) = match output {
-        Ok(output) if output.status.success() => (true, "修复动作已执行。".to_string()),
-        Ok(output) => (
-            false,
-            format!(
-                "修复动作未完成，退出码 {:?}。",
-                output.status.code().unwrap_or_default()
-            ),
-        ),
-        Err(err) => (false, format!("修复动作无法启动：{err}")),
+    let (executed, message, installer_payload) = match output {
+        Ok(output) if output.status.success() => {
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            (
+                true,
+                "修复动作已执行。".to_string(),
+                setup_installer_summary(&stdout),
+            )
+        }
+        Ok(output) => {
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            (
+                false,
+                format!(
+                    "修复动作未完成，退出码 {:?}。",
+                    output.status.code().unwrap_or_default()
+                ),
+                setup_installer_summary(&stdout),
+            )
+        }
+        Err(err) => (false, format!("修复动作无法启动：{err}"), None),
     };
     let ready = preflight_store_ready(options);
-    json!({
+    let mut payload = json!({
         "status": if executed {"repair_executed"} else {"repair_failed"},
         "database_ready": ready,
         "message": if ready {"科学仓库已就绪。"} else {message.as_str()},
         "checks": user_databases_json(options)["required"].clone()
-    })
+    });
+    if let Some(installer_payload) = installer_payload {
+        payload["installer"] = installer_payload;
+    }
+    payload
 }
 
 fn user_setup_install_plan_json(options: &ServerOptions) -> Value {
@@ -721,14 +736,61 @@ fn user_setup_install_plan_json(options: &ServerOptions) -> Value {
 }
 
 fn setup_repair_command(options: &ServerOptions) -> Vec<String> {
+    let installer = options
+        .workspace_root
+        .join("scripts")
+        .join("setup")
+        .join("install_complete_scientific.py");
+    if installer.exists() {
+        let mut command = python_invocation();
+        command.extend([
+            installer.display().to_string(),
+            "--workspace-root".to_string(),
+            options.workspace_root.display().to_string(),
+            "--science-store".to_string(),
+            science_store_path(options).display().to_string(),
+        ]);
+        if let Ok(catalog) = std::env::var("GENOLIGAND_SOURCE_CATALOG")
+            && !catalog.trim().is_empty()
+        {
+            command.extend(["--source-catalog".to_string(), catalog]);
+        }
+        return command;
+    }
     let mut command = gls_cli_invocation(options);
     command.extend([
         "install".to_string(),
         "prepare-science-store".to_string(),
+        "--workspace-root".to_string(),
+        options.workspace_root.display().to_string(),
         "--science-store".to_string(),
         science_store_path(options).display().to_string(),
     ]);
     command
+}
+
+fn python_invocation() -> Vec<String> {
+    match std::env::var("GENOLIGAND_PYTHON") {
+        Ok(value) if !value.trim().is_empty() => vec![value],
+        _ => vec!["python".to_string()],
+    }
+}
+
+fn setup_installer_summary(stdout: &str) -> Option<Value> {
+    let payload: Value = serde_json::from_str(stdout.trim()).ok()?;
+    let downloads = payload
+        .get("downloads")
+        .cloned()
+        .unwrap_or_else(|| json!({}));
+    Some(json!({
+        "status": payload.get("status").cloned().unwrap_or_else(|| json!("unknown")),
+        "runtime_backend": payload.get("runtime_backend").cloned().unwrap_or_else(|| json!("unknown")),
+        "downloads": {
+            "status": downloads.get("status").cloned().unwrap_or_else(|| json!("unknown")),
+            "ready": downloads.get("ready").cloned().unwrap_or_else(|| json!(0)),
+            "failed": downloads.get("failed").cloned().unwrap_or_else(|| json!(0))
+        }
+    }))
 }
 
 fn update_run_state(options: &ServerOptions, run_id: &str, state: &str) -> Value {
@@ -1067,4 +1129,62 @@ fn now_millis() -> u128 {
         .duration_since(UNIX_EPOCH)
         .map(|duration| duration.as_millis())
         .unwrap_or(0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn server_options(workspace_root: PathBuf) -> ServerOptions {
+        ServerOptions {
+            host: "127.0.0.1".to_string(),
+            port: 0,
+            artifact_dir: workspace_root.join(".genoligand-test-runtime"),
+            workspace_root,
+        }
+    }
+
+    #[test]
+    fn setup_repair_uses_complete_installer_when_available() {
+        let workspace_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .and_then(Path::parent)
+            .expect("workspace root")
+            .to_path_buf();
+        let command = setup_repair_command(&server_options(workspace_root));
+        let joined = command.join(" ");
+
+        assert!(joined.contains("install_complete_scientific.py"));
+        assert!(joined.contains("--workspace-root"));
+        assert!(joined.contains("--science-store"));
+        assert!(!joined.contains(" prepare-science-store "));
+    }
+
+    #[test]
+    fn setup_repair_falls_back_to_cli_without_installer_script() {
+        let workspace_root =
+            std::env::temp_dir().join(format!("genoligand-no-installer-{}", now_millis()));
+        fs::create_dir_all(&workspace_root).expect("create temp workspace");
+        let command = setup_repair_command(&server_options(workspace_root.clone()));
+        let joined = command.join(" ");
+        fs::remove_dir_all(&workspace_root).ok();
+
+        assert!(joined.contains("install prepare-science-store"));
+        assert!(joined.contains("--workspace-root"));
+        assert!(joined.contains("--science-store"));
+    }
+
+    #[test]
+    fn setup_installer_summary_keeps_user_relevant_fields_only() {
+        let payload = setup_installer_summary(
+            r#"{"status":"prepared","command":["cargo","run"],"stdout":"raw","downloads":{"status":"ready","ready":2,"failed":0}}"#,
+        )
+        .expect("installer json");
+
+        assert_eq!(payload["status"], "prepared");
+        assert_eq!(payload["downloads"]["status"], "ready");
+        assert_eq!(payload["downloads"]["ready"], 2);
+        assert!(payload.get("command").is_none());
+        assert!(payload.get("stdout").is_none());
+    }
 }
