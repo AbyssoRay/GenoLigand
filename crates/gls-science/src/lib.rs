@@ -1,6 +1,8 @@
+use flate2::read::GzDecoder;
 use serde_json::{Value, json};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
+use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -657,9 +659,24 @@ fn discover_sequence_files_inner(root: &Path, out: &mut Vec<PathBuf>) -> Result<
 }
 
 fn is_sequence_file(path: &Path) -> bool {
-    path.extension()
+    let name = path
+        .file_name()
         .and_then(|value| value.to_str())
-        .is_some_and(|ext| matches!(ext.to_ascii_lowercase().as_str(), "fa" | "faa" | "fasta"))
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    matches_sequence_name(&name)
+}
+
+fn matches_sequence_name(name: &str) -> bool {
+    matches!(
+        name,
+        value if value.ends_with(".fa")
+            || value.ends_with(".faa")
+            || value.ends_with(".fasta")
+            || value.ends_with(".fa.gz")
+            || value.ends_with(".faa.gz")
+            || value.ends_with(".fasta.gz")
+    )
 }
 
 fn parse_fasta_targets(
@@ -669,7 +686,7 @@ fn parse_fasta_targets(
     target_class: &str,
     evidence: &str,
 ) -> Result<Vec<StoreRow>, String> {
-    let text = read_text(path)?;
+    let text = read_sequence_text(path)?;
     let mut rows = Vec::new();
     let mut header = String::new();
     let mut sequence = String::new();
@@ -701,6 +718,26 @@ fn parse_fasta_targets(
         &mut rows,
     );
     Ok(rows)
+}
+
+fn read_sequence_text(path: &Path) -> Result<String, String> {
+    let name = path
+        .file_name()
+        .and_then(|value| value.to_str())
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    if name.ends_with(".gz") {
+        let file =
+            fs::File::open(path).map_err(|err| format!("open_failed:{}:{err}", path.display()))?;
+        let mut decoder = GzDecoder::new(file);
+        let mut text = String::new();
+        decoder
+            .read_to_string(&mut text)
+            .map_err(|err| format!("gzip_read_failed:{}:{err}", path.display()))?;
+        Ok(text)
+    } else {
+        read_text(path)
+    }
 }
 
 fn push_fasta_row(
@@ -1912,6 +1949,48 @@ mod tests {
         assert!(build_manifest.contains("fasta_sequence_rows"));
         fs::remove_dir_all(&root).expect("cleanup temp root");
         assert!(!root.exists());
+    }
+
+    #[test]
+    fn prepare_science_store_builds_metagenome_index_from_gzipped_fasta() {
+        let root = temp_root("build_gzip_index");
+        let store = root.join("science_store");
+        write_gzip(
+            &store.join("downloads/metagenome/orfs.faa.gz"),
+            ">MG_GZ_1 candidate oxidoreductase OS=environmental source\nMSTNPKPQRKTKRNTNRRPQDVKFPGG\n",
+        )
+        .expect("write gzip fasta");
+        let options = StoreOptions {
+            workspace_root: root.clone(),
+            science_store: store.clone(),
+        };
+        let _ = run_store_command(ScienceCommand::PrepareScienceStore, &options)
+            .expect("prepare store");
+        let metagenome =
+            read_text(&store.join("indexes/metagenome_targets.tsv")).expect("metagenome index");
+        assert!(metagenome.contains("MG_GZ_1"));
+        fs::remove_dir_all(&root).expect("cleanup temp root");
+        assert!(!root.exists());
+    }
+
+    fn write_gzip(path: &Path, text: &str) -> Result<(), String> {
+        use flate2::Compression;
+        use flate2::write::GzEncoder;
+        use std::io::Write;
+
+        if let Some(parent) = path.parent() {
+            ensure_dir(parent)?;
+        }
+        let file = fs::File::create(path)
+            .map_err(|err| format!("create_failed:{}:{err}", path.display()))?;
+        let mut encoder = GzEncoder::new(file, Compression::default());
+        encoder
+            .write_all(text.as_bytes())
+            .map_err(|err| format!("gzip_write_failed:{}:{err}", path.display()))?;
+        encoder
+            .finish()
+            .map_err(|err| format!("gzip_finish_failed:{}:{err}", path.display()))?;
+        Ok(())
     }
 
     fn temp_root(label: &str) -> PathBuf {

@@ -19,6 +19,20 @@ http://127.0.0.1:19090/
 
 该命令会选择用户数据目录作为科学仓库，检查工具、数据库来源、索引和修复动作，然后启动本地 WebUI。
 
+如需让安装流程自动拉取数据源，在科学仓库根目录放置 `source_catalog.tsv`，或使用：
+
+```powershell
+python scripts\setup\install_complete_scientific.py --source-catalog path\to\source_catalog.tsv
+```
+
+`source_catalog.tsv` 使用制表符分隔，列为：
+
+```text
+source_id	url	local_path	sha256
+```
+
+`url` 可以是 HTTPS 地址或本地文件路径；`local_path` 是科学仓库内的目标路径；`sha256` 可为空，填写后会强制校验。
+
 ## 准备科学仓库
 
 安装流程负责准备数据库、索引、工具版本和许可证清单。普通用户不需要配置数据库路径。维护人员可单独运行：
