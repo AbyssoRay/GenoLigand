@@ -609,8 +609,8 @@ function candidateDetailSection(rows) {
     <section class="panel full">
       <div class="panel-header">
         <div>
-          <h2>${escapeHtml(first.target_name || first.target_id || "候选详情")}</h2>
-          <p>默认显示排序第一的候选。详细字段来自当前运行输出。</p>
+          <h2>第一候选摘要</h2>
+          <p>摘要来自当前运行的候选详情输出；下方表格显示全部候选详情。</p>
         </div>
         <span class="status-pill ready">候选编号 ${escapeHtml(first.candidate_id || "未提供")}</span>
       </div>
@@ -621,6 +621,16 @@ function candidateDetailSection(rows) {
       ${metricRow("综合分数", first.final_score || "未提供")}
       ${metricRow("证据摘要", first.evidence_summary || "未提供")}
       ${metricRow("详情来源", first.detail_source || "当前运行输出")}
+    </section>
+    <section class="panel full">
+      <div class="panel-header">
+        <div>
+          <h2>全部候选详情</h2>
+          <p>每一行都来自当前运行生成的候选详情输出。</p>
+        </div>
+        <span class="status-pill ready">${rows.length} 行</span>
+      </div>
+      ${table(rows, columnsFor("candidate_detail"))}
     </section>`;
 }
 
@@ -1063,6 +1073,23 @@ function columnsFor(kind) {
     { key: "status", label: "状态" },
   ];
   if (kind === "ranking") return common;
+  if (kind === "candidate_detail") {
+    return [
+      { key: "candidate_id", label: "候选编号" },
+      { key: "target_id", label: "目标编号" },
+      { key: "target_name", label: "目标名称" },
+      { key: "candidate_scope", label: "候选范围" },
+      { key: "organism", label: "物种" },
+      { key: "final_score", label: "综合分数" },
+      { key: "known_database_score", label: "已知库分数" },
+      { key: "metagenome_score", label: "宏基因组分数" },
+      { key: "structure_score", label: "结构分数" },
+      { key: "docking_score", label: "对接分数" },
+      { key: "md_score", label: "动力学分数" },
+      { key: "evidence_summary", label: "证据摘要" },
+      { key: "detail_source", label: "详情来源" },
+    ];
+  }
   if (kind === "evidence") {
     return [
       { key: "evidence_type", label: "证据类型" },
