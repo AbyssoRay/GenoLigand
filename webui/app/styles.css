@@ -335,6 +335,11 @@ select:focus {
   border-color: rgba(242, 181, 99, 0.72);
 }
 
+.waiting {
+  color: var(--soft);
+  border-color: var(--line);
+}
+
 .failed {
   color: var(--bad);
   border-color: rgba(255, 138, 138, 0.72);
@@ -389,6 +394,10 @@ select:focus {
 
 .blocked-text {
   color: var(--warn);
+}
+
+.waiting-text {
+  color: var(--soft);
 }
 
 .stage-list {

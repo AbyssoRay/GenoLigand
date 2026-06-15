@@ -608,11 +608,12 @@ function renderStage(label, index) {
   const runState = state.run?.state;
   const completed = runState === "completed";
   const active = runState === "running" && index === 0;
+  const waiting = !completed && !active;
   return `
     <div class="stage">
       <span class="stage-index">${index + 1}</span>
       <span>${label}</span>
-      <span class="status-pill ${completed ? "ready" : active ? "loading" : "blocked"}">${completed ? "完成" : active ? "进行中" : "等待"}</span>
+      <span class="status-pill ${completed ? "ready" : active ? "loading" : waiting ? "waiting" : "blocked"}">${completed ? "完成" : active ? "进行中" : "等待"}</span>
     </div>`;
 }
 
@@ -747,7 +748,7 @@ function structureSection(rows) {
       </div>
       ${visualStatus([
         { label: "摘要表", value: rows.length ? "已生成" : "未生成", ready: rows.length > 0 },
-        { label: "三维查看器", value: "未接入可用输出", ready: false },
+        { label: "三维查看器", value: "未接入可用输出", ready: false, waiting: true },
         { label: "数据来源", value: rows.length ? "当前运行输出" : "等待运行输出", ready: rows.length > 0 },
       ])}
       ${rows.length ? table(rows, columnsFor("structure")) : `<div class="empty">未生成结构查看数据或口袋摘要。</div>`}
@@ -766,7 +767,7 @@ function mdSection(rows) {
       </div>
       ${visualStatus([
         { label: "摘要表", value: rows.length ? "已生成" : "未生成", ready: rows.length > 0 },
-        { label: "轨迹图", value: "未接入可用输出", ready: false },
+        { label: "轨迹图", value: "未接入可用输出", ready: false, waiting: true },
         { label: "数据来源", value: rows.length ? "当前运行输出" : "等待运行输出", ready: rows.length > 0 },
       ])}
       ${rows.length ? table(rows, columnsFor("md")) : `<div class="empty">未生成 RMSD、RMSF、接触或配体漂移摘要。</div>`}
@@ -781,7 +782,7 @@ function visualStatus(items) {
           (item) => `
             <div class="visual-status-item">
               <span>${escapeHtml(item.label)}</span>
-              <strong class="${item.ready ? "ready-text" : "blocked-text"}">${escapeHtml(item.value)}</strong>
+              <strong class="${item.ready ? "ready-text" : item.waiting ? "waiting-text" : "blocked-text"}">${escapeHtml(item.value)}</strong>
             </div>`
         )
         .join("")}
