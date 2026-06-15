@@ -4,11 +4,11 @@ GenoLigand 是本地运行的靶点发现科研软件。它的核心目标是：
 
 GenoLigand 不声称实验验证、体内结合、药效或机制结论。所有结论都必须表述为计算预测。
 
-## 启动 WebUI（网页界面）
+## 一条命令准备并启动
 
 ```powershell
 cd D:\Project\rust\GenoLigand
-cargo run -p gls-server -- --host 127.0.0.1 --port 19090
+python scripts\setup\install_complete_scientific.py --start-webui
 ```
 
 打开：
@@ -17,12 +17,14 @@ cargo run -p gls-server -- --host 127.0.0.1 --port 19090
 http://127.0.0.1:19090/
 ```
 
+该命令会选择用户数据目录作为科学仓库，检查工具、数据库来源、索引和修复动作，然后启动本地 WebUI。
+
 ## 准备科学仓库
 
-安装流程负责准备数据库、索引、工具版本和许可证清单。普通用户不需要配置数据库路径。
+安装流程负责准备数据库、索引、工具版本和许可证清单。普通用户不需要配置数据库路径。维护人员可单独运行：
 
 ```powershell
-cargo run -p gls-cli -- install prepare-science-store --science-store D:\GenoLigandData\science_store
+python scripts\setup\install_complete_scientific.py
 ```
 
 科学仓库必须包含：

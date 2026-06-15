@@ -22,11 +22,11 @@ GenoLigand 从用户输入的物质、序列或结构出发，计算相互作用
 7. Results：查看候选排序、候选详情、结构/口袋、动力学摘要和证据链。
 8. Export：导出科研报告和可复现产物。
 
-## 启动
+## 准备并启动
 
 ```powershell
 cd D:\Project\rust\GenoLigand
-cargo run -p gls-server -- --host 127.0.0.1 --port 19090
+python scripts\setup\install_complete_scientific.py --start-webui
 ```
 
 浏览器打开：
@@ -34,6 +34,8 @@ cargo run -p gls-server -- --host 127.0.0.1 --port 19090
 ```text
 http://127.0.0.1:19090/
 ```
+
+该入口会检查科学仓库和运行工具，并把运行目录放在用户数据目录中。缺少资源时，界面会显示可执行的安装/修复动作。
 
 ## 命令行主流程
 
@@ -47,4 +49,3 @@ cargo run -p gls-cli -- pipeline run `
 ## 结果边界
 
 报告只表达计算预测，不表达实验验证、药效、临床意义或机制确认。
-

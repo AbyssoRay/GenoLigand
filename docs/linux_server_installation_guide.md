@@ -12,7 +12,7 @@
 ## 准备科学仓库
 
 ```bash
-cargo run -p gls-cli -- install prepare-science-store --science-store /data/genoligand/science_store
+python scripts/setup/install_complete_scientific.py
 ```
 
 科学仓库由安装流程维护。普通用户只通过 WebUI 提交输入。
@@ -21,7 +21,7 @@ cargo run -p gls-cli -- install prepare-science-store --science-store /data/geno
 
 ```bash
 cd /path/to/GenoLigand
-cargo run -p gls-server -- --host 127.0.0.1 --port 19090
+python scripts/setup/install_complete_scientific.py --start-webui
 ```
 
 打开：
@@ -32,7 +32,7 @@ http://127.0.0.1:19090/
 
 ## 主流程
 
-GenoLigand 的生产工作流是：
+GenoLigand 的工作流是：
 
 ```text
 输入归一化 -> 特征计算 -> 已知数据库比对 -> 宏基因组潜在序列比对 -> 结构/口袋/对接/动力学证据 -> 联合靶点排序 -> 证据报告
