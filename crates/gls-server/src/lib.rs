@@ -1202,18 +1202,16 @@ fn diagnostics_json(options: &ServerOptions) -> Value {
 }
 
 fn user_diagnostics_json(options: &ServerOptions) -> Value {
-    let cargo = capture("cargo", &["--version"], &options.workspace_root);
     let gls_cli = capture_command(&gls_cli_help_command(options), &options.workspace_root);
     let database_ready = preflight_store_ready(options);
     let missing = missing_resource_rows(&required_resource_rows(&science_store_path(options)));
     let checks = vec![
         json!({"label":"服务", "ready":true, "next_action":"继续"}),
-        json!({"label":"命令行工具", "ready":gls_cli.0, "next_action": if gls_cli.0 {"继续"} else {"重新安装 GenoLigand 命令行工具"}}),
-        json!({"label":"构建环境", "ready":cargo.0, "next_action": if cargo.0 {"继续"} else {"安装 Rust 构建环境"}}),
+        json!({"label":"GenoLigand 命令行入口", "ready":gls_cli.0, "next_action": if gls_cli.0 {"继续"} else {"重新运行安装程序"}}),
         json!({"label":"科学仓库", "ready":database_ready, "next_action": if database_ready {"继续"} else {"运行安装/修复"}}),
     ];
     json!({
-        "status": if cargo.0 && gls_cli.0 && database_ready {"ready"} else {"warning"},
+        "status": if gls_cli.0 && database_ready {"ready"} else {"warning"},
         "runtime": std::env::consts::OS,
         "checks": checks,
         "missing": missing,
@@ -2514,6 +2512,23 @@ mod tests {
         assert!(!summary.contains("manifest"));
         assert!(!summary.contains("tool_versions"));
         assert!(!summary.contains("science_store"));
+    }
+
+    #[test]
+    fn user_diagnostics_do_not_request_developer_build_tools() {
+        let root =
+            std::env::temp_dir().join(format!("genoligand-user-diagnostics-{}", now_millis()));
+        let options = server_options(root.clone());
+
+        let payload = user_diagnostics_json(&options);
+        let text = payload.to_string();
+
+        assert!(text.contains("GenoLigand 命令行入口"));
+        assert!(!text.contains("Rust"));
+        assert!(!text.contains("cargo"));
+        assert!(!text.contains("构建环境"));
+
+        fs::remove_dir_all(&root).ok();
     }
 
     #[test]
