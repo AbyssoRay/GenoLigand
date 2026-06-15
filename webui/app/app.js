@@ -167,6 +167,8 @@ function renderAlert() {
 function renderInput() {
   page.className = "page";
   const active = inputSpecs.find((item) => item.kind === state.selectedInput) || inputSpecs[0];
+  const activeValidation = inputValidation(active);
+  const saveDisabled = inputsReadyToSave() ? "" : "disabled";
   page.innerHTML = `
     <div class="panel-grid">
       <section class="panel full">
@@ -175,7 +177,7 @@ function renderInput() {
             <h2>选择输入类型</h2>
             <p>可以填写一种或多种输入。只有用户填写的内容会进入计算。</p>
           </div>
-          <span class="status-pill ${hasAnyInput() ? "ready" : "blocked"}">${hasAnyInput() ? "已有输入" : "等待输入"}</span>
+          <span class="status-pill ${inputsReadyToSave() ? "ready" : "blocked"}">${inputStatusLabel()}</span>
         </div>
         <div class="input-grid">
           ${inputSpecs.map(renderInputTypeCard).join("")}
@@ -196,22 +198,24 @@ function renderInput() {
         <div class="field">
           <label for="${active.field}">${active.label}</label>
           <textarea id="${active.field}" data-form="${active.field}" placeholder="${escapeAttr(active.placeholder)}">${escapeHtml(state.form[active.field])}</textarea>
+          <div class="field-help ${activeValidation.ready ? "ready-text" : activeValidation.value ? "blocked-text" : ""}">${escapeHtml(activeValidation.message)}</div>
         </div>
         <div class="actions">
-          <button class="button" data-action="save-input">保存输入</button>
-          <button class="button secondary" data-action="save-and-check">保存并检查</button>
+          <button class="button" data-action="save-input" ${saveDisabled}>保存输入</button>
+          <button class="button secondary" data-action="save-and-check" ${saveDisabled}>保存并检查</button>
           <button class="button ghost" data-action="clear-input">清空当前输入</button>
         </div>
       </section>
       <section class="panel third">
         <h2>输入状态</h2>
         ${metricRow("填写类型", `${filledInputs().length} / ${inputSpecs.length}`)}
+        ${metricRow("可用输入", `${usableInputs().length} / ${inputSpecs.length}`)}
         ${metricRow("候选显示", "运行完成前不显示候选")}
         ${metricRow("结果来源", "仅读取当前项目运行输出")}
       </section>
       <section class="panel third">
         <h2>下一步</h2>
-        <p>${hasAnyInput() ? "保存后进入配置和检查。" : "先填写任一种输入。"}</p>
+        <p>${inputsReadyToSave() ? "保存后进入配置和检查。" : "先完成当前输入检查。"}</p>
       </section>
       <section class="panel third">
         <h2>数据库状态</h2>
@@ -227,12 +231,14 @@ function renderInput() {
 
 function renderInputTypeCard(spec) {
   const selected = state.selectedInput === spec.kind;
-  const filled = state.form[spec.field].trim().length > 0;
+  const value = state.form[spec.field].trim();
+  const filled = value.length > 0;
+  const usable = inputValueUsable(spec.field, value);
   return `
     <button class="input-card ${selected ? "selected" : ""}" data-select-input="${spec.kind}">
       <h3>${spec.title}</h3>
       <p>${spec.minimum}</p>
-      <span class="status-pill ${filled ? "ready" : "blocked"}">${filled ? "已填写" : "未填写"}</span>
+      <span class="status-pill ${usable ? "ready" : "blocked"}">${usable ? "可用" : filled ? "需检查" : "未填写"}</span>
     </button>`;
 }
 
@@ -715,8 +721,8 @@ function collectForm() {
 
 async function saveInput() {
   collectForm();
-  if (!hasAnyInput()) {
-    state.alert = "请先填写至少一种研究输入。";
+  if (!inputsReadyToSave()) {
+    state.alert = "请先填写至少一个可识别的研究输入，并处理所有已填写字段的提示。";
     render();
     return false;
   }
@@ -736,10 +742,16 @@ async function saveInput() {
     ],
     files: [],
   };
-  await api(`/api/projects/${state.project.project_id}/inputs`, {
+  const saved = await api(`/api/projects/${state.project.project_id}/inputs`, {
     method: "POST",
     body: JSON.stringify(inputPayload),
   });
+  if (saved.status !== "saved") {
+    state.project = saved.project || state.project;
+    state.alert = saved.message || "输入未保存，请检查填写内容。";
+    render();
+    return false;
+  }
   state.project = await api(`/api/projects/${state.project.project_id}`);
   setStep("configure");
   return true;
@@ -826,6 +838,15 @@ function hasAnyInput() {
   return filledInputs().length > 0;
 }
 
+function hasUsableInput() {
+  return usableInputs().length > 0;
+}
+
+function inputsReadyToSave() {
+  const filled = filledInputs();
+  return filled.length > 0 && filled.every((item) => inputValueUsable(item.field, item.value));
+}
+
 function filledInputs() {
   return inputSpecs
     .map((spec) => ({
@@ -834,6 +855,74 @@ function filledInputs() {
       value: (state.form[spec.field] || "").trim(),
     }))
     .filter((item) => item.value);
+}
+
+function usableInputs() {
+  return filledInputs().filter((item) => inputValueUsable(item.field, item.value));
+}
+
+function inputStatusLabel() {
+  if (inputsReadyToSave()) return "输入可保存";
+  if (hasAnyInput()) return "需要检查输入";
+  return "等待输入";
+}
+
+function inputValidation(spec) {
+  const value = (state.form[spec.field] || "").trim();
+  if (!value) {
+    return { ready: false, value: "", message: spec.minimum };
+  }
+  if (inputValueUsable(spec.field, value)) {
+    return { ready: true, value, message: "该输入可进入检查。" };
+  }
+  return {
+    ready: false,
+    value,
+    message: "请填写可识别的序列、结构文件路径、分子表示或登记名称。",
+  };
+}
+
+function inputValueUsable(field, value) {
+  const text = String(value || "").trim();
+  if (!text) return false;
+  if (field === "small_molecule") {
+    return looksLikePathWithExt(text, ["sdf", "mol2", "mol", "pdb", "cif", "mmcif"]) || alnumCount(text) >= 1;
+  }
+  if (field === "peptide") {
+    return looksLikePathWithExt(text, ["fasta", "fa", "pdb", "cif", "mmcif"]) || alnumCount(text) >= 2;
+  }
+  if (field === "protein_ligand") {
+    return looksLikePathWithExt(text, ["fasta", "fa", "faa", "pdb", "cif", "mmcif"]) || looksLikeSequence(text, 5);
+  }
+  if (field === "complex") {
+    return looksLikePathWithExt(text, ["pdb", "cif", "mmcif", "ent"]) || alnumCount(text) >= 5;
+  }
+  if (field === "genome_or_metagenome") {
+    return (
+      looksLikePathWithExt(text, ["fasta", "fa", "fna", "faa", "fastq", "fq", "gb", "gff", "gtf", "vcf"]) ||
+      looksLikeSequence(text, 8)
+    );
+  }
+  return alnumCount(text) >= 2;
+}
+
+function looksLikePathWithExt(value, extensions) {
+  const lower = value.toLowerCase();
+  return extensions.some((ext) => lower.endsWith(`.${ext}`) || lower.includes(`.${ext}\n`));
+}
+
+function looksLikeSequence(value, minLength) {
+  const body = value.trim().startsWith(">")
+    ? value
+        .split(/\r?\n/)
+        .slice(1)
+        .join("")
+    : value;
+  return alnumCount(body) >= minLength;
+}
+
+function alnumCount(value) {
+  return Array.from(String(value || "")).filter((char) => /[\p{Letter}\p{Number}]/u.test(char)).length;
 }
 
 function sourceReady(key) {

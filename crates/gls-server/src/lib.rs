@@ -322,6 +322,14 @@ fn write_input_manifest(options: &ServerOptions, project_id: &str, body: &str) -
     if let Some(name) = input_project_name(&value) {
         let _ = write_text(&dir.join("project_name.txt"), &name);
     }
+    if !input_value_has_usable_user_input(&value) {
+        return json!({
+            "status":"failed",
+            "error":"input_not_usable",
+            "message":"\u{8bf7}\u{586b}\u{5199}\u{81f3}\u{5c11}\u{4e00}\u{4e2a}\u{53ef}\u{8bc6}\u{522b}\u{7684}\u{7814}\u{7a76}\u{8f93}\u{5165}\u{3002}",
+            "project": read_project(options, project_id)
+        });
+    }
     match write_text(&path, &(value.to_string() + "\n")) {
         Ok(()) => json!({"status":"saved","project":read_project(options, project_id)}),
         Err(err) => json!({"status":"failed","error":err}),
@@ -1467,23 +1475,81 @@ fn input_project_name(value: &Value) -> Option<String> {
 
 fn input_has_user_value(path: &Path) -> bool {
     let value = read_json_or(path, json!({}));
-    value
-        .get("inputs")
-        .and_then(Value::as_array)
-        .map(|inputs| {
-            inputs.iter().any(|item| {
-                item.get("field")
-                    .and_then(Value::as_str)
-                    .map(|field| field != "project_name")
-                    .unwrap_or(false)
-                    && item
-                        .get("value")
-                        .and_then(Value::as_str)
-                        .map(|value| !value.trim().is_empty())
-                        .unwrap_or(false)
-            })
-        })
-        .unwrap_or(false)
+    input_value_has_usable_user_input(&value)
+}
+
+fn input_value_has_usable_user_input(value: &Value) -> bool {
+    let Some(inputs) = value.get("inputs").and_then(Value::as_array) else {
+        return false;
+    };
+    let mut saw_usable_input = false;
+    for item in inputs {
+        let field = item.get("field").and_then(Value::as_str).unwrap_or("");
+        let input_value = item.get("value").and_then(Value::as_str).unwrap_or("");
+        if field == "project_name" || input_value.trim().is_empty() {
+            continue;
+        }
+        if !input_field_is_usable(field, input_value) {
+            return false;
+        }
+        saw_usable_input = true;
+    }
+    saw_usable_input
+}
+
+fn input_field_is_usable(field: &str, value: &str) -> bool {
+    let value = value.trim();
+    if value.is_empty() || field == "project_name" {
+        return false;
+    }
+    let field = field.to_ascii_lowercase();
+    match field.as_str() {
+        "small_molecule" => {
+            looks_like_path_with_ext(value, &["sdf", "mol2", "mol", "pdb", "cif", "mmcif"])
+                || count_alphanumeric(value) >= 1
+        }
+        "peptide" => {
+            looks_like_path_with_ext(value, &["fasta", "fa", "pdb", "cif", "mmcif"])
+                || count_alphanumeric(value) >= 2
+        }
+        "protein_ligand" => {
+            looks_like_path_with_ext(value, &["fasta", "fa", "faa", "pdb", "cif", "mmcif"])
+                || looks_like_fasta_or_sequence(value, 5)
+        }
+        "complex" => {
+            looks_like_path_with_ext(value, &["pdb", "cif", "mmcif", "ent"])
+                || count_alphanumeric(value) >= 5
+        }
+        "genome_or_metagenome" => {
+            looks_like_path_with_ext(
+                value,
+                &[
+                    "fasta", "fa", "fna", "faa", "fastq", "fq", "gb", "gff", "gtf", "vcf",
+                ],
+            ) || looks_like_fasta_or_sequence(value, 8)
+        }
+        _ => count_alphanumeric(value) >= 2,
+    }
+}
+
+fn looks_like_path_with_ext(value: &str, extensions: &[&str]) -> bool {
+    let value = value.trim().to_ascii_lowercase();
+    extensions
+        .iter()
+        .any(|ext| value.ends_with(&format!(".{ext}")) || value.contains(&format!(".{ext}\n")))
+}
+
+fn looks_like_fasta_or_sequence(value: &str, min_alphanumeric: usize) -> bool {
+    let trimmed = value.trim();
+    if trimmed.starts_with('>') {
+        return count_alphanumeric(trimmed.lines().skip(1).collect::<String>().as_str())
+            >= min_alphanumeric;
+    }
+    count_alphanumeric(trimmed) >= min_alphanumeric
+}
+
+fn count_alphanumeric(value: &str) -> usize {
+    value.chars().filter(|ch| ch.is_alphanumeric()).count()
 }
 
 fn read_json_or(path: &Path, fallback: Value) -> Value {
@@ -1865,6 +1931,62 @@ mod tests {
         assert!(!text.contains("remote"));
 
         fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn input_validation_blocks_punctuation_only_payloads() {
+        let root =
+            std::env::temp_dir().join(format!("genoligand-input-validation-{}", now_millis()));
+        let options = server_options(root.clone());
+        fs::create_dir_all(project_dir(&options, "project-1")).expect("project dir");
+
+        let response = write_input_manifest(
+            &options,
+            "project-1",
+            r#"{"inputs":[{"field":"project_name","value":"研究项目"},{"field":"small_molecule","value":"!!!"}],"files":[]}"#,
+        );
+        assert_eq!(response["status"], "failed");
+        assert_eq!(response["error"], "input_not_usable");
+        assert!(!input_value_has_usable_user_input(&json!({
+            "inputs":[{"field":"complex","value":"---"}]
+        })));
+        assert!(!input_value_has_usable_user_input(&json!({
+            "inputs":[
+                {"field":"small_molecule","value":"CCO"},
+                {"field":"protein_ligand","value":"???"}
+            ]
+        })));
+
+        let preflight = preflight_json(&options, "project-1");
+        let input_ready = preflight["checks"]
+            .as_array()
+            .and_then(|rows| {
+                rows.iter()
+                    .find(|row| row.get("id").and_then(Value::as_str) == Some("input"))
+            })
+            .and_then(|row| row.get("ready").and_then(Value::as_bool))
+            .unwrap_or(true);
+        assert!(!input_ready);
+
+        fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn input_validation_accepts_supported_input_types() {
+        for (field, value) in [
+            ("small_molecule", "CCO"),
+            ("peptide", "ACDEFG"),
+            ("protein_ligand", ">protein\nMSTNPKPQR"),
+            ("complex", "complex_chain_A_ligand_LIG.pdb"),
+            ("genome_or_metagenome", ">orf1\nATGCGTACGTAA"),
+        ] {
+            assert!(
+                input_value_has_usable_user_input(&json!({
+                    "inputs":[{"field":field,"value":value}]
+                })),
+                "{field} should be accepted"
+            );
+        }
     }
 
     #[test]
