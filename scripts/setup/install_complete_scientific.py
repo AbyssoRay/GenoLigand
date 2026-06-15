@@ -68,6 +68,8 @@ def resolve_binary_command(
     env_value = os.environ.get(env_name)
     if env_value:
         return command_from_string(env_value)
+    if (root / "Cargo.toml").exists():
+        return ["cargo", "run", "-p", cargo_package, "--"]
     executable = f"{binary_name}.exe" if os.name == "nt" else binary_name
     built = root / "target" / "debug" / executable
     if built.exists():

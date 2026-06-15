@@ -366,7 +366,9 @@ fn prepare_science_store(options: &StoreOptions) -> Result<String, String> {
     let source_requirements = options.science_store.join("source_requirements.tsv");
     let download_plan = options.science_store.join("download_plan.tsv");
     let index_plan = options.science_store.join("index_plan.tsv");
+    let index_build = options.science_store.join("index_build_manifest.tsv");
     write_tool_versions(&tools)?;
+    let build_summary = build_store_indexes(options, &index_build)?;
     write_source_requirements(options, &source_requirements)?;
     write_download_plan(options, &download_plan)?;
     write_index_plan(options, &index_plan)?;
@@ -425,9 +427,8 @@ fn prepare_science_store(options: &StoreOptions) -> Result<String, String> {
         ));
     }
     for source in REQUIRED_SOURCES {
-        let local_path = options.science_store.join(source.local_rel_path);
         let index_path = options.science_store.join(source.index_rel_path);
-        let source_ready = local_path.exists() && index_path.exists();
+        let source_ready = source_local_available(options, source) && index_path.exists();
         if !source_ready {
             missing.push(format!("source:{}", source.id));
         }
@@ -456,7 +457,12 @@ fn prepare_science_store(options: &StoreOptions) -> Result<String, String> {
                 "tool_versions": "indexes/tool_versions.tsv",
                 "source_requirements": "source_requirements.tsv",
                 "download_plan": "download_plan.tsv",
-                "index_plan": "index_plan.tsv"
+                "index_plan": "index_plan.tsv",
+                "index_build_manifest": "index_build_manifest.tsv",
+                "index_rows_built": {
+                    "known": build_summary.known_rows,
+                    "metagenome": build_summary.metagenome_rows
+                }
             })
         ),
     )?;
@@ -465,6 +471,347 @@ fn prepare_science_store(options: &StoreOptions) -> Result<String, String> {
         if ready == 3 { "ready" } else { "needs_repair" },
         options.science_store.display()
     ))
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct IndexBuildSummary {
+    known_rows: usize,
+    metagenome_rows: usize,
+}
+
+fn build_store_indexes(
+    options: &StoreOptions,
+    manifest_path: &Path,
+) -> Result<IndexBuildSummary, String> {
+    let known_sources = [
+        "imports/known_targets.tsv",
+        "downloads/known_targets.tsv",
+        "downloads/chembl/known_targets.tsv",
+        "downloads/bindingdb/known_targets.tsv",
+        "downloads/uniprot/known_targets.tsv",
+    ];
+    let metagenome_sources = [
+        "imports/metagenome_targets.tsv",
+        "downloads/metagenome_targets.tsv",
+        "downloads/metagenome/metagenome_targets.tsv",
+    ];
+    let mut manifest = String::from("index\tinput_path\tstatus\trows\toutput_path\tnotes\n");
+    let mut known_rows = Vec::new();
+    for rel in known_sources {
+        let path = options.science_store.join(rel);
+        append_canonical_rows(
+            "known_targets",
+            &options.science_store,
+            &path,
+            &mut known_rows,
+            &mut manifest,
+        )?;
+    }
+    let uniprot_dir = options.science_store.join("downloads/uniprot");
+    for path in discover_sequence_files(&uniprot_dir)? {
+        let rows = parse_fasta_targets(
+            &path,
+            "UniProt",
+            "Homo sapiens",
+            "known_human_protein",
+            "protein_sequence_record",
+        )?;
+        append_built_rows(
+            "known_targets",
+            &options.science_store,
+            &path,
+            rows,
+            &mut known_rows,
+            &mut manifest,
+        );
+    }
+
+    let mut metagenome_rows = Vec::new();
+    for rel in metagenome_sources {
+        let path = options.science_store.join(rel);
+        append_canonical_rows(
+            "metagenome_targets",
+            &options.science_store,
+            &path,
+            &mut metagenome_rows,
+            &mut manifest,
+        )?;
+    }
+    let metagenome_dir = options.science_store.join("downloads/metagenome");
+    for path in discover_sequence_files(&metagenome_dir)? {
+        let rows = parse_fasta_targets(
+            &path,
+            "metagenome",
+            "metagenome_or_custom_source",
+            "potential_metagenome_sequence",
+            "sequence_record",
+        )?;
+        append_built_rows(
+            "metagenome_targets",
+            &options.science_store,
+            &path,
+            rows,
+            &mut metagenome_rows,
+            &mut manifest,
+        );
+    }
+
+    known_rows = dedupe_store_rows(known_rows);
+    metagenome_rows = dedupe_store_rows(metagenome_rows);
+    if !known_rows.is_empty() {
+        write_store_rows(
+            &options.science_store.join("indexes/known_targets.tsv"),
+            &known_rows,
+        )?;
+    }
+    if !metagenome_rows.is_empty() {
+        write_store_rows(
+            &options.science_store.join("indexes/metagenome_targets.tsv"),
+            &metagenome_rows,
+        )?;
+    }
+    write_text(manifest_path, &manifest)?;
+    Ok(IndexBuildSummary {
+        known_rows: known_rows.len(),
+        metagenome_rows: metagenome_rows.len(),
+    })
+}
+
+fn append_canonical_rows(
+    index_name: &str,
+    root: &Path,
+    path: &Path,
+    rows: &mut Vec<StoreRow>,
+    manifest: &mut String,
+) -> Result<(), String> {
+    if !path.exists() {
+        manifest.push_str(&format!(
+            "{index_name}\t{}\tmissing\t0\t{}\tnot_present\n",
+            relative_display(root, path),
+            index_output_for(index_name)
+        ));
+        return Ok(());
+    }
+    let parsed = read_store_rows(path, index_name)?;
+    let count = parsed.len();
+    rows.extend(parsed);
+    manifest.push_str(&format!(
+        "{index_name}\t{}\t{}\t{count}\t{}\tcanonical_target_rows\n",
+        relative_display(root, path),
+        if count > 0 { "used" } else { "empty" },
+        index_output_for(index_name)
+    ));
+    Ok(())
+}
+
+fn append_built_rows(
+    index_name: &str,
+    root: &Path,
+    path: &Path,
+    built_rows: Vec<StoreRow>,
+    rows: &mut Vec<StoreRow>,
+    manifest: &mut String,
+) {
+    let count = built_rows.len();
+    rows.extend(built_rows);
+    manifest.push_str(&format!(
+        "{index_name}\t{}\t{}\t{count}\t{}\tfasta_sequence_rows\n",
+        relative_display(root, path),
+        if count > 0 { "used" } else { "empty" },
+        index_output_for(index_name)
+    ));
+}
+
+fn index_output_for(index_name: &str) -> &'static str {
+    match index_name {
+        "known_targets" => "indexes/known_targets.tsv",
+        "metagenome_targets" => "indexes/metagenome_targets.tsv",
+        _ => "indexes/unknown.tsv",
+    }
+}
+
+fn discover_sequence_files(root: &Path) -> Result<Vec<PathBuf>, String> {
+    let mut out = Vec::new();
+    if !root.exists() {
+        return Ok(out);
+    }
+    discover_sequence_files_inner(root, &mut out)?;
+    out.sort();
+    Ok(out)
+}
+
+fn discover_sequence_files_inner(root: &Path, out: &mut Vec<PathBuf>) -> Result<(), String> {
+    for entry in
+        fs::read_dir(root).map_err(|err| format!("read_dir_failed:{}:{err}", root.display()))?
+    {
+        let entry =
+            entry.map_err(|err| format!("read_dir_entry_failed:{}:{err}", root.display()))?;
+        let path = entry.path();
+        if path.is_dir() {
+            discover_sequence_files_inner(&path, out)?;
+        } else if is_sequence_file(&path) {
+            out.push(path);
+        }
+    }
+    Ok(())
+}
+
+fn is_sequence_file(path: &Path) -> bool {
+    path.extension()
+        .and_then(|value| value.to_str())
+        .is_some_and(|ext| matches!(ext.to_ascii_lowercase().as_str(), "fa" | "faa" | "fasta"))
+}
+
+fn parse_fasta_targets(
+    path: &Path,
+    source: &str,
+    default_organism: &str,
+    target_class: &str,
+    evidence: &str,
+) -> Result<Vec<StoreRow>, String> {
+    let text = read_text(path)?;
+    let mut rows = Vec::new();
+    let mut header = String::new();
+    let mut sequence = String::new();
+    for line in text.lines() {
+        let line = line.trim_start_matches('\u{feff}');
+        if let Some(rest) = line.strip_prefix('>') {
+            push_fasta_row(
+                source,
+                default_organism,
+                target_class,
+                evidence,
+                &header,
+                &sequence,
+                &mut rows,
+            );
+            header = rest.trim().to_string();
+            sequence.clear();
+        } else {
+            sequence.push_str(line.trim());
+        }
+    }
+    push_fasta_row(
+        source,
+        default_organism,
+        target_class,
+        evidence,
+        &header,
+        &sequence,
+        &mut rows,
+    );
+    Ok(rows)
+}
+
+fn push_fasta_row(
+    source: &str,
+    default_organism: &str,
+    target_class: &str,
+    evidence: &str,
+    header: &str,
+    sequence: &str,
+    rows: &mut Vec<StoreRow>,
+) {
+    if header.is_empty() || sequence.is_empty() {
+        return;
+    }
+    let (target_id, target_name) = fasta_id_and_name(header);
+    let organism = fasta_organism(header).unwrap_or_else(|| default_organism.to_string());
+    let mut sequence_tokens = tokenize(sequence);
+    sequence_tokens.extend(tokenize(header));
+    rows.push(StoreRow {
+        source: source.to_string(),
+        target_id,
+        target_name,
+        organism,
+        target_class: target_class.to_string(),
+        ligand_tokens: BTreeSet::new(),
+        sequence_tokens,
+        structure_tokens: tokenize(header),
+        evidence: evidence.to_string(),
+    });
+}
+
+fn fasta_id_and_name(header: &str) -> (String, String) {
+    let first = header.split_whitespace().next().unwrap_or(header);
+    let parts = first.split('|').collect::<Vec<_>>();
+    let target_id = if parts.len() >= 2 { parts[1] } else { first };
+    let name_part = if parts.len() >= 3 {
+        parts[2].replace('_', " ")
+    } else {
+        header
+            .split_once(' ')
+            .map(|(_, rest)| rest)
+            .unwrap_or(target_id)
+            .to_string()
+    };
+    let target_name = name_part
+        .split(" OS=")
+        .next()
+        .unwrap_or(&name_part)
+        .trim()
+        .to_string();
+    (target_id.to_string(), target_name)
+}
+
+fn fasta_organism(header: &str) -> Option<String> {
+    let (_, after_os) = header.split_once(" OS=")?;
+    let organism = after_os
+        .split(" OX=")
+        .next()
+        .unwrap_or(after_os)
+        .trim()
+        .to_string();
+    if organism.is_empty() {
+        None
+    } else {
+        Some(organism)
+    }
+}
+
+fn dedupe_store_rows(rows: Vec<StoreRow>) -> Vec<StoreRow> {
+    let mut by_key = BTreeMap::new();
+    for row in rows {
+        by_key
+            .entry((row.source.clone(), row.target_id.clone()))
+            .or_insert(row);
+    }
+    by_key.into_values().collect()
+}
+
+fn write_store_rows(path: &Path, rows: &[StoreRow]) -> Result<(), String> {
+    let mut text = store_row_header();
+    for row in rows {
+        text.push_str(&format!(
+            "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\n",
+            clean_cell(&row.source),
+            clean_cell(&row.target_id),
+            clean_cell(&row.target_name),
+            clean_cell(&row.organism),
+            clean_cell(&row.target_class),
+            row.ligand_tokens
+                .iter()
+                .cloned()
+                .collect::<Vec<_>>()
+                .join(" "),
+            row.sequence_tokens
+                .iter()
+                .cloned()
+                .collect::<Vec<_>>()
+                .join(" "),
+            row.structure_tokens
+                .iter()
+                .cloned()
+                .collect::<Vec<_>>()
+                .join(" "),
+            clean_cell(&row.evidence)
+        ));
+    }
+    write_text(path, &text)
+}
+
+fn store_row_header() -> String {
+    "source\ttarget_id\ttarget_name\torganism\ttarget_class\tligand_tokens\tsequence_tokens\tstructure_tokens\tevidence\n".to_string()
 }
 
 #[derive(Clone, Debug)]
@@ -498,9 +845,10 @@ fn write_source_requirements(options: &StoreOptions, path: &Path) -> Result<(), 
     for source in REQUIRED_SOURCES {
         let local_path = options.science_store.join(source.local_rel_path);
         let index_path = options.science_store.join(source.index_rel_path);
-        let status = if local_path.exists() && index_path.exists() {
+        let local_available = source_local_available(options, source);
+        let status = if local_available && index_path.exists() {
             "ready"
-        } else if local_path.exists() {
+        } else if local_available {
             "downloaded_needs_index"
         } else {
             "missing"
@@ -530,7 +878,7 @@ fn write_download_plan(options: &StoreOptions, path: &Path) -> Result<(), String
         text.push_str(&format!(
             "{}\t{}\t{}\t{}\t{}\tresume_existing_partial_file\tsha256_or_release_manifest_required\n",
             source.id,
-            if local_path.exists() {
+            if source_local_available(options, source) {
                 "present"
             } else {
                 "download_required"
@@ -546,11 +894,10 @@ fn write_download_plan(options: &StoreOptions, path: &Path) -> Result<(), String
 fn write_index_plan(options: &StoreOptions, path: &Path) -> Result<(), String> {
     let mut text = String::from("source_id\tstatus\taction\tindex_target\tdepends_on\n");
     for source in REQUIRED_SOURCES {
-        let local_path = options.science_store.join(source.local_rel_path);
         let index_path = options.science_store.join(source.index_rel_path);
         let status = if index_path.exists() {
             "ready"
-        } else if local_path.exists() {
+        } else if source_local_available(options, source) {
             "index_required"
         } else {
             "waiting_for_download"
@@ -560,10 +907,61 @@ fn write_index_plan(options: &StoreOptions, path: &Path) -> Result<(), String> {
             source.id,
             source.repair_action,
             source.index_rel_path,
-            relative_display(&options.science_store, &local_path)
+            relative_display(
+                &options.science_store,
+                &options.science_store.join(source.local_rel_path)
+            )
         ));
     }
     write_text(path, &text)
+}
+
+fn source_local_available(options: &StoreOptions, source: &RequiredSource) -> bool {
+    let store = &options.science_store;
+    let local_path = store.join(source.local_rel_path);
+    if local_path.is_file() || path_has_any_file(&local_path) {
+        return true;
+    }
+    match source.id {
+        "chembl" => {
+            store.join("imports/known_targets.tsv").exists()
+                || store.join("downloads/chembl/known_targets.tsv").exists()
+        }
+        "bindingdb" => store.join("downloads/bindingdb/known_targets.tsv").exists(),
+        "uniprot_human_reviewed" => {
+            store.join("downloads/uniprot/known_targets.tsv").exists()
+                || discover_sequence_files(&store.join("downloads/uniprot"))
+                    .map(|files| !files.is_empty())
+                    .unwrap_or(false)
+        }
+        "metagenome_potential" => {
+            store.join("imports/metagenome_targets.tsv").exists()
+                || store.join("downloads/metagenome_targets.tsv").exists()
+                || store
+                    .join("downloads/metagenome/metagenome_targets.tsv")
+                    .exists()
+                || discover_sequence_files(&store.join("downloads/metagenome"))
+                    .map(|files| !files.is_empty())
+                    .unwrap_or(false)
+        }
+        _ => false,
+    }
+}
+
+fn path_has_any_file(path: &Path) -> bool {
+    if !path.is_dir() {
+        return false;
+    }
+    let Ok(entries) = fs::read_dir(path) else {
+        return false;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_file() || path_has_any_file(&path) {
+            return true;
+        }
+    }
+    false
 }
 
 fn tools_ready(path: &Path) -> bool {
@@ -1479,6 +1877,39 @@ mod tests {
         let ranking = read_text(&run.join("target_candidate_ranking.tsv")).expect("ranking");
         assert!(ranking.contains("P24941"));
         assert!(!ranking.contains("MG_ORF_0001"));
+        fs::remove_dir_all(&root).expect("cleanup temp root");
+        assert!(!root.exists());
+    }
+
+    #[test]
+    fn prepare_science_store_builds_indexes_from_existing_source_files() {
+        let root = temp_root("build_indexes");
+        let store = root.join("science_store");
+        write_text(
+            &store.join("downloads/chembl/known_targets.tsv"),
+            "source\ttarget_id\ttarget_name\torganism\ttarget_class\tligand_tokens\tsequence_tokens\tstructure_tokens\tevidence\nChEMBL\tCHEMBL_T1\tAlpha kinase\tHomo sapiens\tknown_human_protein\tlig kinase\talpha kinase\tpocket alpha\tsource_table_row\n",
+        )
+        .expect("write known source");
+        write_text(
+            &store.join("downloads/metagenome/orfs.faa"),
+            ">MG_ORF_1 candidate oxidase OS=uncultured bacterium\nMKTAYIAKQRQISFVKSHFSRQDILDLWQ\n",
+        )
+        .expect("write metagenome fasta");
+        let options = StoreOptions {
+            workspace_root: root.clone(),
+            science_store: store.clone(),
+        };
+        let _ = run_store_command(ScienceCommand::PrepareScienceStore, &options)
+            .expect("prepare store");
+        let known = read_text(&store.join("indexes/known_targets.tsv")).expect("known index");
+        let metagenome =
+            read_text(&store.join("indexes/metagenome_targets.tsv")).expect("metagenome index");
+        let build_manifest =
+            read_text(&store.join("index_build_manifest.tsv")).expect("build manifest");
+        assert!(known.contains("CHEMBL_T1"));
+        assert!(metagenome.contains("MG_ORF_1"));
+        assert!(build_manifest.contains("canonical_target_rows"));
+        assert!(build_manifest.contains("fasta_sequence_rows"));
         fs::remove_dir_all(&root).expect("cleanup temp root");
         assert!(!root.exists());
     }
