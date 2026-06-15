@@ -974,6 +974,9 @@ fn read_json_or(path: &Path, fallback: Value) -> Value {
 fn artifact_index(run_dir: &Path) -> Value {
     let mut items = Vec::new();
     for name in [
+        "run_context.json",
+        "run_context.tsv",
+        "artifact_source_map.tsv",
         "input_normalized_manifest.json",
         "feature_manifest.json",
         "known_database_matches.tsv",

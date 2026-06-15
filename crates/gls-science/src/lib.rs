@@ -1206,9 +1206,12 @@ fn first_nonempty_line(text: &str) -> Option<String> {
 }
 
 fn run_pipeline(options: &ScienceOptions) -> Result<String, String> {
+    ensure_dir(&options.run_dir)?;
+    write_run_context(options, "starting", &[])?;
     let blocked = pipeline_blockers(options)?;
     if !blocked.is_empty() {
         write_blocked_outputs(options, &blocked)?;
+        write_run_context(options, "blocked", &blocked)?;
         return Ok(format!(
             "pipeline_blocked\treasons={}\trun_dir={}",
             blocked.join(","),
@@ -1225,6 +1228,9 @@ fn run_pipeline(options: &ScienceOptions) -> Result<String, String> {
     rank_targets(options)?;
     build_evidence(options)?;
     render_report(options)?;
+    write_artifact_source_map(options)?;
+    write_text(&options.run_dir.join("run_state.txt"), "completed\n")?;
+    write_run_context(options, "completed", &[])?;
     Ok(format!(
         "pipeline_completed\trun_dir={}",
         options.run_dir.display()
@@ -1294,6 +1300,7 @@ fn write_blocked_outputs(options: &ScienceOptions, blockers: &[String]) -> Resul
             blockers.join(";")
         ),
     )?;
+    write_artifact_source_map(options)?;
     Ok(())
 }
 
@@ -1549,13 +1556,7 @@ fn rank_targets(options: &ScienceOptions) -> Result<String, String> {
         ));
     }
     write_text(&options.run_dir.join("target_candidate_ranking.tsv"), &text)?;
-    write_text(
-        &options.run_dir.join("candidate_detail.json"),
-        &format!(
-            "{{\"candidate_count\":{},\"status\":\"computed\",\"source\":\"GenoLigand pipeline\"}}\n",
-            candidates.len()
-        ),
-    )?;
+    write_candidate_detail(options, &candidates)?;
     Ok(format!(
         "targets_ranked\tcandidate_count={}",
         candidates.len()
@@ -1563,7 +1564,11 @@ fn rank_targets(options: &ScienceOptions) -> Result<String, String> {
 }
 
 fn build_evidence(options: &ScienceOptions) -> Result<String, String> {
+    write_score_decomposition(options)?;
+    write_artifact_source_map(options)?;
     let files = [
+        "run_context.json",
+        "artifact_source_map.tsv",
         "input_normalized_manifest.tsv",
         "feature_manifest.tsv",
         "known_database_matches.tsv",
@@ -1573,6 +1578,7 @@ fn build_evidence(options: &ScienceOptions) -> Result<String, String> {
         "md_summary.tsv",
         "target_candidate_ranking.tsv",
         "score_decomposition.tsv",
+        "candidate_detail.json",
     ];
     let mut text = String::from("claim_id\tevidence_artifact\towner\tstatus\tnotes\n");
     for file in files {
@@ -1585,7 +1591,6 @@ fn build_evidence(options: &ScienceOptions) -> Result<String, String> {
             ));
         }
     }
-    write_score_decomposition(options)?;
     write_text(&options.run_dir.join("evidence_ledger.tsv"), &text)?;
     Ok("evidence_built".to_string())
 }
@@ -1617,6 +1622,238 @@ fn render_report(options: &ScienceOptions) -> Result<String, String> {
     Ok("report_rendered".to_string())
 }
 
+fn write_run_context(
+    options: &ScienceOptions,
+    state: &str,
+    blockers: &[String],
+) -> Result<(), String> {
+    let project_id = infer_project_id(&options.run_dir);
+    let run_id = infer_run_id(&options.run_dir);
+    let input_status = file_context(&options.input_manifest);
+    let known_index = options.science_store.join("indexes/known_targets.tsv");
+    let metagenome_index = options.science_store.join("indexes/metagenome_targets.tsv");
+    let tool_versions = options.science_store.join("indexes/tool_versions.tsv");
+    let context = json!({
+        "state": state,
+        "project_id": project_id,
+        "run_id": run_id,
+        "workspace_root": options.workspace_root.display().to_string(),
+        "science_store": options.science_store.display().to_string(),
+        "run_dir": options.run_dir.display().to_string(),
+        "input_manifest": input_status,
+        "database_indexes": {
+            "known_targets": file_context(&known_index),
+            "metagenome_targets": file_context(&metagenome_index),
+            "tool_versions": file_context(&tool_versions)
+        },
+        "blockers": blockers,
+    });
+    write_text(
+        &options.run_dir.join("run_context.json"),
+        &(context.to_string() + "\n"),
+    )?;
+    let mut text = String::from("field\tvalue\n");
+    for (field, value) in [
+        ("state", state.to_string()),
+        ("project_id", project_id),
+        ("run_id", run_id),
+        (
+            "workspace_root",
+            options.workspace_root.display().to_string(),
+        ),
+        ("science_store", options.science_store.display().to_string()),
+        ("run_dir", options.run_dir.display().to_string()),
+        (
+            "input_manifest",
+            options.input_manifest.display().to_string(),
+        ),
+        ("known_targets_index", known_index.display().to_string()),
+        (
+            "metagenome_targets_index",
+            metagenome_index.display().to_string(),
+        ),
+        ("tool_versions", tool_versions.display().to_string()),
+        ("blockers", blockers.join(";")),
+    ] {
+        text.push_str(&format!("{field}\t{}\n", clean_cell(&value)));
+    }
+    write_text(&options.run_dir.join("run_context.tsv"), &text)
+}
+
+fn file_context(path: &Path) -> Value {
+    let exists = path.exists();
+    let bytes = fs::metadata(path).map(|meta| meta.len()).unwrap_or(0);
+    let content_id = if exists {
+        read_text(path).ok().map(|text| stable_hash(&text))
+    } else {
+        None
+    };
+    json!({
+        "path": path.display().to_string(),
+        "exists": exists,
+        "bytes": bytes,
+        "content_id": content_id,
+    })
+}
+
+fn infer_project_id(run_dir: &Path) -> String {
+    run_dir
+        .parent()
+        .and_then(|path| path.parent())
+        .and_then(|path| path.file_name())
+        .and_then(|name| name.to_str())
+        .unwrap_or("standalone_project")
+        .to_string()
+}
+
+fn infer_run_id(run_dir: &Path) -> String {
+    run_dir
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("standalone_run")
+        .to_string()
+}
+
+fn write_candidate_detail(
+    options: &ScienceOptions,
+    candidates: &[Candidate],
+) -> Result<(), String> {
+    let project_id = infer_project_id(&options.run_dir);
+    let run_id = infer_run_id(&options.run_dir);
+    let rows = candidates
+        .iter()
+        .map(|candidate| {
+            json!({
+                "candidate_id": candidate.candidate_id,
+                "target_id": candidate.target_id,
+                "target_name": candidate.target_name,
+                "candidate_scope": candidate.candidate_scope,
+                "organism": candidate.organism,
+                "scores": {
+                    "final": candidate.final_score,
+                    "known_database": candidate.known_score,
+                    "metagenome": candidate.metagenome_score,
+                    "structure": candidate.structure_score,
+                    "docking": candidate.docking_score,
+                    "md": candidate.dynamics_score
+                },
+                "evidence_summary": candidate.evidence,
+                "source_artifacts": [
+                    "input_normalized_manifest.tsv",
+                    "feature_manifest.tsv",
+                    "known_database_matches.tsv",
+                    "metagenome_potential_matches.tsv",
+                    "target_candidate_ranking.tsv",
+                    "evidence_ledger.tsv"
+                ],
+                "project_id": project_id,
+                "run_id": run_id
+            })
+        })
+        .collect::<Vec<_>>();
+    let value = json!({
+        "candidate_count": candidates.len(),
+        "status": "computed",
+        "project_id": project_id,
+        "run_id": run_id,
+        "candidates": rows
+    });
+    write_text(
+        &options.run_dir.join("candidate_detail.json"),
+        &(value.to_string() + "\n"),
+    )
+}
+
+fn write_artifact_source_map(options: &ScienceOptions) -> Result<(), String> {
+    let project_id = infer_project_id(&options.run_dir);
+    let run_id = infer_run_id(&options.run_dir);
+    let rows = [
+        (
+            "run_context.json",
+            "workspace, science store, input manifest, database index files",
+            "run_context.tsv",
+        ),
+        (
+            "input_normalized_manifest.tsv",
+            "input_manifest.json",
+            "feature_manifest.tsv",
+        ),
+        (
+            "feature_manifest.tsv",
+            "input_normalized_manifest.tsv",
+            "known_database_matches.tsv;metagenome_potential_matches.tsv",
+        ),
+        (
+            "known_database_matches.tsv",
+            "indexes/known_targets.tsv",
+            "target_candidate_ranking.tsv",
+        ),
+        (
+            "metagenome_potential_matches.tsv",
+            "indexes/metagenome_targets.tsv",
+            "target_candidate_ranking.tsv",
+        ),
+        (
+            "target_candidate_ranking.tsv",
+            "known_database_matches.tsv;metagenome_potential_matches.tsv",
+            "candidate_detail.json;structure_patch_summary.tsv;md_summary.tsv",
+        ),
+        (
+            "structure_patch_summary.tsv",
+            "target_candidate_ranking.tsv",
+            "evidence_ledger.tsv",
+        ),
+        (
+            "docking_summary.tsv",
+            "target_candidate_ranking.tsv",
+            "evidence_ledger.tsv",
+        ),
+        (
+            "md_summary.tsv",
+            "target_candidate_ranking.tsv",
+            "evidence_ledger.tsv",
+        ),
+        (
+            "score_decomposition.tsv",
+            "target_candidate_ranking.tsv",
+            "evidence_ledger.tsv",
+        ),
+        (
+            "candidate_detail.json",
+            "target_candidate_ranking.tsv",
+            "research_report.md",
+        ),
+        (
+            "evidence_ledger.tsv",
+            "all current run artifacts",
+            "research_report.md",
+        ),
+        (
+            "research_report.md",
+            "candidate_detail.json;evidence_ledger.tsv",
+            "export",
+        ),
+    ];
+    let mut text =
+        String::from("project_id\trun_id\tartifact\tupstream_source\tdownstream_use\tstatus\n");
+    for (artifact, upstream, downstream) in rows {
+        text.push_str(&format!(
+            "{}\t{}\t{}\t{}\t{}\t{}\n",
+            clean_cell(&project_id),
+            clean_cell(&run_id),
+            artifact,
+            clean_cell(upstream),
+            clean_cell(downstream),
+            if options.run_dir.join(artifact).exists() {
+                "available"
+            } else {
+                "not_yet_written"
+            }
+        ));
+    }
+    write_text(&options.run_dir.join("artifact_source_map.tsv"), &text)
+}
+
 fn write_score_decomposition(options: &ScienceOptions) -> Result<(), String> {
     let candidates = read_candidates(&options.run_dir.join("target_candidate_ranking.tsv"))?;
     let mut text = String::from("candidate_id\tcomponent\tvalue\towner\n");
@@ -1640,7 +1877,8 @@ fn write_score_decomposition(options: &ScienceOptions) -> Result<(), String> {
 
 fn extract_inputs(path: &Path) -> Result<Vec<NormalizedInput>, String> {
     let text = read_text(path)?;
-    let value = serde_json::from_str::<Value>(&text).unwrap_or(Value::Null);
+    let value =
+        serde_json::from_str::<Value>(text.trim_start_matches('\u{feff}')).unwrap_or(Value::Null);
     let mut values = BTreeMap::<String, String>::new();
     let mut file_count = 0usize;
     if let Some(inputs) = value.get("inputs").and_then(Value::as_array) {
@@ -1991,6 +2229,10 @@ mod tests {
         assert!(out.contains("pipeline_blocked"));
         let ranking = read_text(&run.join("target_candidate_ranking.tsv")).expect("ranking");
         assert_eq!(ranking.lines().count(), 1);
+        let context = read_text(&run.join("run_context.json")).expect("run context");
+        let source_map = read_text(&run.join("artifact_source_map.tsv")).expect("source map");
+        assert!(context.contains("\"state\":\"blocked\""));
+        assert!(source_map.contains("target_candidate_ranking.tsv"));
         let _ = fs::remove_dir_all(root);
     }
 
@@ -2016,6 +2258,15 @@ mod tests {
         let ranking = read_text(&run.join("target_candidate_ranking.tsv")).expect("ranking");
         assert!(ranking.contains("P24941"));
         assert!(!ranking.contains("MG_ORF_0001"));
+        let detail = read_text(&run.join("candidate_detail.json")).expect("candidate detail");
+        let context = read_text(&run.join("run_context.json")).expect("run context");
+        let source_map = read_text(&run.join("artifact_source_map.tsv")).expect("source map");
+        let evidence = read_text(&run.join("evidence_ledger.tsv")).expect("evidence ledger");
+        assert!(detail.contains("\"candidates\""));
+        assert!(detail.contains("\"candidate_id\""));
+        assert!(context.contains("\"state\":\"completed\""));
+        assert!(source_map.contains("research_report.md"));
+        assert!(evidence.contains("score_decomposition"));
         fs::remove_dir_all(&root).expect("cleanup temp root");
         assert!(!root.exists());
     }
