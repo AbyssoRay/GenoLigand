@@ -1214,8 +1214,6 @@ fn user_diagnostics_json(options: &ServerOptions) -> Value {
         json!({"label":"科学仓库", "ready":database_ready, "next_action": if database_ready {"继续"} else {"运行安装/修复"}}),
     ];
     json!({
-        "status": if gls_cli.0 && database_ready {"ready"} else {"warning"},
-        "runtime": std::env::consts::OS,
         "checks": checks,
         "missing": missing,
         "science_store": user_databases_json(options)
@@ -1226,10 +1224,7 @@ fn user_setup_status_json(options: &ServerOptions) -> Value {
     let ready = preflight_store_ready(options);
     let required = required_resource_rows(&science_store_path(options));
     json!({
-        "status": if ready {"ready"} else {"needs_repair"},
         "database_ready": ready,
-        "runtime": std::env::consts::OS,
-        "can_run_repair": true,
         "repair_action": if ready {"继续"} else {"运行安装/修复"},
         "checks": required,
         "missing": missing_resource_rows(&required)
@@ -1242,11 +1237,10 @@ fn run_setup_repair_json(options: &ServerOptions) -> Value {
         .args(&command[1..])
         .current_dir(&options.workspace_root)
         .output();
-    let (executed, message, installer_payload) = match output {
+    let (message, installer_payload) = match output {
         Ok(output) if output.status.success() => {
             let stdout = String::from_utf8_lossy(&output.stdout);
             (
-                true,
                 "修复动作已执行。".to_string(),
                 setup_installer_summary(&stdout),
             )
@@ -1254,7 +1248,6 @@ fn run_setup_repair_json(options: &ServerOptions) -> Value {
         Ok(output) => {
             let stdout = String::from_utf8_lossy(&output.stdout);
             (
-                false,
                 format!(
                     "修复动作未完成，退出码 {:?}。",
                     output.status.code().unwrap_or_default()
@@ -1262,7 +1255,7 @@ fn run_setup_repair_json(options: &ServerOptions) -> Value {
                 setup_installer_summary(&stdout),
             )
         }
-        Err(err) => (false, format!("修复动作无法启动：{err}"), None),
+        Err(err) => (format!("修复动作无法启动：{err}"), None),
     };
     let ready = preflight_store_ready(options);
     let required = required_resource_rows(&science_store_path(options));
@@ -1277,7 +1270,6 @@ fn run_setup_repair_json(options: &ServerOptions) -> Value {
             .unwrap_or(message)
     };
     let mut payload = json!({
-        "status": if executed {"repair_executed"} else {"repair_failed"},
         "database_ready": ready,
         "message": user_message,
         "checks": required,
@@ -2423,6 +2415,44 @@ mod tests {
         assert!(!text.contains("gls-server"));
         assert!(!text.contains("route"));
         assert!(!text.contains("debug"));
+    }
+
+    #[test]
+    fn user_setup_status_hides_runtime_and_internal_status_codes() {
+        let root =
+            std::env::temp_dir().join(format!("genoligand-user-setup-status-{}", now_millis()));
+        let options = server_options(root.clone());
+        let payload = user_setup_status_json(&options);
+        let text = payload.to_string();
+
+        assert!(payload.get("database_ready").is_some());
+        assert!(payload.get("repair_action").is_some());
+        assert!(payload.get("status").is_none());
+        assert!(payload.get("runtime").is_none());
+        assert!(payload.get("can_run_repair").is_none());
+        assert!(!text.contains("needs_repair"));
+        assert!(!text.contains("runtime"));
+        assert!(!text.contains("can_run_repair"));
+
+        fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn user_diagnostics_hides_runtime_and_status_codes() {
+        let root =
+            std::env::temp_dir().join(format!("genoligand-user-diagnostics-{}", now_millis()));
+        let options = server_options(root.clone());
+        let payload = user_diagnostics_json(&options);
+        let text = payload.to_string();
+
+        assert!(payload.get("checks").is_some());
+        assert!(payload.get("missing").is_some());
+        assert!(payload.get("status").is_none());
+        assert!(payload.get("runtime").is_none());
+        assert!(!text.contains("warning"));
+        assert!(!text.contains("runtime"));
+
+        fs::remove_dir_all(&root).ok();
     }
 
     #[test]
