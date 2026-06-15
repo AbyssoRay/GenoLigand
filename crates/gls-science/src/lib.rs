@@ -221,9 +221,9 @@ fn run_pipeline(options: &ScienceOptions) -> Result<String, String> {
 fn pipeline_blockers(options: &ScienceOptions) -> Result<Vec<String>, String> {
     let mut blockers = Vec::new();
     if !options.input_manifest.exists() {
-        blockers.push("missing_real_input_manifest".to_string());
+        blockers.push("missing_input_manifest".to_string());
     } else if extract_inputs(&options.input_manifest)?.is_empty() {
-        blockers.push("missing_real_input".to_string());
+        blockers.push("missing_input".to_string());
     }
     let manifest = options.science_store.join("science_store_manifest.tsv");
     let known = options.science_store.join("indexes/known_targets.tsv");
@@ -295,7 +295,7 @@ fn normalize_input(options: &ScienceOptions) -> Result<String, String> {
     ensure_dir(&options.run_dir)?;
     let inputs = extract_inputs(&options.input_manifest)?;
     if inputs.is_empty() {
-        return Err("missing_real_input".to_string());
+        return Err("missing_input".to_string());
     }
     let mut normalized =
         String::from("input_id\tinput_kind\tprimary_value\tfile_count\tfeature_tokens\tstatus\n");
@@ -546,7 +546,7 @@ fn rank_targets(options: &ScienceOptions) -> Result<String, String> {
     write_text(
         &options.run_dir.join("candidate_detail.json"),
         &format!(
-            "{{\"candidate_count\":{},\"status\":\"computed\",\"source\":\"GenoLigand real pipeline\"}}\n",
+            "{{\"candidate_count\":{},\"status\":\"computed\",\"source\":\"GenoLigand pipeline\"}}\n",
             candidates.len()
         ),
     )?;
@@ -988,7 +988,7 @@ mod tests {
     }
 
     #[test]
-    fn pipeline_uses_one_temporary_real_query_row_then_test_removes_it() {
+    fn pipeline_uses_one_temporary_query_row_then_test_removes_it() {
         let root = temp_root("one_row");
         let store = create_temporary_test_store(&root).expect("store");
         let input = root.join("input.json");

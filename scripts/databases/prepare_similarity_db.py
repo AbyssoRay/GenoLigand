@@ -47,7 +47,7 @@ def main() -> int:
         "version_or_release": "current_release",
         "sha256": sha256_file(fasta),
         "license_note": "UniProt data; release/license details recorded from source URL during science-store preparation.",
-        "used_in_pipeline": "current_real_scientific_pipeline",
+        "used_in_pipeline": "current_scientific_pipeline",
         "created_at_utc": now(),
     }
     append_manifest(args.manifest, [manifest_row])
@@ -62,7 +62,7 @@ def choose_backend(requested: str) -> str:
         return "diamond"
     if shutil.which("blastp") and shutil.which("makeblastdb"):
         return "blastp"
-    raise SystemExit("no_real_similarity_backend_available")
+    raise SystemExit("no_similarity_backend_available")
 
 
 def run(cmd: list[str]) -> None:

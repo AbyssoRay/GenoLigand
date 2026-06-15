@@ -6,7 +6,7 @@ from pathlib import Path
 from typing import Any
 
 
-PIPELINE_MODE = "genoligand_real_scientific_pipeline"
+PIPELINE_MODE = "genoligand_scientific_pipeline"
 SCHEMA_VERSION = "genoligand_worker_current_v1"
 
 

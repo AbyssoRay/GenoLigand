@@ -2,7 +2,7 @@
 
 GenoLigand 是本地运行的靶点发现科研软件。它的核心目标是：用户输入一个物质、序列或结构后，软件先计算其相互作用特征，再在已知蛋白数据库和宏基因组潜在序列空间中比对，给出可能靶点的计算预测、排序和证据链。
 
-GenoLigand 不声称实验验证、真实结合、药效或机制结论。所有结论都必须表述为计算预测。
+GenoLigand 不声称实验验证、体内结合、药效或机制结论。所有结论都必须表述为计算预测。
 
 ## 启动 WebUI（网页界面）
 
@@ -32,9 +32,9 @@ cargo run -p gls-cli -- install prepare-science-store --science-store D:\GenoLig
 - `indexes/metagenome_targets.tsv`
 - `indexes/tool_versions.tsv`
 
-缺少真实输入、真实数据库索引或必要工具时，主流程阻塞并输出零候选。
+缺少研究输入、数据库索引或必要工具时，主流程阻塞并输出零候选。
 
-## 真实主流程
+## 主流程
 
 ```text
 输入归一化 -> 特征计算 -> 已知数据库比对 -> 宏基因组潜在序列比对 -> 结构/口袋/对接/动力学证据 -> 联合靶点排序 -> 证据报告
@@ -71,4 +71,3 @@ cargo run -p gls-cli -- pipeline run `
 - `score_decomposition.tsv`
 - `evidence_ledger.tsv`
 - `research_report.md`
-

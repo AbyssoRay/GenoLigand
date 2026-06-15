@@ -140,7 +140,7 @@ def cmd_embed(args) -> None:
                 "created_at_utc": created,
                 "software_versions": json.dumps(metadata.get("software_versions", {}), sort_keys=True),
                 "plm_status": "success",
-                "plm_notes": "real_esm_embedding",
+                "plm_notes": "esm_embedding",
             }
         )
     write_tsv(output_dir / "embedding_manifest.tsv", manifest_rows, MANIFEST_FIELDS)

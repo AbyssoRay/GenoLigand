@@ -22,6 +22,5 @@ science_store:
     user_supplies_database_paths: false
     advanced_mode_can_rebuild: true
     missing_required_resource_behavior: block_without_candidates
-    candidate_generation_without_real_input: false
+    candidate_generation_without_user_input: false
     candidate_generation_without_store: false
-

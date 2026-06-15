@@ -8,7 +8,7 @@ use std::process::Command;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 pub const PRODUCT_NAME: &str = "GenoLigand Local WebUI";
-pub const PRODUCT_VERSION: &str = "0.10.0";
+pub const PRODUCT_VERSION: &str = "0.9.2";
 
 #[derive(Clone, Debug)]
 pub struct ServerOptions {
@@ -105,7 +105,7 @@ fn route(
             json!({"status":"ready","service":"gls-server","version":PRODUCT_VERSION})
         }
         ("GET", "/api/version") => {
-            json!({"name":PRODUCT_NAME,"version":PRODUCT_VERSION,"science_flow":"real_pipeline_only"})
+            json!({"name":PRODUCT_NAME,"version":PRODUCT_VERSION,"science_flow":"scientific_pipeline"})
         }
         ("GET", "/api/projects") | ("GET", "/api/user/projects") => projects_json(options),
         ("POST", "/api/projects") => create_project(options),
@@ -232,7 +232,7 @@ fn create_project(options: &ServerOptions) -> Value {
     }
     let _ = write_text(
         &dir.join("input_manifest.json"),
-        "{\"inputs\":[],\"files\":[],\"status\":\"waiting_for_real_user_input\"}\n",
+        "{\"inputs\":[],\"files\":[],\"status\":\"waiting_for_user_input\"}\n",
     );
     let project = read_project(options, &project_id);
     json!({"status":"created","project":project})
@@ -261,7 +261,7 @@ fn read_input_manifest(options: &ServerOptions, project_id: &str) -> Value {
     let path = project_dir(options, project_id).join("input_manifest.json");
     read_json_or(
         &path,
-        json!({"inputs":[],"files":[],"status":"waiting_for_real_user_input"}),
+        json!({"inputs":[],"files":[],"status":"waiting_for_user_input"}),
     )
 }
 
@@ -287,7 +287,7 @@ fn preflight_json(options: &ServerOptions, project_id: &str) -> Value {
     let checks = vec![
         check(
             "input_manifest",
-            input.exists() && input_has_real_value(&input),
+            input.exists() && input_has_user_value(&input),
             input.display().to_string(),
         ),
         check(
@@ -684,7 +684,7 @@ fn input_project_name(value: &Value) -> Option<String> {
         .map(ToOwned::to_owned)
 }
 
-fn input_has_real_value(path: &Path) -> bool {
+fn input_has_user_value(path: &Path) -> bool {
     let value = read_json_or(path, json!({}));
     value
         .get("inputs")

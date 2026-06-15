@@ -43,7 +43,7 @@ function render() {
   $("[data-health]").textContent = state.health?.status || "未连接";
   $("[data-health]").className = `pill ${state.health?.status === "ready" ? "ready" : "blocked"}`;
   const title = {
-    workflow: "真实科研主流程",
+    workflow: "科研主流程",
     results: "计算结果",
     system: "系统状态",
   }[state.route];
@@ -61,9 +61,9 @@ function renderWorkflow() {
         <h2>统一流程</h2>
         <p>输入归一化 -> 特征计算 -> 已知数据库比对 -> 宏基因组潜在序列比对 -> 结构/口袋/对接/动力学证据 -> 联合靶点排序 -> 证据报告。</p>
         <div class="actions">
-          <button class="button" data-create>创建真实项目</button>
+          <button class="button" data-create>创建项目</button>
           <button class="button secondary" data-preflight ${state.project ? "" : "disabled"}>预检查</button>
-          <button class="button" data-run ${state.project ? "" : "disabled"}>运行真实主流程</button>
+          <button class="button" data-run ${state.project ? "" : "disabled"}>开始计算</button>
         </div>
       </section>
       ${inputCard("small_molecule", "小分子", "SMILES / SDF / MOL2 / 名称 / 登记号", "smiles")}
@@ -89,7 +89,7 @@ function inputCard(kind, title, help, field) {
     <section class="card">
       <h3>${title}</h3>
       <p>${help}</p>
-      <textarea data-input="${field}" placeholder="只填写真实研究输入；空输入不会生成候选。"></textarea>
+      <textarea data-input="${field}" placeholder="填写研究输入；空输入不会生成候选。"></textarea>
       <div class="actions">
         <button class="button secondary" data-save-input data-kind="${kind}" data-field="${field}" ${state.project ? "" : "disabled"}>保存到项目</button>
       </div>
@@ -108,7 +108,7 @@ async function saveInput(kind, field) {
     field_schema: "genoligand.webui.input_manifest.current",
     input_kind: kind,
     inputs: [
-      { field: "project_name", value: "GenoLigand real research project" },
+      { field: "project_name", value: "GenoLigand research project" },
       { field, value },
     ],
     files: [],
@@ -138,7 +138,7 @@ async function renderResults() {
     state.run = await api(`/api/runs/${state.project.latest_run_id}`);
   }
   if (!state.run) {
-    page.innerHTML = `<section class="card"><h2>暂无运行</h2><p>没有真实运行时不会显示候选。</p></section>`;
+    page.innerHTML = `<section class="card"><h2>暂无运行</h2><p>没有运行记录时不会显示候选。</p></section>`;
     return;
   }
   const [candidates, evidence, structure, md, logs] = await Promise.all([
@@ -166,7 +166,7 @@ async function renderResults() {
 function tableCard(title, rows) {
   const headers = Array.from(new Set(rows.flatMap((row) => Object.keys(row)))).slice(0, 14);
   const body = rows.map((row) => `<tr>${headers.map((key) => `<td>${escapeHtml(row[key] || "")}</td>`).join("")}</tr>`).join("");
-  return `<section class="card wide"><h2>${title}</h2>${rows.length ? `<table><thead><tr>${headers.map((key) => `<th>${escapeHtml(key)}</th>`).join("")}</tr></thead><tbody>${body}</tbody></table>` : "<p>暂无真实计算结果。</p>"}</section>`;
+  return `<section class="card wide"><h2>${title}</h2>${rows.length ? `<table><thead><tr>${headers.map((key) => `<th>${escapeHtml(key)}</th>`).join("")}</tr></thead><tbody>${body}</tbody></table>` : "<p>暂无计算结果。</p>"}</section>`;
 }
 
 function renderSystem() {
@@ -196,4 +196,3 @@ function escapeHtml(value) {
 boot().catch((error) => {
   page.innerHTML = `<section class="card"><h2>服务连接失败</h2><pre>${escapeHtml(error.stack || error.message)}</pre></section>`;
 });
-

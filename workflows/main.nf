@@ -1,6 +1,6 @@
 nextflow.enable.dsl = 2
 
-process GENOLIGAND_REAL_SCIENCE_PIPELINE {
+process GENOLIGAND_SCIENCE_PIPELINE {
   tag "genoligand_pipeline"
   cpus 20
   memory '32 GB'
@@ -27,11 +27,10 @@ process GENOLIGAND_REAL_SCIENCE_PIPELINE {
 }
 
 workflow {
-  GENOLIGAND_REAL_SCIENCE_PIPELINE(
+  GENOLIGAND_SCIENCE_PIPELINE(
     params.input_manifest.toString(),
     params.science_store.toString(),
     params.outdir.toString(),
     params.gls_cli.toString()
   )
 }
-
