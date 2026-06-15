@@ -413,9 +413,6 @@ fn write_input_manifest(options: &ServerOptions, project_id: &str, body: &str) -
     let path = dir.join("input_manifest.json");
     let value =
         serde_json::from_str::<Value>(body).unwrap_or_else(|_| json!({"inputs":[],"files":[]}));
-    if let Some(name) = input_project_name(&value) {
-        let _ = write_text(&dir.join("project_name.txt"), &name);
-    }
     if !input_value_has_usable_user_input(&value) {
         return json!({
             "status":"failed",
@@ -423,6 +420,9 @@ fn write_input_manifest(options: &ServerOptions, project_id: &str, body: &str) -
             "message":"\u{8bf7}\u{586b}\u{5199}\u{81f3}\u{5c11}\u{4e00}\u{4e2a}\u{53ef}\u{8bc6}\u{522b}\u{7684}\u{7814}\u{7a76}\u{8f93}\u{5165}\u{3002}",
             "project": read_project(options, project_id)
         });
+    }
+    if let Some(name) = input_project_name(&value) {
+        let _ = write_text(&dir.join("project_name.txt"), &name);
     }
     match write_text(&path, &(value.to_string() + "\n")) {
         Ok(()) => json!({"status":"saved","project":read_project(options, project_id)}),
@@ -2767,6 +2767,16 @@ mod tests {
         );
         assert_eq!(response["status"], "failed");
         assert_eq!(response["error"], "input_not_usable");
+        assert!(
+            !project_dir(&options, "project-1")
+                .join("project_name.txt")
+                .exists()
+        );
+        assert!(
+            !project_dir(&options, "project-1")
+                .join("input_manifest.json")
+                .exists()
+        );
         assert!(!input_value_has_usable_user_input(&json!({
             "inputs":[{"field":"complex","value":"---"}]
         })));
