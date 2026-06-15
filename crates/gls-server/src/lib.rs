@@ -115,9 +115,10 @@ fn route(
         return response;
     }
     let value = match (method, path) {
-        ("GET", "/api/health") | ("GET", "/api/user/health") => {
+        ("GET", "/api/health") => {
             json!({"status":"ready","service":"gls-server","version":PRODUCT_VERSION})
         }
+        ("GET", "/api/user/health") => user_health_json(),
         ("GET", "/api/version") => {
             json!({"name":PRODUCT_NAME,"version":PRODUCT_VERSION,"science_flow":"scientific_pipeline"})
         }
@@ -1173,6 +1174,10 @@ fn databases_json(options: &ServerOptions) -> Value {
         })
         .collect::<Vec<_>>();
     json!({"science_store":store.display().to_string(),"required":rows,"user_configures_paths":false})
+}
+
+fn user_health_json() -> Value {
+    json!({"status":"ready","application":PRODUCT_NAME,"version":PRODUCT_VERSION})
 }
 
 fn user_databases_json(options: &ServerOptions) -> Value {
@@ -2402,6 +2407,18 @@ mod tests {
         assert!(!text.contains("remote"));
 
         fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn user_health_hides_backend_service_name() {
+        let payload = user_health_json();
+        let text = payload.to_string();
+
+        assert_eq!(payload["status"], "ready");
+        assert_eq!(payload["application"], PRODUCT_NAME);
+        assert!(!text.contains("gls-server"));
+        assert!(!text.contains("route"));
+        assert!(!text.contains("debug"));
     }
 
     #[test]
