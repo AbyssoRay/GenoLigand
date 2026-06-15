@@ -852,17 +852,17 @@ async function saveInput() {
     ],
     files: [],
   };
-  const saved = await api(`/api/projects/${state.project.project_id}/inputs`, {
+  const saved = await api(`/api/user/projects/${state.project.project_id}/inputs`, {
     method: "POST",
     body: JSON.stringify(inputPayload),
   });
-  if (saved.status !== "saved") {
+  if (saved.ok !== true) {
     state.project = saved.project || state.project;
     state.alert = saved.message || "输入未保存，请检查填写内容。";
     render();
     return false;
   }
-  state.project = await api(`/api/projects/${state.project.project_id}`);
+  state.project = saved.project || (await api(`/api/user/projects/${state.project.project_id}`));
   setStep("configure");
   return true;
 }
@@ -874,7 +874,7 @@ async function runPreflight() {
     render();
     return;
   }
-  state.preflight = await api(`/api/projects/${state.project.project_id}/preflight`, {
+  state.preflight = await api(`/api/user/projects/${state.project.project_id}/preflight`, {
     method: "POST",
   });
   render();
@@ -892,7 +892,7 @@ async function runSetupRepair() {
       api("/api/user/setup/status"),
     ]);
     if (state.project) {
-      state.preflight = await api(`/api/projects/${state.project.project_id}/preflight`, {
+      state.preflight = await api(`/api/user/projects/${state.project.project_id}/preflight`, {
         method: "POST",
       });
     }
@@ -918,9 +918,9 @@ async function startRun() {
     return;
   }
   state.alert = "";
-  const result = await api(`/api/projects/${state.project.project_id}/runs`, { method: "POST" });
+  const result = await api(`/api/user/projects/${state.project.project_id}/runs`, { method: "POST" });
   state.run = result.run;
-  state.project = await api(`/api/projects/${state.project.project_id}`);
+  state.project = result.project || (await api(`/api/user/projects/${state.project.project_id}`));
   await loadRunData();
   setStep("run");
 }

@@ -108,6 +108,9 @@ fn route(
         }
         _ => {}
     }
+    if let Some(response) = route_user_project(method, path, options, request_body) {
+        return response;
+    }
     if let Some(response) = route_project(method, path, options, request_body) {
         return response;
     }
@@ -173,6 +176,29 @@ fn route_project(
         ("POST", "runs") => start_run(options, &project_id),
         ("DELETE", "") => delete_project(options, &project_id),
         _ => json!({"error":"not_found"}),
+    };
+    Some((200, "application/json; charset=utf-8", value.to_string()))
+}
+
+fn route_user_project(
+    method: &str,
+    path: &str,
+    options: &ServerOptions,
+    request_body: &str,
+) -> Option<(u16, &'static str, String)> {
+    let rest = path.strip_prefix("/api/user/projects/")?;
+    let mut parts = rest.split('/');
+    let project_id = safe_id(parts.next().unwrap_or(""));
+    if project_id.is_empty() {
+        return Some(json_response(404, json!({"message":"未找到工作台"})));
+    }
+    let suffix = parts.collect::<Vec<_>>().join("/");
+    let value = match (method, suffix.as_str()) {
+        ("GET", "") => user_project_detail(options, &project_id),
+        ("POST", "inputs") => write_user_input_manifest(options, &project_id, request_body),
+        ("GET", "preflight") | ("POST", "preflight") => user_preflight_json(options, &project_id),
+        ("POST", "runs") => start_user_run(options, &project_id),
+        _ => json!({"message":"未找到工作台操作"}),
     };
     Some((200, "application/json; charset=utf-8", value.to_string()))
 }
@@ -325,12 +351,30 @@ fn read_project(options: &ServerOptions, project_id: &str) -> Value {
     })
 }
 
+fn user_project_detail(options: &ServerOptions, project_id: &str) -> Value {
+    user_project_summary(&read_project(options, project_id))
+}
+
 fn read_input_manifest(options: &ServerOptions, project_id: &str) -> Value {
     let path = project_dir(options, project_id).join("input_manifest.json");
     read_json_or(
         &path,
         json!({"inputs":[],"files":[],"status":"waiting_for_user_input"}),
     )
+}
+
+fn write_user_input_manifest(options: &ServerOptions, project_id: &str, body: &str) -> Value {
+    let response = write_input_manifest(options, project_id, body);
+    let ok = response.get("status").and_then(Value::as_str) == Some("saved");
+    let project = response
+        .get("project")
+        .map(user_project_summary)
+        .unwrap_or_else(|| user_project_detail(options, project_id));
+    json!({
+        "ok": ok,
+        "message": if ok {"输入已保存"} else {response.get("message").and_then(Value::as_str).unwrap_or("输入未保存，请检查填写内容")},
+        "project": project
+    })
 }
 
 fn write_input_manifest(options: &ServerOptions, project_id: &str, body: &str) -> Value {
@@ -403,6 +447,37 @@ fn preflight_json(options: &ServerOptions, project_id: &str) -> Value {
     json!({"status": if ready {"preflight_passed"} else {"blocked"}, "checks": checks, "candidate_count_if_blocked": 0})
 }
 
+fn user_preflight_json(options: &ServerOptions, project_id: &str) -> Value {
+    let response = preflight_json(options, project_id);
+    let checks = user_preflight_checks(response.get("checks"));
+    let ready = checks.as_array().is_some_and(|rows| {
+        rows.iter()
+            .all(|row| row.get("ready").and_then(Value::as_bool).unwrap_or(false))
+    });
+    json!({
+        "ok": ready,
+        "message": if ready {"预检查已通过"} else {"还有项目需要处理"},
+        "checks": checks
+    })
+}
+
+fn user_preflight_checks(checks: Option<&Value>) -> Value {
+    let rows = checks
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    Value::Array(
+        rows.into_iter()
+            .map(|row| {
+                json!({
+                    "id": row.get("id").cloned().unwrap_or(Value::Null),
+                    "ready": row.get("ready").cloned().unwrap_or(Value::Bool(false))
+                })
+            })
+            .collect(),
+    )
+}
+
 fn start_run(options: &ServerOptions, project_id: &str) -> Value {
     let project = project_dir(options, project_id);
     let run_id = format!("run-{}", now_millis());
@@ -467,6 +542,28 @@ fn start_run(options: &ServerOptions, project_id: &str) -> Value {
         &(artifact_index.to_string() + "\n"),
     );
     json!({"status":state,"run":run_json(options,&run_id)})
+}
+
+fn start_user_run(options: &ServerOptions, project_id: &str) -> Value {
+    let response = start_run(options, project_id);
+    let run = response.get("run").cloned().unwrap_or_else(|| json!({}));
+    let state = run.get("state").and_then(Value::as_str).unwrap_or_default();
+    json!({
+        "ok": matches!(state, "completed" | "running" | "blocked"),
+        "message": friendly_run_message(state),
+        "run": run,
+        "project": user_project_detail(options, project_id)
+    })
+}
+
+fn friendly_run_message(state: &str) -> &'static str {
+    match state {
+        "completed" => "运行已完成",
+        "running" => "运行已开始",
+        "blocked" => "运行已阻止，请处理缺失项",
+        "failed" => "运行失败，请查看运行中心",
+        _ => "运行状态待确认",
+    }
 }
 
 fn gls_cli_command(options: &ServerOptions, input: &Path, run_dir: &Path) -> Vec<String> {
@@ -2732,6 +2829,38 @@ mod tests {
             .unwrap_or(true);
         assert!(!candidate_visible);
         assert!(!evidence_visible);
+
+        fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn user_input_and_preflight_endpoints_hide_internal_status_codes() {
+        let root = std::env::temp_dir().join(format!("genoligand-user-flow-{}", now_millis()));
+        let options = server_options(root.clone());
+        fs::create_dir_all(project_dir(&options, "project-1")).expect("project dir");
+
+        let invalid = write_user_input_manifest(
+            &options,
+            "project-1",
+            r#"{"inputs":[{"field":"project_name","value":"研究项目"},{"field":"small_molecule","value":"!!!"}],"files":[]}"#,
+        );
+        let invalid_text = invalid.to_string();
+        assert_eq!(invalid["ok"], false);
+        assert!(invalid.get("message").is_some());
+        assert!(invalid.get("status").is_none());
+        assert!(!invalid_text.contains("failed"));
+        assert!(!invalid_text.contains("input_not_usable"));
+
+        let preflight = user_preflight_json(&options, "project-1");
+        let preflight_text = preflight.to_string();
+        assert_eq!(preflight["ok"], false);
+        assert!(preflight.get("checks").is_some());
+        assert!(preflight.get("message").is_some());
+        assert!(preflight.get("status").is_none());
+        assert!(preflight.get("candidate_count_if_blocked").is_none());
+        assert!(!preflight_text.contains("preflight_passed"));
+        assert!(!preflight_text.contains("blocked"));
+        assert!(!preflight_text.contains(&root.display().to_string()));
 
         fs::remove_dir_all(&root).ok();
     }
