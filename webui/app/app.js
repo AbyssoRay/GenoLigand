@@ -483,9 +483,9 @@ function renderResults() {
       <button class="tab active" data-result-tab="ranking">候选排序</button>
       <button class="tab" data-result-tab="detail">候选详情</button>
       <button class="tab" data-result-tab="evidence">证据链</button>
-      <button class="tab" data-result-tab="genome">Genome/ORF</button>
-      <button class="tab" data-result-tab="structure">Structure/Patch</button>
-      <button class="tab" data-result-tab="md">MD Summary</button>
+      <button class="tab" data-result-tab="genome">基因组/ORF</button>
+      <button class="tab" data-result-tab="structure">结构/口袋</button>
+      <button class="tab" data-result-tab="md">动力学摘要</button>
     </div>
     <div data-result-body>
       ${resultSection("候选排序", candidates, "ranking")}
@@ -499,7 +499,7 @@ function renderResults() {
       if (tab === "ranking") body.innerHTML = resultSection("候选排序", candidates, "ranking");
       if (tab === "detail") body.innerHTML = candidateDetailSection(candidates);
       if (tab === "evidence") body.innerHTML = resultSection("证据链", evidence, "evidence");
-      if (tab === "genome") body.innerHTML = resultSection("Genome/ORF", genome, "genome");
+      if (tab === "genome") body.innerHTML = resultSection("基因组/ORF", genome, "genome");
       if (tab === "structure") body.innerHTML = structureSection(structure);
       if (tab === "md") body.innerHTML = mdSection(md);
     });
@@ -576,7 +576,7 @@ function structureSection(rows) {
     <section class="panel full">
       <div class="panel-header">
         <div>
-          <h2>Structure/Patch</h2>
+          <h2>结构/口袋</h2>
           <p>${rows.length ? "结构和口袋摘要来自当前运行输出。" : "当前运行没有结构或口袋摘要。"}</p>
         </div>
         <span class="status-pill ${rows.length ? "ready" : "blocked"}">${rows.length ? `${rows.length} 行` : "未就绪"}</span>
@@ -595,7 +595,7 @@ function mdSection(rows) {
     <section class="panel full">
       <div class="panel-header">
         <div>
-          <h2>MD Summary</h2>
+          <h2>动力学摘要</h2>
           <p>${rows.length ? "动力学摘要来自当前运行输出。" : "当前运行没有轨迹摘要。"}</p>
         </div>
         <span class="status-pill ${rows.length ? "ready" : "blocked"}">${rows.length ? `${rows.length} 行` : "未就绪"}</span>
