@@ -1570,7 +1570,7 @@ fn setup_installer_summary(stdout: &str) -> Option<Value> {
         "summary": payload.get("summary").cloned().unwrap_or_else(|| json!("")),
         "next_action": payload.get("next_action").cloned().unwrap_or_else(|| json!("运行安装/修复")),
         "downloads": {
-            "completed": matches!(download_status, "ready" | "skipped"),
+            "completed": download_status == "ready",
             "ready": downloads.get("ready").cloned().unwrap_or_else(|| json!(0)),
             "failed": downloads.get("failed").cloned().unwrap_or_else(|| json!(0)),
             "message": downloads.get("message").cloned().unwrap_or_else(|| json!("")),
@@ -2569,6 +2569,19 @@ mod tests {
         assert!(!text.contains("D:/hidden"));
         assert!(!text.contains("abc123"));
         assert!(!text.contains("source_requirements"));
+    }
+
+    #[test]
+    fn setup_installer_download_summary_treats_skipped_as_incomplete() {
+        let payload = setup_installer_summary(
+            r#"{"status":"needs_repair","summary":"本次未执行科学资源下载。","next_action":"保持联网后重新运行安装/修复","downloads":{"status":"skipped","ready":0,"failed":0,"message":"本次未执行科学资源下载。","next_action":"保持联网后重新运行安装/修复"}}"#,
+        )
+        .expect("installer json");
+
+        assert_eq!(payload["downloads"]["completed"], false);
+        assert_eq!(payload["downloads"]["message"], "本次未执行科学资源下载。");
+        let text = payload.to_string();
+        assert!(!text.contains("skipped"));
     }
 
     #[test]

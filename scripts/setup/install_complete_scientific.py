@@ -9,6 +9,7 @@ import platform
 import shutil
 import subprocess
 import sys
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -61,6 +62,9 @@ PYTHON_TOOL_PACKAGES: list[dict[str, str]] = [
 ]
 
 RESERVED_WSL_DISTROS = {"Ubuntu-24.04"}
+DOWNLOAD_RETRIES = 3
+DOWNLOAD_TIMEOUT_SECONDS = 120
+DOWNLOAD_USER_AGENT = "GenoLigand-science-store-installer/0.9"
 
 WSL_COMMAND_WRAPPERS = [
     "java",
@@ -683,20 +687,37 @@ def copy_or_download(url: str, destination: Path, expected_sha256: str | None) -
     elif Path(url).exists():
         shutil.copyfile(Path(url), partial)
     else:
-        request = urllib.request.Request(url)
-        existing = partial.stat().st_size if partial.exists() else 0
-        if existing:
-            request.add_header("Range", f"bytes={existing}-")
-        try:
-            with urllib.request.urlopen(request, timeout=60) as response:
-                mode = "ab" if existing and response.status == 206 else "wb"
-                with partial.open(mode) as handle:
-                    shutil.copyfileobj(response, handle)
-        except urllib.error.HTTPError as err:
-            if existing and err.code == 416:
-                pass
-            else:
-                raise
+        last_error: Exception | None = None
+        for attempt in range(1, DOWNLOAD_RETRIES + 1):
+            existing = partial.stat().st_size if partial.exists() else 0
+            request = urllib.request.Request(
+                url,
+                headers={"User-Agent": DOWNLOAD_USER_AGENT},
+            )
+            if existing:
+                request.add_header("Range", f"bytes={existing}-")
+            try:
+                with urllib.request.urlopen(
+                    request,
+                    timeout=DOWNLOAD_TIMEOUT_SECONDS,
+                ) as response:
+                    status = getattr(response, "status", 200)
+                    mode = "ab" if existing and status == 206 else "wb"
+                    with partial.open(mode) as handle:
+                        shutil.copyfileobj(response, handle)
+                last_error = None
+                break
+            except urllib.error.HTTPError as err:
+                if existing and err.code == 416:
+                    last_error = None
+                    break
+                last_error = err
+            except (urllib.error.URLError, TimeoutError, OSError) as err:
+                last_error = err
+            if attempt < DOWNLOAD_RETRIES:
+                time.sleep(min(2 * attempt, 5))
+        if last_error is not None:
+            raise last_error
     actual_sha256 = sha256_file(partial)
     if expected_sha256 and actual_sha256.lower() != expected_sha256.lower():
         return {
@@ -876,7 +897,7 @@ def sync_external_sources(plan: Path, science_store: Path, skip_downloads: bool)
             ready_marker = row.get("ready_marker") or target_rel
             target = science_store / target_rel if target_rel else None
             marker = science_store / ready_marker if ready_marker else target
-            if marker and marker.exists():
+            if marker and path_has_payload(marker):
                 ready += 1
                 writer.writerow(
                     {
@@ -983,6 +1004,14 @@ def directory_size(path: Path) -> int:
     return total
 
 
+def path_has_payload(path: Path) -> bool:
+    if path.is_file():
+        return path.stat().st_size > 0
+    if not path.is_dir():
+        return False
+    return any(child.is_file() for child in path.rglob("*"))
+
+
 def download_summary(download_result: dict[str, object]) -> dict[str, object]:
     status = str(download_result.get("status", "unknown"))
     messages = {
@@ -1029,7 +1058,7 @@ def source_sync_summary(
     for row in rows:
         target_rel = row.get("ready_marker") or row.get("target_rel_path") or ""
         target = science_store / target_rel if target_rel else None
-        ready = bool(target and target.exists())
+        ready = bool(target and path_has_payload(target))
         execution = execution_rows.get(row.get("source_id", ""))
         execution_status = execution.get("status", "") if execution else ""
         needs_bundle = execution_status == "requires_resource_bundle"
@@ -1132,7 +1161,7 @@ def install_ready(payload: dict[str, object]) -> bool:
         and resource_status == "ready"
         and external_status == "ready"
         and tool_status == "ready"
-        and download_status in {"ready", "skipped"}
+        and download_status == "ready"
     )
 
 
@@ -1162,6 +1191,10 @@ def installation_status(
         status = "needs_repair"
         summary = "部分科学资源下载或校验失败，科学仓库尚未准备完成。"
         next_action = "检查网络、磁盘空间后重新运行安装/修复"
+    elif download_status == "skipped":
+        status = "needs_repair"
+        summary = "本次未执行科学资源下载，科学仓库不能标记为完成。"
+        next_action = "保持联网后重新运行安装/修复"
     elif tool_status != "ready":
         status = "needs_repair"
         summary = "Python 科学计算环境尚未准备完成。"
