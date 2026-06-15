@@ -2228,6 +2228,11 @@ fn artifact_visible_for_user(id: &str, path: &Path, run_dir: &Path, completed: b
             completed && rows_len(&run_dir.join("target_candidate_ranking.tsv")) > 0
         }
         "evidence" | "structure_patch" | "md_summary" => completed && rows_len(path) > 0,
+        "research_report" => {
+            completed
+                && rows_len(&run_dir.join("target_candidate_ranking.tsv")) > 0
+                && rows_len(&run_dir.join("evidence_ledger.tsv")) > 0
+        }
         _ => completed,
     }
 }
@@ -2866,6 +2871,20 @@ mod tests {
         fs::write(run_dir.join("research_report.md"), "# Report\n").expect("write report");
         fs::write(run_dir.join("secret.txt"), "hidden\n").expect("write secret");
 
+        let (status, _, _) = download_artifact_response(&options, "run-1", "research_report");
+        assert_eq!(status, 404);
+
+        fs::write(
+            run_dir.join("target_candidate_ranking.tsv"),
+            "rank\tcandidate_id\ttarget_id\ttarget_name\tcandidate_scope\torganism\tfinal_score\tknown_database_score\tmetagenome_score\tstructure_score\tdocking_score\tmd_score\tevidence_summary\tstatus\n1\tC1\tP24941\tCDK2\tknown_database\tHomo sapiens\t0.80\t0.70\t0.00\t0.10\t0.00\t0.00\tmatched current run\tcomputed_prediction\n",
+        )
+        .expect("candidate table");
+        fs::write(
+            run_dir.join("evidence_ledger.tsv"),
+            "claim_id\tevidence_artifact\towner\tstatus\tnotes\nscore_decomposition\tscore_decomposition.tsv\tGenoLigand\tavailable\tcandidate evidence\n",
+        )
+        .expect("evidence");
+
         let (status, content_type, body) =
             download_artifact_response(&options, "run-1", "research_report");
         assert_eq!(status, 200);
@@ -3019,6 +3038,7 @@ mod tests {
         )
         .expect("structure");
         fs::write(run_dir.join("md_summary.tsv"), "candidate_id\trmsd\n").expect("md");
+        fs::write(run_dir.join("research_report.md"), "# Empty report\n").expect("report");
 
         for response in [
             candidates_endpoint_json(&options, "run-1"),
@@ -3039,6 +3059,18 @@ mod tests {
         assert_eq!(genome_endpoint_json(&options, "run-1")["row_count"], 0);
         assert_eq!(structure_endpoint_json(&options, "run-1")["row_count"], 0);
         assert_eq!(md_endpoint_json(&options, "run-1")["row_count"], 0);
+        let artifacts = artifacts_json(&options, "run-1");
+        let report_visible = artifacts["items"]
+            .as_array()
+            .expect("items")
+            .iter()
+            .find(|item| item.get("id").and_then(Value::as_str) == Some("research_report"))
+            .and_then(|item| item.get("exists").and_then(Value::as_bool))
+            .unwrap_or(true);
+        assert!(!report_visible);
+        let (status, _, body) = download_artifact_response(&options, "run-1", "research_report");
+        assert_eq!(status, 404);
+        assert!(!body.contains("Empty report"));
 
         fs::remove_dir_all(&root).ok();
     }
