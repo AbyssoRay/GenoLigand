@@ -1282,7 +1282,7 @@ fn user_setup_install_plan_json(options: &ServerOptions) -> Value {
     json!({
         "status":"ready_to_run",
         "action":"运行安装/修复",
-        "description":"准备数据库、索引、工具版本和许可证记录。普通运行不配置数据库路径。",
+        "description":"准备数据库、索引、计算工具、许可证和来源记录。普通运行不配置数据库路径。",
         "can_run_from_webui": true,
         "database_ready": preflight_store_ready(options)
     })
@@ -1998,7 +1998,7 @@ fn friendly_failure_summary(raw: Option<&str>) -> String {
                     "missing_science_store_manifest" => "缺少科学仓库".to_string(),
                     "missing_known_database_index" => "缺少已知蛋白索引".to_string(),
                     "missing_metagenome_potential_index" => "缺少宏基因组索引".to_string(),
-                    "missing_tool_versions_manifest" => "缺少工具版本记录".to_string(),
+                    "missing_tool_versions_manifest" => "计算工具未就绪".to_string(),
                     _ if value.starts_with("missing_or_unready_tool:") => {
                         "计算工具未就绪".to_string()
                     }
@@ -2345,6 +2345,20 @@ mod tests {
         assert!(!text.contains("known_targets.tsv"));
         assert!(!text.contains("tool_versions.tsv"));
         assert!(!text.contains(&root.display().to_string()));
+    }
+
+    #[test]
+    fn failure_summary_hides_internal_resource_names() {
+        let summary = friendly_failure_summary(Some(
+            "missing_science_store_manifest,missing_tool_versions_manifest,missing_known_database_index",
+        ));
+
+        assert!(summary.contains("缺少科学仓库"));
+        assert!(summary.contains("计算工具未就绪"));
+        assert!(summary.contains("缺少已知蛋白索引"));
+        assert!(!summary.contains("manifest"));
+        assert!(!summary.contains("tool_versions"));
+        assert!(!summary.contains("science_store"));
     }
 
     #[test]
