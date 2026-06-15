@@ -194,6 +194,7 @@ fn route_run(
             "target_candidate_ranking.tsv",
             "candidates",
         ),
+        ("GET", "candidate-detail") => candidate_detail_json(options, &run_id),
         ("GET", "evidence") => evidence_endpoint_json(options, &run_id),
         ("GET", "genome-context") => table_endpoint_json(
             options,
@@ -625,6 +626,51 @@ fn evidence_endpoint_json(options: &ServerOptions, run_id: &str) -> Value {
         "evidence": rows,
         "row_count": rows_len(&path),
         "has_output": path.exists()
+    })
+}
+
+fn candidate_detail_json(options: &ServerOptions, run_id: &str) -> Value {
+    let Some(run_dir) = find_run_dir(options, run_id) else {
+        return json!({"run_id":run_id,"candidate_details":[],"candidate_count":0,"has_output":false});
+    };
+    let path = run_dir.join("candidate_detail.json");
+    let value = read_json_or(&path, json!({}));
+    let rows = value
+        .get("candidates")
+        .and_then(Value::as_array)
+        .map(|items| {
+            items
+                .iter()
+                .map(user_candidate_detail_row)
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    let candidate_count = rows.len();
+    json!({
+        "run_id": run_id,
+        "candidate_details": rows,
+        "candidate_count": candidate_count,
+        "has_output": path.exists()
+    })
+}
+
+fn user_candidate_detail_row(row: &Value) -> Value {
+    let scores = row.get("scores").unwrap_or(&Value::Null);
+    json!({
+        "candidate_id": row.get("candidate_id").cloned().unwrap_or_else(|| json!("")),
+        "target_id": row.get("target_id").cloned().unwrap_or_else(|| json!("")),
+        "target_name": row.get("target_name").cloned().unwrap_or_else(|| json!("")),
+        "candidate_scope": row.get("candidate_scope").cloned().unwrap_or_else(|| json!("")),
+        "organism": row.get("organism").cloned().unwrap_or_else(|| json!("")),
+        "final_score": scores.get("final").cloned().unwrap_or_else(|| json!("")),
+        "known_database_score": scores.get("known_database").cloned().unwrap_or_else(|| json!("")),
+        "metagenome_score": scores.get("metagenome").cloned().unwrap_or_else(|| json!("")),
+        "structure_score": scores.get("structure").cloned().unwrap_or_else(|| json!("")),
+        "docking_score": scores.get("docking").cloned().unwrap_or_else(|| json!("")),
+        "md_score": scores.get("md").cloned().unwrap_or_else(|| json!("")),
+        "evidence_summary": row.get("evidence_summary").cloned().unwrap_or_else(|| json!("")),
+        "status": "\u{8ba1}\u{7b97}\u{5019}\u{9009}",
+        "detail_source": "\u{5f53}\u{524d}\u{8fd0}\u{884c}\u{7684}\u{5019}\u{9009}\u{8be6}\u{60c5}\u{8f93}\u{51fa}"
     })
 }
 
@@ -1963,6 +2009,11 @@ mod tests {
             "claim_id\tevidence_artifact\towner\tstatus\tnotes\nscore_decomposition\tscore_decomposition.tsv\tGenoLigand\tavailable\tsha256:abc123\n",
         )
         .expect("evidence");
+        fs::write(
+            run_dir.join("candidate_detail.json"),
+            r#"{"candidate_count":1,"candidates":[{"candidate_id":"C1","target_id":"P24941","target_name":"CDK2","candidate_scope":"known_database","organism":"Homo sapiens","scores":{"final":0.8,"known_database":0.7,"metagenome":0.0,"structure":0.1,"docking":0.0,"md":0.0},"evidence_summary":"matched current run","source_artifacts":["target_candidate_ranking.tsv"],"sha256":"abc123","path":"D:/hidden"}]}"#,
+        )
+        .expect("candidate detail");
         fs::write(run_dir.join("run_context.json"), r#"{"path":"hidden"}"#).expect("context");
         fs::write(run_dir.join("artifact_source_map.tsv"), "hidden\n").expect("source trace");
         fs::write(run_dir.join("research_report.md"), "# Report\n").expect("report");
@@ -1982,6 +2033,7 @@ mod tests {
             user_setup_install_plan_json(&options),
             preflight_json(&options, "project-1"),
             logs_json(&options, "run-1"),
+            candidate_detail_json(&options, "run-1"),
             evidence_endpoint_json(&options, "run-1"),
             table_endpoint_json(
                 &options,
@@ -2046,6 +2098,46 @@ mod tests {
         assert_eq!(status, 404);
         let (status, _, _) = download_artifact_response(&options, "run-1", "source_trace");
         assert_eq!(status, 404);
+
+        fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn candidate_detail_endpoint_uses_detail_artifact_without_internal_fields() {
+        let root =
+            std::env::temp_dir().join(format!("genoligand-candidate-detail-{}", now_millis()));
+        let options = server_options(root.clone());
+        let run_dir = projects_root(&options)
+            .join("project-1")
+            .join("runs")
+            .join("run-1");
+        fs::create_dir_all(&run_dir).expect("create run dir");
+        fs::write(
+            run_dir.join("candidate_detail.json"),
+            r#"{"candidate_count":1,"project_id":"project-1","run_id":"run-1","candidates":[{"candidate_id":"C1","target_id":"P24941","target_name":"CDK2","candidate_scope":"known_database","organism":"Homo sapiens","scores":{"final":0.8,"known_database":0.7,"metagenome":0.0,"structure":0.1,"docking":0.0,"md":0.0},"evidence_summary":"matched current run","source_artifacts":["target_candidate_ranking.tsv","evidence_ledger.tsv"],"sha256":"abc123","path":"D:/hidden"}]}"#,
+        )
+        .expect("candidate detail");
+
+        let payload = candidate_detail_json(&options, "run-1");
+        assert_eq!(payload["candidate_count"], 1);
+        assert_eq!(payload["candidate_details"][0]["candidate_id"], "C1");
+        assert_eq!(payload["candidate_details"][0]["target_id"], "P24941");
+        assert_eq!(
+            payload["candidate_details"][0]["final_score"]
+                .as_f64()
+                .unwrap(),
+            0.8
+        );
+        assert_eq!(
+            payload["candidate_details"][0]["detail_source"],
+            "当前运行的候选详情输出"
+        );
+        let text = payload.to_string();
+        assert!(!text.contains("source_artifacts"));
+        assert!(!text.contains("target_candidate_ranking.tsv"));
+        assert!(!text.contains("evidence_ledger.tsv"));
+        assert!(!text.contains("sha256"));
+        assert!(!text.contains("D:/hidden"));
 
         fs::remove_dir_all(&root).ok();
     }

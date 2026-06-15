@@ -512,6 +512,7 @@ function renderStage(label, index) {
 function renderResults() {
   page.className = "page";
   const candidates = candidateRows();
+  const candidateDetails = state.runData?.detail?.candidate_details || [];
   const evidence = state.runData?.evidence?.evidence || [];
   const genome = state.runData?.genome?.genome_context || [];
   const structure = state.runData?.structure?.structure_rows || [];
@@ -536,7 +537,7 @@ function renderResults() {
       const tab = button.dataset.resultTab;
       const body = page.querySelector("[data-result-body]");
       if (tab === "ranking") body.innerHTML = resultSection("候选排序", candidates, "ranking");
-      if (tab === "detail") body.innerHTML = candidateDetailSection(candidates);
+      if (tab === "detail") body.innerHTML = candidateDetailSection(candidateDetails);
       if (tab === "evidence") body.innerHTML = resultSection("证据链", evidence, "evidence");
       if (tab === "genome") body.innerHTML = resultSection("基因组/ORF", genome, "genome");
       if (tab === "structure") body.innerHTML = structureSection(structure);
@@ -595,7 +596,7 @@ function resultSection(title, rows, kind) {
 
 function candidateDetailSection(rows) {
   if (!rows.length) {
-    return `<section class="panel full"><h2>候选详情</h2><div class="empty">当前没有候选详情。</div></section>`;
+    return `<section class="panel full"><h2>候选详情</h2><div class="empty">当前没有候选详情输出。完成运行并生成候选详情后才会显示。</div></section>`;
   }
   const first = rows[0];
   return `
@@ -613,6 +614,7 @@ function candidateDetailSection(rows) {
       ${metricRow("物种", first.organism || "未提供")}
       ${metricRow("综合分数", first.final_score || "未提供")}
       ${metricRow("证据摘要", first.evidence_summary || "未提供")}
+      ${metricRow("详情来源", first.detail_source || "当前运行输出")}
     </section>`;
 }
 
@@ -807,8 +809,9 @@ async function loadRunData() {
     return;
   }
   const runId = state.run.run_id;
-  const [candidates, evidence, genome, structure, md, logs, artifacts] = await Promise.all([
+  const [candidates, detail, evidence, genome, structure, md, logs, artifacts] = await Promise.all([
     api(`/api/runs/${runId}/candidates`),
+    api(`/api/runs/${runId}/candidate-detail`),
     api(`/api/runs/${runId}/evidence`),
     api(`/api/runs/${runId}/genome-context`),
     api(`/api/runs/${runId}/structure`),
@@ -816,7 +819,7 @@ async function loadRunData() {
     api(`/api/runs/${runId}/logs`),
     api(`/api/runs/${runId}/artifacts`),
   ]);
-  state.runData = { candidates, evidence, genome, structure, md, logs, artifacts };
+  state.runData = { candidates, detail, evidence, genome, structure, md, logs, artifacts };
 }
 
 function hasAnyInput() {
