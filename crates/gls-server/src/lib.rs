@@ -577,7 +577,16 @@ fn start_run(options: &ServerOptions, project_id: &str) -> Value {
 
 fn start_user_run(options: &ServerOptions, project_id: &str) -> Value {
     let response = start_run(options, project_id);
-    let run = response.get("run").cloned().unwrap_or_else(|| json!({}));
+    user_start_run_response(options, project_id, &response)
+}
+
+fn user_start_run_response(options: &ServerOptions, project_id: &str, response: &Value) -> Value {
+    let run_id = response
+        .get("run")
+        .and_then(|run| run.get("run_id"))
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    let run = user_run_json(options, run_id);
     let state = run.get("state").and_then(Value::as_str).unwrap_or_default();
     json!({
         "ok": matches!(state, "completed" | "running" | "blocked"),
@@ -2924,6 +2933,36 @@ mod tests {
 
         assert_eq!(payload["current_stage"], "完整流程");
         assert_eq!(payload["state_label"], "运行中");
+        assert!(!text.contains("pipeline_run"));
+        assert!(!text.contains("current_command"));
+        assert!(!text.contains("artifact_index"));
+
+        fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn user_start_run_returns_user_stage_labels() {
+        let root = std::env::temp_dir().join(format!("genoligand-user-start-run-{}", now_millis()));
+        let options = server_options(root.clone());
+        let project_id = "project-1";
+        let project_dir = project_dir(&options, project_id);
+        let run_dir = project_dir.join("runs").join("run-1");
+        fs::create_dir_all(&run_dir).expect("run dir");
+        fs::write(
+            project_dir.join("input_manifest.json"),
+            r#"{"inputs":[{"field":"small_molecule","value":"CCO"}]}"#,
+        )
+        .expect("input");
+        fs::write(run_dir.join("run_state.txt"), "running\n").expect("state");
+        fs::write(run_dir.join("current_stage.txt"), "pipeline_run\n").expect("stage");
+
+        let response = json!({"run":{"run_id":"run-1","current_stage":"pipeline_run"}});
+        let payload = user_start_run_response(&options, project_id, &response);
+        let text = payload.to_string();
+
+        assert_eq!(payload["ok"], true);
+        assert_eq!(payload["run"]["current_stage"], "完整流程");
+        assert!(payload["run"].get("state_label").is_some());
         assert!(!text.contains("pipeline_run"));
         assert!(!text.contains("current_command"));
         assert!(!text.contains("artifact_index"));
