@@ -16,19 +16,34 @@
             <span>靶点发现科研工作台</span>
           </div>
         </div>
-        <button data-route="workflow" class="nav active">Workflow 主流程</button>
-        <button data-route="results" class="nav">Results 结果</button>
-        <button data-route="system" class="nav">System 系统</button>
+        <nav class="steps" aria-label="工作流程">
+          <button data-step="input" class="step active">Input 输入</button>
+          <button data-step="configure" class="step">Configure 配置</button>
+          <button data-step="check" class="step">Check 检查</button>
+          <button data-step="run" class="step">Run 运行</button>
+          <button data-step="results" class="step">Results 结果</button>
+          <button data-step="export" class="step">Export 导出</button>
+        </nav>
+        <div class="side-status">
+          <span data-health class="status-pill loading">连接中</span>
+          <span data-project-pill class="muted">未创建项目</span>
+        </div>
       </aside>
       <main class="main">
         <header class="top">
           <div>
-            <h1 data-title>科研主流程</h1>
-            <p data-subtitle>等待研究输入和科学仓库状态。</p>
+            <h1 data-title>输入研究对象</h1>
+            <p data-subtitle>填写任一种研究输入，然后按流程检查、运行、查看结果。</p>
           </div>
-          <span data-health class="pill">连接中</span>
+          <div class="top-actions">
+            <button class="button ghost" data-refresh>刷新状态</button>
+          </div>
         </header>
-        <section data-page></section>
+        <section data-alerts></section>
+        <section data-page class="page loading-state">
+          <div class="spinner"></div>
+          <p>正在读取本机状态...</p>
+        </section>
       </main>
     </div>
     <script src="/app.js"></script>

@@ -1,7 +1,8 @@
-use serde_json::Value;
+use serde_json::{Value, json};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::process::Command;
 
 #[derive(Clone, Debug)]
 pub struct ScienceOptions {
@@ -110,6 +111,187 @@ struct Candidate {
     evidence: String,
 }
 
+#[derive(Clone, Copy, Debug)]
+struct RequiredTool {
+    id: &'static str,
+    label: &'static str,
+    license: &'static str,
+    install_hint: &'static str,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct RequiredSource {
+    id: &'static str,
+    label: &'static str,
+    category: &'static str,
+    landing_url: &'static str,
+    access_method: &'static str,
+    license_note: &'static str,
+    local_rel_path: &'static str,
+    index_rel_path: &'static str,
+    repair_action: &'static str,
+}
+
+const REQUIRED_TOOLS: &[RequiredTool] = &[
+    RequiredTool {
+        id: "java",
+        label: "Java",
+        license: "varies_by_distribution",
+        install_hint: "install_java_runtime",
+    },
+    RequiredTool {
+        id: "nextflow",
+        label: "Nextflow",
+        license: "Apache-2.0",
+        install_hint: "install_nextflow",
+    },
+    RequiredTool {
+        id: "rdkit",
+        label: "RDKit",
+        license: "BSD-3-Clause",
+        install_hint: "install_python_rdkit",
+    },
+    RequiredTool {
+        id: "openbabel",
+        label: "Open Babel",
+        license: "GPL-2.0",
+        install_hint: "install_openbabel",
+    },
+    RequiredTool {
+        id: "mmseqs2",
+        label: "MMseqs2",
+        license: "GPL-3.0",
+        install_hint: "install_mmseqs2",
+    },
+    RequiredTool {
+        id: "foldseek",
+        label: "Foldseek",
+        license: "GPL-3.0",
+        install_hint: "install_foldseek",
+    },
+    RequiredTool {
+        id: "autodock_vina",
+        label: "AutoDock Vina",
+        license: "Apache-2.0",
+        install_hint: "install_autodock_vina",
+    },
+    RequiredTool {
+        id: "openmm",
+        label: "OpenMM",
+        license: "MIT",
+        install_hint: "install_python_openmm",
+    },
+    RequiredTool {
+        id: "pdbfixer",
+        label: "PDBFixer",
+        license: "MIT",
+        install_hint: "install_python_pdbfixer",
+    },
+    RequiredTool {
+        id: "mdtraj",
+        label: "MDTraj",
+        license: "LGPL-2.1",
+        install_hint: "install_python_mdtraj",
+    },
+    RequiredTool {
+        id: "mdanalysis",
+        label: "MDAnalysis",
+        license: "GPL-2.0",
+        install_hint: "install_python_mdanalysis",
+    },
+];
+
+const REQUIRED_SOURCES: &[RequiredSource] = &[
+    RequiredSource {
+        id: "chembl",
+        label: "ChEMBL",
+        category: "known_activity",
+        landing_url: "https://chembl.gitbook.io/chembl-interface-documentation/downloads",
+        access_method: "download_sqlite_release",
+        license_note: "ChEMBL release license and DOI must be recorded from the selected release.",
+        local_rel_path: "downloads/chembl/chembl_sqlite.tar.gz",
+        index_rel_path: "indexes/known_targets.tsv",
+        repair_action: "download_and_index_chembl",
+    },
+    RequiredSource {
+        id: "bindingdb",
+        label: "BindingDB",
+        category: "known_activity",
+        landing_url: "https://www.bindingdb.org/rwd/bind/chemsearch/marvin/Download.jsp",
+        access_method: "download_monthly_tsv_or_archived_release",
+        license_note: "BindingDB curated data license and imported-source licenses must be recorded.",
+        local_rel_path: "downloads/bindingdb/bindingdb_all.tsv.zip",
+        index_rel_path: "indexes/known_targets.tsv",
+        repair_action: "download_and_index_bindingdb",
+    },
+    RequiredSource {
+        id: "uniprot_human_reviewed",
+        label: "UniProt reviewed human proteome",
+        category: "known_protein",
+        landing_url: "https://www.uniprot.org/proteomes/UP000005640",
+        access_method: "download_reviewed_human_fasta",
+        license_note: "UniProt license and release date must be recorded.",
+        local_rel_path: "downloads/uniprot/uniprot_human_reviewed.fasta.gz",
+        index_rel_path: "indexes/known_targets.tsv",
+        repair_action: "download_and_index_uniprot_human",
+    },
+    RequiredSource {
+        id: "rcsb_ligand_bound",
+        label: "RCSB ligand-bound structures",
+        category: "structure",
+        landing_url: "https://www.rcsb.org/docs/programmatic-access/file-download-services",
+        access_method: "download_selected_mmcif_entries",
+        license_note: "RCSB PDB data policy and file provenance must be recorded per downloaded entry.",
+        local_rel_path: "downloads/rcsb/mmcif",
+        index_rel_path: "indexes/structure_targets.tsv",
+        repair_action: "download_and_index_rcsb_ligand_bound",
+    },
+    RequiredSource {
+        id: "biolip2",
+        label: "BioLiP2",
+        category: "structure_interaction",
+        landing_url: "https://zhanggroup.org/BioLiP/",
+        access_method: "download_biolip2_annotations_and_structures",
+        license_note: "BioLiP2 source, publication, and usage notes must be recorded.",
+        local_rel_path: "downloads/biolip2",
+        index_rel_path: "indexes/structure_targets.tsv",
+        repair_action: "download_and_index_biolip2",
+    },
+    RequiredSource {
+        id: "plinder",
+        label: "PLINDER",
+        category: "structure_interaction",
+        landing_url: "https://github.com/plinder-org/plinder",
+        access_method: "download_plinder_release",
+        license_note: "PLINDER data and package license records must be recorded.",
+        local_rel_path: "downloads/plinder",
+        index_rel_path: "indexes/structure_targets.tsv",
+        repair_action: "download_and_index_plinder",
+    },
+    RequiredSource {
+        id: "binding_moad",
+        label: "Binding MOAD",
+        category: "structure_interaction",
+        landing_url: "https://github.com/Mugsie1969/BindingMOAD/",
+        access_method: "download_sunset_archive_with_provenance",
+        license_note: "Binding MOAD sunset archive provenance and citation must be recorded.",
+        local_rel_path: "downloads/binding_moad/bindingmoad.csv",
+        index_rel_path: "indexes/structure_targets.tsv",
+        repair_action: "download_and_index_binding_moad",
+    },
+    RequiredSource {
+        id: "metagenome_potential",
+        label: "Metagenome potential sequence index",
+        category: "metagenome",
+        landing_url: "local_or_configured_public_metagenome_sources",
+        access_method: "download_or_mount_metagenome_sequence_sources",
+        license_note: "Each metagenome source license, release, and hash must be recorded.",
+        local_rel_path: "downloads/metagenome",
+        index_rel_path: "indexes/metagenome_targets.tsv",
+        repair_action: "download_and_index_metagenome_sources",
+    },
+];
+
 pub fn run_store_command(
     command: ScienceCommand,
     options: &StoreOptions,
@@ -148,7 +330,7 @@ pub fn create_temporary_test_store(root: &Path) -> Result<PathBuf, String> {
     )?;
     write_text(
         &store.join("indexes/tool_versions.tsv"),
-        "tool\tstatus\tversion\tlicense\nrdkit\tready\ttest-bound\tBSD\nopenbabel\tready\ttest-bound\tGPL-2.0\nmmseqs2\tready\ttest-bound\tGPL-3.0\nfoldseek\tready\ttest-bound\tGPL-3.0\nautodock_vina\tready\ttest-bound\tApache-2.0\nopenmm\tready\ttest-bound\tMIT\n",
+        &temporary_tool_versions_text(),
     )?;
     write_text(
         &store.join("indexes/known_targets.tsv"),
@@ -161,6 +343,17 @@ pub fn create_temporary_test_store(root: &Path) -> Result<PathBuf, String> {
     Ok(store)
 }
 
+fn temporary_tool_versions_text() -> String {
+    let mut text = String::from("tool\tstatus\tversion\tlicense\tlabel\tdetail\n");
+    for tool in REQUIRED_TOOLS {
+        text.push_str(&format!(
+            "{}\tready\ttest-bound\t{}\t{}\ttemporary_test_fixture\n",
+            tool.id, tool.license, tool.label
+        ));
+    }
+    text
+}
+
 fn prepare_science_store(options: &StoreOptions) -> Result<String, String> {
     ensure_dir(&options.science_store)?;
     ensure_dir(&options.science_store.join("indexes"))?;
@@ -168,28 +361,312 @@ fn prepare_science_store(options: &StoreOptions) -> Result<String, String> {
     let known = options.science_store.join("indexes/known_targets.tsv");
     let metagenome = options.science_store.join("indexes/metagenome_targets.tsv");
     let tools = options.science_store.join("indexes/tool_versions.tsv");
+    let repair = options.science_store.join("repair_actions.tsv");
+    let status = options.science_store.join("install_status.json");
+    let source_requirements = options.science_store.join("source_requirements.tsv");
+    let download_plan = options.science_store.join("download_plan.tsv");
+    let index_plan = options.science_store.join("index_plan.tsv");
+    write_tool_versions(&tools)?;
+    write_source_requirements(options, &source_requirements)?;
+    write_download_plan(options, &download_plan)?;
+    write_index_plan(options, &index_plan)?;
     let rows = [
-        ("warehouse", known.exists(), &known),
-        ("metagenome_index", metagenome.exists(), &metagenome),
-        ("tool_versions", tools.exists(), &tools),
+        (
+            "known_database_index",
+            known.exists(),
+            &known,
+            "build_known_database_index",
+        ),
+        (
+            "metagenome_potential_index",
+            metagenome.exists(),
+            &metagenome,
+            "build_metagenome_potential_index",
+        ),
+        (
+            "tool_versions",
+            tools_ready(&tools),
+            &tools,
+            "install_or_repair_scientific_tools",
+        ),
     ];
     let mut text = String::from("item\tstatus\tpath\n");
+    let mut repair_text = String::from("component\tstatus\taction\tdetail\n");
+    let mut missing = Vec::new();
     let mut ready = 0usize;
-    for (item, exists, path) in rows {
-        if exists {
+    for (item, is_ready, path, action) in rows {
+        if is_ready {
             ready += 1;
+        } else {
+            missing.push(item.to_string());
         }
         text.push_str(&format!(
             "{item}\t{}\t{}\n",
-            if exists { "ready" } else { "missing" },
+            if is_ready { "ready" } else { "missing" },
+            relative_display(&options.science_store, path)
+        ));
+        repair_text.push_str(&format!(
+            "{item}\t{}\t{action}\t{}\n",
+            if is_ready { "ready" } else { "missing" },
             relative_display(&options.science_store, path)
         ));
     }
+    for tool in REQUIRED_TOOLS {
+        let probe = probe_tool(tool);
+        if !probe.ready {
+            missing.push(format!("tool:{}", tool.id));
+        }
+        repair_text.push_str(&format!(
+            "tool:{}\t{}\t{}\t{}\n",
+            tool.id,
+            if probe.ready { "ready" } else { "missing" },
+            tool.install_hint,
+            clean_cell(&probe.detail)
+        ));
+    }
+    for source in REQUIRED_SOURCES {
+        let local_path = options.science_store.join(source.local_rel_path);
+        let index_path = options.science_store.join(source.index_rel_path);
+        let source_ready = local_path.exists() && index_path.exists();
+        if !source_ready {
+            missing.push(format!("source:{}", source.id));
+        }
+        repair_text.push_str(&format!(
+            "source:{}\t{}\t{}\t{}\n",
+            source.id,
+            if source_ready { "ready" } else { "missing" },
+            source.repair_action,
+            clean_cell(source.landing_url)
+        ));
+    }
     write_text(&manifest, &text)?;
+    write_text(&repair, &repair_text)?;
+    write_text(
+        &status,
+        &format!(
+            "{}\n",
+            json!({
+                "status": if missing.is_empty() {"ready"} else {"needs_repair"},
+                "ready_items": ready,
+                "required_items": 3,
+                "missing_components": missing,
+                "science_store": options.science_store.display().to_string(),
+                "workspace_root": options.workspace_root.display().to_string(),
+                "repair_actions": "repair_actions.tsv",
+                "tool_versions": "indexes/tool_versions.tsv",
+                "source_requirements": "source_requirements.tsv",
+                "download_plan": "download_plan.tsv",
+                "index_plan": "index_plan.tsv"
+            })
+        ),
+    )?;
     Ok(format!(
-        "science_store_prepared\tready_items={ready}\trequired_items=3\tstore={}",
+        "science_store_prepared\tready_items={ready}\trequired_items=3\tstatus={}\tstore={}",
+        if ready == 3 { "ready" } else { "needs_repair" },
         options.science_store.display()
     ))
+}
+
+#[derive(Clone, Debug)]
+struct ToolProbe {
+    ready: bool,
+    version: String,
+    detail: String,
+}
+
+fn write_tool_versions(path: &Path) -> Result<(), String> {
+    let mut text = String::from("tool\tstatus\tversion\tlicense\tlabel\tdetail\n");
+    for tool in REQUIRED_TOOLS {
+        let probe = probe_tool(tool);
+        text.push_str(&format!(
+            "{}\t{}\t{}\t{}\t{}\t{}\n",
+            tool.id,
+            if probe.ready { "ready" } else { "missing" },
+            clean_cell(&probe.version),
+            tool.license,
+            tool.label,
+            clean_cell(&probe.detail)
+        ));
+    }
+    write_text(path, &text)
+}
+
+fn write_source_requirements(options: &StoreOptions, path: &Path) -> Result<(), String> {
+    let mut text = String::from(
+        "source_id\tlabel\tcategory\tstatus\tlanding_url\taccess_method\tlicense_note\tlocal_path\tindex_target\trepair_action\n",
+    );
+    for source in REQUIRED_SOURCES {
+        let local_path = options.science_store.join(source.local_rel_path);
+        let index_path = options.science_store.join(source.index_rel_path);
+        let status = if local_path.exists() && index_path.exists() {
+            "ready"
+        } else if local_path.exists() {
+            "downloaded_needs_index"
+        } else {
+            "missing"
+        };
+        text.push_str(&format!(
+            "{}\t{}\t{}\t{status}\t{}\t{}\t{}\t{}\t{}\t{}\n",
+            source.id,
+            source.label,
+            source.category,
+            source.landing_url,
+            source.access_method,
+            clean_cell(source.license_note),
+            relative_display(&options.science_store, &local_path),
+            source.index_rel_path,
+            source.repair_action
+        ));
+    }
+    write_text(path, &text)
+}
+
+fn write_download_plan(options: &StoreOptions, path: &Path) -> Result<(), String> {
+    let mut text = String::from(
+        "source_id\tstatus\taction\tlanding_url\tlocal_path\tresume_policy\tverification_policy\n",
+    );
+    for source in REQUIRED_SOURCES {
+        let local_path = options.science_store.join(source.local_rel_path);
+        text.push_str(&format!(
+            "{}\t{}\t{}\t{}\t{}\tresume_existing_partial_file\tsha256_or_release_manifest_required\n",
+            source.id,
+            if local_path.exists() {
+                "present"
+            } else {
+                "download_required"
+            },
+            source.repair_action,
+            source.landing_url,
+            relative_display(&options.science_store, &local_path)
+        ));
+    }
+    write_text(path, &text)
+}
+
+fn write_index_plan(options: &StoreOptions, path: &Path) -> Result<(), String> {
+    let mut text = String::from("source_id\tstatus\taction\tindex_target\tdepends_on\n");
+    for source in REQUIRED_SOURCES {
+        let local_path = options.science_store.join(source.local_rel_path);
+        let index_path = options.science_store.join(source.index_rel_path);
+        let status = if index_path.exists() {
+            "ready"
+        } else if local_path.exists() {
+            "index_required"
+        } else {
+            "waiting_for_download"
+        };
+        text.push_str(&format!(
+            "{}\t{status}\t{}\t{}\t{}\n",
+            source.id,
+            source.repair_action,
+            source.index_rel_path,
+            relative_display(&options.science_store, &local_path)
+        ));
+    }
+    write_text(path, &text)
+}
+
+fn tools_ready(path: &Path) -> bool {
+    let Ok(text) = fs::read_to_string(path) else {
+        return false;
+    };
+    REQUIRED_TOOLS.iter().all(|tool| {
+        text.lines().any(|line| {
+            let cols = line.split('\t').collect::<Vec<_>>();
+            cols.first()
+                .is_some_and(|name| name.eq_ignore_ascii_case(tool.id))
+                && cols.get(1).copied() == Some("ready")
+        })
+    })
+}
+
+fn probe_tool(tool: &RequiredTool) -> ToolProbe {
+    match tool.id {
+        "java" => probe_command(tool.id, "java", &["-version"]),
+        "nextflow" => probe_command(tool.id, "nextflow", &["-version"]),
+        "rdkit" => probe_python_module(tool.id, "rdkit", "rdkit.__version__"),
+        "openbabel" => probe_command(tool.id, "obabel", &["-V"]),
+        "mmseqs2" => probe_command(tool.id, "mmseqs", &["version"]),
+        "foldseek" => probe_command(tool.id, "foldseek", &["version"]),
+        "autodock_vina" => probe_command(tool.id, "vina", &["--version"]),
+        "openmm" => probe_python_module(tool.id, "openmm", "openmm.version.version"),
+        "pdbfixer" => probe_python_module(tool.id, "pdbfixer", "'installed'"),
+        "mdtraj" => probe_python_module(tool.id, "mdtraj", "mdtraj.__version__"),
+        "mdanalysis" => probe_python_module(tool.id, "MDAnalysis", "MDAnalysis.__version__"),
+        _ => ToolProbe {
+            ready: false,
+            version: "unknown".to_string(),
+            detail: format!("no_probe_defined_for:{}", tool.id),
+        },
+    }
+}
+
+fn probe_command(tool_id: &str, program: &str, args: &[&str]) -> ToolProbe {
+    match Command::new(program).args(args).output() {
+        Ok(output) => {
+            let text = format!(
+                "{}{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            ToolProbe {
+                ready: output.status.success(),
+                version: if output.status.success() {
+                    first_nonempty_line(&text).unwrap_or_else(|| "installed".to_string())
+                } else {
+                    "missing".to_string()
+                },
+                detail: if output.status.success() {
+                    format!("{tool_id}_detected")
+                } else {
+                    format!("{tool_id}_probe_failed")
+                },
+            }
+        }
+        Err(err) => ToolProbe {
+            ready: false,
+            version: "missing".to_string(),
+            detail: format!("{tool_id}_not_found:{err}"),
+        },
+    }
+}
+
+fn probe_python_module(tool_id: &str, module: &str, version_expr: &str) -> ToolProbe {
+    let code = format!("import {module}; print({version_expr})");
+    match Command::new("python").args(["-c", &code]).output() {
+        Ok(output) => {
+            let text = format!(
+                "{}{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            ToolProbe {
+                ready: output.status.success(),
+                version: if output.status.success() {
+                    first_nonempty_line(&text).unwrap_or_else(|| "installed".to_string())
+                } else {
+                    "missing".to_string()
+                },
+                detail: if output.status.success() {
+                    format!("{tool_id}_python_module_detected")
+                } else {
+                    format!("{tool_id}_python_module_missing")
+                },
+            }
+        }
+        Err(err) => ToolProbe {
+            ready: false,
+            version: "missing".to_string(),
+            detail: format!("python_probe_failed_for_{tool_id}:{err}"),
+        },
+    }
+}
+
+fn first_nonempty_line(text: &str) -> Option<String> {
+    text.lines()
+        .map(str::trim)
+        .find(|line| !line.is_empty())
+        .map(ToOwned::to_owned)
 }
 
 fn run_pipeline(options: &ScienceOptions) -> Result<String, String> {
@@ -245,21 +722,14 @@ fn pipeline_blockers(options: &ScienceOptions) -> Result<Vec<String>, String> {
         .exists()
     {
         let tool_text = read_text(&options.science_store.join("indexes/tool_versions.tsv"))?;
-        for tool in [
-            "rdkit",
-            "openbabel",
-            "mmseqs2",
-            "foldseek",
-            "autodock_vina",
-            "openmm",
-        ] {
+        for tool in REQUIRED_TOOLS {
             if !tool_text.lines().any(|line| {
                 line.split('\t')
                     .next()
-                    .is_some_and(|name| name.eq_ignore_ascii_case(tool))
+                    .is_some_and(|name| name.eq_ignore_ascii_case(tool.id))
                     && line.contains("\tready\t")
             }) {
-                blockers.push(format!("missing_or_unready_tool:{tool}"));
+                blockers.push(format!("missing_or_unready_tool:{}", tool.id));
             }
         }
     }

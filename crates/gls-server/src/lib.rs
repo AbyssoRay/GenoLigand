@@ -10,6 +10,20 @@ use std::time::{SystemTime, UNIX_EPOCH};
 pub const PRODUCT_NAME: &str = "GenoLigand Local WebUI";
 pub const PRODUCT_VERSION: &str = "0.9.2";
 
+const REQUIRED_TOOL_IDS: &[&str] = &[
+    "java",
+    "nextflow",
+    "rdkit",
+    "openbabel",
+    "mmseqs2",
+    "foldseek",
+    "autodock_vina",
+    "openmm",
+    "pdbfixer",
+    "mdtraj",
+    "mdanalysis",
+];
+
 #[derive(Clone, Debug)]
 pub struct ServerOptions {
     pub host: String,
@@ -107,17 +121,20 @@ fn route(
         ("GET", "/api/version") => {
             json!({"name":PRODUCT_NAME,"version":PRODUCT_VERSION,"science_flow":"scientific_pipeline"})
         }
-        ("GET", "/api/projects") | ("GET", "/api/user/projects") => projects_json(options),
+        ("GET", "/api/user/projects") => user_projects_json(options),
+        ("GET", "/api/projects") => projects_json(options),
         ("POST", "/api/projects") => create_project(options),
-        ("GET", "/api/databases") | ("GET", "/api/user/databases") => databases_json(options),
-        ("GET", "/api/diagnostics") | ("GET", "/api/user/diagnostics") => diagnostics_json(options),
+        ("GET", "/api/user/databases") => user_databases_json(options),
+        ("GET", "/api/databases") => databases_json(options),
+        ("GET", "/api/user/diagnostics") => user_diagnostics_json(options),
+        ("GET", "/api/diagnostics") => diagnostics_json(options),
         ("POST", "/api/user/diagnostics/run") | ("POST", "/api/diagnostics/run") => {
             diagnostics_json(options)
         }
-        ("GET", "/api/user/setup/status") => setup_status_json(options),
-        ("POST", "/api/user/setup/run") => setup_status_json(options),
-        ("GET", "/api/user/setup/install-plan") => setup_install_plan_json(options),
-        ("POST", "/api/user/setup/install") => setup_install_plan_json(options),
+        ("GET", "/api/user/setup/status") => user_setup_status_json(options),
+        ("POST", "/api/user/setup/run") => run_setup_repair_json(options),
+        ("GET", "/api/user/setup/install-plan") => user_setup_install_plan_json(options),
+        ("POST", "/api/user/setup/install") => run_setup_repair_json(options),
         ("GET", "/api/guides") => {
             json!({"guides":["docs/local_webui_user_guide.md","docs/windows_wsl2_installation_guide.md","docs/linux_server_installation_guide.md"]})
         }
@@ -224,6 +241,36 @@ fn projects_json(options: &ServerOptions) -> Value {
     })
 }
 
+fn user_projects_json(options: &ServerOptions) -> Value {
+    let mut projects = Vec::new();
+    if let Ok(entries) = fs::read_dir(projects_root(options)) {
+        for entry in entries.flatten() {
+            if entry.file_type().map(|file| file.is_dir()).unwrap_or(false) {
+                let id = entry.file_name().to_string_lossy().to_string();
+                let project = read_project(options, &id);
+                projects.push(json!({
+                    "project_id": project.get("project_id").cloned().unwrap_or(Value::Null),
+                    "project_name": project.get("project_name").cloned().unwrap_or(Value::Null),
+                    "project_status": project.get("project_status").cloned().unwrap_or(Value::Null),
+                    "latest_run_id": project.get("latest_run_id").cloned().unwrap_or(Value::Null)
+                }));
+            }
+        }
+    }
+    projects.sort_by_key(|project| {
+        project
+            .get("project_id")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string()
+    });
+    json!({
+        "projects": projects,
+        "templates": [],
+        "supported_actions": ["create","preflight","run","export"]
+    })
+}
+
 fn create_project(options: &ServerOptions) -> Value {
     let project_id = format!("project-{}", now_millis());
     let dir = project_dir(options, &project_id);
@@ -316,7 +363,7 @@ fn preflight_json(options: &ServerOptions, project_id: &str) -> Value {
         ),
         check(
             "tool_versions_manifest",
-            store.join("indexes/tool_versions.tsv").exists(),
+            tool_versions_ready(&store.join("indexes/tool_versions.tsv")),
             store
                 .join("indexes/tool_versions.tsv")
                 .display()
@@ -396,8 +443,8 @@ fn start_run(options: &ServerOptions, project_id: &str) -> Value {
 }
 
 fn gls_cli_command(options: &ServerOptions, input: &Path, run_dir: &Path) -> Vec<String> {
-    vec![
-        gls_cli_path(options),
+    let mut command = gls_cli_invocation(options);
+    command.extend([
         "pipeline".to_string(),
         "run".to_string(),
         "--input-manifest".to_string(),
@@ -408,33 +455,84 @@ fn gls_cli_command(options: &ServerOptions, input: &Path, run_dir: &Path) -> Vec
         science_store_path(options).display().to_string(),
         "--workspace-root".to_string(),
         options.workspace_root.display().to_string(),
-    ]
+    ]);
+    command
 }
 
-fn gls_cli_path(options: &ServerOptions) -> String {
-    std::env::var("GENOLIGAND_GLS_CLI").unwrap_or_else(|_| {
-        let exe = if cfg!(windows) {
-            "gls-cli.exe"
-        } else {
-            "gls-cli"
-        };
-        let candidate = options
-            .workspace_root
-            .join("target")
-            .join("debug")
-            .join(exe);
-        if candidate.exists() {
-            candidate.display().to_string()
-        } else {
-            "gls-cli".to_string()
-        }
-    })
+fn gls_cli_invocation(options: &ServerOptions) -> Vec<String> {
+    if let Ok(path) = std::env::var("GENOLIGAND_GLS_CLI")
+        && !path.trim().is_empty()
+    {
+        return vec![path];
+    }
+    let exe = if cfg!(windows) {
+        "gls-cli.exe"
+    } else {
+        "gls-cli"
+    };
+    let candidate = options
+        .workspace_root
+        .join("target")
+        .join("debug")
+        .join(exe);
+    if candidate.exists() {
+        vec![candidate.display().to_string()]
+    } else if options.workspace_root.join("Cargo.toml").exists() {
+        vec![
+            "cargo".to_string(),
+            "run".to_string(),
+            "-p".to_string(),
+            "gls-cli".to_string(),
+            "--".to_string(),
+        ]
+    } else {
+        vec!["gls-cli".to_string()]
+    }
+}
+
+fn gls_cli_help_command(options: &ServerOptions) -> Vec<String> {
+    let mut command = gls_cli_invocation(options);
+    command.push("--help".to_string());
+    command
 }
 
 fn science_store_path(options: &ServerOptions) -> PathBuf {
     std::env::var("GENOLIGAND_SCIENCE_STORE")
         .map(PathBuf::from)
-        .unwrap_or_else(|_| options.workspace_root.join("science_store"))
+        .unwrap_or_else(|_| default_science_store(&options.workspace_root))
+}
+
+fn default_science_store(workspace_root: &Path) -> PathBuf {
+    if let Ok(root) = std::env::var("GENOLIGAND_DATA_ROOT") {
+        let root = PathBuf::from(root);
+        if !root.as_os_str().is_empty() {
+            return root.join("science_store");
+        }
+    }
+    if cfg!(windows) {
+        let d_root = PathBuf::from(r"D:\GenoLigandData\science_store");
+        if Path::new(r"D:\").exists() {
+            return d_root;
+        }
+        if let Ok(local) = std::env::var("LOCALAPPDATA") {
+            return PathBuf::from(local)
+                .join("GenoLigand")
+                .join("science_store");
+        }
+    } else {
+        let data_root = PathBuf::from("/data/genoligand/science_store");
+        if Path::new("/data").exists() {
+            return data_root;
+        }
+        if let Ok(home) = std::env::var("HOME") {
+            return PathBuf::from(home)
+                .join(".local")
+                .join("share")
+                .join("genoligand")
+                .join("science_store");
+        }
+    }
+    workspace_root.join(".genoligand").join("science_store")
 }
 
 fn project_runs_json(options: &ServerOptions, project_id: &str) -> Value {
@@ -505,15 +603,48 @@ fn databases_json(options: &ServerOptions) -> Value {
         .iter()
         .map(|rel| {
             let path = store.join(rel);
-            json!({"item":rel,"path":path.display().to_string(),"ready":path.exists()})
+            let ready = if *rel == "indexes/tool_versions.tsv" {
+                tool_versions_ready(&path)
+            } else {
+                path.exists()
+            };
+            json!({"item":rel,"path":path.display().to_string(),"ready":ready})
         })
         .collect::<Vec<_>>();
     json!({"science_store":store.display().to_string(),"required":rows,"user_configures_paths":false})
 }
 
+fn user_databases_json(options: &ServerOptions) -> Value {
+    let store = science_store_path(options);
+    let required = [
+        ("science_store_manifest.tsv", "科学仓库"),
+        ("indexes/known_targets.tsv", "已知蛋白索引"),
+        ("indexes/metagenome_targets.tsv", "宏基因组索引"),
+        ("indexes/tool_versions.tsv", "计算工具"),
+    ];
+    let rows = required
+        .iter()
+        .map(|(rel, label)| {
+            let path = store.join(rel);
+            let ready = if *rel == "indexes/tool_versions.tsv" {
+                tool_versions_ready(&path)
+            } else {
+                path.exists()
+            };
+            json!({"item":rel,"label":label,"ready":ready})
+        })
+        .collect::<Vec<_>>();
+    json!({
+        "required": rows,
+        "sources": source_status_rows(&store),
+        "repair_actions_available": store.join("repair_actions.tsv").exists(),
+        "user_configures_paths": false
+    })
+}
+
 fn diagnostics_json(options: &ServerOptions) -> Value {
     let cargo = capture("cargo", &["--version"], &options.workspace_root);
-    let gls_cli = capture(&gls_cli_path(options), &["--help"], &options.workspace_root);
+    let gls_cli = capture_command(&gls_cli_help_command(options), &options.workspace_root);
     json!({
         "status": if cargo.0 && gls_cli.0 {"ready"} else {"warning"},
         "runtime": std::env::consts::OS,
@@ -523,22 +654,81 @@ fn diagnostics_json(options: &ServerOptions) -> Value {
     })
 }
 
-fn setup_status_json(options: &ServerOptions) -> Value {
+fn user_diagnostics_json(options: &ServerOptions) -> Value {
+    let cargo = capture("cargo", &["--version"], &options.workspace_root);
+    let gls_cli = capture_command(&gls_cli_help_command(options), &options.workspace_root);
+    let database_ready = preflight_store_ready(options);
+    let checks = vec![
+        json!({"label":"服务", "ready":true, "next_action":"继续"}),
+        json!({"label":"命令行工具", "ready":gls_cli.0, "next_action": if gls_cli.0 {"继续"} else {"重新安装 GenoLigand 命令行工具"}}),
+        json!({"label":"构建环境", "ready":cargo.0, "next_action": if cargo.0 {"继续"} else {"安装 Rust 构建环境"}}),
+        json!({"label":"科学仓库", "ready":database_ready, "next_action": if database_ready {"继续"} else {"运行安装/修复"}}),
+    ];
     json!({
-        "status": "requires_science_store" ,
-        "single_command": format!("cargo run -p gls-server -- --host {} --port {}", options.host, options.port),
-        "full_scientific_install_command": format!("cargo run -p gls-cli -- install prepare-science-store --science-store {}", science_store_path(options).display()),
-        "setup_modes": ["full scientific"],
-        "full_scientific_ready": preflight_store_ready(options)
+        "status": if cargo.0 && gls_cli.0 && database_ready {"ready"} else {"warning"},
+        "runtime": std::env::consts::OS,
+        "checks": checks,
+        "science_store": user_databases_json(options)
     })
 }
 
-fn setup_install_plan_json(options: &ServerOptions) -> Value {
+fn user_setup_status_json(options: &ServerOptions) -> Value {
+    let ready = preflight_store_ready(options);
     json!({
-        "status":"planned",
-        "command": format!("cargo run -p gls-cli -- install prepare-science-store --science-store {}", science_store_path(options).display()),
-        "note":"Full database download and indexing are installation responsibilities. User research runs do not configure database paths."
+        "status": if ready {"ready"} else {"needs_repair"},
+        "database_ready": ready,
+        "runtime": std::env::consts::OS,
+        "can_run_repair": true,
+        "repair_action": "prepare_science_store",
+        "checks": user_databases_json(options)["required"].clone()
     })
+}
+
+fn run_setup_repair_json(options: &ServerOptions) -> Value {
+    let command = setup_repair_command(options);
+    let output = Command::new(&command[0])
+        .args(&command[1..])
+        .current_dir(&options.workspace_root)
+        .output();
+    let (executed, message) = match output {
+        Ok(output) if output.status.success() => (true, "修复动作已执行。".to_string()),
+        Ok(output) => (
+            false,
+            format!(
+                "修复动作未完成，退出码 {:?}。",
+                output.status.code().unwrap_or_default()
+            ),
+        ),
+        Err(err) => (false, format!("修复动作无法启动：{err}")),
+    };
+    let ready = preflight_store_ready(options);
+    json!({
+        "status": if executed {"repair_executed"} else {"repair_failed"},
+        "database_ready": ready,
+        "message": if ready {"科学仓库已就绪。"} else {message.as_str()},
+        "checks": user_databases_json(options)["required"].clone()
+    })
+}
+
+fn user_setup_install_plan_json(options: &ServerOptions) -> Value {
+    json!({
+        "status":"ready_to_run",
+        "action":"prepare_science_store",
+        "description":"准备数据库、索引、工具版本和许可证记录。普通运行不配置数据库路径。",
+        "can_run_from_webui": true,
+        "database_ready": preflight_store_ready(options)
+    })
+}
+
+fn setup_repair_command(options: &ServerOptions) -> Vec<String> {
+    let mut command = gls_cli_invocation(options);
+    command.extend([
+        "install".to_string(),
+        "prepare-science-store".to_string(),
+        "--science-store".to_string(),
+        science_store_path(options).display().to_string(),
+    ]);
+    command
 }
 
 fn update_run_state(options: &ServerOptions, run_id: &str, state: &str) -> Value {
@@ -567,7 +757,55 @@ fn preflight_store_ready(options: &ServerOptions) -> bool {
     store.join("science_store_manifest.tsv").exists()
         && store.join("indexes/known_targets.tsv").exists()
         && store.join("indexes/metagenome_targets.tsv").exists()
-        && store.join("indexes/tool_versions.tsv").exists()
+        && tool_versions_ready(&store.join("indexes/tool_versions.tsv"))
+}
+
+fn tool_versions_ready(path: &Path) -> bool {
+    let Ok(text) = fs::read_to_string(path) else {
+        return false;
+    };
+    REQUIRED_TOOL_IDS.iter().all(|tool| {
+        text.lines().any(|line| {
+            let cols = line.split('\t').collect::<Vec<_>>();
+            cols.first()
+                .is_some_and(|name| name.eq_ignore_ascii_case(tool))
+                && cols.get(1).copied() == Some("ready")
+        })
+    })
+}
+
+fn source_status_rows(store: &Path) -> Vec<Value> {
+    let path = store.join("source_requirements.tsv");
+    let Ok(text) = fs::read_to_string(path) else {
+        return Vec::new();
+    };
+    let mut lines = text.lines();
+    let Some(header) = lines.next() else {
+        return Vec::new();
+    };
+    let headers = header.split('\t').collect::<Vec<_>>();
+    lines
+        .filter(|line| !line.trim().is_empty())
+        .map(|line| {
+            let cols = line.split('\t').collect::<Vec<_>>();
+            let get = |name: &str| -> String {
+                headers
+                    .iter()
+                    .position(|header| *header == name)
+                    .and_then(|index| cols.get(index).copied())
+                    .unwrap_or("")
+                    .to_string()
+            };
+            json!({
+                "source_id": get("source_id"),
+                "label": get("label"),
+                "category": get("category"),
+                "status": get("status"),
+                "ready": get("status") == "ready",
+                "next_action": get("repair_action")
+            })
+        })
+        .collect()
 }
 
 fn check(id: &str, ready: bool, detail: String) -> Value {
@@ -576,6 +814,27 @@ fn check(id: &str, ready: bool, detail: String) -> Value {
 
 fn capture(program: &str, args: &[&str], cwd: &Path) -> (bool, String) {
     match Command::new(program).args(args).current_dir(cwd).output() {
+        Ok(output) => (
+            output.status.success(),
+            format!(
+                "{}{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            ),
+        ),
+        Err(err) => (false, err.to_string()),
+    }
+}
+
+fn capture_command(command: &[String], cwd: &Path) -> (bool, String) {
+    let Some(program) = command.first() else {
+        return (false, "empty_command".to_string());
+    };
+    match Command::new(program)
+        .args(&command[1..])
+        .current_dir(cwd)
+        .output()
+    {
         Ok(output) => (
             output.status.success(),
             format!(

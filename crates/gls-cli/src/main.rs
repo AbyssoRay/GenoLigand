@@ -85,7 +85,7 @@ impl CommonArgs {
                     .ok()
                     .map(PathBuf::from)
             })
-            .unwrap_or_else(|| workspace_root.join("science_store"));
+            .unwrap_or_else(|| default_science_store(&workspace_root));
         let input_manifest = input_manifest.unwrap_or_else(|| PathBuf::from("input_manifest.json"));
         let run_dir =
             run_dir.unwrap_or_else(|| workspace_root.join("outputs").join("current_pipeline"));
@@ -96,6 +96,39 @@ impl CommonArgs {
             run_dir,
         })
     }
+}
+
+fn default_science_store(workspace_root: &Path) -> PathBuf {
+    if let Ok(root) = std::env::var("GENOLIGAND_DATA_ROOT") {
+        let root = PathBuf::from(root);
+        if !root.as_os_str().is_empty() {
+            return root.join("science_store");
+        }
+    }
+    if cfg!(windows) {
+        let d_root = PathBuf::from(r"D:\GenoLigandData\science_store");
+        if Path::new(r"D:\").exists() {
+            return d_root;
+        }
+        if let Ok(local) = std::env::var("LOCALAPPDATA") {
+            return PathBuf::from(local)
+                .join("GenoLigand")
+                .join("science_store");
+        }
+    } else {
+        let data_root = PathBuf::from("/data/genoligand/science_store");
+        if Path::new("/data").exists() {
+            return data_root;
+        }
+        if let Ok(home) = std::env::var("HOME") {
+            return PathBuf::from(home)
+                .join(".local")
+                .join("share")
+                .join("genoligand")
+                .join("science_store");
+        }
+    }
+    workspace_root.join(".genoligand").join("science_store")
 }
 
 fn take_path(args: &[String], index: &mut usize, flag: &str) -> Result<PathBuf, String> {
