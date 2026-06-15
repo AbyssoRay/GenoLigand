@@ -2609,6 +2609,27 @@ mod tests {
     }
 
     #[test]
+    fn bundled_user_web_assets_avoid_demo_developer_and_mojibake_language() {
+        let user_assets = [
+            include_str!("../../../webui/app/index.html"),
+            include_str!("../../../webui/app/app.js"),
+        ]
+        .join("\n");
+        let forbidden_terms = [
+            "真实", "demo", "Demo", "sample", "Sample", "example", "Example", "示例", "样例",
+            "测试", "GitHub", "commit", "remote", "schema", "manifest", "hash", "raw JSON",
+            "raw json", "gate", "route", "验收", "phase_0", "�", "灏", "鏁", "杈", "绌",
+        ];
+
+        for term in forbidden_terms {
+            assert!(
+                !user_assets.contains(term),
+                "bundled user web assets expose forbidden term: {term}"
+            );
+        }
+    }
+
+    #[test]
     fn user_project_creation_hides_internal_status_and_actions() {
         let root = std::env::temp_dir().join(format!("genoligand-user-create-{}", now_millis()));
         let options = server_options(root.clone());
