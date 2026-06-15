@@ -21,37 +21,21 @@ http://127.0.0.1:19090/
 
 ## 准备科学仓库
 
-安装流程负责准备数据库、索引、工具版本和许可证清单。普通用户不需要配置数据库路径。维护人员可单独运行：
+安装流程负责准备已知蛋白数据库、宏基因组潜在序列索引、结构/口袋/动力学所需工具记录、许可证和来源记录。普通用户不需要配置数据库路径。维护人员需要重建或修复科学仓库时，可单独运行：
 
 ```powershell
 python scripts\setup\install_complete_scientific.py
 ```
 
-科学仓库必须包含：
-
-- `science_store_manifest.tsv`
-- `indexes/known_targets.tsv`
-- `indexes/metagenome_targets.tsv`
-- `indexes/tool_versions.tsv`
-- `install_status.json`
-- `source_requirements.tsv`
-
-缺少研究输入、数据库索引、必要工具、安装状态或科学资源状态时，主流程阻塞并输出零候选。
+科学仓库由安装流程维护。缺少研究输入、数据库索引、必要工具、安装状态或科学资源状态时，主流程阻塞并输出零候选。
 
 ## 主流程
 
 ```text
-输入归一化 -> 特征计算 -> 已知数据库比对 -> 宏基因组潜在序列比对 -> 结构/口袋/对接/动力学证据 -> 联合靶点排序 -> 证据报告
+输入 -> 配置 -> 检查 -> 运行 -> 结果 -> 导出
 ```
 
-CLI（命令行界面）入口：
-
-```powershell
-cargo run -p gls-cli -- pipeline run `
-  --input-manifest path\to\input_manifest.json `
-  --science-store D:\GenoLigandData\science_store `
-  --run-dir outputs\current_pipeline
-```
+后台流程会完成输入整理、特征计算、已知数据库比对、宏基因组潜在序列比对、结构/口袋/对接/动力学证据整合、候选靶点排序和证据报告生成。
 
 支持的输入类型：
 
@@ -63,15 +47,8 @@ cargo run -p gls-cli -- pipeline run `
 
 ## 主要输出
 
-- `input_normalized_manifest.json`
-- `feature_manifest.json`
-- `known_database_matches.tsv`
-- `metagenome_potential_matches.tsv`
-- `structure_patch_summary.tsv`
-- `docking_summary.tsv`
-- `md_summary.tsv`
-- `target_candidate_ranking.tsv`
-- `candidate_detail.json`
-- `score_decomposition.tsv`
-- `evidence_ledger.tsv`
-- `research_report.md`
+- 科研报告。
+- 候选靶点排序表。
+- 候选证据链。
+- 结构与口袋摘要。
+- 动力学摘要。
