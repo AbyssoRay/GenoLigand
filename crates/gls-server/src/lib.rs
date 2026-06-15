@@ -707,7 +707,7 @@ fn user_setup_status_json(options: &ServerOptions) -> Value {
         "database_ready": ready,
         "runtime": std::env::consts::OS,
         "can_run_repair": true,
-        "repair_action": "prepare_science_store",
+        "repair_action": if ready {"继续"} else {"运行安装/修复"},
         "checks": user_databases_json(options)["required"].clone()
     })
 }
@@ -756,7 +756,7 @@ fn run_setup_repair_json(options: &ServerOptions) -> Value {
 fn user_setup_install_plan_json(options: &ServerOptions) -> Value {
     json!({
         "status":"ready_to_run",
-        "action":"prepare_science_store",
+        "action":"运行安装/修复",
         "description":"准备数据库、索引、工具版本和许可证记录。普通运行不配置数据库路径。",
         "can_run_from_webui": true,
         "database_ready": preflight_store_ready(options)
@@ -886,16 +886,64 @@ fn source_status_rows(store: &Path) -> Vec<Value> {
                     .unwrap_or("")
                     .to_string()
             };
+            let raw_status = get("status");
+            let raw_action = get("repair_action");
             json!({
                 "source_id": get("source_id"),
                 "label": get("label"),
-                "category": get("category"),
-                "status": get("status"),
-                "ready": get("status") == "ready",
-                "next_action": get("repair_action")
+                "category": friendly_source_category(&get("category")),
+                "status": friendly_source_status(&raw_status),
+                "ready": raw_status == "ready",
+                "next_action": friendly_source_next_action(&raw_action, &raw_status)
             })
         })
         .collect()
+}
+
+fn friendly_source_category(raw: &str) -> &'static str {
+    match raw {
+        "known_activity" => "已知活性",
+        "known_protein" => "已知蛋白",
+        "structure" => "结构数据",
+        "structure_interaction" => "结构互作",
+        "metagenome" => "宏基因组序列",
+        _ => "科学资源",
+    }
+}
+
+fn friendly_source_status(raw: &str) -> &'static str {
+    match raw {
+        "ready" => "就绪",
+        "downloaded_needs_index" => "已下载，需重建索引",
+        "missing" => "需要准备",
+        "download_required" => "需要下载",
+        "index_required" => "需要重建索引",
+        "waiting_for_download" => "等待下载",
+        _ => "需要检查",
+    }
+}
+
+fn friendly_source_next_action(action: &str, status: &str) -> &'static str {
+    if status == "ready" {
+        return "继续";
+    }
+    match action {
+        "download_and_index_chembl" => "运行安装/修复以准备 ChEMBL 活性数据",
+        "download_and_index_bindingdb" => "运行安装/修复以准备 BindingDB 活性数据",
+        "download_and_index_uniprot_human" => "运行安装/修复以准备 UniProt 人类蛋白索引",
+        "download_and_index_rcsb_ligand_bound" => "运行安装/修复以准备 RCSB 结构数据",
+        "download_and_index_biolip2" => "运行安装/修复以准备 BioLiP2 互作数据",
+        "download_and_index_plinder" => "运行安装/修复以准备 PLINDER 结构数据",
+        "download_and_index_binding_moad" => "运行安装/修复以准备 Binding MOAD 结构数据",
+        "download_and_index_metagenome_sources" => "运行安装/修复以准备宏基因组序列索引",
+        "install_or_repair_scientific_tools" => "运行安装/修复以准备计算工具",
+        "build_known_database_index" => "运行安装/修复以重建已知蛋白索引",
+        "build_metagenome_potential_index" => "运行安装/修复以重建宏基因组索引",
+        _ if status == "downloaded_needs_index" || status == "index_required" => {
+            "运行安装/修复以重建索引"
+        }
+        _ => "运行安装/修复以准备资源",
+    }
 }
 
 fn check(id: &str, ready: bool, _detail: String) -> Value {
@@ -1352,6 +1400,24 @@ mod tests {
     }
 
     #[test]
+    fn source_status_actions_are_user_facing() {
+        assert_eq!(friendly_source_category("known_activity"), "已知活性");
+        assert_eq!(
+            friendly_source_status("downloaded_needs_index"),
+            "已下载，需重建索引"
+        );
+        assert_eq!(
+            friendly_source_next_action("download_and_index_biolip2", "missing"),
+            "运行安装/修复以准备 BioLiP2 互作数据"
+        );
+        assert_eq!(friendly_source_next_action("anything", "ready"), "继续");
+        assert!(
+            !friendly_source_next_action("download_and_index_chembl", "missing")
+                .contains("download_and_index")
+        );
+    }
+
+    #[test]
     fn artifact_download_is_limited_to_current_run_allowlist() {
         let root = std::env::temp_dir().join(format!("genoligand-download-{}", now_millis()));
         let options = server_options(root.clone());
@@ -1400,6 +1466,8 @@ mod tests {
             run_json(&options, "run-1"),
             artifacts_json(&options, "run-1"),
             user_databases_json(&options),
+            user_setup_status_json(&options),
+            user_setup_install_plan_json(&options),
             preflight_json(&options, "project-1"),
             logs_json(&options, "run-1"),
             table_endpoint_json(
@@ -1425,6 +1493,9 @@ mod tests {
             assert!(!text.contains("tool_versions_manifest"));
             assert!(!text.contains("indexes/known_targets.tsv"));
             assert!(!text.contains("indexes/metagenome_targets.tsv"));
+            assert!(!text.contains("prepare_science_store"));
+            assert!(!text.contains("download_and_index"));
+            assert!(!text.contains("install_or_repair"));
         }
 
         fs::remove_dir_all(&root).ok();
