@@ -552,7 +552,7 @@ fn run_json(options: &ServerOptions, run_id: &str) -> Value {
         "current_stage": read_trimmed(&run_dir.join("current_stage.txt")).unwrap_or_default(),
         "failure_summary": friendly_failure_summary(read_trimmed(&run_dir.join("failure_reason.txt")).as_deref()),
         "trace": run_trace(options, &run_dir, run_id),
-        "artifact_index": artifact_index(&run_dir)
+        "outputs": artifact_index(&run_dir)
     })
 }
 
@@ -2579,9 +2579,7 @@ mod tests {
         assert_eq!(run["trace"]["candidate_count"], 0);
         assert_eq!(run["trace"]["evidence_status"], "暂无证据链");
         assert_eq!(run["trace"]["evidence_count"], 0);
-        let items = run["artifact_index"]["items"]
-            .as_array()
-            .expect("artifact items");
+        let items = run["outputs"]["items"].as_array().expect("output items");
         let candidate_visible = items
             .iter()
             .find(|item| item.get("id").and_then(Value::as_str) == Some("candidate_ranking"))
@@ -2678,6 +2676,7 @@ mod tests {
             assert!(!text.contains("failure_reason"));
             assert!(!text.contains("artifact_root"));
             assert!(!text.contains("artifact_backed"));
+            assert!(!text.contains("artifact_index"));
             assert!(!text.contains("source_path"));
             assert!(!text.contains("cargo run hidden"));
             assert!(!text.contains("D:/hidden"));

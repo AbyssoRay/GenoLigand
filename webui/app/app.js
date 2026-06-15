@@ -791,7 +791,7 @@ function visualStatus(items) {
 
 function renderExport() {
   page.className = "page";
-  const artifacts = state.run?.artifact_index?.items || [];
+  const artifacts = state.run?.outputs?.items || [];
   const available = artifacts.filter((item) => item.exists);
   const runId = state.run?.run_id || "";
   page.innerHTML = `
@@ -1222,7 +1222,7 @@ function candidateRows() {
 }
 
 function artifactRows() {
-  const items = state.run?.artifact_index?.items || state.runData?.artifacts?.items || [];
+  const items = state.run?.outputs?.items || state.runData?.artifacts?.items || [];
   if (!items.length) return `<div class="empty">还没有运行输出。</div>`;
   return `
     <div class="table-wrap">
