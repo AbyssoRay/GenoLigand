@@ -424,8 +424,8 @@ function installCatalogSummary() {
   const direct = state.setupPlan?.direct_sources;
   const external = state.setupPlan?.external_sources;
   if (!direct && !external) return "";
-  const directReady = direct?.status === "ready";
-  const externalReady = external?.status === "ready";
+  const directReady = direct?.ready === true;
+  const externalReady = external?.ready === true;
   return `
     <div class="notice ${directReady && externalReady ? "" : "warn"}">
       <strong>安装准备：${direct?.source_count || 0} 个数据库来源，${external?.source_group_count || 0} 组大型资源</strong>

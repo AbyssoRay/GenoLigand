@@ -1285,18 +1285,17 @@ fn user_setup_install_plan_json(options: &ServerOptions) -> Value {
     let catalog_rows = config_tsv_data_row_count(options, "source_catalog.tsv");
     let sync_rows = config_tsv_data_row_count(options, "source_sync_plan.tsv");
     json!({
-        "status":"ready_to_run",
         "action":"运行安装/修复",
         "description":"准备数据库、索引、计算工具、许可证和来源记录。普通运行不配置数据库路径。",
         "can_run_from_webui": true,
         "database_ready": preflight_store_ready(options),
         "direct_sources": {
-            "status": if catalog_rows > 0 {"ready"} else {"needs_package_update"},
+            "ready": catalog_rows > 0,
             "source_count": catalog_rows,
             "next_action": if catalog_rows > 0 {"运行安装/修复"} else {"使用完整安装包重新运行安装/修复"}
         },
         "external_sources": {
-            "status": if sync_rows > 0 {"ready"} else {"needs_package_update"},
+            "ready": sync_rows > 0,
             "source_group_count": sync_rows,
             "next_action": if sync_rows > 0 {"运行安装/修复"} else {"使用完整安装包重新运行安装/修复"}
         }
@@ -2373,8 +2372,12 @@ mod tests {
         let payload = user_setup_install_plan_json(&server_options(root.clone()));
         assert_eq!(payload["direct_sources"]["source_count"], 1);
         assert_eq!(payload["external_sources"]["source_group_count"], 1);
+        assert_eq!(payload["direct_sources"]["ready"], true);
+        assert_eq!(payload["external_sources"]["ready"], true);
         assert_eq!(payload["direct_sources"]["next_action"], "运行安装/修复");
         let text = payload.to_string();
+        assert!(!text.contains("ready_to_run"));
+        assert!(!text.contains("needs_package_update"));
         assert!(!text.contains("source_catalog"));
         assert!(!text.contains("source_sync_plan"));
         assert!(!text.contains("https://example"));
