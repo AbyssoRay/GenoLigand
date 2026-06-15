@@ -340,6 +340,41 @@ select:focus {
   color: var(--muted);
 }
 
+.visual-status {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 10px;
+  margin: 12px 0 14px;
+}
+
+.visual-status-item {
+  display: grid;
+  gap: 6px;
+  min-width: 0;
+  padding: 11px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--surface-2);
+}
+
+.visual-status-item span {
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.visual-status-item strong {
+  font-weight: 600;
+  overflow-wrap: anywhere;
+}
+
+.ready-text {
+  color: var(--good);
+}
+
+.blocked-text {
+  color: var(--warn);
+}
+
 .stage-list {
   display: grid;
   gap: 8px;
@@ -542,6 +577,7 @@ pre {
   }
 
   .metric-row,
+  .visual-status,
   .stage {
     grid-template-columns: 1fr;
   }
