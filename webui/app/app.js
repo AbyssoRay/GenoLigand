@@ -1215,13 +1215,14 @@ function candidateRows() {
 
 function artifactRows() {
   const items = state.run?.outputs?.items || state.runData?.artifacts?.items || [];
-  if (!items.length) return `<div class="empty">还没有运行输出。</div>`;
+  const available = items.filter((item) => item.exists);
+  if (!available.length) return `<div class="empty">当前运行还没有可导出材料。完成运行并生成输出后才会显示下载项。</div>`;
   return `
     <div class="table-wrap">
       <table>
-        <thead><tr><th>输出</th><th>状态</th></tr></thead>
+        <thead><tr><th>输出材料</th><th>状态</th></tr></thead>
         <tbody>
-          ${items.map((item) => `<tr><td>${friendlyArtifact(item.label || item.id)}</td><td><span class="status-pill ${item.exists ? "ready" : "waiting"}">${item.exists ? "已生成" : "未生成"}</span></td></tr>`).join("")}
+          ${available.map((item) => `<tr><td>${friendlyArtifact(item.label || item.id)}</td><td><span class="status-pill ready">可下载</span></td></tr>`).join("")}
         </tbody>
       </table>
     </div>`;

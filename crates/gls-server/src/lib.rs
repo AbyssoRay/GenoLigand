@@ -2645,6 +2645,18 @@ mod tests {
     }
 
     #[test]
+    fn run_monitor_export_list_only_renders_downloadable_artifacts() {
+        let app = include_str!("../../../webui/app/app.js");
+        let start = app.find("function artifactRows()").expect("artifactRows");
+        let end = app.find("function table(").expect("table");
+        let artifact_rows = &app[start..end];
+
+        assert!(artifact_rows.contains("filter((item) => item.exists)"));
+        assert!(artifact_rows.contains("可下载"));
+        assert!(!artifact_rows.contains("未生成"));
+    }
+
+    #[test]
     fn user_project_creation_hides_internal_status_and_actions() {
         let root = std::env::temp_dir().join(format!("genoligand-user-create-{}", now_millis()));
         let options = server_options(root.clone());
