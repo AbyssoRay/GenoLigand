@@ -62,6 +62,15 @@ PYTHON_TOOL_PACKAGES: list[dict[str, str]] = [
 
 RESERVED_WSL_DISTROS = {"Ubuntu-24.04"}
 
+WSL_COMMAND_WRAPPERS = [
+    "java",
+    "nextflow",
+    "mmseqs",
+    "foldseek",
+    "vina",
+    "obabel",
+]
+
 
 def repo_root() -> Path:
     return Path(__file__).resolve().parents[2]
@@ -161,11 +170,13 @@ def runtime_backend() -> str:
     return "native_linux"
 
 
-def tool_path_entries(workspace_root: Path) -> list[str]:
+def tool_path_entries(workspace_root: Path, extra_entries: Sequence[Path] | None = None) -> list[str]:
     entries: list[Path] = [
         workspace_root / "bin",
         workspace_root / "tools" / "bin",
     ]
+    if extra_entries:
+        entries.extend(extra_entries)
     explicit = os.environ.get("GENOLIGAND_TOOL_ROOT")
     if explicit:
         root = Path(explicit)
@@ -181,9 +192,12 @@ def tool_path_entries(workspace_root: Path) -> list[str]:
     return [str(path) for path in entries if path.exists()]
 
 
-def environment_for_science_tools(workspace_root: Path) -> dict[str, str]:
+def environment_for_science_tools(
+    workspace_root: Path,
+    extra_entries: Sequence[Path] | None = None,
+) -> dict[str, str]:
     env = os.environ.copy()
-    entries = tool_path_entries(workspace_root)
+    entries = tool_path_entries(workspace_root, extra_entries)
     if entries:
         env["PATH"] = os.pathsep.join([*entries, env.get("PATH", "")])
     return env
@@ -289,6 +303,26 @@ def write_wsl_python_wrapper(wrapper: Path, distro: str, python_path: str) -> No
         f'@echo off\r\nwsl.exe -d "{safe_distro}" -- "{safe_python}" %*\r\n',
         encoding="utf-8",
     )
+
+
+def write_wsl_command_wrappers(wrapper_dir: Path, distro: str) -> dict[str, object]:
+    wrapper_dir.mkdir(parents=True, exist_ok=True)
+    safe_distro = distro.replace('"', "")
+    wrappers = []
+    for command_name in WSL_COMMAND_WRAPPERS:
+        wrapper = wrapper_dir / f"{command_name}.cmd"
+        wrapper.write_text(
+            f'@echo off\r\nwsl.exe -d "{safe_distro}" -- {command_name} %*\r\n',
+            encoding="utf-8",
+        )
+        wrappers.append(command_name)
+    return {
+        "status": "ready",
+        "backend": "wsl",
+        "wsl_distro": distro,
+        "wrapper_dir": str(wrapper_dir),
+        "wrappers": wrappers,
+    }
 
 
 def venv_python(env_dir: Path) -> Path:
@@ -1181,7 +1215,6 @@ def main() -> int:
     workspace_root = Path(args.workspace_root).resolve()
     science_store = Path(args.science_store).resolve()
     runtime_dir = Path(args.runtime_dir).resolve()
-    science_env = environment_for_science_tools(workspace_root)
     python_env_dir = (
         Path(args.python_env_dir).resolve()
         if args.python_env_dir
@@ -1193,6 +1226,13 @@ def main() -> int:
         python_backend = "wsl"
     elif args.python_backend == "auto" and selected_wsl:
         python_backend = "wsl"
+    command_wrapper_result: dict[str, object] = {"status": "not_used", "backend": python_backend}
+    extra_tool_paths: list[Path] = []
+    if python_backend == "wsl" and selected_wsl:
+        wrapper_dir = python_env_dir / "command-wrappers"
+        command_wrapper_result = write_wsl_command_wrappers(wrapper_dir, selected_wsl)
+        extra_tool_paths.append(wrapper_dir)
+    science_env = environment_for_science_tools(workspace_root, extra_tool_paths)
     source_catalog = Path(args.source_catalog).resolve() if args.source_catalog else default_source_catalog(workspace_root, science_store)
     source_sync_plan = default_source_sync_plan(workspace_root, science_store)
     download_result = (
@@ -1266,7 +1306,8 @@ def main() -> int:
             "python_env_dir": str(python_env_dir),
             "python_backend": python_backend,
             "wsl_distro": selected_wsl or "",
-            "tool_path_entries": tool_path_entries(workspace_root),
+            "command_wrappers": command_wrapper_result,
+            "tool_path_entries": tool_path_entries(workspace_root, extra_tool_paths),
             "download_manifest": download_result.get("manifest", ""),
             "external_sync_manifest": external_sync_result.get("manifest", ""),
             "tool_environment_manifest": tool_environment_result.get("manifest", ""),
