@@ -258,8 +258,7 @@ fn user_projects_json(options: &ServerOptions) -> Value {
     });
     json!({
         "projects": projects,
-        "templates": [],
-        "supported_actions": ["create","preflight","run","export"]
+        "templates": []
     })
 }
 
@@ -2405,6 +2404,8 @@ mod tests {
         assert!(!text.contains("GitHub"));
         assert!(!text.contains("commit"));
         assert!(!text.contains("remote"));
+        assert!(!text.contains("supported_actions"));
+        assert!(!text.contains("preflight"));
 
         fs::remove_dir_all(&root).ok();
     }
