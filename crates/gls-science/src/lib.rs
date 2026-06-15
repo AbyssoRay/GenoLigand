@@ -333,7 +333,7 @@ pub fn create_temporary_test_store(root: &Path) -> Result<PathBuf, String> {
     )?;
     write_text(
         &store.join("indexes/tool_versions.tsv"),
-        &temporary_tool_versions_text(),
+        &unit_test_tool_versions_text(),
     )?;
     write_text(
         &store.join("indexes/known_targets.tsv"),
@@ -375,11 +375,11 @@ pub fn create_temporary_test_store(root: &Path) -> Result<PathBuf, String> {
     Ok(store)
 }
 
-fn temporary_tool_versions_text() -> String {
+fn unit_test_tool_versions_text() -> String {
     let mut text = String::from("tool\tstatus\tversion\tlicense\tlabel\tdetail\n");
     for tool in REQUIRED_TOOLS {
         text.push_str(&format!(
-            "{}\tready\ttest-bound\t{}\t{}\ttemporary_test_fixture\n",
+            "{}\tready\tunit-test-fixture\t{}\t{}\tunit_test_store_fixture\n",
             tool.id, tool.license, tool.label
         ));
     }
@@ -3007,7 +3007,7 @@ mod tests {
         .expect("manifest");
         write_text(
             &store.join("indexes/tool_versions.tsv"),
-            &temporary_tool_versions_text(),
+            &unit_test_tool_versions_text(),
         )
         .expect("tools");
         write_text(
