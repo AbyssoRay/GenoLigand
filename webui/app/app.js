@@ -671,7 +671,7 @@ function resultTracePanel() {
           <h2>结果来源</h2>
           <p>结果只读取当前项目和当前运行的输出；没有输出时保持为空。</p>
         </div>
-        <span class="status-pill ${state.run ? "ready" : "blocked"}">${state.run ? "已选择运行" : "未运行"}</span>
+        <span class="status-pill ${state.run ? "ready" : "waiting"}">${state.run ? "已选择运行" : "未运行"}</span>
       </div>
       ${metricRow("当前项目", projectText)}
       ${metricRow("当前运行", runText)}
@@ -1357,8 +1357,10 @@ function runStateLabel(value) {
 
 function runStateClass(value) {
   if (value === "completed") return "ready";
+  if (value === "running") return "loading";
   if (value === "failed") return "failed";
-  return "blocked";
+  if (value === "blocked") return "blocked";
+  return "waiting";
 }
 
 function friendlyRequirement(item) {
