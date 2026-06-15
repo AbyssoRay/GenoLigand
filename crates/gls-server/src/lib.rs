@@ -856,13 +856,12 @@ fn evidence_endpoint_json(options: &ServerOptions, run_id: &str) -> Value {
     let Some(run_dir) = completed_run_dir(options, run_id) else {
         return json!({"run_id":run_id,"evidence":[],"row_count":0,"has_output":false});
     };
-    let path = run_dir.join("evidence_ledger.tsv");
     let rows = user_evidence_rows(&run_dir);
     json!({
         "run_id": run_id,
         "evidence": rows,
-        "row_count": rows_len(&path),
-        "has_output": path.exists()
+        "row_count": rows.len(),
+        "has_output": !rows.is_empty()
     })
 }
 
@@ -870,13 +869,12 @@ fn candidates_endpoint_json(options: &ServerOptions, run_id: &str) -> Value {
     let Some(run_dir) = completed_run_dir(options, run_id) else {
         return json!({"run_id":run_id,"candidates":[],"row_count":0,"has_output":false});
     };
-    let path = run_dir.join("target_candidate_ranking.tsv");
     let rows = user_candidate_rows(&run_dir);
     json!({
         "run_id": run_id,
         "candidates": rows,
-        "row_count": rows_len(&path),
-        "has_output": path.exists()
+        "row_count": rows.len(),
+        "has_output": !rows.is_empty()
     })
 }
 
@@ -901,7 +899,7 @@ fn candidate_detail_json(options: &ServerOptions, run_id: &str) -> Value {
         "run_id": run_id,
         "candidate_details": rows,
         "candidate_count": candidate_count,
-        "has_output": path.exists()
+        "has_output": candidate_count > 0
     })
 }
 
@@ -909,13 +907,12 @@ fn structure_endpoint_json(options: &ServerOptions, run_id: &str) -> Value {
     let Some(run_dir) = completed_run_dir(options, run_id) else {
         return json!({"run_id":run_id,"structure_rows":[],"row_count":0,"has_output":false});
     };
-    let path = run_dir.join("structure_patch_summary.tsv");
     let rows = user_structure_rows(&run_dir);
     json!({
         "run_id": run_id,
         "structure_rows": rows,
-        "row_count": rows_len(&path),
-        "has_output": path.exists()
+        "row_count": rows.len(),
+        "has_output": !rows.is_empty()
     })
 }
 
@@ -923,13 +920,12 @@ fn md_endpoint_json(options: &ServerOptions, run_id: &str) -> Value {
     let Some(run_dir) = completed_run_dir(options, run_id) else {
         return json!({"run_id":run_id,"md_rows":[],"row_count":0,"has_output":false});
     };
-    let path = run_dir.join("md_summary.tsv");
     let rows = user_md_rows(&run_dir);
     json!({
         "run_id": run_id,
         "md_rows": rows,
-        "row_count": rows_len(&path),
-        "has_output": path.exists()
+        "row_count": rows.len(),
+        "has_output": !rows.is_empty()
     })
 }
 
@@ -937,13 +933,12 @@ fn genome_endpoint_json(options: &ServerOptions, run_id: &str) -> Value {
     let Some(run_dir) = completed_run_dir(options, run_id) else {
         return json!({"run_id":run_id,"genome_context":[],"row_count":0,"has_output":false});
     };
-    let path = run_dir.join("metagenome_potential_matches.tsv");
     let rows = user_genome_rows(&run_dir);
     json!({
         "run_id": run_id,
         "genome_context": rows,
-        "row_count": rows_len(&path),
-        "has_output": path.exists()
+        "row_count": rows.len(),
+        "has_output": !rows.is_empty()
     })
 }
 
@@ -2990,6 +2985,60 @@ mod tests {
             assert!(!body.contains("stale"));
             assert!(!body.contains("missing_store"));
         }
+
+        fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn completed_header_only_result_files_do_not_count_as_user_outputs() {
+        let root = std::env::temp_dir().join(format!("genoligand-empty-results-{}", now_millis()));
+        let options = server_options(root.clone());
+        let project_dir = projects_root(&options).join("project-1");
+        let run_dir = project_dir.join("runs").join("run-1");
+        fs::create_dir_all(&run_dir).expect("create run dir");
+        fs::write(run_dir.join("run_state.txt"), "completed\n").expect("run state");
+        fs::write(
+            run_dir.join("target_candidate_ranking.tsv"),
+            "candidate_id\ttarget_id\n",
+        )
+        .expect("candidate table");
+        fs::write(run_dir.join("evidence_ledger.tsv"), "claim_id\tstatus\n").expect("evidence");
+        fs::write(
+            run_dir.join("candidate_detail.json"),
+            r#"{"candidates":[]}"#,
+        )
+        .expect("candidate detail");
+        fs::write(
+            run_dir.join("metagenome_potential_matches.tsv"),
+            "target_id\ttarget_name\n",
+        )
+        .expect("genome");
+        fs::write(
+            run_dir.join("structure_patch_summary.tsv"),
+            "candidate_id\tstructure_score\n",
+        )
+        .expect("structure");
+        fs::write(run_dir.join("md_summary.tsv"), "candidate_id\trmsd\n").expect("md");
+
+        for response in [
+            candidates_endpoint_json(&options, "run-1"),
+            candidate_detail_json(&options, "run-1"),
+            evidence_endpoint_json(&options, "run-1"),
+            genome_endpoint_json(&options, "run-1"),
+            structure_endpoint_json(&options, "run-1"),
+            md_endpoint_json(&options, "run-1"),
+        ] {
+            assert_eq!(response["has_output"], false);
+        }
+        assert_eq!(candidates_endpoint_json(&options, "run-1")["row_count"], 0);
+        assert_eq!(
+            candidate_detail_json(&options, "run-1")["candidate_count"],
+            0
+        );
+        assert_eq!(evidence_endpoint_json(&options, "run-1")["row_count"], 0);
+        assert_eq!(genome_endpoint_json(&options, "run-1")["row_count"], 0);
+        assert_eq!(structure_endpoint_json(&options, "run-1")["row_count"], 0);
+        assert_eq!(md_endpoint_json(&options, "run-1")["row_count"], 0);
 
         fs::remove_dir_all(&root).ok();
     }
