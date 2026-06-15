@@ -910,10 +910,7 @@ fn setup_installer_summary(stdout: &str) -> Option<Value> {
         .get("downloads")
         .cloned()
         .unwrap_or_else(|| json!({}));
-    let resources = payload
-        .get("resources")
-        .cloned()
-        .unwrap_or_else(|| json!({}));
+    let resources = setup_user_resources(payload.get("resources"));
     Some(json!({
         "status": payload.get("status").cloned().unwrap_or_else(|| json!("unknown")),
         "runtime_backend": payload.get("runtime_backend").cloned().unwrap_or_else(|| json!("unknown")),
@@ -927,6 +924,77 @@ fn setup_installer_summary(stdout: &str) -> Option<Value> {
         },
         "resources": resources
     }))
+}
+
+fn setup_user_resources(resources: Option<&Value>) -> Value {
+    let Some(resources) = resources else {
+        return json!({});
+    };
+    let items = resources
+        .get("items")
+        .and_then(Value::as_array)
+        .map(|items| {
+            items
+                .iter()
+                .map(|item| {
+                    let status = item
+                        .get("status")
+                        .and_then(Value::as_str)
+                        .unwrap_or("missing");
+                    let next_action = item
+                        .get("next_action")
+                        .or_else(|| item.get("repair_action"))
+                        .and_then(Value::as_str)
+                        .unwrap_or("install_or_repair");
+                    json!({
+                        "label": item
+                            .get("label")
+                            .and_then(Value::as_str)
+                            .unwrap_or("\u{79d1}\u{5b66}\u{8d44}\u{6e90}"),
+                        "status": friendly_resource_status(status),
+                        "ready": item.get("ready").and_then(Value::as_bool).unwrap_or(status == "ready"),
+                        "next_action": friendly_source_next_action(next_action, status)
+                    })
+                })
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    let ready = resources
+        .get("ready")
+        .and_then(Value::as_u64)
+        .unwrap_or_else(|| {
+            items
+                .iter()
+                .filter(|item| item.get("ready").and_then(Value::as_bool).unwrap_or(false))
+                .count() as u64
+        });
+    let total = resources
+        .get("total")
+        .and_then(Value::as_u64)
+        .unwrap_or(items.len() as u64);
+    let needs_action = resources
+        .get("needs_action")
+        .and_then(Value::as_bool)
+        .unwrap_or(ready < total);
+    json!({
+        "ready": ready,
+        "total": total,
+        "needs_action": needs_action,
+        "items": items
+    })
+}
+
+fn friendly_resource_status(status: &str) -> &'static str {
+    match status {
+        "ready" => "\u{5c31}\u{7eea}",
+        "downloaded_needs_index" => {
+            "\u{5df2}\u{4e0b}\u{8f7d}\u{ff0c}\u{9700}\u{91cd}\u{5efa}\u{7d22}\u{5f15}"
+        }
+        "missing" | "download_required" | "index_required" | "waiting_for_download" => {
+            "\u{9700}\u{8981}\u{51c6}\u{5907}"
+        }
+        _ => "\u{9700}\u{8981}\u{68c0}\u{67e5}",
+    }
 }
 
 fn update_run_state(options: &ServerOptions, run_id: &str, state: &str) -> Value {
@@ -1709,6 +1777,48 @@ mod tests {
         assert!(payload.get("debug").is_none());
         assert!(payload.get("command").is_none());
         assert!(payload.get("stdout").is_none());
+    }
+
+    #[test]
+    fn setup_installer_resource_summary_hides_internal_fields() {
+        let payload = setup_installer_summary(
+            r#"{"status":"needs_repair","missing_components_count":1,"downloads":{"status":"ready","ready":0,"failed":0},"resources":{"total":1,"ready":0,"needs_action":true,"items":[{"label":"ChEMBL","status":"missing","next_action":"download_and_index_chembl","path":"D:/hidden/science_store_manifest.tsv","sha256":"abc123","manifest":"source_requirements.tsv"}]}}"#,
+        )
+        .expect("installer json");
+
+        assert_eq!(payload["resources"]["total"], 1);
+        assert_eq!(payload["resources"]["items"][0]["label"], "ChEMBL");
+        assert_eq!(payload["resources"]["items"][0]["status"], "需要准备");
+        assert_eq!(
+            payload["resources"]["items"][0]["next_action"],
+            "运行安装/修复以准备 ChEMBL 活性数据"
+        );
+        let text = payload.to_string();
+        assert!(!text.contains("path"));
+        assert!(!text.contains("sha256"));
+        assert!(!text.contains("manifest"));
+        assert!(!text.contains("D:/hidden"));
+        assert!(!text.contains("abc123"));
+        assert!(!text.contains("source_requirements"));
+    }
+
+    #[test]
+    fn first_launch_user_workspace_has_no_seeded_projects_or_templates() {
+        let root = std::env::temp_dir().join(format!("genoligand-first-launch-{}", now_millis()));
+        let options = server_options(root.clone());
+        let payload = user_projects_json(&options);
+
+        assert_eq!(payload["projects"].as_array().map(Vec::len), Some(0));
+        assert_eq!(payload["templates"].as_array().map(Vec::len), Some(0));
+        let text = payload.to_string();
+        assert!(!text.contains("demo"));
+        assert!(!text.contains("sample"));
+        assert!(!text.contains("example"));
+        assert!(!text.contains("GitHub"));
+        assert!(!text.contains("commit"));
+        assert!(!text.contains("remote"));
+
+        fs::remove_dir_all(&root).ok();
     }
 
     #[test]
