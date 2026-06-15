@@ -343,6 +343,35 @@ pub fn create_temporary_test_store(root: &Path) -> Result<PathBuf, String> {
         &store.join("indexes/metagenome_targets.tsv"),
         "source\ttarget_id\ttarget_name\torganism\ttarget_class\tligand_tokens\tsequence_tokens\tstructure_tokens\tevidence\n",
     )?;
+    write_text(
+        &store.join("install_status.json"),
+        &format!(
+            "{}\n",
+            json!({
+                "status": "ready",
+                "fixture": "unit_test_only",
+                "missing_components": []
+            })
+        ),
+    )?;
+    let mut sources = String::from(
+        "source_id\tlabel\tcategory\tstatus\tlanding_url\taccess_method\tlicense_note\tlocal_path\tindex_target\trepair_action\n",
+    );
+    for source in REQUIRED_SOURCES {
+        sources.push_str(&format!(
+            "{}\t{}\t{}\tready\t{}\t{}\t{}\t{}\t{}\t{}\n",
+            source.id,
+            source.label,
+            source.category,
+            source.landing_url,
+            source.access_method,
+            clean_cell(source.license_note),
+            source.local_rel_path,
+            source.index_rel_path,
+            source.repair_action
+        ));
+    }
+    write_text(&store.join("source_requirements.tsv"), &sources)?;
     Ok(store)
 }
 
@@ -470,8 +499,13 @@ fn prepare_science_store(options: &StoreOptions) -> Result<String, String> {
         ),
     )?;
     Ok(format!(
-        "science_store_prepared\tready_items={ready}\trequired_items=3\tstatus={}\tstore={}",
-        if ready == 3 { "ready" } else { "needs_repair" },
+        "science_store_prepared\tready_items={ready}\trequired_items=3\tstatus={}\tmissing_components={}\tstore={}",
+        if missing.is_empty() {
+            "ready"
+        } else {
+            "needs_repair"
+        },
+        missing.len(),
         options.science_store.display()
     ))
 }
@@ -1258,6 +1292,24 @@ fn pipeline_blockers(options: &ScienceOptions) -> Result<Vec<String>, String> {
             blockers.push(label.to_string());
         }
     }
+    let status = options.science_store.join("install_status.json");
+    if status.exists() {
+        let value: Value = serde_json::from_str(&read_text(&status)?)
+            .map_err(|err| format!("install_status_parse_failed:{err}"))?;
+        if value.get("status").and_then(Value::as_str) != Some("ready") {
+            blockers.push("science_store_needs_repair".to_string());
+        }
+    } else {
+        blockers.push("missing_install_status".to_string());
+    }
+    let source_requirements = options.science_store.join("source_requirements.tsv");
+    if source_requirements.exists() {
+        for source in unready_source_ids(&source_requirements)? {
+            blockers.push(format!("source_needs_repair:{source}"));
+        }
+    } else {
+        blockers.push("missing_source_requirements".to_string());
+    }
     if options
         .science_store
         .join("indexes/tool_versions.tsv")
@@ -1276,6 +1328,40 @@ fn pipeline_blockers(options: &ScienceOptions) -> Result<Vec<String>, String> {
         }
     }
     Ok(blockers)
+}
+
+fn unready_source_ids(path: &Path) -> Result<Vec<String>, String> {
+    let text = read_text(path)?;
+    let mut lines = text.lines();
+    let Some(header) = lines.next() else {
+        return Ok(vec!["source_requirements_empty".to_string()]);
+    };
+    let headers = header.split('\t').collect::<Vec<_>>();
+    let source_index = headers
+        .iter()
+        .position(|value| *value == "source_id")
+        .unwrap_or(0);
+    let status_index = headers
+        .iter()
+        .position(|value| *value == "status")
+        .unwrap_or(3);
+    Ok(lines
+        .filter(|line| !line.trim().is_empty())
+        .filter_map(|line| {
+            let cols = line.split('\t').collect::<Vec<_>>();
+            let status = cols.get(status_index).copied().unwrap_or("");
+            if status == "ready" {
+                None
+            } else {
+                Some(
+                    cols.get(source_index)
+                        .copied()
+                        .unwrap_or("source")
+                        .to_string(),
+                )
+            }
+        })
+        .collect())
 }
 
 fn write_blocked_outputs(options: &ScienceOptions, blockers: &[String]) -> Result<(), String> {
@@ -2292,6 +2378,77 @@ mod tests {
         assert!(!report.contains("No candidate target"));
         assert!(!report.contains("known_database"));
         assert!(!report.contains("metagenome_potential"));
+        fs::remove_dir_all(&root).expect("cleanup temp root");
+        assert!(!root.exists());
+    }
+
+    #[test]
+    fn prepare_science_store_reports_needs_repair_until_sources_and_tools_are_ready() {
+        let root = temp_root("empty_prepare");
+        let store = root.join("science_store");
+        let options = StoreOptions {
+            workspace_root: root.clone(),
+            science_store: store.clone(),
+        };
+        let out = run_store_command(ScienceCommand::PrepareScienceStore, &options)
+            .expect("prepare store");
+        let status = read_text(&store.join("install_status.json")).expect("install status");
+
+        assert!(out.contains("status=needs_repair"));
+        assert!(out.contains("missing_components="));
+        assert!(status.contains("\"status\":\"needs_repair\""));
+        assert!(status.contains("source:chembl"));
+        assert!(!status.contains("\"status\":\"ready\""));
+
+        fs::remove_dir_all(&root).expect("cleanup temp root");
+        assert!(!root.exists());
+    }
+
+    #[test]
+    fn pipeline_blocks_when_store_lacks_install_closure() {
+        let root = temp_root("missing_install_closure");
+        let store = root.join("science_store");
+        ensure_dir(&store.join("indexes")).expect("store dirs");
+        write_text(
+            &store.join("science_store_manifest.tsv"),
+            "item\tstatus\tpath\nwarehouse\tready\tindexes/known_targets.tsv\nmetagenome_index\tready\tindexes/metagenome_targets.tsv\ntool_versions\tready\tindexes/tool_versions.tsv\n",
+        )
+        .expect("manifest");
+        write_text(
+            &store.join("indexes/tool_versions.tsv"),
+            &temporary_tool_versions_text(),
+        )
+        .expect("tools");
+        write_text(
+            &store.join("indexes/known_targets.tsv"),
+            "source\ttarget_id\ttarget_name\torganism\ttarget_class\tligand_tokens\tsequence_tokens\tstructure_tokens\tevidence\n",
+        )
+        .expect("known");
+        write_text(
+            &store.join("indexes/metagenome_targets.tsv"),
+            "source\ttarget_id\ttarget_name\torganism\ttarget_class\tligand_tokens\tsequence_tokens\tstructure_tokens\tevidence\n",
+        )
+        .expect("metagenome");
+        let input = root.join("input.json");
+        let run = root.join("run");
+        write_text(
+            &input,
+            "{\"inputs\":[{\"field\":\"smiles\",\"value\":\"CCO\"}],\"files\":[]}\n",
+        )
+        .expect("input");
+        let options = ScienceOptions {
+            workspace_root: root.clone(),
+            science_store: store,
+            input_manifest: input,
+            run_dir: run.clone(),
+        };
+        let out = run_science_command(ScienceCommand::PipelineRun, &options).expect("blocked ok");
+        let failure = read_text(&run.join("failure_reason.txt")).expect("failure");
+
+        assert!(out.contains("pipeline_blocked"));
+        assert!(failure.contains("missing_install_status"));
+        assert!(failure.contains("missing_source_requirements"));
+
         fs::remove_dir_all(&root).expect("cleanup temp root");
         assert!(!root.exists());
     }

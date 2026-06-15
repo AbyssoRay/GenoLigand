@@ -834,6 +834,46 @@ fn preflight_store_ready(options: &ServerOptions) -> bool {
         && store.join("indexes/known_targets.tsv").exists()
         && store.join("indexes/metagenome_targets.tsv").exists()
         && tool_versions_ready(&store.join("indexes/tool_versions.tsv"))
+        && install_status_ready(&store.join("install_status.json"))
+        && source_requirements_ready(&store.join("source_requirements.tsv"))
+}
+
+fn install_status_ready(path: &Path) -> bool {
+    let Ok(text) = fs::read_to_string(path) else {
+        return false;
+    };
+    serde_json::from_str::<Value>(&text)
+        .ok()
+        .and_then(|value| {
+            value
+                .get("status")
+                .and_then(Value::as_str)
+                .map(|status| status == "ready")
+        })
+        .unwrap_or(false)
+}
+
+fn source_requirements_ready(path: &Path) -> bool {
+    let Ok(text) = fs::read_to_string(path) else {
+        return false;
+    };
+    let mut lines = text.lines();
+    let Some(header) = lines.next() else {
+        return false;
+    };
+    let headers = header.split('\t').collect::<Vec<_>>();
+    let Some(status_index) = headers.iter().position(|value| *value == "status") else {
+        return false;
+    };
+    let mut saw_row = false;
+    for line in lines.filter(|line| !line.trim().is_empty()) {
+        saw_row = true;
+        let cols = line.split('\t').collect::<Vec<_>>();
+        if cols.get(status_index).copied() != Some("ready") {
+            return false;
+        }
+    }
+    saw_row
 }
 
 fn required_resource_rows(store: &Path) -> Vec<Value> {
@@ -862,15 +902,28 @@ fn required_resource_rows(store: &Path) -> Vec<Value> {
             "计算工具",
             "运行安装/修复以准备计算工具记录",
         ),
+        (
+            "install_status",
+            "install_status.json",
+            "安装状态",
+            "运行安装/修复以完成安装状态检查",
+        ),
+        (
+            "source_requirements",
+            "source_requirements.tsv",
+            "科学资源状态",
+            "运行安装/修复以完成科学资源检查",
+        ),
     ];
     required
         .iter()
         .map(|(id, rel, label, next_action)| {
             let path = store.join(rel);
-            let ready = if *rel == "indexes/tool_versions.tsv" {
-                tool_versions_ready(&path)
-            } else {
-                path.exists()
+            let ready = match *id {
+                "tools" => tool_versions_ready(&path),
+                "install_status" => install_status_ready(&path),
+                "source_requirements" => source_requirements_ready(&path),
+                _ => path.exists(),
             };
             json!({
                 "id": id,
@@ -1535,11 +1588,13 @@ mod tests {
         let missing = missing_resource_rows(&rows);
         let text = serde_json::to_string(&missing).expect("missing json");
 
-        assert_eq!(missing.len(), 4);
+        assert_eq!(missing.len(), 6);
         assert!(text.contains("科学仓库"));
         assert!(text.contains("已知蛋白索引"));
         assert!(text.contains("宏基因组索引"));
         assert!(text.contains("计算工具"));
+        assert!(text.contains("安装状态"));
+        assert!(text.contains("科学资源状态"));
         assert!(text.contains("运行安装/修复"));
         assert!(!text.contains("science_store_manifest"));
         assert!(!text.contains("known_targets.tsv"));
