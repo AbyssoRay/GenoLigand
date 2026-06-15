@@ -1210,7 +1210,7 @@ fn user_diagnostics_json(options: &ServerOptions) -> Value {
     let missing = missing_resource_rows(&required_resource_rows(&science_store_path(options)));
     let checks = vec![
         json!({"label":"服务", "ready":true, "next_action":"继续"}),
-        json!({"label":"GenoLigand 命令行入口", "ready":gls_cli.0, "next_action": if gls_cli.0 {"继续"} else {"重新运行安装程序"}}),
+        json!({"label":"运行组件", "ready":gls_cli.0, "next_action": if gls_cli.0 {"继续"} else {"重新运行安装程序"}}),
         json!({"label":"科学仓库", "ready":database_ready, "next_action": if database_ready {"继续"} else {"运行安装/修复"}}),
     ];
     json!({
@@ -1287,7 +1287,6 @@ fn user_setup_install_plan_json(options: &ServerOptions) -> Value {
     json!({
         "action":"运行安装/修复",
         "description":"准备数据库、索引、计算工具、许可证和来源记录。普通运行不配置数据库路径。",
-        "can_run_from_webui": true,
         "database_ready": preflight_store_ready(options),
         "direct_sources": {
             "ready": catalog_rows > 0,
@@ -2376,6 +2375,7 @@ mod tests {
         assert_eq!(payload["external_sources"]["ready"], true);
         assert_eq!(payload["direct_sources"]["next_action"], "运行安装/修复");
         let text = payload.to_string();
+        assert!(!text.contains("can_run_from_webui"));
         assert!(!text.contains("ready_to_run"));
         assert!(!text.contains("needs_package_update"));
         assert!(!text.contains("source_catalog"));
@@ -2592,7 +2592,9 @@ mod tests {
         let payload = user_diagnostics_json(&options);
         let text = payload.to_string();
 
-        assert!(text.contains("GenoLigand 命令行入口"));
+        assert!(text.contains("运行组件"));
+        assert!(!text.contains("命令行入口"));
+        assert!(!text.contains("gls-cli"));
         assert!(!text.contains("Rust"));
         assert!(!text.contains("cargo"));
         assert!(!text.contains("构建环境"));
