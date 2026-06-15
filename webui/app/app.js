@@ -973,10 +973,10 @@ function columnsFor(kind) {
   if (kind === "ranking") return common;
   if (kind === "evidence") {
     return [
-      { key: "claim_id", label: "证据编号" },
-      { key: "owner", label: "来源" },
+      { key: "evidence_type", label: "证据类型" },
+      { key: "source", label: "来源" },
       { key: "status", label: "状态" },
-      { key: "notes", label: "说明" },
+      { key: "summary", label: "说明" },
     ];
   }
   if (kind === "genome") {
@@ -1046,9 +1046,6 @@ function friendlyRequirement(item) {
 
 function friendlyArtifact(name) {
   return {
-    run_summary: "运行摘要",
-    run_table: "运行表格",
-    source_trace: "来源追溯",
     normalized_input: "输入归一化记录",
     features: "特征计算记录",
     known_matches: "已知数据库命中",

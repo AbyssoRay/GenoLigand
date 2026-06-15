@@ -194,9 +194,7 @@ fn route_run(
             "target_candidate_ranking.tsv",
             "candidates",
         ),
-        ("GET", "evidence") => {
-            table_endpoint_json(options, &run_id, "evidence_ledger.tsv", "evidence")
-        }
+        ("GET", "evidence") => evidence_endpoint_json(options, &run_id),
         ("GET", "genome-context") => table_endpoint_json(
             options,
             &run_id,
@@ -611,6 +609,112 @@ fn table_endpoint_json(options: &ServerOptions, run_id: &str, file: &str, key: &
         "row_count": rows_len(&path),
         "has_output": path.exists()
     })
+}
+
+fn evidence_endpoint_json(options: &ServerOptions, run_id: &str) -> Value {
+    let Some(run_dir) = find_run_dir(options, run_id) else {
+        return json!({"run_id":run_id,"evidence":[],"row_count":0,"has_output":false});
+    };
+    let path = run_dir.join("evidence_ledger.tsv");
+    let rows = read_tsv_rows(&path)
+        .into_iter()
+        .map(user_evidence_row)
+        .collect::<Vec<_>>();
+    json!({
+        "run_id": run_id,
+        "evidence": rows,
+        "row_count": rows_len(&path),
+        "has_output": path.exists()
+    })
+}
+
+fn user_evidence_row(row: Value) -> Value {
+    let claim = row
+        .get("claim_id")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    let artifact = row
+        .get("evidence_artifact")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    let status = row
+        .get("status")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    let notes = row.get("notes").and_then(Value::as_str).unwrap_or_default();
+    json!({
+        "evidence_type": evidence_type_label(claim, artifact),
+        "source": evidence_source_label(artifact),
+        "status": evidence_status_label(status),
+        "summary": evidence_note_summary(notes)
+    })
+}
+
+fn evidence_type_label(claim: &str, artifact: &str) -> &'static str {
+    let value = if artifact.is_empty() { claim } else { artifact };
+    match value {
+        "input_normalized_manifest.tsv" | "input_normalized_manifest" => {
+            "\u{8f93}\u{5165}\u{89c4}\u{8303}\u{5316}"
+        }
+        "feature_manifest.tsv" | "feature_manifest" => "\u{7279}\u{5f81}\u{8ba1}\u{7b97}",
+        "known_database_matches.tsv" | "known_database_matches" => {
+            "\u{5df2}\u{77e5}\u{6570}\u{636e}\u{5e93}\u{6bd4}\u{5bf9}"
+        }
+        "metagenome_potential_matches.tsv" | "metagenome_potential_matches" => {
+            "\u{5b8f}\u{57fa}\u{56e0}\u{7ec4}\u{6f5c}\u{5728}\u{5e8f}\u{5217}\u{6bd4}\u{5bf9}"
+        }
+        "structure_patch_summary.tsv" | "structure_patch_summary" => {
+            "\u{7ed3}\u{6784}\u{4e0e}\u{53e3}\u{888b}"
+        }
+        "docking_summary.tsv" | "docking_summary" => "\u{5bf9}\u{63a5}\u{6458}\u{8981}",
+        "md_summary.tsv" | "md_summary" => "\u{52a8}\u{529b}\u{5b66}\u{6458}\u{8981}",
+        "target_candidate_ranking.tsv" | "target_candidate_ranking" => {
+            "\u{5019}\u{9009}\u{6392}\u{5e8f}"
+        }
+        "score_decomposition.tsv" | "score_decomposition" => "\u{5206}\u{6570}\u{62c6}\u{89e3}",
+        "candidate_detail.json" | "candidate_detail" => "\u{5019}\u{9009}\u{8be6}\u{60c5}",
+        "research_report.md" | "research_report" => "\u{79d1}\u{7814}\u{62a5}\u{544a}",
+        _ => "\u{8fd0}\u{884c}\u{8bc1}\u{636e}",
+    }
+}
+
+fn evidence_source_label(artifact: &str) -> &'static str {
+    match artifact {
+        "known_database_matches.tsv" => {
+            "ChEMBL\u{3001}BindingDB\u{3001}UniProt \u{7b49}\u{5df2}\u{77e5}\u{6570}\u{636e}\u{5e93}"
+        }
+        "metagenome_potential_matches.tsv" => {
+            "\u{5b8f}\u{57fa}\u{56e0}\u{7ec4}\u{6f5c}\u{5728}\u{5e8f}\u{5217}\u{7d22}\u{5f15}"
+        }
+        "structure_patch_summary.tsv" | "docking_summary.tsv" | "md_summary.tsv" => {
+            "\u{5f53}\u{524d}\u{8fd0}\u{884c}\u{7684}\u{5de5}\u{5177}\u{8f93}\u{51fa}"
+        }
+        "target_candidate_ranking.tsv" | "score_decomposition.tsv" | "candidate_detail.json" => {
+            "\u{5f53}\u{524d}\u{8fd0}\u{884c}\u{7684}\u{5019}\u{9009}\u{7ed3}\u{679c}"
+        }
+        "research_report.md" => {
+            "\u{5f53}\u{524d}\u{8fd0}\u{884c}\u{7684}\u{62a5}\u{544a}\u{8f93}\u{51fa}"
+        }
+        _ => "\u{5f53}\u{524d}\u{8fd0}\u{884c}\u{8f93}\u{51fa}",
+    }
+}
+
+fn evidence_status_label(status: &str) -> &'static str {
+    match status {
+        "available" => "\u{5df2}\u{751f}\u{6210}",
+        "missing" | "not_ready" => "\u{672a}\u{5c31}\u{7eea}",
+        _ => "\u{5df2}\u{8bb0}\u{5f55}",
+    }
+}
+
+fn evidence_note_summary(notes: &str) -> String {
+    if notes.is_empty() {
+        return "\u{5f53}\u{524d}\u{8fd0}\u{884c}\u{5df2}\u{8bb0}\u{5f55}\u{8be5}\u{8bc1}\u{636e}\u{3002}".to_string();
+    }
+    if notes.contains("sha256:") {
+        return "\u{5df2}\u{8bb0}\u{5f55}\u{5185}\u{5bb9}\u{4e00}\u{81f4}\u{6027}\u{6807}\u{8bc6}\u{ff0c}\u{53ef}\u{7528}\u{4e8e}\u{590d}\u{6838}\u{3002}".to_string();
+    }
+    notes.replace(['\t', '\r', '\n'], " ")
 }
 
 fn databases_json(options: &ServerOptions) -> Value {
@@ -1290,7 +1394,6 @@ fn artifact_visible_for_user(id: &str, path: &Path, run_dir: &Path, completed: b
         return false;
     }
     match id {
-        "run_summary" | "run_table" | "source_trace" => true,
         "candidate_ranking" | "candidate_detail" => {
             completed && rows_len(&run_dir.join("target_candidate_ranking.tsv")) > 0
         }
@@ -1301,44 +1404,68 @@ fn artifact_visible_for_user(id: &str, path: &Path, run_dir: &Path, completed: b
 
 fn artifact_specs() -> &'static [(&'static str, &'static str, &'static str)] {
     &[
-        ("run_summary", "运行摘要", "run_context.json"),
-        ("run_table", "运行表格", "run_context.tsv"),
-        ("source_trace", "来源追溯", "artifact_source_map.tsv"),
         (
             "normalized_input",
-            "输入归一化记录",
+            "\u{8f93}\u{5165}\u{89c4}\u{8303}\u{5316}\u{8bb0}\u{5f55}",
             "input_normalized_manifest.json",
         ),
-        ("features", "特征计算记录", "feature_manifest.json"),
+        (
+            "features",
+            "\u{7279}\u{5f81}\u{8ba1}\u{7b97}\u{8bb0}\u{5f55}",
+            "feature_manifest.json",
+        ),
         (
             "known_matches",
-            "已知数据库命中",
+            "\u{5df2}\u{77e5}\u{6570}\u{636e}\u{5e93}\u{547d}\u{4e2d}",
             "known_database_matches.tsv",
         ),
         (
             "metagenome_matches",
-            "宏基因组潜在命中",
+            "\u{5b8f}\u{57fa}\u{56e0}\u{7ec4}\u{6f5c}\u{5728}\u{547d}\u{4e2d}",
             "metagenome_potential_matches.tsv",
         ),
         (
             "structure_patch",
-            "结构与口袋摘要",
+            "\u{7ed3}\u{6784}\u{4e0e}\u{53e3}\u{888b}\u{6458}\u{8981}",
             "structure_patch_summary.tsv",
         ),
-        ("docking", "对接摘要", "docking_summary.tsv"),
-        ("md_summary", "动力学摘要", "md_summary.tsv"),
+        (
+            "docking",
+            "\u{5bf9}\u{63a5}\u{6458}\u{8981}",
+            "docking_summary.tsv",
+        ),
+        (
+            "md_summary",
+            "\u{52a8}\u{529b}\u{5b66}\u{6458}\u{8981}",
+            "md_summary.tsv",
+        ),
         (
             "candidate_ranking",
-            "候选排序",
+            "\u{5019}\u{9009}\u{6392}\u{5e8f}",
             "target_candidate_ranking.tsv",
         ),
-        ("candidate_detail", "候选详情", "candidate_detail.json"),
-        ("score_breakdown", "分数拆解", "score_decomposition.tsv"),
-        ("evidence", "证据链", "evidence_ledger.tsv"),
-        ("research_report", "科研报告", "research_report.md"),
+        (
+            "candidate_detail",
+            "\u{5019}\u{9009}\u{8be6}\u{60c5}",
+            "candidate_detail.json",
+        ),
+        (
+            "score_breakdown",
+            "\u{5206}\u{6570}\u{62c6}\u{89e3}",
+            "score_decomposition.tsv",
+        ),
+        (
+            "evidence",
+            "\u{8bc1}\u{636e}\u{94fe}",
+            "evidence_ledger.tsv",
+        ),
+        (
+            "research_report",
+            "\u{79d1}\u{7814}\u{62a5}\u{544a}",
+            "research_report.md",
+        ),
     ]
 }
-
 fn artifact_file_for_id(id: &str) -> Option<&'static str> {
     artifact_specs()
         .iter()
@@ -1723,9 +1850,11 @@ mod tests {
         .expect("candidate table");
         fs::write(
             run_dir.join("evidence_ledger.tsv"),
-            "claim_id\tstatus\nE1\tok\n",
+            "claim_id\tevidence_artifact\towner\tstatus\tnotes\nscore_decomposition\tscore_decomposition.tsv\tGenoLigand\tavailable\tsha256:abc123\n",
         )
         .expect("evidence");
+        fs::write(run_dir.join("run_context.json"), r#"{"path":"hidden"}"#).expect("context");
+        fs::write(run_dir.join("artifact_source_map.tsv"), "hidden\n").expect("source trace");
         fs::write(run_dir.join("research_report.md"), "# Report\n").expect("report");
 
         let run = run_json(&options, "run-1");
@@ -1743,6 +1872,7 @@ mod tests {
             user_setup_install_plan_json(&options),
             preflight_json(&options, "project-1"),
             logs_json(&options, "run-1"),
+            evidence_endpoint_json(&options, "run-1"),
             table_endpoint_json(
                 &options,
                 "run-1",
@@ -1766,10 +1896,46 @@ mod tests {
             assert!(!text.contains("tool_versions_manifest"));
             assert!(!text.contains("indexes/known_targets.tsv"));
             assert!(!text.contains("indexes/metagenome_targets.tsv"));
+            assert!(!text.contains("evidence_artifact"));
+            assert!(!text.contains("sha256"));
+            assert!(!text.contains("abc123"));
             assert!(!text.contains("prepare_science_store"));
             assert!(!text.contains("download_and_index"));
             assert!(!text.contains("install_or_repair"));
         }
+
+        fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn user_artifact_index_hides_internal_trace_files() {
+        let root = std::env::temp_dir().join(format!("genoligand-user-artifacts-{}", now_millis()));
+        let options = server_options(root.clone());
+        let project_dir = projects_root(&options).join("project-1");
+        let run_dir = project_dir.join("runs").join("run-1");
+        fs::create_dir_all(&run_dir).expect("create run dir");
+        fs::write(run_dir.join("run_state.txt"), "completed\n").expect("state");
+        fs::write(run_dir.join("run_context.json"), r#"{"internal":true}"#).expect("context");
+        fs::write(run_dir.join("run_context.tsv"), "field\tvalue\n").expect("context table");
+        fs::write(
+            run_dir.join("artifact_source_map.tsv"),
+            "artifact\tupstream\n",
+        )
+        .expect("source map");
+        fs::write(run_dir.join("research_report.md"), "# Report\n").expect("report");
+
+        let artifacts = artifacts_json(&options, "run-1");
+        let text = artifacts.to_string();
+        assert!(!text.contains("run_summary"));
+        assert!(!text.contains("run_table"));
+        assert!(!text.contains("source_trace"));
+        assert!(!text.contains("run_context"));
+        assert!(!text.contains("artifact_source_map"));
+
+        let (status, _, _) = download_artifact_response(&options, "run-1", "run_summary");
+        assert_eq!(status, 404);
+        let (status, _, _) = download_artifact_response(&options, "run-1", "source_trace");
+        assert_eq!(status, 404);
 
         fs::remove_dir_all(&root).ok();
     }
