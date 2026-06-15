@@ -380,6 +380,7 @@ function renderCheck() {
         ${installerDownloadSummary()}
         ${installerExternalSourceSummary()}
         ${installerResourceSummary()}
+        ${installerToolEnvironmentSummary()}
         ${missingResourceSummary()}
         ${diagnosticsSummary()}
         ${sourceStatusTable()}
@@ -473,6 +474,19 @@ function installerResourceSummary() {
           )
           .join("")}
       </ul>
+    </div>`;
+}
+
+function installerToolEnvironmentSummary() {
+  const tools = state.setupRepair?.installer?.tool_environment;
+  if (!tools || tools.total === undefined) return "";
+  const ok = tools.completed === true;
+  const message = tools.message || (ok ? "科学计算环境已就绪" : "科学计算环境需要准备");
+  const next = tools.next_action || (ok ? "继续" : "运行安装/修复");
+  return `
+    <div class="notice ${ok ? "" : "warn"}">
+      <strong>计算环境：${tools.ready || 0} / ${tools.total || 0} 就绪</strong>
+      <div class="compact-list">${escapeHtml(message)}；下一步：${escapeHtml(next)}</div>
     </div>`;
 }
 

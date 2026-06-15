@@ -1301,32 +1301,40 @@ fn probe_command(tool_id: &str, program: &str, args: &[&str]) -> ToolProbe {
 
 fn probe_python_module(tool_id: &str, module: &str, version_expr: &str) -> ToolProbe {
     let code = format!("import {module}; print({version_expr})");
-    match Command::new("python").args(["-c", &code]).output() {
-        Ok(output) => {
-            let text = format!(
-                "{}{}",
-                String::from_utf8_lossy(&output.stdout),
-                String::from_utf8_lossy(&output.stderr)
-            );
-            ToolProbe {
-                ready: output.status.success(),
-                version: if output.status.success() {
-                    first_nonempty_line(&text).unwrap_or_else(|| "installed".to_string())
-                } else {
-                    "missing".to_string()
-                },
-                detail: if output.status.success() {
-                    format!("{tool_id}_python_module_detected")
-                } else {
-                    format!("{tool_id}_python_module_missing")
-                },
+    let mut errors = Vec::new();
+    for python in python_command_candidates() {
+        match Command::new(&python[0])
+            .args(&python[1..])
+            .args(["-c", &code])
+            .output()
+        {
+            Ok(output) => {
+                let text = format!(
+                    "{}{}",
+                    String::from_utf8_lossy(&output.stdout),
+                    String::from_utf8_lossy(&output.stderr)
+                );
+                if output.status.success() {
+                    return ToolProbe {
+                        ready: true,
+                        version: first_nonempty_line(&text)
+                            .unwrap_or_else(|| "installed".to_string()),
+                        detail: format!("{tool_id}_python_module_detected"),
+                    };
+                }
+                errors.push(format!(
+                    "{}:{}",
+                    python.join(" "),
+                    first_nonempty_line(&text).unwrap_or_else(|| "module_missing".to_string())
+                ));
             }
+            Err(err) => errors.push(format!("{}:{err}", python.join(" "))),
         }
-        Err(err) => ToolProbe {
-            ready: false,
-            version: "missing".to_string(),
-            detail: format!("python_probe_failed_for_{tool_id}:{err}"),
-        },
+    }
+    ToolProbe {
+        ready: false,
+        version: "missing".to_string(),
+        detail: format!("{tool_id}_python_module_missing:{}", errors.join("|")),
     }
 }
 
@@ -3046,13 +3054,10 @@ fn clean_cell(value: &str) -> String {
 }
 
 fn run_python_script(script: &str, args: &[String], context: &str) -> Result<String, String> {
-    let candidates: [(&str, &[&str]); 3] = [("python", &[]), ("python3", &[]), ("py", &["-3"])];
     let mut errors = Vec::new();
-    for (program, prefix_args) in candidates {
-        let mut command = Command::new(program);
-        for arg in prefix_args {
-            command.arg(arg);
-        }
+    for candidate in python_command_candidates() {
+        let mut command = Command::new(&candidate[0]);
+        command.args(&candidate[1..]);
         command.arg("-c").arg(script);
         for arg in args {
             command.arg(arg);
@@ -3062,19 +3067,43 @@ fn run_python_script(script: &str, args: &[String], context: &str) -> Result<Str
                 return Ok(String::from_utf8_lossy(&output.stdout).to_string());
             }
             Ok(output) => errors.push(format!(
-                "{program}:{}",
+                "{}:{}",
+                candidate.join(" "),
                 String::from_utf8_lossy(&output.stderr)
                     .lines()
                     .next()
                     .unwrap_or("script_failed")
             )),
-            Err(err) => errors.push(format!("{program}:{err}")),
+            Err(err) => errors.push(format!("{}:{err}", candidate.join(" "))),
         }
     }
     Err(format!(
         "{context}_python_failed:{}",
         clean_cell(&errors.join(" | "))
     ))
+}
+
+fn preferred_python_command() -> Vec<String> {
+    std::env::var("GENOLIGAND_PYTHON")
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+        .map(|value| vec![value])
+        .unwrap_or_else(|| vec!["python".to_string()])
+}
+
+fn python_command_candidates() -> Vec<Vec<String>> {
+    let preferred = preferred_python_command();
+    if std::env::var("GENOLIGAND_PYTHON")
+        .ok()
+        .is_some_and(|value| !value.trim().is_empty())
+    {
+        return vec![preferred];
+    }
+    vec![
+        vec!["python".to_string()],
+        vec!["python3".to_string()],
+        vec!["py".to_string(), "-3".to_string()],
+    ]
 }
 
 fn safe_id(value: &str) -> String {

@@ -1554,6 +1554,7 @@ fn setup_installer_summary(stdout: &str) -> Option<Value> {
         .unwrap_or_else(|| json!({}));
     let resources = setup_user_resources(payload.get("resources"));
     let external_sources = setup_user_external_sources(payload.get("external_sources"));
+    let tool_environment = setup_user_tool_environment(payload.get("tool_environment"));
     let download_status = downloads
         .get("status")
         .and_then(Value::as_str)
@@ -1569,8 +1570,44 @@ fn setup_installer_summary(stdout: &str) -> Option<Value> {
             "next_action": downloads.get("next_action").cloned().unwrap_or_else(|| json!("运行安装/修复"))
         },
         "external_sources": external_sources,
-        "resources": resources
+        "resources": resources,
+        "tool_environment": tool_environment
     }))
+}
+
+fn setup_user_tool_environment(tool_environment: Option<&Value>) -> Value {
+    let Some(tool_environment) = tool_environment else {
+        return json!({});
+    };
+    let status = tool_environment
+        .get("status")
+        .and_then(Value::as_str)
+        .unwrap_or("needs_repair");
+    let ready = tool_environment
+        .get("ready")
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    let total = tool_environment
+        .get("total")
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    let completed = status == "ready";
+    json!({
+        "completed": completed,
+        "ready": ready,
+        "total": total,
+        "needs_action": !completed,
+        "message": if completed {
+            "科学计算环境已就绪"
+        } else {
+            "科学计算环境需要准备"
+        },
+        "next_action": if completed {
+            "继续"
+        } else {
+            "运行安装/修复"
+        }
+    })
 }
 
 fn setup_user_resources(resources: Option<&Value>) -> Value {
@@ -2548,6 +2585,24 @@ mod tests {
         assert!(!text.contains("target_path"));
         assert!(!text.contains("ready_marker"));
         assert!(!text.contains("D:/hidden"));
+    }
+
+    #[test]
+    fn setup_installer_tool_environment_summary_hides_internal_fields() {
+        let payload = setup_installer_summary(
+            r#"{"status":"needs_repair","tool_environment":{"status":"needs_repair","python":"D:/hidden/runtime/python-worker-env/Scripts/python.exe","manifest":"D:/hidden/runtime/python-worker-env/tool_environment_manifest.tsv","ready":4,"total":6,"environment":"created","notes":"pip install failed"}}"#,
+        )
+        .expect("installer json");
+
+        assert_eq!(payload["tool_environment"]["ready"], 4);
+        assert_eq!(payload["tool_environment"]["total"], 6);
+        assert_eq!(payload["tool_environment"]["completed"], false);
+        assert_eq!(payload["tool_environment"]["next_action"], "运行安装/修复");
+        let text = payload.to_string();
+        assert!(!text.contains("D:/hidden"));
+        assert!(!text.contains("python-worker-env"));
+        assert!(!text.contains("tool_environment_manifest"));
+        assert!(!text.contains("pip install failed"));
     }
 
     #[test]

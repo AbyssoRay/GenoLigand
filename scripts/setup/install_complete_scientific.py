@@ -15,6 +15,51 @@ import urllib.request
 from pathlib import Path
 from typing import Sequence
 
+PYTHON_TOOL_PACKAGES: list[dict[str, str]] = [
+    {
+        "component": "rdkit",
+        "package": "rdkit",
+        "import_name": "rdkit",
+        "version_expr": "rdkit.__version__",
+    },
+    {
+        "component": "openmm",
+        "package": "openmm",
+        "import_name": "openmm",
+        "version_expr": "openmm.version.version",
+    },
+    {
+        "component": "pdbfixer",
+        "package": "git+https://github.com/openmm/pdbfixer.git",
+        "import_name": "pdbfixer",
+        "version_expr": "'installed'",
+    },
+    {
+        "component": "openff_toolkit",
+        "package": "openff-toolkit",
+        "import_name": "openff.toolkit",
+        "version_expr": "'installed'",
+    },
+    {
+        "component": "mdtraj",
+        "package": "mdtraj",
+        "import_name": "mdtraj",
+        "version_expr": "mdtraj.__version__",
+    },
+    {
+        "component": "mdanalysis",
+        "package": "MDAnalysis",
+        "import_name": "MDAnalysis",
+        "version_expr": "MDAnalysis.__version__",
+    },
+    {
+        "component": "openbabel",
+        "package": "openbabel-wheel",
+        "import_name": "openbabel",
+        "version_expr": "'installed'",
+    },
+]
+
 
 def repo_root() -> Path:
     return Path(__file__).resolve().parents[2]
@@ -60,6 +105,13 @@ def default_runtime_dir() -> Path:
     if xdg_state:
         return Path(xdg_state) / "genoligand" / "runtime"
     return Path.home() / ".local" / "state" / "genoligand" / "runtime"
+
+
+def default_python_env_dir(runtime_dir: Path) -> Path:
+    explicit = os.environ.get("GENOLIGAND_PYTHON_ENV")
+    if explicit:
+        return Path(explicit)
+    return runtime_dir / "python-worker-env"
 
 
 def command_from_string(value: str) -> list[str]:
@@ -124,6 +176,130 @@ def run_command(command: Sequence[str], env: dict[str, str] | None = None) -> su
             "",
             f"command_not_found:{err}",
         )
+
+
+def venv_python(env_dir: Path) -> Path:
+    if os.name == "nt":
+        return env_dir / "Scripts" / "python.exe"
+    return env_dir / "bin" / "python"
+
+
+def probe_python_import(python: Path, import_name: str, version_expr: str) -> dict[str, object]:
+    code = f"import {import_name}; print({version_expr})"
+    completed = run_command([str(python), "-c", code])
+    text = f"{completed.stdout}{completed.stderr}".strip()
+    if completed.returncode == 0:
+        version = next((line.strip() for line in text.splitlines() if line.strip()), "installed")
+        return {"ready": True, "version": version, "notes": "import_ok"}
+    return {
+        "ready": False,
+        "version": "",
+        "notes": next((line.strip() for line in text.splitlines() if line.strip()), "import_failed"),
+    }
+
+
+def ensure_python_tool_environment(env_dir: Path, skip_install: bool) -> dict[str, object]:
+    manifest = env_dir / "tool_environment_manifest.tsv"
+    python = venv_python(env_dir)
+    env_dir.mkdir(parents=True, exist_ok=True)
+    rows: list[dict[str, object]] = []
+    create_status = "existing" if python.exists() else "pending"
+    if skip_install:
+        create_status = "skipped"
+        python = Path(os.environ.get("GENOLIGAND_PYTHON", sys.executable))
+    elif not python.exists():
+        created = run_command([sys.executable, "-m", "venv", str(env_dir)])
+        if created.returncode != 0:
+            write_python_tool_manifest(
+                manifest,
+                [
+                    {
+                        "component": "python_worker_env",
+                        "status": "failed",
+                        "python": str(python),
+                        "package": "venv",
+                        "import_name": "",
+                        "version": "",
+                        "notes": created.stderr.strip() or created.stdout.strip() or "venv_create_failed",
+                    }
+                ],
+            )
+            return {
+                "status": "failed",
+                "python": str(python),
+                "manifest": str(manifest),
+                "ready": 0,
+                "total": len(PYTHON_TOOL_PACKAGES),
+            }
+        create_status = "created"
+    if not skip_install:
+        run_command([str(python), "-m", "pip", "install", "--upgrade", "pip"])
+    ready = 0
+    for spec in PYTHON_TOOL_PACKAGES:
+        probe = probe_python_import(python, spec["import_name"], spec["version_expr"])
+        status = "ready" if probe["ready"] else "missing"
+        notes = str(probe["notes"])
+        if not probe["ready"] and not skip_install:
+            installed = run_command([str(python), "-m", "pip", "install", spec["package"]])
+            probe = probe_python_import(python, spec["import_name"], spec["version_expr"])
+            status = "ready" if probe["ready"] else "failed"
+            notes = (
+                str(probe["notes"])
+                if probe["ready"]
+                else installed.stderr.strip() or installed.stdout.strip() or str(probe["notes"])
+            )
+        if probe["ready"]:
+            ready += 1
+        rows.append(
+            {
+                "component": spec["component"],
+                "status": status,
+                "python": str(python),
+                "package": spec["package"],
+                "import_name": spec["import_name"],
+                "version": str(probe["version"]),
+                "notes": notes,
+            }
+        )
+    write_python_tool_manifest(manifest, rows)
+    total = len(PYTHON_TOOL_PACKAGES)
+    return {
+        "status": "ready" if ready == total else "needs_repair" if not skip_install else "skipped",
+        "python": str(python),
+        "manifest": str(manifest),
+        "ready": ready,
+        "total": total,
+        "environment": create_status,
+    }
+
+
+def write_python_tool_manifest(path: Path, rows: list[dict[str, object]]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("w", encoding="utf-8", newline="") as handle:
+        writer = csv.DictWriter(
+            handle,
+            delimiter="\t",
+            fieldnames=[
+                "component",
+                "status",
+                "python",
+                "package",
+                "import_name",
+                "version",
+                "notes",
+            ],
+        )
+        writer.writeheader()
+        for row in rows:
+            writer.writerow(
+                {
+                    key: str(row.get(key, ""))
+                    .replace("\t", " ")
+                    .replace("\r", " ")
+                    .replace("\n", " ")
+                    for key in writer.fieldnames
+                }
+            )
 
 
 def load_json(path: Path) -> dict[str, object]:
@@ -629,13 +805,16 @@ def install_ready(payload: dict[str, object]) -> bool:
     downloads = payload.get("downloads")
     external_sources = payload.get("external_sources")
     resources = payload.get("resources")
+    tool_environment = payload.get("tool_environment")
     download_status = downloads.get("status") if isinstance(downloads, dict) else None
     external_status = external_sources.get("status") if isinstance(external_sources, dict) else None
     resource_status = resources.get("status") if isinstance(resources, dict) else None
+    tool_status = tool_environment.get("status") if isinstance(tool_environment, dict) else None
     return (
         payload.get("status") == "ready"
         and resource_status == "ready"
         and external_status == "ready"
+        and tool_status == "ready"
         and download_status in {"ready", "skipped"}
     )
 
@@ -645,21 +824,19 @@ def installation_status(
     completed: subprocess.CompletedProcess[str],
     download_result: dict[str, object],
     external_sync_result: dict[str, object],
+    tool_environment_result: dict[str, object],
 ) -> dict[str, object]:
     status_payload = load_json(science_store / "install_status.json")
     store_status = str(status_payload.get("status", "")).strip()
     download_status = str(download_result.get("status", "unknown"))
     external_status = str(external_sync_result.get("status", "unknown"))
+    tool_status = str(tool_environment_result.get("status", "unknown"))
     missing = status_payload.get("missing_components", [])
     missing_count = len(missing) if isinstance(missing, list) else 0
     if completed.returncode != 0:
         status = "failed"
         summary = "安装/修复未完成。"
         next_action = "检查安装环境后重新运行安装/修复"
-    elif store_status == "ready":
-        status = "ready"
-        summary = "科学仓库已就绪。"
-        next_action = "打开 WebUI 并输入研究对象"
     elif download_status == "not_configured":
         status = "needs_repair"
         summary = "安装包未包含科学资源下载清单，科学仓库尚未准备完成。"
@@ -668,6 +845,10 @@ def installation_status(
         status = "needs_repair"
         summary = "部分科学资源下载或校验失败，科学仓库尚未准备完成。"
         next_action = "检查网络、磁盘空间后重新运行安装/修复"
+    elif tool_status not in {"ready", "skipped"}:
+        status = "needs_repair"
+        summary = "Python 科学计算环境尚未准备完成。"
+        next_action = "保持联网后重新运行安装/修复，或检查 Python 环境安装日志"
     elif external_status == "needs_sync":
         status = "needs_repair"
         summary = "大型科学资源尚未闭合，科学仓库尚未准备完成。"
@@ -676,6 +857,10 @@ def installation_status(
         status = "needs_repair"
         summary = "部分大型科学资源同步失败，科学仓库尚未准备完成。"
         next_action = "检查资源包、网络和磁盘空间后重新运行安装/修复"
+    elif store_status == "ready":
+        status = "ready"
+        summary = "科学仓库已就绪。"
+        next_action = "打开 WebUI 并输入研究对象"
     else:
         status = "needs_repair"
         summary = "安装/修复已执行，但仍有资源需要准备。"
@@ -699,7 +884,9 @@ def main() -> int:
     parser.add_argument("--gls-cli")
     parser.add_argument("--gls-server")
     parser.add_argument("--source-catalog")
+    parser.add_argument("--python-env-dir")
     parser.add_argument("--no-download", action="store_true")
+    parser.add_argument("--no-tool-install", action="store_true")
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", default="19090")
     parser.add_argument("--start-webui", action="store_true")
@@ -709,6 +896,11 @@ def main() -> int:
     workspace_root = Path(args.workspace_root).resolve()
     science_store = Path(args.science_store).resolve()
     runtime_dir = Path(args.runtime_dir).resolve()
+    python_env_dir = (
+        Path(args.python_env_dir).resolve()
+        if args.python_env_dir
+        else default_python_env_dir(runtime_dir).resolve()
+    )
     source_catalog = Path(args.source_catalog).resolve() if args.source_catalog else default_source_catalog(workspace_root, science_store)
     source_sync_plan = default_source_sync_plan(workspace_root, science_store)
     download_result = (
@@ -723,6 +915,10 @@ def main() -> int:
         else prepare_downloads(source_catalog, science_store)
     )
     external_sync_result = sync_external_sources(source_sync_plan, science_store, args.no_download)
+    tool_environment_result = ensure_python_tool_environment(
+        python_env_dir,
+        args.no_tool_install,
+    )
     cli_command = resolve_binary_command(
         args.gls_cli,
         "GENOLIGAND_GLS_CLI",
@@ -738,12 +934,17 @@ def main() -> int:
         "--science-store",
         str(science_store),
     ]
-    completed = run_command(command)
+    command_env = os.environ.copy()
+    tool_python = str(tool_environment_result.get("python", "")).strip()
+    if tool_python:
+        command_env["GENOLIGAND_PYTHON"] = tool_python
+    completed = run_command(command, env=command_env)
     install_status = installation_status(
         science_store,
         completed,
         download_result,
         external_sync_result,
+        tool_environment_result,
     )
     payload: dict[str, object] = {
         **install_status,
@@ -755,6 +956,7 @@ def main() -> int:
             external_sync_result,
         ),
         "resources": resource_summary(science_store),
+        "tool_environment": tool_environment_result,
         "runtime_backend": runtime_backend(),
         "access_url": f"http://{args.host}:{args.port}/",
     }
@@ -767,8 +969,10 @@ def main() -> int:
             "workspace_root": str(workspace_root),
             "science_store": str(science_store),
             "runtime_dir": str(runtime_dir),
+            "python_env_dir": str(python_env_dir),
             "download_manifest": download_result.get("manifest", ""),
             "external_sync_manifest": external_sync_result.get("manifest", ""),
+            "tool_environment_manifest": tool_environment_result.get("manifest", ""),
             "source_catalog": download_result.get("catalog", ""),
             "source_sync_plan": str(source_sync_plan),
         }
@@ -812,6 +1016,8 @@ def main() -> int:
     ]
     env = os.environ.copy()
     env["GENOLIGAND_SCIENCE_STORE"] = str(science_store)
+    if tool_python:
+        env["GENOLIGAND_PYTHON"] = tool_python
     print(
         json.dumps(
             {
