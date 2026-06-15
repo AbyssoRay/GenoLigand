@@ -138,6 +138,16 @@ def default_source_catalog(workspace_root: Path, science_store: Path) -> Path:
     return store_catalog
 
 
+def default_source_sync_plan(workspace_root: Path, science_store: Path) -> Path:
+    store_plan = science_store / "source_sync_plan.tsv"
+    if store_plan.exists():
+        return store_plan
+    repo_plan = workspace_root / "configs" / "source_sync_plan.tsv"
+    if repo_plan.exists():
+        return repo_plan
+    return store_plan
+
+
 def sha256_file(path: Path) -> str:
     digest = hashlib.sha256()
     with path.open("rb") as handle:
@@ -311,6 +321,45 @@ def download_summary(download_result: dict[str, object]) -> dict[str, object]:
     }
 
 
+def source_sync_summary(plan: Path, science_store: Path) -> dict[str, object]:
+    rows = read_tsv(plan)
+    if not rows:
+        return {
+            "status": "not_configured",
+            "ready": 0,
+            "total": 0,
+            "needs_action": 0,
+            "message": "安装包未包含大型科学资源同步清单。",
+            "next_action": "使用完整安装包重新运行安装/修复",
+            "items": [],
+        }
+    items: list[dict[str, object]] = []
+    for row in rows:
+        target_rel = row.get("ready_marker") or row.get("target_rel_path") or ""
+        target = science_store / target_rel if target_rel else None
+        ready = bool(target and target.exists())
+        items.append(
+            {
+                "label": row.get("source_label") or row.get("source_id") or "科学资源",
+                "status": "就绪" if ready else "需要同步",
+                "ready": ready,
+                "next_action": row.get("user_next_action") or "运行安装/修复以同步科学资源",
+            }
+        )
+    ready_count = sum(1 for item in items if item["ready"])
+    total = len(items)
+    needs_action = total - ready_count
+    return {
+        "status": "ready" if total and needs_action == 0 else "needs_sync",
+        "ready": ready_count,
+        "total": total,
+        "needs_action": needs_action,
+        "message": "大型科学资源同步状态已检查。",
+        "next_action": "继续" if needs_action == 0 else "保持联网和足够磁盘空间后运行安装/修复",
+        "items": items,
+    }
+
+
 def friendly_source_status(raw: str) -> str:
     return {
         "ready": "就绪",
@@ -394,7 +443,7 @@ def installation_status(
     else:
         status = "needs_repair"
         summary = "安装/修复已执行，但仍有资源需要准备。"
-        next_action = "补齐缺失资源后重新运行安装/修复"
+        next_action = "保持联网和足够磁盘空间后重新运行安装/修复"
     return {
         "status": status,
         "summary": summary,
@@ -425,6 +474,7 @@ def main() -> int:
     science_store = Path(args.science_store).resolve()
     runtime_dir = Path(args.runtime_dir).resolve()
     source_catalog = Path(args.source_catalog).resolve() if args.source_catalog else default_source_catalog(workspace_root, science_store)
+    source_sync_plan = default_source_sync_plan(workspace_root, science_store)
     download_result = (
         {
             "status": "skipped",
@@ -457,6 +507,7 @@ def main() -> int:
         **install_status,
         "returncode": completed.returncode,
         "downloads": download_summary(download_result),
+        "external_sources": source_sync_summary(source_sync_plan, science_store),
         "resources": resource_summary(science_store),
         "runtime_backend": runtime_backend(),
         "access_url": f"http://{args.host}:{args.port}/",
@@ -471,6 +522,7 @@ def main() -> int:
             "runtime_dir": str(runtime_dir),
             "download_manifest": download_result.get("manifest", ""),
             "source_catalog": download_result.get("catalog", ""),
+            "source_sync_plan": str(source_sync_plan),
         }
     print(json.dumps(payload, ensure_ascii=False, indent=2))
     if completed.returncode != 0 or not args.start_webui:

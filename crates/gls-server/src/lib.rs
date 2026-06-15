@@ -1289,13 +1289,36 @@ fn run_setup_repair_json(options: &ServerOptions) -> Value {
 }
 
 fn user_setup_install_plan_json(options: &ServerOptions) -> Value {
+    let catalog_rows = config_tsv_data_row_count(options, "source_catalog.tsv");
+    let sync_rows = config_tsv_data_row_count(options, "source_sync_plan.tsv");
     json!({
         "status":"ready_to_run",
         "action":"运行安装/修复",
         "description":"准备数据库、索引、计算工具、许可证和来源记录。普通运行不配置数据库路径。",
         "can_run_from_webui": true,
-        "database_ready": preflight_store_ready(options)
+        "database_ready": preflight_store_ready(options),
+        "direct_sources": {
+            "status": if catalog_rows > 0 {"ready"} else {"needs_package_update"},
+            "source_count": catalog_rows,
+            "next_action": if catalog_rows > 0 {"运行安装/修复"} else {"使用完整安装包重新运行安装/修复"}
+        },
+        "external_sources": {
+            "status": if sync_rows > 0 {"ready"} else {"needs_package_update"},
+            "source_group_count": sync_rows,
+            "next_action": if sync_rows > 0 {"运行安装/修复"} else {"使用完整安装包重新运行安装/修复"}
+        }
     })
+}
+
+fn config_tsv_data_row_count(options: &ServerOptions, file_name: &str) -> usize {
+    let path = options.workspace_root.join("configs").join(file_name);
+    let Ok(text) = fs::read_to_string(path) else {
+        return 0;
+    };
+    text.lines()
+        .skip(1)
+        .filter(|line| !line.trim().is_empty())
+        .count()
 }
 
 fn setup_repair_command(options: &ServerOptions) -> Vec<String> {
@@ -1346,6 +1369,7 @@ fn setup_installer_summary(stdout: &str) -> Option<Value> {
         .cloned()
         .unwrap_or_else(|| json!({}));
     let resources = setup_user_resources(payload.get("resources"));
+    let external_sources = setup_user_external_sources(payload.get("external_sources"));
     Some(json!({
         "status": payload.get("status").cloned().unwrap_or_else(|| json!("unknown")),
         "runtime_backend": payload.get("runtime_backend").cloned().unwrap_or_else(|| json!("unknown")),
@@ -1359,6 +1383,7 @@ fn setup_installer_summary(stdout: &str) -> Option<Value> {
             "message": downloads.get("message").cloned().unwrap_or_else(|| json!("")),
             "next_action": downloads.get("next_action").cloned().unwrap_or_else(|| json!("运行安装/修复"))
         },
+        "external_sources": external_sources,
         "resources": resources
     }))
 }
@@ -1417,6 +1442,65 @@ fn setup_user_resources(resources: Option<&Value>) -> Value {
         "ready": ready,
         "total": total,
         "needs_action": needs_action,
+        "items": items
+    })
+}
+
+fn setup_user_external_sources(external_sources: Option<&Value>) -> Value {
+    let Some(external_sources) = external_sources else {
+        return json!({});
+    };
+    let items = external_sources
+        .get("items")
+        .and_then(Value::as_array)
+        .map(|items| {
+            items
+                .iter()
+                .map(|item| {
+                    let status = item
+                        .get("status")
+                        .and_then(Value::as_str)
+                        .unwrap_or("需要同步");
+                    json!({
+                        "label": item
+                            .get("label")
+                            .and_then(Value::as_str)
+                            .unwrap_or("科学资源"),
+                        "status": status,
+                        "ready": item.get("ready").and_then(Value::as_bool).unwrap_or(false),
+                        "next_action": item
+                            .get("next_action")
+                            .and_then(Value::as_str)
+                            .unwrap_or("运行安装/修复")
+                    })
+                })
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    let ready = external_sources
+        .get("ready")
+        .and_then(Value::as_u64)
+        .unwrap_or_else(|| {
+            items
+                .iter()
+                .filter(|item| item.get("ready").and_then(Value::as_bool).unwrap_or(false))
+                .count() as u64
+        });
+    let total = external_sources
+        .get("total")
+        .and_then(Value::as_u64)
+        .unwrap_or(items.len() as u64);
+    let needs_action = external_sources
+        .get("needs_action")
+        .and_then(Value::as_u64)
+        .unwrap_or(total.saturating_sub(ready));
+    json!({
+        "status": external_sources.get("status").cloned().unwrap_or_else(|| json!("unknown")),
+        "ready": ready,
+        "total": total,
+        "needs_action": needs_action,
+        "message": external_sources.get("message").cloned().unwrap_or_else(|| json!("")),
+        "next_action": external_sources.get("next_action").cloned().unwrap_or_else(|| json!("运行安装/修复")),
         "items": items
     })
 }
@@ -2250,6 +2334,57 @@ mod tests {
         assert!(!text.contains("D:/hidden"));
         assert!(!text.contains("abc123"));
         assert!(!text.contains("source_requirements"));
+    }
+
+    #[test]
+    fn setup_installer_external_summary_hides_sync_internals() {
+        let payload = setup_installer_summary(
+            r#"{"status":"needs_repair","external_sources":{"status":"needs_sync","ready":0,"total":1,"needs_action":1,"message":"大型科学资源同步状态已检查。","next_action":"运行安装/修复以同步缺失资源","items":[{"label":"PLINDER","status":"需要同步","ready":false,"next_action":"运行安装/修复以同步 PLINDER 结构数据","landing_url":"gs://plinder/2024-06/v2","target_path":"D:/hidden/downloads/plinder","ready_marker":"downloads/plinder"}]}}"#,
+        )
+        .expect("installer json");
+
+        assert_eq!(payload["external_sources"]["total"], 1);
+        assert_eq!(payload["external_sources"]["items"][0]["label"], "PLINDER");
+        assert_eq!(
+            payload["external_sources"]["items"][0]["next_action"],
+            "运行安装/修复以同步 PLINDER 结构数据"
+        );
+        let text = payload.to_string();
+        assert!(!text.contains("gs://"));
+        assert!(!text.contains("landing_url"));
+        assert!(!text.contains("target_path"));
+        assert!(!text.contains("ready_marker"));
+        assert!(!text.contains("D:/hidden"));
+    }
+
+    #[test]
+    fn setup_install_plan_reports_catalog_coverage_without_paths() {
+        let root = std::env::temp_dir().join(format!("genoligand-install-plan-{}", now_millis()));
+        let config_dir = root.join("configs");
+        fs::create_dir_all(&config_dir).expect("config dir");
+        fs::write(
+            config_dir.join("source_catalog.tsv"),
+            "source_id\turl\tlocal_path\nchembl\thttps://example.invalid/chembl.tar.gz\tdownloads/chembl/chembl_sqlite.tar.gz\n",
+        )
+        .expect("source catalog");
+        fs::write(
+            config_dir.join("source_sync_plan.tsv"),
+            "source_id\tsource_label\ttarget_rel_path\nplinder\tPLINDER\tdownloads/plinder\n",
+        )
+        .expect("source sync plan");
+
+        let payload = user_setup_install_plan_json(&server_options(root.clone()));
+        assert_eq!(payload["direct_sources"]["source_count"], 1);
+        assert_eq!(payload["external_sources"]["source_group_count"], 1);
+        assert_eq!(payload["direct_sources"]["next_action"], "运行安装/修复");
+        let text = payload.to_string();
+        assert!(!text.contains("source_catalog"));
+        assert!(!text.contains("source_sync_plan"));
+        assert!(!text.contains("https://example"));
+        assert!(!text.contains("downloads/"));
+        assert!(!text.contains(&root.display().to_string()));
+
+        fs::remove_dir_all(&root).ok();
     }
 
     #[test]

@@ -7,6 +7,7 @@ const state = {
   databases: null,
   diagnostics: null,
   setup: null,
+  setupPlan: null,
   setupRepair: null,
   preflight: null,
   runData: null,
@@ -118,11 +119,12 @@ async function boot() {
 async function refreshAll() {
   try {
     state.alert = "";
-    [state.health, state.databases, state.diagnostics, state.setup] = await Promise.all([
+    [state.health, state.databases, state.diagnostics, state.setup, state.setupPlan] = await Promise.all([
       api("/api/user/health"),
       api("/api/user/databases"),
       api("/api/user/diagnostics"),
       api("/api/user/setup/status"),
+      api("/api/user/setup/install-plan"),
     ]);
     if (state.run?.run_id) {
       state.run = await api(`/api/runs/${state.run.run_id}`);
@@ -380,7 +382,9 @@ function renderCheck() {
           <span class="status-pill ${setupReady ? "ready" : "blocked"}">${setupReady ? "已就绪" : "需要准备"}</span>
         </div>
         ${setupRepairSummary()}
+        ${installCatalogSummary()}
         ${installerDownloadSummary()}
+        ${installerExternalSourceSummary()}
         ${installerResourceSummary()}
         ${missingResourceSummary()}
         ${diagnosticsSummary()}
@@ -416,6 +420,19 @@ function setupRepairSummary() {
     </div>`;
 }
 
+function installCatalogSummary() {
+  const direct = state.setupPlan?.direct_sources;
+  const external = state.setupPlan?.external_sources;
+  if (!direct && !external) return "";
+  const directReady = direct?.status === "ready";
+  const externalReady = external?.status === "ready";
+  return `
+    <div class="notice ${directReady && externalReady ? "" : "warn"}">
+      <strong>安装资源清单：${direct?.source_count || 0} 个直接下载源，${external?.source_group_count || 0} 组大型资源</strong>
+      <div class="compact-list">下一步：${escapeHtml((directReady && externalReady) ? "运行安装/修复" : "使用完整安装包重新运行安装/修复")}</div>
+    </div>`;
+}
+
 function installerDownloadSummary() {
   const downloads = state.setupRepair?.installer?.downloads;
   if (!downloads) return "";
@@ -427,6 +444,24 @@ function installerDownloadSummary() {
     <div class="notice ${ok ? "" : "warn"}">
       <strong>资源下载：${escapeHtml(message)}</strong>
       <div class="compact-list">下一步：${escapeHtml(next)}</div>
+    </div>`;
+}
+
+function installerExternalSourceSummary() {
+  const external = state.setupRepair?.installer?.external_sources;
+  const items = external?.items || [];
+  if (!external || !items.length) return "";
+  return `
+    <div class="notice ${external.needs_action ? "warn" : ""}">
+      <strong>大型资源：${external.ready || 0} / ${external.total || items.length} 就绪</strong>
+      <ul class="compact-list">
+        ${items
+          .map(
+            (item) =>
+              `<li>${escapeHtml(item.label || "科学资源")}：${escapeHtml(item.status || "需要同步")}；${escapeHtml(item.next_action || "运行安装/修复")}</li>`
+          )
+          .join("")}
+      </ul>
     </div>`;
 }
 
