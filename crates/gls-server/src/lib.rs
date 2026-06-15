@@ -302,12 +302,8 @@ fn read_project(options: &ServerOptions, project_id: &str) -> Value {
     json!({
         "project_id": project_id,
         "project_name": read_trimmed(&dir.join("project_name.txt")).unwrap_or_else(|| "GenoLigand research project".to_string()),
-        "workspace_path": dir.display().to_string(),
         "project_status": status,
-        "latest_run_id": latest_run_id,
-        "contains_precomputed_results": false,
-        "saved_state": ["input_manifest","run_state","artifact_index","report_paths"],
-        "collaboration_mode": "local_editable"
+        "latest_run_id": latest_run_id
     })
 }
 
@@ -328,9 +324,7 @@ fn write_input_manifest(options: &ServerOptions, project_id: &str, body: &str) -
         let _ = write_text(&dir.join("project_name.txt"), &name);
     }
     match write_text(&path, &(value.to_string() + "\n")) {
-        Ok(()) => {
-            json!({"status":"saved","input_manifest":value,"path":path.display().to_string()})
-        }
+        Ok(()) => json!({"status":"saved","project":read_project(options, project_id)}),
         Err(err) => json!({"status":"failed","error":err}),
     }
 }
@@ -563,9 +557,7 @@ fn run_json(options: &ServerOptions, run_id: &str) -> Value {
         "run_id": run_id,
         "state": run_state(&run_dir),
         "current_stage": read_trimmed(&run_dir.join("current_stage.txt")).unwrap_or_default(),
-        "current_command": read_trimmed(&run_dir.join("current_command.txt")),
         "failure_reason": read_trimmed(&run_dir.join("failure_reason.txt")),
-        "output_dir": run_dir.display().to_string(),
         "artifact_index": artifact_index(&run_dir)
     })
 }
@@ -579,7 +571,7 @@ fn logs_json(options: &ServerOptions, run_id: &str) -> Value {
 
 fn artifacts_json(options: &ServerOptions, run_id: &str) -> Value {
     find_run_dir(options, run_id)
-        .map(|dir| json!({"run_id":run_id,"artifact_root":dir.display().to_string(),"items":artifact_index(&dir)["items"].clone()}))
+        .map(|dir| json!({"run_id":run_id,"items":artifact_index(&dir)["items"].clone()}))
         .unwrap_or_else(|| json!({"run_id":run_id,"items":[]}))
 }
 
@@ -613,7 +605,6 @@ fn table_endpoint_json(options: &ServerOptions, run_id: &str, file: &str, key: &
     let rows = read_tsv_rows(&path);
     json!({
         "run_id": run_id,
-        "source_path": if path.exists() {Some(path.display().to_string())} else {None},
         key: rows,
         "row_count": rows_len(&path),
         "artifact_backed": path.exists()
@@ -899,8 +890,8 @@ fn source_status_rows(store: &Path) -> Vec<Value> {
         .collect()
 }
 
-fn check(id: &str, ready: bool, detail: String) -> Value {
-    json!({"id":id,"ready":ready,"status":if ready {"ready"} else {"blocked"},"detail":detail})
+fn check(id: &str, ready: bool, _detail: String) -> Value {
+    json!({"id":id,"ready":ready,"status":if ready {"ready"} else {"blocked"}})
 }
 
 fn capture(program: &str, args: &[&str], cwd: &Path) -> (bool, String) {
@@ -1256,6 +1247,48 @@ mod tests {
 
         let (status, _, _) = download_artifact_response(&options, "run-1", "../secret.txt");
         assert_eq!(status, 404);
+
+        fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn user_api_responses_do_not_expose_local_paths_or_commands() {
+        let root = std::env::temp_dir().join(format!("genoligand-user-api-{}", now_millis()));
+        let options = server_options(root.clone());
+        let project_dir = projects_root(&options).join("project-1");
+        let run_dir = project_dir.join("runs").join("run-1");
+        fs::create_dir_all(&run_dir).expect("create run dir");
+        fs::write(project_dir.join("latest_run_id.txt"), "run-1\n").expect("latest run");
+        fs::write(run_dir.join("run_state.txt"), "completed\n").expect("run state");
+        fs::write(run_dir.join("current_command.txt"), "cargo run hidden\n").expect("command");
+        fs::write(
+            run_dir.join("target_candidate_ranking.tsv"),
+            "candidate_id\nC1\n",
+        )
+        .expect("candidate table");
+        fs::write(run_dir.join("research_report.md"), "# Report\n").expect("report");
+
+        let responses = [
+            read_project(&options, "project-1"),
+            run_json(&options, "run-1"),
+            artifacts_json(&options, "run-1"),
+            table_endpoint_json(
+                &options,
+                "run-1",
+                "target_candidate_ranking.tsv",
+                "candidates",
+            ),
+        ];
+        for response in responses {
+            let text = response.to_string();
+            assert!(!text.contains("workspace_path"));
+            assert!(!text.contains("output_dir"));
+            assert!(!text.contains("current_command"));
+            assert!(!text.contains("artifact_root"));
+            assert!(!text.contains("source_path"));
+            assert!(!text.contains("cargo run hidden"));
+            assert!(!text.contains(&root.display().to_string()));
+        }
 
         fs::remove_dir_all(&root).ok();
     }
