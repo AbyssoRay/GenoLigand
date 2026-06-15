@@ -1,4 +1,4 @@
-use gls_server::{ServerOptions, run_server, validate_phase_0_9};
+use gls_server::{ServerOptions, run_server};
 use std::path::PathBuf;
 
 fn main() {
@@ -16,16 +16,11 @@ fn run() -> Result<(), String> {
     }
     let mut host = "127.0.0.1".to_string();
     let mut port = 19090u16;
-    let mut artifact_dir = PathBuf::from("acceptance_artifacts_phase_0_9_1_production_webui");
+    let mut artifact_dir = PathBuf::from("outputs/webui_runtime");
     let mut workspace_root = std::env::current_dir().map_err(|err| err.to_string())?;
-    let mut validate = false;
     let mut index = 0;
     while index < args.len() {
         match args[index].as_str() {
-            "validate-phase-0-9" | "validate-phase-0-9-1" => {
-                validate = true;
-                index += 1;
-            }
             "--host" => {
                 host = args
                     .get(index + 1)
@@ -64,16 +59,10 @@ fn run() -> Result<(), String> {
         artifact_dir,
         workspace_root,
     };
-    if validate {
-        let output = validate_phase_0_9(&options)?;
-        println!("{output}");
-    } else {
-        run_server(&options)?;
-    }
+    run_server(&options)?;
     Ok(())
 }
 
 fn help() -> &'static str {
-    "gls-server [--host 127.0.0.1] [--port 19090] [--artifact-dir DIR]\n\
-     gls-server validate-phase-0-9-1 --artifact-dir DIR --workspace-root DIR"
+    "gls-server [--host 127.0.0.1] [--port 19090] [--artifact-dir DIR] [--workspace-root DIR]"
 }

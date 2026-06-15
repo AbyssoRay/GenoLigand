@@ -1,27 +1,7 @@
 [workspace]
 resolver = "2"
 members = [
-  "crates/gls-types",
-  "crates/gls-artifacts",
-  "crates/gls-ligand",
-  "crates/gls-fragment",
-  "crates/gls-genome",
-  "crates/gls-stats",
-  "crates/gls-shortcircuit",
-  "crates/gls-plm-gate",
-  "crates/gls-fixtures",
-  "crates/gls-tolerance-calib",
-  "crates/gls-geometry",
-  "crates/gls-patch-realizer",
-  "crates/gls-foldgate",
-  "crates/gls-dock",
-  "crates/gls-idp-trend",
-  "crates/gls-report",
-  "crates/gls-geometry-bench",
-  "crates/gls-sequence",
-  "crates/gls-md",
-  "crates/gls-maintain",
-  "crates/gls-architecture",
+  "crates/gls-science",
   "crates/gls-server",
   "crates/gls-cli",
 ]

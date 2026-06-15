@@ -8,23 +8,5 @@ license.workspace = true
 workspace = true
 
 [dependencies]
-gls-dock = { path = "../gls-dock" }
-gls-fixtures = { path = "../gls-fixtures" }
-gls-foldgate = { path = "../gls-foldgate" }
-gls-fragment = { path = "../gls-fragment" }
-gls-genome = { path = "../gls-genome" }
-gls-ligand = { path = "../gls-ligand" }
-gls-md = { path = "../gls-md" }
-gls-maintain = { path = "../gls-maintain" }
-gls-architecture = { path = "../gls-architecture" }
-gls-patch-realizer = { path = "../gls-patch-realizer" }
-gls-plm-gate = { path = "../gls-plm-gate" }
-gls-report = { path = "../gls-report" }
-gls-sequence = { path = "../gls-sequence" }
-gls-shortcircuit = { path = "../gls-shortcircuit" }
-gls-stats = { path = "../gls-stats" }
-gls-tolerance-calib = { path = "../gls-tolerance-calib" }
-gls-types = { path = "../gls-types" }
+gls-science = { path = "../gls-science" }
 
-[dev-dependencies]
-serde_json = "1"

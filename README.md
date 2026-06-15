@@ -1,104 +1,74 @@
-# GenoLigand 0.9.1
+# GenoLigand
 
-GenoLigand 是本地运行的配体感知靶点发现科研工作台。0.9.1 提供正式 WebUI：用户在浏览器中创建项目、配置输入、管理数据库、启动本地工作流、查看候选与证据、导出报告、运行环境诊断，并在需要时同步到 GitHub。计算后端由本机 `gls-server` 提供服务，科学执行入口由 `gls-cli` 统一调度。
+GenoLigand 是本地运行的靶点发现科研软件。它的核心目标是：用户输入一个物质、序列或结构后，软件先计算其相互作用特征，再在已知蛋白数据库和宏基因组潜在序列空间中比对，给出可能靶点的计算预测、排序和证据链。
 
-GenoLigand 输出的是候选优先级和证据整理，不直接声称实验结合、生物活性、机制或临床相关性。
+GenoLigand 不声称实验验证、真实结合、药效或机制结论。所有结论都必须表述为计算预测。
 
-## 启动本地 WebUI
-
-在仓库根目录执行：
+## 启动 WebUI（网页界面）
 
 ```powershell
 cd D:\Project\rust\GenoLigand
-python scripts\phase09\start_phase_0_9_webui.py
+cargo run -p gls-server -- --host 127.0.0.1 --port 19090
 ```
 
-脚本会构建并启动 `gls-server`，默认监听：
+打开：
 
 ```text
 http://127.0.0.1:19090/
 ```
 
-如需使用现有二进制：
+## 准备科学仓库
+
+安装流程负责准备数据库、索引、工具版本和许可证清单。普通用户不需要配置数据库路径。
 
 ```powershell
-python scripts\phase09\start_phase_0_9_webui.py --no-build
+cargo run -p gls-cli -- install prepare-science-store --science-store D:\GenoLigandData\science_store
 ```
 
-如端口被占用：
+科学仓库必须包含：
 
-```powershell
-python scripts\phase09\start_phase_0_9_webui.py --port 19190
-```
+- `science_store_manifest.tsv`
+- `indexes/known_targets.tsv`
+- `indexes/metagenome_targets.tsv`
+- `indexes/tool_versions.tsv`
 
-保持启动终端开启即可使用 WebUI，按 `Ctrl+C` 停止服务。
+缺少真实输入、真实数据库索引或必要工具时，主流程阻塞并输出零候选。
 
-## WebUI 功能
-
-- 项目管理：创建、打开、复制、删除、清理研究项目，继续上次运行并查看历史运行摘要。
-- 输入向导：配置项目基本信息、分子类型、物种、数据库、搜索范围、运行模式、预检查和最终启动。
-- 小分子输入：支持 SMILES、SDF、MOL2、PDB、化合物名称和 CAS 号。
-- 多肽输入：支持单字母氨基酸序列和 FASTA，并提供 IKVAV、YIGSR、RGD 快速填入。
-- 蛋白质配体输入：支持 FASTA、PDB/mmCIF、已有预测结构和链选择。
-- 已有复合物输入：支持 receptor-ligand complex，并可指定配体链、小分子 residue name 或结合区域。
-- 物种与基因组：支持预设物种和自定义 genome FASTA、GTF/GFF3、transcript FASTA、可选 VCF。
-- 数据库管理：查看 genome、annotation、transcript、BioLiP2、UniProt、ChEMBL/BindingDB 和结构缓存的路径、版本、hash、索引、缺失项、空间和修复动作。
-- 运行模式：快速环境自检、标准靶点筛选、结构证据增强筛选、物理中筛完整运行。
-- 预检查：覆盖分子格式、序列合法性、结构文件、数据库、基因组索引、磁盘、写入权限、OpenMM、CUDA、Nextflow、Git remote 和 GitHub 权限。
-- 运行监控：显示阶段、命令、Nextflow run ID、日志尾部、CPU/GPU/显存/内存/磁盘占用、输出目录、失败原因和恢复状态。
-- 结果查看：候选排序、候选详情、Genome/ORF context、结构与 patch、MD 摘要、evidence ledger。
-- 报告导出：HTML、Markdown、CSV/TSV、JSON、artifact bundle、run manifest、tool version manifest、diagnostics report、GitHub push report。
-- 环境诊断：覆盖 WSL2、Linux、Rust binary、gls-cli、gls-server、Nextflow、Java、Python worker、OpenMM、CUDA、NVIDIA 设备、数据库路径、写入权限、磁盘、Git remote、GitHub 推送权限和环境验证项目模板。
-- GitHub 同步：显示 branch、commit hash、remote branch、push 状态、push 日志和 remote HEAD 验证。
-
-## 页面语言和界面配色
-
-WebUI 固定使用暗色界面。右上角提供 `中文 / EN` 按钮，所有主要页面都支持中文和 English。
-
-## 环境验证项目模板
-
-WebUI 提供环境验证项目模板，用于验证安装、数据库、GPU/OpenMM、Nextflow 恢复、WebUI 流程、输入、预检查、运行、监控、结果浏览、报告导出和诊断是否可用。模板只保存验证配置，不包含预计算候选、不包含实验结论，也不会替代用户自己的研究项目。
-
-## 安装指南
-
-更完整的使用说明位于：
+## 真实主流程
 
 ```text
-docs/local_webui_user_guide.md
-docs/windows_wsl2_installation_guide.md
-docs/linux_server_installation_guide.md
+输入归一化 -> 特征计算 -> 已知数据库比对 -> 宏基因组潜在序列比对 -> 结构/口袋/对接/动力学证据 -> 联合靶点排序 -> 证据报告
 ```
 
-## 本地服务接口
-
-常用本地接口：
-
-```text
-GET  /api/health
-GET  /api/version
-GET  /api/projects
-POST /api/projects
-GET  /api/databases
-GET  /api/diagnostics
-GET  /api/github/status
-```
-
-健康接口返回 `ready` 表示本地服务已可响应浏览器请求。
-
-## 停止服务
-
-在启动终端按 `Ctrl+C`。如需手动查找进程：
+CLI（命令行界面）入口：
 
 ```powershell
-Get-Process gls-server
+cargo run -p gls-cli -- pipeline run `
+  --input-manifest path\to\input_manifest.json `
+  --science-store D:\GenoLigandData\science_store `
+  --run-dir outputs\current_pipeline
 ```
 
-停止指定进程：
+支持的输入类型：
 
-```powershell
-Stop-Process -Name gls-server
-```
+- 小分子：SMILES、SDF、MOL2、化合物名称或登记号。
+- 多肽：短肽序列、修饰说明或结构文件。
+- 蛋白质配体：FASTA、蛋白序列或结构文件。
+- 复合物：已有蛋白-配体结构。
+- 自定义基因组/宏基因组：基因组、宏基因组、转录组或蛋白序列文件。
 
-## 许可证
+## 主要输出
 
-GenoLigand 按 `EULA.txt` 中的项目许可证分发。
+- `input_normalized_manifest.json`
+- `feature_manifest.json`
+- `known_database_matches.tsv`
+- `metagenome_potential_matches.tsv`
+- `structure_patch_summary.tsv`
+- `docking_summary.tsv`
+- `md_summary.tsv`
+- `target_candidate_ranking.tsv`
+- `candidate_detail.json`
+- `score_decomposition.tsv`
+- `evidence_ledger.tsv`
+- `research_report.md`
+

@@ -1,64 +1,42 @@
-# GenoLigand 0.9.1 Linux Server Installation Guide
+# Linux 安装说明
 
-## 1. 服务器前置条件 / Server Requirements
+## 前置条件
 
-- Linux host
-- Rust toolchain with `cargo`
-- Python 3.11 or newer
-- Java and Nextflow
+- Linux 主机
+- Rust 工具链
 - Git
-- Optional NVIDIA GPU with CUDA/OpenMM for physical mid-screen mode
+- Java 和 Nextflow
+- Python 3.11 或更新版本
+- 可选 NVIDIA GPU、CUDA 和 OpenMM
 
-GenoLigand 0.9.1 is a local single-user research console. For remote use, expose it through SSH tunneling or a trusted internal reverse proxy.
+## 准备科学仓库
 
-## 2. 构建和启动 / Build And Start
+```bash
+cargo run -p gls-cli -- install prepare-science-store --science-store /data/genoligand/science_store
+```
+
+科学仓库由安装流程维护。普通用户只通过 WebUI 提交输入。
+
+## 启动服务
 
 ```bash
 cd /path/to/GenoLigand
-cargo build -p gls-server
-python scripts/phase09/start_phase_0_9_webui.py --host 127.0.0.1 --port 19090
+cargo run -p gls-server -- --host 127.0.0.1 --port 19090
 ```
 
-Open locally:
+打开：
 
 ```text
 http://127.0.0.1:19090/
 ```
 
-For SSH forwarding from a workstation:
+## 主流程
 
-```bash
-ssh -L 19090:127.0.0.1:19090 user@linux-host
+GenoLigand 的生产工作流是：
+
+```text
+输入归一化 -> 特征计算 -> 已知数据库比对 -> 宏基因组潜在序列比对 -> 结构/口袋/对接/动力学证据 -> 联合靶点排序 -> 证据报告
 ```
 
-Then open `http://127.0.0.1:19090/` on the workstation.
+缺少真实输入或真实科学仓库时，流程阻塞，不生成候选。
 
-## 3. 数据路径 / Data Paths
-
-Configure mounted or local paths for genome FASTA, GTF/GFF3 annotation, transcript FASTA, optional VCF, BioLiP2, UniProt, ChEMBL/BindingDB warehouse, and RCSB/AFDB structure cache.
-
-Keep database profiles stable during a run. The evidence ledger and report export rely on exact manifest paths, versions, hashes, and tool versions.
-
-## 4. GPU 和 OpenMM / GPU And OpenMM
-
-For physical mid-screen mode, confirm that the Linux host sees the NVIDIA device and that OpenMM can use the intended CUDA platform. The WebUI Diagnostics page records OpenMM, CUDA, NVIDIA device, Python worker, and write-permission status.
-
-If no GPU is available, choose a run profile that does not require GPU-backed MD.
-
-## 5. 工作流 / Workflow
-
-1. Create or open a project.
-2. Complete the Input Wizard.
-3. Select database profile and search scope.
-4. Run Diagnostics and Preflight.
-5. Start the selected run mode.
-6. Monitor current stage, command, Nextflow run ID, logs, resources, output directory, and resume state.
-7. Review Candidate Ranking, Candidate Detail, Genome/ORF Context, Structure and Patch Viewer, MD Summary, and Evidence Ledger.
-8. Export reports and machine-readable artifacts.
-9. Use GitHub Sync when the repository state should be committed and pushed.
-
-## 6. 环境验证项目模板 / Environment Validation Project Template
-
-The environment validation project template verifies service startup, database wiring, GPU/OpenMM discovery, Nextflow resume behavior, WebUI flow, inputs, preflight, run creation, monitoring, result browsing, export generation, and diagnostics.
-
-It stores validation configuration only and contains no precomputed candidates or biological conclusions.

@@ -1,64 +1,37 @@
 nextflow.enable.dsl = 2
 
-import java.nio.file.Files
-import java.nio.file.Paths
-import java.security.MessageDigest
+process GENOLIGAND_REAL_SCIENCE_PIPELINE {
+  tag "genoligand_pipeline"
+  cpus 20
+  memory '32 GB'
 
-include { GLS_DEV_SMOKE } from './modules/gls_dev_smoke.nf'
+  input:
+  val input_manifest
+  val science_store
+  val outdir
+  val gls_cli
 
-params.outdir = params.outdir ?: 'results/dev_cpu_smoke'
+  output:
+  path "pipeline_done.txt"
 
-def sourceFingerprint() {
-  def launchPath = Paths.get(launchDir.toString()).toAbsolutePath().normalize()
-  def roots = [
-    'Cargo.toml',
-    'Cargo.lock',
-    'crates',
-    'schemas',
-    'schema_examples',
-    'docs',
-    'workers',
-    'workflows',
-    'config',
-    'tools',
-    'nextflow.config'
-  ]
-  def paths = []
-  roots.each { rel ->
-    def path = launchPath.resolve(rel)
-    if (Files.isDirectory(path)) {
-      def stream = Files.walk(path)
-      try {
-        stream
-          .filter { Files.isRegularFile(it) }
-          .forEach { paths << it }
-      }
-      finally {
-        stream.close()
-      }
-    }
-    else if (Files.exists(path)) {
-      paths << path
-    }
-  }
-
-  def digest = MessageDigest.getInstance('SHA-256')
-  paths
-    .sort { left, right -> launchPath.relativize(left).toString() <=> launchPath.relativize(right).toString() }
-    .each { path ->
-      def relative = launchPath.relativize(path).toString().replace('\\', '/')
-      digest.update(relative.getBytes('UTF-8'))
-      digest.update((byte) 0)
-      digest.update(Files.readAllBytes(path))
-      digest.update((byte) 0)
-    }
-  digest.digest().encodeHex().toString()
+  script:
+  """
+  mkdir -p "${outdir}"
+  "${gls_cli}" pipeline run \
+    --input-manifest "${input_manifest}" \
+    --science-store "${science_store}" \
+    --run-dir "${outdir}" \
+    --workspace-root "${launchDir}"
+  printf "run_dir\\t%s\\n" "${outdir}" > pipeline_done.txt
+  """
 }
 
 workflow {
-  Channel
-    .value(sourceFingerprint())
-    .set { source_fingerprint_ch }
-
-  GLS_DEV_SMOKE(source_fingerprint_ch)
+  GENOLIGAND_REAL_SCIENCE_PIPELINE(
+    params.input_manifest.toString(),
+    params.science_store.toString(),
+    params.outdir.toString(),
+    params.gls_cli.toString()
+  )
 }
+

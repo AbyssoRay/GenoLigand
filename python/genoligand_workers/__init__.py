@@ -1,1 +1,1 @@
-"""Schema-bound scientific primitive workers for Phase 0.8.5."""
+"""Schema-bound scientific primitive workers for GenoLigand."""

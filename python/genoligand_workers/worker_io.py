@@ -6,7 +6,8 @@ from pathlib import Path
 from typing import Any
 
 
-ACCEPTANCE_MODE = "phase_0_8_5_integrated_chain_rust_cleanup_strict"
+PIPELINE_MODE = "genoligand_real_scientific_pipeline"
+SCHEMA_VERSION = "genoligand_worker_current_v1"
 
 
 def parse_worker_args() -> argparse.Namespace:
@@ -19,10 +20,10 @@ def parse_worker_args() -> argparse.Namespace:
 def read_job(path: str | Path) -> dict[str, Any]:
     with Path(path).open("r", encoding="utf-8") as handle:
         job = json.load(handle)
-    if job.get("schema_version") != "phase_0_8_5":
+    if job.get("schema_version") != SCHEMA_VERSION:
         raise ValueError("unsupported worker job schema_version")
-    if job.get("acceptance_mode") != ACCEPTANCE_MODE:
-        raise ValueError("unsupported acceptance_mode")
+    if job.get("pipeline_mode") != PIPELINE_MODE:
+        raise ValueError("unsupported pipeline_mode")
     if job.get("rust_owned_decision_logic") is not True:
         raise ValueError("worker job must declare Rust-owned decision logic")
     return job
@@ -30,7 +31,7 @@ def read_job(path: str | Path) -> dict[str, Any]:
 
 def write_result(path: str | Path, job: dict[str, Any], status: str, version: str) -> None:
     result = {
-        "schema_version": "phase_0_8_5",
+        "schema_version": SCHEMA_VERSION,
         "job_id": job["job_id"],
         "worker": job["worker"],
         "status": status,

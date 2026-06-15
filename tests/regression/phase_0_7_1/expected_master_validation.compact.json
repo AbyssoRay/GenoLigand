@@ -1,9 +1,0 @@
-{
-  "acceptance_mode": "phase_0_7_1_audit_fix_strict",
-  "failed_gate_count": 0,
-  "final_verdict": "PASS",
-  "gate_count": 23,
-  "generated_at_utc": "2026-06-07T11:18:13Z",
-  "p0_all_pass": true,
-  "phase": "0.7.1"
-}

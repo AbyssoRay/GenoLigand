@@ -1,1 +1,0 @@
-"""GenoLigand MD report rendering."""

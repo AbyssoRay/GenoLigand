@@ -1,9 +1,0 @@
-ligand_id: phase_0_3_fixture_ligand
-ligand_class: engineering_fixture
-fragments:
-  - exact: YHEDLV
-  - exact: KQWCM
-  - exact: QWCMR
-  - exact: KQWC
-  - exact: AAAAAA
-  - exact: ST

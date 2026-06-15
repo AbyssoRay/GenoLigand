@@ -1,82 +1,40 @@
-# GenoLigand 0.9.1 Windows + WSL2 Installation Guide
+# Windows + WSL2 安装说明
 
-## 1. Windows 前置条件 / Windows Requirements
+## 前置条件
 
 - Windows 11
 - PowerShell
-- Rust toolchain with `cargo`
-- Python 3.11 or newer
+- Rust 工具链
 - Git
-- A WSL2 Linux backend for scientific engines
-- NVIDIA driver with WSL CUDA support when physical mid-screen mode is required
+- WSL2 Linux 后端
+- Java 和 Nextflow
+- Python 3.11 或更新版本
+- 需要动力学筛选时，准备 NVIDIA 驱动、WSL CUDA 和 OpenMM
 
-Keep your default personal WSL distribution unchanged unless you explicitly decide to use it for GenoLigand. A dedicated project backend is preferred for scientific tools and database mounts.
+## 科学资源由安装流程准备
 
-## 2. WSL2 科学后端 / WSL2 Scientific Backend
+普通用户不手动配置数据库。管理员或高级模式负责准备科学仓库：
 
-The Linux backend should provide Java, Nextflow, Python worker environment, OpenMM, and CUDA device visibility when GPU-backed MD is selected.
+```powershell
+cargo run -p gls-cli -- install prepare-science-store --science-store D:\GenoLigandData\science_store
+```
 
-Mount or configure paths for:
+完整安装应准备 ChEMBL、BindingDB、UniProt、RCSB、BioLiP2、PLINDER、Binding MOAD，以及宏基因组潜在序列索引、结构索引、口袋索引和工具版本清单。
 
-- genome FASTA
-- GTF/GFF3 annotation
-- transcript FASTA
-- optional VCF
-- BioLiP2
-- UniProt
-- ChEMBL/BindingDB warehouse
-- RCSB/AFDB structure cache
-
-Run Diagnostics in the WebUI after any WSL path or environment change.
-
-## 3. 从 Windows 启动 WebUI / Start From Windows
+## 启动 WebUI
 
 ```powershell
 cd D:\Project\rust\GenoLigand
-python scripts\phase09\start_phase_0_9_webui.py
+cargo run -p gls-server -- --host 127.0.0.1 --port 19090
 ```
 
-Open:
+打开：
 
 ```text
 http://127.0.0.1:19090/
 ```
 
-To reuse an existing binary:
+## 阻塞策略
 
-```powershell
-python scripts\phase09\start_phase_0_9_webui.py --no-build
-```
+如果输入、科学仓库、已知数据库索引、宏基因组索引或必要工具缺失，GenoLigand 只显示阻塞原因，候选数量保持为 0。
 
-To choose another local port:
-
-```powershell
-python scripts\phase09\start_phase_0_9_webui.py --port 19190
-```
-
-## 4. 配置数据库 / Configure Databases
-
-Open Database Registry. Select or create a profile, then review path, release/version, hash, index status, missing item count, storage use, and repair action for every required source.
-
-Use absolute Windows paths for Windows-hosted files and mounted Linux paths for WSL-hosted files. Keep the same profile for a run so evidence ledgers can map claims to exact database versions.
-
-## 5. 运行诊断 / Run Diagnostics
-
-Diagnostics covers WSL2, Linux kernel, Rust binary, `gls-cli`, `gls-server`, Nextflow, Java, Python worker, OpenMM, CUDA, NVIDIA device, database paths, write permission, disk space, Git remote, GitHub push permission, and environment validation project template status.
-
-Resolve environment warnings before launching expensive workflows.
-
-## 6. 运行环境验证项目模板 / Run The Environment Validation Project Template
-
-Use the environment validation project template to verify installation and workflow plumbing. It stores validation configuration only and does not include precomputed candidates or biological conclusions.
-
-After the template run creates manifests and artifact indexes, inspect Candidate Ranking, Candidate Detail, Genome/ORF Context, Structure and Patch Viewer, MD Summary, Evidence Ledger, Report Export, Diagnostics, and GitHub Sync.
-
-## 7. 停止服务 / Stop The Service
-
-Press `Ctrl+C` in the service terminal. If the process was started in a background window:
-
-```powershell
-Get-Process gls-server
-Stop-Process -Name gls-server
-```

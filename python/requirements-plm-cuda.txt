@@ -1,5 +1,5 @@
 # Install torch from the current PyTorch selector for the local CUDA runtime.
-# The acceptance script records the actual command used.
+# GenoLigand records the actual scientific tool command used in run manifests.
 fair-esm
 numpy
 pytest

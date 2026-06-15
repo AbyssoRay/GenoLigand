@@ -8,7 +8,6 @@ import sys
 from datetime import datetime, timezone
 from pathlib import Path
 
-from geno_plm.backends.fixture_mock import embed_sequence as mock_embed_sequence
 from geno_plm.device import print_cuda_diagnostics
 from geno_plm.io import (
     all_finite,
@@ -58,7 +57,7 @@ def main(argv: list[str] | None = None) -> int:
     embed = sub.add_parser("embed")
     embed.add_argument("--input-fasta", required=True)
     embed.add_argument("--output-dir", required=True)
-    embed.add_argument("--backend", required=True, choices=["fixture_mock", "esm2_fair"])
+    embed.add_argument("--backend", required=True, choices=["esm2_fair"])
     embed.add_argument("--model-id", required=True)
     embed.add_argument("--device", default="auto", choices=["auto", "cpu", "cuda"])
     embed.add_argument("--include", default="mean")
@@ -95,48 +94,26 @@ def cmd_embed(args) -> None:
     vectors_dir.mkdir(parents=True, exist_ok=True)
     records = read_fasta(args.input_fasta)
     created = now_utc()
-    if args.backend == "fixture_mock":
-        embedded_rows = [
-            {
-                "candidate_id": record["candidate_id"],
-                "vector": mock_embed_sequence(record["candidate_id"], record["sequence"], args.model_id),
-                "sequence_length_effective": len(record["sequence"]),
-                "truncated": "false",
-            }
-            for record in records
-        ]
-        metadata = {
-            "backend": "fixture_mock",
-            "model_id": args.model_id,
-            "model_source": "deterministic_local_fixture",
-            "repr_layer": args.repr_layer,
-            "device_requested": args.device,
-            "device_resolved": "cpu",
-            "dtype": "float32",
-            "fallback_events": [],
-            "software_versions": {"python": sys.version, "platform": platform.platform()},
-        }
-    else:
-        from geno_plm.backends.esm_fair import EsmConfig, embed_records
+    from geno_plm.backends.esm_fair import EsmConfig, embed_records
 
-        embedded_rows, metadata = embed_records(
-            records,
-            EsmConfig(
-                model_id=args.model_id,
-                device=args.device,
-                repr_layer=args.repr_layer,
-                toks_per_batch=args.toks_per_batch,
-                sequence_max_length=args.sequence_max_length,
-                allow_cpu_fallback=args.allow_cpu_fallback,
-                seed=args.seed,
-            ),
+    embedding_rows, metadata = embed_records(
+        records,
+        EsmConfig(
+            model_id=args.model_id,
+            device=args.device,
+            repr_layer=args.repr_layer,
+            toks_per_batch=args.toks_per_batch,
+            sequence_max_length=args.sequence_max_length,
+            allow_cpu_fallback=args.allow_cpu_fallback,
+            seed=args.seed,
         )
+    )
     record_by_id = {record["candidate_id"]: record for record in records}
     manifest_rows = []
-    for embedded in embedded_rows:
-        candidate_id = embedded["candidate_id"]
+    for row in embedding_rows:
+        candidate_id = row["candidate_id"]
         record = record_by_id[candidate_id]
-        vector = embedded["vector"]
+        vector = row["vector"]
         vector_path = vectors_dir / f"{safe_id(candidate_id)}.mean.npy"
         write_npy_float32(vector_path, vector)
         mean_abs, l2_norm = vector_stats(vector)
@@ -154,8 +131,8 @@ def cmd_embed(args) -> None:
                 "pooling": "mean",
                 "embedding_dim": str(len(vector)),
                 "sequence_length_input": str(len(record["sequence"])),
-                "sequence_length_effective": str(embedded["sequence_length_effective"]),
-                "truncated": embedded["truncated"],
+                "sequence_length_effective": str(row["sequence_length_effective"]),
+                "truncated": row["truncated"],
                 "embedding_file": str(vector_path),
                 "embedding_sha256": sha256_file(vector_path),
                 "embedding_mean_abs": f"{mean_abs:.6f}",
@@ -163,7 +140,7 @@ def cmd_embed(args) -> None:
                 "created_at_utc": created,
                 "software_versions": json.dumps(metadata.get("software_versions", {}), sort_keys=True),
                 "plm_status": "success",
-                "plm_notes": "real_esm_embedding" if args.backend != "fixture_mock" else "deterministic_fixture_mock",
+                "plm_notes": "real_esm_embedding",
             }
         )
     write_tsv(output_dir / "embedding_manifest.tsv", manifest_rows, MANIFEST_FIELDS)

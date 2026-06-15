@@ -1,1 +1,0 @@
-"""GenoLigand-owned MD scoring."""

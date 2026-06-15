@@ -1,8 +1,0 @@
-candidate_id	context_expected	expected_behavior
-pos_known_cds_001	K1_known_cds_same_frame	Top 3; multi-fragment; passes short-circuit gate
-pos_alt_frame_001	K2_known_locus_alt_frame	Preserve plus strand frame 2; keep as alternative-frame candidate
-pos_lnc_orf_001	K4_lncRNA_or_nc_transcript_orf	Retain as dark-genome/noncoding candidate on minus strand
-decoy_low_complexity_001	K_LOW_COMPLEXITY_DECOY	Filter before pLM with low_complexity or low_information reason
-decoy_gc_repeat_001	K7_pseudogene_or_repeat_associated_orf	Penalize repeat context; never rank above positives
-decoy_single_fragment_001	K10_unannotated_intergenic_orf	Rank below multi-fragment candidates with insufficient co-occurrence reason
-boundary_stop_001	K10_unannotated_intergenic_orf	ORF extension stops at stop codon and does not merge downstream ORF

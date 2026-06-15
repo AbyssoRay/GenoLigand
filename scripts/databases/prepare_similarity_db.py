@@ -46,8 +46,8 @@ def main() -> int:
         "local_path": str(fasta),
         "version_or_release": "current_release",
         "sha256": sha256_file(fasta),
-        "license_note": "UniProt data; release/license details recorded from source URL at acceptance time.",
-        "used_in_phase": "0.4",
+        "license_note": "UniProt data; release/license details recorded from source URL during science-store preparation.",
+        "used_in_pipeline": "current_real_scientific_pipeline",
         "created_at_utc": now(),
     }
     append_manifest(args.manifest, [manifest_row])
@@ -88,7 +88,7 @@ def append_manifest(path: str, rows: list[dict]) -> None:
         "version_or_release",
         "sha256",
         "license_note",
-        "used_in_phase",
+        "used_in_pipeline",
         "created_at_utc",
     ]
     target = Path(path)

@@ -1,8 +1,0 @@
-hbond_distance_cutoff_angstrom: 3.5
-hbond_angle_cutoff_deg: 120
-hydrophobic_cutoff_angstrom: 4.5
-salt_bridge_cutoff_angstrom: 4.0
-pi_pi_centroid_cutoff_angstrom: 5.0
-cation_pi_cutoff_angstrom: 6.0
-metal_coordination_cutoff_angstrom: 2.8
-steric_clash_cutoff_angstrom: 2.0

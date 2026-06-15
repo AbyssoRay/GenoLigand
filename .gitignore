@@ -4,89 +4,63 @@
 *.profraw
 *.profdata
 
-# Nextflow runtime and generated outputs
+# Nextflow and runtime output
 /.nextflow/
 /.nextflow.log*
 /work/
 /results/
 /out/
 /outputs/
+/artifacts/
+/reports/
 /trace*.txt
 /timeline*.html
 /report*.html
 /dag*.html
 *.command.*
 
-# Generated reports and local artifacts
-/artifacts/
-/acceptance_artifacts/
-/acceptance_artifacts_phase_0_2/
-/acceptance_artifacts_phase_0_3/
-/acceptance_artifacts_phase_0_4/
-/acceptance_artifacts_phase_0_5_gpu_strict/
-/acceptance_artifacts_phase_0_6_structure_patch_strict/
-/acceptance_artifacts_phase_0_7_anti_hallucination_strict/
-/acceptance_artifacts_phase_0_7_1_audit_fix_strict/
-/acceptance_artifacts_phase_0_8_full_database_strict/
-/acceptance_artifacts_phase_0_8_1_database_audit_fix_strict/
-/acceptance_artifacts_phase_0_8_2_mapping_benchmark_storage_strict/
-/acceptance_artifacts_phase_0_8_2_failure_diagnosis/
-/ACCEPTANCE_REPORT.md
-/PHASE_0_2_ACCEPTANCE_REPORT.md
-/PHASE_0_3_ACCEPTANCE_REPORT.md
-/PHASE_0_4_ACCEPTANCE_REPORT.md
-/PHASE_0_5_ACCEPTANCE_REPORT.md
-/PHASE_0_6_ACCEPTANCE_REPORT.md
-/PHASE_0_7_ACCEPTANCE_REPORT.md
-/PHASE_0_7_1_ACCEPTANCE_REPORT.md
-/GENOLIGAND_CANDIDATE_REPORT.md
-/reports/
-/coverage/
+# Local science store and large resource roots
+/science_store/
+/databases/
+/data/
+/models/
+/indexes/
+/tool_store/
+/tools/downloads/
+/tools/cache/
+/tools/tmp/
+/tools/*_src_old/
+/tools/*_download_old/
+/tools/*.zip
+/tools/*.tar.gz
+/tools/*.tgz
+
+# Temporary directories and generated reviews
 /tmp/
 /temp/
 /.cache/
 /.pytest_cache/
-/goal/
-/.phase_0_4_env/
-/.phase_0_4_tools/
-/.phase_0_5_env/
-/.phase_0_6_env/
-/.phase_0_6_tools/
-/.phase_0_7_env/
-/.phase_0_7_tools/
-/.phase_0_7_1_env/
-/.phase_0_7_1_tools/
-/.phase_0_8_env/
-/.phase_0_8_tools/
-/.phase_0_8_1_env/
-/.phase_0_8_1_tools/
-/.phase_0_8_2_env/
-/.phase_0_8_2_tools/
-/envs/esmfold-gpu/
-/envs/colabfold-gpu/
-/data/external_phase_0_4/
-/data/external_phase_0_6/
-/data/external_phase_0_7/
-/data/external_phase_0_7_1/
-/data/external_phase_0_8/
-/data/external_phase_0_8_2/
-/models/phase_0_5/
-/models/phase_0_6/
-/models/phase_0_7/
-/models/phase_0_7_1/
-/databases/phase_0_5/
-/databases/phase_0_6/
-/databases/phase_0_7/
-/databases/phase_0_7_1/
-/databases/phase_0_8/
-/databases/phase_0_8_1/
-/databases/phase_0_8_2/
-/outputs/phase_0_4/
-/outputs/phase_0_7/
-/outputs/phase_0_7_1/
-/outputs/phase_0_8/
-/outputs/phase_0_8_1/
-/outputs/phase_0_8_2/
+/webui/.cache/
+/webui/dist/
+/webui/playwright-report/
+/webui/test-results/
+/webui/node_modules/
+/genoligand_webui_*_review_packet.docx
+/genoligand_webui_*_review_packet.pdf
+
+# Python bytecode and local environments
+__pycache__/
+*.pyc
+/.venv/
+/.conda/
+/.mamba/
+/envs/
+
+# Local secrets
+.env
+.env.*
+!.env.example
+*.local
 
 # Logs and runtime dumps
 *.log
@@ -95,17 +69,7 @@
 *.stackdump
 core.*
 
-# Python worker bytecode
-__pycache__/
-*.pyc
-
-# Local environment and secrets
-.env
-.env.*
-!.env.example
-*.local
-
-# Editor and IDE files
+# Editor and OS metadata
 .vscode/*
 !.vscode/settings.json
 !.vscode/extensions.json
@@ -115,8 +79,6 @@ __pycache__/
 *.swp
 *.swo
 *~
-
-# OS metadata
 .DS_Store
 Thumbs.db
 ehthumbs.db
@@ -132,7 +94,7 @@ $RECYCLE.BIN/
 *.tgz
 *.zip
 
-# Large scientific or pipeline data products
+# Large scientific and pipeline data products
 *.bam
 *.bai
 *.cram
@@ -161,6 +123,8 @@ $RECYCLE.BIN/
 *.pdbqt
 *.sdf
 *.mol2
+*.nc
+*.chk
 
 # Temporary Office files
 ~$*.doc
@@ -169,65 +133,5 @@ $RECYCLE.BIN/
 ~$*.pptx
 ~$*.xls
 ~$*.xlsx
-
-# Keep project fixtures and examples trackable.
-!fixtures/**
-!schema_examples/**
-
-# Phase 0.8.3 BioLiP2 resolver/patch strict runtime artifacts
-/acceptance_artifacts_phase_0_8_3_biolip2_resolver_patch_strict/
-/outputs/phase_0_8_3/
-/databases/phase_0_8_3/
-/.phase_0_8_3_env/
-/.phase_0_8_3_tools/
-
-# Phase 0.8.4 OpenMM short-MD strict runtime artifacts
-/acceptance_artifacts_phase_0_8_4_openmm_short_md_strict/
-/outputs/phase_0_8_4/
-/databases/phase_0_8_4/
-/data/external_phase_0_8_4/
-/.phase_0_8_4_env/
-/.phase_0_8_4_tools/
-/tools/downloads/
-/acceptance_artifacts_phase_*/outputs/md_runs/trajectories/
-*.nc
-*.chk
-
-# Phase 0.8.5 integrated-chain runtime caches and non-committed heavy state.
-/acceptance_artifacts_phase_0_8_5_integrated_chain_rust_cleanup_strict/
-/outputs/phase_0_8_5/
-/databases/phase_0_8_5/
-/data/external_phase_0_8_5/
-/.phase_0_8_5_env/
-/.phase_0_8_5_tools/
-/tools/*_src_old/
-/tools/*_download_old/
-/tools/*.zip
-/tools/*.tar.gz
-/tools/*.tgz
-/tools/cache/
-/tools/tmp/
-
-# GenoLigand 0.9.1 production WebUI runtime caches and heavy generated state.
-/acceptance_artifacts_phase_0_9_webui_local_beta_strict/
-/outputs/phase_0_9/
-/outputs/phase_0_9_1/
-/databases/phase_0_9/
-/databases/phase_0_9_1/
-/data/external_phase_0_9/
-/data/external_phase_0_9_1/
-/.phase_0_9_env/
-/.phase_0_9_1_env/
-/.phase_0_9_tools/
-/.phase_0_9_1_tools/
-/acceptance_artifacts_phase_0_9_1_production_webui/
-/webui/.cache/
-/webui/dist/
-/webui/playwright-report/
-/webui/test-results/
-/webui/node_modules/
-/genoligand_webui_*_review_packet.docx
-/genoligand_webui_*_review_packet.pdf
-
 
 AGENTS.md
