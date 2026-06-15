@@ -334,12 +334,12 @@ fn preflight_json(options: &ServerOptions, project_id: &str) -> Value {
     let store = science_store_path(options);
     let checks = vec![
         check(
-            "input_manifest",
+            "input",
             input.exists() && input_has_user_value(&input),
             input.display().to_string(),
         ),
         check(
-            "science_store_manifest",
+            "science_store",
             store.join("science_store_manifest.tsv").exists(),
             store
                 .join("science_store_manifest.tsv")
@@ -347,7 +347,7 @@ fn preflight_json(options: &ServerOptions, project_id: &str) -> Value {
                 .to_string(),
         ),
         check(
-            "known_database_index",
+            "known_database",
             store.join("indexes/known_targets.tsv").exists(),
             store
                 .join("indexes/known_targets.tsv")
@@ -355,7 +355,7 @@ fn preflight_json(options: &ServerOptions, project_id: &str) -> Value {
                 .to_string(),
         ),
         check(
-            "metagenome_potential_index",
+            "metagenome",
             store.join("indexes/metagenome_targets.tsv").exists(),
             store
                 .join("indexes/metagenome_targets.tsv")
@@ -363,7 +363,7 @@ fn preflight_json(options: &ServerOptions, project_id: &str) -> Value {
                 .to_string(),
         ),
         check(
-            "tool_versions_manifest",
+            "tools",
             tool_versions_ready(&store.join("indexes/tool_versions.tsv")),
             store
                 .join("indexes/tool_versions.tsv")
@@ -557,7 +557,7 @@ fn run_json(options: &ServerOptions, run_id: &str) -> Value {
         "run_id": run_id,
         "state": run_state(&run_dir),
         "current_stage": read_trimmed(&run_dir.join("current_stage.txt")).unwrap_or_default(),
-        "failure_reason": read_trimmed(&run_dir.join("failure_reason.txt")),
+        "failure_summary": friendly_failure_summary(read_trimmed(&run_dir.join("failure_reason.txt")).as_deref()),
         "artifact_index": artifact_index(&run_dir)
     })
 }
@@ -580,10 +580,10 @@ fn download_artifact_response(
     run_id: &str,
     requested: &str,
 ) -> (u16, &'static str, String) {
-    let file = requested.split('?').next().unwrap_or(requested);
-    if !artifact_names().contains(&file) {
+    let artifact_id = requested.split('?').next().unwrap_or(requested);
+    let Some(file) = artifact_file_for_id(artifact_id) else {
         return json_response(404, json!({"error":"artifact_not_available"}));
-    }
+    };
     let Some(run_dir) = find_run_dir(options, run_id) else {
         return json_response(404, json!({"error":"run_not_found"}));
     };
@@ -637,21 +637,29 @@ fn databases_json(options: &ServerOptions) -> Value {
 fn user_databases_json(options: &ServerOptions) -> Value {
     let store = science_store_path(options);
     let required = [
-        ("science_store_manifest.tsv", "科学仓库"),
-        ("indexes/known_targets.tsv", "已知蛋白索引"),
-        ("indexes/metagenome_targets.tsv", "宏基因组索引"),
-        ("indexes/tool_versions.tsv", "计算工具"),
+        ("science_store", "science_store_manifest.tsv", "科学仓库"),
+        (
+            "known_database",
+            "indexes/known_targets.tsv",
+            "已知蛋白索引",
+        ),
+        (
+            "metagenome",
+            "indexes/metagenome_targets.tsv",
+            "宏基因组索引",
+        ),
+        ("tools", "indexes/tool_versions.tsv", "计算工具"),
     ];
     let rows = required
         .iter()
-        .map(|(rel, label)| {
+        .map(|(id, rel, label)| {
             let path = store.join(rel);
             let ready = if *rel == "indexes/tool_versions.tsv" {
                 tool_versions_ready(&path)
             } else {
                 path.exists()
             };
-            json!({"item":rel,"label":label,"ready":ready})
+            json!({"id":id,"label":label,"ready":ready})
         })
         .collect::<Vec<_>>();
     json!({
@@ -1055,31 +1063,58 @@ fn read_json_or(path: &Path, fallback: Value) -> Value {
 
 fn artifact_index(run_dir: &Path) -> Value {
     let mut items = Vec::new();
-    for name in artifact_names() {
-        let path = run_dir.join(name);
-        items.push(json!({"path":name,"exists":path.exists()}));
+    for (id, label, file) in artifact_specs() {
+        let path = run_dir.join(file);
+        items.push(json!({"id":id,"label":label,"exists":path.exists()}));
     }
     json!({"items":items})
 }
 
-fn artifact_names() -> &'static [&'static str] {
+fn artifact_specs() -> &'static [(&'static str, &'static str, &'static str)] {
     &[
-        "run_context.json",
-        "run_context.tsv",
-        "artifact_source_map.tsv",
-        "input_normalized_manifest.json",
-        "feature_manifest.json",
-        "known_database_matches.tsv",
-        "metagenome_potential_matches.tsv",
-        "structure_patch_summary.tsv",
-        "docking_summary.tsv",
-        "md_summary.tsv",
-        "target_candidate_ranking.tsv",
-        "candidate_detail.json",
-        "score_decomposition.tsv",
-        "evidence_ledger.tsv",
-        "research_report.md",
+        ("run_summary", "运行摘要", "run_context.json"),
+        ("run_table", "运行表格", "run_context.tsv"),
+        ("source_trace", "来源追溯", "artifact_source_map.tsv"),
+        (
+            "normalized_input",
+            "输入归一化记录",
+            "input_normalized_manifest.json",
+        ),
+        ("features", "特征计算记录", "feature_manifest.json"),
+        (
+            "known_matches",
+            "已知数据库命中",
+            "known_database_matches.tsv",
+        ),
+        (
+            "metagenome_matches",
+            "宏基因组潜在命中",
+            "metagenome_potential_matches.tsv",
+        ),
+        (
+            "structure_patch",
+            "结构与口袋摘要",
+            "structure_patch_summary.tsv",
+        ),
+        ("docking", "对接摘要", "docking_summary.tsv"),
+        ("md_summary", "动力学摘要", "md_summary.tsv"),
+        (
+            "candidate_ranking",
+            "候选排序",
+            "target_candidate_ranking.tsv",
+        ),
+        ("candidate_detail", "候选详情", "candidate_detail.json"),
+        ("score_breakdown", "分数拆解", "score_decomposition.tsv"),
+        ("evidence", "证据链", "evidence_ledger.tsv"),
+        ("research_report", "科研报告", "research_report.md"),
     ]
+}
+
+fn artifact_file_for_id(id: &str) -> Option<&'static str> {
+    artifact_specs()
+        .iter()
+        .find(|(artifact_id, _, _)| *artifact_id == id)
+        .map(|(_, _, file)| *file)
 }
 
 fn artifact_content_type(file: &str) -> &'static str {
@@ -1092,6 +1127,33 @@ fn artifact_content_type(file: &str) -> &'static str {
     } else {
         "text/plain; charset=utf-8"
     }
+}
+
+fn friendly_failure_summary(raw: Option<&str>) -> String {
+    let Some(raw) = raw.map(str::trim).filter(|value| !value.is_empty()) else {
+        return String::new();
+    };
+    raw.split([',', '\n'])
+        .filter_map(|item| {
+            let value = item.trim();
+            if value.is_empty() {
+                None
+            } else {
+                Some(match value {
+                    "missing_input_manifest" | "missing_input" => "缺少输入记录".to_string(),
+                    "missing_science_store_manifest" => "缺少科学仓库".to_string(),
+                    "missing_known_database_index" => "缺少已知蛋白索引".to_string(),
+                    "missing_metagenome_potential_index" => "缺少宏基因组索引".to_string(),
+                    "missing_tool_versions_manifest" => "缺少工具版本记录".to_string(),
+                    _ if value.starts_with("missing_or_unready_tool:") => {
+                        "计算工具未就绪".to_string()
+                    }
+                    _ => "运行条件未满足".to_string(),
+                })
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("；")
 }
 
 fn read_tsv_rows(path: &Path) -> Vec<Value> {
@@ -1237,12 +1299,12 @@ mod tests {
         fs::write(run_dir.join("secret.txt"), "hidden\n").expect("write secret");
 
         let (status, content_type, body) =
-            download_artifact_response(&options, "run-1", "research_report.md");
+            download_artifact_response(&options, "run-1", "research_report");
         assert_eq!(status, 200);
         assert_eq!(content_type, "text/markdown; charset=utf-8");
         assert!(body.contains("# Report"));
 
-        let (status, _, _) = download_artifact_response(&options, "run-1", "secret.txt");
+        let (status, _, _) = download_artifact_response(&options, "run-1", "secret");
         assert_eq!(status, 404);
 
         let (status, _, _) = download_artifact_response(&options, "run-1", "../secret.txt");
@@ -1272,6 +1334,8 @@ mod tests {
             read_project(&options, "project-1"),
             run_json(&options, "run-1"),
             artifacts_json(&options, "run-1"),
+            user_databases_json(&options),
+            preflight_json(&options, "project-1"),
             table_endpoint_json(
                 &options,
                 "run-1",
@@ -1284,10 +1348,16 @@ mod tests {
             assert!(!text.contains("workspace_path"));
             assert!(!text.contains("output_dir"));
             assert!(!text.contains("current_command"));
+            assert!(!text.contains("failure_reason"));
             assert!(!text.contains("artifact_root"));
             assert!(!text.contains("source_path"));
             assert!(!text.contains("cargo run hidden"));
             assert!(!text.contains(&root.display().to_string()));
+            assert!(!text.contains("input_manifest"));
+            assert!(!text.contains("science_store_manifest"));
+            assert!(!text.contains("tool_versions_manifest"));
+            assert!(!text.contains("indexes/known_targets.tsv"));
+            assert!(!text.contains("indexes/metagenome_targets.tsv"));
         }
 
         fs::remove_dir_all(&root).ok();

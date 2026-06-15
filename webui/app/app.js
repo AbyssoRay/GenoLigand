@@ -440,7 +440,7 @@ function renderRun() {
         ${metricRow("当前状态", runStateLabel(runState))}
         ${metricRow("下一步", nextActionText())}
         ${metricRow("候选数量", `${candidateRows().length}`)}
-        ${metricRow("阻塞原因", friendlyFailure(state.run?.failure_reason) || "无")}
+        ${metricRow("阻塞原因", state.run?.failure_summary || "无")}
       </section>
       <section class="panel full">
         <h2>输出文件</h2>
@@ -615,23 +615,23 @@ function renderExport() {
           <span class="status-pill ${available.length ? "ready" : "blocked"}">${available.length ? `${available.length} 项可用` : "暂无可导出项"}</span>
         </div>
       </section>
-      ${exportCard("科研报告", "research_report.md", artifacts, runId)}
-      ${exportCard("候选表", "target_candidate_ranking.tsv", artifacts, runId)}
-      ${exportCard("证据链", "evidence_ledger.tsv", artifacts, runId)}
-      ${exportCard("复现材料", "input_normalized_manifest.json", artifacts, runId)}
-      ${exportCard("结构与口袋摘要", "structure_patch_summary.tsv", artifacts, runId)}
-      ${exportCard("动力学摘要", "md_summary.tsv", artifacts, runId)}
+      ${exportCard("科研报告", "research_report", artifacts, runId)}
+      ${exportCard("候选表", "candidate_ranking", artifacts, runId)}
+      ${exportCard("证据链", "evidence", artifacts, runId)}
+      ${exportCard("复现材料", "normalized_input", artifacts, runId)}
+      ${exportCard("结构与口袋摘要", "structure_patch", artifacts, runId)}
+      ${exportCard("动力学摘要", "md_summary", artifacts, runId)}
     </div>`;
 }
 
-function exportCard(title, artifactName, artifacts, runId) {
-  const exists = Boolean(runId) && artifacts.some((item) => item.path === artifactName && item.exists);
-  const href = `/api/runs/${encodeURIComponent(runId)}/download/${encodeURIComponent(artifactName)}`;
+function exportCard(title, artifactId, artifacts, runId) {
+  const exists = Boolean(runId) && artifacts.some((item) => item.id === artifactId && item.exists);
+  const href = `/api/runs/${encodeURIComponent(runId)}/download/${encodeURIComponent(artifactId)}`;
   return `
     <section class="panel third">
       <h2>${title}</h2>
       <p>${exists ? "当前运行已生成。" : "当前运行未生成。"}</p>
-      ${exists ? `<a class="button secondary" href="${href}" download="${escapeAttr(artifactName)}">下载</a>` : `<button class="button disabled" disabled>不可用</button>`}
+      ${exists ? `<a class="button secondary" href="${href}">下载</a>` : `<button class="button disabled" disabled>不可用</button>`}
     </section>`;
 }
 
@@ -653,8 +653,7 @@ async function saveInput() {
     const created = await api("/api/projects", { method: "POST", body: "{}" });
     state.project = created.project;
   }
-  const manifest = {
-    field_schema: "genoligand.webui.input_manifest.current",
+  const inputPayload = {
     input_kind: "multi_input_workbench",
     inputs: [
       {
@@ -667,7 +666,7 @@ async function saveInput() {
   };
   await api(`/api/projects/${state.project.project_id}/inputs`, {
     method: "POST",
-    body: JSON.stringify(manifest),
+    body: JSON.stringify(inputPayload),
   });
   state.project = await api(`/api/projects/${state.project.project_id}`);
   setStep("configure");
@@ -766,9 +765,9 @@ function filledInputs() {
 
 function sourceReady(key) {
   const required = state.databases?.required || [];
-  if (key === "known") return required.some((row) => row.item === "indexes/known_targets.tsv" && row.ready);
-  if (key === "metagenome") return required.some((row) => row.item === "indexes/metagenome_targets.tsv" && row.ready);
-  if (key === "structure") return required.some((row) => row.item === "indexes/tool_versions.tsv" && row.ready);
+  if (key === "known") return required.some((row) => row.id === "known_database" && row.ready);
+  if (key === "metagenome") return required.some((row) => row.id === "metagenome" && row.ready);
+  if (key === "structure") return required.some((row) => row.id === "tools" && row.ready);
   return false;
 }
 
@@ -777,14 +776,14 @@ function storeStatusRows() {
   if (!required.length) return `<div class="empty">尚未读取到科学仓库状态。</div>`;
   return required
     .map((row) =>
-      metricRow(friendlyRequirement(row.item), row.ready ? "就绪" : "需要安装或修复")
+      metricRow(row.label || friendlyRequirement(row.id), row.ready ? "就绪" : "需要安装或修复")
     )
     .join("");
 }
 
 function preflightGroups() {
   const byId = new Map((state.preflight?.checks || []).map((row) => [row.id, row]));
-  const inputReady = state.project && byId.get("input_manifest")?.ready;
+  const inputReady = state.project && byId.get("input")?.ready;
   return [
     {
       title: "Input",
@@ -799,14 +798,14 @@ function preflightGroups() {
     {
       title: "Database",
       rows: [
-        checkRow(byId, "science_store_manifest", "科学仓库", "运行安装/修复"),
-        checkRow(byId, "known_database_index", "已知蛋白索引", "准备数据库索引"),
-        checkRow(byId, "metagenome_potential_index", "宏基因组索引", "准备序列索引"),
+        checkRow(byId, "science_store", "科学仓库", "运行安装/修复"),
+        checkRow(byId, "known_database", "已知蛋白索引", "准备数据库索引"),
+        checkRow(byId, "metagenome", "宏基因组索引", "准备序列索引"),
       ],
     },
     {
       title: "Runtime",
-      rows: [checkRow(byId, "tool_versions_manifest", "计算工具", "准备运行环境")],
+      rows: [checkRow(byId, "tools", "计算工具", "准备运行环境")],
     },
     {
       title: "Storage",
@@ -864,7 +863,7 @@ function artifactRows() {
       <table>
         <thead><tr><th>输出</th><th>状态</th></tr></thead>
         <tbody>
-          ${items.map((item) => `<tr><td>${friendlyArtifact(item.path)}</td><td><span class="status-pill ${item.exists ? "ready" : "blocked"}">${item.exists ? "已生成" : "未生成"}</span></td></tr>`).join("")}
+          ${items.map((item) => `<tr><td>${friendlyArtifact(item.id || item.path)}</td><td><span class="status-pill ${item.exists ? "ready" : "blocked"}">${item.exists ? "已生成" : "未生成"}</span></td></tr>`).join("")}
         </tbody>
       </table>
     </div>`;
@@ -968,47 +967,31 @@ function runStateClass(value) {
 
 function friendlyRequirement(item) {
   return {
-    "science_store_manifest.tsv": "科学仓库",
-    "indexes/known_targets.tsv": "已知蛋白索引",
-    "indexes/metagenome_targets.tsv": "宏基因组索引",
-    "indexes/tool_versions.tsv": "计算工具",
+    science_store: "科学仓库",
+    known_database: "已知蛋白索引",
+    metagenome: "宏基因组索引",
+    tools: "计算工具",
   }[item] || item;
 }
 
 function friendlyArtifact(name) {
   return {
-    "input_normalized_manifest.json": "输入归一化记录",
-    "feature_manifest.json": "特征计算记录",
-    "known_database_matches.tsv": "已知数据库命中",
-    "metagenome_potential_matches.tsv": "宏基因组潜在命中",
-    "structure_patch_summary.tsv": "结构与口袋摘要",
-    "docking_summary.tsv": "对接摘要",
-    "md_summary.tsv": "动力学摘要",
-    "target_candidate_ranking.tsv": "候选排序",
-    "candidate_detail.json": "候选详情",
-    "score_decomposition.tsv": "分数拆解",
-    "evidence_ledger.tsv": "证据链",
-    "research_report.md": "科研报告",
+    run_summary: "运行摘要",
+    run_table: "运行表格",
+    source_trace: "来源追溯",
+    normalized_input: "输入归一化记录",
+    features: "特征计算记录",
+    known_matches: "已知数据库命中",
+    metagenome_matches: "宏基因组潜在命中",
+    structure_patch: "结构与口袋摘要",
+    docking: "对接摘要",
+    md_summary: "动力学摘要",
+    candidate_ranking: "候选排序",
+    candidate_detail: "候选详情",
+    score_breakdown: "分数拆解",
+    evidence: "证据链",
+    research_report: "科研报告",
   }[name] || name;
-}
-
-function friendlyFailure(text) {
-  if (!text) return "";
-  return String(text)
-    .split(/\r?\n|,/)
-    .filter(Boolean)
-    .map((item) => {
-      const value = item.trim();
-      return {
-        missing_input_manifest: "缺少输入记录",
-        missing_input: "缺少研究输入",
-        missing_science_store_manifest: "缺少科学仓库",
-        missing_known_database_index: "缺少已知蛋白索引",
-        missing_metagenome_potential_index: "缺少宏基因组索引",
-        missing_tool_versions_manifest: "缺少工具版本记录",
-      }[value] || value.replace("missing_or_unready_tool:", "工具未就绪：");
-    })
-    .join("；");
 }
 
 function friendlyScope(value) {
