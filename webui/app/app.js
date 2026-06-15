@@ -351,6 +351,7 @@ function renderCheck() {
           <span class="status-pill ${setupReady ? "ready" : "blocked"}">${setupReady ? "已就绪" : "需要准备"}</span>
         </div>
         ${setupRepairSummary()}
+        ${installerDownloadSummary()}
         ${installerResourceSummary()}
         ${missingResourceSummary()}
         ${diagnosticsSummary()}
@@ -383,6 +384,20 @@ function setupRepairSummary() {
   return `
     <div class="notice ${ready ? "" : "warn"}">
       ${escapeHtml(state.setupRepair.message || (ready ? "科学仓库已就绪。" : "修复动作已执行，但仍有缺项。"))}
+    </div>`;
+}
+
+function installerDownloadSummary() {
+  const downloads = state.setupRepair?.installer?.downloads;
+  if (!downloads) return "";
+  const status = downloads.status || "unknown";
+  const ok = status === "ready" || status === "skipped";
+  const message = downloads.message || (ok ? "科学资源下载步骤已完成。" : "科学资源下载状态需要检查。");
+  const next = downloads.next_action || (ok ? "继续" : "重新运行安装/修复");
+  return `
+    <div class="notice ${ok ? "" : "warn"}">
+      <strong>资源下载：${escapeHtml(message)}</strong>
+      <div class="compact-list">下一步：${escapeHtml(next)}</div>
     </div>`;
 }
 

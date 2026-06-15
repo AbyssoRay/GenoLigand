@@ -1345,7 +1345,9 @@ fn setup_installer_summary(stdout: &str) -> Option<Value> {
         "downloads": {
             "status": downloads.get("status").cloned().unwrap_or_else(|| json!("unknown")),
             "ready": downloads.get("ready").cloned().unwrap_or_else(|| json!(0)),
-            "failed": downloads.get("failed").cloned().unwrap_or_else(|| json!(0))
+            "failed": downloads.get("failed").cloned().unwrap_or_else(|| json!(0)),
+            "message": downloads.get("message").cloned().unwrap_or_else(|| json!("")),
+            "next_action": downloads.get("next_action").cloned().unwrap_or_else(|| json!("运行安装/修复"))
         },
         "resources": resources
     }))
@@ -2194,15 +2196,23 @@ mod tests {
     #[test]
     fn setup_installer_summary_keeps_user_relevant_fields_only() {
         let payload = setup_installer_summary(
-            r#"{"status":"needs_repair","summary":"安装/修复已执行，但仍有资源需要准备。","next_action":"补齐缺失资源后重新运行安装/修复","missing_components_count":3,"debug":{"command":["cargo","run"],"stdout":"raw"},"downloads":{"status":"ready","ready":2,"failed":0}}"#,
+            r#"{"status":"needs_repair","summary":"安装/修复已执行，但仍有资源需要准备。","next_action":"补齐缺失资源后重新运行安装/修复","missing_components_count":3,"debug":{"command":["cargo","run"],"stdout":"raw"},"downloads":{"status":"not_configured","ready":0,"failed":0,"message":"安装包未包含科学资源下载清单，科学仓库尚未准备完成。","next_action":"使用包含科学资源清单的完整安装包重新运行安装/修复"}}"#,
         )
         .expect("installer json");
 
         assert_eq!(payload["status"], "needs_repair");
         assert_eq!(payload["missing_components_count"], 3);
         assert_eq!(payload["next_action"], "补齐缺失资源后重新运行安装/修复");
-        assert_eq!(payload["downloads"]["status"], "ready");
-        assert_eq!(payload["downloads"]["ready"], 2);
+        assert_eq!(payload["downloads"]["status"], "not_configured");
+        assert_eq!(payload["downloads"]["ready"], 0);
+        assert_eq!(
+            payload["downloads"]["message"],
+            "安装包未包含科学资源下载清单，科学仓库尚未准备完成。"
+        );
+        assert_eq!(
+            payload["downloads"]["next_action"],
+            "使用包含科学资源清单的完整安装包重新运行安装/修复"
+        );
         assert!(payload.get("resources").is_some());
         assert!(payload.get("debug").is_none());
         assert!(payload.get("command").is_none());

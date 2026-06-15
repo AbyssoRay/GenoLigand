@@ -289,10 +289,25 @@ def prepare_downloads(catalog: Path, science_store: Path) -> dict[str, object]:
 
 
 def download_summary(download_result: dict[str, object]) -> dict[str, object]:
+    status = str(download_result.get("status", "unknown"))
+    messages = {
+        "ready": "科学资源下载步骤已完成。",
+        "failed": "部分科学资源下载或校验失败。",
+        "not_configured": "安装包未包含科学资源下载清单，科学仓库尚未准备完成。",
+        "skipped": "本次已跳过下载步骤。",
+    }
+    actions = {
+        "ready": "继续",
+        "failed": "检查网络、磁盘空间后重新运行安装/修复",
+        "not_configured": "使用包含科学资源清单的完整安装包重新运行安装/修复",
+        "skipped": "如资源缺失，请重新运行安装/修复",
+    }
     return {
-        "status": download_result.get("status", "unknown"),
+        "status": status,
         "ready": download_result.get("ready", 0),
         "failed": download_result.get("failed", 0),
+        "message": messages.get(status, "科学资源下载状态需要检查。"),
+        "next_action": actions.get(status, "重新运行安装/修复"),
     }
 
 
@@ -350,9 +365,14 @@ def resource_summary(science_store: Path) -> dict[str, object]:
     }
 
 
-def installation_status(science_store: Path, completed: subprocess.CompletedProcess[str]) -> dict[str, object]:
+def installation_status(
+    science_store: Path,
+    completed: subprocess.CompletedProcess[str],
+    download_result: dict[str, object],
+) -> dict[str, object]:
     status_payload = load_json(science_store / "install_status.json")
     store_status = str(status_payload.get("status", "")).strip()
+    download_status = str(download_result.get("status", "unknown"))
     missing = status_payload.get("missing_components", [])
     missing_count = len(missing) if isinstance(missing, list) else 0
     if completed.returncode != 0:
@@ -363,6 +383,14 @@ def installation_status(science_store: Path, completed: subprocess.CompletedProc
         status = "ready"
         summary = "科学仓库已就绪。"
         next_action = "打开 WebUI 并输入研究对象"
+    elif download_status == "not_configured":
+        status = "needs_repair"
+        summary = "安装包未包含科学资源下载清单，科学仓库尚未准备完成。"
+        next_action = "使用包含科学资源清单的完整安装包重新运行安装/修复"
+    elif download_status == "failed":
+        status = "needs_repair"
+        summary = "部分科学资源下载或校验失败，科学仓库尚未准备完成。"
+        next_action = "检查网络、磁盘空间后重新运行安装/修复"
     else:
         status = "needs_repair"
         summary = "安装/修复已执行，但仍有资源需要准备。"
@@ -424,7 +452,7 @@ def main() -> int:
         str(science_store),
     ]
     completed = run_command(command)
-    install_status = installation_status(science_store, completed)
+    install_status = installation_status(science_store, completed, download_result)
     payload: dict[str, object] = {
         **install_status,
         "returncode": completed.returncode,
