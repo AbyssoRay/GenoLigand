@@ -60,6 +60,8 @@ PYTHON_TOOL_PACKAGES: list[dict[str, str]] = [
     },
 ]
 
+RESERVED_WSL_DISTROS = {"Ubuntu-24.04"}
+
 
 def repo_root() -> Path:
     return Path(__file__).resolve().parents[2]
@@ -159,6 +161,34 @@ def runtime_backend() -> str:
     return "native_linux"
 
 
+def tool_path_entries(workspace_root: Path) -> list[str]:
+    entries: list[Path] = [
+        workspace_root / "bin",
+        workspace_root / "tools" / "bin",
+    ]
+    explicit = os.environ.get("GENOLIGAND_TOOL_ROOT")
+    if explicit:
+        root = Path(explicit)
+        entries.extend([root, root / "bin"])
+    if os.name == "nt":
+        entries.extend(
+            [
+                Path("D:/user/codex/tools"),
+                Path("D:/user/codex/tools/bin"),
+                Path("D:/GenoLigandTools/bin"),
+            ]
+        )
+    return [str(path) for path in entries if path.exists()]
+
+
+def environment_for_science_tools(workspace_root: Path) -> dict[str, str]:
+    env = os.environ.copy()
+    entries = tool_path_entries(workspace_root)
+    if entries:
+        env["PATH"] = os.pathsep.join([*entries, env.get("PATH", "")])
+    return env
+
+
 def run_command(command: Sequence[str], env: dict[str, str] | None = None) -> subprocess.CompletedProcess[str]:
     command_list = list(command)
     try:
@@ -176,6 +206,89 @@ def run_command(command: Sequence[str], env: dict[str, str] | None = None) -> su
             "",
             f"command_not_found:{err}",
         )
+
+
+def run_command_bytes(command: Sequence[str]) -> subprocess.CompletedProcess[bytes]:
+    command_list = list(command)
+    try:
+        return subprocess.run(
+            command_list,
+            check=False,
+            capture_output=True,
+        )
+    except FileNotFoundError as err:
+        return subprocess.CompletedProcess(
+            command_list,
+            127,
+            b"",
+            f"command_not_found:{err}".encode("utf-8"),
+        )
+
+
+def decode_process_bytes(data: bytes) -> str:
+    if not data:
+        return ""
+    for encoding in ("utf-16le", "utf-8", "gbk"):
+        try:
+            text = data.decode(encoding)
+        except UnicodeDecodeError:
+            continue
+        if text.strip():
+            return text.replace("\x00", "")
+    return data.decode("utf-8", errors="replace").replace("\x00", "")
+
+
+def list_wsl_distributions() -> list[str]:
+    if os.name != "nt":
+        return []
+    completed = run_command_bytes(["wsl.exe", "-l", "-q"])
+    text = decode_process_bytes(completed.stdout)
+    names = []
+    for line in text.splitlines():
+        name = line.replace("\x00", "").strip().lstrip("*").strip()
+        if name and name.upper() != "NAME":
+            names.append(name)
+    return names
+
+
+def selected_project_wsl_distro(explicit: str | None) -> str | None:
+    if os.name != "nt":
+        return None
+    names = list_wsl_distributions()
+    requested = explicit or os.environ.get("GENOLIGAND_WSL_DISTRO", "")
+    if requested:
+        return requested if requested in names and requested not in RESERVED_WSL_DISTROS else None
+    for name in names:
+        if name not in RESERVED_WSL_DISTROS and name.lower().startswith("genoligand"):
+            return name
+    return None
+
+
+def wsl_home(distro: str) -> str:
+    completed = run_command_bytes(["wsl.exe", "-d", distro, "--", "bash", "-lc", "printf %s \"$HOME\""])
+    if completed.returncode != 0:
+        return ""
+    return decode_process_bytes(completed.stdout).strip()
+
+
+def run_wsl_command(distro: str, command: Sequence[str]) -> subprocess.CompletedProcess[str]:
+    completed = run_command_bytes(["wsl.exe", "-d", distro, "--", *command])
+    return subprocess.CompletedProcess(
+        completed.args,
+        completed.returncode,
+        decode_process_bytes(completed.stdout),
+        decode_process_bytes(completed.stderr),
+    )
+
+
+def write_wsl_python_wrapper(wrapper: Path, distro: str, python_path: str) -> None:
+    wrapper.parent.mkdir(parents=True, exist_ok=True)
+    safe_distro = distro.replace('"', "")
+    safe_python = python_path.replace('"', "")
+    wrapper.write_text(
+        f'@echo off\r\nwsl.exe -d "{safe_distro}" -- "{safe_python}" %*\r\n',
+        encoding="utf-8",
+    )
 
 
 def venv_python(env_dir: Path) -> Path:
@@ -198,7 +311,28 @@ def probe_python_import(python: Path, import_name: str, version_expr: str) -> di
     }
 
 
-def ensure_python_tool_environment(env_dir: Path, skip_install: bool) -> dict[str, object]:
+def ensure_python_tool_environment(
+    env_dir: Path,
+    skip_install: bool,
+    backend: str = "local",
+    wsl_distro: str | None = None,
+) -> dict[str, object]:
+    if backend == "wsl":
+        if not wsl_distro:
+            return {
+                "status": "failed",
+                "backend": "wsl",
+                "python": "",
+                "manifest": str(env_dir / "tool_environment_manifest.tsv"),
+                "ready": 0,
+                "total": len(PYTHON_TOOL_PACKAGES),
+                "environment": "missing_wsl_distribution",
+            }
+        return ensure_wsl_python_tool_environment(env_dir, wsl_distro, skip_install)
+    return ensure_local_python_tool_environment(env_dir, skip_install)
+
+
+def ensure_local_python_tool_environment(env_dir: Path, skip_install: bool) -> dict[str, object]:
     manifest = env_dir / "tool_environment_manifest.tsv"
     python = venv_python(env_dir)
     env_dir.mkdir(parents=True, exist_ok=True)
@@ -265,11 +399,160 @@ def ensure_python_tool_environment(env_dir: Path, skip_install: bool) -> dict[st
     total = len(PYTHON_TOOL_PACKAGES)
     return {
         "status": "ready" if ready == total else "needs_repair" if not skip_install else "skipped",
+        "backend": "local",
         "python": str(python),
         "manifest": str(manifest),
         "ready": ready,
         "total": total,
         "environment": create_status,
+    }
+
+
+def ensure_wsl_python_tool_environment(env_dir: Path, distro: str, skip_install: bool) -> dict[str, object]:
+    manifest = env_dir / "tool_environment_manifest.tsv"
+    wrapper = env_dir / "genoligand-wsl-python.cmd"
+    env_dir.mkdir(parents=True, exist_ok=True)
+    home = wsl_home(distro)
+    if not home:
+        write_python_tool_manifest(
+            manifest,
+            [
+                {
+                    "component": "python_worker_env",
+                    "status": "failed",
+                    "python": str(wrapper),
+                    "package": "wsl",
+                    "import_name": "",
+                    "version": "",
+                    "notes": "wsl_home_unavailable",
+                }
+            ],
+        )
+        return {
+            "status": "failed",
+            "backend": "wsl",
+            "wsl_distro": distro,
+            "python": str(wrapper),
+            "manifest": str(manifest),
+            "ready": 0,
+            "total": len(PYTHON_TOOL_PACKAGES),
+            "environment": "wsl_unavailable",
+        }
+    python_path = f"{home}/.local/state/genoligand/python-worker-env/bin/python"
+    write_wsl_python_wrapper(wrapper, distro, python_path)
+    if skip_install:
+        rows = [
+            {
+                "component": spec["component"],
+                "status": "skipped",
+                "python": str(wrapper),
+                "package": spec["package"],
+                "import_name": spec["import_name"],
+                "version": "",
+                "notes": "tool_install_skipped",
+            }
+            for spec in PYTHON_TOOL_PACKAGES
+        ]
+        write_python_tool_manifest(manifest, rows)
+        return {
+            "status": "skipped",
+            "backend": "wsl",
+            "wsl_distro": distro,
+            "python": str(wrapper),
+            "manifest": str(manifest),
+            "ready": 0,
+            "total": len(PYTHON_TOOL_PACKAGES),
+            "environment": "skipped",
+        }
+    create = run_wsl_command(
+        distro,
+        [
+            "bash",
+            "-lc",
+            "python3 -m venv ~/.local/state/genoligand/python-worker-env && ~/.local/state/genoligand/python-worker-env/bin/python -m pip install --upgrade pip",
+        ],
+    )
+    if create.returncode != 0:
+        write_python_tool_manifest(
+            manifest,
+            [
+                {
+                    "component": "python_worker_env",
+                    "status": "failed",
+                    "python": str(wrapper),
+                    "package": "venv",
+                    "import_name": "",
+                    "version": "",
+                    "notes": create.stderr.strip() or create.stdout.strip() or "wsl_venv_create_failed",
+                }
+            ],
+        )
+        return {
+            "status": "failed",
+            "backend": "wsl",
+            "wsl_distro": distro,
+            "python": str(wrapper),
+            "manifest": str(manifest),
+            "ready": 0,
+            "total": len(PYTHON_TOOL_PACKAGES),
+            "environment": "failed",
+        }
+    ready = 0
+    rows: list[dict[str, object]] = []
+    for spec in PYTHON_TOOL_PACKAGES:
+        probe = probe_wsl_python_import(distro, python_path, spec["import_name"], spec["version_expr"])
+        status = "ready" if probe["ready"] else "missing"
+        notes = str(probe["notes"])
+        if not probe["ready"]:
+            installed = run_wsl_command(
+                distro,
+                [python_path, "-m", "pip", "install", spec["package"]],
+            )
+            probe = probe_wsl_python_import(distro, python_path, spec["import_name"], spec["version_expr"])
+            status = "ready" if probe["ready"] else "failed"
+            notes = (
+                str(probe["notes"])
+                if probe["ready"]
+                else installed.stderr.strip() or installed.stdout.strip() or str(probe["notes"])
+            )
+        if probe["ready"]:
+            ready += 1
+        rows.append(
+            {
+                "component": spec["component"],
+                "status": status,
+                "python": str(wrapper),
+                "package": spec["package"],
+                "import_name": spec["import_name"],
+                "version": str(probe["version"]),
+                "notes": notes,
+            }
+        )
+    write_python_tool_manifest(manifest, rows)
+    total = len(PYTHON_TOOL_PACKAGES)
+    return {
+        "status": "ready" if ready == total else "needs_repair",
+        "backend": "wsl",
+        "wsl_distro": distro,
+        "python": str(wrapper),
+        "manifest": str(manifest),
+        "ready": ready,
+        "total": total,
+        "environment": "created_or_existing",
+    }
+
+
+def probe_wsl_python_import(distro: str, python_path: str, import_name: str, version_expr: str) -> dict[str, object]:
+    code = f"import {import_name}; print({version_expr})"
+    completed = run_wsl_command(distro, [python_path, "-c", code])
+    text = f"{completed.stdout}{completed.stderr}".strip()
+    if completed.returncode == 0:
+        version = next((line.strip() for line in text.splitlines() if line.strip()), "installed")
+        return {"ready": True, "version": version, "notes": "import_ok"}
+    return {
+        "ready": False,
+        "version": "",
+        "notes": next((line.strip() for line in text.splitlines() if line.strip()), "import_failed"),
     }
 
 
@@ -845,7 +1128,7 @@ def installation_status(
         status = "needs_repair"
         summary = "部分科学资源下载或校验失败，科学仓库尚未准备完成。"
         next_action = "检查网络、磁盘空间后重新运行安装/修复"
-    elif tool_status not in {"ready", "skipped"}:
+    elif tool_status != "ready":
         status = "needs_repair"
         summary = "Python 科学计算环境尚未准备完成。"
         next_action = "保持联网后重新运行安装/修复，或检查 Python 环境安装日志"
@@ -885,6 +1168,8 @@ def main() -> int:
     parser.add_argument("--gls-server")
     parser.add_argument("--source-catalog")
     parser.add_argument("--python-env-dir")
+    parser.add_argument("--python-backend", choices=["auto", "local", "wsl"], default="auto")
+    parser.add_argument("--wsl-distro")
     parser.add_argument("--no-download", action="store_true")
     parser.add_argument("--no-tool-install", action="store_true")
     parser.add_argument("--host", default="127.0.0.1")
@@ -896,11 +1181,18 @@ def main() -> int:
     workspace_root = Path(args.workspace_root).resolve()
     science_store = Path(args.science_store).resolve()
     runtime_dir = Path(args.runtime_dir).resolve()
+    science_env = environment_for_science_tools(workspace_root)
     python_env_dir = (
         Path(args.python_env_dir).resolve()
         if args.python_env_dir
         else default_python_env_dir(runtime_dir).resolve()
     )
+    selected_wsl = selected_project_wsl_distro(args.wsl_distro)
+    python_backend = "local"
+    if args.python_backend == "wsl":
+        python_backend = "wsl"
+    elif args.python_backend == "auto" and selected_wsl:
+        python_backend = "wsl"
     source_catalog = Path(args.source_catalog).resolve() if args.source_catalog else default_source_catalog(workspace_root, science_store)
     source_sync_plan = default_source_sync_plan(workspace_root, science_store)
     download_result = (
@@ -918,6 +1210,8 @@ def main() -> int:
     tool_environment_result = ensure_python_tool_environment(
         python_env_dir,
         args.no_tool_install,
+        python_backend,
+        selected_wsl,
     )
     cli_command = resolve_binary_command(
         args.gls_cli,
@@ -934,7 +1228,7 @@ def main() -> int:
         "--science-store",
         str(science_store),
     ]
-    command_env = os.environ.copy()
+    command_env = dict(science_env)
     tool_python = str(tool_environment_result.get("python", "")).strip()
     if tool_python:
         command_env["GENOLIGAND_PYTHON"] = tool_python
@@ -970,6 +1264,9 @@ def main() -> int:
             "science_store": str(science_store),
             "runtime_dir": str(runtime_dir),
             "python_env_dir": str(python_env_dir),
+            "python_backend": python_backend,
+            "wsl_distro": selected_wsl or "",
+            "tool_path_entries": tool_path_entries(workspace_root),
             "download_manifest": download_result.get("manifest", ""),
             "external_sync_manifest": external_sync_result.get("manifest", ""),
             "tool_environment_manifest": tool_environment_result.get("manifest", ""),
@@ -1014,7 +1311,7 @@ def main() -> int:
         "--workspace-root",
         str(workspace_root),
     ]
-    env = os.environ.copy()
+    env = dict(science_env)
     env["GENOLIGAND_SCIENCE_STORE"] = str(science_store)
     if tool_python:
         env["GENOLIGAND_PYTHON"] = tool_python

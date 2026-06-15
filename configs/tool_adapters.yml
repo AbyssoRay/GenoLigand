@@ -27,4 +27,19 @@ adapters:
     role: short_molecular_dynamics_engine
     output_owner: GenoLigand
     required_for_pipeline: true
-
+  pdbfixer:
+    role: structure_preparation_engine
+    output_owner: GenoLigand
+    required_for_pipeline: true
+  openff_toolkit:
+    role: forcefield_parameterization_engine
+    output_owner: GenoLigand
+    required_for_pipeline: true
+  mdtraj:
+    role: trajectory_feature_engine
+    output_owner: GenoLigand
+    required_for_pipeline: true
+  mdanalysis:
+    role: trajectory_analysis_engine
+    output_owner: GenoLigand
+    required_for_pipeline: true

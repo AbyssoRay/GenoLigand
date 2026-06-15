@@ -872,6 +872,9 @@ async function saveInput() {
     return false;
   }
   state.project = saved.project || (await api(`/api/user/projects/${state.project.project_id}`));
+  state.run = null;
+  state.runData = null;
+  state.preflight = null;
   setStep("configure");
   return true;
 }

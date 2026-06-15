@@ -425,9 +425,16 @@ fn write_input_manifest(options: &ServerOptions, project_id: &str, body: &str) -
         let _ = write_text(&dir.join("project_name.txt"), &name);
     }
     match write_text(&path, &(value.to_string() + "\n")) {
-        Ok(()) => json!({"status":"saved","project":read_project(options, project_id)}),
+        Ok(()) => {
+            clear_current_run_selection(&dir);
+            json!({"status":"saved","project":read_project(options, project_id)})
+        }
         Err(err) => json!({"status":"failed","error":err}),
     }
+}
+
+fn clear_current_run_selection(project_dir: &Path) {
+    let _ = fs::remove_file(project_dir.join("latest_run_id.txt"));
 }
 
 fn preflight_json(options: &ServerOptions, project_id: &str) -> Value {
@@ -441,7 +448,7 @@ fn preflight_json(options: &ServerOptions, project_id: &str) -> Value {
         ),
         check(
             "science_store",
-            store.join("science_store_manifest.tsv").exists(),
+            preflight_store_ready(options),
             store
                 .join("science_store_manifest.tsv")
                 .display()
@@ -2754,6 +2761,21 @@ mod tests {
     }
 
     #[test]
+    fn saving_input_clears_stale_run_state_in_webui() {
+        let app = include_str!("../../../webui/app/app.js");
+        let start = app.find("async function saveInput()").expect("saveInput");
+        let end = app[start..]
+            .find("async function runPreflight()")
+            .map(|offset| start + offset)
+            .expect("runPreflight");
+        let save_input = &app[start..end];
+
+        assert!(save_input.contains("state.run = null"));
+        assert!(save_input.contains("state.runData = null"));
+        assert!(save_input.contains("state.preflight = null"));
+    }
+
+    #[test]
     fn visual_result_sections_use_clear_not_ready_language() {
         let app = include_str!("../../../webui/app/app.js");
         assert!(app.contains("图形查看未就绪"));
@@ -3235,6 +3257,91 @@ mod tests {
         assert!(!preflight_text.contains("preflight_passed"));
         assert!(!preflight_text.contains("blocked"));
         assert!(!preflight_text.contains(&root.display().to_string()));
+
+        fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn preflight_requires_closed_install_state_not_just_files() {
+        let root =
+            std::env::temp_dir().join(format!("genoligand-preflight-store-{}", now_millis()));
+        let options = server_options(root.clone());
+        let project_dir = project_dir(&options, "project-1");
+        let store = root.join("science_store");
+        fs::create_dir_all(store.join("indexes")).expect("store indexes");
+        fs::create_dir_all(&project_dir).expect("project dir");
+        fs::write(
+            project_dir.join("input_manifest.json"),
+            r#"{"inputs":[{"field":"small_molecule","value":"CCO"}]}"#,
+        )
+        .expect("input");
+        fs::write(
+            store.join("science_store_manifest.tsv"),
+            "source\tstatus\nstore\tready\n",
+        )
+        .expect("store manifest");
+        fs::write(
+            store.join("indexes/known_targets.tsv"),
+            "source\ttarget_id\ttarget_name\torganism\ttarget_class\tfeatures\tevidence\n",
+        )
+        .expect("known index");
+        fs::write(
+            store.join("indexes/metagenome_targets.tsv"),
+            "source\ttarget_id\ttarget_name\torganism\ttarget_class\tfeatures\tevidence\n",
+        )
+        .expect("metagenome index");
+        fs::write(
+            store.join("indexes/tool_versions.tsv"),
+            "tool\tstatus\tversion\tdetail\nrdkit\tready\tinstalled\tok\n",
+        )
+        .expect("tools");
+        fs::write(
+            store.join("install_status.json"),
+            r#"{"status":"needs_repair"}"#,
+        )
+        .expect("install status");
+        fs::write(
+            store.join("source_requirements.tsv"),
+            "source_id\tstatus\nchembl\tready\n",
+        )
+        .expect("source requirements");
+
+        let preflight = preflight_json(&options, "project-1");
+        let science_store_ready = preflight["checks"]
+            .as_array()
+            .and_then(|rows| {
+                rows.iter()
+                    .find(|row| row.get("id").and_then(Value::as_str) == Some("science_store"))
+            })
+            .and_then(|row| row.get("ready").and_then(Value::as_bool))
+            .unwrap_or(true);
+        assert!(!science_store_ready);
+
+        fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn saving_new_input_clears_current_run_selection() {
+        let root =
+            std::env::temp_dir().join(format!("genoligand-input-clears-run-{}", now_millis()));
+        let options = server_options(root.clone());
+        let project_id = "project-1";
+        let project_dir = project_dir(&options, project_id);
+        fs::create_dir_all(&project_dir).expect("project dir");
+        fs::write(project_dir.join("latest_run_id.txt"), "run-old\n").expect("latest run");
+
+        let response = write_input_manifest(
+            &options,
+            project_id,
+            r#"{"inputs":[{"field":"project_name","value":"研究项目"},{"field":"protein_ligand","value":">p\nMSTNPKPQR"}],"files":[]}"#,
+        );
+
+        assert_eq!(response["status"], "saved");
+        assert!(
+            !project_dir.join("latest_run_id.txt").exists(),
+            "new input must detach stale run outputs from current project"
+        );
+        assert!(read_project(&options, project_id)["latest_run_id"].is_null());
 
         fs::remove_dir_all(&root).ok();
     }

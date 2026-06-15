@@ -191,6 +191,12 @@ const REQUIRED_TOOLS: &[RequiredTool] = &[
         install_hint: "install_python_pdbfixer",
     },
     RequiredTool {
+        id: "openff_toolkit",
+        label: "OpenFF Toolkit",
+        license: "MIT",
+        install_hint: "install_python_openff_toolkit",
+    },
+    RequiredTool {
         id: "mdtraj",
         label: "MDTraj",
         license: "LGPL-2.1",
@@ -1253,12 +1259,20 @@ fn probe_tool(tool: &RequiredTool) -> ToolProbe {
         "java" => probe_command(tool.id, "java", &["-version"]),
         "nextflow" => probe_command(tool.id, "nextflow", &["-version"]),
         "rdkit" => probe_python_module(tool.id, "rdkit", "rdkit.__version__"),
-        "openbabel" => probe_command(tool.id, "obabel", &["-V"]),
+        "openbabel" => {
+            let command_probe = probe_command(tool.id, "obabel", &["-V"]);
+            if command_probe.ready {
+                command_probe
+            } else {
+                probe_python_module(tool.id, "openbabel", "'installed'")
+            }
+        }
         "mmseqs2" => probe_command(tool.id, "mmseqs", &["version"]),
         "foldseek" => probe_command(tool.id, "foldseek", &["version"]),
         "autodock_vina" => probe_command(tool.id, "vina", &["--version"]),
         "openmm" => probe_python_module(tool.id, "openmm", "openmm.version.version"),
         "pdbfixer" => probe_python_module(tool.id, "pdbfixer", "'installed'"),
+        "openff_toolkit" => probe_python_module(tool.id, "openff.toolkit", "'installed'"),
         "mdtraj" => probe_python_module(tool.id, "mdtraj", "mdtraj.__version__"),
         "mdanalysis" => probe_python_module(tool.id, "MDAnalysis", "MDAnalysis.__version__"),
         _ => ToolProbe {
