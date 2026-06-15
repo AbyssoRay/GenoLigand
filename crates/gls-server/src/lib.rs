@@ -312,10 +312,7 @@ fn user_projects_json(options: &ServerOptions) -> Value {
             .unwrap_or("")
             .to_string()
     });
-    json!({
-        "projects": projects,
-        "templates": []
-    })
+    json!({"projects": projects})
 }
 
 fn create_project(options: &ServerOptions) -> Value {
@@ -2569,8 +2566,10 @@ mod tests {
         let payload = user_projects_json(&options);
 
         assert_eq!(payload["projects"].as_array().map(Vec::len), Some(0));
-        assert_eq!(payload["templates"].as_array().map(Vec::len), Some(0));
+        assert!(payload.get("templates").is_none());
         let text = payload.to_string();
+        assert!(!text.contains("templates"));
+        assert!(!text.contains("template"));
         assert!(!text.contains("demo"));
         assert!(!text.contains("sample"));
         assert!(!text.contains("example"));
