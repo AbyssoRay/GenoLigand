@@ -2,18 +2,19 @@
 
 ## 前置条件
 
+普通用户使用发行包时只需要：
+
 - Windows 11
 - PowerShell
-- Rust 工具链
-- Git
-- WSL2 Linux 后端
-- Java 和 Nextflow
 - Python 3.11 或更新版本
-- 需要动力学筛选时，准备 NVIDIA 驱动、WSL CUDA 和 OpenMM
+- WSL2 Linux 后端
+- 需要动力学筛选时，本机具备 NVIDIA 驱动和 WSL CUDA 能力
+
+发行包应包含 `gls-cli`、`gls-server` 和科学工具准备入口。源码开发者才需要 Rust 工具链、Git、Java、Nextflow 或手动调试 Python 环境。
 
 ## 科学资源由安装流程准备
 
-普通用户不手动配置数据库。发行包或管理员预置数据源目录；高级模式可单独维护科学仓库：
+普通用户不手动配置数据库。安装流程读取随包资源清单，下载、校验、索引并记录来源；高级模式只用于维护或修复科学仓库：
 
 ```powershell
 python scripts\setup\install_complete_scientific.py

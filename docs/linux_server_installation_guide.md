@@ -2,12 +2,13 @@
 
 ## 前置条件
 
+普通用户使用发行包时只需要：
+
 - Linux 主机
-- Rust 工具链
-- Git
-- Java 和 Nextflow
 - Python 3.11 或更新版本
-- 可选 NVIDIA GPU、CUDA 和 OpenMM
+- 需要动力学筛选时，本机具备 NVIDIA GPU、CUDA 和 OpenMM 可用条件
+
+发行包应包含 `gls-cli`、`gls-server` 和科学工具准备入口。源码开发者才需要 Rust 工具链、Git、Java、Nextflow 或手动调试 Python 环境。
 
 ## 准备科学仓库
 
@@ -15,7 +16,7 @@
 python scripts/setup/install_complete_scientific.py
 ```
 
-科学仓库由安装流程维护。发行包或管理员预置数据源目录；普通用户只通过 WebUI 提交输入。
+科学仓库由安装流程维护。安装流程读取随包资源清单，下载、校验、索引并记录来源；普通用户只通过 WebUI 提交输入。
 
 ## 启动服务
 

@@ -79,15 +79,22 @@ def resolve_binary_command(
     env_value = os.environ.get(env_name)
     if env_value:
         return command_from_string(env_value)
-    if (root / "Cargo.toml").exists():
-        return ["cargo", "run", "-p", cargo_package, "--"]
     executable = f"{binary_name}.exe" if os.name == "nt" else binary_name
-    built = root / "target" / "debug" / executable
-    if built.exists():
-        return [str(built)]
+    for candidate in [
+        root / "bin" / executable,
+        root / "tools" / "bin" / executable,
+        root / "target" / "release" / executable,
+        root / "target" / "debug" / executable,
+    ]:
+        if candidate.exists():
+            return [str(candidate)]
     on_path = shutil.which(binary_name)
     if on_path:
         return [on_path]
+    if (root / "Cargo.toml").exists():
+        cargo = shutil.which("cargo")
+        if cargo:
+            return [cargo, "run", "-p", cargo_package, "--"]
     return ["cargo", "run", "-p", cargo_package, "--"]
 
 
@@ -100,13 +107,22 @@ def runtime_backend() -> str:
 
 
 def run_command(command: Sequence[str], env: dict[str, str] | None = None) -> subprocess.CompletedProcess[str]:
-    return subprocess.run(
-        list(command),
-        check=False,
-        text=True,
-        capture_output=True,
-        env=env,
-    )
+    command_list = list(command)
+    try:
+        return subprocess.run(
+            command_list,
+            check=False,
+            text=True,
+            capture_output=True,
+            env=env,
+        )
+    except FileNotFoundError as err:
+        return subprocess.CompletedProcess(
+            command_list,
+            127,
+            "",
+            f"command_not_found:{err}",
+        )
 
 
 def load_json(path: Path) -> dict[str, object]:
