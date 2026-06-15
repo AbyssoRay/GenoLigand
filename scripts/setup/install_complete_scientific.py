@@ -19,6 +19,13 @@ def repo_root() -> Path:
     return Path(__file__).resolve().parents[2]
 
 
+def configure_stdio() -> None:
+    for stream in (sys.stdout, sys.stderr):
+        reconfigure = getattr(stream, "reconfigure", None)
+        if callable(reconfigure):
+            reconfigure(encoding="utf-8", errors="replace")
+
+
 def default_science_store() -> Path:
     explicit = os.environ.get("GENOLIGAND_SCIENCE_STORE")
     if explicit:
@@ -100,6 +107,15 @@ def run_command(command: Sequence[str], env: dict[str, str] | None = None) -> su
         capture_output=True,
         env=env,
     )
+
+
+def load_json(path: Path) -> dict[str, object]:
+    if not path.exists():
+        return {}
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError:
+        return {"status": "unreadable"}
 
 
 def default_source_catalog(workspace_root: Path, science_store: Path) -> Path:
@@ -262,7 +278,41 @@ def prepare_downloads(catalog: Path, science_store: Path) -> dict[str, object]:
         }
 
 
+def download_summary(download_result: dict[str, object]) -> dict[str, object]:
+    return {
+        "status": download_result.get("status", "unknown"),
+        "ready": download_result.get("ready", 0),
+        "failed": download_result.get("failed", 0),
+    }
+
+
+def installation_status(science_store: Path, completed: subprocess.CompletedProcess[str]) -> dict[str, object]:
+    status_payload = load_json(science_store / "install_status.json")
+    store_status = str(status_payload.get("status", "")).strip()
+    missing = status_payload.get("missing_components", [])
+    missing_count = len(missing) if isinstance(missing, list) else 0
+    if completed.returncode != 0:
+        status = "failed"
+        summary = "安装/修复未完成。"
+        next_action = "检查安装环境后重新运行安装/修复"
+    elif store_status == "ready":
+        status = "ready"
+        summary = "科学仓库已就绪。"
+        next_action = "打开 WebUI 并输入研究对象"
+    else:
+        status = "needs_repair"
+        summary = "安装/修复已执行，但仍有资源需要准备。"
+        next_action = "补齐缺失资源后重新运行安装/修复"
+    return {
+        "status": status,
+        "summary": summary,
+        "next_action": next_action,
+        "missing_components_count": missing_count,
+    }
+
+
 def main() -> int:
+    configure_stdio()
     parser = argparse.ArgumentParser(
         description="Prepare or validate the GenoLigand local science store."
     )
@@ -276,6 +326,7 @@ def main() -> int:
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", default="19090")
     parser.add_argument("--start-webui", action="store_true")
+    parser.add_argument("--debug-output", action="store_true")
     args = parser.parse_args()
 
     workspace_root = Path(args.workspace_root).resolve()
@@ -309,19 +360,25 @@ def main() -> int:
         str(science_store),
     ]
     completed = run_command(command)
-    payload = {
-        "status": "prepared" if completed.returncode == 0 else "failed",
-        "command": command,
+    install_status = installation_status(science_store, completed)
+    payload: dict[str, object] = {
+        **install_status,
         "returncode": completed.returncode,
-        "stdout": completed.stdout.strip(),
-        "stderr": completed.stderr.strip(),
-        "downloads": download_result,
+        "downloads": download_summary(download_result),
         "runtime_backend": runtime_backend(),
-        "workspace_root": str(workspace_root),
-        "science_store": str(science_store),
-        "runtime_dir": str(runtime_dir),
         "access_url": f"http://{args.host}:{args.port}/",
     }
+    if args.debug_output:
+        payload["debug"] = {
+            "command": command,
+            "stdout": completed.stdout.strip(),
+            "stderr": completed.stderr.strip(),
+            "workspace_root": str(workspace_root),
+            "science_store": str(science_store),
+            "runtime_dir": str(runtime_dir),
+            "download_manifest": download_result.get("manifest", ""),
+            "source_catalog": download_result.get("catalog", ""),
+        }
     print(json.dumps(payload, ensure_ascii=False, indent=2))
     if completed.returncode != 0 or not args.start_webui:
         return completed.returncode
@@ -350,10 +407,8 @@ def main() -> int:
         json.dumps(
             {
                 "status": "starting_webui",
-                "command": server_command,
+                "summary": "WebUI 正在启动。",
                 "access_url": f"http://{args.host}:{args.port}/",
-                "science_store": str(science_store),
-                "runtime_dir": str(runtime_dir),
             },
             ensure_ascii=False,
             indent=2,

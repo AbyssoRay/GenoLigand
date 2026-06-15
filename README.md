@@ -17,21 +17,7 @@ python scripts\setup\install_complete_scientific.py --start-webui
 http://127.0.0.1:19090/
 ```
 
-该命令会选择用户数据目录作为科学仓库，检查工具、数据库来源、索引和修复动作，然后启动本地 WebUI。
-
-如需让安装流程自动拉取数据源，在科学仓库根目录放置 `source_catalog.tsv`，或使用：
-
-```powershell
-python scripts\setup\install_complete_scientific.py --source-catalog path\to\source_catalog.tsv
-```
-
-`source_catalog.tsv` 使用制表符分隔，列为：
-
-```text
-source_id	url	local_path	sha256
-```
-
-`url` 可以是 HTTPS 地址或本地文件路径；`local_path` 是科学仓库内的目标路径；`sha256` 可为空，填写后会强制校验。
+该命令会选择用户数据目录作为科学仓库，检查工具、数据库来源、索引和修复动作，然后启动本地 WebUI。发行包或管理员可以预置数据源目录；普通用户不需要配置数据库路径。
 
 ## 准备科学仓库
 
@@ -47,8 +33,10 @@ python scripts\setup\install_complete_scientific.py
 - `indexes/known_targets.tsv`
 - `indexes/metagenome_targets.tsv`
 - `indexes/tool_versions.tsv`
+- `install_status.json`
+- `source_requirements.tsv`
 
-缺少研究输入、数据库索引或必要工具时，主流程阻塞并输出零候选。
+缺少研究输入、数据库索引、必要工具、安装状态或科学资源状态时，主流程阻塞并输出零候选。
 
 ## 主流程
 

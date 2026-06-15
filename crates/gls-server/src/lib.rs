@@ -726,10 +726,20 @@ fn run_setup_repair_json(options: &ServerOptions) -> Value {
     };
     let ready = preflight_store_ready(options);
     let required = required_resource_rows(&science_store_path(options));
+    let user_message = if ready {
+        "科学仓库已就绪。".to_string()
+    } else {
+        installer_payload
+            .as_ref()
+            .and_then(|payload| payload.get("summary").and_then(Value::as_str))
+            .filter(|summary| !summary.trim().is_empty())
+            .map(ToOwned::to_owned)
+            .unwrap_or(message)
+    };
     let mut payload = json!({
         "status": if executed {"repair_executed"} else {"repair_failed"},
         "database_ready": ready,
-        "message": if ready {"科学仓库已就绪。"} else {message.as_str()},
+        "message": user_message,
         "checks": required,
         "missing": missing_resource_rows(&required)
     });
@@ -799,6 +809,9 @@ fn setup_installer_summary(stdout: &str) -> Option<Value> {
     Some(json!({
         "status": payload.get("status").cloned().unwrap_or_else(|| json!("unknown")),
         "runtime_backend": payload.get("runtime_backend").cloned().unwrap_or_else(|| json!("unknown")),
+        "summary": payload.get("summary").cloned().unwrap_or_else(|| json!("")),
+        "next_action": payload.get("next_action").cloned().unwrap_or_else(|| json!("运行安装/修复")),
+        "missing_components_count": payload.get("missing_components_count").cloned().unwrap_or_else(|| json!(0)),
         "downloads": {
             "status": downloads.get("status").cloned().unwrap_or_else(|| json!("unknown")),
             "ready": downloads.get("ready").cloned().unwrap_or_else(|| json!(0)),
@@ -1551,13 +1564,16 @@ mod tests {
     #[test]
     fn setup_installer_summary_keeps_user_relevant_fields_only() {
         let payload = setup_installer_summary(
-            r#"{"status":"prepared","command":["cargo","run"],"stdout":"raw","downloads":{"status":"ready","ready":2,"failed":0}}"#,
+            r#"{"status":"needs_repair","summary":"安装/修复已执行，但仍有资源需要准备。","next_action":"补齐缺失资源后重新运行安装/修复","missing_components_count":3,"debug":{"command":["cargo","run"],"stdout":"raw"},"downloads":{"status":"ready","ready":2,"failed":0}}"#,
         )
         .expect("installer json");
 
-        assert_eq!(payload["status"], "prepared");
+        assert_eq!(payload["status"], "needs_repair");
+        assert_eq!(payload["missing_components_count"], 3);
+        assert_eq!(payload["next_action"], "补齐缺失资源后重新运行安装/修复");
         assert_eq!(payload["downloads"]["status"], "ready");
         assert_eq!(payload["downloads"]["ready"], 2);
+        assert!(payload.get("debug").is_none());
         assert!(payload.get("command").is_none());
         assert!(payload.get("stdout").is_none());
     }
