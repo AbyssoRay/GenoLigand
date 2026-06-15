@@ -734,13 +734,13 @@ function structureSection(rows) {
       <div class="panel-header">
         <div>
           <h2>结构/口袋</h2>
-          <p>${rows.length ? "结构和口袋摘要来自当前运行输出。" : "当前运行没有结构或口袋摘要。"}</p>
+          <p>${rows.length ? "当前显示结构和口袋表格摘要；图形查看未就绪。" : "当前运行没有结构或口袋摘要；图形查看未就绪。"}</p>
         </div>
         <span class="status-pill ${outputStatusClass(rows)}">${rows.length ? `${rows.length} 行` : "未就绪"}</span>
       </div>
       ${visualStatus([
         { label: "摘要表", value: rows.length ? "已生成" : "未生成", ready: rows.length > 0 },
-        { label: "三维查看器", value: "未接入可用输出", ready: false, waiting: true },
+        { label: "三维查看器", value: "图形查看未就绪", ready: false, waiting: true },
         { label: "数据来源", value: rows.length ? "当前运行输出" : "等待运行输出", ready: rows.length > 0 },
       ])}
       ${rows.length ? table(rows, columnsFor("structure")) : `<div class="empty">未生成结构查看数据或口袋摘要。</div>`}
@@ -753,13 +753,13 @@ function mdSection(rows) {
       <div class="panel-header">
         <div>
           <h2>动力学摘要</h2>
-          <p>${rows.length ? "动力学摘要来自当前运行输出。" : "当前运行没有轨迹摘要。"}</p>
+          <p>${rows.length ? "当前显示动力学表格摘要；轨迹图未就绪。" : "当前运行没有轨迹摘要；轨迹图未就绪。"}</p>
         </div>
         <span class="status-pill ${outputStatusClass(rows)}">${rows.length ? `${rows.length} 行` : "未就绪"}</span>
       </div>
       ${visualStatus([
         { label: "摘要表", value: rows.length ? "已生成" : "未生成", ready: rows.length > 0 },
-        { label: "轨迹图", value: "未接入可用输出", ready: false, waiting: true },
+        { label: "轨迹图", value: "轨迹图未就绪", ready: false, waiting: true },
         { label: "数据来源", value: rows.length ? "当前运行输出" : "等待运行输出", ready: rows.length > 0 },
       ])}
       ${rows.length ? table(rows, columnsFor("md")) : `<div class="empty">未生成 RMSD、RMSF、接触或配体漂移摘要。</div>`}

@@ -1078,7 +1078,7 @@ fn user_structure_row(row: &Value, targets: &BTreeMap<String, (String, String)>)
         } else {
             "\u{5df2}\u{751f}\u{6210}\u{7ed3}\u{6784}\u{6458}\u{8981}"
         },
-        "viewer_status": "\u{672a}\u{63a5}\u{5165}\u{53ef}\u{7528}\u{4e09}\u{7ef4}\u{67e5}\u{770b}\u{8f93}\u{51fa}",
+        "viewer_status": "\u{56fe}\u{5f62}\u{67e5}\u{770b}\u{672a}\u{5c31}\u{7eea}",
         "result_source": "\u{7ed3}\u{6784}\u{4e0e}\u{53e3}\u{888b}\u{6458}\u{8981}\u{8f93}\u{51fa}"
     })
 }
@@ -1118,7 +1118,7 @@ fn user_md_row(row: &Value, targets: &BTreeMap<String, (String, String)>) -> Val
         } else {
             "\u{5df2}\u{751f}\u{6210}\u{52a8}\u{529b}\u{5b66}\u{6458}\u{8981}"
         },
-        "trajectory_status": "\u{672a}\u{63a5}\u{5165}\u{53ef}\u{7528}\u{8f68}\u{8ff9}\u{56fe}\u{8f93}\u{51fa}",
+        "trajectory_status": "\u{8f68}\u{8ff9}\u{56fe}\u{672a}\u{5c31}\u{7eea}",
         "result_source": "\u{52a8}\u{529b}\u{5b66}\u{6458}\u{8981}\u{8f93}\u{51fa}"
     })
 }
@@ -2654,6 +2654,19 @@ mod tests {
         assert!(artifact_rows.contains("filter((item) => item.exists)"));
         assert!(artifact_rows.contains("可下载"));
         assert!(!artifact_rows.contains("未生成"));
+    }
+
+    #[test]
+    fn visual_result_sections_use_clear_not_ready_language() {
+        let app = include_str!("../../../webui/app/app.js");
+        assert!(app.contains("图形查看未就绪"));
+        assert!(app.contains("轨迹图未就绪"));
+        assert!(!app.contains("未接入可用输出"));
+
+        let structure = user_structure_row(&json!({"candidate_id":"C1"}), &BTreeMap::new());
+        let md = user_md_row(&json!({"candidate_id":"C1"}), &BTreeMap::new());
+        assert_eq!(structure["viewer_status"], "图形查看未就绪");
+        assert_eq!(md["trajectory_status"], "轨迹图未就绪");
     }
 
     #[test]
