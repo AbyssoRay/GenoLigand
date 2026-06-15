@@ -1652,48 +1652,58 @@ fn match_metagenome(options: &ScienceOptions) -> Result<String, String> {
 }
 
 fn evaluate_structure(options: &ScienceOptions) -> Result<String, String> {
-    let candidates = read_candidates(&options.run_dir.join("target_candidate_ranking.tsv"))?;
-    let mut text = String::from(
+    let structure = options.run_dir.join("structure_patch_summary.tsv");
+    let docking = options.run_dir.join("docking_summary.tsv");
+    let structure_ready = copy_tool_output_or_header(
+        options,
+        "structure_patch_summary.tsv",
         "candidate_id\tstructure_score\tstructure_evidence\tbinding_patch\tpatch_evidence\tkey_residues\tdocking_score\tdocking_pose\tligand_position\tinteraction_residues\n",
-    );
-    for candidate in candidates {
-        if candidate.final_score > 0.0 {
-            let structure_score =
-                (candidate.known_score.max(candidate.metagenome_score) * 0.8).min(1.0);
-            text.push_str(&format!(
-                "{}\t{structure_score:.4}\tmatched_structure_or_pocket_tokens\tpatch_{}\t{}\t{}\t\t\t\t{}\n",
-                candidate.candidate_id,
-                safe_id(&candidate.target_id),
-                clean_cell(&candidate.evidence),
-                inferred_residues(&candidate.target_name),
-                inferred_residues(&candidate.target_name)
-            ));
-        }
-    }
-    write_text(&options.run_dir.join("structure_patch_summary.tsv"), &text)?;
-    write_text(
-        &options.run_dir.join("docking_summary.tsv"),
-        "candidate_id\tdocking_status\tdocking_score\tdocking_engine\tnotes\n",
+        &structure,
     )?;
-    Ok("structure_evaluated".to_string())
+    let docking_ready = copy_tool_output_or_header(
+        options,
+        "docking_summary.tsv",
+        "candidate_id\tdocking_status\tdocking_score\tdocking_engine\tnotes\n",
+        &docking,
+    )?;
+    Ok(format!(
+        "structure_evaluated\tstructure_artifact={}\tdocking_artifact={}",
+        if structure_ready {
+            "ready"
+        } else {
+            "not_ready"
+        },
+        if docking_ready { "ready" } else { "not_ready" }
+    ))
 }
 
 fn screen_dynamics(options: &ScienceOptions) -> Result<String, String> {
-    let candidates = read_candidates(&options.run_dir.join("target_candidate_ranking.tsv"))?;
-    let mut text = String::from(
+    let ready = copy_tool_output_or_header(
+        options,
+        "md_summary.tsv",
         "candidate_id\trmsd\trmsf\tligand_drift\thydrogen_bond_occupancy\tcontact_occupancy\tinteraction_persistence\tmd_risk_flags\tmd_score_decomposition\tmd_stability_score\n",
-    );
-    for candidate in candidates {
-        if candidate.final_score > 0.0 {
-            let md = (candidate.final_score * 0.5).min(1.0);
-            text.push_str(&format!(
-                "{}\t\t\t\t\t\t\tmd_not_run_without_openmm_result\tcomputed_from_database_evidence_only\t{md:.4}\n",
-                candidate.candidate_id
-            ));
-        }
+        &options.run_dir.join("md_summary.tsv"),
+    )?;
+    Ok(format!(
+        "dynamics_screened\tmd_artifact={}",
+        if ready { "ready" } else { "not_ready" }
+    ))
+}
+
+fn copy_tool_output_or_header(
+    options: &ScienceOptions,
+    file_name: &str,
+    header: &str,
+    out_path: &Path,
+) -> Result<bool, String> {
+    let tool_output = options.run_dir.join("tool_outputs").join(file_name);
+    if tool_output.exists() {
+        let text = read_text(&tool_output)?;
+        write_text(out_path, &text)?;
+        return Ok(text.lines().skip(1).any(|line| !line.trim().is_empty()));
     }
-    write_text(&options.run_dir.join("md_summary.tsv"), &text)?;
-    Ok("dynamics_screened".to_string())
+    write_text(out_path, header)?;
+    Ok(false)
 }
 
 fn rank_targets(options: &ScienceOptions) -> Result<String, String> {
@@ -1781,17 +1791,15 @@ fn build_evidence(options: &ScienceOptions) -> Result<String, String> {
 
 fn render_report(options: &ScienceOptions) -> Result<String, String> {
     let candidates = read_candidates(&options.run_dir.join("target_candidate_ranking.tsv"))?;
-    let mut text = String::from("# GenoLigand 科研报告\n\n");
+    let mut text = String::from("# GenoLigand \u{79d1}\u{7814}\u{62a5}\u{544a}\n\n");
     text.push_str(
-        "本报告只包含计算预测和证据优先级，不代表实验验证、体内结合、药效或作用机制确认。\n\n",
+        "\u{672c}\u{62a5}\u{544a}\u{53ea}\u{5305}\u{542b}\u{8ba1}\u{7b97}\u{9884}\u{6d4b}\u{3001}\u{5019}\u{9009}\u{4f18}\u{5148}\u{7ea7}\u{548c}\u{8bc1}\u{636e}\u{6458}\u{8981}\u{ff0c}\u{4e0d}\u{4ee3}\u{8868}\u{5b9e}\u{9a8c}\u{9a8c}\u{8bc1}\u{3001}\u{4f53}\u{5185}\u{7ed3}\u{5408}\u{3001}\u{836f}\u{6548}\u{6216}\u{4f5c}\u{7528}\u{673a}\u{5236}\u{786e}\u{8ba4}\u{3002}\n\n",
     );
-    text.push_str("## 候选靶点\n\n");
+    text.push_str("## \u{5019}\u{9009}\u{9776}\u{70b9}\n\n");
     if candidates.is_empty() {
-        text.push_str(
-            "当前运行没有生成候选靶点。可能原因是没有匹配证据，或计算在开始前被运行条件阻塞。\n",
-        );
+        text.push_str("\u{5f53}\u{524d}\u{8fd0}\u{884c}\u{6ca1}\u{6709}\u{751f}\u{6210}\u{5019}\u{9009}\u{9776}\u{70b9}\u{3002}\u{53ef}\u{80fd}\u{539f}\u{56e0}\u{662f}\u{6ca1}\u{6709}\u{5339}\u{914d}\u{8bc1}\u{636e}\u{ff0c}\u{6216}\u{8ba1}\u{7b97}\u{5728}\u{5f00}\u{59cb}\u{524d}\u{88ab}\u{8fd0}\u{884c}\u{6761}\u{4ef6}\u{963b}\u{585e}\u{3002}\n");
     } else {
-        text.push_str("| 排序 | 靶点 | 候选范围 | 物种 | 综合分数 | 证据摘要 |\n");
+        text.push_str("| \u{6392}\u{5e8f} | \u{9776}\u{70b9} | \u{5019}\u{9009}\u{8303}\u{56f4} | \u{7269}\u{79cd} | \u{7efc}\u{5408}\u{5206}\u{6570} | \u{8bc1}\u{636e}\u{6458}\u{8981} |\n");
         text.push_str("| --- | --- | --- | --- | --- | --- |\n");
         for (index, candidate) in candidates.iter().enumerate() {
             text.push_str(&format!(
@@ -1806,7 +1814,7 @@ fn render_report(options: &ScienceOptions) -> Result<String, String> {
             ));
         }
         text.push_str(
-            "\n建议把排序靠前的候选作为后续实验验证的优先对象，而不是直接视为已确认靶点。\n",
+            "\n\u{5efa}\u{8bae}\u{628a}\u{6392}\u{5e8f}\u{9760}\u{524d}\u{7684}\u{5019}\u{9009}\u{4f5c}\u{4e3a}\u{540e}\u{7eed}\u{5b9e}\u{9a8c}\u{9a8c}\u{8bc1}\u{7684}\u{4f18}\u{5148}\u{5bf9}\u{8c61}\u{ff0c}\u{800c}\u{4e0d}\u{662f}\u{76f4}\u{63a5}\u{89c6}\u{4e3a}\u{5df2}\u{786e}\u{8ba4}\u{9776}\u{70b9}\u{3002}\n",
         );
     }
     write_text(&options.run_dir.join("research_report.md"), &text)?;
@@ -1815,13 +1823,16 @@ fn render_report(options: &ScienceOptions) -> Result<String, String> {
 
 fn report_scope_label(value: &str) -> &'static str {
     match value {
-        "known_database" | "known_human_protein" => "已知蛋白数据库",
-        "metagenome_potential" | "metagenome_potential_protein" => "宏基因组潜在序列",
-        "structure_interaction" => "结构互作证据",
-        _ => "计算候选",
+        "known_database" | "known_human_protein" => {
+            "\u{5df2}\u{77e5}\u{86cb}\u{767d}\u{6570}\u{636e}\u{5e93}"
+        }
+        "metagenome_potential" | "metagenome_potential_protein" => {
+            "\u{5b8f}\u{57fa}\u{56e0}\u{7ec4}\u{6f5c}\u{5728}\u{5e8f}\u{5217}"
+        }
+        "structure_interaction" => "\u{7ed3}\u{6784}\u{4e92}\u{4f5c}\u{8bc1}\u{636e}",
+        _ => "\u{8ba1}\u{7b97}\u{5019}\u{9009}",
     }
 }
-
 fn write_run_context(
     options: &ScienceOptions,
     state: &str,
@@ -1996,21 +2007,21 @@ fn write_artifact_source_map(options: &ScienceOptions) -> Result<(), String> {
         (
             "target_candidate_ranking.tsv",
             "known_database_matches.tsv;metagenome_potential_matches.tsv",
-            "candidate_detail.json;structure_patch_summary.tsv;md_summary.tsv",
+            "candidate_detail.json",
         ),
         (
             "structure_patch_summary.tsv",
-            "target_candidate_ranking.tsv",
+            "tool_outputs/structure_patch_summary.tsv when available;otherwise header-only not-ready artifact",
             "evidence_ledger.tsv",
         ),
         (
             "docking_summary.tsv",
-            "target_candidate_ranking.tsv",
+            "tool_outputs/docking_summary.tsv when available;otherwise header-only not-ready artifact",
             "evidence_ledger.tsv",
         ),
         (
             "md_summary.tsv",
-            "target_candidate_ranking.tsv",
+            "tool_outputs/md_summary.tsv when available;otherwise header-only not-ready artifact",
             "evidence_ledger.tsv",
         ),
         (
@@ -2684,20 +2695,6 @@ fn tokenize(value: &str) -> BTreeSet<String> {
         .collect()
 }
 
-fn inferred_residues(name: &str) -> String {
-    let letters = name
-        .chars()
-        .filter(|ch| ch.is_ascii_alphabetic())
-        .take(3)
-        .collect::<String>()
-        .to_ascii_uppercase();
-    if letters.is_empty() {
-        "UNK".to_string()
-    } else {
-        letters
-    }
-}
-
 fn write_json_manifest(path: &Path, artifact: &str, status: &str) -> Result<(), String> {
     write_text(
         path,
@@ -2850,10 +2847,15 @@ mod tests {
         let source_map = read_text(&run.join("artifact_source_map.tsv")).expect("source map");
         let evidence = read_text(&run.join("evidence_ledger.tsv")).expect("evidence ledger");
         let report = read_text(&run.join("research_report.md")).expect("research report");
+        let structure =
+            read_text(&run.join("structure_patch_summary.tsv")).expect("structure summary");
+        let docking = read_text(&run.join("docking_summary.tsv")).expect("docking summary");
+        let md = read_text(&run.join("md_summary.tsv")).expect("md summary");
         assert!(detail.contains("\"candidates\""));
         assert!(detail.contains("\"candidate_id\""));
         assert!(context.contains("\"state\":\"completed\""));
         assert!(source_map.contains("research_report.md"));
+        assert!(source_map.contains("tool_outputs/structure_patch_summary.tsv"));
         assert!(evidence.contains("score_decomposition"));
         assert!(report.contains("# GenoLigand 科研报告"));
         assert!(report.contains("计算预测"));
@@ -2863,6 +2865,59 @@ mod tests {
         assert!(!report.contains("No candidate target"));
         assert!(!report.contains("known_database"));
         assert!(!report.contains("metagenome_potential"));
+        assert_eq!(structure.lines().count(), 1);
+        assert_eq!(docking.lines().count(), 1);
+        assert_eq!(md.lines().count(), 1);
+        assert!(!structure.contains("matched_structure_or_pocket_tokens"));
+        assert!(!structure.contains("patch_P24941"));
+        assert!(!md.contains("computed_from_database_evidence_only"));
+        fs::remove_dir_all(&root).expect("cleanup temp root");
+        assert!(!root.exists());
+    }
+
+    #[test]
+    fn structure_and_dynamics_use_only_tool_outputs_when_present() {
+        let root = temp_root("tool_outputs");
+        let run = root.join("run");
+        let store = root.join("science_store");
+        let input = root.join("input.json");
+        write_text(&input, "{\"inputs\":[],\"files\":[]}\n").expect("input");
+        write_text(
+            &run.join("tool_outputs/structure_patch_summary.tsv"),
+            "candidate_id\tstructure_score\tstructure_evidence\tbinding_patch\tpatch_evidence\tkey_residues\tdocking_score\tdocking_pose\tligand_position\tinteraction_residues\ncandidate_1\t0.9\tworker_structure\tpatch_1\tworker_patch\tHIS57\t\t\t\tHIS57\n",
+        )
+        .expect("structure output");
+        write_text(
+            &run.join("tool_outputs/docking_summary.tsv"),
+            "candidate_id\tdocking_status\tdocking_score\tdocking_engine\tnotes\ncandidate_1\tcompleted\t-7.1\tvina\tworker_pose\n",
+        )
+        .expect("docking output");
+        write_text(
+            &run.join("tool_outputs/md_summary.tsv"),
+            "candidate_id\trmsd\trmsf\tligand_drift\thydrogen_bond_occupancy\tcontact_occupancy\tinteraction_persistence\tmd_risk_flags\tmd_score_decomposition\tmd_stability_score\ncandidate_1\t1.2\t0.4\t0.6\t0.72\t0.81\t0.77\tstable\tworker_md\t0.8\n",
+        )
+        .expect("md output");
+        let options = ScienceOptions {
+            workspace_root: root.clone(),
+            science_store: store,
+            input_manifest: input,
+            run_dir: run.clone(),
+        };
+        let structure =
+            run_science_command(ScienceCommand::StructureEvaluate, &options).expect("structure");
+        let dynamics =
+            run_science_command(ScienceCommand::DynamicsScreen, &options).expect("dynamics");
+        let structure_text =
+            read_text(&run.join("structure_patch_summary.tsv")).expect("structure summary");
+        let docking_text = read_text(&run.join("docking_summary.tsv")).expect("docking summary");
+        let md_text = read_text(&run.join("md_summary.tsv")).expect("md summary");
+
+        assert!(structure.contains("structure_artifact=ready"));
+        assert!(structure.contains("docking_artifact=ready"));
+        assert!(dynamics.contains("md_artifact=ready"));
+        assert!(structure_text.contains("worker_structure"));
+        assert!(docking_text.contains("worker_pose"));
+        assert!(md_text.contains("worker_md"));
         fs::remove_dir_all(&root).expect("cleanup temp root");
         assert!(!root.exists());
     }
