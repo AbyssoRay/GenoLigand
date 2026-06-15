@@ -29,7 +29,7 @@ const inputSpecs = [
     title: "小分子",
     field: "small_molecule",
     label: "SMILES、SDF、MOL2、化合物名称或登记号",
-    placeholder: "例如：粘贴 SMILES，或填写本机结构文件路径",
+    placeholder: "粘贴 SMILES，或填写本机结构文件路径",
     minimum: "至少提供一个可解析的分子表示。",
   },
   {
@@ -37,7 +37,7 @@ const inputSpecs = [
     title: "多肽",
     field: "peptide",
     label: "短肽序列、修饰说明或结构文件",
-    placeholder: "例如：输入肽序列，修饰可另起一行说明",
+    placeholder: "输入肽序列；修饰说明可另起一行填写",
     minimum: "至少提供肽序列或结构文件路径。",
   },
   {
@@ -45,7 +45,7 @@ const inputSpecs = [
     title: "蛋白质配体",
     field: "protein_ligand",
     label: "FASTA、蛋白序列或结构文件",
-    placeholder: "例如：粘贴 FASTA 或填写结构文件路径",
+    placeholder: "粘贴 FASTA、蛋白序列，或填写结构文件路径",
     minimum: "至少提供序列或结构文件路径。",
   },
   {
@@ -53,7 +53,7 @@ const inputSpecs = [
     title: "复合物结构",
     field: "complex",
     label: "蛋白-配体复合物结构、链信息或结合区域",
-    placeholder: "例如：填写 PDB/mmCIF 文件路径，并注明链或配体",
+    placeholder: "填写 PDB/mmCIF 文件路径，并注明链或配体",
     minimum: "至少提供结构文件路径或复合物描述。",
   },
   {
@@ -61,7 +61,7 @@ const inputSpecs = [
     title: "自定义基因组",
     field: "genome_or_metagenome",
     label: "基因组、宏基因组、转录组或蛋白序列文件",
-    placeholder: "例如：填写 FASTA/FASTQ 文件路径或粘贴蛋白序列",
+    placeholder: "填写 FASTA/FASTQ 文件路径，或粘贴蛋白序列",
     minimum: "至少提供序列文件路径或序列文本。",
   },
 ];
@@ -1021,8 +1021,10 @@ function friendlyArtifact(name) {
 
 function friendlyScope(value) {
   return {
-    known_database: "已知数据库",
+    known_database: "已知蛋白数据库",
+    known_human_protein: "已知蛋白数据库",
     metagenome_potential: "宏基因组潜在序列",
+    metagenome_potential_protein: "宏基因组潜在序列",
     structure_interaction: "结构互作",
   }[value] || value || "未提供";
 }
@@ -1030,8 +1032,25 @@ function friendlyScope(value) {
 function formatCell(key, value) {
   if (value === undefined || value === null || value === "") return "未提供";
   if (key === "candidate_scope") return friendlyScope(value);
-  if (key === "status") return runStateLabel(value);
+  if (key === "status") return friendlyStatus(value);
   return value;
+}
+
+function friendlyStatus(value) {
+  return {
+    not_started: "未开始",
+    created: "已创建",
+    running: "运行中",
+    completed: "已完成",
+    blocked: "已阻塞",
+    failed: "失败",
+    cancelled: "已取消",
+    resumable: "可恢复",
+    computed_prediction: "计算候选",
+    ready: "就绪",
+    missing: "缺失",
+    unavailable: "不可用",
+  }[value] || value || "未提供";
 }
 
 function escapeHtml(value) {
