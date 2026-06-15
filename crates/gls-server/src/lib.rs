@@ -553,11 +553,13 @@ fn run_json(options: &ServerOptions, run_id: &str) -> Value {
     let Some(run_dir) = find_run_dir(options, run_id) else {
         return json!({"run_id":run_id,"state":"not_found"});
     };
+    let state = run_state(&run_dir);
     json!({
         "run_id": run_id,
-        "state": run_state(&run_dir),
+        "state": state,
         "current_stage": read_trimmed(&run_dir.join("current_stage.txt")).unwrap_or_default(),
         "failure_summary": friendly_failure_summary(read_trimmed(&run_dir.join("failure_reason.txt")).as_deref()),
+        "trace": run_trace(options, &run_dir, run_id),
         "artifact_index": artifact_index(&run_dir)
     })
 }
@@ -1069,6 +1071,55 @@ fn run_state(run_dir: &Path) -> String {
     read_trimmed(&run_dir.join("run_state.txt")).unwrap_or_else(|| "created".to_string())
 }
 
+fn run_trace(options: &ServerOptions, run_dir: &Path, run_id: &str) -> Value {
+    let project = run_dir
+        .parent()
+        .and_then(Path::parent)
+        .map(Path::to_path_buf);
+    let project_name = project
+        .as_ref()
+        .and_then(|dir| read_trimmed(&dir.join("project_name.txt")))
+        .unwrap_or_else(|| "未命名研究项目".to_string());
+    let input_ready = project
+        .as_ref()
+        .map(|dir| input_has_user_value(&dir.join("input_manifest.json")))
+        .unwrap_or(false);
+    let artifact_items = artifact_index(run_dir);
+    let output_count = artifact_items["items"]
+        .as_array()
+        .map(|items| {
+            items
+                .iter()
+                .filter(|item| item.get("exists").and_then(Value::as_bool).unwrap_or(false))
+                .count()
+        })
+        .unwrap_or(0);
+    let state = run_state(run_dir);
+    let completed = state == "completed";
+    let candidate_rows = if completed {
+        rows_len(&run_dir.join("target_candidate_ranking.tsv"))
+    } else {
+        0
+    };
+    let evidence_rows = if completed {
+        rows_len(&run_dir.join("evidence_ledger.tsv"))
+    } else {
+        0
+    };
+    json!({
+        "project_label": project_name,
+        "run_label": if run_id.is_empty() { "未选择运行" } else { "当前运行" },
+        "input_status": if input_ready { "已保存用户输入" } else { "未保存用户输入" },
+        "database_status": if preflight_store_ready(options) { "科学仓库就绪" } else { "科学仓库未就绪" },
+        "output_status": if completed && output_count > 0 { "已生成输出" } else if state == "blocked" { "已记录阻塞信息" } else { "暂无输出" },
+        "output_count": output_count,
+        "candidate_status": if candidate_rows > 0 { "已生成候选排序" } else { "暂无候选排序" },
+        "candidate_count": candidate_rows,
+        "evidence_status": if evidence_rows > 0 { "已生成证据链" } else { "暂无证据链" },
+        "evidence_count": evidence_rows
+    })
+}
+
 fn input_project_name(value: &Value) -> Option<String> {
     value
         .get("inputs")
@@ -1111,11 +1162,26 @@ fn read_json_or(path: &Path, fallback: Value) -> Value {
 
 fn artifact_index(run_dir: &Path) -> Value {
     let mut items = Vec::new();
+    let completed = run_state(run_dir) == "completed";
     for (id, label, file) in artifact_specs() {
         let path = run_dir.join(file);
-        items.push(json!({"id":id,"label":label,"exists":path.exists()}));
+        items.push(json!({"id":id,"label":label,"exists":artifact_visible_for_user(id, &path, run_dir, completed)}));
     }
     json!({"items":items})
+}
+
+fn artifact_visible_for_user(id: &str, path: &Path, run_dir: &Path, completed: bool) -> bool {
+    if !path.exists() {
+        return false;
+    }
+    match id {
+        "run_summary" | "run_table" | "source_trace" => true,
+        "candidate_ranking" | "candidate_detail" => {
+            completed && rows_len(&run_dir.join("target_candidate_ranking.tsv")) > 0
+        }
+        "evidence" => completed && rows_len(path) > 0,
+        _ => completed,
+    }
 }
 
 fn artifact_specs() -> &'static [(&'static str, &'static str, &'static str)] {
@@ -1445,6 +1511,55 @@ mod tests {
     }
 
     #[test]
+    fn blocked_run_trace_does_not_present_scientific_results() {
+        let root = std::env::temp_dir().join(format!("genoligand-blocked-trace-{}", now_millis()));
+        let options = server_options(root.clone());
+        let project_dir = projects_root(&options).join("project-1");
+        let run_dir = project_dir.join("runs").join("run-1");
+        fs::create_dir_all(&run_dir).expect("create run dir");
+        fs::write(
+            project_dir.join("input_manifest.json"),
+            r#"{"inputs":[{"field":"small_molecule","value":"CCO"}]}"#,
+        )
+        .expect("input");
+        fs::write(run_dir.join("run_state.txt"), "blocked\n").expect("run state");
+        fs::write(
+            run_dir.join("target_candidate_ranking.tsv"),
+            "candidate_id\n",
+        )
+        .expect("candidate table");
+        fs::write(
+            run_dir.join("evidence_ledger.tsv"),
+            "claim_id\tstatus\nblocked\tmissing_store\n",
+        )
+        .expect("blocked evidence");
+
+        let run = run_json(&options, "run-1");
+        assert_eq!(run["trace"]["output_status"], "已记录阻塞信息");
+        assert_eq!(run["trace"]["candidate_status"], "暂无候选排序");
+        assert_eq!(run["trace"]["candidate_count"], 0);
+        assert_eq!(run["trace"]["evidence_status"], "暂无证据链");
+        assert_eq!(run["trace"]["evidence_count"], 0);
+        let items = run["artifact_index"]["items"]
+            .as_array()
+            .expect("artifact items");
+        let candidate_visible = items
+            .iter()
+            .find(|item| item.get("id").and_then(Value::as_str) == Some("candidate_ranking"))
+            .and_then(|item| item.get("exists").and_then(Value::as_bool))
+            .unwrap_or(true);
+        let evidence_visible = items
+            .iter()
+            .find(|item| item.get("id").and_then(Value::as_str) == Some("evidence"))
+            .and_then(|item| item.get("exists").and_then(Value::as_bool))
+            .unwrap_or(true);
+        assert!(!candidate_visible);
+        assert!(!evidence_visible);
+
+        fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
     fn user_api_responses_do_not_expose_local_paths_or_commands() {
         let root = std::env::temp_dir().join(format!("genoligand-user-api-{}", now_millis()));
         let options = server_options(root.clone());
@@ -1452,6 +1567,12 @@ mod tests {
         let run_dir = project_dir.join("runs").join("run-1");
         fs::create_dir_all(&run_dir).expect("create run dir");
         fs::write(project_dir.join("latest_run_id.txt"), "run-1\n").expect("latest run");
+        fs::write(project_dir.join("project_name.txt"), "蛋白靶点筛选\n").expect("project name");
+        fs::write(
+            project_dir.join("input_manifest.json"),
+            r#"{"inputs":[{"field":"project_name","value":"蛋白靶点筛选"},{"field":"small_molecule","value":"CCO"}]}"#,
+        )
+        .expect("input");
         fs::write(run_dir.join("run_state.txt"), "completed\n").expect("run state");
         fs::write(run_dir.join("current_command.txt"), "cargo run hidden\n").expect("command");
         fs::write(
@@ -1459,11 +1580,22 @@ mod tests {
             "candidate_id\nC1\n",
         )
         .expect("candidate table");
+        fs::write(
+            run_dir.join("evidence_ledger.tsv"),
+            "claim_id\tstatus\nE1\tok\n",
+        )
+        .expect("evidence");
         fs::write(run_dir.join("research_report.md"), "# Report\n").expect("report");
+
+        let run = run_json(&options, "run-1");
+        assert_eq!(run["trace"]["project_label"], "蛋白靶点筛选");
+        assert_eq!(run["trace"]["input_status"], "已保存用户输入");
+        assert_eq!(run["trace"]["candidate_count"], 1);
+        assert_eq!(run["trace"]["evidence_count"], 1);
 
         let responses = [
             read_project(&options, "project-1"),
-            run_json(&options, "run-1"),
+            run,
             artifacts_json(&options, "run-1"),
             user_databases_json(&options),
             user_setup_status_json(&options),

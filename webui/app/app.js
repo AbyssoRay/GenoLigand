@@ -507,25 +507,31 @@ function renderResults() {
 }
 
 function resultTracePanel() {
-  const projectText = state.project?.project_name || (state.project ? "当前项目" : "未创建");
-  const runText = state.run ? runStateLabel(state.run.state) : "未运行";
-  const databaseReady = state.setup?.database_ready === true || preflightGroups()
-    .find((group) => group.title === "数据库和索引")
-    ?.rows.every((row) => row.ready);
+  const trace = state.run?.trace || {};
+  const projectText = trace.project_label || state.project?.project_name || (state.project ? "当前项目" : "未创建");
+  const runText = state.run ? `${trace.run_label || "当前运行"}：${runStateLabel(state.run.state)}` : "未运行";
+  const databaseText = trace.database_status || "未检查";
+  const outputText = trace.output_status
+    ? `${trace.output_status}${Number.isFinite(trace.output_count) ? `（${trace.output_count} 项）` : ""}`
+    : "暂无输出";
+  const candidateText = trace.candidate_status || (candidateRows().length ? "已生成候选排序" : "暂无候选排序");
+  const evidenceText = trace.evidence_status || (state.runData?.evidence?.has_output ? "已生成证据链" : "暂无证据链");
   return `
     <section class="panel full">
       <div class="panel-header">
         <div>
           <h2>结果来源</h2>
-          <p>结果只读取当前项目的运行输出；没有输出时保持为空。</p>
+          <p>结果只读取当前项目和当前运行的输出；没有输出时保持为空。</p>
         </div>
         <span class="status-pill ${state.run ? "ready" : "blocked"}">${state.run ? "已选择运行" : "未运行"}</span>
       </div>
       ${metricRow("当前项目", projectText)}
       ${metricRow("当前运行", runText)}
-      ${metricRow("数据库状态", databaseReady ? "就绪" : "未就绪")}
-      ${metricRow("候选来源", candidateRows().length ? "候选排序输出" : "暂无候选输出")}
-      ${metricRow("证据来源", state.runData?.evidence?.has_output ? "证据链输出" : "暂无证据输出")}
+      ${metricRow("输入来源", trace.input_status || (state.project ? "已保存用户输入" : "未保存用户输入"))}
+      ${metricRow("数据库来源", databaseText)}
+      ${metricRow("输出材料", outputText)}
+      ${metricRow("候选来源", candidateText)}
+      ${metricRow("证据来源", evidenceText)}
     </section>`;
 }
 
