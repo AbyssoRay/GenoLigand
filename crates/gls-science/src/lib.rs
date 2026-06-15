@@ -533,6 +533,12 @@ fn build_store_indexes(
         "downloads/bindingdb/known_targets.tsv",
         "downloads/bindingdb/known_targets.tsv.gz",
         "downloads/bindingdb/known_targets.zip",
+        "downloads/bindingdb/bindingdb_all.tsv",
+        "downloads/bindingdb/bindingdb_all.tsv.gz",
+        "downloads/bindingdb/bindingdb_all.tsv.zip",
+        "downloads/bindingdb/bindingdb_all.txt",
+        "downloads/bindingdb/bindingdb_all.txt.gz",
+        "downloads/bindingdb/bindingdb_all.txt.zip",
         "downloads/uniprot/known_targets.tsv",
         "downloads/uniprot/known_targets.tsv.gz",
         "downloads/uniprot/known_targets.zip",
@@ -1080,6 +1086,12 @@ fn source_local_available(options: &StoreOptions, source: &RequiredSource) -> bo
                 "downloads/bindingdb/known_targets.tsv",
                 "downloads/bindingdb/known_targets.tsv.gz",
                 "downloads/bindingdb/known_targets.zip",
+                "downloads/bindingdb/bindingdb_all.tsv",
+                "downloads/bindingdb/bindingdb_all.tsv.gz",
+                "downloads/bindingdb/bindingdb_all.tsv.zip",
+                "downloads/bindingdb/bindingdb_all.txt",
+                "downloads/bindingdb/bindingdb_all.txt.gz",
+                "downloads/bindingdb/bindingdb_all.txt.zip",
             ],
         ),
         "uniprot_human_reviewed" => {
@@ -2087,8 +2099,16 @@ fn read_normalized_inputs(path: &Path) -> Result<Vec<NormalizedInput>, String> {
 
 fn read_store_rows(path: &Path, label: &str) -> Result<Vec<StoreRow>, String> {
     let text = read_table_text(path).map_err(|err| format!("{label}_missing:{err}"))?;
+    let mut lines = text.lines();
+    let Some(header_line) = lines.next() else {
+        return Ok(Vec::new());
+    };
+    let headers = split_tsv(header_line.trim_start_matches('\u{feff}'));
+    if is_bindingdb_header(&headers) {
+        return Ok(parse_bindingdb_rows(&headers, lines));
+    }
     let mut rows = Vec::new();
-    for line in text.lines().skip(1) {
+    for line in lines {
         let line = line.trim_start_matches('\u{feff}');
         let cols = split_tsv(line);
         if cols.len() < 9 {
@@ -2107,6 +2127,166 @@ fn read_store_rows(path: &Path, label: &str) -> Result<Vec<StoreRow>, String> {
         });
     }
     Ok(rows)
+}
+
+fn is_bindingdb_header(headers: &[String]) -> bool {
+    find_header(
+        headers,
+        &[
+            "BindingDB Target Chain Sequence",
+            "Target Chain Sequence",
+            "Target Sequence",
+        ],
+    )
+    .is_some()
+        && find_header(headers, &["Target Name", "Target", "BindingDB Target Name"]).is_some()
+}
+
+fn parse_bindingdb_rows<'a, I>(headers: &[String], lines: I) -> Vec<StoreRow>
+where
+    I: IntoIterator<Item = &'a str>,
+{
+    let target_name_idx = find_header(headers, &["Target Name", "Target", "BindingDB Target Name"]);
+    let sequence_idx = find_header(
+        headers,
+        &[
+            "BindingDB Target Chain Sequence",
+            "Target Chain Sequence",
+            "Target Sequence",
+        ],
+    );
+    let organism_idx = find_header(
+        headers,
+        &[
+            "Target Source Organism According to Curator or DataSource",
+            "Target Source Organism",
+            "Organism",
+        ],
+    );
+    let smiles_idx = find_header(headers, &["Ligand SMILES", "SMILES", "Ligand Smiles"]);
+    let ligand_name_idx = find_header(headers, &["Ligand Name", "Name", "Compound Name"]);
+    let monomer_idx = find_header(
+        headers,
+        &["BindingDB MonomerID", "MonomerID", "Target MonomerID"],
+    );
+    let swiss_idx = find_header(
+        headers,
+        &[
+            "UniProt (SwissProt) Primary ID of Target Chain",
+            "UniProt SwissProt Primary ID of Target Chain",
+            "UniProt Primary ID",
+        ],
+    );
+    let trembl_idx = find_header(
+        headers,
+        &[
+            "UniProt (TrEMBL) Primary ID of Target Chain",
+            "UniProt TrEMBL Primary ID of Target Chain",
+        ],
+    );
+    let pdb_idx = find_header(
+        headers,
+        &[
+            "Target Chain PDB ID(s)",
+            "PDB ID(s) for Target Chain",
+            "PDB IDs",
+        ],
+    );
+    let activity_indexes = [
+        find_header(headers, &["Ki (nM)", "Ki"]),
+        find_header(headers, &["IC50 (nM)", "IC50"]),
+        find_header(headers, &["Kd (nM)", "Kd"]),
+        find_header(headers, &["EC50 (nM)", "EC50"]),
+    ];
+
+    let mut rows = Vec::new();
+    for line in lines {
+        let cols = split_tsv(line.trim_start_matches('\u{feff}'));
+        let target_name = cell(&cols, target_name_idx);
+        let sequence = cell(&cols, sequence_idx);
+        if target_name.is_empty() && sequence.is_empty() {
+            continue;
+        }
+        let organism = cell(&cols, organism_idx);
+        let smiles = cell(&cols, smiles_idx);
+        let ligand_name = cell(&cols, ligand_name_idx);
+        let uniprot = first_nonempty(&[cell(&cols, swiss_idx), cell(&cols, trembl_idx)]);
+        let monomer = cell(&cols, monomer_idx);
+        let target_id = first_nonempty(&[uniprot.clone(), monomer.clone(), target_name.clone()]);
+        let target_id = if target_id.is_empty() {
+            format!("BINDINGDB_{}", stable_hash(&sequence))
+        } else {
+            safe_id(&target_id)
+        };
+        let target_name = if target_name.is_empty() {
+            target_id.clone()
+        } else {
+            target_name
+        };
+        let target_class = if organism.to_ascii_lowercase().contains("homo sapiens")
+            || organism.to_ascii_lowercase().contains("human")
+        {
+            "known_human_protein"
+        } else {
+            "known_protein"
+        };
+        let mut ligand_tokens = tokenize(&smiles);
+        ligand_tokens.extend(tokenize(&ligand_name));
+        for idx in activity_indexes.iter().flatten() {
+            ligand_tokens.extend(tokenize(cell(&cols, Some(*idx)).as_str()));
+        }
+        let mut sequence_tokens = tokenize(&sequence);
+        sequence_tokens.extend(tokenize(&target_name));
+        sequence_tokens.extend(tokenize(&uniprot));
+        rows.push(StoreRow {
+            source: "BindingDB".to_string(),
+            target_id,
+            target_name,
+            organism: if organism.is_empty() {
+                "unknown".to_string()
+            } else {
+                organism
+            },
+            target_class: target_class.to_string(),
+            ligand_tokens,
+            sequence_tokens,
+            structure_tokens: tokenize(&cell(&cols, pdb_idx)),
+            evidence: "bindingdb_activity_row".to_string(),
+        });
+    }
+    rows
+}
+
+fn find_header(headers: &[String], candidates: &[&str]) -> Option<usize> {
+    let candidate_keys = candidates
+        .iter()
+        .map(|candidate| normalize_header(candidate))
+        .collect::<BTreeSet<_>>();
+    headers
+        .iter()
+        .position(|header| candidate_keys.contains(&normalize_header(header)))
+}
+
+fn normalize_header(value: &str) -> String {
+    value
+        .chars()
+        .filter(|ch| ch.is_ascii_alphanumeric())
+        .flat_map(|ch| ch.to_lowercase())
+        .collect()
+}
+
+fn cell(cols: &[String], idx: Option<usize>) -> String {
+    idx.and_then(|value| cols.get(value))
+        .map(|value| value.trim().to_string())
+        .unwrap_or_default()
+}
+
+fn first_nonempty(values: &[String]) -> String {
+    values
+        .iter()
+        .find(|value| !value.trim().is_empty())
+        .cloned()
+        .unwrap_or_default()
 }
 
 fn score_row(input: &NormalizedInput, row: &StoreRow) -> f64 {
@@ -2556,6 +2736,38 @@ mod tests {
             read_text(&store.join("indexes/metagenome_targets.tsv")).expect("metagenome index");
         assert!(known.contains("CHEMBL_ZIP1"));
         assert!(metagenome.contains("MG_ZIP_1"));
+        fs::remove_dir_all(&root).expect("cleanup temp root");
+        assert!(!root.exists());
+    }
+
+    #[test]
+    fn prepare_science_store_builds_known_index_from_bindingdb_activity_tsv() {
+        let root = temp_root("build_bindingdb_table");
+        let store = root.join("science_store");
+        write_text(
+            &store.join("downloads/bindingdb/bindingdb_all.tsv"),
+            "Ligand SMILES\tLigand Name\tBindingDB MonomerID\tTarget Name\tTarget Source Organism According to Curator or DataSource\tKi (nM)\tUniProt (SwissProt) Primary ID of Target Chain\tBindingDB Target Chain Sequence\tTarget Chain PDB ID(s)\nCCO\tethanol-like ligand\t5001\tAcetylcholinesterase\tHomo sapiens\t12\tP22303\tMKTAYIAKQRQISFVKSHFSRQDILDLWQ\t1ACJ\n",
+        )
+        .expect("write bindingdb source");
+        let options = StoreOptions {
+            workspace_root: root.clone(),
+            science_store: store.clone(),
+        };
+        let _ = run_store_command(ScienceCommand::PrepareScienceStore, &options)
+            .expect("prepare store");
+        let known = read_text(&store.join("indexes/known_targets.tsv")).expect("known index");
+        let requirements =
+            read_text(&store.join("source_requirements.tsv")).expect("source requirements");
+
+        assert!(known.contains("BindingDB"));
+        assert!(known.contains("P22303"));
+        assert!(known.contains("Acetylcholinesterase"));
+        assert!(known.contains("bindingdb_activity_row"));
+        assert!(known.contains("cco"));
+        assert!(known.contains("eth"));
+        assert!(known.contains("han"));
+        assert!(known.contains("mkt"));
+        assert!(requirements.contains("bindingdb\tBindingDB\tknown_activity\tready"));
         fs::remove_dir_all(&root).expect("cleanup temp root");
         assert!(!root.exists());
     }
