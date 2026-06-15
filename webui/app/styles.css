@@ -113,6 +113,21 @@ button {
   border-color: var(--line);
 }
 
+.step:disabled,
+.step.disabled {
+  cursor: not-allowed;
+  color: var(--soft);
+  background: transparent;
+  border-color: transparent;
+}
+
+.step:disabled:hover,
+.step.disabled:hover {
+  color: var(--soft);
+  background: transparent;
+  border-color: transparent;
+}
+
 .side-status {
   margin-top: auto;
   display: grid;

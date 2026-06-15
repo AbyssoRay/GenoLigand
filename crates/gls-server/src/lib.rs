@@ -2684,6 +2684,21 @@ mod tests {
     }
 
     #[test]
+    fn workflow_navigation_unlocks_results_only_after_completed_run() {
+        let app = include_str!("../../../webui/app/app.js");
+
+        assert!(app.contains("function canOpenStep(step)"));
+        assert!(app.contains("if (step === \"input\") return true"));
+        assert!(
+            app.contains(
+                "if (step === \"results\" || step === \"export\") return canViewResults();"
+            )
+        );
+        assert!(app.contains("button.disabled = !enabled"));
+        assert!(app.contains("if (!canOpenStep(step)) return;"));
+    }
+
+    #[test]
     fn visual_result_sections_use_clear_not_ready_language() {
         let app = include_str!("../../../webui/app/app.js");
         assert!(app.contains("图形查看未就绪"));

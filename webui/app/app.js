@@ -101,6 +101,7 @@ async function api(path, options = {}) {
 }
 
 function setStep(step) {
+  if (!canOpenStep(step)) return;
   state.step = step;
   document.querySelectorAll("[data-step]").forEach((button) => {
     button.classList.toggle("active", button.dataset.step === step);
@@ -140,6 +141,7 @@ function render() {
   const [title, subtitle] = stepMeta[state.step];
   document.querySelector("[data-title]").textContent = title;
   document.querySelector("[data-subtitle]").textContent = subtitle;
+  updateStepNavigation();
   renderShellStatus();
   renderAlert();
   if (state.step === "input") renderInput();
@@ -648,6 +650,7 @@ function renderResults() {
 
 function resultTracePanel() {
   const trace = state.run?.trace || {};
+  const completed = state.run?.state === "completed";
   const projectText = trace.project_label || state.project?.project_name || (state.project ? "当前项目" : "未创建");
   const runText = state.run ? `${trace.run_label || "当前运行"}：${state.run.state_label || runStateLabel(state.run.state)}` : "未运行";
   const databaseText = trace.database_status || "未检查";
@@ -663,7 +666,7 @@ function resultTracePanel() {
           <h2>结果来源</h2>
           <p>结果只读取当前项目和当前运行的输出；没有输出时保持为空。</p>
         </div>
-        <span class="status-pill ${state.run ? "ready" : "waiting"}">${state.run ? "已选择运行" : "未运行"}</span>
+        <span class="status-pill ${completed ? "ready" : "waiting"}">${completed ? "运行已完成" : "等待运行完成"}</span>
       </div>
       ${metricRow("当前项目", projectText)}
       ${metricRow("当前运行", runText)}
@@ -1122,6 +1125,22 @@ function canStartRun() {
 
 function canViewResults() {
   return state.run?.state === "completed";
+}
+
+function canOpenStep(step) {
+  if (step === "input") return true;
+  if (step === "configure" || step === "check" || step === "run") return Boolean(state.project);
+  if (step === "results" || step === "export") return canViewResults();
+  return false;
+}
+
+function updateStepNavigation() {
+  document.querySelectorAll("[data-step]").forEach((button) => {
+    const enabled = canOpenStep(button.dataset.step);
+    button.disabled = !enabled;
+    button.classList.toggle("disabled", !enabled);
+    button.classList.toggle("active", button.dataset.step === state.step);
+  });
 }
 
 function nextActionText() {
