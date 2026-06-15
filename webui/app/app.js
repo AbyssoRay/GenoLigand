@@ -309,7 +309,7 @@ function renderConfigure() {
             <h2>搜索范围</h2>
             <p>数据库和索引由安装流程维护。普通运行不需要配置路径。</p>
           </div>
-          <span class="status-pill ${state.project ? "ready" : "blocked"}">${state.project ? "已保存输入" : "等待输入"}</span>
+          <span class="status-pill ${state.project ? "ready" : "waiting"}">${state.project ? "已保存输入" : "等待输入"}</span>
         </div>
         <div class="panel-grid">
           ${scopeCard("已知蛋白数据库", "ChEMBL、BindingDB、UniProt、结构互作证据。", "known")}
