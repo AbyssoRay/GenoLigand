@@ -1564,6 +1564,14 @@ fn compute_features(options: &ScienceOptions) -> Result<String, String> {
                 input.kind.as_str()
             ));
         }
+        for (family, name, value) in typed_feature_rows(&input) {
+            text.push_str(&format!(
+                "{}\t{}\t{family}\t{name}\t{}\tGenoLigand\n",
+                input.input_id,
+                input.kind.as_str(),
+                clean_cell(&value)
+            ));
+        }
     }
     write_text(&options.run_dir.join("feature_manifest.tsv"), &text)?;
     write_json_manifest(
@@ -2193,13 +2201,32 @@ fn extract_inputs(path: &Path) -> Result<Vec<NormalizedInput>, String> {
 
 fn primary_for_kind(kind: InputKind, values: &BTreeMap<String, String>) -> Option<String> {
     let hints: &[&str] = match kind {
-        InputKind::SmallMolecule => &["smiles", "sdf", "mol2", "compound", "cas"],
+        InputKind::SmallMolecule => &[
+            "small_molecule",
+            "small molecule",
+            "smiles",
+            "sdf",
+            "mol2",
+            "compound",
+            "cas",
+        ],
         InputKind::Peptide => &["peptide"],
-        InputKind::ProteinLigand => &["protein", "fasta_sequence"],
+        InputKind::ProteinLigand => &[
+            "protein_ligand",
+            "protein ligand",
+            "protein",
+            "fasta_sequence",
+        ],
         InputKind::Complex => &["complex"],
-        InputKind::GenomeOrMetagenome => {
-            &["genome", "metagenome", "transcript", "gff", "gtf", "vcf"]
-        }
+        InputKind::GenomeOrMetagenome => &[
+            "genome_or_metagenome",
+            "genome",
+            "metagenome",
+            "transcript",
+            "gff",
+            "gtf",
+            "vcf",
+        ],
     };
     for (key, value) in values {
         if hints.iter().any(|hint| key.contains(hint)) {
@@ -2615,6 +2642,254 @@ fn first_nonempty(values: &[String]) -> String {
         .unwrap_or_default()
 }
 
+fn typed_feature_rows(input: &NormalizedInput) -> Vec<(&'static str, &'static str, String)> {
+    match input.kind {
+        InputKind::SmallMolecule => small_molecule_features(&input.primary_value),
+        InputKind::Peptide => peptide_or_protein_features("peptide", &input.primary_value),
+        InputKind::ProteinLigand => {
+            peptide_or_protein_features("protein_sequence", &input.primary_value)
+        }
+        InputKind::Complex => complex_features(&input.primary_value),
+        InputKind::GenomeOrMetagenome => genome_or_metagenome_features(&input.primary_value),
+    }
+}
+
+fn small_molecule_features(value: &str) -> Vec<(&'static str, &'static str, String)> {
+    let compact = compact_sequence(value);
+    let atom_symbol_count = compact
+        .chars()
+        .filter(|ch| ch.is_ascii_uppercase() || matches!(ch, 'c' | 'n' | 'o' | 's' | 'p'))
+        .count();
+    let aromatic_symbol_count = compact
+        .chars()
+        .filter(|ch| matches!(ch, 'c' | 'n' | 'o' | 's' | 'p'))
+        .count();
+    vec![
+        (
+            "small_molecule",
+            "atom_symbol_count",
+            atom_symbol_count.to_string(),
+        ),
+        (
+            "small_molecule",
+            "aromatic_symbol_count",
+            aromatic_symbol_count.to_string(),
+        ),
+        (
+            "small_molecule",
+            "ring_marker_count",
+            compact
+                .chars()
+                .filter(|ch| ch.is_ascii_digit())
+                .count()
+                .to_string(),
+        ),
+        (
+            "small_molecule",
+            "branch_marker_count",
+            compact
+                .chars()
+                .filter(|ch| matches!(ch, '(' | ')'))
+                .count()
+                .to_string(),
+        ),
+        (
+            "small_molecule",
+            "charge_marker_count",
+            compact
+                .chars()
+                .filter(|ch| matches!(ch, '+' | '-'))
+                .count()
+                .to_string(),
+        ),
+        (
+            "small_molecule",
+            "chiral_marker_count",
+            compact.chars().filter(|ch| *ch == '@').count().to_string(),
+        ),
+        ("input", "file_or_inline", file_or_inline(value).to_string()),
+    ]
+}
+
+fn peptide_or_protein_features(
+    family: &'static str,
+    value: &str,
+) -> Vec<(&'static str, &'static str, String)> {
+    let sequence = compact_sequence(value);
+    let amino_acids = sequence
+        .chars()
+        .filter(|ch| is_standard_amino_acid(*ch))
+        .collect::<Vec<_>>();
+    let aa_count = amino_acids.len();
+    let hydrophobic_count = amino_acids
+        .iter()
+        .filter(|ch| {
+            matches!(
+                ch.to_ascii_uppercase(),
+                'A' | 'I' | 'L' | 'M' | 'F' | 'W' | 'Y' | 'V'
+            )
+        })
+        .count();
+    let charged_count = amino_acids
+        .iter()
+        .filter(|ch| matches!(ch.to_ascii_uppercase(), 'D' | 'E' | 'K' | 'R' | 'H'))
+        .count();
+    let cysteine_count = amino_acids
+        .iter()
+        .filter(|ch| ch.eq_ignore_ascii_case(&'C'))
+        .count();
+    vec![
+        (family, "amino_acid_count", aa_count.to_string()),
+        (
+            family,
+            "hydrophobic_residue_count",
+            hydrophobic_count.to_string(),
+        ),
+        (family, "charged_residue_count", charged_count.to_string()),
+        (family, "cysteine_count", cysteine_count.to_string()),
+        (
+            family,
+            "fasta_header_count",
+            value
+                .lines()
+                .filter(|line| line.starts_with('>'))
+                .count()
+                .to_string(),
+        ),
+        ("input", "file_or_inline", file_or_inline(value).to_string()),
+    ]
+}
+
+fn complex_features(value: &str) -> Vec<(&'static str, &'static str, String)> {
+    let lower = value.to_ascii_lowercase();
+    let path = Path::new(value.trim());
+    let extension = path
+        .extension()
+        .and_then(|ext| ext.to_str())
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    vec![
+        (
+            "complex",
+            "structure_file_exists",
+            path.exists().to_string(),
+        ),
+        (
+            "complex",
+            "structure_extension",
+            if extension.is_empty() {
+                "inline_or_untyped".to_string()
+            } else {
+                extension
+            },
+        ),
+        (
+            "complex",
+            "chain_marker_count",
+            count_word_markers(&lower, &["chain", "链"]).to_string(),
+        ),
+        (
+            "complex",
+            "ligand_marker_count",
+            count_word_markers(&lower, &["ligand", "配体"]).to_string(),
+        ),
+        ("input", "file_or_inline", file_or_inline(value).to_string()),
+    ]
+}
+
+fn genome_or_metagenome_features(value: &str) -> Vec<(&'static str, &'static str, String)> {
+    let sequence = compact_sequence(value);
+    let nucleotide_count = sequence
+        .chars()
+        .filter(|ch| matches!(ch.to_ascii_uppercase(), 'A' | 'C' | 'G' | 'T' | 'U' | 'N'))
+        .count();
+    let gc_count = sequence
+        .chars()
+        .filter(|ch| matches!(ch.to_ascii_uppercase(), 'G' | 'C'))
+        .count();
+    let gc_fraction = if nucleotide_count > 0 {
+        format!("{:.4}", gc_count as f64 / nucleotide_count as f64)
+    } else {
+        "0.0000".to_string()
+    };
+    vec![
+        (
+            "genome_or_metagenome",
+            "nucleotide_count",
+            nucleotide_count.to_string(),
+        ),
+        ("genome_or_metagenome", "gc_fraction", gc_fraction),
+        (
+            "genome_or_metagenome",
+            "fasta_record_count",
+            value
+                .lines()
+                .filter(|line| line.starts_with('>'))
+                .count()
+                .to_string(),
+        ),
+        (
+            "genome_or_metagenome",
+            "orf_start_marker_count",
+            sequence
+                .to_ascii_uppercase()
+                .matches("ATG")
+                .count()
+                .to_string(),
+        ),
+        ("input", "file_or_inline", file_or_inline(value).to_string()),
+    ]
+}
+
+fn compact_sequence(value: &str) -> String {
+    value
+        .lines()
+        .filter(|line| !line.starts_with('>'))
+        .flat_map(|line| line.chars())
+        .filter(|ch| !ch.is_whitespace())
+        .collect()
+}
+
+fn is_standard_amino_acid(ch: char) -> bool {
+    matches!(
+        ch.to_ascii_uppercase(),
+        'A' | 'C'
+            | 'D'
+            | 'E'
+            | 'F'
+            | 'G'
+            | 'H'
+            | 'I'
+            | 'K'
+            | 'L'
+            | 'M'
+            | 'N'
+            | 'P'
+            | 'Q'
+            | 'R'
+            | 'S'
+            | 'T'
+            | 'V'
+            | 'W'
+            | 'Y'
+    )
+}
+
+fn file_or_inline(value: &str) -> &'static str {
+    if Path::new(value.trim()).exists() {
+        "existing_file"
+    } else {
+        "inline_or_declared_path"
+    }
+}
+
+fn count_word_markers(value: &str, markers: &[&str]) -> usize {
+    markers
+        .iter()
+        .map(|marker| value.matches(marker).count())
+        .sum()
+}
+
 fn score_row(input: &NormalizedInput, row: &StoreRow) -> f64 {
     let matched = matched_tokens(input, row);
     if matched.is_empty() {
@@ -2957,6 +3232,86 @@ mod tests {
         assert!(!structure.contains("matched_structure_or_pocket_tokens"));
         assert!(!structure.contains("patch_P24941"));
         assert!(!md.contains("computed_from_database_evidence_only"));
+        fs::remove_dir_all(&root).expect("cleanup temp root");
+        assert!(!root.exists());
+    }
+
+    #[test]
+    fn feature_compute_emits_type_specific_features_for_all_supported_inputs() {
+        let root = temp_root("typed_features");
+        let input = root.join("input.json");
+        let run = root.join("run");
+        write_text(
+            &input,
+            r#"{"inputs":[
+{"field":"small_molecule","value":"c1ccccc1O"},
+{"field":"peptide","value":"ACDEK"},
+{"field":"protein_ligand","value":">protein\nMKTAYIAKQRQISFVKSHFSRQDILDLWQ"},
+{"field":"complex","value":"complex.pdb chain A ligand ATP"},
+{"field":"genome_or_metagenome","value":">contig1\nATGCGCGTAA"}
+],"files":[]}"#,
+        )
+        .expect("write input");
+        let options = ScienceOptions {
+            workspace_root: root.clone(),
+            science_store: root.join("science_store"),
+            input_manifest: input,
+            run_dir: run.clone(),
+        };
+
+        run_science_command(ScienceCommand::InputNormalize, &options).expect("normalize");
+        run_science_command(ScienceCommand::FeaturesCompute, &options).expect("features");
+        let features = read_text(&run.join("feature_manifest.tsv")).expect("feature manifest");
+
+        for expected in [
+            "small_molecule\tatom_symbol_count",
+            "peptide\tamino_acid_count",
+            "protein_sequence\tamino_acid_count",
+            "complex\tchain_marker_count",
+            "genome_or_metagenome\tgc_fraction",
+            "genome_or_metagenome\torf_start_marker_count",
+        ] {
+            assert!(
+                features.contains(expected),
+                "missing feature row: {expected}"
+            );
+        }
+        fs::remove_dir_all(&root).expect("cleanup temp root");
+        assert!(!root.exists());
+    }
+
+    #[test]
+    fn webui_field_names_normalize_to_all_supported_input_types() {
+        let root = temp_root("webui_fields");
+        let input = root.join("input.json");
+        write_text(
+            &input,
+            r#"{"inputs":[
+{"field":"small_molecule","value":"CCO"},
+{"field":"peptide","value":"ACDEK"},
+{"field":"protein_ligand","value":"MKTAYIAKQ"},
+{"field":"complex","value":"complex.pdb chain A ligand ATP"},
+{"field":"genome_or_metagenome","value":"ATGCGCTAA"}
+],"files":[]}"#,
+        )
+        .expect("write input");
+
+        let inputs = extract_inputs(&input).expect("extract inputs");
+        let kinds = inputs
+            .iter()
+            .map(|input| input.kind.as_str())
+            .collect::<BTreeSet<_>>();
+
+        assert_eq!(inputs.len(), 5);
+        for expected in [
+            "small_molecule",
+            "peptide",
+            "protein_ligand",
+            "complex",
+            "genome_or_metagenome",
+        ] {
+            assert!(kinds.contains(expected), "missing input kind: {expected}");
+        }
         fs::remove_dir_all(&root).expect("cleanup temp root");
         assert!(!root.exists());
     }

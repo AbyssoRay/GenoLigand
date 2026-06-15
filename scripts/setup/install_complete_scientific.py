@@ -10,6 +10,7 @@ import shutil
 import subprocess
 import sys
 import urllib.error
+import urllib.parse
 import urllib.request
 from pathlib import Path
 from typing import Sequence
@@ -138,10 +139,18 @@ def read_tsv(path: Path) -> list[dict[str, str]]:
     if not path.exists():
         return []
     with path.open("r", encoding="utf-8-sig", newline="") as handle:
-        return [
-            {key: (value or "").strip() for key, value in row.items()}
-            for row in csv.DictReader(handle, delimiter="\t")
-        ]
+        cleaned: list[dict[str, str]] = []
+        for row in csv.DictReader(handle, delimiter="\t"):
+            cleaned_row: dict[str, str] = {}
+            for key, value in row.items():
+                if key is None:
+                    continue
+                if isinstance(value, list):
+                    cleaned_row[key] = " ".join(value).strip()
+                else:
+                    cleaned_row[key] = (value or "").strip()
+            cleaned.append(cleaned_row)
+        return cleaned
 
 
 def default_source_catalog(workspace_root: Path, science_store: Path) -> Path:
@@ -314,6 +323,173 @@ def prepare_downloads(catalog: Path, science_store: Path) -> dict[str, object]:
         }
 
 
+def direct_source_location(row: dict[str, str]) -> str:
+    for key in ("download_url", "source_path", "source_url"):
+        value = row.get(key, "").strip()
+        if value:
+            return value
+    landing = row.get("landing_url", "").strip()
+    if landing.startswith("file://") or Path(landing).exists():
+        return landing
+    return ""
+
+
+def sync_external_sources(plan: Path, science_store: Path, skip_downloads: bool) -> dict[str, object]:
+    manifest = science_store / "external_sync_execution_manifest.tsv"
+    rows = read_tsv(plan)
+    manifest.parent.mkdir(parents=True, exist_ok=True)
+    with manifest.open("w", encoding="utf-8", newline="") as handle:
+        writer = csv.DictWriter(
+            handle,
+            delimiter="\t",
+            fieldnames=[
+                "source_id",
+                "source_label",
+                "target_rel_path",
+                "status",
+                "bytes",
+                "sha256",
+                "notes",
+            ],
+        )
+        writer.writeheader()
+        if not rows:
+            writer.writerow(
+                {
+                    "source_id": "external_sources",
+                    "source_label": "大型科学资源",
+                    "target_rel_path": "",
+                    "status": "not_configured",
+                    "bytes": "0",
+                    "sha256": "",
+                    "notes": "source_sync_plan_tsv_missing_or_empty",
+                }
+            )
+            return {
+                "status": "not_configured",
+                "manifest": str(manifest),
+                "ready": 0,
+                "failed": 0,
+                "needs_action": 0,
+                "total": 0,
+            }
+        ready = 0
+        failed = 0
+        needs_action = 0
+        for row in rows:
+            source_id = row.get("source_id", "")
+            label = row.get("source_label") or source_id or "科学资源"
+            target_rel = row.get("target_rel_path", "")
+            ready_marker = row.get("ready_marker") or target_rel
+            target = science_store / target_rel if target_rel else None
+            marker = science_store / ready_marker if ready_marker else target
+            if marker and marker.exists():
+                ready += 1
+                writer.writerow(
+                    {
+                        "source_id": source_id,
+                        "source_label": label,
+                        "target_rel_path": target_rel,
+                        "status": "ready",
+                        "bytes": str(directory_size(marker)),
+                        "sha256": "",
+                        "notes": "already_available",
+                    }
+                )
+                continue
+            if skip_downloads:
+                needs_action += 1
+                writer.writerow(
+                    {
+                        "source_id": source_id,
+                        "source_label": label,
+                        "target_rel_path": target_rel,
+                        "status": "skipped",
+                        "bytes": "0",
+                        "sha256": "",
+                        "notes": "download_skipped",
+                    }
+                )
+                continue
+            location = direct_source_location(row)
+            if not location or not target:
+                needs_action += 1
+                writer.writerow(
+                    {
+                        "source_id": source_id,
+                        "source_label": label,
+                        "target_rel_path": target_rel,
+                        "status": "requires_resource_bundle",
+                        "bytes": "0",
+                        "sha256": "",
+                        "notes": "direct_download_or_local_source_required",
+                    }
+                )
+                continue
+            try:
+                destination = external_destination(target, location)
+                result = copy_or_download(location, destination, row.get("sha256", "") or None)
+                if result["status"] == "ready":
+                    ready += 1
+                else:
+                    failed += 1
+                writer.writerow(
+                    {
+                        "source_id": source_id,
+                        "source_label": label,
+                        "target_rel_path": target_rel,
+                        "status": str(result["status"]),
+                        "bytes": str(result["bytes"]),
+                        "sha256": str(result["sha256"]),
+                        "notes": "external_resource_synced",
+                    }
+                )
+            except Exception as err:  # noqa: BLE001 - install must report actionable status
+                failed += 1
+                writer.writerow(
+                    {
+                        "source_id": source_id,
+                        "source_label": label,
+                        "target_rel_path": target_rel,
+                        "status": "failed",
+                        "bytes": "0",
+                        "sha256": "",
+                        "notes": str(err).replace("\t", " ").replace("\n", " "),
+                    }
+                )
+        total = len(rows)
+        status = "ready" if ready == total and failed == 0 else "failed" if failed else "needs_sync"
+        return {
+            "status": status,
+            "manifest": str(manifest),
+            "ready": ready,
+            "failed": failed,
+            "needs_action": needs_action,
+            "total": total,
+        }
+
+
+def external_destination(target: Path, location: str) -> Path:
+    if target.suffix:
+        return target
+    source_name = Path(urllib.parse.urlparse(location).path).name
+    if source_name:
+        return target / source_name
+    return target / "external_resource"
+
+
+def directory_size(path: Path) -> int:
+    if path.is_file():
+        return path.stat().st_size
+    if not path.exists():
+        return 0
+    total = 0
+    for child in path.rglob("*"):
+        if child.is_file():
+            total += child.stat().st_size
+    return total
+
+
 def download_summary(download_result: dict[str, object]) -> dict[str, object]:
     status = str(download_result.get("status", "unknown"))
     messages = {
@@ -337,7 +513,11 @@ def download_summary(download_result: dict[str, object]) -> dict[str, object]:
     }
 
 
-def source_sync_summary(plan: Path, science_store: Path) -> dict[str, object]:
+def source_sync_summary(
+    plan: Path,
+    science_store: Path,
+    sync_result: dict[str, object],
+) -> dict[str, object]:
     rows = read_tsv(plan)
     if not rows:
         return {
@@ -349,29 +529,44 @@ def source_sync_summary(plan: Path, science_store: Path) -> dict[str, object]:
             "next_action": "使用完整安装包重新运行安装/修复",
             "items": [],
         }
+    execution_rows = {
+        row.get("source_id", ""): row for row in read_tsv(science_store / "external_sync_execution_manifest.tsv")
+    }
     items: list[dict[str, object]] = []
     for row in rows:
         target_rel = row.get("ready_marker") or row.get("target_rel_path") or ""
         target = science_store / target_rel if target_rel else None
         ready = bool(target and target.exists())
+        execution = execution_rows.get(row.get("source_id", ""))
+        execution_status = execution.get("status", "") if execution else ""
+        needs_bundle = execution_status == "requires_resource_bundle"
         items.append(
             {
                 "label": row.get("source_label") or row.get("source_id") or "科学资源",
-                "status": "就绪" if ready else "需要同步",
+                "status": "就绪" if ready else "需要完整资源包" if needs_bundle else "需要同步",
                 "ready": ready,
-                "next_action": row.get("user_next_action") or "运行安装/修复以同步科学资源",
+                "next_action": (
+                    "使用包含该资源的完整安装包，或在同步清单中提供可直接读取的本地路径/下载地址"
+                    if needs_bundle
+                    else row.get("user_next_action") or "运行安装/修复以同步科学资源"
+                ),
             }
         )
     ready_count = sum(1 for item in items if item["ready"])
     total = len(items)
     needs_action = total - ready_count
+    failed = int(sync_result.get("failed", 0) or 0)
     return {
-        "status": "ready" if total and needs_action == 0 else "needs_sync",
+        "status": "ready" if total and needs_action == 0 else "failed" if failed else "needs_sync",
         "ready": ready_count,
         "total": total,
         "needs_action": needs_action,
-        "message": "大型科学资源同步状态已检查。",
-        "next_action": "继续" if needs_action == 0 else "保持联网和足够磁盘空间后运行安装/修复",
+        "message": "大型科学资源同步状态已检查并记录。",
+        "next_action": (
+            "继续"
+            if needs_action == 0
+            else "补齐完整资源包或同步清单后重新运行安装/修复"
+        ),
         "items": items,
     }
 
@@ -449,10 +644,12 @@ def installation_status(
     science_store: Path,
     completed: subprocess.CompletedProcess[str],
     download_result: dict[str, object],
+    external_sync_result: dict[str, object],
 ) -> dict[str, object]:
     status_payload = load_json(science_store / "install_status.json")
     store_status = str(status_payload.get("status", "")).strip()
     download_status = str(download_result.get("status", "unknown"))
+    external_status = str(external_sync_result.get("status", "unknown"))
     missing = status_payload.get("missing_components", [])
     missing_count = len(missing) if isinstance(missing, list) else 0
     if completed.returncode != 0:
@@ -471,6 +668,14 @@ def installation_status(
         status = "needs_repair"
         summary = "部分科学资源下载或校验失败，科学仓库尚未准备完成。"
         next_action = "检查网络、磁盘空间后重新运行安装/修复"
+    elif external_status == "needs_sync":
+        status = "needs_repair"
+        summary = "大型科学资源尚未闭合，科学仓库尚未准备完成。"
+        next_action = "使用完整资源包，或在同步清单中提供可直接读取的本地路径/下载地址后重新运行安装/修复"
+    elif external_status == "failed":
+        status = "needs_repair"
+        summary = "部分大型科学资源同步失败，科学仓库尚未准备完成。"
+        next_action = "检查资源包、网络和磁盘空间后重新运行安装/修复"
     else:
         status = "needs_repair"
         summary = "安装/修复已执行，但仍有资源需要准备。"
@@ -517,6 +722,7 @@ def main() -> int:
         if args.no_download
         else prepare_downloads(source_catalog, science_store)
     )
+    external_sync_result = sync_external_sources(source_sync_plan, science_store, args.no_download)
     cli_command = resolve_binary_command(
         args.gls_cli,
         "GENOLIGAND_GLS_CLI",
@@ -533,12 +739,21 @@ def main() -> int:
         str(science_store),
     ]
     completed = run_command(command)
-    install_status = installation_status(science_store, completed, download_result)
+    install_status = installation_status(
+        science_store,
+        completed,
+        download_result,
+        external_sync_result,
+    )
     payload: dict[str, object] = {
         **install_status,
         "returncode": completed.returncode,
         "downloads": download_summary(download_result),
-        "external_sources": source_sync_summary(source_sync_plan, science_store),
+        "external_sources": source_sync_summary(
+            source_sync_plan,
+            science_store,
+            external_sync_result,
+        ),
         "resources": resource_summary(science_store),
         "runtime_backend": runtime_backend(),
         "access_url": f"http://{args.host}:{args.port}/",
@@ -553,6 +768,7 @@ def main() -> int:
             "science_store": str(science_store),
             "runtime_dir": str(runtime_dir),
             "download_manifest": download_result.get("manifest", ""),
+            "external_sync_manifest": external_sync_result.get("manifest", ""),
             "source_catalog": download_result.get("catalog", ""),
             "source_sync_plan": str(source_sync_plan),
         }
