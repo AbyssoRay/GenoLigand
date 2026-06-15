@@ -2671,6 +2671,19 @@ mod tests {
     }
 
     #[test]
+    fn run_monitor_only_links_to_results_after_completion() {
+        let app = include_str!("../../../webui/app/app.js");
+        let start = app.find("function renderRun()").expect("renderRun");
+        let end = app.find("function renderStage").expect("renderStage");
+        let render_run = &app[start..end];
+
+        assert!(render_run.contains("canViewResults()"));
+        assert!(!render_run.contains("state.run ? \"\" : \"disabled\""));
+        assert!(app.contains("function canViewResults()"));
+        assert!(app.contains("return state.run?.state === \"completed\""));
+    }
+
+    #[test]
     fn visual_result_sections_use_clear_not_ready_language() {
         let app = include_str!("../../../webui/app/app.js");
         assert!(app.contains("图形查看未就绪"));

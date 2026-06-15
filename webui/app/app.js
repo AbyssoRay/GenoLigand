@@ -544,7 +544,7 @@ function renderRun() {
         <div class="actions">
           <button class="button" data-action="start-run" ${canStartRun() ? "" : "disabled"}>开始运行</button>
           <button class="button secondary" data-action="refresh-run">刷新</button>
-          <button class="button ghost" data-action="to-results" ${state.run ? "" : "disabled"}>查看结果</button>
+          <button class="button ghost" data-action="to-results" ${canViewResults() ? "" : "disabled"}>查看结果</button>
         </div>
       </section>
       <section class="panel">
@@ -1118,6 +1118,10 @@ function checkRow(byId, id, label, next) {
 function canStartRun() {
   const groups = preflightGroups();
   return Boolean(state.project) && groups.every((group) => group.rows.every((row) => row.ready));
+}
+
+function canViewResults() {
+  return state.run?.state === "completed";
 }
 
 function nextActionText() {
