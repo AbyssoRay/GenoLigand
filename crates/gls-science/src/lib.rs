@@ -1795,7 +1795,7 @@ fn render_report(options: &ScienceOptions) -> Result<String, String> {
     text.push_str(
         "\u{672c}\u{62a5}\u{544a}\u{53ea}\u{5305}\u{542b}\u{8ba1}\u{7b97}\u{9884}\u{6d4b}\u{3001}\u{5019}\u{9009}\u{4f18}\u{5148}\u{7ea7}\u{548c}\u{8bc1}\u{636e}\u{6458}\u{8981}\u{ff0c}\u{4e0d}\u{4ee3}\u{8868}\u{5b9e}\u{9a8c}\u{9a8c}\u{8bc1}\u{3001}\u{4f53}\u{5185}\u{7ed3}\u{5408}\u{3001}\u{836f}\u{6548}\u{6216}\u{4f5c}\u{7528}\u{673a}\u{5236}\u{786e}\u{8ba4}\u{3002}\n\n",
     );
-    text.push_str(&report_source_summary(options));
+    text.push_str(&report_source_summary(options, candidates.len()));
     text.push_str("## \u{5019}\u{9009}\u{9776}\u{70b9}\n\n");
     if candidates.is_empty() {
         text.push_str("\u{5f53}\u{524d}\u{8fd0}\u{884c}\u{6ca1}\u{6709}\u{751f}\u{6210}\u{5019}\u{9009}\u{9776}\u{70b9}\u{3002}\u{53ef}\u{80fd}\u{539f}\u{56e0}\u{662f}\u{6ca1}\u{6709}\u{5339}\u{914d}\u{8bc1}\u{636e}\u{ff0c}\u{6216}\u{8ba1}\u{7b97}\u{5728}\u{5f00}\u{59cb}\u{524d}\u{88ab}\u{8fd0}\u{884c}\u{6761}\u{4ef6}\u{963b}\u{585e}\u{3002}\n");
@@ -1822,7 +1822,7 @@ fn render_report(options: &ScienceOptions) -> Result<String, String> {
     Ok("report_rendered".to_string())
 }
 
-fn report_source_summary(options: &ScienceOptions) -> String {
+fn report_source_summary(options: &ScienceOptions, candidate_count: usize) -> String {
     let project_id = clean_cell(&infer_project_id(&options.run_dir));
     let run_id = clean_cell(&infer_run_id(&options.run_dir));
     let input_status = if options.input_manifest.exists() {
@@ -1851,14 +1851,12 @@ fn report_source_summary(options: &ScienceOptions) -> String {
     } else {
         "\u{79d1}\u{5b66}\u{8d44}\u{6e90}\u{9700}\u{8981}\u{68c0}\u{67e5}\u{6216}\u{4fee}\u{590d}"
     };
-    let output_status = if options
-        .run_dir
-        .join("target_candidate_ranking.tsv")
-        .exists()
-    {
-        "\u{5019}\u{9009}\u{6392}\u{5e8f}\u{3001}\u{5019}\u{9009}\u{8be6}\u{60c5}\u{548c}\u{8bc1}\u{636e}\u{94fe}\u{5747}\u{6765}\u{81ea}\u{5f53}\u{524d}\u{8fd0}\u{884c}\u{8f93}\u{51fa}"
+    let output_status = if candidate_count > 0 {
+        format!(
+            "\u{5f53}\u{524d}\u{8fd0}\u{884c}\u{751f}\u{6210} {candidate_count} \u{4e2a}\u{5019}\u{9009}\u{5047}\u{8bbe}\u{ff0c}\u{6392}\u{5e8f}\u{3001}\u{8be6}\u{60c5}\u{548c}\u{8bc1}\u{636e}\u{6458}\u{8981}\u{5747}\u{6765}\u{81ea}\u{5f53}\u{524d}\u{8fd0}\u{884c}"
+        )
     } else {
-        "\u{672a}\u{751f}\u{6210}\u{5019}\u{9009}\u{6392}\u{5e8f}\u{8f93}\u{51fa}"
+        "\u{5f53}\u{524d}\u{8fd0}\u{884c}\u{6ca1}\u{6709}\u{53ef}\u{5c55}\u{793a}\u{7684}\u{5019}\u{9009}\u{5047}\u{8bbe}".to_string()
     };
     format!(
         "## \u{7ed3}\u{679c}\u{6765}\u{6e90}\n\n- \u{9879}\u{76ee}\u{7f16}\u{53f7}\u{ff1a}{project_id}\n- \u{8fd0}\u{884c}\u{7f16}\u{53f7}\u{ff1a}{run_id}\n- \u{8f93}\u{5165}\u{ff1a}{input_status}\n- \u{6570}\u{636e}\u{5e93}\u{ff1a}{database_status}\n- \u{8f93}\u{51fa}\u{6750}\u{6599}\u{ff1a}{output_status}\n\n",
@@ -2861,6 +2859,43 @@ mod tests {
         let source_map = read_text(&run.join("artifact_source_map.tsv")).expect("source map");
         assert!(context.contains("\"state\":\"blocked\""));
         assert!(source_map.contains("target_candidate_ranking.tsv"));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn report_empty_candidate_table_does_not_claim_result_outputs() {
+        let root = temp_root("empty_report");
+        let store = create_temporary_test_store(&root).expect("store");
+        let input = root.join("input.json");
+        let run = root.join("run");
+        ensure_dir(&run).expect("run dir");
+        write_text(
+            &input,
+            "{\"inputs\":[{\"field\":\"small_molecule\",\"value\":\"CCO\"}],\"files\":[]}\n",
+        )
+        .expect("input");
+        write_text(
+            &run.join("target_candidate_ranking.tsv"),
+            "rank\tcandidate_id\ttarget_id\ttarget_name\tcandidate_scope\torganism\tfinal_score\tknown_database_score\tmetagenome_score\tstructure_score\tdocking_score\tmd_score\tevidence_summary\tstatus\n",
+        )
+        .expect("empty ranking");
+        let options = ScienceOptions {
+            workspace_root: root.clone(),
+            science_store: store,
+            input_manifest: input,
+            run_dir: run.clone(),
+        };
+
+        render_report(&options).expect("report");
+        let report = read_text(&run.join("research_report.md")).expect("report text");
+
+        assert!(report.contains("当前运行没有可展示的候选假设"));
+        assert!(report.contains("当前运行没有生成候选靶点"));
+        assert!(!report.contains("生成 0 个候选假设"));
+        assert!(!report.contains("排序、详情和证据摘要均来自当前运行"));
+        assert!(!report.contains("target_candidate_ranking.tsv"));
+        assert!(!report.contains("input_manifest"));
+
         let _ = fs::remove_dir_all(root);
     }
 
