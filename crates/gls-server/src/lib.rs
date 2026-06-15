@@ -111,6 +111,9 @@ fn route(
     if let Some(response) = route_user_project(method, path, options, request_body) {
         return response;
     }
+    if let Some(response) = route_user_run(method, path, options) {
+        return response;
+    }
     if let Some(response) = route_project(method, path, options, request_body) {
         return response;
     }
@@ -231,6 +234,37 @@ fn route_run(
                 return Some(download_artifact_response(options, &run_id, file));
             }
             json!({"error":"not_found"})
+        }
+    };
+    Some((200, "application/json; charset=utf-8", value.to_string()))
+}
+
+fn route_user_run(
+    method: &str,
+    path: &str,
+    options: &ServerOptions,
+) -> Option<(u16, &'static str, String)> {
+    let rest = path.strip_prefix("/api/user/runs/")?;
+    let mut parts = rest.split('/');
+    let run_id = safe_id(parts.next().unwrap_or(""));
+    let suffix = parts.collect::<Vec<_>>().join("/");
+    let value = match (method, suffix.as_str()) {
+        ("GET", "") => user_run_json(options, &run_id),
+        ("GET", "logs") => logs_json(options, &run_id),
+        ("GET", "artifacts") => artifacts_json(options, &run_id),
+        ("GET", "candidates") => candidates_endpoint_json(options, &run_id),
+        ("GET", "candidate-detail") => candidate_detail_json(options, &run_id),
+        ("GET", "evidence") => evidence_endpoint_json(options, &run_id),
+        ("GET", "genome-context") => genome_endpoint_json(options, &run_id),
+        ("GET", "structure") => structure_endpoint_json(options, &run_id),
+        ("GET", "md-summary") => md_endpoint_json(options, &run_id),
+        _ => {
+            if method == "GET"
+                && let Some(file) = suffix.strip_prefix("download/")
+            {
+                return Some(download_artifact_response(options, &run_id, file));
+            }
+            json!({"message":"未找到运行材料"})
         }
     };
     Some((200, "application/json; charset=utf-8", value.to_string()))
@@ -685,6 +719,14 @@ fn run_json(options: &ServerOptions, run_id: &str) -> Value {
         "trace": run_trace(options, &run_dir, run_id),
         "outputs": artifact_index(&run_dir)
     })
+}
+
+fn user_run_json(options: &ServerOptions, run_id: &str) -> Value {
+    let mut run = run_json(options, run_id);
+    if let Some(stage) = run.get("current_stage").and_then(Value::as_str) {
+        run["current_stage"] = json!(stage_user_label(stage));
+    }
+    run
 }
 
 fn logs_json(options: &ServerOptions, run_id: &str) -> Value {
@@ -2861,6 +2903,28 @@ mod tests {
         assert!(!preflight_text.contains("preflight_passed"));
         assert!(!preflight_text.contains("blocked"));
         assert!(!preflight_text.contains(&root.display().to_string()));
+
+        fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn user_run_detail_uses_stage_labels_not_internal_stage_keys() {
+        let root = std::env::temp_dir().join(format!("genoligand-user-run-{}", now_millis()));
+        let options = server_options(root.clone());
+        let run_dir = project_dir(&options, "project-1")
+            .join("runs")
+            .join("run-1");
+        fs::create_dir_all(&run_dir).expect("run dir");
+        fs::write(run_dir.join("run_state.txt"), "running\n").expect("state");
+        fs::write(run_dir.join("current_stage.txt"), "pipeline_run\n").expect("stage");
+
+        let payload = user_run_json(&options, "run-1");
+        let text = payload.to_string();
+
+        assert_eq!(payload["current_stage"], "完整流程");
+        assert!(!text.contains("pipeline_run"));
+        assert!(!text.contains("current_command"));
+        assert!(!text.contains("artifact_index"));
 
         fs::remove_dir_all(&root).ok();
     }

@@ -127,7 +127,7 @@ async function refreshAll() {
       api("/api/user/setup/install-plan"),
     ]);
     if (state.run?.run_id) {
-      state.run = await api(`/api/runs/${state.run.run_id}`);
+      state.run = await api(`/api/user/runs/${state.run.run_id}`);
       await loadRunData();
     }
   } catch (error) {
@@ -814,7 +814,7 @@ function renderExport() {
 
 function exportCard(title, artifactId, artifacts, runId) {
   const exists = Boolean(runId) && artifacts.some((item) => item.id === artifactId && item.exists);
-  const href = `/api/runs/${encodeURIComponent(runId)}/download/${encodeURIComponent(artifactId)}`;
+  const href = `/api/user/runs/${encodeURIComponent(runId)}/download/${encodeURIComponent(artifactId)}`;
   return `
     <section class="panel third">
       <h2>${title}</h2>
@@ -932,14 +932,14 @@ async function loadRunData() {
   }
   const runId = state.run.run_id;
   const [candidates, detail, evidence, genome, structure, md, logs, artifacts] = await Promise.all([
-    api(`/api/runs/${runId}/candidates`),
-    api(`/api/runs/${runId}/candidate-detail`),
-    api(`/api/runs/${runId}/evidence`),
-    api(`/api/runs/${runId}/genome-context`),
-    api(`/api/runs/${runId}/structure`),
-    api(`/api/runs/${runId}/md-summary`),
-    api(`/api/runs/${runId}/logs`),
-    api(`/api/runs/${runId}/artifacts`),
+    api(`/api/user/runs/${runId}/candidates`),
+    api(`/api/user/runs/${runId}/candidate-detail`),
+    api(`/api/user/runs/${runId}/evidence`),
+    api(`/api/user/runs/${runId}/genome-context`),
+    api(`/api/user/runs/${runId}/structure`),
+    api(`/api/user/runs/${runId}/md-summary`),
+    api(`/api/user/runs/${runId}/logs`),
+    api(`/api/user/runs/${runId}/artifacts`),
   ]);
   state.runData = { candidates, detail, evidence, genome, structure, md, logs, artifacts };
 }
