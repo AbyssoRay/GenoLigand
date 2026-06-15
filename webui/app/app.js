@@ -713,15 +713,15 @@ function candidateDetailSection(rows) {
           <h2>第一候选摘要</h2>
           <p>摘要来自当前运行的候选详情输出；下方表格显示全部候选详情。</p>
         </div>
-        <span class="status-pill ready">候选编号 ${escapeHtml(first.candidate_id || "未提供")}</span>
+        <span class="status-pill ready">候选编号 ${escapeHtml(valueOrMissing(first.candidate_id))}</span>
       </div>
-      ${metricRow("目标名称", first.target_name || "未提供")}
-      ${metricRow("目标编号", first.target_id || "未提供")}
+      ${metricRow("目标名称", valueOrMissing(first.target_name))}
+      ${metricRow("目标编号", valueOrMissing(first.target_id))}
       ${metricRow("候选范围", friendlyScope(first.candidate_scope))}
-      ${metricRow("物种", first.organism || "未提供")}
-      ${metricRow("综合分数", first.final_score || "未提供")}
-      ${metricRow("证据摘要", first.evidence_summary || "未提供")}
-      ${metricRow("详情来源", first.detail_source || "当前运行输出")}
+      ${metricRow("物种", valueOrMissing(first.organism))}
+      ${metricRow("综合分数", valueOrMissing(first.final_score))}
+      ${metricRow("证据摘要", valueOrMissing(first.evidence_summary))}
+      ${metricRow("详情来源", valueOrMissing(first.detail_source, "当前运行输出"))}
     </section>
     <section class="panel full">
       <div class="panel-header">
@@ -1339,6 +1339,10 @@ function columnsFor(kind) {
 
 function metricRow(label, value) {
   return `<div class="metric-row"><div class="metric-label">${escapeHtml(label)}</div><div>${escapeHtml(value)}</div></div>`;
+}
+
+function valueOrMissing(value, fallback = "未提供") {
+  return value === undefined || value === null || value === "" ? fallback : value;
 }
 
 function runStateLabel(value) {
