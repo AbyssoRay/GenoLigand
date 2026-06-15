@@ -810,7 +810,8 @@ fn user_candidate_row(row: &Value) -> Value {
         "md_score": row_text(row, "md_score"),
         "evidence_summary": row_text(row, "evidence_summary"),
         "status": status,
-        "status_label": friendly_status_label(status)
+        "status_label": friendly_status_label(status),
+        "result_source": "候选排序输出"
     })
 }
 
@@ -822,7 +823,8 @@ fn user_genome_row(row: &Value) -> Value {
         "organism": row_text(row, "organism"),
         "target_class": row_text(row, "target_class"),
         "match_score": row_text(row, "match_score"),
-        "evidence": row_text(row, "evidence")
+        "evidence": row_text(row, "evidence"),
+        "result_source": "宏基因组比对输出"
     })
 }
 
@@ -842,7 +844,8 @@ fn user_candidate_detail_row(row: &Value) -> Value {
         "md_score": scores.get("md").cloned().unwrap_or_else(|| json!("")),
         "evidence_summary": row.get("evidence_summary").cloned().unwrap_or_else(|| json!("")),
         "status": "\u{8ba1}\u{7b97}\u{5019}\u{9009}",
-        "detail_source": "\u{5f53}\u{524d}\u{8fd0}\u{884c}\u{7684}\u{5019}\u{9009}\u{8be6}\u{60c5}\u{8f93}\u{51fa}"
+        "detail_source": "\u{5f53}\u{524d}\u{8fd0}\u{884c}\u{7684}\u{5019}\u{9009}\u{8be6}\u{60c5}\u{8f93}\u{51fa}",
+        "result_source": "\u{5019}\u{9009}\u{8be6}\u{60c5}\u{8f93}\u{51fa}"
     })
 }
 
@@ -878,7 +881,8 @@ fn user_structure_row(row: &Value, targets: &BTreeMap<String, (String, String)>)
         } else {
             "\u{5df2}\u{751f}\u{6210}\u{7ed3}\u{6784}\u{6458}\u{8981}"
         },
-        "viewer_status": "\u{672a}\u{63a5}\u{5165}\u{53ef}\u{7528}\u{4e09}\u{7ef4}\u{67e5}\u{770b}\u{8f93}\u{51fa}"
+        "viewer_status": "\u{672a}\u{63a5}\u{5165}\u{53ef}\u{7528}\u{4e09}\u{7ef4}\u{67e5}\u{770b}\u{8f93}\u{51fa}",
+        "result_source": "\u{7ed3}\u{6784}\u{4e0e}\u{53e3}\u{888b}\u{6458}\u{8981}\u{8f93}\u{51fa}"
     })
 }
 
@@ -917,7 +921,8 @@ fn user_md_row(row: &Value, targets: &BTreeMap<String, (String, String)>) -> Val
         } else {
             "\u{5df2}\u{751f}\u{6210}\u{52a8}\u{529b}\u{5b66}\u{6458}\u{8981}"
         },
-        "trajectory_status": "\u{672a}\u{63a5}\u{5165}\u{53ef}\u{7528}\u{8f68}\u{8ff9}\u{56fe}\u{8f93}\u{51fa}"
+        "trajectory_status": "\u{672a}\u{63a5}\u{5165}\u{53ef}\u{7528}\u{8f68}\u{8ff9}\u{56fe}\u{8f93}\u{51fa}",
+        "result_source": "\u{52a8}\u{529b}\u{5b66}\u{6458}\u{8981}\u{8f93}\u{51fa}"
     })
 }
 
@@ -939,7 +944,8 @@ fn user_evidence_row(row: Value) -> Value {
         "evidence_type": evidence_type_label(claim, artifact),
         "source": evidence_source_label(artifact),
         "status": evidence_status_label(status),
-        "summary": evidence_note_summary(notes)
+        "summary": evidence_note_summary(notes),
+        "result_source": "证据链输出"
     })
 }
 
@@ -2683,6 +2689,10 @@ mod tests {
         assert_eq!(
             payload["candidate_details"][0]["detail_source"],
             "当前运行的候选详情输出"
+        );
+        assert_eq!(
+            payload["candidate_details"][0]["result_source"],
+            "候选详情输出"
         );
         let text = payload.to_string();
         assert!(!text.contains("source_artifacts"));

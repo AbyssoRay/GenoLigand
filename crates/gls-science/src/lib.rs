@@ -1795,6 +1795,7 @@ fn render_report(options: &ScienceOptions) -> Result<String, String> {
     text.push_str(
         "\u{672c}\u{62a5}\u{544a}\u{53ea}\u{5305}\u{542b}\u{8ba1}\u{7b97}\u{9884}\u{6d4b}\u{3001}\u{5019}\u{9009}\u{4f18}\u{5148}\u{7ea7}\u{548c}\u{8bc1}\u{636e}\u{6458}\u{8981}\u{ff0c}\u{4e0d}\u{4ee3}\u{8868}\u{5b9e}\u{9a8c}\u{9a8c}\u{8bc1}\u{3001}\u{4f53}\u{5185}\u{7ed3}\u{5408}\u{3001}\u{836f}\u{6548}\u{6216}\u{4f5c}\u{7528}\u{673a}\u{5236}\u{786e}\u{8ba4}\u{3002}\n\n",
     );
+    text.push_str(&report_source_summary(options));
     text.push_str("## \u{5019}\u{9009}\u{9776}\u{70b9}\n\n");
     if candidates.is_empty() {
         text.push_str("\u{5f53}\u{524d}\u{8fd0}\u{884c}\u{6ca1}\u{6709}\u{751f}\u{6210}\u{5019}\u{9009}\u{9776}\u{70b9}\u{3002}\u{53ef}\u{80fd}\u{539f}\u{56e0}\u{662f}\u{6ca1}\u{6709}\u{5339}\u{914d}\u{8bc1}\u{636e}\u{ff0c}\u{6216}\u{8ba1}\u{7b97}\u{5728}\u{5f00}\u{59cb}\u{524d}\u{88ab}\u{8fd0}\u{884c}\u{6761}\u{4ef6}\u{963b}\u{585e}\u{3002}\n");
@@ -1819,6 +1820,49 @@ fn render_report(options: &ScienceOptions) -> Result<String, String> {
     }
     write_text(&options.run_dir.join("research_report.md"), &text)?;
     Ok("report_rendered".to_string())
+}
+
+fn report_source_summary(options: &ScienceOptions) -> String {
+    let project_id = clean_cell(&infer_project_id(&options.run_dir));
+    let run_id = clean_cell(&infer_run_id(&options.run_dir));
+    let input_status = if options.input_manifest.exists() {
+        "\u{5df2}\u{8bfb}\u{53d6}\u{5f53}\u{524d}\u{9879}\u{76ee}\u{8f93}\u{5165}"
+    } else {
+        "\u{672a}\u{8bfb}\u{53d6}\u{5230}\u{5f53}\u{524d}\u{9879}\u{76ee}\u{8f93}\u{5165}"
+    };
+    let required = [
+        options.science_store.join("science_store_manifest.tsv"),
+        options.science_store.join("indexes/known_targets.tsv"),
+        options.science_store.join("indexes/metagenome_targets.tsv"),
+        options.science_store.join("indexes/tool_versions.tsv"),
+    ];
+    let install_ready = read_text(&options.science_store.join("install_status.json"))
+        .ok()
+        .and_then(|text| serde_json::from_str::<Value>(&text).ok())
+        .and_then(|value| {
+            value
+                .get("status")
+                .and_then(Value::as_str)
+                .map(|status| status == "ready")
+        })
+        .unwrap_or(false);
+    let database_status = if install_ready && required.iter().all(|path| path.exists()) {
+        "\u{79d1}\u{5b66}\u{8d44}\u{6e90}\u{5df2}\u{5c31}\u{7eea}"
+    } else {
+        "\u{79d1}\u{5b66}\u{8d44}\u{6e90}\u{9700}\u{8981}\u{68c0}\u{67e5}\u{6216}\u{4fee}\u{590d}"
+    };
+    let output_status = if options
+        .run_dir
+        .join("target_candidate_ranking.tsv")
+        .exists()
+    {
+        "\u{5019}\u{9009}\u{6392}\u{5e8f}\u{3001}\u{5019}\u{9009}\u{8be6}\u{60c5}\u{548c}\u{8bc1}\u{636e}\u{94fe}\u{5747}\u{6765}\u{81ea}\u{5f53}\u{524d}\u{8fd0}\u{884c}\u{8f93}\u{51fa}"
+    } else {
+        "\u{672a}\u{751f}\u{6210}\u{5019}\u{9009}\u{6392}\u{5e8f}\u{8f93}\u{51fa}"
+    };
+    format!(
+        "## \u{7ed3}\u{679c}\u{6765}\u{6e90}\n\n- \u{9879}\u{76ee}\u{7f16}\u{53f7}\u{ff1a}{project_id}\n- \u{8fd0}\u{884c}\u{7f16}\u{53f7}\u{ff1a}{run_id}\n- \u{8f93}\u{5165}\u{ff1a}{input_status}\n- \u{6570}\u{636e}\u{5e93}\u{ff1a}{database_status}\n- \u{8f93}\u{51fa}\u{6750}\u{6599}\u{ff1a}{output_status}\n\n",
+    )
 }
 
 fn report_scope_label(value: &str) -> &'static str {
@@ -2858,11 +2902,18 @@ mod tests {
         assert!(source_map.contains("tool_outputs/structure_patch_summary.tsv"));
         assert!(evidence.contains("score_decomposition"));
         assert!(report.contains("# GenoLigand 科研报告"));
+        assert!(report.contains("## 结果来源"));
+        assert!(report.contains("项目编号"));
+        assert!(report.contains("运行编号"));
+        assert!(report.contains("输出材料"));
         assert!(report.contains("计算预测"));
         assert!(report.contains("建议把排序靠前的候选作为后续实验验证的优先对象"));
         assert!(report.contains("已知蛋白数据库") || report.contains("宏基因组潜在序列"));
         assert!(!report.contains("GenoLigand Scientific Report"));
         assert!(!report.contains("No candidate target"));
+        assert!(!report.contains("input_manifest"));
+        assert!(!report.contains("science_store"));
+        assert!(!report.contains("target_candidate_ranking.tsv"));
         assert!(!report.contains("known_database"));
         assert!(!report.contains("metagenome_potential"));
         assert_eq!(structure.lines().count(), 1);

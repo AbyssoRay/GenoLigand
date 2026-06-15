@@ -1184,6 +1184,7 @@ function columnsFor(kind) {
     { key: "md_score", label: "动力学分数" },
     { key: "evidence_summary", label: "证据摘要" },
     { key: "status", label: "状态" },
+    { key: "result_source", label: "输出材料" },
   ];
   if (kind === "ranking") return common;
   if (kind === "candidate_detail") {
@@ -1201,6 +1202,7 @@ function columnsFor(kind) {
       { key: "md_score", label: "动力学分数" },
       { key: "evidence_summary", label: "证据摘要" },
       { key: "detail_source", label: "详情来源" },
+      { key: "result_source", label: "输出材料" },
     ];
   }
   if (kind === "evidence") {
@@ -1209,6 +1211,7 @@ function columnsFor(kind) {
       { key: "source", label: "来源" },
       { key: "status", label: "状态" },
       { key: "summary", label: "说明" },
+      { key: "result_source", label: "输出材料" },
     ];
   }
   if (kind === "genome") {
@@ -1219,6 +1222,7 @@ function columnsFor(kind) {
       { key: "organism", label: "物种" },
       { key: "target_class", label: "类别" },
       { key: "evidence", label: "证据" },
+      { key: "result_source", label: "输出材料" },
     ];
   }
   if (kind === "structure") {
@@ -1231,6 +1235,7 @@ function columnsFor(kind) {
       { key: "summary", label: "结构证据" },
       { key: "status", label: "状态" },
       { key: "viewer_status", label: "查看器" },
+      { key: "result_source", label: "输出材料" },
     ];
   }
   if (kind === "md") {
@@ -1246,6 +1251,7 @@ function columnsFor(kind) {
       { key: "summary", label: "摘要" },
       { key: "status", label: "状态" },
       { key: "trajectory_status", label: "轨迹图" },
+      { key: "result_source", label: "输出材料" },
     ];
   }
   return common;
