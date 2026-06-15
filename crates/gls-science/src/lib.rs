@@ -5,6 +5,7 @@ use std::fs;
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use zip::ZipArchive;
 
 #[derive(Clone, Debug)]
 pub struct ScienceOptions {
@@ -487,15 +488,31 @@ fn build_store_indexes(
 ) -> Result<IndexBuildSummary, String> {
     let known_sources = [
         "imports/known_targets.tsv",
+        "imports/known_targets.tsv.gz",
+        "imports/known_targets.zip",
         "downloads/known_targets.tsv",
+        "downloads/known_targets.tsv.gz",
+        "downloads/known_targets.zip",
         "downloads/chembl/known_targets.tsv",
+        "downloads/chembl/known_targets.tsv.gz",
+        "downloads/chembl/known_targets.zip",
         "downloads/bindingdb/known_targets.tsv",
+        "downloads/bindingdb/known_targets.tsv.gz",
+        "downloads/bindingdb/known_targets.zip",
         "downloads/uniprot/known_targets.tsv",
+        "downloads/uniprot/known_targets.tsv.gz",
+        "downloads/uniprot/known_targets.zip",
     ];
     let metagenome_sources = [
         "imports/metagenome_targets.tsv",
+        "imports/metagenome_targets.tsv.gz",
+        "imports/metagenome_targets.zip",
         "downloads/metagenome_targets.tsv",
+        "downloads/metagenome_targets.tsv.gz",
+        "downloads/metagenome_targets.zip",
         "downloads/metagenome/metagenome_targets.tsv",
+        "downloads/metagenome/metagenome_targets.tsv.gz",
+        "downloads/metagenome/metagenome_targets.zip",
     ];
     let mut manifest = String::from("index\tinput_path\tstatus\trows\toutput_path\tnotes\n");
     let mut known_rows = Vec::new();
@@ -664,7 +681,7 @@ fn is_sequence_file(path: &Path) -> bool {
         .and_then(|value| value.to_str())
         .unwrap_or_default()
         .to_ascii_lowercase();
-    matches_sequence_name(&name)
+    matches_sequence_name(&name) || name.ends_with(".zip")
 }
 
 fn matches_sequence_name(name: &str) -> bool {
@@ -676,6 +693,9 @@ fn matches_sequence_name(name: &str) -> bool {
             || value.ends_with(".fa.gz")
             || value.ends_with(".faa.gz")
             || value.ends_with(".fasta.gz")
+            || value.ends_with(".fa.zip")
+            || value.ends_with(".faa.zip")
+            || value.ends_with(".fasta.zip")
     )
 }
 
@@ -727,17 +747,66 @@ fn read_sequence_text(path: &Path) -> Result<String, String> {
         .unwrap_or_default()
         .to_ascii_lowercase();
     if name.ends_with(".gz") {
-        let file =
-            fs::File::open(path).map_err(|err| format!("open_failed:{}:{err}", path.display()))?;
-        let mut decoder = GzDecoder::new(file);
-        let mut text = String::new();
-        decoder
-            .read_to_string(&mut text)
-            .map_err(|err| format!("gzip_read_failed:{}:{err}", path.display()))?;
-        Ok(text)
+        read_gzip_text(path)
+    } else if name.ends_with(".zip") {
+        read_zip_text(path, matches_sequence_name)
     } else {
         read_text(path)
     }
+}
+
+fn read_table_text(path: &Path) -> Result<String, String> {
+    let name = path
+        .file_name()
+        .and_then(|value| value.to_str())
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    if name.ends_with(".gz") {
+        read_gzip_text(path)
+    } else if name.ends_with(".zip") {
+        read_zip_text(path, matches_table_name)
+    } else {
+        read_text(path)
+    }
+}
+
+fn matches_table_name(name: &str) -> bool {
+    name.ends_with(".tsv") || name.ends_with(".txt")
+}
+
+fn read_gzip_text(path: &Path) -> Result<String, String> {
+    let file =
+        fs::File::open(path).map_err(|err| format!("open_failed:{}:{err}", path.display()))?;
+    let mut decoder = GzDecoder::new(file);
+    let mut text = String::new();
+    decoder
+        .read_to_string(&mut text)
+        .map_err(|err| format!("gzip_read_failed:{}:{err}", path.display()))?;
+    Ok(text)
+}
+
+fn read_zip_text(path: &Path, accept: fn(&str) -> bool) -> Result<String, String> {
+    let file =
+        fs::File::open(path).map_err(|err| format!("open_failed:{}:{err}", path.display()))?;
+    let mut archive =
+        ZipArchive::new(file).map_err(|err| format!("zip_open_failed:{}:{err}", path.display()))?;
+    for index in 0..archive.len() {
+        let mut member = archive
+            .by_index(index)
+            .map_err(|err| format!("zip_member_failed:{}:{err}", path.display()))?;
+        if member.is_dir() {
+            continue;
+        }
+        let name = member.name().to_ascii_lowercase();
+        if accept(&name) {
+            let mut text = String::new();
+            member
+                .read_to_string(&mut text)
+                .map_err(|err| format!("zip_read_failed:{}:{err}", path.display()))?;
+            return Ok(text);
+        }
+    }
+    Err(format!("zip_no_supported_text_member:{}", path.display()))
 }
 
 fn push_fasta_row(
@@ -960,29 +1029,61 @@ fn source_local_available(options: &StoreOptions, source: &RequiredSource) -> bo
         return true;
     }
     match source.id {
-        "chembl" => {
-            store.join("imports/known_targets.tsv").exists()
-                || store.join("downloads/chembl/known_targets.tsv").exists()
-        }
-        "bindingdb" => store.join("downloads/bindingdb/known_targets.tsv").exists(),
+        "chembl" => any_source_path_exists(
+            store,
+            &[
+                "imports/known_targets.tsv",
+                "imports/known_targets.tsv.gz",
+                "imports/known_targets.zip",
+                "downloads/chembl/known_targets.tsv",
+                "downloads/chembl/known_targets.tsv.gz",
+                "downloads/chembl/known_targets.zip",
+            ],
+        ),
+        "bindingdb" => any_source_path_exists(
+            store,
+            &[
+                "downloads/bindingdb/known_targets.tsv",
+                "downloads/bindingdb/known_targets.tsv.gz",
+                "downloads/bindingdb/known_targets.zip",
+            ],
+        ),
         "uniprot_human_reviewed" => {
-            store.join("downloads/uniprot/known_targets.tsv").exists()
-                || discover_sequence_files(&store.join("downloads/uniprot"))
-                    .map(|files| !files.is_empty())
-                    .unwrap_or(false)
+            any_source_path_exists(
+                store,
+                &[
+                    "downloads/uniprot/known_targets.tsv",
+                    "downloads/uniprot/known_targets.tsv.gz",
+                    "downloads/uniprot/known_targets.zip",
+                ],
+            ) || discover_sequence_files(&store.join("downloads/uniprot"))
+                .map(|files| !files.is_empty())
+                .unwrap_or(false)
         }
         "metagenome_potential" => {
-            store.join("imports/metagenome_targets.tsv").exists()
-                || store.join("downloads/metagenome_targets.tsv").exists()
-                || store
-                    .join("downloads/metagenome/metagenome_targets.tsv")
-                    .exists()
-                || discover_sequence_files(&store.join("downloads/metagenome"))
-                    .map(|files| !files.is_empty())
-                    .unwrap_or(false)
+            any_source_path_exists(
+                store,
+                &[
+                    "imports/metagenome_targets.tsv",
+                    "imports/metagenome_targets.tsv.gz",
+                    "imports/metagenome_targets.zip",
+                    "downloads/metagenome_targets.tsv",
+                    "downloads/metagenome_targets.tsv.gz",
+                    "downloads/metagenome_targets.zip",
+                    "downloads/metagenome/metagenome_targets.tsv",
+                    "downloads/metagenome/metagenome_targets.tsv.gz",
+                    "downloads/metagenome/metagenome_targets.zip",
+                ],
+            ) || discover_sequence_files(&store.join("downloads/metagenome"))
+                .map(|files| !files.is_empty())
+                .unwrap_or(false)
         }
         _ => false,
     }
+}
+
+fn any_source_path_exists(store: &Path, rel_paths: &[&str]) -> bool {
+    rel_paths.iter().any(|rel| store.join(rel).exists())
 }
 
 fn path_has_any_file(path: &Path) -> bool {
@@ -1645,9 +1746,10 @@ fn read_normalized_inputs(path: &Path) -> Result<Vec<NormalizedInput>, String> {
 }
 
 fn read_store_rows(path: &Path, label: &str) -> Result<Vec<StoreRow>, String> {
-    let text = read_text(path).map_err(|err| format!("{label}_missing:{err}"))?;
+    let text = read_table_text(path).map_err(|err| format!("{label}_missing:{err}"))?;
     let mut rows = Vec::new();
     for line in text.lines().skip(1) {
+        let line = line.trim_start_matches('\u{feff}');
         let cols = split_tsv(line);
         if cols.len() < 9 {
             continue;
@@ -1973,6 +2075,58 @@ mod tests {
         assert!(!root.exists());
     }
 
+    #[test]
+    fn prepare_science_store_builds_known_index_from_gzipped_target_table() {
+        let root = temp_root("build_gzip_table");
+        let store = root.join("science_store");
+        write_gzip(
+            &store.join("downloads/chembl/known_targets.tsv.gz"),
+            "source\ttarget_id\ttarget_name\torganism\ttarget_class\tligand_tokens\tsequence_tokens\tstructure_tokens\tevidence\nChEMBL\tCHEMBL_GZ1\tBeta receptor\tHomo sapiens\tknown_human_protein\tbeta ligand\tbeta receptor\tbinding site\tgzipped_source_table\n",
+        )
+        .expect("write gzip table");
+        let options = StoreOptions {
+            workspace_root: root.clone(),
+            science_store: store.clone(),
+        };
+        let _ = run_store_command(ScienceCommand::PrepareScienceStore, &options)
+            .expect("prepare store");
+        let known = read_text(&store.join("indexes/known_targets.tsv")).expect("known index");
+        assert!(known.contains("CHEMBL_GZ1"));
+        fs::remove_dir_all(&root).expect("cleanup temp root");
+        assert!(!root.exists());
+    }
+
+    #[test]
+    fn prepare_science_store_builds_indexes_from_zip_members() {
+        let root = temp_root("build_zip_indexes");
+        let store = root.join("science_store");
+        write_zip(
+            &store.join("downloads/chembl/known_targets.zip"),
+            "nested/known_targets.tsv",
+            "source\ttarget_id\ttarget_name\torganism\ttarget_class\tligand_tokens\tsequence_tokens\tstructure_tokens\tevidence\nChEMBL\tCHEMBL_ZIP1\tGamma enzyme\tHomo sapiens\tknown_human_protein\tgamma ligand\tgamma enzyme\tactive site\tzipped_source_table\n",
+        )
+        .expect("write zip table");
+        write_zip(
+            &store.join("downloads/metagenome/orfs.zip"),
+            "orfs/orfs.faa",
+            ">MG_ZIP_1 candidate transferase OS=environmental source\nMTEYKLVVVGAGGVGKSALTIQLIQNHFVDEYDPTIEDSY\n",
+        )
+        .expect("write zip fasta");
+        let options = StoreOptions {
+            workspace_root: root.clone(),
+            science_store: store.clone(),
+        };
+        let _ = run_store_command(ScienceCommand::PrepareScienceStore, &options)
+            .expect("prepare store");
+        let known = read_text(&store.join("indexes/known_targets.tsv")).expect("known index");
+        let metagenome =
+            read_text(&store.join("indexes/metagenome_targets.tsv")).expect("metagenome index");
+        assert!(known.contains("CHEMBL_ZIP1"));
+        assert!(metagenome.contains("MG_ZIP_1"));
+        fs::remove_dir_all(&root).expect("cleanup temp root");
+        assert!(!root.exists());
+    }
+
     fn write_gzip(path: &Path, text: &str) -> Result<(), String> {
         use flate2::Compression;
         use flate2::write::GzEncoder;
@@ -1990,6 +2144,31 @@ mod tests {
         encoder
             .finish()
             .map_err(|err| format!("gzip_finish_failed:{}:{err}", path.display()))?;
+        Ok(())
+    }
+
+    fn write_zip(path: &Path, member_name: &str, text: &str) -> Result<(), String> {
+        use std::io::Write;
+        use zip::CompressionMethod;
+        use zip::write::FileOptions;
+
+        if let Some(parent) = path.parent() {
+            ensure_dir(parent)?;
+        }
+        let file = fs::File::create(path)
+            .map_err(|err| format!("create_failed:{}:{err}", path.display()))?;
+        let mut writer = zip::ZipWriter::new(file);
+        let options: FileOptions<'_, ()> =
+            FileOptions::default().compression_method(CompressionMethod::Deflated);
+        writer
+            .start_file(member_name, options)
+            .map_err(|err| format!("zip_start_failed:{}:{err}", path.display()))?;
+        writer
+            .write_all(text.as_bytes())
+            .map_err(|err| format!("zip_write_failed:{}:{err}", path.display()))?;
+        writer
+            .finish()
+            .map_err(|err| format!("zip_finish_failed:{}:{err}", path.display()))?;
         Ok(())
     }
 
