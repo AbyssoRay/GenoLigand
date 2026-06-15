@@ -726,6 +726,8 @@ fn user_run_json(options: &ServerOptions, run_id: &str) -> Value {
     if let Some(stage) = run.get("current_stage").and_then(Value::as_str) {
         run["current_stage"] = json!(stage_user_label(stage));
     }
+    let state = run.get("state").and_then(Value::as_str).unwrap_or_default();
+    run["state_label"] = json!(run_state_user_label(state));
     run
 }
 
@@ -2922,6 +2924,7 @@ mod tests {
         let text = payload.to_string();
 
         assert_eq!(payload["current_stage"], "完整流程");
+        assert_eq!(payload["state_label"], "运行中");
         assert!(!text.contains("pipeline_run"));
         assert!(!text.contains("current_command"));
         assert!(!text.contains("artifact_index"));

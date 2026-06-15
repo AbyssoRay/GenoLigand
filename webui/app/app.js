@@ -538,6 +538,7 @@ function sourceStatusTable() {
 function renderRun() {
   page.className = "page";
   const runState = state.run?.state || "not_started";
+  const runLabel = state.run?.state_label || runStateLabel(runState);
   page.innerHTML = `
     <div class="panel-grid">
       <section class="panel full">
@@ -546,7 +547,7 @@ function renderRun() {
             <h2>运行中心</h2>
             <p>这里显示当前运行阶段、下一步动作、资源状态和日志。</p>
           </div>
-          <span class="status-pill ${runStateClass(runState)}">${runStateLabel(runState)}</span>
+          <span class="status-pill ${runStateClass(runState)}">${escapeHtml(runLabel)}</span>
         </div>
         <div class="actions">
           <button class="button" data-action="start-run" ${canStartRun() ? "" : "disabled"}>开始运行</button>
@@ -560,7 +561,7 @@ function renderRun() {
       </section>
       <section class="panel">
         <h2>运行摘要</h2>
-        ${metricRow("当前状态", runStateLabel(runState))}
+        ${metricRow("当前状态", runLabel)}
         ${metricRow("下一步", nextActionText())}
         ${metricRow("候选数量", candidateCountText())}
         ${metricRow("阻塞原因", state.run?.failure_summary || "无")}
@@ -656,7 +657,7 @@ function renderResults() {
 function resultTracePanel() {
   const trace = state.run?.trace || {};
   const projectText = trace.project_label || state.project?.project_name || (state.project ? "当前项目" : "未创建");
-  const runText = state.run ? `${trace.run_label || "当前运行"}：${runStateLabel(state.run.state)}` : "未运行";
+  const runText = state.run ? `${trace.run_label || "当前运行"}：${state.run.state_label || runStateLabel(state.run.state)}` : "未运行";
   const databaseText = trace.database_status || "未检查";
   const outputText = trace.output_status
     ? `${trace.output_status}${Number.isFinite(trace.output_count) ? `（${trace.output_count} 项）` : ""}`
