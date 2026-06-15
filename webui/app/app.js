@@ -428,7 +428,7 @@ function installCatalogSummary() {
   const externalReady = external?.status === "ready";
   return `
     <div class="notice ${directReady && externalReady ? "" : "warn"}">
-      <strong>安装资源清单：${direct?.source_count || 0} 个直接下载源，${external?.source_group_count || 0} 组大型资源</strong>
+      <strong>安装准备：${direct?.source_count || 0} 个数据库来源，${external?.source_group_count || 0} 组大型资源</strong>
       <div class="compact-list">下一步：${escapeHtml((directReady && externalReady) ? "运行安装/修复" : "使用完整安装包重新运行安装/修复")}</div>
     </div>`;
 }
@@ -523,7 +523,7 @@ function diagnosticsSummary() {
 function sourceStatusTable() {
   const sources = state.databases?.sources || [];
   if (!sources.length) {
-    return `<div class="empty">尚未生成科学资源清单。运行安装/修复后会显示每个数据库源的状态。</div>`;
+    return `<div class="empty">尚未读取到数据库状态。运行安装/修复后会显示每个资源的准备情况。</div>`;
   }
   return table(
     sources,
