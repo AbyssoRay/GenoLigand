@@ -575,19 +575,87 @@ fn download_artifact_response(
     requested: &str,
 ) -> (u16, &'static str, String) {
     let artifact_id = requested.split('?').next().unwrap_or(requested);
-    let Some(file) = artifact_file_for_id(artifact_id) else {
-        return json_response(404, json!({"error":"artifact_not_available"}));
-    };
     let Some(run_dir) = find_run_dir(options, run_id) else {
         return json_response(404, json!({"error":"run_not_found"}));
     };
-    let path = run_dir.join(file);
-    if !path.exists() {
-        return json_response(404, json!({"error":"artifact_not_available"}));
-    }
-    match fs::read_to_string(&path) {
-        Ok(text) => (200, artifact_content_type(file), text),
-        Err(_) => json_response(404, json!({"error":"artifact_not_available"})),
+    match artifact_id {
+        "research_report" => {
+            let path = run_dir.join("research_report.md");
+            if !path.exists() {
+                return json_response(404, json!({"error":"artifact_not_available"}));
+            }
+            match fs::read_to_string(&path) {
+                Ok(text) => (200, "text/markdown; charset=utf-8", text),
+                Err(_) => json_response(404, json!({"error":"artifact_not_available"})),
+            }
+        }
+        "candidate_ranking" => user_tsv_download(
+            user_candidate_rows(&run_dir),
+            &[
+                ("\u{6392}\u{5e8f}", "rank"),
+                ("\u{5019}\u{9009}\u{7f16}\u{53f7}", "candidate_id"),
+                ("\u{76ee}\u{6807}\u{7f16}\u{53f7}", "target_id"),
+                ("\u{76ee}\u{6807}\u{540d}\u{79f0}", "target_name"),
+                ("\u{5019}\u{9009}\u{8303}\u{56f4}", "candidate_scope_label"),
+                ("\u{7269}\u{79cd}", "organism"),
+                ("\u{7efc}\u{5408}\u{5206}\u{6570}", "final_score"),
+                (
+                    "\u{5df2}\u{77e5}\u{5e93}\u{5206}\u{6570}",
+                    "known_database_score",
+                ),
+                (
+                    "\u{5b8f}\u{57fa}\u{56e0}\u{7ec4}\u{5206}\u{6570}",
+                    "metagenome_score",
+                ),
+                ("\u{7ed3}\u{6784}\u{5206}\u{6570}", "structure_score"),
+                ("\u{5bf9}\u{63a5}\u{5206}\u{6570}", "docking_score"),
+                ("\u{52a8}\u{529b}\u{5b66}\u{5206}\u{6570}", "md_score"),
+                ("\u{8bc1}\u{636e}\u{6458}\u{8981}", "evidence_summary"),
+                ("\u{72b6}\u{6001}", "status_label"),
+            ],
+        ),
+        "evidence" => user_tsv_download(
+            user_evidence_rows(&run_dir),
+            &[
+                ("\u{8bc1}\u{636e}\u{7c7b}\u{578b}", "evidence_type"),
+                ("\u{6765}\u{6e90}", "source"),
+                ("\u{72b6}\u{6001}", "status"),
+                ("\u{8bf4}\u{660e}", "summary"),
+            ],
+        ),
+        "structure_patch" => user_tsv_download(
+            user_structure_rows(&run_dir),
+            &[
+                ("\u{5019}\u{9009}\u{7f16}\u{53f7}", "candidate_id"),
+                ("\u{76ee}\u{6807}\u{7f16}\u{53f7}", "target_id"),
+                ("\u{76ee}\u{6807}\u{540d}\u{79f0}", "target_name"),
+                ("\u{7ed3}\u{6784}\u{5206}\u{6570}", "structure_score"),
+                ("\u{5bf9}\u{63a5}\u{5206}\u{6570}", "docking_score"),
+                ("\u{7ed3}\u{6784}\u{8bc1}\u{636e}", "summary"),
+                ("\u{72b6}\u{6001}", "status"),
+                ("\u{67e5}\u{770b}\u{5668}", "viewer_status"),
+            ],
+        ),
+        "md_summary" => user_tsv_download(
+            user_md_rows(&run_dir),
+            &[
+                ("\u{5019}\u{9009}\u{7f16}\u{53f7}", "candidate_id"),
+                ("\u{76ee}\u{6807}\u{7f16}\u{53f7}", "target_id"),
+                ("\u{76ee}\u{6807}\u{540d}\u{79f0}", "target_name"),
+                ("\u{52a8}\u{529b}\u{5b66}\u{5206}\u{6570}", "md_score"),
+                ("RMSD", "rmsd"),
+                ("RMSF", "rmsf"),
+                ("\u{914d}\u{4f53}\u{6f02}\u{79fb}", "ligand_drift"),
+                (
+                    "\u{63a5}\u{89e6}\u{5360}\u{6709}\u{7387}",
+                    "contact_occupancy",
+                ),
+                ("\u{6458}\u{8981}", "summary"),
+                ("\u{72b6}\u{6001}", "status"),
+                ("\u{8f68}\u{8ff9}\u{56fe}", "trajectory_status"),
+            ],
+        ),
+        _ => json_response(404, json!({"error":"artifact_not_available"})),
     }
 }
 
@@ -596,10 +664,7 @@ fn evidence_endpoint_json(options: &ServerOptions, run_id: &str) -> Value {
         return json!({"run_id":run_id,"evidence":[],"row_count":0,"has_output":false});
     };
     let path = run_dir.join("evidence_ledger.tsv");
-    let rows = read_tsv_rows(&path)
-        .into_iter()
-        .map(user_evidence_row)
-        .collect::<Vec<_>>();
+    let rows = user_evidence_rows(&run_dir);
     json!({
         "run_id": run_id,
         "evidence": rows,
@@ -613,10 +678,7 @@ fn candidates_endpoint_json(options: &ServerOptions, run_id: &str) -> Value {
         return json!({"run_id":run_id,"candidates":[],"row_count":0,"has_output":false});
     };
     let path = run_dir.join("target_candidate_ranking.tsv");
-    let rows = read_tsv_rows(&path)
-        .into_iter()
-        .map(|row| user_candidate_row(&row))
-        .collect::<Vec<_>>();
+    let rows = user_candidate_rows(&run_dir);
     json!({
         "run_id": run_id,
         "candidates": rows,
@@ -655,11 +717,7 @@ fn structure_endpoint_json(options: &ServerOptions, run_id: &str) -> Value {
         return json!({"run_id":run_id,"structure_rows":[],"row_count":0,"has_output":false});
     };
     let path = run_dir.join("structure_patch_summary.tsv");
-    let targets = candidate_target_lookup(&run_dir);
-    let rows = read_tsv_rows(&path)
-        .into_iter()
-        .map(|row| user_structure_row(&row, &targets))
-        .collect::<Vec<_>>();
+    let rows = user_structure_rows(&run_dir);
     json!({
         "run_id": run_id,
         "structure_rows": rows,
@@ -673,11 +731,7 @@ fn md_endpoint_json(options: &ServerOptions, run_id: &str) -> Value {
         return json!({"run_id":run_id,"md_rows":[],"row_count":0,"has_output":false});
     };
     let path = run_dir.join("md_summary.tsv");
-    let targets = candidate_target_lookup(&run_dir);
-    let rows = read_tsv_rows(&path)
-        .into_iter()
-        .map(|row| user_md_row(&row, &targets))
-        .collect::<Vec<_>>();
+    let rows = user_md_rows(&run_dir);
     json!({
         "run_id": run_id,
         "md_rows": rows,
@@ -691,10 +745,7 @@ fn genome_endpoint_json(options: &ServerOptions, run_id: &str) -> Value {
         return json!({"run_id":run_id,"genome_context":[],"row_count":0,"has_output":false});
     };
     let path = run_dir.join("metagenome_potential_matches.tsv");
-    let rows = read_tsv_rows(&path)
-        .into_iter()
-        .map(|row| user_genome_row(&row))
-        .collect::<Vec<_>>();
+    let rows = user_genome_rows(&run_dir);
     json!({
         "run_id": run_id,
         "genome_context": rows,
@@ -703,13 +754,53 @@ fn genome_endpoint_json(options: &ServerOptions, run_id: &str) -> Value {
     })
 }
 
+fn user_candidate_rows(run_dir: &Path) -> Vec<Value> {
+    read_tsv_rows(&run_dir.join("target_candidate_ranking.tsv"))
+        .into_iter()
+        .map(|row| user_candidate_row(&row))
+        .collect()
+}
+
+fn user_evidence_rows(run_dir: &Path) -> Vec<Value> {
+    read_tsv_rows(&run_dir.join("evidence_ledger.tsv"))
+        .into_iter()
+        .map(user_evidence_row)
+        .collect()
+}
+
+fn user_structure_rows(run_dir: &Path) -> Vec<Value> {
+    let targets = candidate_target_lookup(run_dir);
+    read_tsv_rows(&run_dir.join("structure_patch_summary.tsv"))
+        .into_iter()
+        .map(|row| user_structure_row(&row, &targets))
+        .collect()
+}
+
+fn user_md_rows(run_dir: &Path) -> Vec<Value> {
+    let targets = candidate_target_lookup(run_dir);
+    read_tsv_rows(&run_dir.join("md_summary.tsv"))
+        .into_iter()
+        .map(|row| user_md_row(&row, &targets))
+        .collect()
+}
+
+fn user_genome_rows(run_dir: &Path) -> Vec<Value> {
+    read_tsv_rows(&run_dir.join("metagenome_potential_matches.tsv"))
+        .into_iter()
+        .map(|row| user_genome_row(&row))
+        .collect()
+}
+
 fn user_candidate_row(row: &Value) -> Value {
+    let scope = row_text(row, "candidate_scope");
+    let status = first_non_empty(row_text(row, "status"), "computed_prediction");
     json!({
         "rank": row_text(row, "rank"),
         "candidate_id": row_text(row, "candidate_id"),
         "target_id": row_text(row, "target_id"),
         "target_name": row_text(row, "target_name"),
-        "candidate_scope": row_text(row, "candidate_scope"),
+        "candidate_scope": scope,
+        "candidate_scope_label": friendly_candidate_scope(scope),
         "organism": row_text(row, "organism"),
         "final_score": row_text(row, "final_score"),
         "known_database_score": row_text(row, "known_database_score"),
@@ -718,7 +809,8 @@ fn user_candidate_row(row: &Value) -> Value {
         "docking_score": row_text(row, "docking_score"),
         "md_score": row_text(row, "md_score"),
         "evidence_summary": row_text(row, "evidence_summary"),
-        "status": first_non_empty(row_text(row, "status"), "computed_prediction")
+        "status": status,
+        "status_label": friendly_status_label(status)
     })
 }
 
@@ -923,6 +1015,64 @@ fn friendly_match_source(source: &str) -> String {
     } else {
         trimmed.to_string()
     }
+}
+
+fn friendly_candidate_scope(scope: &str) -> &'static str {
+    match scope {
+        "known_database" | "known_human_protein" => {
+            "\u{5df2}\u{77e5}\u{86cb}\u{767d}\u{6570}\u{636e}\u{5e93}"
+        }
+        "metagenome_potential" | "metagenome_potential_protein" => {
+            "\u{5b8f}\u{57fa}\u{56e0}\u{7ec4}\u{6f5c}\u{5728}\u{5e8f}\u{5217}"
+        }
+        "structure_interaction" => "\u{7ed3}\u{6784}\u{4e92}\u{4f5c}",
+        _ => "\u{672a}\u{5206}\u{7c7b}",
+    }
+}
+
+fn friendly_status_label(status: &str) -> &'static str {
+    match status {
+        "computed_prediction" => "\u{8ba1}\u{7b97}\u{5019}\u{9009}",
+        "completed" => "\u{5df2}\u{5b8c}\u{6210}",
+        "blocked" => "\u{9700}\u{8981}\u{5904}\u{7406}",
+        "failed" => "\u{5931}\u{8d25}",
+        "running" => "\u{8fd0}\u{884c}\u{4e2d}",
+        _ => "\u{8bb0}\u{5f55}",
+    }
+}
+
+fn user_tsv_download(
+    rows: Vec<Value>,
+    fields: &[(&'static str, &'static str)],
+) -> (u16, &'static str, String) {
+    if rows.is_empty() {
+        return json_response(404, json!({"error":"artifact_not_available"}));
+    }
+    let mut text = fields
+        .iter()
+        .map(|(label, _)| escape_tsv(label))
+        .collect::<Vec<_>>()
+        .join("\t");
+    text.push('\n');
+    for row in rows {
+        text.push_str(
+            &fields
+                .iter()
+                .map(|(_, key)| escape_tsv(row_text(&row, key)))
+                .collect::<Vec<_>>()
+                .join("\t"),
+        );
+        text.push('\n');
+    }
+    (200, "text/tab-separated-values; charset=utf-8", text)
+}
+
+fn escape_tsv(value: &str) -> String {
+    value
+        .replace('\t', " ")
+        .replace(['\r', '\n'], " ")
+        .trim()
+        .to_string()
 }
 
 fn evidence_type_label(claim: &str, artifact: &str) -> &'static str {
@@ -1795,10 +1945,10 @@ fn artifact_visible_for_user(id: &str, path: &Path, run_dir: &Path, completed: b
         return false;
     }
     match id {
-        "candidate_ranking" | "candidate_detail" => {
+        "candidate_ranking" => {
             completed && rows_len(&run_dir.join("target_candidate_ranking.tsv")) > 0
         }
-        "evidence" => completed && rows_len(path) > 0,
+        "evidence" | "structure_patch" | "md_summary" => completed && rows_len(path) > 0,
         _ => completed,
     }
 }
@@ -1806,34 +1956,9 @@ fn artifact_visible_for_user(id: &str, path: &Path, run_dir: &Path, completed: b
 fn artifact_specs() -> &'static [(&'static str, &'static str, &'static str)] {
     &[
         (
-            "normalized_input",
-            "\u{8f93}\u{5165}\u{89c4}\u{8303}\u{5316}\u{8bb0}\u{5f55}",
-            "input_normalized_manifest.json",
-        ),
-        (
-            "features",
-            "\u{7279}\u{5f81}\u{8ba1}\u{7b97}\u{8bb0}\u{5f55}",
-            "feature_manifest.json",
-        ),
-        (
-            "known_matches",
-            "\u{5df2}\u{77e5}\u{6570}\u{636e}\u{5e93}\u{547d}\u{4e2d}",
-            "known_database_matches.tsv",
-        ),
-        (
-            "metagenome_matches",
-            "\u{5b8f}\u{57fa}\u{56e0}\u{7ec4}\u{6f5c}\u{5728}\u{547d}\u{4e2d}",
-            "metagenome_potential_matches.tsv",
-        ),
-        (
             "structure_patch",
             "\u{7ed3}\u{6784}\u{4e0e}\u{53e3}\u{888b}\u{6458}\u{8981}",
             "structure_patch_summary.tsv",
-        ),
-        (
-            "docking",
-            "\u{5bf9}\u{63a5}\u{6458}\u{8981}",
-            "docking_summary.tsv",
         ),
         (
             "md_summary",
@@ -1846,16 +1971,6 @@ fn artifact_specs() -> &'static [(&'static str, &'static str, &'static str)] {
             "target_candidate_ranking.tsv",
         ),
         (
-            "candidate_detail",
-            "\u{5019}\u{9009}\u{8be6}\u{60c5}",
-            "candidate_detail.json",
-        ),
-        (
-            "score_breakdown",
-            "\u{5206}\u{6570}\u{62c6}\u{89e3}",
-            "score_decomposition.tsv",
-        ),
-        (
             "evidence",
             "\u{8bc1}\u{636e}\u{94fe}",
             "evidence_ledger.tsv",
@@ -1866,24 +1981,6 @@ fn artifact_specs() -> &'static [(&'static str, &'static str, &'static str)] {
             "research_report.md",
         ),
     ]
-}
-fn artifact_file_for_id(id: &str) -> Option<&'static str> {
-    artifact_specs()
-        .iter()
-        .find(|(artifact_id, _, _)| *artifact_id == id)
-        .map(|(_, _, file)| *file)
-}
-
-fn artifact_content_type(file: &str) -> &'static str {
-    if file.ends_with(".json") {
-        "application/json; charset=utf-8"
-    } else if file.ends_with(".tsv") {
-        "text/tab-separated-values; charset=utf-8"
-    } else if file.ends_with(".md") {
-        "text/markdown; charset=utf-8"
-    } else {
-        "text/plain; charset=utf-8"
-    }
 }
 
 fn friendly_failure_summary(raw: Option<&str>) -> String {
@@ -2274,6 +2371,12 @@ mod tests {
         let (status, _, _) = download_artifact_response(&options, "run-1", "../secret.txt");
         assert_eq!(status, 404);
 
+        let (status, _, _) = download_artifact_response(&options, "run-1", "normalized_input");
+        assert_eq!(status, 404);
+
+        let (status, _, _) = download_artifact_response(&options, "run-1", "score_breakdown");
+        assert_eq!(status, 404);
+
         fs::remove_dir_all(&root).ok();
     }
 
@@ -2462,11 +2565,67 @@ mod tests {
         assert!(!text.contains("source_trace"));
         assert!(!text.contains("run_context"));
         assert!(!text.contains("artifact_source_map"));
+        assert!(!text.contains("normalized_input"));
+        assert!(!text.contains("features"));
+        assert!(!text.contains("score_breakdown"));
+        assert!(!text.contains("candidate_detail"));
 
         let (status, _, _) = download_artifact_response(&options, "run-1", "run_summary");
         assert_eq!(status, 404);
         let (status, _, _) = download_artifact_response(&options, "run-1", "source_trace");
         assert_eq!(status, 404);
+
+        fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn user_downloads_are_sanitized_exports() {
+        let root = std::env::temp_dir().join(format!("genoligand-user-downloads-{}", now_millis()));
+        let options = server_options(root.clone());
+        let run_dir = projects_root(&options)
+            .join("project-1")
+            .join("runs")
+            .join("run-1");
+        fs::create_dir_all(&run_dir).expect("create run dir");
+        fs::write(
+            run_dir.join("target_candidate_ranking.tsv"),
+            "rank\tcandidate_id\ttarget_id\ttarget_name\tcandidate_scope\torganism\tfinal_score\tknown_database_score\tmetagenome_score\tstructure_score\tdocking_score\tmd_score\tevidence_summary\tstatus\tsha256\tdebug_path\n1\tC1\tP24941\tCDK2\tknown_database\tHomo sapiens\t0.80\t0.70\t0.00\t0.10\t0.00\t0.00\tmatched current run\tcomputed_prediction\tabc123\tD:/hidden\n",
+        )
+        .expect("candidate table");
+        fs::write(
+            run_dir.join("evidence_ledger.tsv"),
+            "claim_id\tevidence_artifact\towner\tstatus\tnotes\nscore_decomposition\tscore_decomposition.tsv\tGenoLigand\tavailable\tsha256:abc123\n",
+        )
+        .expect("evidence");
+        fs::write(
+            run_dir.join("structure_patch_summary.tsv"),
+            "candidate_id\tstructure_score\tstructure_evidence\tbinding_patch\tpatch_evidence\tkey_residues\tdocking_score\tdocking_pose\tligand_position\tinteraction_residues\nC1\t0.60\tworker_structure\tpatch_internal\tworker_patch\tHIS57\t0.50\tpose_internal\tligand_internal\tHIS57\n",
+        )
+        .expect("structure");
+        fs::write(
+            run_dir.join("md_summary.tsv"),
+            "candidate_id\trmsd\trmsf\tligand_drift\thydrogen_bond_occupancy\tcontact_occupancy\tinteraction_persistence\tmd_risk_flags\tmd_score_decomposition\tmd_stability_score\nC1\t1.2\t0.4\t0.6\t0.72\t0.81\t0.77\tstable_internal\tscore_internal\t0.8\n",
+        )
+        .expect("md");
+
+        for artifact_id in [
+            "candidate_ranking",
+            "evidence",
+            "structure_patch",
+            "md_summary",
+        ] {
+            let (status, content_type, body) =
+                download_artifact_response(&options, "run-1", artifact_id);
+            assert_eq!(status, 200);
+            assert_eq!(content_type, "text/tab-separated-values; charset=utf-8");
+            assert!(!body.contains("sha256"));
+            assert!(!body.contains("debug_path"));
+            assert!(!body.contains("D:/hidden"));
+            assert!(!body.contains("binding_patch"));
+            assert!(!body.contains("patch_internal"));
+            assert!(!body.contains("md_score_decomposition"));
+            assert!(!body.contains("score_internal"));
+        }
 
         fs::remove_dir_all(&root).ok();
     }

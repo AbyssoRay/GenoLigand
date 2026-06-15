@@ -72,7 +72,7 @@ const stepMeta = {
   check: ["检查运行条件", "输入、数据库、运行环境、存储和导出条件都通过后再运行。"],
   run: ["运行中心", "查看当前阶段、下一步动作、资源状态和日志。"],
   results: ["查看结果", "候选排序、详情、证据、结构和动力学结果只来自当前运行输出。"],
-  export: ["导出", "整理报告、候选表和可复现材料。"],
+  export: ["导出", "整理报告、候选表和证据摘要。"],
 };
 
 const stageLabels = [
@@ -706,7 +706,6 @@ function renderExport() {
       ${exportCard("科研报告", "research_report", artifacts, runId)}
       ${exportCard("候选表", "candidate_ranking", artifacts, runId)}
       ${exportCard("证据链", "evidence", artifacts, runId)}
-      ${exportCard("复现材料", "normalized_input", artifacts, runId)}
       ${exportCard("结构与口袋摘要", "structure_patch", artifacts, runId)}
       ${exportCard("动力学摘要", "md_summary", artifacts, runId)}
     </div>`;
@@ -1172,16 +1171,9 @@ function friendlyRequirement(item) {
 
 function friendlyArtifact(name) {
   return {
-    normalized_input: "输入归一化记录",
-    features: "特征计算记录",
-    known_matches: "已知数据库命中",
-    metagenome_matches: "宏基因组潜在命中",
     structure_patch: "结构与口袋摘要",
-    docking: "对接摘要",
     md_summary: "动力学摘要",
     candidate_ranking: "候选排序",
-    candidate_detail: "候选详情",
-    score_breakdown: "分数拆解",
     evidence: "证据链",
     research_report: "科研报告",
   }[name] || name;
