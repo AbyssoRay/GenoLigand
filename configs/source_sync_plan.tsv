@@ -1,5 +1,5 @@
-source_id	source_label	source_class	landing_url	target_rel_path	ready_marker	user_next_action
-rcsb_ligand_bound	RCSB ligand-bound structures	structure	https://www.rcsb.org/docs/programmatic-access/file-download-services	downloads/rcsb/mmcif	downloads/rcsb/mmcif	运行安装/修复以同步 RCSB 结构数据
-biolip2	BioLiP2	structure_interaction	https://zhanggroup.org/BioLiP/	downloads/biolip2	downloads/biolip2	运行安装/修复以同步 BioLiP2 互作数据
-plinder	PLINDER	structure_interaction	https://github.com/plinder-org/plinder	downloads/plinder	downloads/plinder	运行安装/修复以同步 PLINDER 结构数据
-metagenome_potential	宏基因组潜在序列库	metagenome	local_or_configured_public_metagenome_sources	downloads/metagenome	downloads/metagenome	运行安装/修复以同步宏基因组潜在序列库
+source_id	source_label	source_class	sync_method	source_url	target_rel_path	ready_marker	include_pattern	user_next_action
+rcsb_ligand_bound	RCSB ligand-bound structures	structure	html_tree	https://files.rcsb.org/pub/pdb/data/structures/divided/mmCIF/	downloads/rcsb/mmcif	downloads/rcsb/mmcif	\.cif\.gz$	运行安装/修复以同步 RCSB mmCIF 结构数据
+biolip2	BioLiP2	structure_interaction	html_links	https://zhanggroup.org/BioLiP/download.html	downloads/biolip2	downloads/biolip2/BioLiP.txt.gz	^(download/(BioLiP|BioLiP_nr)\.txt\.gz|data/(ligand\.tsv|protein|protein_nr|peptide|peptide_nr)\.fasta\.gz)$	运行安装/修复以同步 BioLiP2 注释和序列数据
+plinder	PLINDER	structure_interaction	gcs_prefix	gs://plinder/2024-06/v2/index/	downloads/plinder/index	downloads/plinder/index/annotation_table.parquet	^(annotation_table|annotation_table_nonredundant)\.parquet$	运行安装/修复以同步 PLINDER 注释索引
+metagenome_potential	MGnify protein database	metagenome	html_links	https://ftp.ebi.ac.uk/pub/databases/metagenomics/peptide_database/current_release/	downloads/metagenome/mgnify	downloads/metagenome/mgnify/mgy_clusters.fa.gz	^(LICENSE|README\.txt|md5sum\.txt|mgy_clusters\.fa\.gz|mgy_proteins_[0-9]+\.fa\.gz)$	运行安装/修复以同步 MGnify 蛋白序列库

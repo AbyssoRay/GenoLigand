@@ -6,6 +6,7 @@ import hashlib
 import json
 import os
 import platform
+import re
 import shutil
 import subprocess
 import sys
@@ -73,6 +74,7 @@ WSL_COMMAND_WRAPPERS = [
     "foldseek",
     "vina",
     "obabel",
+    "rsync",
 ]
 
 
@@ -848,7 +850,239 @@ def direct_source_location(row: dict[str, str]) -> str:
     return ""
 
 
-def sync_external_sources(plan: Path, science_store: Path, skip_downloads: bool) -> dict[str, object]:
+def directory_digest(path: Path) -> str:
+    digest = hashlib.sha256()
+    if path.is_file():
+        digest.update(path.name.encode("utf-8"))
+        digest.update(str(path.stat().st_size).encode("ascii"))
+        digest.update(sha256_file(path).encode("ascii"))
+        return digest.hexdigest()
+    if path.is_dir():
+        for child in sorted(p for p in path.rglob("*") if p.is_file()):
+            rel = child.relative_to(path).as_posix()
+            digest.update(rel.encode("utf-8"))
+            digest.update(str(child.stat().st_size).encode("ascii"))
+            digest.update(sha256_file(child).encode("ascii"))
+    return digest.hexdigest()
+
+
+def extract_html_links(page_url: str, include_pattern: str) -> list[str]:
+    request = urllib.request.Request(page_url, headers={"User-Agent": DOWNLOAD_USER_AGENT})
+    with urllib.request.urlopen(request, timeout=DOWNLOAD_TIMEOUT_SECONDS) as response:
+        html = response.read().decode("utf-8", errors="replace")
+    pattern = re.compile(include_pattern) if include_pattern else None
+    hrefs = re.findall(r"""href\s*=\s*["']?([^"'\s>]+)""", html, flags=re.IGNORECASE)
+    urls = []
+    seen = set()
+    for href in hrefs:
+        if href.startswith("?") or href.startswith("#") or href.endswith("/"):
+            continue
+        if pattern and not pattern.search(href):
+            continue
+        absolute = urllib.parse.urljoin(page_url, href)
+        if absolute not in seen:
+            seen.add(absolute)
+            urls.append(absolute)
+    return urls
+
+
+def sync_html_links(row: dict[str, str], target: Path) -> dict[str, object]:
+    source_url = row.get("source_url") or row.get("download_url") or row.get("landing_url")
+    include_pattern = row.get("include_pattern", "")
+    if not source_url:
+        return {"status": "requires_resource_bundle", "bytes": 0, "sha256": "", "notes": "html_source_url_required"}
+    links = extract_html_links(source_url, include_pattern)
+    if not links:
+        return {"status": "failed", "bytes": 0, "sha256": "", "notes": "no_matching_links"}
+    target.mkdir(parents=True, exist_ok=True)
+    failures = []
+    for link in links:
+        destination = target / Path(urllib.parse.urlparse(link).path).name
+        try:
+            copy_or_download(link, destination, row.get("sha256", "") or None)
+        except Exception as err:  # noqa: BLE001 - report per-source install failure
+            failures.append(f"{link}:{err}")
+    if failures:
+        return {"status": "failed", "bytes": directory_size(target), "sha256": directory_digest(target), "notes": "|".join(failures)[:1000]}
+    return {
+        "status": "ready" if path_has_payload(target) else "failed",
+        "bytes": directory_size(target),
+        "sha256": directory_digest(target),
+        "notes": f"html_links_synced:{len(links)}",
+    }
+
+
+def list_html_hrefs(page_url: str) -> list[str]:
+    parsed = urllib.parse.urlparse(page_url)
+    if parsed.scheme == "file":
+        local = Path(urllib.request.url2pathname(parsed.path))
+        if local.is_dir():
+            local = local / "index.html"
+        html = local.read_text(encoding="utf-8", errors="replace")
+        return re.findall(r"""href\s*=\s*["']?([^"'\s>]+)""", html, flags=re.IGNORECASE)
+    request = urllib.request.Request(page_url, headers={"User-Agent": DOWNLOAD_USER_AGENT})
+    with urllib.request.urlopen(request, timeout=DOWNLOAD_TIMEOUT_SECONDS) as response:
+        html = response.read().decode("utf-8", errors="replace")
+    return re.findall(r"""href\s*=\s*["']?([^"'\s>]+)""", html, flags=re.IGNORECASE)
+
+
+def sync_html_tree(row: dict[str, str], target: Path) -> dict[str, object]:
+    source_url = row.get("source_url") or row.get("download_url") or row.get("landing_url")
+    include_pattern = row.get("include_pattern", "")
+    pattern = re.compile(include_pattern) if include_pattern else None
+    max_depth = int(row.get("max_depth") or "3")
+    if not source_url:
+        return {"status": "requires_resource_bundle", "bytes": 0, "sha256": "", "notes": "html_tree_source_url_required"}
+    root_url = source_url if source_url.endswith("/") else f"{source_url}/"
+    target.mkdir(parents=True, exist_ok=True)
+    downloaded = 0
+    failures = []
+    queue: list[tuple[str, Path, int]] = [(root_url, target, 0)]
+    seen_dirs = set()
+    while queue:
+        current_url, current_target, depth = queue.pop(0)
+        if current_url in seen_dirs:
+            continue
+        seen_dirs.add(current_url)
+        try:
+            hrefs = list_html_hrefs(current_url)
+        except Exception as err:  # noqa: BLE001 - report source failure
+            failures.append(f"{current_url}:{err}")
+            continue
+        for href in hrefs:
+            if href.startswith("?") or href.startswith("#") or href.startswith("../") or href == "/":
+                continue
+            absolute = urllib.parse.urljoin(current_url, href)
+            parsed_path = urllib.parse.urlparse(href).path
+            name = Path(parsed_path.rstrip("/")).name
+            if not name:
+                continue
+            if href.endswith("/"):
+                if depth + 1 <= max_depth:
+                    queue.append((absolute if absolute.endswith("/") else f"{absolute}/", current_target / name, depth + 1))
+                continue
+            if pattern and not pattern.search(href):
+                continue
+            destination = current_target / name
+            try:
+                copy_or_download(absolute, destination, row.get("sha256", "") or None)
+                downloaded += 1
+            except Exception as err:  # noqa: BLE001 - report per-file failure
+                failures.append(f"{absolute}:{err}")
+    if failures:
+        return {"status": "failed", "bytes": directory_size(target), "sha256": directory_digest(target), "notes": "|".join(failures)[:1000]}
+    return {
+        "status": "ready" if downloaded and path_has_payload(target) else "failed",
+        "bytes": directory_size(target),
+        "sha256": directory_digest(target),
+        "notes": f"html_tree_files_synced:{downloaded}",
+    }
+
+
+def parse_gcs_location(row: dict[str, str]) -> tuple[str, str] | None:
+    explicit_bucket = row.get("gcs_bucket", "").strip()
+    explicit_prefix = row.get("gcs_prefix", "").strip()
+    if explicit_bucket:
+        return explicit_bucket, explicit_prefix
+    location = (row.get("source_url") or row.get("download_url") or row.get("landing_url") or "").strip()
+    if not location.startswith("gs://"):
+        return None
+    without_scheme = location[5:]
+    bucket, _, prefix = without_scheme.partition("/")
+    return bucket, prefix
+
+
+def sync_gcs_prefix(row: dict[str, str], target: Path) -> dict[str, object]:
+    parsed = parse_gcs_location(row)
+    if not parsed:
+        return {"status": "requires_resource_bundle", "bytes": 0, "sha256": "", "notes": "gcs_bucket_or_gs_url_required"}
+    bucket, prefix = parsed
+    include_pattern = row.get("include_pattern", "")
+    pattern = re.compile(include_pattern) if include_pattern else None
+    target.mkdir(parents=True, exist_ok=True)
+    page_token = ""
+    downloaded = 0
+    failures = []
+    while True:
+        query = urllib.parse.urlencode({"prefix": prefix, "maxResults": "1000", **({"pageToken": page_token} if page_token else {})})
+        api_url = f"https://storage.googleapis.com/storage/v1/b/{urllib.parse.quote(bucket)}/o?{query}"
+        request = urllib.request.Request(api_url, headers={"User-Agent": DOWNLOAD_USER_AGENT})
+        with urllib.request.urlopen(request, timeout=DOWNLOAD_TIMEOUT_SECONDS) as response:
+            payload = json.loads(response.read().decode("utf-8"))
+        for item in payload.get("items", []):
+            name = item.get("name", "")
+            if not name or name.endswith("/"):
+                continue
+            rel_name = name[len(prefix) :].lstrip("/") if prefix and name.startswith(prefix) else name
+            if pattern and not pattern.search(rel_name):
+                continue
+            media_url = item.get("mediaLink") or f"https://storage.googleapis.com/{bucket}/{urllib.parse.quote(name)}"
+            destination = target / rel_name
+            try:
+                copy_or_download(media_url, destination, None)
+                downloaded += 1
+            except Exception as err:  # noqa: BLE001 - report per-source install failure
+                failures.append(f"{name}:{err}")
+        page_token = payload.get("nextPageToken", "")
+        if not page_token:
+            break
+    if failures:
+        return {"status": "failed", "bytes": directory_size(target), "sha256": directory_digest(target), "notes": "|".join(failures)[:1000]}
+    return {
+        "status": "ready" if downloaded and path_has_payload(target) else "failed",
+        "bytes": directory_size(target),
+        "sha256": directory_digest(target),
+        "notes": f"gcs_objects_synced:{downloaded}",
+    }
+
+
+def sync_rsync(row: dict[str, str], target: Path, env: dict[str, str] | None) -> dict[str, object]:
+    source_url = row.get("source_url") or row.get("download_url") or row.get("landing_url")
+    if not source_url:
+        return {"status": "requires_resource_bundle", "bytes": 0, "sha256": "", "notes": "rsync_source_url_required"}
+    target.mkdir(parents=True, exist_ok=True)
+    command = ["rsync", "-rlpt", "-z", "--delete", source_url, str(target)]
+    completed = subprocess.run(command, capture_output=True, text=True, env=env, timeout=None)
+    if completed.returncode != 0:
+        notes = (completed.stderr or completed.stdout or "rsync_failed").replace("\t", " ").replace("\n", " ")
+        return {"status": "failed", "bytes": directory_size(target), "sha256": directory_digest(target), "notes": notes[:1000]}
+    return {
+        "status": "ready" if path_has_payload(target) else "failed",
+        "bytes": directory_size(target),
+        "sha256": directory_digest(target),
+        "notes": "rsync_synced",
+    }
+
+
+def sync_external_row(row: dict[str, str], target: Path, env: dict[str, str] | None) -> dict[str, object]:
+    method = (row.get("sync_method") or "direct").strip().lower()
+    if method == "html_links":
+        return sync_html_links(row, target)
+    if method == "html_tree":
+        return sync_html_tree(row, target)
+    if method == "gcs_prefix":
+        return sync_gcs_prefix(row, target)
+    if method == "rsync":
+        return sync_rsync(row, target, env)
+    location = direct_source_location(row)
+    if not location:
+        return {"status": "requires_resource_bundle", "bytes": 0, "sha256": "", "notes": "direct_download_or_local_source_required"}
+    destination = external_destination(target, location)
+    result = copy_or_download(location, destination, row.get("sha256", "") or None)
+    return {
+        "status": result["status"],
+        "bytes": result["bytes"],
+        "sha256": result["sha256"],
+        "notes": f"{method}_resource_synced",
+    }
+
+
+def sync_external_sources(
+    plan: Path,
+    science_store: Path,
+    skip_downloads: bool,
+    env: dict[str, str] | None = None,
+) -> dict[str, object]:
     manifest = science_store / "external_sync_execution_manifest.tsv"
     rows = read_tsv(plan)
     manifest.parent.mkdir(parents=True, exist_ok=True)
@@ -925,8 +1159,7 @@ def sync_external_sources(plan: Path, science_store: Path, skip_downloads: bool)
                     }
                 )
                 continue
-            location = direct_source_location(row)
-            if not location or not target:
+            if not target:
                 needs_action += 1
                 writer.writerow(
                     {
@@ -936,15 +1169,16 @@ def sync_external_sources(plan: Path, science_store: Path, skip_downloads: bool)
                         "status": "requires_resource_bundle",
                         "bytes": "0",
                         "sha256": "",
-                        "notes": "direct_download_or_local_source_required",
+                        "notes": "target_rel_path_required",
                     }
                 )
                 continue
             try:
-                destination = external_destination(target, location)
-                result = copy_or_download(location, destination, row.get("sha256", "") or None)
+                result = sync_external_row(row, target, env)
                 if result["status"] == "ready":
                     ready += 1
+                elif result["status"] == "requires_resource_bundle":
+                    needs_action += 1
                 else:
                     failed += 1
                 writer.writerow(
@@ -955,7 +1189,7 @@ def sync_external_sources(plan: Path, science_store: Path, skip_downloads: bool)
                         "status": str(result["status"]),
                         "bytes": str(result["bytes"]),
                         "sha256": str(result["sha256"]),
-                        "notes": "external_resource_synced",
+                        "notes": str(result["notes"]),
                     }
                 )
             except Exception as err:  # noqa: BLE001 - install must report actionable status
@@ -1279,7 +1513,12 @@ def main() -> int:
         if args.no_download
         else prepare_downloads(source_catalog, science_store)
     )
-    external_sync_result = sync_external_sources(source_sync_plan, science_store, args.no_download)
+    external_sync_result = sync_external_sources(
+        source_sync_plan,
+        science_store,
+        args.no_download,
+        science_env,
+    )
     tool_environment_result = ensure_python_tool_environment(
         python_env_dir,
         args.no_tool_install,
