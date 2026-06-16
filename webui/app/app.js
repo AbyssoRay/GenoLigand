@@ -1067,7 +1067,9 @@ function sourceReady(key) {
   const required = state.databases?.required || [];
   if (key === "known") return required.some((row) => row.id === "known_database" && row.ready);
   if (key === "metagenome") return required.some((row) => row.id === "metagenome" && row.ready);
-  if (key === "structure") return required.some((row) => row.id === "tools" && row.ready);
+  if (key === "structure_index") return required.some((row) => row.id === "structure_interaction" && row.ready);
+  if (key === "tools") return required.some((row) => row.id === "tools" && row.ready);
+  if (key === "structure") return sourceReady("structure_index") && sourceReady("tools");
   return false;
 }
 
@@ -1101,6 +1103,7 @@ function preflightGroups() {
         checkRow(byId, "science_store", "科学仓库", "运行安装/修复"),
         checkRow(byId, "known_database", "已知蛋白索引", "准备数据库索引"),
         checkRow(byId, "metagenome", "宏基因组索引", "准备序列索引"),
+        checkRow(byId, "structure_interaction", "结构互作索引", "准备结构索引"),
       ],
     },
     {
@@ -1215,7 +1218,8 @@ function resourceStatusRows() {
     ["科学仓库", sourceReady("known") || sourceReady("metagenome") ? "已读取状态" : "需要准备"],
     ["已知蛋白索引", sourceReady("known") ? "就绪" : "需要准备"],
     ["宏基因组索引", sourceReady("metagenome") ? "就绪" : "需要准备"],
-    ["结构/动力学工具", sourceReady("structure") ? "就绪" : "需要准备"],
+    ["结构互作索引", sourceReady("structure_index") ? "就绪" : "需要准备"],
+    ["结构/动力学工具", sourceReady("tools") ? "就绪" : "需要准备"],
   ];
   return rows.map(([label, value]) => metricRow(label, value)).join("");
 }

@@ -4,6 +4,7 @@ science_store:
     - science_store_manifest.tsv
     - indexes/known_targets.tsv
     - indexes/metagenome_targets.tsv
+    - indexes/structure_targets.tsv
     - indexes/tool_versions.tsv
   known_database_sources:
     - ChEMBL

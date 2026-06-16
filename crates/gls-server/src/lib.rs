@@ -411,8 +411,8 @@ fn write_user_input_manifest(options: &ServerOptions, project_id: &str, body: &s
 fn write_input_manifest(options: &ServerOptions, project_id: &str, body: &str) -> Value {
     let dir = project_dir(options, project_id);
     let path = dir.join("input_manifest.json");
-    let value =
-        serde_json::from_str::<Value>(body).unwrap_or_else(|_| json!({"inputs":[],"files":[]}));
+    let value = serde_json::from_str::<Value>(body.trim_start_matches('\u{feff}'))
+        .unwrap_or_else(|_| json!({"inputs":[],"files":[]}));
     if !input_value_has_usable_user_input(&value) {
         return json!({
             "status":"failed",
@@ -467,6 +467,14 @@ fn preflight_json(options: &ServerOptions, project_id: &str) -> Value {
             store.join("indexes/metagenome_targets.tsv").exists(),
             store
                 .join("indexes/metagenome_targets.tsv")
+                .display()
+                .to_string(),
+        ),
+        check(
+            "structure_interaction",
+            store.join("indexes/structure_targets.tsv").exists(),
+            store
+                .join("indexes/structure_targets.tsv")
                 .display()
                 .to_string(),
         ),
@@ -1358,6 +1366,7 @@ fn databases_json(options: &ServerOptions) -> Value {
         "science_store_manifest.tsv",
         "indexes/known_targets.tsv",
         "indexes/metagenome_targets.tsv",
+        "indexes/structure_targets.tsv",
         "indexes/tool_versions.tsv",
     ];
     let rows = required
@@ -1771,6 +1780,7 @@ fn preflight_store_ready(options: &ServerOptions) -> bool {
     store.join("science_store_manifest.tsv").exists()
         && store.join("indexes/known_targets.tsv").exists()
         && store.join("indexes/metagenome_targets.tsv").exists()
+        && store.join("indexes/structure_targets.tsv").exists()
         && tool_versions_ready(&store.join("indexes/tool_versions.tsv"))
         && install_status_ready(&store.join("install_status.json"))
         && source_requirements_ready(&store.join("source_requirements.tsv"))
@@ -1780,7 +1790,7 @@ fn install_status_ready(path: &Path) -> bool {
     let Ok(text) = fs::read_to_string(path) else {
         return false;
     };
-    serde_json::from_str::<Value>(&text)
+    serde_json::from_str::<Value>(text.trim_start_matches('\u{feff}'))
         .ok()
         .and_then(|value| {
             value
@@ -1833,6 +1843,12 @@ fn required_resource_rows(store: &Path) -> Vec<Value> {
             "indexes/metagenome_targets.tsv",
             "宏基因组索引",
             "运行安装/修复以准备宏基因组索引",
+        ),
+        (
+            "structure_interaction",
+            "indexes/structure_targets.tsv",
+            "结构互作索引",
+            "运行安装/修复以准备结构互作索引",
         ),
         (
             "tools",
@@ -2249,7 +2265,7 @@ fn count_alphanumeric(value: &str) -> usize {
 fn read_json_or(path: &Path, fallback: Value) -> Value {
     fs::read_to_string(path)
         .ok()
-        .and_then(|text| serde_json::from_str::<Value>(&text).ok())
+        .and_then(|text| serde_json::from_str::<Value>(text.trim_start_matches('\u{feff}')).ok())
         .unwrap_or(fallback)
 }
 
@@ -2326,6 +2342,7 @@ fn friendly_failure_summary(raw: Option<&str>) -> String {
                     "missing_science_store_manifest" => "缺少科学仓库".to_string(),
                     "missing_known_database_index" => "缺少已知蛋白索引".to_string(),
                     "missing_metagenome_potential_index" => "缺少宏基因组索引".to_string(),
+                    "missing_structure_interaction_index" => "缺少结构互作索引".to_string(),
                     "missing_tool_versions_manifest" => "计算工具未就绪".to_string(),
                     _ if value.starts_with("missing_or_unready_tool:") => {
                         "计算工具未就绪".to_string()
@@ -3010,10 +3027,11 @@ mod tests {
         let missing = missing_resource_rows(&rows);
         let text = serde_json::to_string(&missing).expect("missing json");
 
-        assert_eq!(missing.len(), 6);
+        assert_eq!(missing.len(), 7);
         assert!(text.contains("科学仓库"));
         assert!(text.contains("已知蛋白索引"));
         assert!(text.contains("宏基因组索引"));
+        assert!(text.contains("结构互作索引"));
         assert!(text.contains("计算工具"));
         assert!(text.contains("安装状态"));
         assert!(text.contains("科学资源状态"));
@@ -3042,12 +3060,13 @@ mod tests {
     #[test]
     fn failure_summary_hides_internal_resource_names() {
         let summary = friendly_failure_summary(Some(
-            "missing_science_store_manifest,missing_tool_versions_manifest,missing_known_database_index",
+            "missing_science_store_manifest,missing_tool_versions_manifest,missing_known_database_index,missing_structure_interaction_index",
         ));
 
         assert!(summary.contains("缺少科学仓库"));
         assert!(summary.contains("计算工具未就绪"));
         assert!(summary.contains("缺少已知蛋白索引"));
+        assert!(summary.contains("缺少结构互作索引"));
         assert!(!summary.contains("manifest"));
         assert!(!summary.contains("tool_versions"));
         assert!(!summary.contains("science_store"));
@@ -3351,6 +3370,11 @@ mod tests {
         )
         .expect("metagenome index");
         fs::write(
+            store.join("indexes/structure_targets.tsv"),
+            "source\ttarget_id\ttarget_name\torganism\ttarget_class\tfeatures\tevidence\n",
+        )
+        .expect("structure index");
+        fs::write(
             store.join("indexes/tool_versions.tsv"),
             "tool\tstatus\tversion\tdetail\nrdkit\tready\tinstalled\tok\n",
         )
@@ -3551,6 +3575,7 @@ mod tests {
             assert!(!text.contains("tool_versions_manifest"));
             assert!(!text.contains("indexes/known_targets.tsv"));
             assert!(!text.contains("indexes/metagenome_targets.tsv"));
+            assert!(!text.contains("indexes/structure_targets.tsv"));
             assert!(!text.contains("evidence_artifact"));
             assert!(!text.contains("sha256"));
             assert!(!text.contains("abc123"));

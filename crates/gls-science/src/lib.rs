@@ -114,6 +114,19 @@ struct Candidate {
     evidence: String,
 }
 
+#[derive(Clone, Debug)]
+struct IndexMatch {
+    input_id: String,
+    source: String,
+    target_id: String,
+    target_name: String,
+    organism: String,
+    target_class: String,
+    match_score: f64,
+    matched_features: String,
+    evidence: String,
+}
+
 #[derive(Clone, Copy, Debug)]
 struct RequiredTool {
     id: &'static str,
@@ -335,7 +348,7 @@ pub fn create_temporary_test_store(root: &Path) -> Result<PathBuf, String> {
     ensure_dir(&store.join("indexes"))?;
     write_text(
         &store.join("science_store_manifest.tsv"),
-        "item\tstatus\tpath\nwarehouse\tready\tindexes/known_targets.tsv\nmetagenome_index\tready\tindexes/metagenome_targets.tsv\ntool_versions\tready\tindexes/tool_versions.tsv\n",
+        "item\tstatus\tpath\nwarehouse\tready\tindexes/known_targets.tsv\nmetagenome_index\tready\tindexes/metagenome_targets.tsv\nstructure_index\tready\tindexes/structure_targets.tsv\ntool_versions\tready\tindexes/tool_versions.tsv\n",
     )?;
     write_text(
         &store.join("indexes/tool_versions.tsv"),
@@ -350,12 +363,16 @@ pub fn create_temporary_test_store(root: &Path) -> Result<PathBuf, String> {
         "source\ttarget_id\ttarget_name\torganism\ttarget_class\tligand_tokens\tsequence_tokens\tstructure_tokens\tevidence\n",
     )?;
     write_text(
+        &store.join("indexes/structure_targets.tsv"),
+        "source\ttarget_id\ttarget_name\torganism\ttarget_class\tligand_tokens\tsequence_tokens\tstructure_tokens\tevidence\nRCSB\tP24941\tCyclin-dependent kinase 2 structure\tHomo sapiens\tstructure_interaction_record\tatp\tkin ase p24 249\tpocket kinase\tstructure_interaction_record\n",
+    )?;
+    write_text(
         &store.join("install_status.json"),
         &format!(
             "{}\n",
             json!({
                 "status": "ready",
-                "fixture": "unit_test_only",
+                "test_context": "unit_only",
                 "missing_components": []
             })
         ),
@@ -398,6 +415,7 @@ fn prepare_science_store(options: &StoreOptions) -> Result<String, String> {
     let manifest = options.science_store.join("science_store_manifest.tsv");
     let known = options.science_store.join("indexes/known_targets.tsv");
     let metagenome = options.science_store.join("indexes/metagenome_targets.tsv");
+    let structure = options.science_store.join("indexes/structure_targets.tsv");
     let tools = options.science_store.join("indexes/tool_versions.tsv");
     let repair = options.science_store.join("repair_actions.tsv");
     let status = options.science_store.join("install_status.json");
@@ -422,6 +440,12 @@ fn prepare_science_store(options: &StoreOptions) -> Result<String, String> {
             metagenome.exists(),
             &metagenome,
             "build_metagenome_potential_index",
+        ),
+        (
+            "structure_interaction_index",
+            structure.exists(),
+            &structure,
+            "build_structure_interaction_index",
         ),
         (
             "tool_versions",
@@ -487,7 +511,7 @@ fn prepare_science_store(options: &StoreOptions) -> Result<String, String> {
             json!({
                 "status": if missing.is_empty() {"ready"} else {"needs_repair"},
                 "ready_items": ready,
-                "required_items": 3,
+                "required_items": 4,
                 "missing_components": missing,
                 "science_store": options.science_store.display().to_string(),
                 "workspace_root": options.workspace_root.display().to_string(),
@@ -499,13 +523,14 @@ fn prepare_science_store(options: &StoreOptions) -> Result<String, String> {
                 "index_build_manifest": "index_build_manifest.tsv",
                 "index_rows_built": {
                     "known": build_summary.known_rows,
-                    "metagenome": build_summary.metagenome_rows
+                    "metagenome": build_summary.metagenome_rows,
+                    "structure": build_summary.structure_rows
                 }
             })
         ),
     )?;
     Ok(format!(
-        "science_store_prepared\tready_items={ready}\trequired_items=3\tstatus={}\tmissing_components={}\tstore={}",
+        "science_store_prepared\tready_items={ready}\trequired_items=4\tstatus={}\tmissing_components={}\tstore={}",
         if missing.is_empty() {
             "ready"
         } else {
@@ -520,6 +545,7 @@ fn prepare_science_store(options: &StoreOptions) -> Result<String, String> {
 struct IndexBuildSummary {
     known_rows: usize,
     metagenome_rows: usize,
+    structure_rows: usize,
 }
 
 fn build_store_indexes(
@@ -598,6 +624,7 @@ fn build_store_indexes(
             rows,
             &mut known_rows,
             &mut manifest,
+            "fasta_sequence_rows",
         );
     }
 
@@ -628,6 +655,7 @@ fn build_store_indexes(
             rows,
             &mut metagenome_rows,
             &mut manifest,
+            "fasta_sequence_rows",
         );
     }
 
@@ -645,10 +673,19 @@ fn build_store_indexes(
             &metagenome_rows,
         )?;
     }
+    let mut structure_rows = build_structure_index_rows(options, &mut manifest)?;
+    structure_rows = dedupe_store_rows(structure_rows);
+    if !structure_rows.is_empty() {
+        write_store_rows(
+            &options.science_store.join("indexes/structure_targets.tsv"),
+            &structure_rows,
+        )?;
+    }
     write_text(manifest_path, &manifest)?;
     Ok(IndexBuildSummary {
         known_rows: known_rows.len(),
         metagenome_rows: metagenome_rows.len(),
+        structure_rows: structure_rows.len(),
     })
 }
 
@@ -686,11 +723,12 @@ fn append_built_rows(
     built_rows: Vec<StoreRow>,
     rows: &mut Vec<StoreRow>,
     manifest: &mut String,
+    notes: &str,
 ) {
     let count = built_rows.len();
     rows.extend(built_rows);
     manifest.push_str(&format!(
-        "{index_name}\t{}\t{}\t{count}\t{}\tfasta_sequence_rows\n",
+        "{index_name}\t{}\t{}\t{count}\t{}\t{notes}\n",
         relative_display(root, path),
         if count > 0 { "used" } else { "empty" },
         index_output_for(index_name)
@@ -701,8 +739,65 @@ fn index_output_for(index_name: &str) -> &'static str {
     match index_name {
         "known_targets" => "indexes/known_targets.tsv",
         "metagenome_targets" => "indexes/metagenome_targets.tsv",
+        "structure_targets" => "indexes/structure_targets.tsv",
         _ => "indexes/unknown.tsv",
     }
+}
+
+fn build_structure_index_rows(
+    options: &StoreOptions,
+    manifest: &mut String,
+) -> Result<Vec<StoreRow>, String> {
+    let mut rows = Vec::new();
+    for path in discover_structure_files(&options.science_store.join("downloads/rcsb/mmcif"))? {
+        let built = structure_file_row("RCSB", &path);
+        append_built_rows(
+            "structure_targets",
+            &options.science_store,
+            &path,
+            vec![built],
+            &mut rows,
+            manifest,
+            "rcsb_structure_file_rows",
+        );
+    }
+    for path in discover_biolip_tables(&options.science_store.join("downloads/biolip2"))? {
+        let built = parse_biolip_structure_rows(&path)?;
+        append_built_rows(
+            "structure_targets",
+            &options.science_store,
+            &path,
+            built,
+            &mut rows,
+            manifest,
+            "biolip2_interaction_rows",
+        );
+    }
+    for path in discover_plinder_tables(&options.science_store.join("downloads/plinder"))? {
+        let built = structure_file_row("PLINDER", &path);
+        append_built_rows(
+            "structure_targets",
+            &options.science_store,
+            &path,
+            vec![built],
+            &mut rows,
+            manifest,
+            "plinder_annotation_rows",
+        );
+    }
+    for path in discover_moad_tables(&options.science_store.join("downloads/binding_moad"))? {
+        let built = parse_moad_structure_rows(&path)?;
+        append_built_rows(
+            "structure_targets",
+            &options.science_store,
+            &path,
+            built,
+            &mut rows,
+            manifest,
+            "binding_moad_complex_rows",
+        );
+    }
+    Ok(rows)
 }
 
 fn discover_sequence_files(root: &Path) -> Result<Vec<PathBuf>, String> {
@@ -757,6 +852,78 @@ fn discover_chembl_sqlite_sources_inner(root: &Path, out: &mut Vec<PathBuf>) -> 
     Ok(())
 }
 
+fn discover_structure_files(root: &Path) -> Result<Vec<PathBuf>, String> {
+    let mut out = Vec::new();
+    if !root.exists() {
+        return Ok(out);
+    }
+    discover_matching_files(root, &mut out, is_structure_file)?;
+    out.sort();
+    Ok(out)
+}
+
+fn discover_biolip_tables(root: &Path) -> Result<Vec<PathBuf>, String> {
+    let mut out = Vec::new();
+    if !root.exists() {
+        return Ok(out);
+    }
+    discover_matching_files(root, &mut out, |path| {
+        let name = lower_file_name(path);
+        name == "biolip.txt"
+            || name == "biolip.txt.gz"
+            || name == "biolip_nr.txt"
+            || name == "biolip_nr.txt.gz"
+    })?;
+    out.sort();
+    Ok(out)
+}
+
+fn discover_plinder_tables(root: &Path) -> Result<Vec<PathBuf>, String> {
+    let mut out = Vec::new();
+    if !root.exists() {
+        return Ok(out);
+    }
+    discover_matching_files(root, &mut out, |path| {
+        let name = lower_file_name(path);
+        name == "annotation_table.parquet" || name == "annotation_table_nonredundant.parquet"
+    })?;
+    out.sort();
+    Ok(out)
+}
+
+fn discover_moad_tables(root: &Path) -> Result<Vec<PathBuf>, String> {
+    let mut out = Vec::new();
+    if !root.exists() {
+        return Ok(out);
+    }
+    discover_matching_files(root, &mut out, |path| {
+        let name = lower_file_name(path);
+        name.ends_with(".csv") || name.ends_with(".tsv") || name.ends_with(".txt")
+    })?;
+    out.sort();
+    Ok(out)
+}
+
+fn discover_matching_files(
+    root: &Path,
+    out: &mut Vec<PathBuf>,
+    predicate: fn(&Path) -> bool,
+) -> Result<(), String> {
+    for entry in
+        fs::read_dir(root).map_err(|err| format!("read_dir_failed:{}:{err}", root.display()))?
+    {
+        let entry =
+            entry.map_err(|err| format!("read_dir_entry_failed:{}:{err}", root.display()))?;
+        let path = entry.path();
+        if path.is_dir() {
+            discover_matching_files(&path, out, predicate)?;
+        } else if predicate(&path) {
+            out.push(path);
+        }
+    }
+    Ok(())
+}
+
 fn is_chembl_sqlite_source(path: &Path) -> bool {
     let name = path
         .file_name()
@@ -764,6 +931,25 @@ fn is_chembl_sqlite_source(path: &Path) -> bool {
         .unwrap_or_default()
         .to_ascii_lowercase();
     is_sqlite_name(&name) || (name.ends_with(".tar.gz") && name.contains("chembl"))
+}
+
+fn is_structure_file(path: &Path) -> bool {
+    let name = lower_file_name(path);
+    name.ends_with(".cif")
+        || name.ends_with(".cif.gz")
+        || name.ends_with(".mmcif")
+        || name.ends_with(".mmcif.gz")
+        || name.ends_with(".pdb")
+        || name.ends_with(".pdb.gz")
+        || name.ends_with(".ent")
+        || name.ends_with(".ent.gz")
+}
+
+fn lower_file_name(path: &Path) -> String {
+    path.file_name()
+        .and_then(|value| value.to_str())
+        .unwrap_or_default()
+        .to_ascii_lowercase()
 }
 
 fn is_sqlite_name(name: &str) -> bool {
@@ -836,6 +1022,231 @@ fn parse_fasta_targets(
         &mut rows,
     );
     Ok(rows)
+}
+
+fn structure_file_row(source: &str, path: &Path) -> StoreRow {
+    let file_name = path
+        .file_name()
+        .and_then(|value| value.to_str())
+        .unwrap_or("");
+    let structure_id = structure_id_from_file_name(file_name);
+    let mut structure_tokens = tokenize(&structure_id);
+    structure_tokens.extend(tokenize(file_name));
+    structure_tokens.extend(tokenize(&path.display().to_string()));
+    StoreRow {
+        source: source.to_string(),
+        target_id: safe_id(&structure_id),
+        target_name: format!("{source} structure {structure_id}"),
+        organism: "unknown".to_string(),
+        target_class: "structure_record".to_string(),
+        ligand_tokens: BTreeSet::new(),
+        sequence_tokens: tokenize(&structure_id),
+        structure_tokens,
+        evidence: format!(
+            "{}_structure_file",
+            source.to_ascii_lowercase().replace(' ', "_")
+        ),
+    }
+}
+
+fn structure_id_from_file_name(file_name: &str) -> String {
+    let mut name = file_name.to_string();
+    for suffix in [
+        ".mmcif.gz",
+        ".cif.gz",
+        ".pdb.gz",
+        ".ent.gz",
+        ".mmcif",
+        ".cif",
+        ".pdb",
+        ".ent",
+        ".parquet",
+    ] {
+        if name.to_ascii_lowercase().ends_with(suffix) {
+            let keep = name.len().saturating_sub(suffix.len());
+            name.truncate(keep);
+            break;
+        }
+    }
+    if name.len() == 7 && name.to_ascii_lowercase().starts_with("pdb") {
+        name = name[3..].to_string();
+    }
+    safe_id(&name.to_ascii_uppercase())
+}
+
+fn parse_biolip_structure_rows(path: &Path) -> Result<Vec<StoreRow>, String> {
+    let text = read_table_text(path)?;
+    let mut rows = Vec::new();
+    for line in text.lines() {
+        let line = line.trim_start_matches('\u{feff}').trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let cols = split_loose_columns(line);
+        if cols.is_empty() || cols[0].eq_ignore_ascii_case("pdb_id") {
+            continue;
+        }
+        let pdb = cols.first().map(|value| value.trim()).unwrap_or_default();
+        if pdb.is_empty() {
+            continue;
+        }
+        let chain = cols.get(1).map(|value| value.trim()).unwrap_or_default();
+        let ligand = cols
+            .get(4)
+            .or_else(|| cols.get(3))
+            .map(|value| value.trim())
+            .unwrap_or_default();
+        let target_id = if chain.is_empty() {
+            safe_id(&pdb.to_ascii_uppercase())
+        } else {
+            safe_id(&format!("{}_{}", pdb.to_ascii_uppercase(), chain))
+        };
+        let mut structure_tokens = tokenize(line);
+        structure_tokens.extend(tokenize(pdb));
+        structure_tokens.extend(tokenize(chain));
+        rows.push(StoreRow {
+            source: "BioLiP2".to_string(),
+            target_id,
+            target_name: if chain.is_empty() {
+                format!("BioLiP2 interaction {}", pdb.to_ascii_uppercase())
+            } else {
+                format!(
+                    "BioLiP2 interaction {} chain {chain}",
+                    pdb.to_ascii_uppercase()
+                )
+            },
+            organism: "unknown".to_string(),
+            target_class: "structure_interaction_record".to_string(),
+            ligand_tokens: tokenize(ligand),
+            sequence_tokens: tokenize(&format!("{pdb} {chain}")),
+            structure_tokens,
+            evidence: "biolip2_interaction_row".to_string(),
+        });
+    }
+    Ok(rows)
+}
+
+fn parse_moad_structure_rows(path: &Path) -> Result<Vec<StoreRow>, String> {
+    let text = read_table_text(path)?;
+    let mut lines = text
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty() && !line.starts_with('#'));
+    let Some(first_line) = lines.next() else {
+        return Ok(Vec::new());
+    };
+    let delimiter = if first_line.contains('\t') {
+        Some('\t')
+    } else if first_line.contains(',') {
+        Some(',')
+    } else {
+        None
+    };
+    let first_cols = split_optional_delimited(first_line, delimiter);
+    let first_is_header = first_cols.iter().any(|col| {
+        let key = normalize_header(col);
+        matches!(
+            key.as_str(),
+            "pdb" | "pdbid" | "pdbcode" | "ligand" | "ligandid" | "hetid"
+        )
+    });
+    let headers = if first_is_header {
+        first_cols
+    } else {
+        Vec::new()
+    };
+    let pdb_idx = find_header(&headers, &["pdb", "pdb_id", "pdbid", "pdb code"]);
+    let ligand_idx = find_header(&headers, &["ligand", "ligand_id", "het_id", "het id"]);
+    let affinity_idx = find_header(
+        &headers,
+        &["affinity", "ki", "kd", "ic50", "ec50", "binding data"],
+    );
+    let mut rows = Vec::new();
+    let mut row_lines = Vec::new();
+    if !first_is_header {
+        row_lines.push(first_line.to_string());
+    }
+    row_lines.extend(lines.map(ToOwned::to_owned));
+    for line in row_lines {
+        let cols = split_optional_delimited(&line, delimiter);
+        let pdb = if first_is_header {
+            cell(&cols, pdb_idx)
+        } else {
+            cols.first()
+                .map(|value| value.trim().to_string())
+                .unwrap_or_default()
+        };
+        if pdb.is_empty() {
+            continue;
+        }
+        let ligand = if first_is_header {
+            cell(&cols, ligand_idx)
+        } else {
+            cols.get(1)
+                .map(|value| value.trim().to_string())
+                .unwrap_or_default()
+        };
+        let affinity = if first_is_header {
+            cell(&cols, affinity_idx)
+        } else {
+            cols.get(2)
+                .map(|value| value.trim().to_string())
+                .unwrap_or_default()
+        };
+        let mut ligand_tokens = tokenize(&ligand);
+        ligand_tokens.extend(tokenize(&affinity));
+        rows.push(StoreRow {
+            source: "Binding MOAD".to_string(),
+            target_id: safe_id(&pdb.to_ascii_uppercase()),
+            target_name: format!("Binding MOAD complex {}", pdb.to_ascii_uppercase()),
+            organism: "unknown".to_string(),
+            target_class: "structure_interaction_record".to_string(),
+            ligand_tokens,
+            sequence_tokens: tokenize(&pdb),
+            structure_tokens: tokenize(&line),
+            evidence: "binding_moad_complex_row".to_string(),
+        });
+    }
+    Ok(rows)
+}
+
+fn split_loose_columns(line: &str) -> Vec<String> {
+    if line.contains('\t') {
+        split_tsv(line)
+    } else {
+        line.split_whitespace().map(ToOwned::to_owned).collect()
+    }
+}
+
+fn split_optional_delimited(line: &str, delimiter: Option<char>) -> Vec<String> {
+    match delimiter {
+        Some('\t') => split_tsv(line),
+        Some(',') => split_csv_line(line),
+        _ => split_loose_columns(line),
+    }
+}
+
+fn split_csv_line(line: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut current = String::new();
+    let mut quoted = false;
+    let mut chars = line.chars().peekable();
+    while let Some(ch) = chars.next() {
+        match ch {
+            '"' if quoted && chars.peek() == Some(&'"') => {
+                current.push('"');
+                chars.next();
+            }
+            '"' => quoted = !quoted,
+            ',' if !quoted => {
+                out.push(current.trim().to_string());
+                current.clear();
+            }
+            _ => current.push(ch),
+        }
+    }
+    out.push(current.trim().to_string());
+    out
 }
 
 fn read_sequence_text(path: &Path) -> Result<String, String> {
@@ -1401,11 +1812,13 @@ fn pipeline_blockers(options: &ScienceOptions) -> Result<Vec<String>, String> {
     let manifest = options.science_store.join("science_store_manifest.tsv");
     let known = options.science_store.join("indexes/known_targets.tsv");
     let metagenome = options.science_store.join("indexes/metagenome_targets.tsv");
+    let structure = options.science_store.join("indexes/structure_targets.tsv");
     let tools = options.science_store.join("indexes/tool_versions.tsv");
     for (label, path) in [
         ("missing_science_store_manifest", manifest),
         ("missing_known_database_index", known),
         ("missing_metagenome_potential_index", metagenome),
+        ("missing_structure_interaction_index", structure),
         ("missing_tool_versions_manifest", tools),
     ] {
         if !path.exists() {
@@ -1414,7 +1827,8 @@ fn pipeline_blockers(options: &ScienceOptions) -> Result<Vec<String>, String> {
     }
     let status = options.science_store.join("install_status.json");
     if status.exists() {
-        let value: Value = serde_json::from_str(&read_text(&status)?)
+        let status_text = read_text(&status)?;
+        let value: Value = serde_json::from_str(status_text.trim_start_matches('\u{feff}'))
             .map_err(|err| format!("install_status_parse_failed:{err}"))?;
         if value.get("status").and_then(Value::as_str) != Some("ready") {
             blockers.push("science_store_needs_repair".to_string());
@@ -1682,14 +2096,25 @@ fn match_metagenome(options: &ScienceOptions) -> Result<String, String> {
 }
 
 fn evaluate_structure(options: &ScienceOptions) -> Result<String, String> {
+    let structure_matches = if options
+        .run_dir
+        .join("input_normalized_manifest.tsv")
+        .exists()
+    {
+        match_structure_interactions(options)?
+    } else {
+        write_empty_structure_interaction_matches(options)?;
+        Vec::new()
+    };
     let structure = options.run_dir.join("structure_patch_summary.tsv");
     let docking = options.run_dir.join("docking_summary.tsv");
-    let structure_ready = copy_tool_output_or_header(
-        options,
-        "structure_patch_summary.tsv",
-        "candidate_id\tstructure_score\tstructure_evidence\tbinding_patch\tpatch_evidence\tkey_residues\tdocking_score\tdocking_pose\tligand_position\tinteraction_residues\n",
-        &structure,
-    )?;
+    let structure_ready =
+        if copy_tool_output_if_available(options, "structure_patch_summary.tsv", &structure)? {
+            true
+        } else {
+            write_structure_summary_from_matches(&structure, &structure_matches)?;
+            !structure_matches.is_empty()
+        };
     let docking_ready = copy_tool_output_or_header(
         options,
         "docking_summary.tsv",
@@ -1707,6 +2132,92 @@ fn evaluate_structure(options: &ScienceOptions) -> Result<String, String> {
     ))
 }
 
+fn write_empty_structure_interaction_matches(options: &ScienceOptions) -> Result<(), String> {
+    write_text(
+        &options.run_dir.join("structure_interaction_matches.tsv"),
+        "input_id\tsource\ttarget_id\ttarget_name\torganism\ttarget_class\tmatch_score\tmatched_features\tevidence\n",
+    )
+}
+
+fn match_structure_interactions(options: &ScienceOptions) -> Result<Vec<IndexMatch>, String> {
+    let inputs = read_normalized_inputs(&options.run_dir.join("input_normalized_manifest.tsv"))?;
+    let rows = read_store_rows(
+        &options.science_store.join("indexes/structure_targets.tsv"),
+        "structure_interaction_index",
+    )?;
+    let mut matches = Vec::new();
+    let mut out = String::from(
+        "input_id\tsource\ttarget_id\ttarget_name\torganism\ttarget_class\tmatch_score\tmatched_features\tevidence\n",
+    );
+    for input in &inputs {
+        for row in &rows {
+            let score = score_row(input, row);
+            if score <= 0.0 {
+                continue;
+            }
+            let matched_features = matched_tokens(input, row).join(" ");
+            let item = IndexMatch {
+                input_id: input.input_id.clone(),
+                source: row.source.clone(),
+                target_id: row.target_id.clone(),
+                target_name: row.target_name.clone(),
+                organism: row.organism.clone(),
+                target_class: row.target_class.clone(),
+                match_score: score,
+                matched_features,
+                evidence: row.evidence.clone(),
+            };
+            out.push_str(&format!(
+                "{}\t{}\t{}\t{}\t{}\t{}\t{:.4}\t{}\t{}\n",
+                item.input_id,
+                clean_cell(&item.source),
+                clean_cell(&item.target_id),
+                clean_cell(&item.target_name),
+                clean_cell(&item.organism),
+                clean_cell(&item.target_class),
+                item.match_score,
+                clean_cell(&item.matched_features),
+                clean_cell(&item.evidence)
+            ));
+            matches.push(item);
+        }
+    }
+    write_text(
+        &options.run_dir.join("structure_interaction_matches.tsv"),
+        &out,
+    )?;
+    Ok(matches)
+}
+
+fn write_structure_summary_from_matches(path: &Path, matches: &[IndexMatch]) -> Result<(), String> {
+    let mut text = String::from(
+        "candidate_id\tstructure_score\tstructure_evidence\tbinding_patch\tpatch_evidence\tkey_residues\tdocking_score\tdocking_pose\tligand_position\tinteraction_residues\n",
+    );
+    let mut by_target = BTreeMap::<String, &IndexMatch>::new();
+    for item in matches {
+        let key = item.target_id.clone();
+        match by_target.get(&key) {
+            Some(existing) if existing.match_score >= item.match_score => {}
+            _ => {
+                by_target.insert(key, item);
+            }
+        }
+    }
+    for item in by_target.values() {
+        text.push_str(&format!(
+            "target_{}\t{:.4}\t{}\t{}\t{}\t{}\t\t\t\t{}\n",
+            safe_id(&item.target_id),
+            item.match_score,
+            clean_cell(&format!("{} {}", item.source, item.evidence)),
+            "structure_index_match",
+            clean_cell(&item.target_class),
+            clean_cell(&item.matched_features),
+            clean_cell(&item.matched_features)
+        ));
+    }
+    write_text(path, &text)
+}
+
 fn screen_dynamics(options: &ScienceOptions) -> Result<String, String> {
     let ready = copy_tool_output_or_header(
         options,
@@ -1718,6 +2229,20 @@ fn screen_dynamics(options: &ScienceOptions) -> Result<String, String> {
         "dynamics_screened\tmd_artifact={}",
         if ready { "ready" } else { "not_ready" }
     ))
+}
+
+fn copy_tool_output_if_available(
+    options: &ScienceOptions,
+    file_name: &str,
+    out_path: &Path,
+) -> Result<bool, String> {
+    let tool_output = options.run_dir.join("tool_outputs").join(file_name);
+    if tool_output.exists() {
+        let text = read_text(&tool_output)?;
+        write_text(out_path, &text)?;
+        return Ok(text.lines().skip(1).any(|line| !line.trim().is_empty()));
+    }
+    Ok(false)
 }
 
 fn copy_tool_output_or_header(
@@ -1746,6 +2271,11 @@ fn rank_targets(options: &ScienceOptions) -> Result<String, String> {
     merge_match_file(
         &options.run_dir.join("metagenome_potential_matches.tsv"),
         "metagenome_potential",
+        &mut by_target,
+    )?;
+    merge_match_file(
+        &options.run_dir.join("structure_interaction_matches.tsv"),
+        "structure_interaction",
         &mut by_target,
     )?;
     let mut candidates = by_target.into_values().collect::<Vec<_>>();
@@ -1797,6 +2327,7 @@ fn build_evidence(options: &ScienceOptions) -> Result<String, String> {
         "feature_manifest.tsv",
         "known_database_matches.tsv",
         "metagenome_potential_matches.tsv",
+        "structure_interaction_matches.tsv",
         "structure_patch_summary.tsv",
         "docking_summary.tsv",
         "md_summary.tsv",
@@ -1864,11 +2395,12 @@ fn report_source_summary(options: &ScienceOptions, candidate_count: usize) -> St
         options.science_store.join("science_store_manifest.tsv"),
         options.science_store.join("indexes/known_targets.tsv"),
         options.science_store.join("indexes/metagenome_targets.tsv"),
+        options.science_store.join("indexes/structure_targets.tsv"),
         options.science_store.join("indexes/tool_versions.tsv"),
     ];
     let install_ready = read_text(&options.science_store.join("install_status.json"))
         .ok()
-        .and_then(|text| serde_json::from_str::<Value>(&text).ok())
+        .and_then(|text| serde_json::from_str::<Value>(text.trim_start_matches('\u{feff}')).ok())
         .and_then(|value| {
             value
                 .get("status")
@@ -1915,6 +2447,7 @@ fn write_run_context(
     let input_status = file_context(&options.input_manifest);
     let known_index = options.science_store.join("indexes/known_targets.tsv");
     let metagenome_index = options.science_store.join("indexes/metagenome_targets.tsv");
+    let structure_index = options.science_store.join("indexes/structure_targets.tsv");
     let tool_versions = options.science_store.join("indexes/tool_versions.tsv");
     let context = json!({
         "state": state,
@@ -1927,6 +2460,7 @@ fn write_run_context(
         "database_indexes": {
             "known_targets": file_context(&known_index),
             "metagenome_targets": file_context(&metagenome_index),
+            "structure_targets": file_context(&structure_index),
             "tool_versions": file_context(&tool_versions)
         },
         "blockers": blockers,
@@ -1954,6 +2488,10 @@ fn write_run_context(
         (
             "metagenome_targets_index",
             metagenome_index.display().to_string(),
+        ),
+        (
+            "structure_targets_index",
+            structure_index.display().to_string(),
         ),
         ("tool_versions", tool_versions.display().to_string()),
         ("blockers", blockers.join(";")),
@@ -2078,12 +2616,17 @@ fn write_artifact_source_map(options: &ScienceOptions) -> Result<(), String> {
         ),
         (
             "target_candidate_ranking.tsv",
-            "known_database_matches.tsv;metagenome_potential_matches.tsv",
+            "known_database_matches.tsv;metagenome_potential_matches.tsv;structure_interaction_matches.tsv",
             "candidate_detail.json",
         ),
         (
+            "structure_interaction_matches.tsv",
+            "indexes/structure_targets.tsv;feature_manifest.tsv",
+            "target_candidate_ranking.tsv;structure_patch_summary.tsv",
+        ),
+        (
             "structure_patch_summary.tsv",
-            "tool_outputs/structure_patch_summary.tsv when available;otherwise header-only not-ready artifact",
+            "structure_interaction_matches.tsv;tool_outputs/structure_patch_summary.tsv when available;otherwise index-match summary",
             "evidence_ledger.tsv",
         ),
         (
@@ -2932,6 +3475,18 @@ fn matched_tokens(input: &NormalizedInput, row: &StoreRow) -> Vec<String> {
         .collect::<Vec<_>>()
 }
 
+fn initial_candidate_scope(scope: &str, organism: &str) -> String {
+    match scope {
+        "known_database" if organism.eq_ignore_ascii_case("Homo sapiens") => {
+            "known_human_protein".to_string()
+        }
+        "known_database" => "known_nonhuman_protein".to_string(),
+        "metagenome_potential" => "metagenome_potential_protein".to_string(),
+        "structure_interaction" => "structure_interaction".to_string(),
+        _ => "computed_candidate".to_string(),
+    }
+}
+
 fn merge_match_file(
     path: &Path,
     scope: &str,
@@ -2952,15 +3507,7 @@ fn merge_match_file(
             candidate_id: format!("target_{}", safe_id(&target_id)),
             target_id,
             target_name: cols[3].clone(),
-            candidate_scope: if scope == "known_database" {
-                if cols[4].eq_ignore_ascii_case("Homo sapiens") {
-                    "known_human_protein".to_string()
-                } else {
-                    "known_nonhuman_protein".to_string()
-                }
-            } else {
-                "metagenome_potential_protein".to_string()
-            },
+            candidate_scope: initial_candidate_scope(scope, &cols[4]),
             organism: cols[4].clone(),
             known_score: 0.0,
             metagenome_score: 0.0,
@@ -2970,11 +3517,16 @@ fn merge_match_file(
             final_score: 0.0,
             evidence: String::new(),
         });
-        if scope == "known_database" {
-            entry.known_score = entry.known_score.max(score);
-        } else {
-            entry.metagenome_score = entry.metagenome_score.max(score);
-            entry.candidate_scope = "metagenome_potential_protein".to_string();
+        match scope {
+            "known_database" => entry.known_score = entry.known_score.max(score),
+            "metagenome_potential" => {
+                entry.metagenome_score = entry.metagenome_score.max(score);
+                if !entry.candidate_scope.starts_with("known_") {
+                    entry.candidate_scope = "metagenome_potential_protein".to_string();
+                }
+            }
+            "structure_interaction" => entry.structure_score = entry.structure_score.max(score),
+            _ => {}
         }
         if !entry.evidence.is_empty() {
             entry.evidence.push(';');
@@ -3252,7 +3804,9 @@ mod tests {
         assert!(detail.contains("\"candidate_id\""));
         assert!(context.contains("\"state\":\"completed\""));
         assert!(source_map.contains("research_report.md"));
+        assert!(source_map.contains("structure_interaction_matches.tsv"));
         assert!(source_map.contains("tool_outputs/structure_patch_summary.tsv"));
+        assert!(evidence.contains("structure_interaction_matches"));
         assert!(evidence.contains("score_decomposition"));
         assert!(report.contains("# GenoLigand 科研报告"));
         assert!(report.contains("## 结果来源"));
@@ -3269,11 +3823,13 @@ mod tests {
         assert!(!report.contains("target_candidate_ranking.tsv"));
         assert!(!report.contains("known_database"));
         assert!(!report.contains("metagenome_potential"));
-        assert_eq!(structure.lines().count(), 1);
+        assert_eq!(structure.lines().count(), 2);
         assert_eq!(docking.lines().count(), 1);
         assert_eq!(md.lines().count(), 1);
+        assert!(structure.contains("structure_index_match"));
         assert!(!structure.contains("matched_structure_or_pocket_tokens"));
         assert!(!structure.contains("patch_P24941"));
+        assert!(!docking.contains("completed"));
         assert!(!md.contains("computed_from_database_evidence_only"));
         fs::remove_dir_all(&root).expect("cleanup temp root");
         assert!(!root.exists());
@@ -3435,7 +3991,7 @@ mod tests {
         ensure_dir(&store.join("indexes")).expect("store dirs");
         write_text(
             &store.join("science_store_manifest.tsv"),
-            "item\tstatus\tpath\nwarehouse\tready\tindexes/known_targets.tsv\nmetagenome_index\tready\tindexes/metagenome_targets.tsv\ntool_versions\tready\tindexes/tool_versions.tsv\n",
+            "item\tstatus\tpath\nwarehouse\tready\tindexes/known_targets.tsv\nmetagenome_index\tready\tindexes/metagenome_targets.tsv\nstructure_index\tready\tindexes/structure_targets.tsv\ntool_versions\tready\tindexes/tool_versions.tsv\n",
         )
         .expect("manifest");
         write_text(
@@ -3453,6 +4009,11 @@ mod tests {
             "source\ttarget_id\ttarget_name\torganism\ttarget_class\tligand_tokens\tsequence_tokens\tstructure_tokens\tevidence\n",
         )
         .expect("metagenome");
+        write_text(
+            &store.join("indexes/structure_targets.tsv"),
+            "source\ttarget_id\ttarget_name\torganism\ttarget_class\tligand_tokens\tsequence_tokens\tstructure_tokens\tevidence\n",
+        )
+        .expect("structure");
         let input = root.join("input.json");
         let run = root.join("run");
         write_text(
@@ -3700,6 +4261,55 @@ mod tests {
         assert!(known.contains("han"));
         assert!(known.contains("mkt"));
         assert!(requirements.contains("bindingdb\tBindingDB\tknown_activity\tready"));
+        fs::remove_dir_all(&root).expect("cleanup temp root");
+        assert!(!root.exists());
+    }
+
+    #[test]
+    fn prepare_science_store_builds_structure_index_from_downloaded_sources() {
+        let root = temp_root("build_structure_index");
+        let store = root.join("science_store");
+        write_text(
+            &store.join("downloads/rcsb/mmcif/ab/1abc.cif.gz"),
+            "structure file marker",
+        )
+        .expect("write rcsb structure marker");
+        write_gzip(
+            &store.join("downloads/biolip2/BioLiP.txt.gz"),
+            "1ABC\tA\tA\t1\tATP\tadenosine triphosphate\n",
+        )
+        .expect("write biolip2 table");
+        write_text(
+            &store.join("downloads/plinder/index/annotation_table.parquet"),
+            "plinder annotation marker",
+        )
+        .expect("write plinder annotation marker");
+        write_text(
+            &store.join("downloads/binding_moad/bindingmoad.csv"),
+            "pdb,ligand,affinity\n2XYZ,ATP,10 nM\n",
+        )
+        .expect("write moad table");
+        let options = StoreOptions {
+            workspace_root: root.clone(),
+            science_store: store.clone(),
+        };
+        let _ = run_store_command(ScienceCommand::PrepareScienceStore, &options)
+            .expect("prepare store");
+        let structure =
+            read_text(&store.join("indexes/structure_targets.tsv")).expect("structure index");
+        let manifest = read_text(&store.join("index_build_manifest.tsv")).expect("build manifest");
+        let status = read_text(&store.join("install_status.json")).expect("install status");
+
+        assert!(structure.contains("RCSB"));
+        assert!(structure.contains("1ABC"));
+        assert!(structure.contains("BioLiP2"));
+        assert!(structure.contains("Binding MOAD"));
+        assert!(structure.contains("PLINDER"));
+        assert!(manifest.contains("rcsb_structure_file_rows"));
+        assert!(manifest.contains("biolip2_interaction_rows"));
+        assert!(manifest.contains("binding_moad_complex_rows"));
+        assert!(manifest.contains("plinder_annotation_rows"));
+        assert!(status.contains("\"structure\":"));
         fs::remove_dir_all(&root).expect("cleanup temp root");
         assert!(!root.exists());
     }
