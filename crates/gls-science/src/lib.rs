@@ -357,7 +357,8 @@ pub fn run_science_command(
     }
 }
 
-pub fn create_temporary_test_store(root: &Path) -> Result<PathBuf, String> {
+#[cfg(test)]
+fn create_temporary_test_store(root: &Path) -> Result<PathBuf, String> {
     let store = root.join("science_store");
     ensure_dir(&store.join("indexes"))?;
     write_text(
@@ -412,6 +413,7 @@ pub fn create_temporary_test_store(root: &Path) -> Result<PathBuf, String> {
     Ok(store)
 }
 
+#[cfg(test)]
 fn unit_test_tool_versions_text() -> String {
     let mut text = String::from("tool\tstatus\tversion\tlicense\tlabel\tdetail\n");
     for tool in REQUIRED_TOOLS {
@@ -2356,15 +2358,136 @@ fn build_evidence(options: &ScienceOptions) -> Result<String, String> {
     for file in files {
         let path = options.run_dir.join(file);
         if path.exists() {
+            let status = artifact_evidence_status(file, &path)?;
             text.push_str(&format!(
-                "{}\t{file}\tGenoLigand\tavailable\tsha256:{}\n",
+                "{}\t{file}\tGenoLigand\t{}\t{};content_id:{}\n",
                 file.trim_end_matches(".tsv"),
+                status.label,
+                clean_cell(&status.notes),
                 stable_hash(&read_text(&path)?)
             ));
         }
     }
     write_text(&options.run_dir.join("evidence_ledger.tsv"), &text)?;
     Ok("evidence_built".to_string())
+}
+
+struct ArtifactEvidenceStatus {
+    label: &'static str,
+    notes: String,
+}
+
+fn artifact_evidence_status(file: &str, path: &Path) -> Result<ArtifactEvidenceStatus, String> {
+    let rows = if file.ends_with(".tsv") {
+        rows_in_tsv(path)?
+    } else {
+        0
+    };
+    let (label, notes) = match file {
+        "run_context.json" => ("available", "run context recorded".to_string()),
+        "artifact_source_map.tsv" => ("available", format!("{rows} source-map rows")),
+        "input_normalized_manifest.tsv" => {
+            if rows > 0 {
+                ("available", format!("{rows} normalized input rows"))
+            } else {
+                ("not_generated", "no normalized input rows".to_string())
+            }
+        }
+        "feature_manifest.tsv" => {
+            if rows > 0 {
+                ("available", format!("{rows} computed feature rows"))
+            } else {
+                ("not_generated", "no computed feature rows".to_string())
+            }
+        }
+        "known_database_matches.tsv" => {
+            if rows > 0 {
+                ("available", format!("{rows} known database match rows"))
+            } else {
+                ("no_match", "no known database match rows".to_string())
+            }
+        }
+        "metagenome_potential_matches.tsv" => {
+            if rows > 0 {
+                ("available", format!("{rows} metagenome match rows"))
+            } else {
+                ("no_match", "no metagenome match rows".to_string())
+            }
+        }
+        "structure_interaction_matches.tsv" => {
+            if rows > 0 {
+                (
+                    "available",
+                    format!("{rows} structure interaction match rows"),
+                )
+            } else {
+                (
+                    "no_match",
+                    "no structure interaction match rows".to_string(),
+                )
+            }
+        }
+        "structure_patch_summary.tsv" => {
+            if rows > 0 {
+                ("available", format!("{rows} structure or pocket rows"))
+            } else {
+                ("not_generated", "no structure or pocket rows".to_string())
+            }
+        }
+        "docking_summary.tsv" => {
+            if rows > 0 {
+                ("available", format!("{rows} docking rows"))
+            } else {
+                ("not_generated", "no docking rows".to_string())
+            }
+        }
+        "md_summary.tsv" => {
+            if rows > 0 {
+                ("available", format!("{rows} dynamics rows"))
+            } else {
+                ("not_generated", "no dynamics rows".to_string())
+            }
+        }
+        "target_candidate_ranking.tsv" => {
+            if rows > 0 {
+                ("available", format!("{rows} ranked candidate rows"))
+            } else {
+                ("no_candidate", "no ranked candidate rows".to_string())
+            }
+        }
+        "score_decomposition.tsv" => {
+            if rows > 0 {
+                ("available", format!("{rows} score component rows"))
+            } else {
+                ("not_generated", "no score component rows".to_string())
+            }
+        }
+        "candidate_detail.json" => {
+            let value =
+                serde_json::from_str::<Value>(read_text(path)?.trim_start_matches('\u{feff}'))
+                    .unwrap_or(Value::Null);
+            let count = value
+                .get("candidates")
+                .and_then(Value::as_array)
+                .map(Vec::len)
+                .unwrap_or(0);
+            if count > 0 {
+                ("available", format!("{count} candidate detail rows"))
+            } else {
+                ("no_candidate", "no candidate detail rows".to_string())
+            }
+        }
+        _ => ("available", "artifact recorded".to_string()),
+    };
+    Ok(ArtifactEvidenceStatus { label, notes })
+}
+
+fn rows_in_tsv(path: &Path) -> Result<usize, String> {
+    Ok(read_text(path)?
+        .lines()
+        .skip(1)
+        .filter(|line| !line.trim().is_empty())
+        .count())
 }
 
 fn render_report(options: &ScienceOptions) -> Result<String, String> {
@@ -2644,17 +2767,17 @@ fn write_artifact_source_map(options: &ScienceOptions) -> Result<(), String> {
         ),
         (
             "structure_patch_summary.tsv",
-            "structure_interaction_matches.tsv;tool_outputs/structure_patch_summary.tsv when available;otherwise index-match summary",
+            "structure_interaction_matches.tsv;schema-bound structure output when present;otherwise index-match summary",
             "evidence_ledger.tsv",
         ),
         (
             "docking_summary.tsv",
-            "tool_outputs/docking_summary.tsv when available;otherwise header-only not-ready artifact",
+            "schema-bound docking output when present;otherwise no generated rows",
             "evidence_ledger.tsv",
         ),
         (
             "md_summary.tsv",
-            "tool_outputs/md_summary.tsv when available;otherwise header-only not-ready artifact",
+            "schema-bound dynamics output when present;otherwise no generated rows",
             "evidence_ledger.tsv",
         ),
         (
@@ -2681,6 +2804,8 @@ fn write_artifact_source_map(options: &ScienceOptions) -> Result<(), String> {
     let mut text =
         String::from("project_id\trun_id\tartifact\tupstream_source\tdownstream_use\tstatus\n");
     for (artifact, upstream, downstream) in rows {
+        let artifact_path = options.run_dir.join(artifact);
+        let status = artifact_source_status(&artifact_path)?;
         text.push_str(&format!(
             "{}\t{}\t{}\t{}\t{}\t{}\n",
             clean_cell(&project_id),
@@ -2688,14 +2813,20 @@ fn write_artifact_source_map(options: &ScienceOptions) -> Result<(), String> {
             artifact,
             clean_cell(upstream),
             clean_cell(downstream),
-            if options.run_dir.join(artifact).exists() {
-                "available"
-            } else {
-                "not_yet_written"
-            }
+            status
         ));
     }
     write_text(&options.run_dir.join("artifact_source_map.tsv"), &text)
+}
+
+fn artifact_source_status(path: &Path) -> Result<&'static str, String> {
+    if !path.exists() {
+        return Ok("not_yet_written");
+    }
+    if path.extension().and_then(|value| value.to_str()) == Some("tsv") && rows_in_tsv(path)? == 0 {
+        return Ok("no_rows");
+    }
+    Ok("available")
 }
 
 fn write_score_decomposition(options: &ScienceOptions) -> Result<(), String> {
@@ -4036,9 +4167,18 @@ mod tests {
         assert!(context.contains("\"state\":\"completed\""));
         assert!(source_map.contains("research_report.md"));
         assert!(source_map.contains("structure_interaction_matches.tsv"));
-        assert!(source_map.contains("tool_outputs/structure_patch_summary.tsv"));
+        assert!(source_map.contains("schema-bound structure output when present"));
+        assert!(source_map.contains("schema-bound dynamics output when present"));
+        assert!(source_map.contains("docking_summary.tsv\t"));
+        assert!(source_map.contains("md_summary.tsv\t"));
+        assert!(source_map.contains("docking_summary.tsv\tschema-bound docking output when present;otherwise no generated rows\tevidence_ledger.tsv\tno_rows"));
+        assert!(source_map.contains("md_summary.tsv\tschema-bound dynamics output when present;otherwise no generated rows\tevidence_ledger.tsv\tno_rows"));
         assert!(evidence.contains("structure_interaction_matches"));
         assert!(evidence.contains("score_decomposition"));
+        assert!(
+            evidence.contains("docking_summary.tsv\tGenoLigand\tnot_generated\tno docking rows")
+        );
+        assert!(evidence.contains("md_summary.tsv\tGenoLigand\tnot_generated\tno dynamics rows"));
         assert!(report.contains("# GenoLigand 科研报告"));
         assert!(report.contains("## 结果来源"));
         assert!(report.contains("项目编号"));

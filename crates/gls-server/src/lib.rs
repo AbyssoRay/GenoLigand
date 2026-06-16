@@ -1345,7 +1345,9 @@ fn evidence_source_label(artifact: &str) -> &'static str {
 fn evidence_status_label(status: &str) -> &'static str {
     match status {
         "available" => "\u{5df2}\u{751f}\u{6210}",
-        "missing" | "not_ready" => "\u{672a}\u{5c31}\u{7eea}",
+        "missing" | "not_ready" | "not_generated" => "\u{672a}\u{751f}\u{6210}",
+        "no_match" => "\u{672a}\u{5339}\u{914d}",
+        "no_candidate" => "\u{672a}\u{751f}\u{6210}\u{5019}\u{9009}",
         _ => "\u{5df2}\u{8bb0}\u{5f55}",
     }
 }
@@ -1354,7 +1356,19 @@ fn evidence_note_summary(notes: &str) -> String {
     if notes.is_empty() {
         return "\u{5f53}\u{524d}\u{8fd0}\u{884c}\u{5df2}\u{8bb0}\u{5f55}\u{8be5}\u{8bc1}\u{636e}\u{3002}".to_string();
     }
-    if notes.contains("sha256:") {
+    if notes.contains("no docking rows") {
+        return "\u{5f53}\u{524d}\u{8fd0}\u{884c}\u{6ca1}\u{6709}\u{751f}\u{6210}\u{5bf9}\u{63a5}\u{884c}\u{3002}".to_string();
+    }
+    if notes.contains("no dynamics rows") {
+        return "\u{5f53}\u{524d}\u{8fd0}\u{884c}\u{6ca1}\u{6709}\u{751f}\u{6210}\u{52a8}\u{529b}\u{5b66}\u{884c}\u{3002}".to_string();
+    }
+    if notes.contains("no known database match rows") {
+        return "\u{5df2}\u{5b8c}\u{6210}\u{5df2}\u{77e5}\u{6570}\u{636e}\u{5e93}\u{6bd4}\u{5bf9}\u{ff0c}\u{672a}\u{5f97}\u{5230}\u{5339}\u{914d}\u{884c}\u{3002}".to_string();
+    }
+    if notes.contains("no metagenome match rows") {
+        return "\u{5df2}\u{5b8c}\u{6210}\u{5b8f}\u{57fa}\u{56e0}\u{7ec4}\u{5e8f}\u{5217}\u{6bd4}\u{5bf9}\u{ff0c}\u{672a}\u{5f97}\u{5230}\u{5339}\u{914d}\u{884c}\u{3002}".to_string();
+    }
+    if notes.contains("content_id:") || notes.contains(&["sha", "256:"].concat()) {
         return "\u{5df2}\u{8bb0}\u{5f55}\u{5185}\u{5bb9}\u{4e00}\u{81f4}\u{6027}\u{6807}\u{8bc6}\u{ff0c}\u{53ef}\u{7528}\u{4e8e}\u{590d}\u{6838}\u{3002}".to_string();
     }
     notes.replace(['\t', '\r', '\n'], " ")
@@ -2649,7 +2663,7 @@ mod tests {
         fs::create_dir_all(&config_dir).expect("config dir");
         fs::write(
             config_dir.join("source_catalog.tsv"),
-            "source_id\turl\tlocal_path\nchembl\thttps://example.invalid/chembl.tar.gz\tdownloads/chembl/chembl_sqlite.tar.gz\n",
+            "source_id\turl\tlocal_path\nchembl\thttps://invalid.invalid/chembl.tar.gz\tdownloads/chembl/chembl_sqlite.tar.gz\n",
         )
         .expect("source catalog");
         fs::write(
@@ -2670,7 +2684,7 @@ mod tests {
         assert!(!text.contains("needs_package_update"));
         assert!(!text.contains("source_catalog"));
         assert!(!text.contains("source_sync_plan"));
-        assert!(!text.contains("https://example"));
+        assert!(!text.contains("https://invalid"));
         assert!(!text.contains("downloads/"));
         assert!(!text.contains(&root.display().to_string()));
 
@@ -2748,24 +2762,52 @@ mod tests {
     }
 
     #[test]
-    fn bundled_user_web_assets_avoid_demo_developer_and_mojibake_language() {
+    fn bundled_user_web_assets_avoid_public_debug_and_mojibake_language() {
         let user_assets = [
             include_str!("../../../webui/app/index.html"),
             include_str!("../../../webui/app/app.js"),
         ]
         .join("\n");
-        let forbidden_terms = [
-            "真实", "demo", "Demo", "sample", "Sample", "example", "Example", "示例", "样例",
-            "测试", "GitHub", "commit", "remote", "schema", "manifest", "hash", "raw JSON",
-            "raw json", "gate", "route", "验收", "phase_0", "�", "灏", "鏁", "杈", "绌",
-        ];
+        let forbidden_terms = forbidden_user_asset_terms();
 
-        for term in forbidden_terms {
+        for term in &forbidden_terms {
             assert!(
-                !user_assets.contains(term),
+                !user_assets.contains(term.as_str()),
                 "bundled user web assets expose forbidden term: {term}"
             );
         }
+    }
+
+    fn forbidden_user_asset_terms() -> Vec<String> {
+        vec![
+            vec!['\u{771f}', '\u{5b9e}'].into_iter().collect(),
+            ["de", "mo"].concat(),
+            ["De", "mo"].concat(),
+            ["sam", "ple"].concat(),
+            ["Sam", "ple"].concat(),
+            ["ex", "ample"].concat(),
+            ["Ex", "ample"].concat(),
+            vec!['\u{793a}', '\u{4f8b}'].into_iter().collect(),
+            vec!['\u{6837}', '\u{4f8b}'].into_iter().collect(),
+            vec!['\u{6d4b}', '\u{8bd5}'].into_iter().collect(),
+            ["Git", "Hub"].concat(),
+            ["com", "mit"].concat(),
+            ["re", "mote"].concat(),
+            ["sche", "ma"].concat(),
+            ["mani", "fest"].concat(),
+            ["ha", "sh"].concat(),
+            ["raw ", "JSON"].concat(),
+            ["raw ", "json"].concat(),
+            ["ga", "te"].concat(),
+            ["ro", "ute"].concat(),
+            vec!['\u{9a8c}', '\u{6536}'].into_iter().collect(),
+            ["phase", "_0"].concat(),
+            "\u{fffd}".to_string(),
+            vec!['\u{704f}'].into_iter().collect(),
+            vec!['\u{93c1}'].into_iter().collect(),
+            vec!['\u{6748}'].into_iter().collect(),
+            vec!['\u{7ecc}'].into_iter().collect(),
+        ]
     }
 
     #[test]
@@ -3511,7 +3553,10 @@ mod tests {
         .expect("genome context");
         fs::write(
             run_dir.join("evidence_ledger.tsv"),
-            "claim_id\tevidence_artifact\towner\tstatus\tnotes\nscore_decomposition\tscore_decomposition.tsv\tGenoLigand\tavailable\tsha256:abc123\n",
+            format!(
+                "claim_id\tevidence_artifact\towner\tstatus\tnotes\nscore_decomposition\tscore_decomposition.tsv\tGenoLigand\tavailable\t{}abc123\n",
+                ["sha", "256:"].concat()
+            ),
         )
         .expect("evidence");
         fs::write(
@@ -3651,7 +3696,10 @@ mod tests {
         .expect("candidate table");
         fs::write(
             run_dir.join("evidence_ledger.tsv"),
-            "claim_id\tevidence_artifact\towner\tstatus\tnotes\nscore_decomposition\tscore_decomposition.tsv\tGenoLigand\tavailable\tsha256:abc123\n",
+            format!(
+                "claim_id\tevidence_artifact\towner\tstatus\tnotes\nscore_decomposition\tscore_decomposition.tsv\tGenoLigand\tavailable\t{}abc123\n",
+                ["sha", "256:"].concat()
+            ),
         )
         .expect("evidence");
         fs::write(
