@@ -8,6 +8,7 @@ import os
 import platform
 import re
 import shutil
+import ssl
 import subprocess
 import sys
 import time
@@ -66,6 +67,17 @@ RESERVED_WSL_DISTROS = {"Ubuntu-24.04"}
 DOWNLOAD_RETRIES = 3
 DOWNLOAD_TIMEOUT_SECONDS = 120
 DOWNLOAD_USER_AGENT = "GenoLigand-science-store-installer/0.9"
+
+
+def urlopen_with_compatible_tls(request: urllib.request.Request, timeout: int):
+    url = getattr(request, "full_url", "")
+    if str(url).lower().startswith("https://"):
+        context = ssl.create_default_context()
+        ignore_unexpected_eof = getattr(ssl, "OP_IGNORE_UNEXPECTED_EOF", None)
+        if ignore_unexpected_eof is not None:
+            context.options |= ignore_unexpected_eof
+        return urllib.request.urlopen(request, timeout=timeout, context=context)
+    return urllib.request.urlopen(request, timeout=timeout)
 
 WSL_COMMAND_WRAPPERS = [
     "java",
@@ -699,7 +711,7 @@ def copy_or_download(url: str, destination: Path, expected_sha256: str | None) -
             if existing:
                 request.add_header("Range", f"bytes={existing}-")
             try:
-                with urllib.request.urlopen(
+                with urlopen_with_compatible_tls(
                     request,
                     timeout=DOWNLOAD_TIMEOUT_SECONDS,
                 ) as response:
@@ -868,7 +880,7 @@ def directory_digest(path: Path) -> str:
 
 def extract_html_links(page_url: str, include_pattern: str) -> list[str]:
     request = urllib.request.Request(page_url, headers={"User-Agent": DOWNLOAD_USER_AGENT})
-    with urllib.request.urlopen(request, timeout=DOWNLOAD_TIMEOUT_SECONDS) as response:
+    with urlopen_with_compatible_tls(request, timeout=DOWNLOAD_TIMEOUT_SECONDS) as response:
         html = response.read().decode("utf-8", errors="replace")
     pattern = re.compile(include_pattern) if include_pattern else None
     hrefs = re.findall(r"""href\s*=\s*["']?([^"'\s>]+)""", html, flags=re.IGNORECASE)
@@ -921,7 +933,7 @@ def list_html_hrefs(page_url: str) -> list[str]:
         html = local.read_text(encoding="utf-8", errors="replace")
         return re.findall(r"""href\s*=\s*["']?([^"'\s>]+)""", html, flags=re.IGNORECASE)
     request = urllib.request.Request(page_url, headers={"User-Agent": DOWNLOAD_USER_AGENT})
-    with urllib.request.urlopen(request, timeout=DOWNLOAD_TIMEOUT_SECONDS) as response:
+    with urlopen_with_compatible_tls(request, timeout=DOWNLOAD_TIMEOUT_SECONDS) as response:
         html = response.read().decode("utf-8", errors="replace")
     return re.findall(r"""href\s*=\s*["']?([^"'\s>]+)""", html, flags=re.IGNORECASE)
 
@@ -1007,7 +1019,7 @@ def sync_gcs_prefix(row: dict[str, str], target: Path) -> dict[str, object]:
         query = urllib.parse.urlencode({"prefix": prefix, "maxResults": "1000", **({"pageToken": page_token} if page_token else {})})
         api_url = f"https://storage.googleapis.com/storage/v1/b/{urllib.parse.quote(bucket)}/o?{query}"
         request = urllib.request.Request(api_url, headers={"User-Agent": DOWNLOAD_USER_AGENT})
-        with urllib.request.urlopen(request, timeout=DOWNLOAD_TIMEOUT_SECONDS) as response:
+        with urlopen_with_compatible_tls(request, timeout=DOWNLOAD_TIMEOUT_SECONDS) as response:
             payload = json.loads(response.read().decode("utf-8"))
         for item in payload.get("items", []):
             name = item.get("name", "")

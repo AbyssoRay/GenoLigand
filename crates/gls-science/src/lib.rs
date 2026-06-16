@@ -86,6 +86,20 @@ struct NormalizedInput {
 }
 
 #[derive(Clone, Debug)]
+struct ComputedFeatureInput {
+    input_id: String,
+    tokens: BTreeSet<String>,
+}
+
+#[derive(Clone, Debug)]
+struct FeatureRow {
+    family: String,
+    name: String,
+    value: String,
+    token: String,
+}
+
+#[derive(Clone, Debug)]
 struct StoreRow {
     source: String,
     target_id: String,
@@ -1937,7 +1951,7 @@ fn normalize_input(options: &ScienceOptions) -> Result<String, String> {
             "{}\t{}\t{}\t{}\t{}\tnormalized\n",
             input.input_id,
             input.kind.as_str(),
-            clean_cell(&input.primary_value),
+            encode_tsv_cell(&input.primary_value),
             input.file_count,
             input.tokens.iter().cloned().collect::<Vec<_>>().join(" ")
         ));
@@ -1966,7 +1980,7 @@ fn compute_features(options: &ScienceOptions) -> Result<String, String> {
         return Err("normalized_input_missing_or_empty".to_string());
     }
     let mut text = String::from(
-        "input_id\tinput_kind\tfeature_family\tfeature_name\tfeature_value\tfeature_source\n",
+        "input_id\tinput_kind\tfeature_family\tfeature_name\tfeature_value\tfeature_source\tfeature_token\n",
     );
     for input in rows {
         let token_count = input.tokens.len();
@@ -1995,17 +2009,20 @@ fn compute_features(options: &ScienceOptions) -> Result<String, String> {
             ),
         ] {
             text.push_str(&format!(
-                "{}\t{}\t{family}\t{name}\t{value}\tGenoLigand\n",
+                "{}\t{}\t{family}\t{name}\t{value}\tGenoLigand\t\n",
                 input.input_id,
                 input.kind.as_str()
             ));
         }
-        for (family, name, value) in typed_feature_rows(&input) {
+        for row in typed_feature_rows(&input) {
             text.push_str(&format!(
-                "{}\t{}\t{family}\t{name}\t{}\tGenoLigand\n",
+                "{}\t{}\t{}\t{}\t{}\tGenoLigand\t{}\n",
                 input.input_id,
                 input.kind.as_str(),
-                clean_cell(&value)
+                clean_cell(&row.family),
+                clean_cell(&row.name),
+                clean_cell(&row.value),
+                clean_cell(&row.token)
             ));
         }
     }
@@ -2022,7 +2039,7 @@ fn compute_features(options: &ScienceOptions) -> Result<String, String> {
 }
 
 fn match_known(options: &ScienceOptions) -> Result<String, String> {
-    let inputs = read_normalized_inputs(&options.run_dir.join("input_normalized_manifest.tsv"))?;
+    let inputs = read_computed_feature_inputs(&options.run_dir.join("feature_manifest.tsv"))?;
     let rows = read_store_rows(
         &options.science_store.join("indexes/known_targets.tsv"),
         "known_database_index",
@@ -2056,7 +2073,7 @@ fn match_known(options: &ScienceOptions) -> Result<String, String> {
 }
 
 fn match_metagenome(options: &ScienceOptions) -> Result<String, String> {
-    let inputs = read_normalized_inputs(&options.run_dir.join("input_normalized_manifest.tsv"))?;
+    let inputs = read_computed_feature_inputs(&options.run_dir.join("feature_manifest.tsv"))?;
     let rows = read_store_rows(
         &options.science_store.join("indexes/metagenome_targets.tsv"),
         "metagenome_potential_index",
@@ -2140,7 +2157,7 @@ fn write_empty_structure_interaction_matches(options: &ScienceOptions) -> Result
 }
 
 fn match_structure_interactions(options: &ScienceOptions) -> Result<Vec<IndexMatch>, String> {
-    let inputs = read_normalized_inputs(&options.run_dir.join("input_normalized_manifest.tsv"))?;
+    let inputs = read_computed_feature_inputs(&options.run_dir.join("feature_manifest.tsv"))?;
     let rows = read_store_rows(
         &options.science_store.join("indexes/structure_targets.tsv"),
         "structure_interaction_index",
@@ -2564,6 +2581,7 @@ fn write_candidate_detail(
                     "feature_manifest.tsv",
                     "known_database_matches.tsv",
                     "metagenome_potential_matches.tsv",
+                    "structure_interaction_matches.tsv",
                     "target_candidate_ranking.tsv",
                     "evidence_ledger.tsv"
                 ],
@@ -2820,12 +2838,40 @@ fn read_normalized_inputs(path: &Path) -> Result<Vec<NormalizedInput>, String> {
         out.push(NormalizedInput {
             input_id: cols[0].clone(),
             kind,
-            primary_value: cols[2].clone(),
+            primary_value: decode_tsv_cell(&cols[2]),
             file_count: cols[3].parse().unwrap_or(0),
             tokens: cols[4].split_whitespace().map(ToOwned::to_owned).collect(),
         });
     }
     Ok(out)
+}
+
+fn read_computed_feature_inputs(path: &Path) -> Result<Vec<ComputedFeatureInput>, String> {
+    let text = read_text(path)?;
+    let mut by_input = BTreeMap::<String, ComputedFeatureInput>::new();
+    for line in text.lines().skip(1) {
+        let cols = split_tsv(line);
+        if cols.len() < 7 {
+            continue;
+        }
+        if !matches!(
+            cols[1].as_str(),
+            "small_molecule" | "peptide" | "protein_ligand" | "complex" | "genome_or_metagenome"
+        ) {
+            continue;
+        }
+        let token = cols[6].trim();
+        let entry = by_input
+            .entry(cols[0].clone())
+            .or_insert_with(|| ComputedFeatureInput {
+                input_id: cols[0].clone(),
+                tokens: BTreeSet::new(),
+            });
+        if !token.is_empty() {
+            entry.tokens.insert(token.to_ascii_lowercase());
+        }
+    }
+    Ok(by_input.into_values().collect())
 }
 
 fn read_source_rows(path: &Path, label: &str) -> Result<(Vec<StoreRow>, &'static str), String> {
@@ -3207,7 +3253,7 @@ fn first_nonempty(values: &[String]) -> String {
         .unwrap_or_default()
 }
 
-fn typed_feature_rows(input: &NormalizedInput) -> Vec<(&'static str, &'static str, String)> {
+fn typed_feature_rows(input: &NormalizedInput) -> Vec<FeatureRow> {
     match input.kind {
         InputKind::SmallMolecule => small_molecule_features(&input.primary_value),
         InputKind::Peptide => peptide_or_protein_features("peptide", &input.primary_value),
@@ -3219,7 +3265,7 @@ fn typed_feature_rows(input: &NormalizedInput) -> Vec<(&'static str, &'static st
     }
 }
 
-fn small_molecule_features(value: &str) -> Vec<(&'static str, &'static str, String)> {
+fn small_molecule_features(value: &str) -> Vec<FeatureRow> {
     let compact = compact_sequence(value);
     let atom_symbol_count = compact
         .chars()
@@ -3229,18 +3275,20 @@ fn small_molecule_features(value: &str) -> Vec<(&'static str, &'static str, Stri
         .chars()
         .filter(|ch| matches!(ch, 'c' | 'n' | 'o' | 's' | 'p'))
         .count();
-    vec![
-        (
+    let mut rows = vec![
+        feature_row(
             "small_molecule",
             "atom_symbol_count",
             atom_symbol_count.to_string(),
+            "",
         ),
-        (
+        feature_row(
             "small_molecule",
             "aromatic_symbol_count",
             aromatic_symbol_count.to_string(),
+            "",
         ),
-        (
+        feature_row(
             "small_molecule",
             "ring_marker_count",
             compact
@@ -3248,8 +3296,9 @@ fn small_molecule_features(value: &str) -> Vec<(&'static str, &'static str, Stri
                 .filter(|ch| ch.is_ascii_digit())
                 .count()
                 .to_string(),
+            "",
         ),
-        (
+        feature_row(
             "small_molecule",
             "branch_marker_count",
             compact
@@ -3257,8 +3306,9 @@ fn small_molecule_features(value: &str) -> Vec<(&'static str, &'static str, Stri
                 .filter(|ch| matches!(ch, '(' | ')'))
                 .count()
                 .to_string(),
+            "",
         ),
-        (
+        feature_row(
             "small_molecule",
             "charge_marker_count",
             compact
@@ -3266,20 +3316,30 @@ fn small_molecule_features(value: &str) -> Vec<(&'static str, &'static str, Stri
                 .filter(|ch| matches!(ch, '+' | '-'))
                 .count()
                 .to_string(),
+            "",
         ),
-        (
+        feature_row(
             "small_molecule",
             "chiral_marker_count",
             compact.chars().filter(|ch| *ch == '@').count().to_string(),
+            "",
         ),
-        ("input", "file_or_inline", file_or_inline(value).to_string()),
-    ]
+        feature_row(
+            "input",
+            "file_or_inline",
+            file_or_inline(value).to_string(),
+            "",
+        ),
+    ];
+    rows.extend(token_feature_rows(
+        "small_molecule",
+        "ligand_fingerprint_token",
+        tokenize(&compact),
+    ));
+    rows
 }
 
-fn peptide_or_protein_features(
-    family: &'static str,
-    value: &str,
-) -> Vec<(&'static str, &'static str, String)> {
+fn peptide_or_protein_features(family: &str, value: &str) -> Vec<FeatureRow> {
     let sequence = compact_sequence(value);
     let amino_acids = sequence
         .chars()
@@ -3303,16 +3363,22 @@ fn peptide_or_protein_features(
         .iter()
         .filter(|ch| ch.eq_ignore_ascii_case(&'C'))
         .count();
-    vec![
-        (family, "amino_acid_count", aa_count.to_string()),
-        (
+    let mut rows = vec![
+        feature_row(family, "amino_acid_count", aa_count.to_string(), ""),
+        feature_row(
             family,
             "hydrophobic_residue_count",
             hydrophobic_count.to_string(),
+            "",
         ),
-        (family, "charged_residue_count", charged_count.to_string()),
-        (family, "cysteine_count", cysteine_count.to_string()),
-        (
+        feature_row(
+            family,
+            "charged_residue_count",
+            charged_count.to_string(),
+            "",
+        ),
+        feature_row(family, "cysteine_count", cysteine_count.to_string(), ""),
+        feature_row(
             family,
             "fasta_header_count",
             value
@@ -3320,12 +3386,24 @@ fn peptide_or_protein_features(
                 .filter(|line| line.starts_with('>'))
                 .count()
                 .to_string(),
+            "",
         ),
-        ("input", "file_or_inline", file_or_inline(value).to_string()),
-    ]
+        feature_row(
+            "input",
+            "file_or_inline",
+            file_or_inline(value).to_string(),
+            "",
+        ),
+    ];
+    rows.extend(token_feature_rows(
+        family,
+        "sequence_feature_token",
+        tokenize(&sequence),
+    ));
+    rows
 }
 
-fn complex_features(value: &str) -> Vec<(&'static str, &'static str, String)> {
+fn complex_features(value: &str) -> Vec<FeatureRow> {
     let lower = value.to_ascii_lowercase();
     let path = Path::new(value.trim());
     let extension = path
@@ -3333,13 +3411,14 @@ fn complex_features(value: &str) -> Vec<(&'static str, &'static str, String)> {
         .and_then(|ext| ext.to_str())
         .unwrap_or("")
         .to_ascii_lowercase();
-    vec![
-        (
+    let mut rows = vec![
+        feature_row(
             "complex",
             "structure_file_exists",
             path.exists().to_string(),
+            "",
         ),
-        (
+        feature_row(
             "complex",
             "structure_extension",
             if extension.is_empty() {
@@ -3347,22 +3426,36 @@ fn complex_features(value: &str) -> Vec<(&'static str, &'static str, String)> {
             } else {
                 extension
             },
+            "",
         ),
-        (
+        feature_row(
             "complex",
             "chain_marker_count",
             count_word_markers(&lower, &["chain", "链"]).to_string(),
+            "",
         ),
-        (
+        feature_row(
             "complex",
             "ligand_marker_count",
             count_word_markers(&lower, &["ligand", "配体"]).to_string(),
+            "",
         ),
-        ("input", "file_or_inline", file_or_inline(value).to_string()),
-    ]
+        feature_row(
+            "input",
+            "file_or_inline",
+            file_or_inline(value).to_string(),
+            "",
+        ),
+    ];
+    rows.extend(token_feature_rows(
+        "complex",
+        "structure_feature_token",
+        tokenize(&lower),
+    ));
+    rows
 }
 
-fn genome_or_metagenome_features(value: &str) -> Vec<(&'static str, &'static str, String)> {
+fn genome_or_metagenome_features(value: &str) -> Vec<FeatureRow> {
     let sequence = compact_sequence(value);
     let nucleotide_count = sequence
         .chars()
@@ -3377,14 +3470,16 @@ fn genome_or_metagenome_features(value: &str) -> Vec<(&'static str, &'static str
     } else {
         "0.0000".to_string()
     };
-    vec![
-        (
+    let translated_orfs = translate_orfs(&sequence);
+    let mut rows = vec![
+        feature_row(
             "genome_or_metagenome",
             "nucleotide_count",
             nucleotide_count.to_string(),
+            "",
         ),
-        ("genome_or_metagenome", "gc_fraction", gc_fraction),
-        (
+        feature_row("genome_or_metagenome", "gc_fraction", gc_fraction, ""),
+        feature_row(
             "genome_or_metagenome",
             "fasta_record_count",
             value
@@ -3392,8 +3487,9 @@ fn genome_or_metagenome_features(value: &str) -> Vec<(&'static str, &'static str
                 .filter(|line| line.starts_with('>'))
                 .count()
                 .to_string(),
+            "",
         ),
-        (
+        feature_row(
             "genome_or_metagenome",
             "orf_start_marker_count",
             sequence
@@ -3401,9 +3497,113 @@ fn genome_or_metagenome_features(value: &str) -> Vec<(&'static str, &'static str
                 .matches("ATG")
                 .count()
                 .to_string(),
+            "",
         ),
-        ("input", "file_or_inline", file_or_inline(value).to_string()),
-    ]
+        feature_row(
+            "genome_or_metagenome",
+            "translated_orf_count",
+            translated_orfs.len().to_string(),
+            "",
+        ),
+        feature_row(
+            "input",
+            "file_or_inline",
+            file_or_inline(value).to_string(),
+            "",
+        ),
+    ];
+    for peptide in translated_orfs {
+        rows.extend(token_feature_rows(
+            "genome_or_metagenome",
+            "translated_orf_feature_token",
+            tokenize(&peptide),
+        ));
+    }
+    if rows
+        .iter()
+        .filter(|row| row.name == "translated_orf_feature_token")
+        .count()
+        == 0
+    {
+        rows.extend(token_feature_rows(
+            "genome_or_metagenome",
+            "sequence_feature_token",
+            tokenize(&sequence),
+        ));
+    }
+    rows
+}
+
+fn feature_row(family: &str, name: &str, value: String, token: &str) -> FeatureRow {
+    FeatureRow {
+        family: family.to_string(),
+        name: name.to_string(),
+        value,
+        token: token.to_ascii_lowercase(),
+    }
+}
+
+fn token_feature_rows(family: &str, name: &str, tokens: BTreeSet<String>) -> Vec<FeatureRow> {
+    tokens
+        .into_iter()
+        .map(|token| feature_row(family, name, token.clone(), &token))
+        .collect()
+}
+
+fn translate_orfs(sequence: &str) -> Vec<String> {
+    let upper = sequence.to_ascii_uppercase();
+    let bases = upper.as_bytes();
+    let mut peptides = Vec::new();
+    for frame in 0..3 {
+        let mut pos = frame;
+        while pos + 3 <= bases.len() {
+            if &upper[pos..pos + 3] != "ATG" {
+                pos += 3;
+                continue;
+            }
+            let mut peptide = String::new();
+            let mut codon_pos = pos;
+            while codon_pos + 3 <= bases.len() {
+                let codon = &upper[codon_pos..codon_pos + 3];
+                if matches!(codon, "TAA" | "TAG" | "TGA") {
+                    break;
+                }
+                peptide.push(codon_to_amino_acid(codon));
+                codon_pos += 3;
+            }
+            if peptide.len() >= 3 {
+                peptides.push(peptide);
+            }
+            pos += 3;
+        }
+    }
+    peptides
+}
+
+fn codon_to_amino_acid(codon: &str) -> char {
+    match codon {
+        "TTT" | "TTC" => 'F',
+        "TTA" | "TTG" | "CTT" | "CTC" | "CTA" | "CTG" => 'L',
+        "ATT" | "ATC" | "ATA" => 'I',
+        "ATG" => 'M',
+        "GTT" | "GTC" | "GTA" | "GTG" => 'V',
+        "TCT" | "TCC" | "TCA" | "TCG" | "AGT" | "AGC" => 'S',
+        "CCT" | "CCC" | "CCA" | "CCG" => 'P',
+        "ACT" | "ACC" | "ACA" | "ACG" => 'T',
+        "GCT" | "GCC" | "GCA" | "GCG" => 'A',
+        "TAT" | "TAC" => 'Y',
+        "CAT" | "CAC" => 'H',
+        "CAA" | "CAG" => 'Q',
+        "AAT" | "AAC" => 'N',
+        "AAA" | "AAG" => 'K',
+        "GAT" | "GAC" => 'D',
+        "GAA" | "GAG" => 'E',
+        "TGT" | "TGC" => 'C',
+        "TGG" => 'W',
+        "CGT" | "CGC" | "CGA" | "CGG" | "AGA" | "AGG" => 'R',
+        "GGT" | "GGC" | "GGA" | "GGG" => 'G',
+        _ => 'X',
+    }
 }
 
 fn compact_sequence(value: &str) -> String {
@@ -3455,7 +3655,7 @@ fn count_word_markers(value: &str, markers: &[&str]) -> usize {
         .sum()
 }
 
-fn score_row(input: &NormalizedInput, row: &StoreRow) -> f64 {
+fn score_row(input: &ComputedFeatureInput, row: &StoreRow) -> f64 {
     let matched = matched_tokens(input, row);
     if matched.is_empty() {
         0.0
@@ -3464,7 +3664,7 @@ fn score_row(input: &NormalizedInput, row: &StoreRow) -> f64 {
     }
 }
 
-fn matched_tokens(input: &NormalizedInput, row: &StoreRow) -> Vec<String> {
+fn matched_tokens(input: &ComputedFeatureInput, row: &StoreRow) -> Vec<String> {
     let mut db_tokens = row.ligand_tokens.clone();
     db_tokens.extend(row.sequence_tokens.iter().cloned());
     db_tokens.extend(row.structure_tokens.iter().cloned());
@@ -3617,6 +3817,37 @@ fn split_tsv(line: &str) -> Vec<String> {
 
 fn clean_cell(value: &str) -> String {
     value.replace(['\t', '\r', '\n'], " ")
+}
+
+fn encode_tsv_cell(value: &str) -> String {
+    value
+        .replace('\\', "\\\\")
+        .replace('\t', "\\t")
+        .replace('\r', "\\r")
+        .replace('\n', "\\n")
+}
+
+fn decode_tsv_cell(value: &str) -> String {
+    let mut out = String::new();
+    let mut chars = value.chars();
+    while let Some(ch) = chars.next() {
+        if ch != '\\' {
+            out.push(ch);
+            continue;
+        }
+        match chars.next() {
+            Some('n') => out.push('\n'),
+            Some('r') => out.push('\r'),
+            Some('t') => out.push('\t'),
+            Some('\\') => out.push('\\'),
+            Some(other) => {
+                out.push('\\');
+                out.push(other);
+            }
+            None => out.push('\\'),
+        }
+    }
+    out
 }
 
 fn run_python_script(script: &str, args: &[String], context: &str) -> Result<String, String> {
@@ -3869,12 +4100,59 @@ mod tests {
             "complex\tchain_marker_count",
             "genome_or_metagenome\tgc_fraction",
             "genome_or_metagenome\torf_start_marker_count",
+            "genome_or_metagenome\ttranslated_orf_count\t1",
+            "genome_or_metagenome\ttranslated_orf_feature_token\tmrv",
         ] {
             assert!(
                 features.contains(expected),
                 "missing feature row: {expected}"
             );
         }
+        fs::remove_dir_all(&root).expect("cleanup temp root");
+        assert!(!root.exists());
+    }
+
+    #[test]
+    fn database_matching_requires_computed_feature_tokens() {
+        let root = temp_root("feature_bound_matching");
+        let store = root.join("science_store");
+        let run = root.join("run");
+        let input = root.join("input.json");
+        write_text(
+            &store.join("indexes/known_targets.tsv"),
+            "source\ttarget_id\ttarget_name\torganism\ttarget_class\tligand_tokens\tsequence_tokens\tstructure_tokens\tevidence\nChEMBL\tCHEMBL_T1\tEthanol binding protein\tHomo sapiens\tknown_human_protein\tcco\t\t\tactivity_row\n",
+        )
+        .expect("known index");
+        write_text(
+            &input,
+            "{\"inputs\":[{\"field\":\"small_molecule\",\"value\":\"CCO\"}],\"files\":[]}\n",
+        )
+        .expect("input");
+        let options = ScienceOptions {
+            workspace_root: root.clone(),
+            science_store: store,
+            input_manifest: input,
+            run_dir: run.clone(),
+        };
+
+        run_science_command(ScienceCommand::InputNormalize, &options).expect("normalize");
+        run_science_command(ScienceCommand::FeaturesCompute, &options).expect("features");
+        run_science_command(ScienceCommand::DatabaseMatchKnown, &options).expect("match known");
+        let with_features =
+            read_text(&run.join("known_database_matches.tsv")).expect("known matches");
+        assert!(with_features.contains("CHEMBL_T1"));
+
+        write_text(
+            &run.join("feature_manifest.tsv"),
+            "input_id\tinput_kind\tfeature_family\tfeature_name\tfeature_value\tfeature_source\tfeature_token\ninput_1\tsmall_molecule\tinput\tinput_length\t3\tGenoLigand\t\n",
+        )
+        .expect("strip feature tokens");
+        run_science_command(ScienceCommand::DatabaseMatchKnown, &options)
+            .expect("match known without feature tokens");
+        let without_features =
+            read_text(&run.join("known_database_matches.tsv")).expect("known matches");
+        assert!(!without_features.contains("CHEMBL_T1"));
+
         fs::remove_dir_all(&root).expect("cleanup temp root");
         assert!(!root.exists());
     }
