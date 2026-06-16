@@ -1264,6 +1264,149 @@ def path_has_payload(path: Path) -> bool:
     return any(child.is_file() for child in path.rglob("*"))
 
 
+def file_count(path: Path) -> int:
+    if path.is_file():
+        return 1
+    if not path.is_dir():
+        return 0
+    return sum(1 for child in path.rglob("*") if child.is_file())
+
+
+def write_science_resource_manifests(
+    source_catalog: Path,
+    source_sync_plan: Path,
+    science_store: Path,
+) -> dict[str, object]:
+    manifest_dir = science_store / "manifests"
+    manifest_dir.mkdir(parents=True, exist_ok=True)
+    source_file_manifest = manifest_dir / "source_file_manifest.tsv"
+    hash_manifest = manifest_dir / "hash_manifest.tsv"
+    license_manifest = manifest_dir / "license_manifest.tsv"
+    source_rows: list[dict[str, str]] = []
+    for row in read_tsv(source_catalog):
+        source_rows.append(
+            {
+                "source_id": row.get("source_id", ""),
+                "source_label": row.get("source_id", ""),
+                "source_class": "direct_download",
+                "release_or_date": row.get("release_or_date", ""),
+                "license_note": row.get("license_note", ""),
+                "local_path": row.get("local_path", ""),
+                "provenance": row.get("url", ""),
+            }
+        )
+    for row in read_tsv(source_sync_plan):
+        source_rows.append(
+            {
+                "source_id": row.get("source_id", ""),
+                "source_label": row.get("source_label", row.get("source_id", "")),
+                "source_class": row.get("source_class", "external_sync"),
+                "release_or_date": row.get("release_or_date", ""),
+                "license_note": row.get("license_note", ""),
+                "local_path": row.get("ready_marker") or row.get("target_rel_path", ""),
+                "provenance": row.get("source_url", ""),
+            }
+        )
+    total = 0
+    ready = 0
+    hash_ready = 0
+    license_ready = 0
+    with source_file_manifest.open("w", encoding="utf-8", newline="") as source_handle, hash_manifest.open(
+        "w", encoding="utf-8", newline=""
+    ) as hash_handle, license_manifest.open("w", encoding="utf-8", newline="") as license_handle:
+        source_writer = csv.DictWriter(
+            source_handle,
+            delimiter="\t",
+            fieldnames=[
+                "source_id",
+                "source_label",
+                "source_class",
+                "local_path",
+                "status",
+                "file_count",
+                "bytes",
+                "sha256",
+                "provenance",
+            ],
+        )
+        hash_writer = csv.DictWriter(
+            hash_handle,
+            delimiter="\t",
+            fieldnames=["source_id", "local_path", "status", "bytes", "sha256"],
+        )
+        license_writer = csv.DictWriter(
+            license_handle,
+            delimiter="\t",
+            fieldnames=[
+                "source_id",
+                "source_label",
+                "release_or_date",
+                "license_note",
+                "status",
+            ],
+        )
+        source_writer.writeheader()
+        hash_writer.writeheader()
+        license_writer.writeheader()
+        for row in source_rows:
+            source_id = row["source_id"] or "unknown_source"
+            local_rel = row["local_path"]
+            local_path = science_store / local_rel if local_rel else science_store / "__missing_local_path__"
+            exists = path_has_payload(local_path)
+            bytes_count = directory_size(local_path) if exists else 0
+            digest = directory_digest(local_path) if exists else ""
+            status = "ready" if exists else "missing"
+            license_status = "recorded" if row["license_note"] else "missing"
+            total += 1
+            if exists:
+                ready += 1
+            if digest:
+                hash_ready += 1
+            if license_status == "recorded":
+                license_ready += 1
+            common = {
+                "source_id": source_id,
+                "source_label": row["source_label"] or source_id,
+                "source_class": row["source_class"],
+                "local_path": local_rel,
+                "status": status,
+                "file_count": str(file_count(local_path) if exists else 0),
+                "bytes": str(bytes_count),
+                "sha256": digest,
+                "provenance": row["provenance"],
+            }
+            source_writer.writerow(common)
+            hash_writer.writerow(
+                {
+                    "source_id": source_id,
+                    "local_path": local_rel,
+                    "status": "ready" if digest else "missing",
+                    "bytes": str(bytes_count),
+                    "sha256": digest,
+                }
+            )
+            license_writer.writerow(
+                {
+                    "source_id": source_id,
+                    "source_label": row["source_label"] or source_id,
+                    "release_or_date": row["release_or_date"],
+                    "license_note": row["license_note"],
+                    "status": license_status,
+                }
+            )
+    status = "ready" if total > 0 and ready == total and hash_ready == total and license_ready == total else "needs_repair"
+    return {
+        "status": status,
+        "total": total,
+        "ready": ready,
+        "hash_ready": hash_ready,
+        "license_ready": license_ready,
+        "source_file_manifest": str(source_file_manifest),
+        "hash_manifest": str(hash_manifest),
+        "license_manifest": str(license_manifest),
+    }
+
+
 def download_summary(download_result: dict[str, object]) -> dict[str, object]:
     status = str(download_result.get("status", "unknown"))
     messages = {
@@ -1404,16 +1547,19 @@ def install_ready(payload: dict[str, object]) -> bool:
     external_sources = payload.get("external_sources")
     resources = payload.get("resources")
     tool_environment = payload.get("tool_environment")
+    source_manifests = payload.get("source_manifests")
     download_status = downloads.get("status") if isinstance(downloads, dict) else None
     external_status = external_sources.get("status") if isinstance(external_sources, dict) else None
     resource_status = resources.get("status") if isinstance(resources, dict) else None
     tool_status = tool_environment.get("status") if isinstance(tool_environment, dict) else None
+    source_manifest_status = source_manifests.get("status") if isinstance(source_manifests, dict) else None
     return (
         payload.get("status") == "ready"
         and resource_status == "ready"
         and external_status == "ready"
         and tool_status == "ready"
         and download_status == "ready"
+        and source_manifest_status == "ready"
     )
 
 
@@ -1423,12 +1569,14 @@ def installation_status(
     download_result: dict[str, object],
     external_sync_result: dict[str, object],
     tool_environment_result: dict[str, object],
+    source_manifest_result: dict[str, object],
 ) -> dict[str, object]:
     status_payload = load_json(science_store / "install_status.json")
     store_status = str(status_payload.get("status", "")).strip()
     download_status = str(download_result.get("status", "unknown"))
     external_status = str(external_sync_result.get("status", "unknown"))
     tool_status = str(tool_environment_result.get("status", "unknown"))
+    source_manifest_status = str(source_manifest_result.get("status", "unknown"))
     missing = status_payload.get("missing_components", [])
     missing_count = len(missing) if isinstance(missing, list) else 0
     if completed.returncode != 0:
@@ -1459,6 +1607,10 @@ def installation_status(
         status = "needs_repair"
         summary = "部分大型科学资源同步失败，科学仓库尚未准备完成。"
         next_action = "检查资源包、网络和磁盘空间后重新运行安装/修复"
+    elif source_manifest_status != "ready":
+        status = "needs_repair"
+        summary = "科学资源来源、完整性或许可证记录尚未闭合。"
+        next_action = "补齐资源文件、来源记录和许可证记录后重新运行安装/修复"
     elif store_status == "ready":
         status = "ready"
         summary = "科学仓库已就绪。"
@@ -1537,6 +1689,11 @@ def main() -> int:
         args.no_download,
         science_env,
     )
+    source_manifest_result = write_science_resource_manifests(
+        source_catalog,
+        source_sync_plan,
+        science_store,
+    )
     tool_environment_result = ensure_python_tool_environment(
         python_env_dir,
         args.no_tool_install,
@@ -1569,6 +1726,7 @@ def main() -> int:
         download_result,
         external_sync_result,
         tool_environment_result,
+        source_manifest_result,
     )
     payload: dict[str, object] = {
         **install_status,
@@ -1579,6 +1737,7 @@ def main() -> int:
             science_store,
             external_sync_result,
         ),
+        "source_manifests": source_manifest_result,
         "resources": resource_summary(science_store),
         "tool_environment": tool_environment_result,
         "runtime_backend": runtime_backend(),

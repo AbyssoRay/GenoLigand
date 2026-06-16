@@ -379,6 +379,7 @@ function renderCheck() {
         ${installCatalogSummary()}
         ${installerDownloadSummary()}
         ${installerExternalSourceSummary()}
+        ${installerSourceRecordSummary()}
         ${installerResourceSummary()}
         ${installerToolEnvironmentSummary()}
         ${missingResourceSummary()}
@@ -456,6 +457,20 @@ function installerExternalSourceSummary() {
           )
           .join("")}
       </ul>
+    </div>`;
+}
+
+function installerSourceRecordSummary() {
+  const records = state.setupRepair?.installer?.source_records;
+  if (!records || records.total === undefined) return "";
+  const ok = records.completed === true;
+  const next = records.next_action || (ok ? "继续" : "运行安装/修复");
+  return `
+    <div class="notice ${ok ? "" : "warn"}">
+      <strong>来源记录：${records.ready || 0} / ${records.total || 0} 就绪</strong>
+      <div class="compact-list">
+        完整性记录 ${records.integrity_ready || 0} / ${records.total || 0}，许可证记录 ${records.license_ready || 0} / ${records.total || 0}；下一步：${escapeHtml(next)}
+      </div>
     </div>`;
 }
 

@@ -1590,6 +1590,7 @@ fn setup_installer_summary(stdout: &str) -> Option<Value> {
         .unwrap_or_else(|| json!({}));
     let resources = setup_user_resources(payload.get("resources"));
     let external_sources = setup_user_external_sources(payload.get("external_sources"));
+    let source_records = setup_user_source_manifests(payload.get("source_manifests"));
     let tool_environment = setup_user_tool_environment(payload.get("tool_environment"));
     let download_status = downloads
         .get("status")
@@ -1606,9 +1607,55 @@ fn setup_installer_summary(stdout: &str) -> Option<Value> {
             "next_action": downloads.get("next_action").cloned().unwrap_or_else(|| json!("运行安装/修复"))
         },
         "external_sources": external_sources,
+        "source_records": source_records,
         "resources": resources,
         "tool_environment": tool_environment
     }))
+}
+
+fn setup_user_source_manifests(source_manifests: Option<&Value>) -> Value {
+    let Some(source_manifests) = source_manifests else {
+        return json!({});
+    };
+    let status = source_manifests
+        .get("status")
+        .and_then(Value::as_str)
+        .unwrap_or("needs_repair");
+    let total = source_manifests
+        .get("total")
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    let ready = source_manifests
+        .get("ready")
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    let integrity_ready = source_manifests
+        .get("hash_ready")
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    let license_ready = source_manifests
+        .get("license_ready")
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    let completed = status == "ready";
+    json!({
+        "completed": completed,
+        "ready": ready,
+        "total": total,
+        "integrity_ready": integrity_ready,
+        "license_ready": license_ready,
+        "needs_action": !completed,
+        "message": if completed {
+            "来源、完整性和许可证记录已就绪"
+        } else {
+            "来源、完整性或许可证记录需要补齐"
+        },
+        "next_action": if completed {
+            "继续"
+        } else {
+            "运行安装/修复"
+        }
+    })
 }
 
 fn setup_user_tool_environment(tool_environment: Option<&Value>) -> Value {
@@ -2645,6 +2692,30 @@ mod tests {
     }
 
     #[test]
+    fn setup_installer_source_records_hide_manifest_paths_and_hashes() {
+        let payload = setup_installer_summary(
+            r#"{"status":"needs_repair","source_manifests":{"status":"needs_repair","total":4,"ready":2,"hash_ready":2,"license_ready":3,"source_file_manifest":"D:/hidden/source_file_manifest.tsv","hash_manifest":"D:/hidden/hash_manifest.tsv","license_manifest":"D:/hidden/license_manifest.tsv","sha256":"abc123"}}"#,
+        )
+        .expect("installer json");
+
+        assert!(payload.get("source_manifests").is_none());
+        assert_eq!(payload["source_records"]["total"], 4);
+        assert_eq!(payload["source_records"]["ready"], 2);
+        assert_eq!(payload["source_records"]["integrity_ready"], 2);
+        assert_eq!(payload["source_records"]["license_ready"], 3);
+        assert_eq!(payload["source_records"]["completed"], false);
+        let text = payload.to_string();
+        assert!(!text.contains("source_manifests"));
+        assert!(!text.contains("source_file_manifest"));
+        assert!(!text.contains("hash_manifest"));
+        assert!(!text.contains("license_manifest"));
+        assert!(!text.contains("hash_ready"));
+        assert!(!text.contains("sha256"));
+        assert!(!text.contains("abc123"));
+        assert!(!text.contains("D:/hidden"));
+    }
+
+    #[test]
     fn setup_installer_tool_environment_summary_hides_internal_fields() {
         let payload = setup_installer_summary(
             r#"{"status":"needs_repair","tool_environment":{"status":"needs_repair","python":"D:/hidden/runtime/python-worker-env/Scripts/python.exe","manifest":"D:/hidden/runtime/python-worker-env/tool_environment_manifest.tsv","ready":4,"total":6,"environment":"created","notes":"pip install failed"}}"#,
@@ -2723,6 +2794,14 @@ mod tests {
             .iter()
             .position(|value| *value == "ready_marker")
             .expect("ready_marker");
+        let release = headers
+            .iter()
+            .position(|value| *value == "release_or_date")
+            .expect("release_or_date");
+        let license = headers
+            .iter()
+            .position(|value| *value == "license_note")
+            .expect("license_note");
         let allowed = ["html_links", "html_tree", "gcs_prefix", "rsync", "direct"];
         let mut rows = 0usize;
         for line in lines {
@@ -2736,6 +2815,8 @@ mod tests {
             assert!(!cols[source_url].trim().is_empty());
             assert!(!cols[target].trim().is_empty());
             assert!(!cols[ready].trim().is_empty());
+            assert!(!cols[release].trim().is_empty());
+            assert!(!cols[license].trim().is_empty());
             assert_ne!(
                 cols[method], "direct",
                 "external sources must not degrade to opaque landing pages"
