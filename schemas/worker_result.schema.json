@@ -1,0 +1,27 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://genoligand.local/schemas/worker_result.schema.json",
+  "title": "GenoLigand worker result",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "job_id",
+    "worker",
+    "status",
+    "engine_version",
+    "python_owns_final_score",
+    "python_owns_report_semantics",
+    "primitive_execution_only"
+  ],
+  "properties": {
+    "schema_version": { "const": "genoligand_worker_current_v1" },
+    "job_id": { "type": "string", "minLength": 1 },
+    "worker": { "type": "string", "minLength": 1 },
+    "status": { "enum": ["PASS", "FAIL"] },
+    "engine_version": { "type": "string", "minLength": 1 },
+    "python_owns_final_score": { "const": false },
+    "python_owns_report_semantics": { "const": false },
+    "primitive_execution_only": { "const": true }
+  }
+}

@@ -146,7 +146,13 @@ def default_python_env_dir(runtime_dir: Path) -> Path:
 def command_from_string(value: str) -> list[str]:
     import shlex
 
-    return shlex.split(value)
+    text = value.strip()
+    unquoted = text.strip('"')
+    if unquoted and Path(unquoted).exists():
+        return [unquoted]
+    if os.name == "nt":
+        return [part.strip('"') for part in shlex.split(text, posix=False)]
+    return shlex.split(text)
 
 
 def resolve_binary_command(
@@ -1608,15 +1614,15 @@ def main() -> int:
         print(
             json.dumps(
                 {
-                    "status": "webui_not_started",
-                    "summary": "安装尚未闭合，WebUI 未启动。",
-                    "next_action": payload.get("next_action", "重新运行安装/修复"),
+                    "status": "starting_webui_setup_required",
+                    "summary": "安装尚未闭合，WebUI 将以修复状态启动。运行流程会保持阻塞，直到数据库、索引和工具准备完成。",
+                    "next_action": payload.get("next_action", "在 WebUI 中运行安装/修复"),
+                    "access_url": f"http://{args.host}:{args.port}/",
                 },
                 ensure_ascii=False,
                 indent=2,
             )
         )
-        return exit_code
 
     runtime_dir.mkdir(parents=True, exist_ok=True)
     server_command = resolve_binary_command(

@@ -1309,6 +1309,9 @@ fn evidence_type_label(claim: &str, artifact: &str) -> &'static str {
         "structure_patch_summary.tsv" | "structure_patch_summary" => {
             "\u{7ed3}\u{6784}\u{4e0e}\u{53e3}\u{888b}"
         }
+        "worker_runtime_summary.tsv" | "worker_runtime_summary" => {
+            "\u{5de5}\u{5177}\u{9002}\u{914d}\u{5668}\u{68c0}\u{67e5}"
+        }
         "docking_summary.tsv" | "docking_summary" => "\u{5bf9}\u{63a5}\u{6458}\u{8981}",
         "md_summary.tsv" | "md_summary" => "\u{52a8}\u{529b}\u{5b66}\u{6458}\u{8981}",
         "target_candidate_ranking.tsv" | "target_candidate_ranking" => {
@@ -1328,6 +1331,9 @@ fn evidence_source_label(artifact: &str) -> &'static str {
         }
         "metagenome_potential_matches.tsv" => {
             "\u{5b8f}\u{57fa}\u{56e0}\u{7ec4}\u{6f5c}\u{5728}\u{5e8f}\u{5217}\u{7d22}\u{5f15}"
+        }
+        "worker_runtime_summary.tsv" => {
+            "\u{5f53}\u{524d}\u{8fd0}\u{884c}\u{7684}\u{5de5}\u{5177}\u{9002}\u{914d}\u{5668}"
         }
         "structure_patch_summary.tsv" | "docking_summary.tsv" | "md_summary.tsv" => {
             "\u{5f53}\u{524d}\u{8fd0}\u{884c}\u{7684}\u{5de5}\u{5177}\u{8f93}\u{51fa}"

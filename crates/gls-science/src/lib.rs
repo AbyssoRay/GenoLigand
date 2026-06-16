@@ -7,6 +7,9 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use zip::ZipArchive;
 
+const WORKER_SCHEMA_VERSION: &str = "genoligand_worker_current_v1";
+const WORKER_PIPELINE_MODE: &str = "genoligand_scientific_pipeline";
+
 #[derive(Clone, Debug)]
 pub struct ScienceOptions {
     pub workspace_root: PathBuf,
@@ -84,6 +87,41 @@ struct NormalizedInput {
     file_count: usize,
     tokens: BTreeSet<String>,
 }
+
+#[derive(Clone, Copy, Debug)]
+struct WorkerTask {
+    job_id: &'static str,
+    worker: &'static str,
+    module: &'static str,
+    stage: &'static str,
+}
+
+const WORKER_TASKS: &[WorkerTask] = &[
+    WorkerTask {
+        job_id: "openff_rdkit_smoke",
+        worker: "openff_rdkit",
+        module: "genoligand_workers.openff_worker",
+        stage: "chemical_primitive",
+    },
+    WorkerTask {
+        job_id: "pdbfixer_smoke",
+        worker: "pdbfixer",
+        module: "genoligand_workers.pdbfixer_worker",
+        stage: "structure_preparation_primitive",
+    },
+    WorkerTask {
+        job_id: "openmm_smoke",
+        worker: "openmm",
+        module: "genoligand_workers.openmm_worker",
+        stage: "dynamics_primitive",
+    },
+    WorkerTask {
+        job_id: "trajectory_features_smoke",
+        worker: "trajectory_features",
+        module: "genoligand_workers.trajectory_worker",
+        stage: "trajectory_feature_primitive",
+    },
+];
 
 #[derive(Clone, Debug)]
 struct ComputedFeatureInput {
@@ -1804,6 +1842,7 @@ fn run_pipeline(options: &ScienceOptions) -> Result<String, String> {
     match_known(options)?;
     match_metagenome(options)?;
     rank_targets(options)?;
+    run_schema_bound_workers(options)?;
     evaluate_structure(options)?;
     screen_dynamics(options)?;
     rank_targets(options)?;
@@ -2158,6 +2197,212 @@ fn write_empty_structure_interaction_matches(options: &ScienceOptions) -> Result
     )
 }
 
+fn run_schema_bound_workers(options: &ScienceOptions) -> Result<String, String> {
+    let job_dir = options.run_dir.join("worker_jobs");
+    let result_dir = options.run_dir.join("worker_results");
+    ensure_dir(&job_dir)?;
+    ensure_dir(&result_dir)?;
+    let mut summary = String::from(
+        "job_id\tworker\tstage\tjob_schema_valid\tlaunch_status\tresult_schema_valid\tresult_status\tengine_version\tprimitive_execution_only\tpython_owns_final_score\tpython_owns_report_semantics\n",
+    );
+    for task in WORKER_TASKS {
+        let job_path = job_dir.join(format!("{}.json", task.job_id));
+        let result_path = result_dir.join(format!("{}.json", task.job_id));
+        let job = worker_job_value(options, task);
+        write_text(&job_path, &(job.to_string() + "\n"))?;
+        let job_schema_valid = validate_worker_job(&job, task);
+        let launch_status = match run_worker_task(options, task, &job_path, &result_path) {
+            Ok(()) => "ok".to_string(),
+            Err(err) => {
+                if !result_path.exists() {
+                    write_worker_failure_result(&result_path, task, &err)?;
+                }
+                format!("failed:{}", clean_cell(&err))
+            }
+        };
+        if !result_path.exists() {
+            write_worker_failure_result(&result_path, task, "worker_result_missing")?;
+        }
+        let result = read_worker_result_or_failure(&result_path, task)?;
+        let result_schema_valid = validate_worker_result(&result, task);
+        let result_status = result
+            .get("status")
+            .and_then(Value::as_str)
+            .unwrap_or("FAIL");
+        let engine_version = result
+            .get("engine_version")
+            .and_then(Value::as_str)
+            .unwrap_or("missing");
+        let primitive_execution_only = result
+            .get("primitive_execution_only")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        let python_owns_final_score = result
+            .get("python_owns_final_score")
+            .and_then(Value::as_bool)
+            .unwrap_or(true);
+        let python_owns_report_semantics = result
+            .get("python_owns_report_semantics")
+            .and_then(Value::as_bool)
+            .unwrap_or(true);
+        summary.push_str(&format!(
+            "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\n",
+            task.job_id,
+            task.worker,
+            task.stage,
+            job_schema_valid,
+            clean_cell(&launch_status),
+            result_schema_valid,
+            clean_cell(result_status),
+            clean_cell(engine_version),
+            primitive_execution_only,
+            python_owns_final_score,
+            python_owns_report_semantics
+        ));
+    }
+    write_text(
+        &options.run_dir.join("worker_runtime_summary.tsv"),
+        &summary,
+    )?;
+    Ok(format!(
+        "schema_bound_workers_checked\tworker_count={}",
+        WORKER_TASKS.len()
+    ))
+}
+
+fn worker_job_value(options: &ScienceOptions, task: &WorkerTask) -> Value {
+    json!({
+        "schema_version": WORKER_SCHEMA_VERSION,
+        "pipeline_mode": WORKER_PIPELINE_MODE,
+        "job_id": task.job_id,
+        "worker": task.worker,
+        "stage": task.stage,
+        "rust_owned_decision_logic": true,
+        "decision_owner": "GenoLigand Rust core",
+        "input_manifest": options.input_manifest.display().to_string(),
+        "run_dir": options.run_dir.display().to_string(),
+        "science_store": options.science_store.display().to_string(),
+        "expected_result_schema": WORKER_SCHEMA_VERSION
+    })
+}
+
+fn validate_worker_job(value: &Value, task: &WorkerTask) -> bool {
+    value.get("schema_version").and_then(Value::as_str) == Some(WORKER_SCHEMA_VERSION)
+        && value.get("pipeline_mode").and_then(Value::as_str) == Some(WORKER_PIPELINE_MODE)
+        && value.get("job_id").and_then(Value::as_str) == Some(task.job_id)
+        && value.get("worker").and_then(Value::as_str) == Some(task.worker)
+        && value.get("stage").and_then(Value::as_str) == Some(task.stage)
+        && value
+            .get("rust_owned_decision_logic")
+            .and_then(Value::as_bool)
+            == Some(true)
+        && value.get("expected_result_schema").and_then(Value::as_str)
+            == Some(WORKER_SCHEMA_VERSION)
+}
+
+fn run_worker_task(
+    options: &ScienceOptions,
+    task: &WorkerTask,
+    job_path: &Path,
+    result_path: &Path,
+) -> Result<(), String> {
+    let python_root = options.workspace_root.join("python");
+    let mut errors = Vec::new();
+    for candidate in python_command_candidates() {
+        let mut command = Command::new(&candidate[0]);
+        command.args(&candidate[1..]);
+        command
+            .arg("-m")
+            .arg(task.module)
+            .arg("--job")
+            .arg(job_path)
+            .arg("--out")
+            .arg(result_path);
+        if python_root.exists() {
+            let mut paths = vec![python_root.clone()];
+            if let Some(existing) = std::env::var_os("PYTHONPATH") {
+                paths.extend(std::env::split_paths(&existing));
+            }
+            if let Ok(joined) = std::env::join_paths(paths) {
+                command.env("PYTHONPATH", joined);
+            }
+        }
+        match command.output() {
+            Ok(output) if output.status.success() => return Ok(()),
+            Ok(output) => {
+                let stderr = String::from_utf8_lossy(&output.stderr);
+                let stdout = String::from_utf8_lossy(&output.stdout);
+                let detail = stderr
+                    .lines()
+                    .find(|line| !line.trim().is_empty())
+                    .or_else(|| stdout.lines().find(|line| !line.trim().is_empty()))
+                    .unwrap_or("worker_exit_nonzero");
+                errors.push(format!("{}:{detail}", candidate.join(" ")));
+            }
+            Err(err) => errors.push(format!("{}:{err}", candidate.join(" "))),
+        }
+    }
+    Err(format!(
+        "{}_launch_failed:{}",
+        task.worker,
+        clean_cell(&errors.join(" | "))
+    ))
+}
+
+fn read_worker_result_or_failure(path: &Path, task: &WorkerTask) -> Result<Value, String> {
+    match read_text(path)
+        .ok()
+        .and_then(|text| serde_json::from_str::<Value>(text.trim_start_matches('\u{feff}')).ok())
+    {
+        Some(value) => Ok(value),
+        None => {
+            write_worker_failure_result(path, task, "worker_result_parse_failed")?;
+            serde_json::from_str::<Value>(&read_text(path)?)
+                .map_err(|err| format!("worker_result_reparse_failed:{}:{err}", path.display()))
+        }
+    }
+}
+
+fn write_worker_failure_result(path: &Path, task: &WorkerTask, reason: &str) -> Result<(), String> {
+    let value = json!({
+        "schema_version": WORKER_SCHEMA_VERSION,
+        "job_id": task.job_id,
+        "worker": task.worker,
+        "status": "FAIL",
+        "engine_version": format!("worker unavailable: {}", clean_cell(reason)),
+        "python_owns_final_score": false,
+        "python_owns_report_semantics": false,
+        "primitive_execution_only": true
+    });
+    write_text(path, &(value.to_string() + "\n"))
+}
+
+fn validate_worker_result(value: &Value, task: &WorkerTask) -> bool {
+    value.get("schema_version").and_then(Value::as_str) == Some(WORKER_SCHEMA_VERSION)
+        && value.get("job_id").and_then(Value::as_str) == Some(task.job_id)
+        && value.get("worker").and_then(Value::as_str) == Some(task.worker)
+        && matches!(
+            value.get("status").and_then(Value::as_str),
+            Some("PASS") | Some("FAIL")
+        )
+        && value
+            .get("engine_version")
+            .and_then(Value::as_str)
+            .is_some()
+        && value
+            .get("python_owns_final_score")
+            .and_then(Value::as_bool)
+            == Some(false)
+        && value
+            .get("python_owns_report_semantics")
+            .and_then(Value::as_bool)
+            == Some(false)
+        && value
+            .get("primitive_execution_only")
+            .and_then(Value::as_bool)
+            == Some(true)
+}
+
 fn match_structure_interactions(options: &ScienceOptions) -> Result<Vec<IndexMatch>, String> {
     let inputs = read_computed_feature_inputs(&options.run_dir.join("feature_manifest.tsv"))?;
     let rows = read_store_rows(
@@ -2347,6 +2592,7 @@ fn build_evidence(options: &ScienceOptions) -> Result<String, String> {
         "known_database_matches.tsv",
         "metagenome_potential_matches.tsv",
         "structure_interaction_matches.tsv",
+        "worker_runtime_summary.tsv",
         "structure_patch_summary.tsv",
         "docking_summary.tsv",
         "md_summary.tsv",
@@ -2425,6 +2671,22 @@ fn artifact_evidence_status(file: &str, path: &Path) -> Result<ArtifactEvidenceS
                     "no_match",
                     "no structure interaction match rows".to_string(),
                 )
+            }
+        }
+        "worker_runtime_summary.tsv" => {
+            if rows > 0 {
+                let text = read_text(path)?;
+                let pass_count = text
+                    .lines()
+                    .skip(1)
+                    .filter(|line| line.contains("\tPASS\t"))
+                    .count();
+                (
+                    "available",
+                    format!("{rows} worker checks recorded; {pass_count} passed"),
+                )
+            } else {
+                ("not_generated", "no worker runtime rows".to_string())
             }
         }
         "structure_patch_summary.tsv" => {
@@ -2764,6 +3026,11 @@ fn write_artifact_source_map(options: &ScienceOptions) -> Result<(), String> {
             "structure_interaction_matches.tsv",
             "indexes/structure_targets.tsv;feature_manifest.tsv",
             "target_candidate_ranking.tsv;structure_patch_summary.tsv",
+        ),
+        (
+            "worker_runtime_summary.tsv",
+            "Rust-generated worker job specs;schema-bound primitive worker results",
+            "evidence_ledger.tsv",
         ),
         (
             "structure_patch_summary.tsv",
@@ -4169,11 +4436,14 @@ mod tests {
         assert!(source_map.contains("structure_interaction_matches.tsv"));
         assert!(source_map.contains("schema-bound structure output when present"));
         assert!(source_map.contains("schema-bound dynamics output when present"));
+        assert!(source_map.contains("worker_runtime_summary.tsv"));
+        assert!(source_map.contains("Rust-generated worker job specs"));
         assert!(source_map.contains("docking_summary.tsv\t"));
         assert!(source_map.contains("md_summary.tsv\t"));
         assert!(source_map.contains("docking_summary.tsv\tschema-bound docking output when present;otherwise no generated rows\tevidence_ledger.tsv\tno_rows"));
         assert!(source_map.contains("md_summary.tsv\tschema-bound dynamics output when present;otherwise no generated rows\tevidence_ledger.tsv\tno_rows"));
         assert!(evidence.contains("structure_interaction_matches"));
+        assert!(evidence.contains("worker_runtime_summary"));
         assert!(evidence.contains("score_decomposition"));
         assert!(
             evidence.contains("docking_summary.tsv\tGenoLigand\tnot_generated\tno docking rows")
@@ -4202,6 +4472,56 @@ mod tests {
         assert!(!structure.contains("patch_P24941"));
         assert!(!docking.contains("completed"));
         assert!(!md.contains("computed_from_database_evidence_only"));
+        fs::remove_dir_all(&root).expect("cleanup temp root");
+        assert!(!root.exists());
+    }
+
+    #[test]
+    fn pipeline_records_schema_bound_workers_without_delegating_scores() {
+        let root = temp_root("schema_workers");
+        let store = create_temporary_test_store(&root).expect("store");
+        let input = root.join("input.json");
+        let run = root.join("run");
+        write_text(
+            &input,
+            "{\"inputs\":[{\"field\":\"small_molecule\",\"value\":\"CCO kinase\"}],\"files\":[]}\n",
+        )
+        .expect("write input");
+        let options = ScienceOptions {
+            workspace_root: root.clone(),
+            science_store: store,
+            input_manifest: input,
+            run_dir: run.clone(),
+        };
+
+        run_science_command(ScienceCommand::PipelineRun, &options).expect("pipeline");
+        let summary = read_text(&run.join("worker_runtime_summary.tsv")).expect("worker summary");
+        let rows = summary.lines().skip(1).collect::<Vec<_>>();
+        assert_eq!(rows.len(), WORKER_TASKS.len());
+        for row in rows {
+            assert!(
+                row.contains("\ttrue\t"),
+                "worker job/result schema was not recorded as valid: {row}"
+            );
+            assert!(
+                row.ends_with("\ttrue\tfalse\tfalse"),
+                "worker escaped primitive-only boundary: {row}"
+            );
+        }
+        let job = read_text(&run.join("worker_jobs/openmm_smoke.json")).expect("worker job");
+        let result =
+            read_text(&run.join("worker_results/openmm_smoke.json")).expect("worker result");
+        let score = read_text(&run.join("score_decomposition.tsv")).expect("score");
+        let source_map = read_text(&run.join("artifact_source_map.tsv")).expect("source map");
+
+        assert!(job.contains("\"rust_owned_decision_logic\":true"));
+        assert!(result.contains("\"python_owns_final_score\":false"));
+        assert!(result.contains("\"python_owns_report_semantics\":false"));
+        assert!(result.contains("\"primitive_execution_only\":true"));
+        assert!(source_map.contains("worker_runtime_summary.tsv"));
+        assert!(score.contains("\tGenoLigand\n"));
+        assert!(!score.contains("Python"));
+
         fs::remove_dir_all(&root).expect("cleanup temp root");
         assert!(!root.exists());
     }

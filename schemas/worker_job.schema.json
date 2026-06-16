@@ -1,0 +1,33 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://genoligand.local/schemas/worker_job.schema.json",
+  "title": "GenoLigand worker job",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "pipeline_mode",
+    "job_id",
+    "worker",
+    "stage",
+    "rust_owned_decision_logic",
+    "decision_owner",
+    "input_manifest",
+    "run_dir",
+    "science_store",
+    "expected_result_schema"
+  ],
+  "properties": {
+    "schema_version": { "const": "genoligand_worker_current_v1" },
+    "pipeline_mode": { "const": "genoligand_scientific_pipeline" },
+    "job_id": { "type": "string", "minLength": 1 },
+    "worker": { "type": "string", "minLength": 1 },
+    "stage": { "type": "string", "minLength": 1 },
+    "rust_owned_decision_logic": { "const": true },
+    "decision_owner": { "const": "GenoLigand Rust core" },
+    "input_manifest": { "type": "string", "minLength": 1 },
+    "run_dir": { "type": "string", "minLength": 1 },
+    "science_store": { "type": "string", "minLength": 1 },
+    "expected_result_schema": { "const": "genoligand_worker_current_v1" }
+  }
+}
