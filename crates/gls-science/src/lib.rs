@@ -3533,6 +3533,31 @@ mod tests {
     }
 
     #[test]
+    fn prepare_science_store_builds_metagenome_index_from_nested_mgnify_fasta() {
+        let root = temp_root("build_mgnify_index");
+        let store = root.join("science_store");
+        write_gzip(
+            &store.join("downloads/metagenome/mgnify/mgy_clusters.fa.gz"),
+            ">MGYP000001 environmental protein OS=metagenome\nMSEQNNTEMTFQIQRIYTKDISFEAPNAPHVFQKDW\n",
+        )
+        .expect("write mgnify fasta");
+        let options = StoreOptions {
+            workspace_root: root.clone(),
+            science_store: store.clone(),
+        };
+        let _ = run_store_command(ScienceCommand::PrepareScienceStore, &options)
+            .expect("prepare store");
+        let metagenome =
+            read_text(&store.join("indexes/metagenome_targets.tsv")).expect("metagenome index");
+        let build_manifest =
+            read_text(&store.join("index_build_manifest.tsv")).expect("build manifest");
+        assert!(metagenome.contains("MGYP000001"));
+        assert!(build_manifest.contains("mgy_clusters.fa.gz"));
+        fs::remove_dir_all(&root).expect("cleanup temp root");
+        assert!(!root.exists());
+    }
+
+    #[test]
     fn prepare_science_store_builds_known_index_from_gzipped_target_table() {
         let root = temp_root("build_gzip_table");
         let store = root.join("science_store");

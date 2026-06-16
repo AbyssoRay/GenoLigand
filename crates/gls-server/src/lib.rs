@@ -2661,6 +2661,53 @@ mod tests {
     }
 
     #[test]
+    fn source_sync_plan_uses_executable_sync_methods() {
+        let plan = include_str!("../../../configs/source_sync_plan.tsv");
+        let mut lines = plan.lines();
+        let header = lines.next().expect("source sync header");
+        let headers = header.split('\t').collect::<Vec<_>>();
+        let source_id = headers
+            .iter()
+            .position(|value| *value == "source_id")
+            .expect("source_id");
+        let method = headers
+            .iter()
+            .position(|value| *value == "sync_method")
+            .expect("sync_method");
+        let source_url = headers
+            .iter()
+            .position(|value| *value == "source_url")
+            .expect("source_url");
+        let target = headers
+            .iter()
+            .position(|value| *value == "target_rel_path")
+            .expect("target_rel_path");
+        let ready = headers
+            .iter()
+            .position(|value| *value == "ready_marker")
+            .expect("ready_marker");
+        let allowed = ["html_links", "html_tree", "gcs_prefix", "rsync", "direct"];
+        let mut rows = 0usize;
+        for line in lines {
+            if line.trim().is_empty() {
+                continue;
+            }
+            let cols = line.split('\t').collect::<Vec<_>>();
+            rows += 1;
+            assert!(!cols[source_id].trim().is_empty());
+            assert!(allowed.contains(&cols[method]));
+            assert!(!cols[source_url].trim().is_empty());
+            assert!(!cols[target].trim().is_empty());
+            assert!(!cols[ready].trim().is_empty());
+            assert_ne!(
+                cols[method], "direct",
+                "external sources must not degrade to opaque landing pages"
+            );
+        }
+        assert_eq!(rows, 4);
+    }
+
+    #[test]
     fn first_launch_user_workspace_has_no_seeded_projects_or_templates() {
         let root = std::env::temp_dir().join(format!("genoligand-first-launch-{}", now_millis()));
         let options = server_options(root.clone());
