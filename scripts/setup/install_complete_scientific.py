@@ -1249,7 +1249,93 @@ def sync_rsync(row: dict[str, str], target: Path, env: dict[str, str] | None) ->
     }
 
 
-def sync_external_row(row: dict[str, str], target: Path, env: dict[str, str] | None) -> dict[str, object]:
+def sync_rcsb_ligand_bound_scope(row: dict[str, str], target: Path, science_store: Path) -> dict[str, object]:
+    pdb_ids = ligand_bound_pdb_scope(science_store)
+    if not pdb_ids:
+        return {
+            "status": "requires_resource_bundle",
+            "bytes": 0,
+            "sha256": "",
+            "notes": "ligand_bound_pdb_scope_missing",
+        }
+    target.mkdir(parents=True, exist_ok=True)
+    template = row.get("source_url") or "https://files.rcsb.org/download/{pdb_id}.cif.gz"
+    downloaded = 0
+    failures: list[str] = []
+    for pdb_id in sorted(pdb_ids):
+        upper = pdb_id.upper()
+        destination = target / upper[1:3].lower() / f"{upper.lower()}.cif.gz"
+        if path_has_payload(destination):
+            downloaded += 1
+            continue
+        url = template.replace("{pdb_id}", upper).replace("{pdb_id_lower}", upper.lower())
+        try:
+            copy_or_download(url, destination, None)
+            downloaded += 1
+        except Exception as err:  # noqa: BLE001 - keep per-entry provenance in install manifest
+            failures.append(f"{upper}:{err}")
+    scope_manifest = target.parent / "ligand_bound_pdb_scope.tsv"
+    scope_manifest.parent.mkdir(parents=True, exist_ok=True)
+    with scope_manifest.open("w", encoding="utf-8", newline="") as handle:
+        writer = csv.DictWriter(handle, delimiter="\t", fieldnames=["pdb_id", "status"])
+        writer.writeheader()
+        for pdb_id in sorted(pdb_ids):
+            upper = pdb_id.upper()
+            destination = target / upper[1:3].lower() / f"{upper.lower()}.cif.gz"
+            writer.writerow({"pdb_id": upper, "status": "ready" if path_has_payload(destination) else "missing"})
+    if failures:
+        return {
+            "status": "failed",
+            "bytes": directory_size(target),
+            "sha256": directory_digest(target),
+            "notes": "|".join(failures)[:1000],
+        }
+    return {
+        "status": "ready" if downloaded and path_has_payload(target) else "failed",
+        "bytes": directory_size(target),
+        "sha256": directory_digest(target),
+        "notes": f"rcsb_ligand_bound_entries_synced:{downloaded}",
+    }
+
+
+def ligand_bound_pdb_scope(science_store: Path) -> set[str]:
+    pdb_ids: set[str] = set()
+    explicit = science_store / "downloads/rcsb/ligand_bound_pdb_ids.txt"
+    if explicit.exists():
+        pdb_ids.update(extract_pdb_ids(explicit.read_text(encoding="utf-8", errors="replace")))
+    for path in [
+        science_store / "downloads/binding_moad/bindingmoad.csv",
+        science_store / "downloads/binding_moad/BindingMOAD_data_for_PDB_1_31_2022.csv",
+        science_store / "downloads/biolip2/BioLiP.txt",
+        science_store / "downloads/biolip2/BioLiP.txt.gz",
+    ]:
+        if path.exists():
+            try:
+                pdb_ids.update(extract_pdb_ids(read_text_or_gzip(path)))
+            except OSError:
+                continue
+    return {pdb_id for pdb_id in pdb_ids if len(pdb_id) == 4}
+
+
+def read_text_or_gzip(path: Path) -> str:
+    if path.suffix == ".gz":
+        import gzip
+
+        with gzip.open(path, "rt", encoding="utf-8", errors="replace") as handle:
+            return handle.read()
+    return path.read_text(encoding="utf-8", errors="replace")
+
+
+def extract_pdb_ids(text: str) -> set[str]:
+    return {match.group(0).upper() for match in re.finditer(r"\b[0-9][A-Za-z0-9]{3}\b", text)}
+
+
+def sync_external_row(
+    row: dict[str, str],
+    target: Path,
+    science_store: Path,
+    env: dict[str, str] | None,
+) -> dict[str, object]:
     method = (row.get("sync_method") or "direct").strip().lower()
     if method == "html_links":
         return sync_html_links(row, target)
@@ -1257,6 +1343,8 @@ def sync_external_row(row: dict[str, str], target: Path, env: dict[str, str] | N
         return sync_html_tree(row, target)
     if method == "gcs_prefix":
         return sync_gcs_prefix(row, target)
+    if method == "rcsb_ligand_bound_scope":
+        return sync_rcsb_ligand_bound_scope(row, target, science_store)
     if method == "rsync":
         return sync_rsync(row, target, env)
     location = direct_source_location(row)
@@ -1419,7 +1507,7 @@ def sync_external_sources(
                 )
                 continue
             try:
-                result = sync_external_row(row, target, env)
+                result = sync_external_row(row, target, science_store, env)
                 if result["status"] == "ready":
                     ready += 1
                 elif result["status"] == "requires_resource_bundle":

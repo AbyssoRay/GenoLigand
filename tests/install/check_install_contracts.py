@@ -28,6 +28,10 @@ def main() -> int:
     require((ROOT / "python/requirements-workers-cpu.txt").is_file(), "CPU worker requirements missing")
     require((ROOT / "python/requirements-workers-cuda.txt").is_file(), "CUDA worker requirements missing")
     require((ROOT / "python/environment-workers.yml").is_file(), "worker conda environment missing")
+    sync_plan = read("configs/source_sync_plan.tsv")
+    require("rcsb_ligand_bound_scope" in sync_plan, "RCSB install must use ligand-bound scoped downloads")
+    require("pub/pdb/data/structures/divided/mmCIF" not in sync_plan, "RCSB install must not mirror the full mmCIF tree")
+    require("gs://plinder/2024-06/v2/index/" in sync_plan, "PLINDER public storage source missing")
 
     print("install_contracts\tPASS")
     return 0

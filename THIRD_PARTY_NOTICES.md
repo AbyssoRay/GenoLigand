@@ -16,6 +16,5 @@ GenoLigand integrates open-source scientific engines through GenoLigand-owned ad
 | DIAMOND | Sequence search engine | GPL-compatible upstream license terms | https://github.com/bbuchfink/diamond |
 | MMseqs2 | Sequence search engine | GPL-compatible upstream license terms | https://github.com/soedinglab/MMseqs2 |
 | Foldseek | Structure search engine | GPL-compatible upstream license terms | https://github.com/steineggerlab/foldseek |
-| Mol* / NGL | Molecular visualization option | Upstream web viewer license notices | https://molstar.org/ / https://nglviewer.org/ |
 
 Packaged releases must include exact license texts for the versions installed by the science-store installer. This file is the repository-level dependency notice map; installed-version manifests belong in the user science store.

@@ -8,7 +8,7 @@ use std::process::Command;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 pub const PRODUCT_NAME: &str = "GenoLigand Local WebUI";
-pub const PRODUCT_VERSION: &str = "0.9.4";
+pub const PRODUCT_VERSION: &str = "0.9.5";
 
 const REQUIRED_TOOL_IDS: &[&str] = &[
     "java",
@@ -168,6 +168,7 @@ fn web_asset_response(path: &str, _options: &ServerOptions) -> Option<(u16, &'st
         "core/actions.js" => include_str!("../../../webui/app/core/actions.js"),
         "core/selectors.js" => include_str!("../../../webui/app/core/selectors.js"),
         "components/common.js" => include_str!("../../../webui/app/components/common.js"),
+        "components/viewers.js" => include_str!("../../../webui/app/components/viewers.js"),
         "styles/tokens.css" => include_str!("../../../webui/app/styles/tokens.css"),
         "styles/base.css" => include_str!("../../../webui/app/styles/base.css"),
         "styles/layout.css" => include_str!("../../../webui/app/styles/layout.css"),
@@ -960,27 +961,31 @@ fn candidate_detail_json(options: &ServerOptions, run_id: &str) -> Value {
 
 fn structure_endpoint_json(options: &ServerOptions, run_id: &str) -> Value {
     let Some(run_dir) = completed_run_dir(options, run_id) else {
-        return json!({"run_id":run_id,"structure_rows":[],"row_count":0,"has_output":false});
+        return json!({"run_id":run_id,"structure_rows":[],"row_count":0,"has_output":false,"viewer":structure_viewer_unavailable()});
     };
     let rows = user_structure_rows(&run_dir);
+    let viewer = structure_viewer_payload(&run_dir);
     json!({
         "run_id": run_id,
         "structure_rows": rows,
         "row_count": rows.len(),
-        "has_output": !rows.is_empty()
+        "has_output": !rows.is_empty(),
+        "viewer": viewer
     })
 }
 
 fn md_endpoint_json(options: &ServerOptions, run_id: &str) -> Value {
     let Some(run_dir) = completed_run_dir(options, run_id) else {
-        return json!({"run_id":run_id,"md_rows":[],"row_count":0,"has_output":false});
+        return json!({"run_id":run_id,"md_rows":[],"row_count":0,"has_output":false,"charts":[]});
     };
     let rows = user_md_rows(&run_dir);
+    let charts = md_chart_rows(&run_dir, &rows);
     json!({
         "run_id": run_id,
         "md_rows": rows,
         "row_count": rows.len(),
-        "has_output": !rows.is_empty()
+        "has_output": !rows.is_empty(),
+        "charts": charts
     })
 }
 
@@ -1034,6 +1039,230 @@ fn user_md_rows(run_dir: &Path) -> Vec<Value> {
         .into_iter()
         .map(|row| user_md_row(&row, &targets))
         .collect()
+}
+
+fn structure_viewer_unavailable() -> Value {
+    json!({
+        "ready": false,
+        "source": "等待当前运行结构坐标输出",
+        "artifact": "",
+        "atom_count": 0,
+        "atoms": []
+    })
+}
+
+fn structure_viewer_payload(run_dir: &Path) -> Value {
+    for rel in [
+        "structure_viewer.json",
+        "viewer_structure.json",
+        "tool_outputs/structure_viewer.json",
+    ] {
+        let path = run_dir.join(rel);
+        if let Some(value) = read_viewer_json(&path, rel) {
+            return value;
+        }
+    }
+    for rel in [
+        "structure_viewer.pdb",
+        "complex.pdb",
+        "docking_pose.pdb",
+        "pose.pdb",
+        "structure.pdb",
+        "tool_outputs/structure_viewer.pdb",
+    ] {
+        let path = run_dir.join(rel);
+        if let Some(value) = read_coordinate_text(&path, rel, CoordinateFormat::Pdb) {
+            return value;
+        }
+    }
+    for rel in [
+        "structure_viewer.cif",
+        "structure_viewer.mmcif",
+        "complex.cif",
+        "complex.mmcif",
+        "tool_outputs/structure_viewer.cif",
+        "tool_outputs/structure_viewer.mmcif",
+    ] {
+        let path = run_dir.join(rel);
+        if let Some(value) = read_coordinate_text(&path, rel, CoordinateFormat::Mmcif) {
+            return value;
+        }
+    }
+    structure_viewer_unavailable()
+}
+
+fn read_viewer_json(path: &Path, artifact: &str) -> Option<Value> {
+    let text = fs::read_to_string(path).ok()?;
+    let value = serde_json::from_str::<Value>(&text).ok()?;
+    let atoms = value
+        .get("atoms")
+        .and_then(Value::as_array)?
+        .iter()
+        .filter_map(sanitize_atom_json)
+        .take(5000)
+        .collect::<Vec<_>>();
+    if atoms.is_empty() {
+        return None;
+    }
+    Some(json!({
+        "ready": true,
+        "source": "当前运行结构坐标输出",
+        "artifact": artifact,
+        "atom_count": atoms.len(),
+        "atoms": atoms
+    }))
+}
+
+fn sanitize_atom_json(value: &Value) -> Option<Value> {
+    let x = value.get("x").and_then(Value::as_f64)?;
+    let y = value.get("y").and_then(Value::as_f64)?;
+    let z = value.get("z").and_then(Value::as_f64)?;
+    Some(json!({
+        "element": clean_element(value.get("element").and_then(Value::as_str).unwrap_or("C")),
+        "x": x,
+        "y": y,
+        "z": z
+    }))
+}
+
+#[derive(Clone, Copy)]
+enum CoordinateFormat {
+    Pdb,
+    Mmcif,
+}
+
+fn read_coordinate_text(path: &Path, artifact: &str, format: CoordinateFormat) -> Option<Value> {
+    let text = fs::read_to_string(path).ok()?;
+    let atoms = match format {
+        CoordinateFormat::Pdb => parse_pdb_atoms(&text),
+        CoordinateFormat::Mmcif => parse_mmcif_atoms(&text),
+    };
+    if atoms.is_empty() {
+        return None;
+    }
+    Some(json!({
+        "ready": true,
+        "source": "当前运行结构坐标输出",
+        "artifact": artifact,
+        "atom_count": atoms.len(),
+        "atoms": atoms
+    }))
+}
+
+fn parse_pdb_atoms(text: &str) -> Vec<Value> {
+    text.lines()
+        .filter(|line| line.starts_with("ATOM") || line.starts_with("HETATM"))
+        .filter_map(|line| {
+            let x = fixed_f64(line, 30, 38)?;
+            let y = fixed_f64(line, 38, 46)?;
+            let z = fixed_f64(line, 46, 54)?;
+            let element = fixed_slice(line, 76, 78)
+                .filter(|value| !value.trim().is_empty())
+                .or_else(|| fixed_slice(line, 12, 16))
+                .unwrap_or("C");
+            Some(json!({"element": clean_element(element), "x": x, "y": y, "z": z}))
+        })
+        .take(5000)
+        .collect()
+}
+
+fn parse_mmcif_atoms(text: &str) -> Vec<Value> {
+    text.lines()
+        .filter(|line| line.starts_with("ATOM ") || line.starts_with("HETATM "))
+        .filter_map(|line| {
+            let cols = line.split_whitespace().collect::<Vec<_>>();
+            let element = cols.get(2).copied().unwrap_or("C");
+            let x = cols.get(10).and_then(|value| value.parse::<f64>().ok())?;
+            let y = cols.get(11).and_then(|value| value.parse::<f64>().ok())?;
+            let z = cols.get(12).and_then(|value| value.parse::<f64>().ok())?;
+            Some(json!({"element": clean_element(element), "x": x, "y": y, "z": z}))
+        })
+        .take(5000)
+        .collect()
+}
+
+fn fixed_slice(value: &str, start: usize, end: usize) -> Option<&str> {
+    value.get(start..end)
+}
+
+fn fixed_f64(value: &str, start: usize, end: usize) -> Option<f64> {
+    fixed_slice(value, start, end)?.trim().parse::<f64>().ok()
+}
+
+fn clean_element(value: &str) -> String {
+    let mut chars = value
+        .chars()
+        .filter(|ch| ch.is_ascii_alphabetic())
+        .take(2)
+        .collect::<String>()
+        .to_ascii_uppercase();
+    if chars.is_empty() {
+        chars = "C".to_string();
+    }
+    chars
+}
+
+fn md_chart_rows(run_dir: &Path, rows: &[Value]) -> Vec<Value> {
+    let mut charts = Vec::new();
+    for row in rows.iter().take(3) {
+        let candidate = row_text(row, "candidate_id");
+        for (key, label, unit) in [
+            ("rmsd", "RMSD", "Å"),
+            ("rmsf", "RMSF", "Å"),
+            ("ligand_drift", "配体漂移", "Å"),
+            ("contact_occupancy", "接触占有率", "fraction"),
+            ("hydrogen_bond_occupancy", "氢键占有率", "fraction"),
+        ] {
+            if let Some(value) = row_number(row, key) {
+                charts.push(json!({
+                    "candidate_id": candidate,
+                    "label": label,
+                    "metric": key,
+                    "value": value,
+                    "display_value": format_metric_value(value, unit),
+                    "unit": unit,
+                    "time_step": first_non_empty(row_text(row, "time_step"), "summary"),
+                    "artifact": "md_summary.tsv"
+                }));
+            }
+        }
+    }
+    charts.extend(score_chart_rows(run_dir));
+    charts
+}
+
+fn score_chart_rows(run_dir: &Path) -> Vec<Value> {
+    read_tsv_rows(&run_dir.join("score_decomposition.tsv"))
+        .into_iter()
+        .take(8)
+        .filter_map(|row| {
+            let value = row_number(&row, "score").or_else(|| row_number(&row, "value"))?;
+            Some(json!({
+                "candidate_id": row_text(&row, "candidate_id"),
+                "label": first_non_empty(row_text(&row, "component"), row_text(&row, "score_component")),
+                "metric": "score_decomposition",
+                "value": value,
+                "display_value": format!("{value:.3}"),
+                "unit": "score",
+                "time_step": "summary",
+                "artifact": "score_decomposition.tsv"
+            }))
+        })
+        .collect()
+}
+
+fn row_number(row: &Value, key: &str) -> Option<f64> {
+    row.get(key)
+        .and_then(Value::as_str)
+        .and_then(|value| value.trim().parse::<f64>().ok())
+}
+
+fn format_metric_value(value: f64, unit: &str) -> String {
+    if unit == "fraction" {
+        format!("{value:.3}")
+    } else {
+        format!("{value:.3} {unit}")
+    }
 }
 
 fn user_genome_rows(run_dir: &Path) -> Vec<Value> {
@@ -1133,7 +1362,7 @@ fn user_structure_row(row: &Value, targets: &BTreeMap<String, (String, String)>)
         } else {
             "\u{5df2}\u{751f}\u{6210}\u{7ed3}\u{6784}\u{6458}\u{8981}"
         },
-        "viewer_status": "\u{56fe}\u{5f62}\u{67e5}\u{770b}\u{672a}\u{5c31}\u{7eea}",
+        "viewer_status": "三维查看未就绪",
         "result_source": "\u{7ed3}\u{6784}\u{4e0e}\u{53e3}\u{888b}\u{6458}\u{8981}\u{8f93}\u{51fa}"
     })
 }
@@ -2994,7 +3223,14 @@ mod tests {
             .iter()
             .position(|value| *value == "license_note")
             .expect("license_note");
-        let allowed = ["html_links", "html_tree", "gcs_prefix", "rsync", "direct"];
+        let allowed = [
+            "html_links",
+            "html_tree",
+            "gcs_prefix",
+            "rcsb_ligand_bound_scope",
+            "rsync",
+            "direct",
+        ];
         let mut rows = 0usize;
         for line in lines {
             if line.trim().is_empty() {
@@ -3223,13 +3459,13 @@ mod tests {
     #[test]
     fn visual_result_sections_use_clear_not_ready_language() {
         let app = web_asset_text("pages/results.js");
-        assert!(app.contains("图形查看未就绪"));
+        assert!(app.contains("三维查看未就绪"));
         assert!(app.contains("轨迹图未就绪"));
         assert!(!app.contains("未接入可用输出"));
 
         let structure = user_structure_row(&json!({"candidate_id":"C1"}), &BTreeMap::new());
         let md = user_md_row(&json!({"candidate_id":"C1"}), &BTreeMap::new());
-        assert_eq!(structure["viewer_status"], "图形查看未就绪");
+        assert_eq!(structure["viewer_status"], "三维查看未就绪");
         assert_eq!(md["trajectory_status"], "轨迹图未就绪");
     }
 
@@ -4104,6 +4340,71 @@ mod tests {
         assert!(!text.contains("evidence_ledger.tsv"));
         assert!(!text.contains("sha256"));
         assert!(!text.contains("D:/hidden"));
+
+        fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn structure_endpoint_exposes_viewer_coordinates_only_from_completed_run_artifact() {
+        let root = std::env::temp_dir().join(format!("genoligand-viewer-{}", now_millis()));
+        let options = server_options(root.clone());
+        let run_dir = projects_root(&options)
+            .join("project-1")
+            .join("runs")
+            .join("run-1");
+        fs::create_dir_all(&run_dir).expect("create run dir");
+        fs::write(run_dir.join("run_state.txt"), "completed\n").expect("state");
+        fs::write(
+            run_dir.join("structure_patch_summary.tsv"),
+            "candidate_id\tstructure_score\tstructure_evidence\nC1\t0.60\tcurrent_run_structure\n",
+        )
+        .expect("structure");
+        fs::write(
+            run_dir.join("structure_viewer.pdb"),
+            "ATOM      1  N   GLY A   1      11.104  13.207   2.100  1.00 20.00           N\nATOM      2  CA  GLY A   1      12.456  13.607   2.500  1.00 20.00           C\n",
+        )
+        .expect("viewer pdb");
+
+        let payload = structure_endpoint_json(&options, "run-1");
+        assert_eq!(payload["has_output"], true);
+        assert_eq!(payload["viewer"]["ready"], true);
+        assert_eq!(payload["viewer"]["atom_count"], 2);
+        assert_eq!(payload["viewer"]["artifact"], "structure_viewer.pdb");
+        let text = payload.to_string();
+        assert!(!text.contains(&root.display().to_string()));
+        assert!(!text.contains("debug_path"));
+
+        fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn md_endpoint_builds_chart_rows_from_current_run_summaries() {
+        let root = std::env::temp_dir().join(format!("genoligand-md-chart-{}", now_millis()));
+        let options = server_options(root.clone());
+        let run_dir = projects_root(&options)
+            .join("project-1")
+            .join("runs")
+            .join("run-1");
+        fs::create_dir_all(&run_dir).expect("create run dir");
+        fs::write(run_dir.join("run_state.txt"), "completed\n").expect("state");
+        fs::write(
+            run_dir.join("md_summary.tsv"),
+            "candidate_id\trmsd\trmsf\tligand_drift\thydrogen_bond_occupancy\tcontact_occupancy\nC1\t1.2\t0.4\t0.6\t0.72\t0.81\n",
+        )
+        .expect("md");
+        fs::write(
+            run_dir.join("score_decomposition.tsv"),
+            "candidate_id\tcomponent\tscore\nC1\tstructure\t0.5\n",
+        )
+        .expect("score");
+
+        let payload = md_endpoint_json(&options, "run-1");
+        assert_eq!(payload["has_output"], true);
+        assert!(payload["charts"].as_array().unwrap().len() >= 5);
+        let text = payload.to_string();
+        assert!(text.contains("md_summary.tsv"));
+        assert!(text.contains("score_decomposition.tsv"));
+        assert!(!text.contains(&root.display().to_string()));
 
         fs::remove_dir_all(&root).ok();
     }

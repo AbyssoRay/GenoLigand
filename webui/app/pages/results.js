@@ -31,6 +31,7 @@
       if (tab === "genome") body.innerHTML = resultSection("基因组/ORF", genome, "genome");
       if (tab === "structure") body.innerHTML = structureSection(structure);
       if (tab === "md") body.innerHTML = mdSection(md);
+      hydrateResultVisuals();
     });
   });
 }
@@ -119,39 +120,43 @@ function candidateDetailSection(rows) {
 }
 
 function structureSection(rows) {
+  const viewer = state.runData?.structure?.viewer;
   return `
     <section class="panel full">
       <div class="panel-header">
         <div>
           <h2>结构/口袋</h2>
-          <p>${rows.length ? "当前显示结构和口袋表格摘要；图形查看未就绪。" : "当前运行没有结构或口袋摘要；图形查看未就绪。"}</p>
+          <p>${rows.length ? "当前显示结构和口袋摘要；三维查看只在当前运行提供坐标时启用。" : "当前运行没有结构或口袋摘要；三维查看未就绪。"}</p>
         </div>
         <span class="status-pill ${outputStatusClass(rows)}">${rows.length ? `${rows.length} 行` : "未就绪"}</span>
       </div>
       ${visualStatus([
         { label: "摘要表", value: rows.length ? "已生成" : "未生成", ready: rows.length > 0 },
-        { label: "三维查看器", value: "图形查看未就绪", ready: false, waiting: true },
+        { label: "三维查看器", value: viewer?.ready ? "已连接当前运行坐标" : "未就绪", ready: viewer?.ready === true, waiting: viewer?.ready !== true },
         { label: "数据来源", value: rows.length ? "当前运行输出" : "等待运行输出", ready: rows.length > 0 },
       ])}
+      ${renderStructureViewer(viewer)}
       ${rows.length ? table(rows, columnsFor("structure")) : `<div class="empty">未生成结构查看数据或口袋摘要。</div>`}
     </section>`;
 }
 
 function mdSection(rows) {
+  const charts = state.runData?.md?.charts || [];
   return `
     <section class="panel full">
       <div class="panel-header">
         <div>
           <h2>动力学摘要</h2>
-          <p>${rows.length ? "当前显示动力学表格摘要；轨迹图未就绪。" : "当前运行没有轨迹摘要；轨迹图未就绪。"}</p>
+          <p>${rows.length ? "当前显示动力学表格和图形摘要；全部来自当前运行轨迹摘要或分数拆解。" : "当前运行没有轨迹摘要；轨迹图未就绪。"}</p>
         </div>
         <span class="status-pill ${outputStatusClass(rows)}">${rows.length ? `${rows.length} 行` : "未就绪"}</span>
       </div>
       ${visualStatus([
         { label: "摘要表", value: rows.length ? "已生成" : "未生成", ready: rows.length > 0 },
-        { label: "轨迹图", value: "轨迹图未就绪", ready: false, waiting: true },
+        { label: "轨迹图", value: charts.length ? "已生成图形摘要" : "未就绪", ready: charts.length > 0, waiting: charts.length === 0 },
         { label: "数据来源", value: rows.length ? "当前运行输出" : "等待运行输出", ready: rows.length > 0 },
       ])}
+      ${renderMdCharts(charts)}
       ${rows.length ? table(rows, columnsFor("md")) : `<div class="empty">未生成 RMSD、RMSF、接触或配体漂移摘要。</div>`}
     </section>`;
 }

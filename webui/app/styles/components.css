@@ -175,6 +175,104 @@ select:focus {
   overflow-wrap: anywhere;
 }
 
+.viewer-card,
+.viewer-empty {
+  margin: 12px 0 14px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: #071216;
+  overflow: hidden;
+}
+
+.viewer-empty {
+  display: grid;
+  gap: 6px;
+  padding: 16px;
+  color: var(--muted);
+  border-style: dashed;
+}
+
+.viewer-empty strong {
+  color: var(--warn);
+}
+
+.viewer-head {
+  display: flex;
+  justify-content: space-between;
+  gap: 12px;
+  align-items: flex-start;
+  padding: 12px;
+  border-bottom: 1px solid var(--line);
+}
+
+.viewer-head div {
+  display: grid;
+  gap: 3px;
+  min-width: 0;
+}
+
+.viewer-head span,
+.viewer-help {
+  color: var(--muted);
+  font-size: 12px;
+}
+
+[data-structure-viewer] {
+  display: block;
+  width: 100%;
+  height: min(46vh, 420px);
+  background: #061014;
+  touch-action: none;
+}
+
+.viewer-help {
+  padding: 9px 12px 12px;
+}
+
+.chart-grid {
+  display: grid;
+  gap: 10px;
+  margin: 12px 0 14px;
+}
+
+.chart-row {
+  display: grid;
+  grid-template-columns: minmax(120px, 0.6fr) minmax(160px, 1fr) minmax(80px, auto) minmax(120px, 0.7fr);
+  gap: 10px;
+  align-items: center;
+  padding: 10px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--surface-2);
+}
+
+.chart-row span,
+.chart-row em {
+  color: var(--muted);
+  font-style: normal;
+}
+
+.chart-row strong {
+  color: var(--text);
+  font-weight: 600;
+}
+
+.chart-bar {
+  height: 10px;
+  overflow: hidden;
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  background: #061014;
+}
+
+.chart-bar i {
+  display: block;
+  height: 100%;
+  min-width: 2px;
+  background: linear-gradient(90deg, var(--accent), var(--accent-2));
+  border-radius: inherit;
+}
+
 .ready-text {
   color: var(--good);
 }

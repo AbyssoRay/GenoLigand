@@ -39,7 +39,8 @@
 
   .metric-row,
   .visual-status,
-  .stage {
+  .stage,
+  .chart-row {
     grid-template-columns: 1fr;
   }
 }
