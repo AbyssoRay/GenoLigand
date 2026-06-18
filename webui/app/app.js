@@ -9,6 +9,7 @@ const state = {
   setup: null,
   setupPlan: null,
   setupRepair: null,
+  setupProgress: null,
   preflight: null,
   runData: null,
   form: {
@@ -21,6 +22,8 @@ const state = {
   },
   alert: "",
 };
+
+let setupProgressTimer = null;
 
 const page = document.querySelector("[data-page]");
 const alerts = document.querySelector("[data-alerts]");
@@ -120,12 +123,13 @@ async function boot() {
 async function refreshAll() {
   try {
     state.alert = "";
-    [state.health, state.databases, state.diagnostics, state.setup, state.setupPlan] = await Promise.all([
+    [state.health, state.databases, state.diagnostics, state.setup, state.setupPlan, state.setupProgress] = await Promise.all([
       api("/api/user/health"),
       api("/api/user/databases"),
       api("/api/user/diagnostics"),
       api("/api/user/setup/status"),
       api("/api/user/setup/install-plan"),
+      api("/api/user/setup/progress"),
     ]);
     if (state.run?.run_id) {
       state.run = await api(`/api/user/runs/${state.run.run_id}`);
@@ -376,6 +380,7 @@ function renderCheck() {
           <span class="status-pill ${setupReady ? "ready" : "blocked"}">${setupReady ? "已就绪" : "需要准备"}</span>
         </div>
         ${setupRepairSummary()}
+        ${installerProgressSummary()}
         ${installCatalogSummary()}
         ${installerDownloadSummary()}
         ${installerExternalSourceSummary()}
@@ -413,6 +418,39 @@ function setupRepairSummary() {
   return `
     <div class="notice ${ready ? "" : "warn"}">
       ${escapeHtml(state.setupRepair.message || (ready ? "科学仓库已就绪。" : "修复动作已执行，但仍有缺项。"))}
+    </div>`;
+}
+
+function installerProgressSummary() {
+  const progress = [state.setupProgress, state.setupRepair?.progress, state.setupRepair?.installer?.progress].find(
+    (item) => item && item.status !== "idle",
+  );
+  if (!progress || progress.status === "idle") return "";
+  const percent = boundedPercent(progress.percent);
+  const failed = Number(progress.failed_steps || 0);
+  const ok = progress.status === "ready";
+  const blocked = failed > 0 || ["failed", "needs_repair"].includes(progress.status);
+  const bytes = progress.bytes_total
+    ? `${formatBytes(progress.bytes_downloaded || 0)} / ${formatBytes(progress.bytes_total || 0)}`
+    : formatBytes(progress.bytes_downloaded || 0);
+  return `
+    <div class="progress-panel ${ok ? "ready" : blocked ? "blocked" : ""}">
+      <div class="progress-head">
+        <div>
+          <strong>${escapeHtml(progress.stage || "安装/修复")}</strong>
+          <span>${escapeHtml(progress.current_resource || "科学资源")}</span>
+        </div>
+        <span class="status-pill ${ok ? "ready" : blocked ? "blocked" : "loading"}">${percent}%</span>
+      </div>
+      <div class="progress-bar" role="progressbar" aria-valuemin="0" aria-valuemax="100" aria-valuenow="${percent}">
+        <span style="width:${percent}%"></span>
+      </div>
+      <div class="progress-meta">
+        <span>${escapeHtml(progress.message || "正在处理")}</span>
+        <span>${Number(progress.completed_steps || 0)} / ${Number(progress.total_steps || 0)} 步</span>
+        <span>${bytes}</span>
+        ${failed ? `<span class="blocked-text">${failed} 项需要处理</span>` : ""}
+      </div>
     </div>`;
 }
 
@@ -907,16 +945,54 @@ async function runPreflight() {
   render();
 }
 
+async function refreshSetupProgress() {
+  try {
+    state.setupProgress = await api("/api/user/setup/progress");
+  } catch {
+    state.setupProgress = state.setupProgress || null;
+  }
+}
+
+function startSetupProgressPolling() {
+  stopSetupProgressPolling();
+  setupProgressTimer = window.setInterval(async () => {
+    await refreshSetupProgress();
+    if (state.step === "check") render();
+  }, 1000);
+}
+
+function stopSetupProgressPolling() {
+  if (setupProgressTimer) {
+    window.clearInterval(setupProgressTimer);
+    setupProgressTimer = null;
+  }
+}
+
 async function runSetupRepair() {
   state.alert = "";
   state.setupRepair = { message: "正在运行安装/修复...", database_ready: false };
+  state.setupProgress = {
+    status: "running",
+    stage: "安装/修复",
+    current_resource: "科学资源",
+    completed_steps: 0,
+    total_steps: 1,
+    failed_steps: 0,
+    bytes_downloaded: 0,
+    bytes_total: 0,
+    percent: 0,
+    message: "正在准备安装/修复",
+  };
   render();
+  startSetupProgressPolling();
   try {
     state.setupRepair = await api("/api/user/setup/run", { method: "POST" });
-    [state.databases, state.diagnostics, state.setup] = await Promise.all([
+    state.setupProgress = state.setupRepair.progress || state.setupRepair.installer?.progress || state.setupProgress;
+    [state.databases, state.diagnostics, state.setup, state.setupProgress] = await Promise.all([
       api("/api/user/databases"),
       api("/api/user/diagnostics"),
       api("/api/user/setup/status"),
+      api("/api/user/setup/progress"),
     ]);
     if (state.project) {
       state.preflight = await api(`/api/user/projects/${state.project.project_id}/preflight`, {
@@ -925,6 +1001,8 @@ async function runSetupRepair() {
     }
   } catch (error) {
     state.alert = `修复动作失败：${error.message}`;
+  } finally {
+    stopSetupProgressPolling();
   }
   render();
 }
@@ -1391,6 +1469,25 @@ function columnsFor(kind) {
 
 function metricRow(label, value) {
   return `<div class="metric-row"><div class="metric-label">${escapeHtml(label)}</div><div>${escapeHtml(value)}</div></div>`;
+}
+
+function boundedPercent(value) {
+  const number = Number(value);
+  if (!Number.isFinite(number)) return 0;
+  return Math.max(0, Math.min(100, Math.round(number)));
+}
+
+function formatBytes(value) {
+  const bytes = Number(value || 0);
+  if (!Number.isFinite(bytes) || bytes <= 0) return "0 B";
+  const units = ["B", "KB", "MB", "GB", "TB"];
+  let size = bytes;
+  let unit = 0;
+  while (size >= 1024 && unit < units.length - 1) {
+    size /= 1024;
+    unit += 1;
+  }
+  return `${size >= 10 || unit === 0 ? Math.round(size) : size.toFixed(1)} ${units[unit]}`;
 }
 
 function valueOrMissing(value, fallback = "未提供") {

@@ -16,7 +16,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 from pathlib import Path
-from typing import Sequence
+from typing import Callable, Sequence
 
 PYTHON_TOOL_PACKAGES: list[dict[str, str]] = [
     {
@@ -67,6 +67,7 @@ RESERVED_WSL_DISTROS = {"Ubuntu-24.04"}
 DOWNLOAD_RETRIES = 3
 DOWNLOAD_TIMEOUT_SECONDS = 120
 DOWNLOAD_USER_AGENT = "GenoLigand-science-store-installer/0.9"
+ProgressCallback = Callable[[str, int, int | None, str], None]
 
 
 def urlopen_with_compatible_tls(request: urllib.request.Request, timeout: int):
@@ -670,6 +671,47 @@ def read_tsv(path: Path) -> list[dict[str, str]]:
         return cleaned
 
 
+def write_install_progress(
+    science_store: Path,
+    *,
+    status: str,
+    stage: str,
+    current_resource: str = "",
+    completed_steps: int = 0,
+    total_steps: int = 0,
+    failed_steps: int = 0,
+    bytes_downloaded: int = 0,
+    bytes_total: int | None = None,
+    message: str = "",
+) -> dict[str, object]:
+    progress_dir = science_store
+    progress_dir.mkdir(parents=True, exist_ok=True)
+    if bytes_total and bytes_total > 0:
+        percent = min(100, round((bytes_downloaded / bytes_total) * 100))
+    elif total_steps > 0:
+        percent = min(100, round((completed_steps / total_steps) * 100))
+    else:
+        percent = 0
+    payload: dict[str, object] = {
+        "status": status,
+        "stage": stage,
+        "current_resource": current_resource,
+        "completed_steps": completed_steps,
+        "total_steps": total_steps,
+        "failed_steps": failed_steps,
+        "bytes_downloaded": bytes_downloaded,
+        "bytes_total": bytes_total if bytes_total is not None else "",
+        "percent": percent,
+        "message": message,
+        "updated_at": int(time.time()),
+    }
+    (science_store / "install_progress.json").write_text(
+        json.dumps(payload, ensure_ascii=False, indent=2) + "\n",
+        encoding="utf-8",
+    )
+    return payload
+
+
 def default_source_catalog(workspace_root: Path, science_store: Path) -> Path:
     store_catalog = science_store / "source_catalog.tsv"
     if store_catalog.exists():
@@ -698,18 +740,54 @@ def sha256_file(path: Path) -> str:
     return digest.hexdigest()
 
 
-def copy_or_download(url: str, destination: Path, expected_sha256: str | None) -> dict[str, object]:
+def copy_with_progress(
+    source,
+    handle,
+    *,
+    bytes_done: int = 0,
+    bytes_total: int | None = None,
+    progress: ProgressCallback | None = None,
+) -> int:
+    copied = bytes_done
+    while True:
+        chunk = source.read(1024 * 1024)
+        if not chunk:
+            break
+        handle.write(chunk)
+        copied += len(chunk)
+        if progress:
+            progress("downloading", copied, bytes_total, "正在下载数据库资源")
+    return copied
+
+
+def copy_or_download(
+    url: str,
+    destination: Path,
+    expected_sha256: str | None,
+    progress: ProgressCallback | None = None,
+) -> dict[str, object]:
     destination.parent.mkdir(parents=True, exist_ok=True)
     partial = destination.with_suffix(destination.suffix + ".part")
     if url.startswith("file://"):
         source = Path(urllib.request.url2pathname(url[7:]))
-        shutil.copyfile(source, partial)
+        total = source.stat().st_size if source.exists() else None
+        if progress:
+            progress("copying", 0, total, "正在复制本地资源")
+        with source.open("rb") as source_handle, partial.open("wb") as target_handle:
+            copy_with_progress(source_handle, target_handle, bytes_total=total, progress=progress)
     elif Path(url).exists():
-        shutil.copyfile(Path(url), partial)
+        source = Path(url)
+        total = source.stat().st_size
+        if progress:
+            progress("copying", 0, total, "正在复制本地资源")
+        with source.open("rb") as source_handle, partial.open("wb") as target_handle:
+            copy_with_progress(source_handle, target_handle, bytes_total=total, progress=progress)
     else:
         last_error: Exception | None = None
         for attempt in range(1, DOWNLOAD_RETRIES + 1):
             existing = partial.stat().st_size if partial.exists() else 0
+            if progress:
+                progress("downloading", existing, None, f"正在下载数据库资源，第 {attempt} 次尝试")
             request = urllib.request.Request(
                 url,
                 headers={"User-Agent": DOWNLOAD_USER_AGENT},
@@ -723,8 +801,22 @@ def copy_or_download(url: str, destination: Path, expected_sha256: str | None) -
                 ) as response:
                     status = getattr(response, "status", 200)
                     mode = "ab" if existing and status == 206 else "wb"
+                    content_length = response.headers.get("Content-Length")
+                    response_bytes = int(content_length) if content_length and content_length.isdigit() else None
+                    if status == 206 and response_bytes is not None:
+                        total = existing + response_bytes
+                        start = existing
+                    else:
+                        total = response_bytes
+                        start = 0
                     with partial.open(mode) as handle:
-                        shutil.copyfileobj(response, handle)
+                        copy_with_progress(
+                            response,
+                            handle,
+                            bytes_done=start,
+                            bytes_total=total,
+                            progress=progress,
+                        )
                 last_error = None
                 break
             except urllib.error.HTTPError as err:
@@ -734,18 +826,26 @@ def copy_or_download(url: str, destination: Path, expected_sha256: str | None) -
                 last_error = err
             except (urllib.error.URLError, TimeoutError, OSError) as err:
                 last_error = err
+            if progress:
+                progress("retrying", partial.stat().st_size if partial.exists() else 0, None, "下载中断，准备重试")
             if attempt < DOWNLOAD_RETRIES:
                 time.sleep(min(2 * attempt, 5))
         if last_error is not None:
             raise last_error
+    if progress:
+        progress("verifying", partial.stat().st_size if partial.exists() else 0, partial.stat().st_size if partial.exists() else None, "正在校验资源")
     actual_sha256 = sha256_file(partial)
     if expected_sha256 and actual_sha256.lower() != expected_sha256.lower():
+        if progress:
+            progress("failed", partial.stat().st_size, partial.stat().st_size, "完整性校验失败")
         return {
             "status": "checksum_failed",
             "bytes": partial.stat().st_size,
             "sha256": actual_sha256,
         }
     partial.replace(destination)
+    if progress:
+        progress("completed", destination.stat().st_size, destination.stat().st_size, "资源已完成")
     return {
         "status": "ready",
         "bytes": destination.stat().st_size,
@@ -762,6 +862,15 @@ def prepare_downloads(catalog: Path, science_store: Path) -> dict[str, object]:
             for row in reader:
                 rows.append({key: (value or "").strip() for key, value in row.items()})
     manifest.parent.mkdir(parents=True, exist_ok=True)
+    write_install_progress(
+        science_store,
+        status="running",
+        stage="下载数据库",
+        current_resource="准备下载清单",
+        completed_steps=0,
+        total_steps=len(rows),
+        message="正在准备数据库下载",
+    )
     with manifest.open("w", encoding="utf-8", newline="") as handle:
         writer = csv.DictWriter(
             handle,
@@ -789,6 +898,15 @@ def prepare_downloads(catalog: Path, science_store: Path) -> dict[str, object]:
                     "notes": "source_catalog_tsv_missing_or_empty",
                 }
             )
+            write_install_progress(
+                science_store,
+                status="needs_repair",
+                stage="下载数据库",
+                current_resource="下载清单",
+                completed_steps=0,
+                total_steps=0,
+                message="缺少数据库下载清单",
+            )
             return {
                 "status": "not_configured",
                 "catalog": str(catalog),
@@ -800,11 +918,23 @@ def prepare_downloads(catalog: Path, science_store: Path) -> dict[str, object]:
         failed = 0
         for row in rows:
             source_id = row.get("source_id", "")
+            source_label = row.get("source_label") or source_id or "数据库资源"
             url = row.get("url", "")
             local_path = row.get("local_path", "")
             expected = row.get("sha256", "") or None
+            completed = ready + failed
             if not source_id or not url or not local_path:
                 failed += 1
+                write_install_progress(
+                    science_store,
+                    status="running",
+                    stage="下载数据库",
+                    current_resource=source_label,
+                    completed_steps=ready + failed,
+                    total_steps=len(rows),
+                    failed_steps=failed,
+                    message="数据库来源记录不完整",
+                )
                 writer.writerow(
                     {
                         "source_id": source_id or "missing_source_id",
@@ -819,11 +949,37 @@ def prepare_downloads(catalog: Path, science_store: Path) -> dict[str, object]:
                 continue
             destination = science_store / local_path
             try:
-                result = copy_or_download(url, destination, expected)
+                def progress_callback(status: str, bytes_done: int, bytes_total: int | None, message: str) -> None:
+                    write_install_progress(
+                        science_store,
+                        status="running" if status not in {"failed", "completed"} else status,
+                        stage="下载数据库",
+                        current_resource=source_label,
+                        completed_steps=completed,
+                        total_steps=len(rows),
+                        failed_steps=failed,
+                        bytes_downloaded=bytes_done,
+                        bytes_total=bytes_total,
+                        message=message,
+                    )
+
+                result = copy_or_download(url, destination, expected, progress_callback)
                 if result["status"] == "ready":
                     ready += 1
                 else:
                     failed += 1
+                write_install_progress(
+                    science_store,
+                    status="running",
+                    stage="下载数据库",
+                    current_resource=source_label,
+                    completed_steps=ready + failed,
+                    total_steps=len(rows),
+                    failed_steps=failed,
+                    bytes_downloaded=int(result.get("bytes", 0) or 0),
+                    bytes_total=int(result.get("bytes", 0) or 0),
+                    message="数据库资源处理完成" if result["status"] == "ready" else "数据库资源处理失败",
+                )
                 writer.writerow(
                     {
                         "source_id": source_id,
@@ -837,6 +993,16 @@ def prepare_downloads(catalog: Path, science_store: Path) -> dict[str, object]:
                 )
             except Exception as err:  # noqa: BLE001 - report install diagnostics, do not hide failures
                 failed += 1
+                write_install_progress(
+                    science_store,
+                    status="running",
+                    stage="下载数据库",
+                    current_resource=source_label,
+                    completed_steps=ready + failed,
+                    total_steps=len(rows),
+                    failed_steps=failed,
+                    message="数据库资源下载失败",
+                )
                 writer.writerow(
                     {
                         "source_id": source_id,
@@ -848,8 +1014,19 @@ def prepare_downloads(catalog: Path, science_store: Path) -> dict[str, object]:
                         "notes": str(err).replace("\t", " ").replace("\n", " "),
                     }
                 )
+        result_status = "ready" if failed == 0 else "failed"
+        write_install_progress(
+            science_store,
+            status="running" if result_status == "ready" else "needs_repair",
+            stage="下载数据库",
+            current_resource="数据库下载",
+            completed_steps=ready + failed,
+            total_steps=len(rows),
+            failed_steps=failed,
+            message="数据库下载完成" if result_status == "ready" else "数据库下载存在失败项",
+        )
         return {
-            "status": "ready" if failed == 0 else "failed",
+            "status": result_status,
             "catalog": str(catalog),
             "manifest": str(manifest),
             "ready": ready,
@@ -1104,6 +1281,15 @@ def sync_external_sources(
     manifest = science_store / "external_sync_execution_manifest.tsv"
     rows = read_tsv(plan)
     manifest.parent.mkdir(parents=True, exist_ok=True)
+    write_install_progress(
+        science_store,
+        status="running",
+        stage="同步大型资源",
+        current_resource="准备资源同步",
+        completed_steps=0,
+        total_steps=len(rows),
+        message="正在准备大型资源同步",
+    )
     with manifest.open("w", encoding="utf-8", newline="") as handle:
         writer = csv.DictWriter(
             handle,
@@ -1131,6 +1317,15 @@ def sync_external_sources(
                     "notes": "source_sync_plan_tsv_missing_or_empty",
                 }
             )
+            write_install_progress(
+                science_store,
+                status="needs_repair",
+                stage="同步大型资源",
+                current_resource="资源同步清单",
+                completed_steps=0,
+                total_steps=0,
+                message="缺少大型资源同步清单",
+            )
             return {
                 "status": "not_configured",
                 "manifest": str(manifest),
@@ -1151,6 +1346,18 @@ def sync_external_sources(
             marker = science_store / ready_marker if ready_marker else target
             if marker and path_has_payload(marker):
                 ready += 1
+                write_install_progress(
+                    science_store,
+                    status="running",
+                    stage="同步大型资源",
+                    current_resource=label,
+                    completed_steps=ready + failed + needs_action,
+                    total_steps=len(rows),
+                    failed_steps=failed,
+                    bytes_downloaded=directory_size(marker),
+                    bytes_total=directory_size(marker),
+                    message="资源已可用",
+                )
                 writer.writerow(
                     {
                         "source_id": source_id,
@@ -1165,6 +1372,16 @@ def sync_external_sources(
                 continue
             if skip_downloads:
                 needs_action += 1
+                write_install_progress(
+                    science_store,
+                    status="running",
+                    stage="同步大型资源",
+                    current_resource=label,
+                    completed_steps=ready + failed + needs_action,
+                    total_steps=len(rows),
+                    failed_steps=failed,
+                    message="本次未执行资源同步",
+                )
                 writer.writerow(
                     {
                         "source_id": source_id,
@@ -1179,6 +1396,16 @@ def sync_external_sources(
                 continue
             if not target:
                 needs_action += 1
+                write_install_progress(
+                    science_store,
+                    status="running",
+                    stage="同步大型资源",
+                    current_resource=label,
+                    completed_steps=ready + failed + needs_action,
+                    total_steps=len(rows),
+                    failed_steps=failed,
+                    message="资源目标未配置",
+                )
                 writer.writerow(
                     {
                         "source_id": source_id,
@@ -1199,6 +1426,18 @@ def sync_external_sources(
                     needs_action += 1
                 else:
                     failed += 1
+                write_install_progress(
+                    science_store,
+                    status="running",
+                    stage="同步大型资源",
+                    current_resource=label,
+                    completed_steps=ready + failed + needs_action,
+                    total_steps=len(rows),
+                    failed_steps=failed,
+                    bytes_downloaded=int(result.get("bytes", 0) or 0),
+                    bytes_total=int(result.get("bytes", 0) or 0) or None,
+                    message="资源同步完成" if result["status"] == "ready" else "资源需要继续处理",
+                )
                 writer.writerow(
                     {
                         "source_id": source_id,
@@ -1212,6 +1451,16 @@ def sync_external_sources(
                 )
             except Exception as err:  # noqa: BLE001 - install must report actionable status
                 failed += 1
+                write_install_progress(
+                    science_store,
+                    status="running",
+                    stage="同步大型资源",
+                    current_resource=label,
+                    completed_steps=ready + failed + needs_action,
+                    total_steps=len(rows),
+                    failed_steps=failed,
+                    message="资源同步失败",
+                )
                 writer.writerow(
                     {
                         "source_id": source_id,
@@ -1225,6 +1474,16 @@ def sync_external_sources(
                 )
         total = len(rows)
         status = "ready" if ready == total and failed == 0 else "failed" if failed else "needs_sync"
+        write_install_progress(
+            science_store,
+            status="running" if status == "ready" else "needs_repair",
+            stage="同步大型资源",
+            current_resource="大型资源同步",
+            completed_steps=ready + failed + needs_action,
+            total_steps=total,
+            failed_steps=failed,
+            message="大型资源同步完成" if status == "ready" else "大型资源仍需处理",
+        )
         return {
             "status": status,
             "manifest": str(manifest),
@@ -1657,6 +1916,15 @@ def main() -> int:
         if args.python_env_dir
         else default_python_env_dir(runtime_dir).resolve()
     )
+    write_install_progress(
+        science_store,
+        status="running",
+        stage="准备安装",
+        current_resource="安装/修复",
+        completed_steps=0,
+        total_steps=6,
+        message="正在准备安装/修复",
+    )
     selected_wsl = selected_project_wsl_distro(args.wsl_distro)
     python_backend = "local"
     if args.python_backend == "wsl":
@@ -1683,16 +1951,44 @@ def main() -> int:
         if args.no_download
         else prepare_downloads(source_catalog, science_store)
     )
+    if args.no_download:
+        write_install_progress(
+            science_store,
+            status="running",
+            stage="下载数据库",
+            current_resource="数据库下载",
+            completed_steps=1,
+            total_steps=6,
+            message="本次跳过数据库下载",
+        )
     external_sync_result = sync_external_sources(
         source_sync_plan,
         science_store,
         args.no_download,
         science_env,
     )
+    write_install_progress(
+        science_store,
+        status="running",
+        stage="记录来源",
+        current_resource="来源、完整性和许可记录",
+        completed_steps=3,
+        total_steps=6,
+        message="正在记录数据库来源和许可信息",
+    )
     source_manifest_result = write_science_resource_manifests(
         source_catalog,
         source_sync_plan,
         science_store,
+    )
+    write_install_progress(
+        science_store,
+        status="running",
+        stage="准备工具",
+        current_resource="科学计算环境",
+        completed_steps=4,
+        total_steps=6,
+        message="正在检查科学计算工具",
     )
     tool_environment_result = ensure_python_tool_environment(
         python_env_dir,
@@ -1719,6 +2015,15 @@ def main() -> int:
     tool_python = str(tool_environment_result.get("python", "")).strip()
     if tool_python:
         command_env["GENOLIGAND_PYTHON"] = tool_python
+    write_install_progress(
+        science_store,
+        status="running",
+        stage="构建索引",
+        current_resource="科学仓库索引",
+        completed_steps=5,
+        total_steps=6,
+        message="正在构建数据库索引",
+    )
     completed = run_command(command, env=command_env)
     install_status = installation_status(
         science_store,
@@ -1744,6 +2049,17 @@ def main() -> int:
         "access_url": f"http://{args.host}:{args.port}/",
     }
     payload["install_ready"] = install_ready(payload)
+    final_progress_status = "ready" if payload["install_ready"] else "needs_repair"
+    payload["progress"] = write_install_progress(
+        science_store,
+        status=final_progress_status,
+        stage="完成检查",
+        current_resource="安装/修复",
+        completed_steps=6,
+        total_steps=6,
+        failed_steps=0 if payload["install_ready"] else 1,
+        message=str(payload.get("summary", "")),
+    )
     if args.debug_output:
         payload["debug"] = {
             "command": command,

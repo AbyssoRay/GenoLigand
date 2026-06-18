@@ -8,7 +8,7 @@ use std::process::Command;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 pub const PRODUCT_NAME: &str = "GenoLigand Local WebUI";
-pub const PRODUCT_VERSION: &str = "0.9.2";
+pub const PRODUCT_VERSION: &str = "0.9.3";
 
 const REQUIRED_TOOL_IDS: &[&str] = &[
     "java",
@@ -140,6 +140,7 @@ fn route(
             diagnostics_json(options)
         }
         ("GET", "/api/user/setup/status") => user_setup_status_json(options),
+        ("GET", "/api/user/setup/progress") => user_setup_progress_json(options),
         ("POST", "/api/user/setup/run") => run_setup_repair_json(options),
         ("GET", "/api/user/setup/install-plan") => user_setup_install_plan_json(options),
         ("POST", "/api/user/setup/install") => run_setup_repair_json(options),
@@ -1460,6 +1461,12 @@ fn user_setup_status_json(options: &ServerOptions) -> Value {
     })
 }
 
+fn user_setup_progress_json(options: &ServerOptions) -> Value {
+    let path = science_store_path(options).join("install_progress.json");
+    let value = read_json_or(&path, json!({}));
+    setup_user_install_progress(Some(&value))
+}
+
 fn run_setup_repair_json(options: &ServerOptions) -> Value {
     let command = setup_repair_command(options);
     let output = Command::new(&command[0])
@@ -1507,6 +1514,7 @@ fn run_setup_repair_json(options: &ServerOptions) -> Value {
     if let Some(installer_payload) = installer_payload {
         payload["installer"] = installer_payload;
     }
+    payload["progress"] = user_setup_progress_json(options);
     payload
 }
 
@@ -1592,6 +1600,7 @@ fn setup_installer_summary(stdout: &str) -> Option<Value> {
     let external_sources = setup_user_external_sources(payload.get("external_sources"));
     let source_records = setup_user_source_manifests(payload.get("source_manifests"));
     let tool_environment = setup_user_tool_environment(payload.get("tool_environment"));
+    let progress = setup_user_install_progress(payload.get("progress"));
     let download_status = downloads
         .get("status")
         .and_then(Value::as_str)
@@ -1609,8 +1618,57 @@ fn setup_installer_summary(stdout: &str) -> Option<Value> {
         "external_sources": external_sources,
         "source_records": source_records,
         "resources": resources,
-        "tool_environment": tool_environment
+        "tool_environment": tool_environment,
+        "progress": progress
     }))
+}
+
+fn setup_user_install_progress(progress: Option<&Value>) -> Value {
+    let Some(progress) = progress else {
+        return json!({
+            "status": "idle",
+            "stage": "等待安装",
+            "current_resource": "",
+            "completed_steps": 0,
+            "total_steps": 0,
+            "failed_steps": 0,
+            "bytes_downloaded": 0,
+            "bytes_total": 0,
+            "percent": 0,
+            "message": "尚未开始安装/修复",
+            "updated_at": 0
+        });
+    };
+    let text_field = |name: &str, fallback: &str| {
+        progress
+            .get(name)
+            .and_then(Value::as_str)
+            .unwrap_or(fallback)
+            .to_string()
+    };
+    let number_field = |name: &str| {
+        progress
+            .get(name)
+            .and_then(|value| {
+                value
+                    .as_u64()
+                    .or_else(|| value.as_str().and_then(|text| text.parse::<u64>().ok()))
+            })
+            .unwrap_or(0)
+    };
+    json!({
+        "status": text_field("status", "idle"),
+        "stage": text_field("stage", "等待安装"),
+        "current_resource": text_field("current_resource", ""),
+        "completed_steps": number_field("completed_steps"),
+        "total_steps": number_field("total_steps"),
+        "failed_steps": number_field("failed_steps"),
+        "bytes_downloaded": number_field("bytes_downloaded"),
+        "bytes_total": number_field("bytes_total"),
+        "percent": number_field("percent").min(100),
+        "message": text_field("message", "尚未开始安装/修复"),
+        "updated_at": number_field("updated_at")
+    })
 }
 
 fn setup_user_source_manifests(source_manifests: Option<&Value>) -> Value {
@@ -1851,6 +1909,7 @@ fn preflight_store_ready(options: &ServerOptions) -> bool {
         && tool_versions_ready(&store.join("indexes/tool_versions.tsv"))
         && install_status_ready(&store.join("install_status.json"))
         && source_requirements_ready(&store.join("source_requirements.tsv"))
+        && source_manifests_ready(&store.join("manifests"))
 }
 
 fn install_status_ready(path: &Path) -> bool {
@@ -1885,6 +1944,36 @@ fn source_requirements_ready(path: &Path) -> bool {
         saw_row = true;
         let cols = line.split('\t').collect::<Vec<_>>();
         if cols.get(status_index).copied() != Some("ready") {
+            return false;
+        }
+    }
+    saw_row
+}
+
+fn source_manifests_ready(dir: &Path) -> bool {
+    tsv_status_column_ready(&dir.join("source_file_manifest.tsv"), "status", &["ready"])
+        && tsv_status_column_ready(&dir.join("hash_manifest.tsv"), "status", &["ready"])
+        && tsv_status_column_ready(&dir.join("license_manifest.tsv"), "status", &["recorded"])
+}
+
+fn tsv_status_column_ready(path: &Path, column_name: &str, ready_values: &[&str]) -> bool {
+    let Ok(text) = fs::read_to_string(path) else {
+        return false;
+    };
+    let mut lines = text.lines();
+    let Some(header) = lines.next() else {
+        return false;
+    };
+    let headers = header.split('\t').collect::<Vec<_>>();
+    let Some(status_index) = headers.iter().position(|value| *value == column_name) else {
+        return false;
+    };
+    let mut saw_row = false;
+    for line in lines.filter(|line| !line.trim().is_empty()) {
+        saw_row = true;
+        let cols = line.split('\t').collect::<Vec<_>>();
+        let status = cols.get(status_index).copied().unwrap_or_default();
+        if !ready_values.contains(&status) {
             return false;
         }
     }
@@ -1935,6 +2024,12 @@ fn required_resource_rows(store: &Path) -> Vec<Value> {
             "科学资源状态",
             "运行安装/修复以完成科学资源检查",
         ),
+        (
+            "source_records",
+            "manifests/source_file_manifest.tsv",
+            "来源与许可记录",
+            "运行安装/修复以补齐来源、完整性和许可记录",
+        ),
     ];
     required
         .iter()
@@ -1944,6 +2039,7 @@ fn required_resource_rows(store: &Path) -> Vec<Value> {
                 "tools" => tool_versions_ready(&path),
                 "install_status" => install_status_ready(&path),
                 "source_requirements" => source_requirements_ready(&path),
+                "source_records" => source_manifests_ready(&store.join("manifests")),
                 _ => path.exists(),
             };
             json!({
@@ -2573,6 +2669,26 @@ mod tests {
         }
     }
 
+    fn write_ready_source_records(store: &Path) {
+        let dir = store.join("manifests");
+        fs::create_dir_all(&dir).expect("source records dir");
+        fs::write(
+            dir.join("source_file_manifest.tsv"),
+            "source_id\tstatus\nchembl\tready\n",
+        )
+        .expect("source file records");
+        fs::write(
+            dir.join("hash_manifest.tsv"),
+            "source_id\tstatus\nchembl\tready\n",
+        )
+        .expect("integrity records");
+        fs::write(
+            dir.join("license_manifest.tsv"),
+            "source_id\tstatus\nchembl\trecorded\n",
+        )
+        .expect("license records");
+    }
+
     #[test]
     fn setup_repair_uses_complete_installer_when_available() {
         let workspace_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -2630,6 +2746,43 @@ mod tests {
         assert!(!text.contains("runtime_backend"));
         assert!(!text.contains("missing_components_count"));
         assert!(!text.contains("not_configured"));
+    }
+
+    #[test]
+    fn setup_installer_progress_hides_paths_and_internal_fields() {
+        let payload = setup_installer_summary(
+            r#"{"status":"needs_repair","progress":{"status":"running","stage":"下载数据库","current_resource":"ChEMBL","completed_steps":2,"total_steps":8,"failed_steps":0,"bytes_downloaded":1048576,"bytes_total":2097152,"percent":50,"message":"正在下载数据库资源","updated_at":123,"path":"D:/hidden/store/download.part","sha256":"abc123","manifest":"download_execution_manifest.tsv"}}"#,
+        )
+        .expect("installer json");
+
+        assert_eq!(payload["progress"]["status"], "running");
+        assert_eq!(payload["progress"]["stage"], "下载数据库");
+        assert_eq!(payload["progress"]["current_resource"], "ChEMBL");
+        assert_eq!(payload["progress"]["percent"], 50);
+        assert_eq!(payload["progress"]["bytes_downloaded"], 1048576);
+        assert_eq!(payload["progress"]["bytes_total"], 2097152);
+        let text = payload.to_string();
+        assert!(!text.contains("D:/hidden"));
+        assert!(!text.contains("sha256"));
+        assert!(!text.contains("abc123"));
+        assert!(!text.contains("download_execution_manifest"));
+    }
+
+    #[test]
+    fn source_record_gate_requires_all_source_integrity_and_license_rows() {
+        let root = std::env::temp_dir().join(format!("genoligand-source-records-{}", now_millis()));
+        let store = root.join("science_store");
+        write_ready_source_records(&store);
+        assert!(source_manifests_ready(&store.join("manifests")));
+
+        fs::write(
+            store.join("manifests/license_manifest.tsv"),
+            "source_id\tstatus\nchembl\tmissing\n",
+        )
+        .expect("license records");
+        assert!(!source_manifests_ready(&store.join("manifests")));
+
+        fs::remove_dir_all(&root).ok();
     }
 
     #[test]
@@ -3156,7 +3309,7 @@ mod tests {
         let missing = missing_resource_rows(&rows);
         let text = serde_json::to_string(&missing).expect("missing json");
 
-        assert_eq!(missing.len(), 7);
+        assert_eq!(missing.len(), 8);
         assert!(text.contains("科学仓库"));
         assert!(text.contains("已知蛋白索引"));
         assert!(text.contains("宏基因组索引"));
@@ -3164,6 +3317,7 @@ mod tests {
         assert!(text.contains("计算工具"));
         assert!(text.contains("安装状态"));
         assert!(text.contains("科学资源状态"));
+        assert!(text.contains("来源与许可记录"));
         assert!(text.contains("运行安装/修复"));
         assert!(!text.contains("science_store_manifest"));
         assert!(!text.contains("known_targets.tsv"));
