@@ -1,0 +1,184 @@
+﻿.shell {
+  min-height: 100vh;
+  display: grid;
+  grid-template-columns: 272px minmax(0, 1fr);
+}
+
+.side {
+  position: sticky;
+  top: 0;
+  height: 100vh;
+  display: flex;
+  flex-direction: column;
+  gap: 20px;
+  padding: 22px 18px;
+  border-right: 1px solid var(--line);
+  background: var(--side);
+}
+
+.brand {
+  display: flex;
+  gap: 12px;
+  align-items: center;
+  min-width: 0;
+}
+
+.brand strong {
+  display: block;
+  font-size: 18px;
+  letter-spacing: 0;
+}
+
+.brand span,
+.muted {
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.mark {
+  width: 42px;
+  height: 42px;
+  flex: 0 0 auto;
+  display: grid;
+  place-items: center;
+  border: 1px solid var(--accent);
+  color: var(--accent);
+  font-weight: 800;
+}
+
+.steps {
+  display: grid;
+  gap: 8px;
+}
+
+.step {
+  width: 100%;
+  min-height: 42px;
+  text-align: left;
+  border: 1px solid transparent;
+  color: var(--muted);
+  background: transparent;
+  padding: 10px 12px;
+  border-radius: 8px;
+  cursor: pointer;
+}
+
+.step:hover,
+.step.active {
+  color: var(--text);
+  background: var(--surface-2);
+  border-color: var(--line);
+}
+
+.step:disabled,
+.step.disabled {
+  cursor: not-allowed;
+  color: var(--soft);
+  background: transparent;
+  border-color: transparent;
+}
+
+.step:disabled:hover,
+.step.disabled:hover {
+  color: var(--soft);
+  background: transparent;
+  border-color: transparent;
+}
+
+.side-status {
+  margin-top: auto;
+  display: grid;
+  gap: 10px;
+}
+
+.main {
+  min-width: 0;
+  padding: 26px;
+}
+
+.top {
+  display: flex;
+  justify-content: space-between;
+  gap: 18px;
+  align-items: flex-start;
+  margin-bottom: 22px;
+}
+
+h1,
+h2,
+h3 {
+  margin: 0;
+  line-height: 1.2;
+}
+
+h1 {
+  font-size: clamp(26px, 3vw, 38px);
+  letter-spacing: 0;
+}
+
+h2 {
+  font-size: 18px;
+}
+
+h3 {
+  font-size: 15px;
+}
+
+p {
+  margin: 8px 0 0;
+  color: var(--muted);
+}
+
+.compact-list {
+  margin: 8px 0 0;
+  padding-left: 18px;
+  color: var(--muted);
+}
+
+.compact-list li + li {
+  margin-top: 4px;
+}
+
+.page {
+  min-width: 0;
+}
+
+.panel-grid {
+  display: grid;
+  grid-template-columns: repeat(12, minmax(0, 1fr));
+  gap: 16px;
+}
+
+.panel {
+  grid-column: span 6;
+  min-width: 0;
+  background: var(--surface);
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  padding: 16px;
+  box-shadow: var(--shadow);
+}
+
+.panel.full {
+  grid-column: 1 / -1;
+}
+
+.panel.third {
+  grid-column: span 4;
+}
+
+.panel.compact {
+  padding: 14px;
+}
+
+.panel-header {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 12px;
+  margin-bottom: 14px;
+}
+
+.panel-header p {
+  max-width: 74ch;
+}

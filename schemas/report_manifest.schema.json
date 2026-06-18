@@ -1,0 +1,16 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://genoligand.local/schemas/report_manifest.schema.json",
+  "title": "GenoLigand Report Manifest",
+  "type": "object",
+  "required": ["report_id", "run_id", "candidate_count", "artifact_ids"],
+  "additionalProperties": false,
+  "properties": {
+    "report_id": { "type": "string", "minLength": 1 },
+    "run_id": { "type": "string", "minLength": 1 },
+    "candidate_count": { "type": "integer", "minimum": 0 },
+    "artifact_ids": { "type": "array", "items": { "type": "string" } },
+    "generated_at": { "type": "string" },
+    "interpretation_boundary": { "type": "string" }
+  }
+}

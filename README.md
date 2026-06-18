@@ -1,56 +1,47 @@
 # GenoLigand
 
-GenoLigand 是本地运行的靶点发现科研软件。它的核心目标是：用户输入一个物质、序列或结构后，软件先计算其相互作用特征，再在已知蛋白数据库和宏基因组潜在序列空间中比对，给出可能靶点的计算预测、排序和证据链。
+GenoLigand 是本地运行的科研软件，用于从小分子、多肽、蛋白质配体、复合物结构或自定义基因组/宏基因组输入出发，计算相互作用特征，并在已知蛋白数据库与潜在序列空间中排序候选靶点。
 
-GenoLigand 不声称实验验证、体内结合、药效或机制结论。所有结论都必须表述为计算预测。
+## 安装并启动
 
-## 一条命令准备并启动
-
-```powershell
-cd D:\Project\rust\GenoLigand
-python scripts\setup\install_complete_scientific.py --start-webui
-```
-
-打开：
-
-```text
-http://127.0.0.1:19090/
-```
-
-该命令会选择用户数据目录作为科学仓库，检查工具、数据库来源、索引和修复动作，然后启动本地 WebUI。发行包或管理员可以预置数据源目录；普通用户不需要配置数据库路径。
-
-如果数据库、索引、计算工具或大型科学资源尚未闭合，该命令仍会打开本地工作台，并在页面中显示安装/修复动作；运行流程会保持阻塞，不会生成候选、分数或报告。
-
-## 准备科学仓库
-
-安装流程负责准备已知蛋白数据库、宏基因组潜在序列索引、结构互作索引、计算工具记录、许可证和来源记录。普通用户不需要配置数据库路径。维护人员需要重建或修复科学仓库时，可单独运行：
+Windows / WSL2：
 
 ```powershell
-python scripts\setup\install_complete_scientific.py
+.\install.ps1
 ```
 
-科学仓库由安装流程维护。缺少研究输入、数据库索引、必要工具、安装状态或科学资源状态时，主流程阻塞并输出零候选。
+Linux：
 
-## 主流程
-
-```text
-输入 -> 配置 -> 检查 -> 运行 -> 结果 -> 导出
+```bash
+./install.sh
 ```
 
-后台流程会完成输入整理、特征计算、已知数据库比对、宏基因组潜在序列比对、结构互作索引比对、候选靶点排序和证据报告生成。对接和短动力学只在当前运行已经产生对应计算产物时纳入；没有产物时保持空结果，不生成替代结论。
+安装入口会准备 `gls-cli`、`gls-server`、Python worker、科学工具、数据库仓库和索引。完成后打开本地 WebUI，输入自己的研究对象，按 `Input -> Configure -> Check -> Run -> Results -> Export` 完成一次运行。
 
-支持的输入类型：
+## 用户流程
 
-- 小分子：SMILES、SDF、MOL2、化合物名称或登记号。
-- 多肽：短肽序列、修饰说明或结构文件。
-- 蛋白质配体：FASTA、蛋白序列或结构文件。
-- 复合物：已有蛋白-配体结构。
-- 自定义基因组/宏基因组：基因组、宏基因组、转录组或蛋白序列文件。
+1. 在输入区选择小分子、多肽、蛋白质配体、复合物结构或自定义基因组/宏基因组。
+2. 配置数据库范围、搜索范围、结构与动力学证据选项。
+3. 运行检查，确认输入、数据库、运行环境、GPU、存储和导出条件可用。
+4. 启动运行并在 Run Monitor 查看阶段、下一步动作、资源状态、日志和产物树。
+5. 在 Results 查看候选排序、候选详情、证据链、Genome/ORF、Structure/Patch、MD Summary。
+6. 导出科研报告、候选表、可复现包、项目包或支持包。
 
-## 主要输出
+## 科学结果边界
 
-- 科研报告。
-- 候选靶点排序表。
-- 候选证据链。
-- 结构与口袋摘要。
-- 动力学摘要。
+GenoLigand 输出的是计算预测结果。报告应表达候选假设、证据强度、优先级和后续实验验证建议，不表达已完成实验确认。
+
+每个候选、分数、结构摘要、动力学摘要、证据链和报告条目都必须追溯到 project、run、input、database、candidate 和 artifact。缺少有效输入、数据库、工具或运行产物时，界面显示阻塞状态和修复动作，不生成候选结果。
+
+## 开发结构
+
+仓库职责边界见 [docs/architecture.md](docs/architecture.md)。Nextflow 只调度 `gls-cli`，Rust 拥有主流程、候选排序、证据链和报告语义，Python worker 只执行 schema 约束的科学计算 primitive。
+
+常用开发检查：
+
+```bash
+cargo fmt --check
+cargo clippy --all-targets --all-features -- -D warnings
+cargo test --workspace
+python -m py_compile scripts/setup/install_complete_scientific.py
+```

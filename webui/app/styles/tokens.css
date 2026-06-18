@@ -1,0 +1,19 @@
+﻿:root {
+  color-scheme: dark;
+  --bg: #071013;
+  --side: #09161a;
+  --surface: #0d1b20;
+  --surface-2: #12262d;
+  --surface-3: #18343b;
+  --line: #25424a;
+  --line-strong: #38606a;
+  --text: #edf6f7;
+  --muted: #9fb5bc;
+  --soft: #6f8790;
+  --accent: #44d7c7;
+  --accent-2: #f5c46b;
+  --good: #73d79c;
+  --warn: #f2b563;
+  --bad: #ff8a8a;
+  --shadow: 0 14px 42px rgba(0, 0, 0, 0.22);
+}

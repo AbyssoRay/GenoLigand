@@ -1,0 +1,36 @@
+# GenoLigand 仓库职责边界
+
+GenoLigand 的产品职责是从用户输入的物质、序列或结构出发，计算相互作用特征，并在已知蛋白与宏基因组潜在序列空间中排序候选靶点。仓库结构必须服务这个主流程，普通用户界面保持干净，科学结果必须可追溯到输入、数据库、运行和产物。
+
+## 目录职责
+
+| 目录 | 唯一职责 | 不承担的职责 |
+| --- | --- | --- |
+| `crates/` | Rust 产品主逻辑、命令行、后端服务、主流程编排、候选排序、证据链、报告语义 | 直接保存运行产物或数据库状态 |
+| `python/` | 受 schema 约束的科学计算 worker primitive | 最终排序、最终分数、报告语义、用户主入口 |
+| `scripts/setup/` | 安装、环境准备、工具与数据库准备的内部实现 | 普通用户主入口文案 |
+| `scripts/databases/` | 数据库下载、校验、索引和迁移辅助 | 科学结果解释、候选排序 |
+| `scripts/validation/` | 静态检查、发布检查、契约验证 | 产品主流程执行 |
+| `scripts/cleanup/` | 清理候选识别、清理执行和发布前清洁检查 | 科学计算或报告渲染 |
+| `scripts/md/`、`scripts/structure/`、`scripts/plm/`、`scripts/similarity/` | 受控 worker/adapter 包装层 | WebUI、Nextflow 或用户直接调用的主流程入口 |
+| `configs/` | 静态规则、资源目录声明、adapter 注册表 | 本机数据库版本、hash、索引产物 |
+| `schemas/` | Rust、WebUI、Python worker、项目包之间的数据契约 | 运行产物、示例结果 |
+| `webui/` | 普通科研用户界面 | 开发者验收面板、内置候选、固定结果 |
+| `workflows/` | Nextflow 调度入口 | 直接调用科学脚本或拥有科学语义 |
+| `docs/` | 用户文档、架构文档、后续计划归档 | 本机运行状态 |
+| `tests/` | 安装、真实性、WebUI、端到端和干净发布防回归检查 | 生产数据存放 |
+
+## 产品规则
+
+- 普通用户首次打开必须看到干净工作台，不出现示例项目、测试 run、固定候选或开发者调试状态。
+- 普通用户界面不暴露 GitHub、commit、remote、schema、manifest、hash、raw JSON、gate、route 等开发者概念。
+- 无输入、无数据库、无工具或无运行产物时，结果页保持空状态并给出修复动作，不展示固定候选或预生成分数。
+- 所有候选、分数、结构、动力学摘要、证据链和报告都必须能追溯到 project、run、input、database、candidate 和 artifact。
+- Rust 拥有主流程、最终排序、最终分数、证据链、报告语义和用户可见解释。
+- Python worker 只执行科学计算 primitive，并通过 schema 化 job/result 与 Rust 交换数据。
+- Nextflow 只调度 `gls-cli`，不直接调用 `scripts/md/`、`scripts/structure/`、`scripts/plm/`、`scripts/similarity/`。
+- WebUI 和 `gls-server` 只通过正式 API 与 `gls-cli` 进入主流程；安装修复入口可以调用 `scripts/setup/install_complete_scientific.py`。
+
+## 发布边界
+
+仓库只保存代码、配置规则、schema、文档和测试。安装后生成的数据库 manifest、工具版本、hash、索引和运行产物进入用户 science store 或项目运行目录，不写入仓库配置目录。发布前必须通过 clean release 检查，确认根目录没有运行产物、缓存、旧验收目录、测试截图或临时文件。

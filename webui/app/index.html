@@ -17,12 +17,12 @@
           </div>
         </div>
         <nav class="steps" aria-label="工作流程">
-          <button data-step="input" class="step active">输入</button>
-          <button data-step="configure" class="step">配置</button>
-          <button data-step="check" class="step">检查</button>
-          <button data-step="run" class="step">运行</button>
-          <button data-step="results" class="step">结果</button>
-          <button data-step="export" class="step">导出</button>
+          <button data-step="input" class="step active">Input</button>
+          <button data-step="configure" class="step">Configure</button>
+          <button data-step="check" class="step">Check</button>
+          <button data-step="run" class="step">Run</button>
+          <button data-step="results" class="step">Results</button>
+          <button data-step="export" class="step">Export</button>
         </nav>
         <div class="side-status">
           <span data-health class="status-pill loading">连接中</span>
@@ -33,7 +33,7 @@
         <header class="top">
           <div>
             <h1 data-title>输入研究对象</h1>
-            <p data-subtitle>填写任一种研究输入，然后按流程检查、运行、查看结果。</p>
+            <p data-subtitle>填写一种研究输入，然后按流程检查、运行、查看结果。</p>
           </div>
           <div class="top-actions">
             <button class="button ghost" data-refresh>刷新状态</button>
@@ -46,6 +46,17 @@
         </section>
       </main>
     </div>
+    <script src="/state/app-state.js"></script>
+    <script src="/api/client.js"></script>
+    <script src="/pages/input.js"></script>
+    <script src="/pages/configure.js"></script>
+    <script src="/pages/check.js"></script>
+    <script src="/pages/run.js"></script>
+    <script src="/pages/results.js"></script>
+    <script src="/pages/export.js"></script>
+    <script src="/core/actions.js"></script>
+    <script src="/core/selectors.js"></script>
+    <script src="/components/common.js"></script>
     <script src="/app.js"></script>
   </body>
 </html>

@@ -1,0 +1,26 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://genoligand.local/schemas/diagnostics.schema.json",
+  "title": "GenoLigand Diagnostics",
+  "type": "object",
+  "required": ["status", "checks"],
+  "additionalProperties": false,
+  "properties": {
+    "status": { "type": "string" },
+    "checks": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["id", "label", "ready", "next_action"],
+        "additionalProperties": false,
+        "properties": {
+          "id": { "type": "string" },
+          "label": { "type": "string" },
+          "ready": { "type": "boolean" },
+          "next_action": { "type": "string" },
+          "details": { "type": "object", "additionalProperties": true }
+        }
+      }
+    }
+  }
+}

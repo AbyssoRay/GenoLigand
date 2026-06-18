@@ -1,0 +1,11 @@
+# GenoLigand schema-bound scientific worker runtime, CUDA OpenMM profile.
+numpy
+pandas
+rdkit
+openbabel-wheel
+openmm
+pdbfixer
+openff-toolkit
+mdtraj
+MDAnalysis
+jsonschema

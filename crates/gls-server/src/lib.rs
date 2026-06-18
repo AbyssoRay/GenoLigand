@@ -8,7 +8,7 @@ use std::process::Command;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 pub const PRODUCT_NAME: &str = "GenoLigand Local WebUI";
-pub const PRODUCT_VERSION: &str = "0.9.3";
+pub const PRODUCT_VERSION: &str = "0.9.4";
 
 const REQUIRED_TOOL_IDS: &[&str] = &[
     "java",
@@ -92,21 +92,12 @@ fn route(
                 include_str!("../../../webui/app/index.html").to_string(),
             );
         }
-        ("GET", "/styles.css") => {
-            return (
-                200,
-                "text/css; charset=utf-8",
-                include_str!("../../../webui/app/styles.css").to_string(),
-            );
-        }
-        ("GET", "/app.js") => {
-            return (
-                200,
-                "application/javascript; charset=utf-8",
-                include_str!("../../../webui/app/app.js").to_string(),
-            );
-        }
         _ => {}
+    }
+    if method == "GET"
+        && let Some(response) = web_asset_response(path, options)
+    {
+        return response;
     }
     if let Some(response) = route_user_project(method, path, options, request_body) {
         return response;
@@ -156,6 +147,54 @@ fn route(
         }
     };
     (200, "application/json; charset=utf-8", value.to_string())
+}
+
+fn web_asset_response(path: &str, _options: &ServerOptions) -> Option<(u16, &'static str, String)> {
+    let rel = path.strip_prefix('/')?;
+    if rel.contains("..") || rel.contains('\\') || !is_allowed_web_asset(rel) {
+        return None;
+    }
+    let body = match rel {
+        "app.js" => include_str!("../../../webui/app/app.js"),
+        "styles.css" => include_str!("../../../webui/app/styles.css"),
+        "state/app-state.js" => include_str!("../../../webui/app/state/app-state.js"),
+        "api/client.js" => include_str!("../../../webui/app/api/client.js"),
+        "pages/input.js" => include_str!("../../../webui/app/pages/input.js"),
+        "pages/configure.js" => include_str!("../../../webui/app/pages/configure.js"),
+        "pages/check.js" => include_str!("../../../webui/app/pages/check.js"),
+        "pages/run.js" => include_str!("../../../webui/app/pages/run.js"),
+        "pages/results.js" => include_str!("../../../webui/app/pages/results.js"),
+        "pages/export.js" => include_str!("../../../webui/app/pages/export.js"),
+        "core/actions.js" => include_str!("../../../webui/app/core/actions.js"),
+        "core/selectors.js" => include_str!("../../../webui/app/core/selectors.js"),
+        "components/common.js" => include_str!("../../../webui/app/components/common.js"),
+        "styles/tokens.css" => include_str!("../../../webui/app/styles/tokens.css"),
+        "styles/base.css" => include_str!("../../../webui/app/styles/base.css"),
+        "styles/layout.css" => include_str!("../../../webui/app/styles/layout.css"),
+        "styles/components.css" => include_str!("../../../webui/app/styles/components.css"),
+        "styles/pages.css" => include_str!("../../../webui/app/styles/pages.css"),
+        _ => return None,
+    };
+    Some((200, web_asset_content_type(rel), body.to_string()))
+}
+
+fn is_allowed_web_asset(rel: &str) -> bool {
+    rel == "app.js"
+        || rel == "styles.css"
+        || rel.starts_with("state/")
+        || rel.starts_with("api/")
+        || rel.starts_with("pages/")
+        || rel.starts_with("core/")
+        || rel.starts_with("components/")
+        || rel.starts_with("styles/")
+}
+
+fn web_asset_content_type(rel: &str) -> &'static str {
+    if rel.ends_with(".css") {
+        "text/css; charset=utf-8"
+    } else {
+        "application/javascript; charset=utf-8"
+    }
 }
 
 fn route_project(
@@ -3003,11 +3042,7 @@ mod tests {
 
     #[test]
     fn bundled_user_web_assets_avoid_public_debug_and_mojibake_language() {
-        let user_assets = [
-            include_str!("../../../webui/app/index.html"),
-            include_str!("../../../webui/app/app.js"),
-        ]
-        .join("\n");
+        let user_assets = web_user_assets();
         let forbidden_terms = forbidden_user_asset_terms();
 
         for term in &forbidden_terms {
@@ -3050,9 +3085,62 @@ mod tests {
         ]
     }
 
+    fn workspace_root() -> PathBuf {
+        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .and_then(Path::parent)
+            .expect("workspace root")
+            .to_path_buf()
+    }
+
+    fn web_asset_text(rel: &str) -> String {
+        fs::read_to_string(workspace_root().join("webui").join("app").join(rel))
+            .unwrap_or_else(|err| panic!("read web asset {rel}: {err}"))
+    }
+
+    fn web_user_assets() -> String {
+        [
+            "index.html",
+            "app.js",
+            "state/app-state.js",
+            "api/client.js",
+            "pages/input.js",
+            "pages/configure.js",
+            "pages/check.js",
+            "pages/run.js",
+            "pages/results.js",
+            "pages/export.js",
+            "core/actions.js",
+            "core/selectors.js",
+            "components/common.js",
+        ]
+        .iter()
+        .map(|rel| web_asset_text(rel))
+        .collect::<Vec<_>>()
+        .join("\n")
+    }
+
+    #[test]
+    fn split_user_web_assets_are_served_from_whitelist() {
+        let options = server_options(workspace_root());
+
+        let (status, content_type, body) = route("GET", "/state/app-state.js", &options, "");
+        assert_eq!(status, 200);
+        assert_eq!(content_type, "application/javascript; charset=utf-8");
+        assert!(body.contains("const state ="));
+
+        let (status, content_type, body) = route("GET", "/styles/tokens.css", &options, "");
+        assert_eq!(status, 200);
+        assert_eq!(content_type, "text/css; charset=utf-8");
+        assert!(body.contains("--accent"));
+
+        let (status, _, _) = route("GET", "/../Cargo.toml", &options, "");
+        assert_eq!(status, 404);
+    }
+
     #[test]
     fn first_launch_input_view_does_not_render_resource_status_panels() {
-        let app = include_str!("../../../webui/app/app.js");
+        let app = web_asset_text("pages/input.js");
         let start = app.find("function renderInput()").expect("renderInput");
         let end = app
             .find("function renderInputTypeCard")
@@ -3067,10 +3155,9 @@ mod tests {
 
     #[test]
     fn run_monitor_export_list_only_renders_downloadable_artifacts() {
-        let app = include_str!("../../../webui/app/app.js");
+        let app = web_asset_text("core/selectors.js");
         let start = app.find("function artifactRows()").expect("artifactRows");
-        let end = app.find("function table(").expect("table");
-        let artifact_rows = &app[start..end];
+        let artifact_rows = &app[start..];
 
         assert!(artifact_rows.contains("filter((item) => item.exists)"));
         assert!(artifact_rows.contains("可下载"));
@@ -3079,49 +3166,48 @@ mod tests {
 
     #[test]
     fn export_view_only_renders_downloadable_artifacts() {
-        let app = include_str!("../../../webui/app/app.js");
+        let app = web_asset_text("pages/export.js");
+        let selectors = web_asset_text("core/selectors.js");
         let start = app.find("function renderExport()").expect("renderExport");
-        let end = app.find("function collectForm()").expect("collectForm");
-        let export_view = &app[start..end];
+        let export_view = &app[start..];
 
-        assert!(export_view.contains("available.map"));
+        assert!(selectors.contains("available.map"));
         assert!(export_view.contains("当前运行还没有可导出材料"));
-        assert!(export_view.contains("下载"));
+        assert!(selectors.contains("下载"));
         assert!(!export_view.contains("当前运行未生成"));
-        assert!(!export_view.contains("不可用"));
+        assert!(!selectors.contains("不可用"));
     }
 
     #[test]
     fn run_monitor_only_links_to_results_after_completion() {
-        let app = include_str!("../../../webui/app/app.js");
-        let start = app.find("function renderRun()").expect("renderRun");
-        let end = app.find("function renderStage").expect("renderStage");
-        let render_run = &app[start..end];
+        let render_run = web_asset_text("pages/run.js");
+        let selectors = web_asset_text("core/selectors.js");
 
         assert!(render_run.contains("canViewResults()"));
         assert!(!render_run.contains("state.run ? \"\" : \"disabled\""));
-        assert!(app.contains("function canViewResults()"));
-        assert!(app.contains("return state.run?.state === \"completed\""));
+        assert!(selectors.contains("function canViewResults()"));
+        assert!(selectors.contains("return state.run?.state === \"completed\""));
     }
 
     #[test]
     fn workflow_navigation_unlocks_results_only_after_completed_run() {
-        let app = include_str!("../../../webui/app/app.js");
+        let app = web_asset_text("app.js");
+        let selectors = web_asset_text("core/selectors.js");
 
-        assert!(app.contains("function canOpenStep(step)"));
-        assert!(app.contains("if (step === \"input\") return true"));
+        assert!(selectors.contains("function canOpenStep(step)"));
+        assert!(selectors.contains("if (step === \"input\") return true"));
         assert!(
-            app.contains(
+            selectors.contains(
                 "if (step === \"results\" || step === \"export\") return canViewResults();"
             )
         );
-        assert!(app.contains("button.disabled = !enabled"));
+        assert!(selectors.contains("button.disabled = !enabled"));
         assert!(app.contains("if (!canOpenStep(step)) return;"));
     }
 
     #[test]
     fn saving_input_clears_stale_run_state_in_webui() {
-        let app = include_str!("../../../webui/app/app.js");
+        let app = web_asset_text("core/actions.js");
         let start = app.find("async function saveInput()").expect("saveInput");
         let end = app[start..]
             .find("async function runPreflight()")
@@ -3136,7 +3222,7 @@ mod tests {
 
     #[test]
     fn visual_result_sections_use_clear_not_ready_language() {
-        let app = include_str!("../../../webui/app/app.js");
+        let app = web_asset_text("pages/results.js");
         assert!(app.contains("图形查看未就绪"));
         assert!(app.contains("轨迹图未就绪"));
         assert!(!app.contains("未接入可用输出"));

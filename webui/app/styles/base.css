@@ -1,0 +1,22 @@
+﻿* {
+  box-sizing: border-box;
+}
+
+body {
+  margin: 0;
+  background: var(--bg);
+  color: var(--text);
+  font: 14px/1.55 "Microsoft YaHei UI", "Microsoft YaHei", "PingFang SC",
+    "Noto Sans CJK SC", "Segoe UI", system-ui, sans-serif;
+}
+
+button,
+input,
+textarea,
+select {
+  font: inherit;
+}
+
+button {
+  touch-action: manipulation;
+}

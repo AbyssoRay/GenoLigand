@@ -1,0 +1,19 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://genoligand.local/schemas/run.schema.json",
+  "title": "GenoLigand Run",
+  "type": "object",
+  "required": ["run_id", "project_id", "state", "input_manifest_id", "artifact_ids"],
+  "additionalProperties": false,
+  "properties": {
+    "run_id": { "type": "string", "minLength": 1 },
+    "project_id": { "type": "string", "minLength": 1 },
+    "state": { "type": "string" },
+    "state_label": { "type": "string" },
+    "input_manifest_id": { "type": ["string", "null"] },
+    "database_manifest_id": { "type": ["string", "null"] },
+    "artifact_ids": { "type": "array", "items": { "type": "string" } },
+    "started_at": { "type": ["string", "null"] },
+    "finished_at": { "type": ["string", "null"] }
+  }
+}
