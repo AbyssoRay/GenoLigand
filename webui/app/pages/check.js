@@ -9,7 +9,7 @@
         <div class="panel-header">
           <div>
             <h2>预检查</h2>
-            <p>通过后即可开始运行；未通过时不会生成候选。</p>
+            <p>确认当前输入、数据库和运行环境是否可以开始计算；未通过时会给出下一步处理动作。</p>
           </div>
           <span class="status-pill ${allReady ? "ready" : "blocked"}">${allReady ? "可以运行" : "需要处理"}</span>
         </div>
@@ -23,8 +23,8 @@
       <section class="panel full">
         <div class="panel-header">
           <div>
-            <h2>安装与修复</h2>
-            <p>本机缺少数据库、索引或工具记录时，可以先运行修复动作。</p>
+            <h2>修复中心</h2>
+            <p>这里汇总缺少什么、能否运行以及下一步如何处理。</p>
           </div>
           <span class="status-pill ${setupReady ? "ready" : "blocked"}">${setupReady ? "已就绪" : "需要准备"}</span>
         </div>
@@ -78,7 +78,8 @@ function installerProgressSummary() {
   const percent = boundedPercent(progress.percent);
   const failed = Number(progress.failed_steps || 0);
   const ok = progress.status === "ready";
-  const blocked = failed > 0 || ["failed", "needs_repair"].includes(progress.status);
+  const paused = progress.status === "paused";
+  const blocked = !paused && (failed > 0 || ["failed", "needs_repair"].includes(progress.status));
   const bytes = progress.bytes_total
     ? `${formatBytes(progress.bytes_downloaded || 0)} / ${formatBytes(progress.bytes_total || 0)}`
     : formatBytes(progress.bytes_downloaded || 0);
@@ -89,7 +90,7 @@ function installerProgressSummary() {
           <strong>${escapeHtml(progress.stage || "安装/修复")}</strong>
           <span>${escapeHtml(progress.current_resource || "科学资源")}</span>
         </div>
-        <span class="status-pill ${ok ? "ready" : blocked ? "blocked" : "loading"}">${percent}%</span>
+        <span class="status-pill ${ok ? "ready" : blocked ? "blocked" : paused ? "waiting" : "loading"}">${paused ? "已暂停" : `${percent}%`}</span>
       </div>
       <div class="progress-bar" role="progressbar" aria-valuemin="0" aria-valuemax="100" aria-valuenow="${percent}">
         <span style="width:${percent}%"></span>

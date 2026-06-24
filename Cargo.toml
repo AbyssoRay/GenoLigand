@@ -9,7 +9,7 @@ members = [
 [workspace.package]
 edition = "2024"
 license = "LicenseRef-EULA"
-version = "0.9.5"
+version = "0.9.6"
 
 [workspace.lints.rust]
 unsafe_code = "forbid"

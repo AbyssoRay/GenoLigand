@@ -4,11 +4,11 @@ use std::fs;
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Stdio};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 pub const PRODUCT_NAME: &str = "GenoLigand Local WebUI";
-pub const PRODUCT_VERSION: &str = "0.9.5";
+pub const PRODUCT_VERSION: &str = "0.9.6";
 
 const REQUIRED_TOOL_IDS: &[&str] = &[
     "java",
@@ -23,6 +23,7 @@ const REQUIRED_TOOL_IDS: &[&str] = &[
     "mdtraj",
     "mdanalysis",
 ];
+const INSTALL_PROGRESS_STALE_SECONDS: u64 = 30 * 60;
 
 #[derive(Clone, Debug)]
 pub struct ServerOptions {
@@ -341,6 +342,9 @@ fn user_projects_json(options: &ServerOptions) -> Value {
         for entry in entries.flatten() {
             if entry.file_type().map(|file| file.is_dir()).unwrap_or(false) {
                 let id = entry.file_name().to_string_lossy().to_string();
+                if !project_visible_to_user(options, &id) {
+                    continue;
+                }
                 let project = read_project(options, &id);
                 projects.push(user_project_summary(&project));
             }
@@ -378,11 +382,12 @@ fn create_project_record(options: &ServerOptions) -> Result<Value, String> {
     if let Err(err) = fs::create_dir_all(dir.join("runs")) {
         return Err(err.to_string());
     }
-    let _ = write_text(
-        &dir.join("input_manifest.json"),
-        "{\"inputs\":[],\"files\":[],\"status\":\"waiting_for_user_input\"}\n",
-    );
     Ok(read_project(options, &project_id))
+}
+
+fn project_visible_to_user(options: &ServerOptions, project_id: &str) -> bool {
+    let dir = project_dir(options, project_id);
+    input_has_user_value(&dir.join("input_manifest.json")) || dir.join("latest_run_id.txt").exists()
 }
 
 fn user_project_summary(project: &Value) -> Value {
@@ -1732,31 +1737,41 @@ fn user_setup_status_json(options: &ServerOptions) -> Value {
 fn user_setup_progress_json(options: &ServerOptions) -> Value {
     let path = science_store_path(options).join("install_progress.json");
     let value = read_json_or(&path, json!({}));
-    setup_user_install_progress(Some(&value))
+    let mut progress = setup_user_install_progress(Some(&value));
+    if setup_progress_is_stale(&progress) {
+        progress["status"] = json!("needs_repair");
+        progress["failed_steps"] = json!(1);
+        progress["message"] =
+            json!("安装进度长时间没有更新，请重新运行安装/修复并检查网络、磁盘和依赖状态。");
+    }
+    progress
 }
 
 fn run_setup_repair_json(options: &ServerOptions) -> Value {
+    if setup_progress_is_running(options) {
+        let ready = preflight_store_ready(options);
+        let required = required_resource_rows(&science_store_path(options));
+        return json!({
+            "database_ready": ready,
+            "message": "安装/修复正在运行，请保持页面打开并查看进度。",
+            "checks": required,
+            "missing": missing_resource_rows(&required),
+            "progress": user_setup_progress_json(options)
+        });
+    }
     let command = setup_repair_command(options);
-    let output = Command::new(&command[0])
+    let started = Command::new(&command[0])
         .args(&command[1..])
         .current_dir(&options.workspace_root)
-        .output();
-    let (message, installer_payload) = match output {
-        Ok(output) if output.status.success() => {
-            let stdout = String::from_utf8_lossy(&output.stdout);
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn();
+    let (message, installer_payload) = match started {
+        Ok(_) => {
+            write_setup_progress_start(options);
             (
-                "修复动作已执行。".to_string(),
-                setup_installer_summary(&stdout),
-            )
-        }
-        Ok(output) => {
-            let stdout = String::from_utf8_lossy(&output.stdout);
-            (
-                format!(
-                    "修复动作未完成，退出码 {:?}。",
-                    output.status.code().unwrap_or_default()
-                ),
-                setup_installer_summary(&stdout),
+                "安装/修复已启动，正在后台准备科学资源。".to_string(),
+                None::<Value>,
             )
         }
         Err(err) => (format!("修复动作无法启动：{err}"), None),
@@ -1784,6 +1799,53 @@ fn run_setup_repair_json(options: &ServerOptions) -> Value {
     }
     payload["progress"] = user_setup_progress_json(options);
     payload
+}
+
+fn setup_progress_is_running(options: &ServerOptions) -> bool {
+    let value = read_json_or(
+        &science_store_path(options).join("install_progress.json"),
+        json!({}),
+    );
+    let progress = setup_user_install_progress(Some(&value));
+    progress.get("status").and_then(Value::as_str) == Some("running")
+        && !setup_progress_is_stale(&progress)
+}
+
+fn setup_progress_is_stale(progress: &Value) -> bool {
+    if progress.get("status").and_then(Value::as_str) != Some("running") {
+        return false;
+    }
+    let updated_at = progress
+        .get("updated_at")
+        .and_then(|value| {
+            value
+                .as_u64()
+                .or_else(|| value.as_str().and_then(|text| text.parse::<u64>().ok()))
+        })
+        .unwrap_or(0);
+    updated_at > 0 && now_seconds().saturating_sub(updated_at) > INSTALL_PROGRESS_STALE_SECONDS
+}
+
+fn write_setup_progress_start(options: &ServerOptions) {
+    let store = science_store_path(options);
+    let _ = fs::create_dir_all(&store);
+    let payload = json!({
+        "status": "running",
+        "stage": "准备安装",
+        "current_resource": "科学资源",
+        "completed_steps": 0,
+        "total_steps": 6,
+        "failed_steps": 0,
+        "bytes_downloaded": 0,
+        "bytes_total": "",
+        "percent": 0,
+        "message": "安装/修复已启动，正在准备科学资源。",
+        "updated_at": now_seconds()
+    });
+    let _ = write_text(
+        &store.join("install_progress.json"),
+        &(payload.to_string() + "\n"),
+    );
 }
 
 fn user_setup_install_plan_json(options: &ServerOptions) -> Value {
@@ -1858,6 +1920,7 @@ fn python_invocation() -> Vec<String> {
     }
 }
 
+#[cfg(test)]
 fn setup_installer_summary(stdout: &str) -> Option<Value> {
     let payload: Value = serde_json::from_str(stdout.trim()).ok()?;
     let downloads = payload
@@ -1939,6 +2002,7 @@ fn setup_user_install_progress(progress: Option<&Value>) -> Value {
     })
 }
 
+#[cfg(test)]
 fn setup_user_source_manifests(source_manifests: Option<&Value>) -> Value {
     let Some(source_manifests) = source_manifests else {
         return json!({});
@@ -1984,6 +2048,7 @@ fn setup_user_source_manifests(source_manifests: Option<&Value>) -> Value {
     })
 }
 
+#[cfg(test)]
 fn setup_user_tool_environment(tool_environment: Option<&Value>) -> Value {
     let Some(tool_environment) = tool_environment else {
         return json!({});
@@ -2019,6 +2084,7 @@ fn setup_user_tool_environment(tool_environment: Option<&Value>) -> Value {
     })
 }
 
+#[cfg(test)]
 fn setup_user_resources(resources: Option<&Value>) -> Value {
     let Some(resources) = resources else {
         return json!({});
@@ -2077,6 +2143,7 @@ fn setup_user_resources(resources: Option<&Value>) -> Value {
     })
 }
 
+#[cfg(test)]
 fn setup_user_external_sources(external_sources: Option<&Value>) -> Value {
     let Some(external_sources) = external_sources else {
         return json!({});
@@ -2134,6 +2201,7 @@ fn setup_user_external_sources(external_sources: Option<&Value>) -> Value {
     })
 }
 
+#[cfg(test)]
 fn friendly_resource_status(status: &str) -> &'static str {
     match status {
         "ready" => "\u{5c31}\u{7eea}",
@@ -2924,6 +2992,13 @@ fn now_millis() -> u128 {
         .unwrap_or(0)
 }
 
+fn now_seconds() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_secs())
+        .unwrap_or(0)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3257,6 +3332,8 @@ mod tests {
     fn first_launch_user_workspace_has_no_seeded_projects_or_templates() {
         let root = std::env::temp_dir().join(format!("genoligand-first-launch-{}", now_millis()));
         let options = server_options(root.clone());
+        fs::create_dir_all(projects_root(&options).join("project-stale").join("runs"))
+            .expect("stale project dir");
         let payload = user_projects_json(&options);
 
         assert_eq!(payload["projects"].as_array().map(Vec::len), Some(0));
@@ -3476,15 +3553,55 @@ mod tests {
 
         let payload = create_user_project(&options);
         let text = payload.to_string();
+        let listed = user_projects_json(&options);
 
         assert!(payload.get("project").is_some());
         assert!(payload["project"].get("project_id").is_some());
         assert!(payload.get("message").is_some());
+        assert_eq!(listed["projects"].as_array().map(Vec::len), Some(0));
         assert!(payload.get("status").is_none());
         assert!(!text.contains("created"));
         assert!(!text.contains("supported_actions"));
         assert!(!text.contains("preflight"));
         assert!(!text.contains("export"));
+
+        fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn setup_progress_marks_stale_running_state_as_repairable() {
+        let root = std::env::temp_dir().join(format!("genoligand-stale-progress-{}", now_millis()));
+        let options = server_options(root.clone());
+        let store = science_store_path(&options);
+        fs::create_dir_all(&store).expect("store");
+        fs::write(
+            store.join("install_progress.json"),
+            json!({
+                "status": "running",
+                "stage": "下载数据库",
+                "current_resource": "ChEMBL",
+                "completed_steps": 1,
+                "total_steps": 6,
+                "failed_steps": 0,
+                "bytes_downloaded": 1024,
+                "bytes_total": 2048,
+                "percent": 50,
+                "message": "正在下载数据库资源",
+                "updated_at": 1
+            })
+            .to_string(),
+        )
+        .expect("progress");
+
+        let progress = user_setup_progress_json(&options);
+        assert_eq!(progress["status"], "needs_repair");
+        assert_eq!(progress["failed_steps"], 1);
+        assert!(
+            progress["message"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("安装进度长时间没有更新")
+        );
 
         fs::remove_dir_all(&root).ok();
     }

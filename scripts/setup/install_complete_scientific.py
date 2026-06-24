@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import concurrent.futures
 import csv
 import hashlib
 import json
@@ -67,6 +68,7 @@ RESERVED_WSL_DISTROS = {"Ubuntu-24.04"}
 DOWNLOAD_RETRIES = 3
 DOWNLOAD_TIMEOUT_SECONDS = 120
 DOWNLOAD_USER_AGENT = "GenoLigand-science-store-installer/0.9"
+RCSB_DOWNLOAD_WORKERS = 20
 ProgressCallback = Callable[[str, int, int | None, str], None]
 
 
@@ -760,6 +762,49 @@ def copy_with_progress(
     return copied
 
 
+def download_with_external_tool(
+    url: str,
+    partial: Path,
+    progress: ProgressCallback | None = None,
+) -> bool:
+    curl = shutil.which("curl.exe") or shutil.which("curl")
+    if not curl:
+        return False
+    command = [
+        curl,
+        "-L",
+        "--fail",
+        "--retry",
+        "5",
+        "--retry-delay",
+        "5",
+        "--connect-timeout",
+        "60",
+        "--output",
+        str(partial),
+        url,
+    ]
+    if partial.exists() and partial.stat().st_size > 0:
+        command.insert(2, "-C")
+        command.insert(3, "-")
+    if progress:
+        progress(
+            "downloading",
+            partial.stat().st_size if partial.exists() else 0,
+            None,
+            "内置下载中断，正在使用系统下载器继续下载",
+        )
+    completed = subprocess.run(command, capture_output=True, text=True, check=False)
+    if completed.returncode == 0 and partial.exists() and partial.stat().st_size > 0:
+        if progress:
+            progress("downloaded", partial.stat().st_size, None, "系统下载器已完成资源下载")
+        return True
+    if progress:
+        message = completed.stderr.strip() or completed.stdout.strip() or "系统下载器未完成下载"
+        progress("retrying", partial.stat().st_size if partial.exists() else 0, None, message[:180])
+    return False
+
+
 def copy_or_download(
     url: str,
     destination: Path,
@@ -767,6 +812,35 @@ def copy_or_download(
     progress: ProgressCallback | None = None,
 ) -> dict[str, object]:
     destination.parent.mkdir(parents=True, exist_ok=True)
+    if destination.exists() and destination.stat().st_size > 0:
+        if progress:
+            progress(
+                "verifying",
+                destination.stat().st_size,
+                destination.stat().st_size,
+                "正在校验已下载资源",
+            )
+        actual_sha256 = sha256_file(destination)
+        if not expected_sha256 or actual_sha256.lower() == expected_sha256.lower():
+            if progress:
+                progress(
+                    "completed",
+                    destination.stat().st_size,
+                    destination.stat().st_size,
+                    "资源已存在并通过校验",
+                )
+            return {
+                "status": "ready",
+                "bytes": destination.stat().st_size,
+                "sha256": actual_sha256,
+            }
+        if progress:
+            progress(
+                "retrying",
+                destination.stat().st_size,
+                destination.stat().st_size,
+                "已下载资源校验不一致，正在重新下载",
+            )
     partial = destination.with_suffix(destination.suffix + ".part")
     if url.startswith("file://"):
         source = Path(urllib.request.url2pathname(url[7:]))
@@ -831,7 +905,8 @@ def copy_or_download(
             if attempt < DOWNLOAD_RETRIES:
                 time.sleep(min(2 * attempt, 5))
         if last_error is not None:
-            raise last_error
+            if not download_with_external_tool(url, partial, progress):
+                raise last_error
     if progress:
         progress("verifying", partial.stat().st_size if partial.exists() else 0, partial.stat().st_size if partial.exists() else None, "正在校验资源")
     actual_sha256 = sha256_file(partial)
@@ -1017,7 +1092,7 @@ def prepare_downloads(catalog: Path, science_store: Path) -> dict[str, object]:
         result_status = "ready" if failed == 0 else "failed"
         write_install_progress(
             science_store,
-            status="running" if result_status == "ready" else "needs_repair",
+            status="ready" if result_status == "ready" else "needs_repair",
             stage="下载数据库",
             current_resource="数据库下载",
             completed_steps=ready + failed,
@@ -1081,7 +1156,11 @@ def extract_html_links(page_url: str, include_pattern: str) -> list[str]:
     return urls
 
 
-def sync_html_links(row: dict[str, str], target: Path) -> dict[str, object]:
+def sync_html_links(
+    row: dict[str, str],
+    target: Path,
+    progress: ProgressCallback | None = None,
+) -> dict[str, object]:
     source_url = row.get("source_url") or row.get("download_url") or row.get("landing_url")
     include_pattern = row.get("include_pattern", "")
     if not source_url:
@@ -1091,10 +1170,12 @@ def sync_html_links(row: dict[str, str], target: Path) -> dict[str, object]:
         return {"status": "failed", "bytes": 0, "sha256": "", "notes": "no_matching_links"}
     target.mkdir(parents=True, exist_ok=True)
     failures = []
-    for link in links:
+    for index, link in enumerate(links, start=1):
         destination = target / Path(urllib.parse.urlparse(link).path).name
+        if progress:
+            progress("downloading", index - 1, len(links), f"正在同步资源 {index}/{len(links)}")
         try:
-            copy_or_download(link, destination, row.get("sha256", "") or None)
+            copy_or_download(link, destination, row.get("sha256", "") or None, progress)
         except Exception as err:  # noqa: BLE001 - report per-source install failure
             failures.append(f"{link}:{err}")
     if failures:
@@ -1187,7 +1268,11 @@ def parse_gcs_location(row: dict[str, str]) -> tuple[str, str] | None:
     return bucket, prefix
 
 
-def sync_gcs_prefix(row: dict[str, str], target: Path) -> dict[str, object]:
+def sync_gcs_prefix(
+    row: dict[str, str],
+    target: Path,
+    progress: ProgressCallback | None = None,
+) -> dict[str, object]:
     parsed = parse_gcs_location(row)
     if not parsed:
         return {"status": "requires_resource_bundle", "bytes": 0, "sha256": "", "notes": "gcs_bucket_or_gs_url_required"}
@@ -1213,8 +1298,10 @@ def sync_gcs_prefix(row: dict[str, str], target: Path) -> dict[str, object]:
                 continue
             media_url = item.get("mediaLink") or f"https://storage.googleapis.com/{bucket}/{urllib.parse.quote(name)}"
             destination = target / rel_name
+            if progress:
+                progress("downloading", downloaded, None, f"正在同步对象 {rel_name}")
             try:
-                copy_or_download(media_url, destination, None)
+                copy_or_download(media_url, destination, None, progress)
                 downloaded += 1
             except Exception as err:  # noqa: BLE001 - report per-source install failure
                 failures.append(f"{name}:{err}")
@@ -1249,7 +1336,12 @@ def sync_rsync(row: dict[str, str], target: Path, env: dict[str, str] | None) ->
     }
 
 
-def sync_rcsb_ligand_bound_scope(row: dict[str, str], target: Path, science_store: Path) -> dict[str, object]:
+def sync_rcsb_ligand_bound_scope(
+    row: dict[str, str],
+    target: Path,
+    science_store: Path,
+    progress: ProgressCallback | None = None,
+) -> dict[str, object]:
     pdb_ids = ligand_bound_pdb_scope(science_store)
     if not pdb_ids:
         return {
@@ -1262,18 +1354,42 @@ def sync_rcsb_ligand_bound_scope(row: dict[str, str], target: Path, science_stor
     template = row.get("source_url") or "https://files.rcsb.org/download/{pdb_id}.cif.gz"
     downloaded = 0
     failures: list[str] = []
-    for pdb_id in sorted(pdb_ids):
+    sorted_ids = sorted(pdb_ids)
+    total = len(sorted_ids)
+    workers = max(1, int(os.environ.get("GENOLIGAND_RCSB_DOWNLOAD_WORKERS", str(RCSB_DOWNLOAD_WORKERS))))
+
+    def sync_one(pdb_id: str) -> tuple[str, bool, str]:
         upper = pdb_id.upper()
         destination = target / upper[1:3].lower() / f"{upper.lower()}.cif.gz"
         if path_has_payload(destination):
-            downloaded += 1
-            continue
+            return upper, True, "already_available"
         url = template.replace("{pdb_id}", upper).replace("{pdb_id_lower}", upper.lower())
         try:
             copy_or_download(url, destination, None)
-            downloaded += 1
+            return upper, True, "downloaded"
         except Exception as err:  # noqa: BLE001 - keep per-entry provenance in install manifest
-            failures.append(f"{upper}:{err}")
+            return upper, False, str(err)
+
+    last_progress = 0.0
+    completed = 0
+    with concurrent.futures.ThreadPoolExecutor(max_workers=min(workers, total)) as pool:
+        futures = [pool.submit(sync_one, pdb_id) for pdb_id in sorted_ids]
+        for future in concurrent.futures.as_completed(futures):
+            upper, ok, note = future.result()
+            completed += 1
+            if ok:
+                downloaded += 1
+            else:
+                failures.append(f"{upper}:{note}")
+            now = time.time()
+            if progress and (completed == 1 or completed % 25 == 0 or now - last_progress >= 30):
+                progress(
+                    "downloading",
+                    completed,
+                    total,
+                    f"正在同步 RCSB 结构 {completed}/{total}，并行任务 {min(workers, total)}",
+                )
+                last_progress = now
     scope_manifest = target.parent / "ligand_bound_pdb_scope.tsv"
     scope_manifest.parent.mkdir(parents=True, exist_ok=True)
     with scope_manifest.open("w", encoding="utf-8", newline="") as handle:
@@ -1311,10 +1427,10 @@ def ligand_bound_pdb_scope(science_store: Path) -> set[str]:
     ]:
         if path.exists():
             try:
-                pdb_ids.update(extract_pdb_ids(read_text_or_gzip(path)))
+                pdb_ids.update(extract_pdb_ids_from_source_file(path))
             except OSError:
                 continue
-    return {pdb_id for pdb_id in pdb_ids if len(pdb_id) == 4}
+    return {pdb_id for pdb_id in pdb_ids if valid_pdb_id(pdb_id)}
 
 
 def read_text_or_gzip(path: Path) -> str:
@@ -1327,7 +1443,38 @@ def read_text_or_gzip(path: Path) -> str:
 
 
 def extract_pdb_ids(text: str) -> set[str]:
-    return {match.group(0).upper() for match in re.finditer(r"\b[0-9][A-Za-z0-9]{3}\b", text)}
+    return {
+        match.group(0).upper()
+        for match in re.finditer(r"\b[0-9][A-Za-z0-9]{3}\b", text)
+        if valid_pdb_id(match.group(0))
+    }
+
+
+def valid_pdb_id(value: str) -> bool:
+    text = value.strip().upper()
+    return bool(re.fullmatch(r"[0-9][A-Z0-9]{3}", text)) and any(char.isalpha() for char in text)
+
+
+def extract_pdb_ids_from_source_file(path: Path) -> set[str]:
+    if path.suffix.lower() == ".csv":
+        text = read_text_or_gzip(path)
+        reader = csv.DictReader(text.splitlines())
+        ids: set[str] = set()
+        for row in reader:
+            for key in ("pdbFile", "pdb_id", "pdb", "PDB"):
+                value = (row.get(key) or "").strip()
+                if valid_pdb_id(value):
+                    ids.add(value.upper())
+                    break
+        return ids
+    ids: set[str] = set()
+    for line in read_text_or_gzip(path).splitlines():
+        if not line.strip() or line.startswith("#"):
+            continue
+        first = re.split(r"[\t, ]+", line.strip(), maxsplit=1)[0]
+        if valid_pdb_id(first):
+            ids.add(first.upper())
+    return ids
 
 
 def sync_external_row(
@@ -1335,23 +1482,24 @@ def sync_external_row(
     target: Path,
     science_store: Path,
     env: dict[str, str] | None,
+    progress: ProgressCallback | None = None,
 ) -> dict[str, object]:
     method = (row.get("sync_method") or "direct").strip().lower()
     if method == "html_links":
-        return sync_html_links(row, target)
+        return sync_html_links(row, target, progress)
     if method == "html_tree":
         return sync_html_tree(row, target)
     if method == "gcs_prefix":
-        return sync_gcs_prefix(row, target)
+        return sync_gcs_prefix(row, target, progress)
     if method == "rcsb_ligand_bound_scope":
-        return sync_rcsb_ligand_bound_scope(row, target, science_store)
+        return sync_rcsb_ligand_bound_scope(row, target, science_store, progress)
     if method == "rsync":
         return sync_rsync(row, target, env)
     location = direct_source_location(row)
     if not location:
         return {"status": "requires_resource_bundle", "bytes": 0, "sha256": "", "notes": "direct_download_or_local_source_required"}
     destination = external_destination(target, location)
-    result = copy_or_download(location, destination, row.get("sha256", "") or None)
+    result = copy_or_download(location, destination, row.get("sha256", "") or None, progress)
     return {
         "status": result["status"],
         "bytes": result["bytes"],
@@ -1507,7 +1655,38 @@ def sync_external_sources(
                 )
                 continue
             try:
-                result = sync_external_row(row, target, science_store, env)
+                completed_before = ready + failed + needs_action
+
+                def progress_callback(
+                    status_text: str,
+                    bytes_done: int,
+                    bytes_total: int | None,
+                    message: str,
+                ) -> None:
+                    write_install_progress(
+                        science_store,
+                        status="running" if status_text not in {"failed", "completed"} else status_text,
+                        stage="同步大型资源",
+                        current_resource=label,
+                        completed_steps=completed_before,
+                        total_steps=len(rows),
+                        failed_steps=failed,
+                        bytes_downloaded=bytes_done,
+                        bytes_total=bytes_total,
+                        message=message,
+                    )
+
+                write_install_progress(
+                    science_store,
+                    status="running",
+                    stage="同步大型资源",
+                    current_resource=label,
+                    completed_steps=completed_before,
+                    total_steps=len(rows),
+                    failed_steps=failed,
+                    message=f"正在同步 {label}",
+                )
+                result = sync_external_row(row, target, science_store, env, progress_callback)
                 if result["status"] == "ready":
                     ready += 1
                 elif result["status"] == "requires_resource_bundle":
@@ -1564,7 +1743,7 @@ def sync_external_sources(
         status = "ready" if ready == total and failed == 0 else "failed" if failed else "needs_sync"
         write_install_progress(
             science_store,
-            status="running" if status == "ready" else "needs_repair",
+            status="ready" if status == "ready" else "needs_repair",
             stage="同步大型资源",
             current_resource="大型资源同步",
             completed_steps=ready + failed + needs_action,

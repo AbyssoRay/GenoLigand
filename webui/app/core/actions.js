@@ -70,6 +70,9 @@ function startSetupProgressPolling() {
   stopSetupProgressPolling();
   setupProgressTimer = window.setInterval(async () => {
     await refreshSetupProgress();
+    if (state.setupProgress && state.setupProgress.status !== "running") {
+      stopSetupProgressPolling();
+    }
     if (state.step === "check") render();
   }, 1000);
 }
@@ -83,6 +86,7 @@ function stopSetupProgressPolling() {
 
 async function runSetupRepair() {
   state.alert = "";
+  let keepPolling = false;
   state.setupRepair = { message: "正在运行安装/修复...", database_ready: false };
   state.setupProgress = {
     status: "running",
@@ -112,10 +116,11 @@ async function runSetupRepair() {
         method: "POST",
       });
     }
+    keepPolling = state.setupProgress?.status === "running";
   } catch (error) {
     state.alert = `修复动作失败：${error.message}`;
   } finally {
-    stopSetupProgressPolling();
+    if (!keepPolling) stopSetupProgressPolling();
   }
   render();
 }

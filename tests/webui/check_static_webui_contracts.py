@@ -51,7 +51,18 @@ def main() -> int:
     for term in forbidden:
         require(term not in user_text, f"user web assets expose developer term: {term}")
 
-    mojibake_terms = ["鐨", "绌", "瀹", "杈", "鏁", "鏈", "闇", "淇", "妫€", "娴"]
+    mojibake_terms = [
+        chr(0x9428),
+        chr(0x7ECC),
+        chr(0x7039),
+        chr(0x6748),
+        chr(0x93C1),
+        chr(0x93C8),
+        chr(0x95C7),
+        chr(0x6DC7),
+        chr(0x59AB) + chr(0x20AC),
+        chr(0x5A34),
+    ]
     for term in mojibake_terms:
         require(term not in user_text, f"user web assets contain mojibake text: {term}")
 
