@@ -530,7 +530,7 @@ def ensure_wsl_python_tool_environment(env_dir: Path, distro: str, skip_install:
         [
             "bash",
             "-lc",
-            "python3 -m venv ~/.local/state/genoligand/python-worker-env && ~/.local/state/genoligand/python-worker-env/bin/python -m pip install --upgrade pip",
+            "if [ ! -x ~/.local/state/genoligand/python-worker-env/bin/python ]; then python3 -m venv ~/.local/state/genoligand/python-worker-env; fi && ~/.local/state/genoligand/python-worker-env/bin/python -m pip install --upgrade pip",
         ],
     )
     if create.returncode != 0:

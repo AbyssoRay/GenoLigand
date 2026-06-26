@@ -1,10 +1,11 @@
 use flate2::read::GzDecoder;
 use serde_json::{Value, json};
 use std::collections::{BTreeMap, BTreeSet};
+use std::env;
 use std::fs;
 use std::io::Read;
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Output};
 use zip::ZipArchive;
 
 const WORKER_SCHEMA_VERSION: &str = "genoligand_worker_current_v1";
@@ -1749,32 +1750,34 @@ fn probe_tool(tool: &RequiredTool) -> ToolProbe {
 }
 
 fn probe_command(tool_id: &str, program: &str, args: &[&str]) -> ToolProbe {
-    match Command::new(program).args(args).output() {
-        Ok(output) => {
-            let text = format!(
-                "{}{}",
-                String::from_utf8_lossy(&output.stdout),
-                String::from_utf8_lossy(&output.stderr)
-            );
-            ToolProbe {
-                ready: output.status.success(),
-                version: if output.status.success() {
-                    first_nonempty_line(&text).unwrap_or_else(|| "installed".to_string())
-                } else {
-                    "missing".to_string()
-                },
-                detail: if output.status.success() {
-                    format!("{tool_id}_detected")
-                } else {
-                    format!("{tool_id}_probe_failed")
-                },
+    let mut errors = Vec::new();
+    for command in command_candidates(program) {
+        let mut full_command = vec![command.clone()];
+        full_command.extend(args.iter().map(|arg| (*arg).to_string()));
+        match command_output(&full_command) {
+            Ok(output) => {
+                let text = process_output_text(&output);
+                if output.status.success() {
+                    return ToolProbe {
+                        ready: true,
+                        version: first_nonempty_line(&text)
+                            .unwrap_or_else(|| "installed".to_string()),
+                        detail: format!("{tool_id}_detected"),
+                    };
+                }
+                errors.push(format!(
+                    "{}:{}",
+                    command,
+                    first_nonempty_line(&text).unwrap_or_else(|| "probe_failed".to_string())
+                ));
             }
+            Err(err) => errors.push(format!("{command}:{err}")),
         }
-        Err(err) => ToolProbe {
-            ready: false,
-            version: "missing".to_string(),
-            detail: format!("{tool_id}_not_found:{err}"),
-        },
+    }
+    ToolProbe {
+        ready: false,
+        version: "missing".to_string(),
+        detail: format!("{tool_id}_not_found:{}", errors.join("|")),
     }
 }
 
@@ -1782,17 +1785,11 @@ fn probe_python_module(tool_id: &str, module: &str, version_expr: &str) -> ToolP
     let code = format!("import {module}; print({version_expr})");
     let mut errors = Vec::new();
     for python in python_command_candidates() {
-        match Command::new(&python[0])
-            .args(&python[1..])
-            .args(["-c", &code])
-            .output()
-        {
+        let mut command = python.clone();
+        command.extend(["-c".to_string(), code.clone()]);
+        match command_output(&command) {
             Ok(output) => {
-                let text = format!(
-                    "{}{}",
-                    String::from_utf8_lossy(&output.stdout),
-                    String::from_utf8_lossy(&output.stderr)
-                );
+                let text = process_output_text(&output);
                 if output.status.success() {
                     return ToolProbe {
                         ready: true,
@@ -1815,6 +1812,72 @@ fn probe_python_module(tool_id: &str, module: &str, version_expr: &str) -> ToolP
         version: "missing".to_string(),
         detail: format!("{tool_id}_python_module_missing:{}", errors.join("|")),
     }
+}
+
+fn command_candidates(program: &str) -> Vec<String> {
+    let mut candidates = vec![program.to_string()];
+    if cfg!(windows)
+        && !program.contains(['\\', '/'])
+        && let Some(path_var) = env::var_os("PATH")
+    {
+        for dir in env::split_paths(&path_var) {
+            for ext in ["exe", "cmd", "bat"] {
+                let candidate = dir.join(format!("{program}.{ext}"));
+                if candidate.is_file() {
+                    candidates.push(candidate.display().to_string());
+                }
+            }
+        }
+    }
+    candidates.sort();
+    candidates.dedup();
+    candidates
+}
+
+fn command_output(command: &[String]) -> Result<Output, std::io::Error> {
+    if command.is_empty() {
+        return Command::new("").output();
+    }
+    if cfg!(windows) && is_windows_script(&command[0]) {
+        return Command::new("cmd.exe")
+            .arg("/C")
+            .arg(&command[0])
+            .args(&command[1..])
+            .output();
+    }
+    Command::new(&command[0]).args(&command[1..]).output()
+}
+
+fn is_windows_script(command: &str) -> bool {
+    Path::new(command)
+        .extension()
+        .and_then(|ext| ext.to_str())
+        .is_some_and(|ext| ext.eq_ignore_ascii_case("cmd") || ext.eq_ignore_ascii_case("bat"))
+}
+
+fn process_output_text(output: &Output) -> String {
+    format!(
+        "{}{}",
+        decode_process_bytes(&output.stdout),
+        decode_process_bytes(&output.stderr)
+    )
+}
+
+fn decode_process_bytes(data: &[u8]) -> String {
+    if data.is_empty() {
+        return String::new();
+    }
+    let zero_count = data.iter().filter(|byte| **byte == 0).count();
+    if data.len().is_multiple_of(2) && zero_count * 4 >= data.len() {
+        let words = data
+            .chunks_exact(2)
+            .map(|chunk| u16::from_le_bytes([chunk[0], chunk[1]]));
+        return char::decode_utf16(words)
+            .map(|item| item.unwrap_or(char::REPLACEMENT_CHARACTER))
+            .collect::<String>()
+            .replace('\0', "");
+    }
+    String::from_utf8_lossy(data).replace('\0', "")
 }
 
 fn first_nonempty_line(text: &str) -> Option<String> {
@@ -4250,21 +4313,21 @@ fn decode_tsv_cell(value: &str) -> String {
 
 fn run_python_script(script: &str, args: &[String], context: &str) -> Result<String, String> {
     let mut errors = Vec::new();
-    for candidate in python_command_candidates() {
-        let mut command = Command::new(&candidate[0]);
-        command.args(&candidate[1..]);
-        command.arg("-c").arg(script);
+    for candidate in script_python_command_candidates() {
+        let mut command = candidate.clone();
+        command.push("-c".to_string());
+        command.push(script.to_string());
         for arg in args {
-            command.arg(arg);
+            command.push(python_script_arg(&candidate, arg));
         }
-        match command.output() {
+        match command_output(&command) {
             Ok(output) if output.status.success() => {
-                return Ok(String::from_utf8_lossy(&output.stdout).to_string());
+                return Ok(decode_process_bytes(&output.stdout));
             }
             Ok(output) => errors.push(format!(
                 "{}:{}",
                 candidate.join(" "),
-                String::from_utf8_lossy(&output.stderr)
+                decode_process_bytes(&output.stderr)
                     .lines()
                     .next()
                     .unwrap_or("script_failed")
@@ -4311,6 +4374,47 @@ fn safe_id(value: &str) -> String {
     } else {
         id
     }
+}
+
+fn script_python_command_candidates() -> Vec<Vec<String>> {
+    let mut candidates = vec![
+        vec!["python".to_string()],
+        vec!["python3".to_string()],
+        vec!["py".to_string(), "-3".to_string()],
+    ];
+    if let Some(preferred) = std::env::var("GENOLIGAND_PYTHON")
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+        .map(|value| vec![value])
+    {
+        candidates.push(preferred);
+    }
+    candidates
+}
+
+fn python_script_arg(candidate: &[String], arg: &str) -> String {
+    if cfg!(windows)
+        && candidate.first().is_some_and(|python| {
+            is_windows_script(python) && python.contains("genoligand-wsl-python")
+        })
+    {
+        return windows_path_to_wsl(arg).unwrap_or_else(|| arg.to_string());
+    }
+    arg.to_string()
+}
+
+fn windows_path_to_wsl(value: &str) -> Option<String> {
+    let bytes = value.as_bytes();
+    if bytes.len() < 3 || bytes[1] != b':' || !bytes[0].is_ascii_alphabetic() {
+        return None;
+    }
+    let slash = bytes[2];
+    if slash != b'\\' && slash != b'/' {
+        return None;
+    }
+    let drive = (bytes[0] as char).to_ascii_lowercase();
+    let rest = value[3..].replace('\\', "/");
+    Some(format!("/mnt/{drive}/{rest}"))
 }
 
 fn relative_display(root: &Path, path: &Path) -> String {
