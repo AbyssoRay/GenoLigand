@@ -8,7 +8,7 @@ use std::process::{Command, Stdio};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 pub const PRODUCT_NAME: &str = "GenoLigand Local WebUI";
-pub const PRODUCT_VERSION: &str = "0.9.10";
+pub const PRODUCT_VERSION: &str = "0.9.11";
 
 const REQUIRED_TOOL_IDS: &[&str] = &[
     "java",

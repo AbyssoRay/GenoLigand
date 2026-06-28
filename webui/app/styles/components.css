@@ -1,12 +1,13 @@
 ﻿.input-grid {
   display: grid;
-  grid-template-columns: repeat(5, minmax(190px, 1fr));
+  grid-template-columns: repeat(auto-fit, minmax(172px, 1fr));
   gap: 12px;
 }
 
 .input-card {
   display: grid;
   gap: 10px;
+  min-width: 0;
   background: var(--surface-2);
   border: 1px solid var(--line);
   border-radius: 8px;
@@ -16,6 +17,10 @@
 .input-card.selected {
   border-color: var(--accent);
   background: #102b2f;
+}
+
+.input-card p {
+  overflow-wrap: anywhere;
 }
 
 .field {
