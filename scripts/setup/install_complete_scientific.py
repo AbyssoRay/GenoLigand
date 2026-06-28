@@ -327,7 +327,7 @@ def write_wsl_python_wrapper(wrapper: Path, distro: str, python_path: str) -> No
     safe_distro = distro.replace('"', "")
     safe_python = python_path.replace('"', "")
     wrapper.write_text(
-        f'@echo off\r\nwsl.exe -d "{safe_distro}" -- "{safe_python}" %*\r\n',
+        f'@echo off\nwsl.exe -d {safe_distro} -- "{safe_python}" %*\n',
         encoding="utf-8",
     )
 
@@ -339,7 +339,7 @@ def write_wsl_command_wrappers(wrapper_dir: Path, distro: str) -> dict[str, obje
     for command_name in WSL_COMMAND_WRAPPERS:
         wrapper = wrapper_dir / f"{command_name}.cmd"
         wrapper.write_text(
-            f'@echo off\r\nwsl.exe -d "{safe_distro}" -- {command_name} %*\r\n',
+            f'@echo off\nwsl.exe -d {safe_distro} -- {command_name} %*\n',
             encoding="utf-8",
         )
         wrappers.append(command_name)
@@ -739,6 +739,24 @@ def sha256_file(path: Path) -> str:
     with path.open("rb") as handle:
         for chunk in iter(lambda: handle.read(1024 * 1024), b""):
             digest.update(chunk)
+    return digest.hexdigest()
+
+
+def sha256_file_with_progress(
+    path: Path,
+    progress: Callable[[int], None] | None = None,
+) -> str:
+    digest = hashlib.sha256()
+    read_bytes = 0
+    last_progress = 0.0
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+            read_bytes += len(chunk)
+            now = time.time()
+            if progress and (now - last_progress >= 10 or read_bytes == path.stat().st_size):
+                progress(read_bytes)
+                last_progress = now
     return digest.hexdigest()
 
 
@@ -1798,10 +1816,47 @@ def file_count(path: Path) -> int:
     return sum(1 for child in path.rglob("*") if child.is_file())
 
 
+def resource_payload_summary(
+    path: Path,
+    progress: Callable[[int, int | None, str], None] | None = None,
+) -> dict[str, object]:
+    if path.is_file():
+        files = [path]
+        root = path.parent
+    elif path.is_dir():
+        files = sorted(child for child in path.rglob("*") if child.is_file())
+        root = path
+    else:
+        return {"file_count": 0, "bytes": 0, "sha256": ""}
+    total_bytes = sum(child.stat().st_size for child in files)
+    if not files or total_bytes <= 0:
+        return {"file_count": 0, "bytes": 0, "sha256": ""}
+    digest = hashlib.sha256()
+    bytes_done = 0
+    if progress:
+        progress(0, total_bytes, "正在记录来源文件")
+    for child in files:
+        rel = child.name if path.is_file() else child.relative_to(root).as_posix()
+        size = child.stat().st_size
+        digest.update(rel.encode("utf-8"))
+        digest.update(str(size).encode("ascii"))
+
+        def file_progress(read_bytes: int, *, completed_before: int = bytes_done) -> None:
+            if progress:
+                progress(completed_before + read_bytes, total_bytes, f"正在校验 {rel}")
+
+        digest.update(sha256_file_with_progress(child, file_progress).encode("ascii"))
+        bytes_done += size
+        if progress:
+            progress(bytes_done, total_bytes, f"已记录 {rel}")
+    return {"file_count": len(files), "bytes": total_bytes, "sha256": digest.hexdigest()}
+
+
 def write_science_resource_manifests(
     source_catalog: Path,
     source_sync_plan: Path,
     science_store: Path,
+    progress: Callable[[str, int, int | None, str], None] | None = None,
 ) -> dict[str, object]:
     manifest_dir = science_store / "manifests"
     manifest_dir.mkdir(parents=True, exist_ok=True)
@@ -1874,13 +1929,23 @@ def write_science_resource_manifests(
         source_writer.writeheader()
         hash_writer.writeheader()
         license_writer.writeheader()
-        for row in source_rows:
+        total_sources = len(source_rows)
+        for index, row in enumerate(source_rows, start=1):
             source_id = row["source_id"] or "unknown_source"
             local_rel = row["local_path"]
             local_path = science_store / local_rel if local_rel else science_store / "__missing_local_path__"
-            exists = path_has_payload(local_path)
-            bytes_count = directory_size(local_path) if exists else 0
-            digest = directory_digest(local_path) if exists else ""
+            if progress:
+                progress(source_id, index - 1, total_sources, f"正在记录来源 {index}/{total_sources}")
+
+            def source_progress(bytes_done: int, bytes_total: int | None, message: str) -> None:
+                if progress:
+                    progress(source_id, bytes_done, bytes_total, f"{message} ({index}/{total_sources})")
+
+            summary = resource_payload_summary(local_path, source_progress)
+            file_count_value = int(summary["file_count"])
+            bytes_count = int(summary["bytes"])
+            digest = str(summary["sha256"])
+            exists = file_count_value > 0 and bytes_count > 0
             status = "ready" if exists else "missing"
             license_status = "recorded" if row["license_note"] else "missing"
             total += 1
@@ -1896,7 +1961,7 @@ def write_science_resource_manifests(
                 "source_class": row["source_class"],
                 "local_path": local_rel,
                 "status": status,
-                "file_count": str(file_count(local_path) if exists else 0),
+                "file_count": str(file_count_value),
                 "bytes": str(bytes_count),
                 "sha256": digest,
                 "provenance": row["provenance"],
@@ -2243,10 +2308,29 @@ def main() -> int:
         total_steps=6,
         message="正在记录数据库来源和许可信息",
     )
+    def source_manifest_progress(
+        source_id: str,
+        bytes_done: int,
+        bytes_total: int | None,
+        message: str,
+    ) -> None:
+        write_install_progress(
+            science_store,
+            status="running",
+            stage="记录来源",
+            current_resource=source_id,
+            completed_steps=3,
+            total_steps=6,
+            bytes_downloaded=bytes_done,
+            bytes_total=bytes_total,
+            message=message,
+        )
+
     source_manifest_result = write_science_resource_manifests(
         source_catalog,
         source_sync_plan,
         science_store,
+        source_manifest_progress,
     )
     write_install_progress(
         science_store,

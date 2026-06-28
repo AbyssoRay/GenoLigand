@@ -8,7 +8,7 @@ use std::process::{Command, Stdio};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 pub const PRODUCT_NAME: &str = "GenoLigand Local WebUI";
-pub const PRODUCT_VERSION: &str = "0.9.7";
+pub const PRODUCT_VERSION: &str = "0.9.8";
 
 const REQUIRED_TOOL_IDS: &[&str] = &[
     "java",
@@ -724,7 +724,14 @@ fn gls_cli_help_command(options: &ServerOptions) -> Vec<String> {
 fn science_store_path(options: &ServerOptions) -> PathBuf {
     std::env::var("GENOLIGAND_SCIENCE_STORE")
         .map(PathBuf::from)
-        .unwrap_or_else(|_| default_science_store(&options.workspace_root))
+        .unwrap_or_else(|_| {
+            #[cfg(test)]
+            {
+                return options.workspace_root.join("science_store");
+            }
+            #[allow(unreachable_code)]
+            default_science_store(&options.workspace_root)
+        })
 }
 
 fn default_science_store(workspace_root: &Path) -> PathBuf {

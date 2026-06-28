@@ -3,13 +3,17 @@ use serde_json::{Value, json};
 use std::collections::{BTreeMap, BTreeSet};
 use std::env;
 use std::fs;
-use std::io::Read;
+use std::io::{BufRead, BufReader, Read};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 use zip::ZipArchive;
 
 const WORKER_SCHEMA_VERSION: &str = "genoligand_worker_current_v1";
 const WORKER_PIPELINE_MODE: &str = "genoligand_scientific_pipeline";
+const MAX_INDEX_ROWS: usize = 30_000;
+const MAX_SOURCE_INDEX_ROWS: usize = 5_000;
+const MAX_FASTA_INDEX_ROWS: usize = MAX_SOURCE_INDEX_ROWS;
+const MAX_SEQUENCE_TOKEN_CHARS: usize = 96;
 
 #[derive(Clone, Debug)]
 pub struct ScienceOptions {
@@ -751,6 +755,14 @@ fn append_canonical_rows(
     rows: &mut Vec<StoreRow>,
     manifest: &mut String,
 ) -> Result<(), String> {
+    if rows.len() >= MAX_INDEX_ROWS {
+        manifest.push_str(&format!(
+            "{index_name}\t{}\tskipped\t0\t{}\tindex_row_limit_reached\n",
+            relative_display(root, path),
+            index_output_for(index_name)
+        ));
+        return Ok(());
+    }
     if !path.exists() {
         manifest.push_str(&format!(
             "{index_name}\t{}\tmissing\t0\t{}\tnot_present\n",
@@ -759,11 +771,23 @@ fn append_canonical_rows(
         ));
         return Ok(());
     }
-    let (parsed, notes) = read_source_rows(path, index_name)?;
+    let (mut parsed, notes) = read_source_rows(path, index_name)?;
+    let available = MAX_INDEX_ROWS
+        .saturating_sub(rows.len())
+        .min(MAX_SOURCE_INDEX_ROWS);
+    let parsed_total = parsed.len();
+    if parsed.len() > available {
+        parsed.truncate(available);
+    }
     let count = parsed.len();
     rows.extend(parsed);
+    let note_suffix = if parsed_total > count {
+        ";index_row_limit_reached"
+    } else {
+        ""
+    };
     manifest.push_str(&format!(
-        "{index_name}\t{}\t{}\t{count}\t{}\t{notes}\n",
+        "{index_name}\t{}\t{}\t{count}\t{}\t{notes}{note_suffix}\n",
         relative_display(root, path),
         if count > 0 { "used" } else { "empty" },
         index_output_for(index_name)
@@ -780,10 +804,19 @@ fn append_built_rows(
     manifest: &mut String,
     notes: &str,
 ) {
-    let count = built_rows.len();
-    rows.extend(built_rows);
+    let available = MAX_INDEX_ROWS
+        .saturating_sub(rows.len())
+        .min(MAX_SOURCE_INDEX_ROWS);
+    let total = built_rows.len();
+    let count = total.min(available);
+    rows.extend(built_rows.into_iter().take(count));
+    let note_suffix = if total > count {
+        ";index_row_limit_reached"
+    } else {
+        ""
+    };
     manifest.push_str(&format!(
-        "{index_name}\t{}\t{}\t{count}\t{}\t{notes}\n",
+        "{index_name}\t{}\t{}\t{count}\t{}\t{notes}{note_suffix}\n",
         relative_display(root, path),
         if count > 0 { "used" } else { "empty" },
         index_output_for(index_name)
@@ -1045,38 +1078,148 @@ fn parse_fasta_targets(
     target_class: &str,
     evidence: &str,
 ) -> Result<Vec<StoreRow>, String> {
-    let text = read_sequence_text(path)?;
-    let mut rows = Vec::new();
-    let mut header = String::new();
-    let mut sequence = String::new();
-    for line in text.lines() {
-        let line = line.trim_start_matches('\u{feff}');
-        if let Some(rest) = line.strip_prefix('>') {
-            push_fasta_row(
-                source,
-                default_organism,
-                target_class,
-                evidence,
-                &header,
-                &sequence,
-                &mut rows,
-            );
-            header = rest.trim().to_string();
-            sequence.clear();
-        } else {
-            sequence.push_str(line.trim());
-        }
+    let name = path
+        .file_name()
+        .and_then(|value| value.to_str())
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    if name.ends_with(".gz") {
+        let file =
+            fs::File::open(path).map_err(|err| format!("open_failed:{}:{err}", path.display()))?;
+        let decoder = GzDecoder::new(file);
+        return parse_fasta_reader(
+            BufReader::new(decoder),
+            source,
+            default_organism,
+            target_class,
+            evidence,
+        )
+        .map_err(|err| format!("gzip_read_failed:{}:{err}", path.display()));
     }
-    push_fasta_row(
+    if name.ends_with(".zip") {
+        let text = read_zip_text(path, matches_sequence_name)?;
+        return parse_fasta_lines(
+            text.lines(),
+            source,
+            default_organism,
+            target_class,
+            evidence,
+        );
+    }
+    let file =
+        fs::File::open(path).map_err(|err| format!("open_failed:{}:{err}", path.display()))?;
+    parse_fasta_reader(
+        BufReader::new(file),
         source,
         default_organism,
         target_class,
         evidence,
+    )
+    .map_err(|err| format!("read_failed:{}:{err}", path.display()))
+}
+
+fn parse_fasta_reader<R: BufRead>(
+    reader: R,
+    source: &str,
+    default_organism: &str,
+    target_class: &str,
+    evidence: &str,
+) -> Result<Vec<StoreRow>, std::io::Error> {
+    let context = FastaParseContext {
+        source,
+        default_organism,
+        target_class,
+        evidence,
+    };
+    let mut rows = Vec::new();
+    let mut header = String::new();
+    let mut sequence = String::new();
+    for line in reader.lines() {
+        let line = line?;
+        if parse_fasta_line(&line, &context, &mut header, &mut sequence, &mut rows) {
+            return Ok(rows);
+        }
+    }
+    push_fasta_row(
+        context.source,
+        context.default_organism,
+        context.target_class,
+        context.evidence,
         &header,
         &sequence,
         &mut rows,
     );
     Ok(rows)
+}
+
+fn parse_fasta_lines<'a, I>(
+    lines: I,
+    source: &str,
+    default_organism: &str,
+    target_class: &str,
+    evidence: &str,
+) -> Result<Vec<StoreRow>, String>
+where
+    I: IntoIterator<Item = &'a str>,
+{
+    let context = FastaParseContext {
+        source,
+        default_organism,
+        target_class,
+        evidence,
+    };
+    let mut rows = Vec::new();
+    let mut header = String::new();
+    let mut sequence = String::new();
+    for line in lines {
+        if parse_fasta_line(line, &context, &mut header, &mut sequence, &mut rows) {
+            return Ok(rows);
+        }
+    }
+    push_fasta_row(
+        context.source,
+        context.default_organism,
+        context.target_class,
+        context.evidence,
+        &header,
+        &sequence,
+        &mut rows,
+    );
+    Ok(rows)
+}
+
+struct FastaParseContext<'a> {
+    source: &'a str,
+    default_organism: &'a str,
+    target_class: &'a str,
+    evidence: &'a str,
+}
+
+fn parse_fasta_line(
+    line: &str,
+    context: &FastaParseContext<'_>,
+    header: &mut String,
+    sequence: &mut String,
+    rows: &mut Vec<StoreRow>,
+) -> bool {
+    let line = line.trim_start_matches('\u{feff}');
+    if let Some(rest) = line.strip_prefix('>') {
+        push_fasta_row(
+            context.source,
+            context.default_organism,
+            context.target_class,
+            context.evidence,
+            header,
+            sequence,
+            rows,
+        );
+        *header = rest.trim().to_string();
+        sequence.clear();
+        rows.len() >= MAX_FASTA_INDEX_ROWS
+    } else {
+        sequence.push_str(line.trim());
+        false
+    }
 }
 
 fn structure_file_row(source: &str, path: &Path) -> StoreRow {
@@ -1202,7 +1345,7 @@ fn parse_moad_structure_rows(path: &Path) -> Result<Vec<StoreRow>, String> {
         let key = normalize_header(col);
         matches!(
             key.as_str(),
-            "pdb" | "pdbid" | "pdbcode" | "ligand" | "ligandid" | "hetid"
+            "pdb" | "pdbid" | "pdbcode" | "pdbfile" | "ligand" | "ligandid" | "hetid"
         )
     });
     let headers = if first_is_header {
@@ -1210,11 +1353,21 @@ fn parse_moad_structure_rows(path: &Path) -> Result<Vec<StoreRow>, String> {
     } else {
         Vec::new()
     };
-    let pdb_idx = find_header(&headers, &["pdb", "pdb_id", "pdbid", "pdb code"]);
+    let pdb_idx = find_header(&headers, &["pdb", "pdb_id", "pdbid", "pdb code", "pdbFile"]);
     let ligand_idx = find_header(&headers, &["ligand", "ligand_id", "het_id", "het id"]);
     let affinity_idx = find_header(
         &headers,
-        &["affinity", "ki", "kd", "ic50", "ec50", "binding data"],
+        &[
+            "affinity",
+            "ki",
+            "kd",
+            "ic50",
+            "ec50",
+            "binding data",
+            "measurement",
+            "magnitude",
+            "units",
+        ],
     );
     let mut rows = Vec::new();
     let mut row_lines = Vec::new();
@@ -1304,21 +1457,6 @@ fn split_csv_line(line: &str) -> Vec<String> {
     out
 }
 
-fn read_sequence_text(path: &Path) -> Result<String, String> {
-    let name = path
-        .file_name()
-        .and_then(|value| value.to_str())
-        .unwrap_or_default()
-        .to_ascii_lowercase();
-    if name.ends_with(".gz") {
-        read_gzip_text(path)
-    } else if name.ends_with(".zip") {
-        read_zip_text(path, matches_sequence_name)
-    } else {
-        read_text(path)
-    }
-}
-
 fn read_table_text(path: &Path) -> Result<String, String> {
     let name = path
         .file_name()
@@ -1387,7 +1525,7 @@ fn push_fasta_row(
     }
     let (target_id, target_name) = fasta_id_and_name(header);
     let organism = fasta_organism(header).unwrap_or_else(|| default_organism.to_string());
-    let mut sequence_tokens = tokenize(sequence);
+    let mut sequence_tokens = tokenize_limited(sequence, MAX_SEQUENCE_TOKEN_CHARS);
     sequence_tokens.extend(tokenize(header));
     rows.push(StoreRow {
         source: source.to_string(),
@@ -3351,17 +3489,43 @@ fn read_source_rows(path: &Path, label: &str) -> Result<(Vec<StoreRow>, &'static
 }
 
 fn read_store_rows(path: &Path, label: &str) -> Result<Vec<StoreRow>, String> {
-    let text = read_table_text(path).map_err(|err| format!("{label}_missing:{err}"))?;
-    let mut lines = text.lines();
+    let name = lower_file_name(path);
+    if name.ends_with(".zip") {
+        let text = read_zip_text(path, matches_table_name)
+            .map_err(|err| format!("{label}_missing:{err}"))?;
+        return parse_store_rows_from_lines(text.lines().map(|line| Ok(line.to_string())), label);
+    }
+    if name.ends_with(".gz") {
+        let file = fs::File::open(path)
+            .map_err(|err| format!("{label}_missing:{}:{err}", path.display()))?;
+        let decoder = GzDecoder::new(file);
+        return parse_store_rows_from_lines(BufReader::new(decoder).lines(), label)
+            .map_err(|err| format!("{label}_missing:{err}"));
+    }
+    let file =
+        fs::File::open(path).map_err(|err| format!("{label}_missing:{}:{err}", path.display()))?;
+    parse_store_rows_from_lines(BufReader::new(file).lines(), label)
+        .map_err(|err| format!("{label}_missing:{err}"))
+}
+
+fn parse_store_rows_from_lines<I>(mut lines: I, label: &str) -> Result<Vec<StoreRow>, String>
+where
+    I: Iterator<Item = Result<String, std::io::Error>>,
+{
     let Some(header_line) = lines.next() else {
         return Ok(Vec::new());
     };
+    let header_line = header_line.map_err(|err| format!("{label}_read_failed:{err}"))?;
     let headers = split_tsv(header_line.trim_start_matches('\u{feff}'));
     if is_bindingdb_header(&headers) {
-        return Ok(parse_bindingdb_rows(&headers, lines));
+        return parse_bindingdb_rows(&headers, lines, label);
     }
     let mut rows = Vec::new();
     for line in lines {
+        if rows.len() >= MAX_SOURCE_INDEX_ROWS {
+            break;
+        }
+        let line = line.map_err(|err| format!("{label}_read_failed:{err}"))?;
         let line = line.trim_start_matches('\u{feff}');
         let cols = split_tsv(line);
         if cols.len() < 9 {
@@ -3492,7 +3656,7 @@ GROUP BY
     act.standard_relation,
     act.standard_value,
     act.standard_units
-LIMIT 200000
+LIMIT 5000
 """
 
 connection = sqlite3.connect(sys.argv[1])
@@ -3528,7 +3692,7 @@ fn chembl_store_row(row: ChEMBLActivityRow) -> StoreRow {
     let mut sequence_tokens = tokenize(&row.target_id);
     sequence_tokens.extend(tokenize(&row.target_name));
     sequence_tokens.extend(tokenize(&row.accessions));
-    sequence_tokens.extend(tokenize(&row.sequences));
+    sequence_tokens.extend(tokenize_limited(&row.sequences, MAX_SEQUENCE_TOKEN_CHARS));
     let organism = if row.organism.trim().is_empty() {
         "unknown".to_string()
     } else {
@@ -3559,6 +3723,7 @@ fn is_bindingdb_header(headers: &[String]) -> bool {
         headers,
         &[
             "BindingDB Target Chain Sequence",
+            "BindingDB Target Chain Sequence 1",
             "Target Chain Sequence",
             "Target Sequence",
         ],
@@ -3567,15 +3732,20 @@ fn is_bindingdb_header(headers: &[String]) -> bool {
         && find_header(headers, &["Target Name", "Target", "BindingDB Target Name"]).is_some()
 }
 
-fn parse_bindingdb_rows<'a, I>(headers: &[String], lines: I) -> Vec<StoreRow>
+fn parse_bindingdb_rows<I>(
+    headers: &[String],
+    lines: I,
+    label: &str,
+) -> Result<Vec<StoreRow>, String>
 where
-    I: IntoIterator<Item = &'a str>,
+    I: Iterator<Item = Result<String, std::io::Error>>,
 {
     let target_name_idx = find_header(headers, &["Target Name", "Target", "BindingDB Target Name"]);
     let sequence_idx = find_header(
         headers,
         &[
             "BindingDB Target Chain Sequence",
+            "BindingDB Target Chain Sequence 1",
             "Target Chain Sequence",
             "Target Sequence",
         ],
@@ -3598,6 +3768,7 @@ where
         headers,
         &[
             "UniProt (SwissProt) Primary ID of Target Chain",
+            "UniProt (SwissProt) Primary ID of Target Chain 1",
             "UniProt SwissProt Primary ID of Target Chain",
             "UniProt Primary ID",
         ],
@@ -3606,6 +3777,7 @@ where
         headers,
         &[
             "UniProt (TrEMBL) Primary ID of Target Chain",
+            "UniProt (TrEMBL) Primary ID of Target Chain 1",
             "UniProt TrEMBL Primary ID of Target Chain",
         ],
     );
@@ -3613,6 +3785,7 @@ where
         headers,
         &[
             "Target Chain PDB ID(s)",
+            "PDB ID(s) of Target Chain 1",
             "PDB ID(s) for Target Chain",
             "PDB IDs",
         ],
@@ -3626,6 +3799,10 @@ where
 
     let mut rows = Vec::new();
     for line in lines {
+        if rows.len() >= MAX_SOURCE_INDEX_ROWS {
+            break;
+        }
+        let line = line.map_err(|err| format!("{label}_read_failed:{err}"))?;
         let cols = split_tsv(line.trim_start_matches('\u{feff}'));
         let target_name = cell(&cols, target_name_idx);
         let sequence = cell(&cols, sequence_idx);
@@ -3660,7 +3837,7 @@ where
         for idx in activity_indexes.iter().flatten() {
             ligand_tokens.extend(tokenize(cell(&cols, Some(*idx)).as_str()));
         }
-        let mut sequence_tokens = tokenize(&sequence);
+        let mut sequence_tokens = tokenize_limited(&sequence, MAX_SEQUENCE_TOKEN_CHARS);
         sequence_tokens.extend(tokenize(&target_name));
         sequence_tokens.extend(tokenize(&uniprot));
         rows.push(StoreRow {
@@ -3679,7 +3856,7 @@ where
             evidence: "bindingdb_activity_row".to_string(),
         });
     }
-    rows
+    Ok(rows)
 }
 
 fn find_header(headers: &[String], candidates: &[&str]) -> Option<usize> {
@@ -4245,6 +4422,49 @@ fn tokenize(value: &str) -> BTreeSet<String> {
         })
         .filter(|part| !part.is_empty())
         .collect()
+}
+
+fn tokenize_limited(value: &str, max_chars: usize) -> BTreeSet<String> {
+    let mut prefix = String::new();
+    let mut char_count = 0usize;
+    for ch in value.chars() {
+        char_count += 1;
+        if char_count <= max_chars {
+            prefix.push(ch);
+        }
+    }
+    if char_count <= max_chars {
+        return tokenize(value);
+    }
+    let mut tokens = compact_sequence_tokens(&prefix);
+    tokens.insert(format!("len_{char_count}"));
+    tokens.insert(format!("hash_{}", stable_hash(value)));
+    tokens
+}
+
+fn compact_sequence_tokens(value: &str) -> BTreeSet<String> {
+    let compact = value
+        .chars()
+        .filter(|ch| ch.is_ascii_alphanumeric())
+        .flat_map(|ch| ch.to_lowercase())
+        .collect::<String>();
+    let chars = compact.chars().collect::<Vec<_>>();
+    let mut tokens = BTreeSet::new();
+    if chars.is_empty() {
+        return tokens;
+    }
+    let k = 6usize.min(chars.len());
+    let max_tokens = 16usize;
+    let step = ((chars.len().saturating_sub(k)) / max_tokens.max(1)).max(1);
+    let mut pos = 0usize;
+    while pos + k <= chars.len() && tokens.len() < max_tokens {
+        tokens.insert(chars[pos..pos + k].iter().collect::<String>());
+        pos += step;
+    }
+    if chars.len() > k {
+        tokens.insert(chars[chars.len() - k..].iter().collect::<String>());
+    }
+    tokens
 }
 
 fn write_json_manifest(path: &Path, artifact: &str, status: &str) -> Result<(), String> {
