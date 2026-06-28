@@ -40,8 +40,17 @@ def main() -> int:
         require((WEB / rel).is_file(), f"missing split web asset: {rel}")
 
     index = read(WEB / "index.html")
+    require(
+        'rel="icon" href="/favicon.svg" type="image/svg+xml"' in index,
+        "index.html must declare a first-party favicon",
+    )
     for rel in required[:12]:
         require(f'src="/{rel}"' in index, f"index.html does not load {rel}")
+    for step in ["configure", "check", "run", "results", "export"]:
+        require(
+            f'data-step="{step}" class="step disabled" disabled' in index,
+            f"initial step navigation must disable {step}",
+        )
 
     user_text = "\n".join(
         read(path)

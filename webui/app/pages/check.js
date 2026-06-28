@@ -222,7 +222,7 @@ function diagnosticsSummary() {
           (row) => `
             <section class="panel compact third">
               <h3>${escapeHtml(row.label)}</h3>
-              <p>${escapeHtml(row.ready ? "通过" : row.next_action || "需要处理")}</p>
+              <p>${escapeHtml(row.detail || (row.ready ? "通过" : row.next_action || "需要处理"))}</p>
               <span class="status-pill ${row.ready ? "ready" : "blocked"}">${row.ready ? "就绪" : "待处理"}</span>
             </section>`
         )

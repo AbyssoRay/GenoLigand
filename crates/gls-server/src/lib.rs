@@ -8,7 +8,7 @@ use std::process::{Command, Stdio};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 pub const PRODUCT_NAME: &str = "GenoLigand Local WebUI";
-pub const PRODUCT_VERSION: &str = "0.9.12";
+pub const PRODUCT_VERSION: &str = "0.9.13";
 
 const REQUIRED_TOOL_IDS: &[&str] = &[
     "java",
@@ -20,10 +20,12 @@ const REQUIRED_TOOL_IDS: &[&str] = &[
     "autodock_vina",
     "openmm",
     "pdbfixer",
+    "openff_toolkit",
     "mdtraj",
     "mdanalysis",
 ];
 const INSTALL_PROGRESS_STALE_SECONDS: u64 = 30 * 60;
+const FAVICON_SVG: &str = r##"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64"><rect width="64" height="64" rx="10" fill="#001312"/><rect x="5" y="5" width="54" height="54" rx="8" fill="#082423" stroke="#24f2dd" stroke-width="3"/><text x="32" y="39" text-anchor="middle" font-family="Arial, sans-serif" font-size="22" font-weight="700" fill="#dffdf8">GL</text></svg>"##;
 
 #[derive(Clone, Debug)]
 pub struct ServerOptions {
@@ -121,6 +123,7 @@ fn route(
             json!({"name":PRODUCT_NAME,"version":PRODUCT_VERSION,"science_flow":"scientific_pipeline"})
         }
         ("GET", "/api/user/projects") => user_projects_json(options),
+        ("GET", "/api/user/workspace-summary") => user_workspace_summary_json(options),
         ("POST", "/api/user/projects") => create_user_project(options),
         ("GET", "/api/projects") => projects_json(options),
         ("POST", "/api/projects") => create_project(options),
@@ -175,6 +178,7 @@ fn web_asset_response(path: &str, _options: &ServerOptions) -> Option<(u16, &'st
         "styles/layout.css" => include_str!("../../../webui/app/styles/layout.css"),
         "styles/components.css" => include_str!("../../../webui/app/styles/components.css"),
         "styles/pages.css" => include_str!("../../../webui/app/styles/pages.css"),
+        "favicon.svg" | "favicon.ico" => FAVICON_SVG,
         _ => return None,
     };
     Some((200, web_asset_content_type(rel), body.to_string()))
@@ -189,11 +193,15 @@ fn is_allowed_web_asset(rel: &str) -> bool {
         || rel.starts_with("core/")
         || rel.starts_with("components/")
         || rel.starts_with("styles/")
+        || rel == "favicon.svg"
+        || rel == "favicon.ico"
 }
 
 fn web_asset_content_type(rel: &str) -> &'static str {
     if rel.ends_with(".css") {
         "text/css; charset=utf-8"
+    } else if rel.ends_with(".svg") || rel.ends_with(".ico") {
+        "image/svg+xml; charset=utf-8"
     } else {
         "application/javascript; charset=utf-8"
     }
@@ -358,6 +366,57 @@ fn user_projects_json(options: &ServerOptions) -> Value {
             .to_string()
     });
     json!({"projects": projects})
+}
+
+fn user_workspace_summary_json(options: &ServerOptions) -> Value {
+    let mut project_count = 0usize;
+    let mut run_count = 0usize;
+    let mut candidate_count = 0usize;
+    let mut result_count = 0usize;
+    let mut export_item_count = 0usize;
+    if let Ok(entries) = fs::read_dir(projects_root(options)) {
+        for entry in entries.flatten() {
+            if !entry.file_type().map(|file| file.is_dir()).unwrap_or(false) {
+                continue;
+            }
+            let project_id = entry.file_name().to_string_lossy().to_string();
+            if !project_visible_to_user(options, &project_id) {
+                continue;
+            }
+            project_count += 1;
+            let runs_dir = entry.path().join("runs");
+            if let Ok(runs) = fs::read_dir(runs_dir) {
+                for run in runs.flatten() {
+                    if !run.file_type().map(|file| file.is_dir()).unwrap_or(false) {
+                        continue;
+                    }
+                    run_count += 1;
+                    let run_dir = run.path();
+                    if run_state(&run_dir) == "completed" {
+                        let candidates = rows_len(&run_dir.join("target_candidate_ranking.tsv"));
+                        candidate_count += candidates;
+                        result_count += candidates
+                            + rows_len(&run_dir.join("evidence_ledger.tsv"))
+                            + rows_len(&run_dir.join("metagenome_potential_matches.tsv"))
+                            + rows_len(&run_dir.join("structure_patch_summary.tsv"))
+                            + rows_len(&run_dir.join("md_summary.tsv"));
+                    }
+                    export_item_count += visible_export_count(&run_dir);
+                }
+            }
+        }
+    }
+    json!({
+        "project_count": project_count,
+        "run_count": run_count,
+        "candidate_count": candidate_count,
+        "result_count": result_count,
+        "export_item_count": export_item_count,
+        "demo_count": 0,
+        "sample_count": 0,
+        "test_result_count": 0,
+        "blank_workspace": project_count == 0 && run_count == 0 && candidate_count == 0 && export_item_count == 0
+    })
 }
 
 fn create_project(options: &ServerOptions) -> Value {
@@ -1717,27 +1776,38 @@ fn diagnostics_json(options: &ServerOptions) -> Value {
 fn user_diagnostics_json(options: &ServerOptions) -> Value {
     let gls_cli = capture_command(&gls_cli_help_command(options), &options.workspace_root);
     let database_ready = preflight_store_ready(options);
-    let missing = missing_resource_rows(&required_resource_rows(&science_store_path(options)));
-    let checks = vec![
+    let store = science_store_path(options);
+    let missing = missing_resource_rows(&required_resource_rows(&store));
+    let openmm_platforms = openmm_platform_status(&store);
+    let mut checks = vec![
         json!({"label":"服务", "ready":true, "next_action":"继续"}),
         json!({"label":"运行组件", "ready":gls_cli.0, "next_action": if gls_cli.0 {"继续"} else {"重新运行安装程序"}}),
         json!({"label":"科学仓库", "ready":database_ready, "next_action": if database_ready {"继续"} else {"运行安装/修复"}}),
     ];
+    checks.push(json!({
+        "label": "OpenMM/CUDA",
+        "ready": openmm_platforms["openmm_ready"].as_bool().unwrap_or(false),
+        "next_action": openmm_platforms["next_action"].clone(),
+        "detail": openmm_platforms["summary"].clone()
+    }));
     json!({
         "checks": checks,
         "missing": missing,
-        "science_store": user_databases_json(options)
+        "science_store": user_databases_json(options),
+        "tool_platforms": [openmm_platforms]
     })
 }
 
 fn user_setup_status_json(options: &ServerOptions) -> Value {
     let ready = preflight_store_ready(options);
-    let required = required_resource_rows(&science_store_path(options));
+    let store = science_store_path(options);
+    let required = required_resource_rows(&store);
     json!({
         "database_ready": ready,
         "repair_action": if ready {"继续"} else {"运行安装/修复"},
         "checks": required,
-        "missing": missing_resource_rows(&required)
+        "missing": missing_resource_rows(&required),
+        "tool_platforms": [openmm_platform_status(&store)]
     })
 }
 
@@ -1858,10 +1928,12 @@ fn write_setup_progress_start(options: &ServerOptions) {
 fn user_setup_install_plan_json(options: &ServerOptions) -> Value {
     let catalog_rows = config_tsv_data_row_count(options, "source_catalog.tsv");
     let sync_rows = config_tsv_data_row_count(options, "source_sync_plan.tsv");
+    let store = science_store_path(options);
     json!({
         "action":"运行安装/修复",
         "description":"准备数据库、索引、计算工具、许可证和来源记录。普通运行不配置数据库路径。",
         "database_ready": preflight_store_ready(options),
+        "tool_platforms": [openmm_platform_status(&store)],
         "direct_sources": {
             "ready": catalog_rows > 0,
             "source_count": catalog_rows,
@@ -2423,6 +2495,85 @@ fn tool_versions_ready(path: &Path) -> bool {
     })
 }
 
+fn openmm_platform_status(store: &Path) -> Value {
+    let path = store.join("indexes/tool_versions.tsv");
+    let openmm = tool_version_row(&path, "openmm");
+    let cuda = tool_version_row(&path, "openmm_cuda");
+    let openmm_ready = openmm
+        .as_ref()
+        .and_then(|row| row.get("status"))
+        .is_some_and(|status| status == "ready");
+    let version = openmm
+        .as_ref()
+        .and_then(|row| row.get("version"))
+        .cloned()
+        .unwrap_or_else(|| "missing".to_string());
+    let detail = cuda
+        .as_ref()
+        .and_then(|row| row.get("detail"))
+        .cloned()
+        .or_else(|| openmm.as_ref().and_then(|row| row.get("detail")).cloned())
+        .unwrap_or_default();
+    let platforms = detail_value(&detail, "platforms").unwrap_or_default();
+    let cuda_ready = cuda
+        .as_ref()
+        .and_then(|row| row.get("status"))
+        .is_some_and(|status| status == "ready")
+        || detail_value(&detail, "cuda").is_some_and(|value| value == "ready");
+    let summary = if !openmm_ready {
+        "OpenMM 未就绪".to_string()
+    } else if platforms.is_empty() {
+        format!("OpenMM {version} 已就绪；CUDA 平台状态等待安装器刷新")
+    } else if cuda_ready {
+        format!("OpenMM {version} 平台：{platforms}；CUDA 可用")
+    } else {
+        format!("OpenMM {version} 平台：{platforms}；CUDA 未检测到")
+    };
+    json!({
+        "id": "openmm_cuda",
+        "label": "OpenMM/CUDA 平台",
+        "openmm_ready": openmm_ready,
+        "cuda_ready": cuda_ready,
+        "platforms": platforms,
+        "summary": summary,
+        "next_action": if openmm_ready {"继续"} else {"运行安装/修复"}
+    })
+}
+
+fn tool_version_row(path: &Path, id: &str) -> Option<BTreeMap<String, String>> {
+    let text = fs::read_to_string(path).ok()?;
+    let mut lines = text.lines().filter(|line| !line.trim().is_empty());
+    let headers = lines.next()?.split('\t').collect::<Vec<_>>();
+    for line in lines {
+        let cols = line.split('\t').collect::<Vec<_>>();
+        if cols
+            .first()
+            .is_some_and(|tool| tool.eq_ignore_ascii_case(id))
+        {
+            let mut row = BTreeMap::new();
+            for (index, header) in headers.iter().enumerate() {
+                row.insert(
+                    (*header).to_string(),
+                    cols.get(index).copied().unwrap_or_default().to_string(),
+                );
+            }
+            return Some(row);
+        }
+    }
+    None
+}
+
+fn detail_value(detail: &str, key: &str) -> Option<String> {
+    detail.split(';').find_map(|part| {
+        let (left, right) = part.split_once('=')?;
+        if left.trim() == key {
+            Some(right.trim().to_string())
+        } else {
+            None
+        }
+    })
+}
+
 fn source_status_rows(store: &Path) -> Vec<Value> {
     let path = store.join("source_requirements.tsv");
     let Ok(text) = fs::read_to_string(path) else {
@@ -2783,6 +2934,18 @@ fn artifact_index(run_dir: &Path) -> Value {
         items.push(json!({"id":id,"label":label,"exists":artifact_visible_for_user(id, &path, run_dir, completed)}));
     }
     json!({"items":items})
+}
+
+fn visible_export_count(run_dir: &Path) -> usize {
+    artifact_index(run_dir)["items"]
+        .as_array()
+        .map(|items| {
+            items
+                .iter()
+                .filter(|item| item.get("exists").and_then(Value::as_bool).unwrap_or(false))
+                .count()
+        })
+        .unwrap_or(0)
 }
 
 fn artifact_visible_for_user(id: &str, path: &Path, run_dir: &Path, completed: bool) -> bool {
@@ -3342,8 +3505,15 @@ mod tests {
         fs::create_dir_all(projects_root(&options).join("project-stale").join("runs"))
             .expect("stale project dir");
         let payload = user_projects_json(&options);
+        let summary = user_workspace_summary_json(&options);
 
         assert_eq!(payload["projects"].as_array().map(Vec::len), Some(0));
+        assert_eq!(summary["project_count"], 0);
+        assert_eq!(summary["run_count"], 0);
+        assert_eq!(summary["candidate_count"], 0);
+        assert_eq!(summary["result_count"], 0);
+        assert_eq!(summary["export_item_count"], 0);
+        assert_eq!(summary["blank_workspace"], true);
         assert!(payload.get("templates").is_none());
         let text = payload.to_string();
         assert!(!text.contains("templates"));
@@ -3356,6 +3526,70 @@ mod tests {
         assert!(!text.contains("remote"));
         assert!(!text.contains("supported_actions"));
         assert!(!text.contains("preflight"));
+
+        fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn user_workspace_summary_counts_visible_completed_run_artifacts() {
+        let root =
+            std::env::temp_dir().join(format!("genoligand-workspace-summary-{}", now_millis()));
+        let options = server_options(root.clone());
+        let hidden_run_dir = projects_root(&options)
+            .join("hidden-project")
+            .join("runs")
+            .join("run-hidden");
+        fs::create_dir_all(&hidden_run_dir).expect("hidden run dir");
+        fs::write(hidden_run_dir.join("run_state.txt"), "completed\n").expect("hidden state");
+        fs::write(
+            hidden_run_dir.join("target_candidate_ranking.tsv"),
+            "candidate_id\nHIDDEN\n",
+        )
+        .expect("hidden candidates");
+
+        let project_dir = projects_root(&options).join("project-1");
+        let run_dir = project_dir.join("runs").join("run-1");
+        fs::create_dir_all(&run_dir).expect("run dir");
+        fs::write(
+            project_dir.join("input_manifest.json"),
+            r#"{"inputs":[{"field":"small_molecule","value":"CCO"}],"files":[]}"#,
+        )
+        .expect("input manifest");
+        fs::write(project_dir.join("latest_run_id.txt"), "run-1\n").expect("latest run");
+        fs::write(run_dir.join("run_state.txt"), "completed\n").expect("state");
+        fs::write(
+            run_dir.join("target_candidate_ranking.tsv"),
+            "candidate_id\ttarget_id\nC1\tP1\nC2\tP2\n",
+        )
+        .expect("candidate ranking");
+        fs::write(
+            run_dir.join("evidence_ledger.tsv"),
+            "claim_id\tstatus\ncandidate_ranking\tavailable\n",
+        )
+        .expect("evidence");
+        fs::write(
+            run_dir.join("metagenome_potential_matches.tsv"),
+            "orf_id\tmatch_score\nORF1\t0.42\n",
+        )
+        .expect("genome rows");
+        fs::write(
+            run_dir.join("structure_patch_summary.tsv"),
+            "candidate_id\n",
+        )
+        .expect("structure header");
+        fs::write(run_dir.join("md_summary.tsv"), "candidate_id\n").expect("md header");
+        fs::write(run_dir.join("research_report.md"), "# Report\n").expect("report");
+
+        let summary = user_workspace_summary_json(&options);
+        assert_eq!(summary["project_count"], 1);
+        assert_eq!(summary["run_count"], 1);
+        assert_eq!(summary["candidate_count"], 2);
+        assert_eq!(summary["result_count"], 4);
+        assert_eq!(summary["export_item_count"], 3);
+        assert_eq!(summary["demo_count"], 0);
+        assert_eq!(summary["sample_count"], 0);
+        assert_eq!(summary["test_result_count"], 0);
+        assert_eq!(summary["blank_workspace"], false);
 
         fs::remove_dir_all(&root).ok();
     }
@@ -3453,6 +3687,11 @@ mod tests {
         assert_eq!(status, 200);
         assert_eq!(content_type, "text/css; charset=utf-8");
         assert!(body.contains("--accent"));
+
+        let (status, content_type, body) = route("GET", "/favicon.svg", &options, "");
+        assert_eq!(status, 200);
+        assert_eq!(content_type, "image/svg+xml; charset=utf-8");
+        assert!(body.contains("<svg"));
 
         let (status, _, _) = route("GET", "/../Cargo.toml", &options, "");
         assert_eq!(status, 404);
@@ -3659,6 +3898,56 @@ mod tests {
         assert!(payload.get("runtime").is_none());
         assert!(!text.contains("warning"));
         assert!(!text.contains("runtime"));
+
+        fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn openmm_platform_status_reads_cuda_row_from_tool_versions() {
+        let root =
+            std::env::temp_dir().join(format!("genoligand-openmm-platforms-{}", now_millis()));
+        let store = root.join("science_store");
+        let index_dir = store.join("indexes");
+        fs::create_dir_all(&index_dir).expect("index dir");
+        fs::write(
+            index_dir.join("tool_versions.tsv"),
+            "tool\tstatus\tversion\tlicense\tlabel\tdetail\nopenmm\tready\t8.2.0\tMIT\tOpenMM\topenmm_python_module_detected;platforms=Reference,CPU,CUDA;cuda=ready\nopenmm_cuda\tready\t8.2.0\tMIT\tOpenMM CUDA Platform\topenmm_python_module_detected;platforms=Reference,CPU,CUDA;cuda=ready\n",
+        )
+        .expect("tool versions");
+
+        let status = openmm_platform_status(&store);
+        assert_eq!(status["openmm_ready"], true);
+        assert_eq!(status["cuda_ready"], true);
+        assert_eq!(status["platforms"], "Reference,CPU,CUDA");
+        assert!(
+            status["summary"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("CUDA")
+        );
+
+        fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn user_setup_and_diagnostics_expose_openmm_platforms() {
+        let root =
+            std::env::temp_dir().join(format!("genoligand-user-openmm-platforms-{}", now_millis()));
+        let options = server_options(root.clone());
+
+        let diagnostics = user_diagnostics_json(&options);
+        let setup = user_setup_status_json(&options);
+        let plan = user_setup_install_plan_json(&options);
+
+        let checks = diagnostics["checks"].as_array().expect("checks");
+        assert!(
+            checks
+                .iter()
+                .any(|row| row.get("label").and_then(Value::as_str) == Some("OpenMM/CUDA"))
+        );
+        assert_eq!(diagnostics["tool_platforms"][0]["id"], "openmm_cuda");
+        assert_eq!(setup["tool_platforms"][0]["id"], "openmm_cuda");
+        assert_eq!(plan["tool_platforms"][0]["id"], "openmm_cuda");
 
         fs::remove_dir_all(&root).ok();
     }

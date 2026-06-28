@@ -1664,8 +1664,12 @@ struct ToolProbe {
 
 fn write_tool_versions(path: &Path) -> Result<(), String> {
     let mut text = String::from("tool\tstatus\tversion\tlicense\tlabel\tdetail\n");
+    let mut openmm_probe = None;
     for tool in REQUIRED_TOOLS {
         let probe = probe_tool(tool);
+        if tool.id == "openmm" {
+            openmm_probe = Some(probe.clone());
+        }
         text.push_str(&format!(
             "{}\t{}\t{}\t{}\t{}\t{}\n",
             tool.id,
@@ -1673,6 +1677,18 @@ fn write_tool_versions(path: &Path) -> Result<(), String> {
             clean_cell(&probe.version),
             tool.license,
             tool.label,
+            clean_cell(&probe.detail)
+        ));
+    }
+    if let Some(probe) = openmm_probe {
+        text.push_str(&format!(
+            "openmm_cuda\t{}\t{}\tMIT\tOpenMM CUDA Platform\t{}\n",
+            if openmm_cuda_ready(&probe) {
+                "ready"
+            } else {
+                "missing"
+            },
+            clean_cell(&probe.version),
             clean_cell(&probe.detail)
         ));
     }
@@ -1877,7 +1893,7 @@ fn probe_tool(tool: &RequiredTool) -> ToolProbe {
         "mmseqs2" => probe_command(tool.id, "mmseqs", &["version"]),
         "foldseek" => probe_command(tool.id, "foldseek", &["version"]),
         "autodock_vina" => probe_command(tool.id, "vina", &["--version"]),
-        "openmm" => probe_python_module(tool.id, "openmm", "openmm.version.version"),
+        "openmm" => probe_openmm(),
         "pdbfixer" => probe_python_module(tool.id, "pdbfixer", "'installed'"),
         "openff_toolkit" => probe_python_module(tool.id, "openff.toolkit", "'installed'"),
         "mdtraj" => probe_python_module(tool.id, "mdtraj", "mdtraj.__version__"),
@@ -1888,6 +1904,61 @@ fn probe_tool(tool: &RequiredTool) -> ToolProbe {
             detail: format!("no_probe_defined_for:{}", tool.id),
         },
     }
+}
+
+fn probe_openmm() -> ToolProbe {
+    let code = concat!(
+        "import openmm; ",
+        "version = getattr(openmm.version, 'version', getattr(openmm, '__version__', 'installed')); ",
+        "platforms = [openmm.Platform.getPlatform(i).getName() for i in range(openmm.Platform.getNumPlatforms())]; ",
+        "print(str(version) + '\\t' + ','.join(platforms))"
+    );
+    let mut errors = Vec::new();
+    for python in python_command_candidates() {
+        let mut command = python.clone();
+        command.extend(["-c".to_string(), code.to_string()]);
+        match command_output(&command) {
+            Ok(output) => {
+                let text = process_output_text(&output);
+                if output.status.success() {
+                    let line =
+                        first_nonempty_line(&text).unwrap_or_else(|| "installed\t".to_string());
+                    let (version, platforms) = line.split_once('\t').unwrap_or((line.as_str(), ""));
+                    let cuda = platforms
+                        .split(',')
+                        .any(|name| name.trim().eq_ignore_ascii_case("cuda"));
+                    return ToolProbe {
+                        ready: true,
+                        version: version.to_string(),
+                        detail: format!(
+                            "openmm_python_module_detected;platforms={};cuda={}",
+                            platforms,
+                            if cuda { "ready" } else { "missing" }
+                        ),
+                    };
+                }
+                errors.push(format!(
+                    "{}:{}",
+                    python.join(" "),
+                    first_nonempty_line(&text).unwrap_or_else(|| "module_missing".to_string())
+                ));
+            }
+            Err(err) => errors.push(format!("{}:{err}", python.join(" "))),
+        }
+    }
+    ToolProbe {
+        ready: false,
+        version: "missing".to_string(),
+        detail: format!("openmm_python_module_missing:{}", errors.join("|")),
+    }
+}
+
+fn openmm_cuda_ready(probe: &ToolProbe) -> bool {
+    probe.ready
+        && probe.detail.split(';').any(|part| {
+            part.split_once('=')
+                .is_some_and(|(key, value)| key.trim() == "cuda" && value.trim() == "ready")
+        })
 }
 
 fn probe_command(tool_id: &str, program: &str, args: &[&str]) -> ToolProbe {
@@ -4660,6 +4731,24 @@ fn stable_hash(value: &str) -> String {
 mod tests {
     use super::*;
     use std::time::{SystemTime, UNIX_EPOCH};
+
+    #[test]
+    fn openmm_cuda_ready_follows_probe_detail_flag() {
+        let cuda_probe = ToolProbe {
+            ready: true,
+            version: "8.2.0".to_string(),
+            detail: "openmm_python_module_detected;platforms=Reference,CPU,CUDA;cuda=ready"
+                .to_string(),
+        };
+        let cpu_probe = ToolProbe {
+            ready: true,
+            version: "8.2.0".to_string(),
+            detail: "openmm_python_module_detected;platforms=Reference,CPU;cuda=missing"
+                .to_string(),
+        };
+        assert!(openmm_cuda_ready(&cuda_probe));
+        assert!(!openmm_cuda_ready(&cpu_probe));
+    }
 
     #[test]
     fn pipeline_blocks_without_science_store_and_writes_zero_candidates() {

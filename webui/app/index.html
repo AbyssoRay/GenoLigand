@@ -4,6 +4,7 @@
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <title>GenoLigand</title>
+    <link rel="icon" href="/favicon.svg" type="image/svg+xml" />
     <link rel="stylesheet" href="/styles.css" />
   </head>
   <body>
@@ -18,11 +19,11 @@
         </div>
         <nav class="steps" aria-label="工作流程">
           <button data-step="input" class="step active">Input</button>
-          <button data-step="configure" class="step">Configure</button>
-          <button data-step="check" class="step">Check</button>
-          <button data-step="run" class="step">Run</button>
-          <button data-step="results" class="step">Results</button>
-          <button data-step="export" class="step">Export</button>
+          <button data-step="configure" class="step disabled" disabled>Configure</button>
+          <button data-step="check" class="step disabled" disabled>Check</button>
+          <button data-step="run" class="step disabled" disabled>Run</button>
+          <button data-step="results" class="step disabled" disabled>Results</button>
+          <button data-step="export" class="step disabled" disabled>Export</button>
         </nav>
         <div class="side-status">
           <span data-health class="status-pill loading">连接中</span>
