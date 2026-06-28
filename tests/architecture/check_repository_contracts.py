@@ -26,7 +26,7 @@ def main() -> int:
     require("install_complete_scientific.py" in server, "installer exception must be explicit")
 
     require((ROOT / "docs/architecture.md").is_file(), "architecture responsibility map is required")
-    require((ROOT / "docs/plans/next_implementation_plan.md").is_file(), "next plan must live under docs/plans")
+    require(not (ROOT / "docs/plans/next_implementation_plan.md").exists(), "obsolete next plan must be removed")
     require(not (ROOT / "GenoLigand_next_implementation_plan.md").exists(), "root plan file must be moved")
 
     for schema in [
