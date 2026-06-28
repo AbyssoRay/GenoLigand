@@ -158,6 +158,87 @@ def command_from_string(value: str) -> list[str]:
     return shlex.split(text)
 
 
+def host_toolchain_path_entries() -> list[str]:
+    entries: list[Path] = []
+    if os.name == "nt":
+        user_profile = os.environ.get("USERPROFILE")
+        if user_profile:
+            entries.append(Path(user_profile) / ".cargo" / "bin")
+    else:
+        entries.append(Path.home() / ".cargo" / "bin")
+    return [str(path) for path in entries if path.exists()]
+
+
+def prepend_process_path(entries: Sequence[str]) -> None:
+    existing = os.environ.get("PATH", "")
+    clean_entries = [entry for entry in entries if entry]
+    if clean_entries:
+        os.environ["PATH"] = os.pathsep.join([*clean_entries, existing])
+
+
+def run_package_install(command: Sequence[str]) -> bool:
+    completed = run_command(command)
+    return completed.returncode == 0
+
+
+def ensure_cargo_available() -> str:
+    prepend_process_path(host_toolchain_path_entries())
+    cargo = shutil.which("cargo")
+    if cargo:
+        return cargo
+    if os.name == "nt":
+        winget = shutil.which("winget")
+        if winget:
+            run_package_install(
+                [
+                    winget,
+                    "install",
+                    "--id",
+                    "Rustlang.Rustup",
+                    "--exact",
+                    "--source",
+                    "winget",
+                    "--accept-package-agreements",
+                    "--accept-source-agreements",
+                ]
+            )
+            prepend_process_path(host_toolchain_path_entries())
+            cargo = shutil.which("cargo")
+            if cargo:
+                return cargo
+        return ""
+    sudo = [] if os.geteuid() == 0 else ["sudo"]
+    installers = [
+        (["apt-get"], [*sudo, "apt-get", "update"], [*sudo, "apt-get", "install", "-y", "cargo", "rustc", "build-essential", "pkg-config"]),
+        (["dnf"], [], [*sudo, "dnf", "install", "-y", "cargo", "rust", "gcc", "pkg-config"]),
+        (["yum"], [], [*sudo, "yum", "install", "-y", "cargo", "rust", "gcc", "pkg-config"]),
+        (["pacman"], [], [*sudo, "pacman", "-Sy", "--noconfirm", "rust", "gcc", "pkgconf"]),
+    ]
+    for probes, update, install in installers:
+        if shutil.which(probes[0]):
+            if update:
+                run_package_install(update)
+            run_package_install(install)
+            cargo = shutil.which("cargo")
+            if cargo:
+                return cargo
+    return ""
+
+
+def build_release_binary(root: Path, binary_name: str, cargo_package: str) -> Path | None:
+    if not (root / "Cargo.toml").exists():
+        return None
+    cargo = ensure_cargo_available()
+    if not cargo:
+        return None
+    executable = f"{binary_name}.exe" if os.name == "nt" else binary_name
+    binary = root / "target" / "release" / executable
+    completed = run_command([cargo, "build", "--release", "-p", cargo_package])
+    if completed.returncode == 0 and binary.exists():
+        return binary
+    return binary if binary.exists() else None
+
+
 def resolve_binary_command(
     explicit: str | None,
     env_name: str,
@@ -174,19 +255,23 @@ def resolve_binary_command(
     for candidate in [
         root / "bin" / executable,
         root / "tools" / "bin" / executable,
-        root / "target" / "release" / executable,
-        root / "target" / "debug" / executable,
     ]:
         if candidate.exists():
             return [str(candidate)]
+    built = build_release_binary(root, binary_name, cargo_package)
+    if built:
+        return [str(built)]
+    release_binary = root / "target" / "release" / executable
+    if release_binary.exists():
+        return [str(release_binary)]
+    if os.environ.get("GENOLIGAND_ALLOW_DEBUG_BINARIES") == "1":
+        debug_binary = root / "target" / "debug" / executable
+        if debug_binary.exists():
+            return [str(debug_binary)]
     on_path = shutil.which(binary_name)
     if on_path:
         return [on_path]
-    if (root / "Cargo.toml").exists():
-        cargo = shutil.which("cargo")
-        if cargo:
-            return [cargo, "run", "-p", cargo_package, "--"]
-    return ["cargo", "run", "-p", cargo_package, "--"]
+    return [binary_name]
 
 
 def runtime_backend() -> str:
@@ -712,6 +797,75 @@ def write_install_progress(
         encoding="utf-8",
     )
     return payload
+
+
+def process_exists(pid: int) -> bool:
+    if pid <= 0:
+        return False
+    try:
+        os.kill(pid, 0)
+        return True
+    except OSError:
+        return False
+
+
+def read_json_object(path: Path) -> dict[str, object]:
+    try:
+        value = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return {}
+    return value if isinstance(value, dict) else {}
+
+
+def acquire_install_lock(science_store: Path) -> Path:
+    lock_path = science_store / "install.lock.json"
+    science_store.mkdir(parents=True, exist_ok=True)
+    while True:
+        existing = read_json_object(lock_path)
+        existing_pid = int(existing.get("pid", 0) or 0)
+        if existing_pid and process_exists(existing_pid) and existing_pid != os.getpid():
+            write_install_progress(
+                science_store,
+                status="running",
+                stage="等待安装",
+                current_resource="安装/修复",
+                completed_steps=0,
+                total_steps=6,
+                message="检测到安装/修复正在运行，正在等待当前任务完成。",
+            )
+            time.sleep(30)
+            continue
+        try:
+            with lock_path.open("x", encoding="utf-8") as handle:
+                json.dump(
+                    {
+                        "pid": os.getpid(),
+                        "started_at": int(time.time()),
+                        "command": " ".join(sys.argv),
+                    },
+                    handle,
+                    ensure_ascii=False,
+                    indent=2,
+                )
+                handle.write("\n")
+            return lock_path
+        except FileExistsError:
+            try:
+                lock_path.unlink()
+            except OSError:
+                time.sleep(5)
+
+
+def release_install_lock(lock_path: Path | None) -> None:
+    if not lock_path:
+        return
+    existing = read_json_object(lock_path)
+    existing_pid = int(existing.get("pid", 0) or 0)
+    if existing_pid in (0, os.getpid()):
+        try:
+            lock_path.unlink()
+        except OSError:
+            pass
 
 
 def default_source_catalog(workspace_root: Path, science_store: Path) -> Path:
@@ -2248,6 +2402,8 @@ def main() -> int:
         if args.python_env_dir
         else default_python_env_dir(runtime_dir).resolve()
     )
+    prepend_process_path(host_toolchain_path_entries())
+    install_lock = acquire_install_lock(science_store)
     write_install_progress(
         science_store,
         status="running",
@@ -2347,6 +2503,15 @@ def main() -> int:
         python_backend,
         selected_wsl,
     )
+    write_install_progress(
+        science_store,
+        status="running",
+        stage="构建程序",
+        current_resource="GenoLigand CLI",
+        completed_steps=4,
+        total_steps=6,
+        message="正在构建优化版 GenoLigand 程序",
+    )
     cli_command = resolve_binary_command(
         args.gls_cli,
         "GENOLIGAND_GLS_CLI",
@@ -2434,6 +2599,8 @@ def main() -> int:
     exit_code = 0 if payload["install_ready"] else 2
     if completed.returncode != 0:
         exit_code = completed.returncode
+    release_install_lock(install_lock)
+    install_lock = None
     if not args.start_webui:
         return exit_code
     if exit_code != 0:

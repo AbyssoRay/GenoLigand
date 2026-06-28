@@ -1317,7 +1317,10 @@ fn parse_biolip_structure_rows(path: &Path) -> Result<Vec<StoreRow>, String> {
             target_class: "structure_interaction_record".to_string(),
             ligand_tokens: tokenize(ligand),
             sequence_tokens: tokenize(&format!("{pdb} {chain}")),
-            structure_tokens,
+            structure_tokens: tokenize_limited(
+                &structure_tokens.into_iter().collect::<Vec<_>>().join(" "),
+                MAX_SEQUENCE_TOKEN_CHARS,
+            ),
             evidence: "biolip2_interaction_row".to_string(),
         });
     }
@@ -1411,7 +1414,7 @@ fn parse_moad_structure_rows(path: &Path) -> Result<Vec<StoreRow>, String> {
             target_class: "structure_interaction_record".to_string(),
             ligand_tokens,
             sequence_tokens: tokenize(&pdb),
-            structure_tokens: tokenize(&line),
+            structure_tokens: tokenize_limited(&line, MAX_SEQUENCE_TOKEN_CHARS),
             evidence: "binding_moad_complex_row".to_string(),
         });
     }
