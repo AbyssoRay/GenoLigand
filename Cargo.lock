@@ -110,14 +110,14 @@ dependencies = [
 
 [[package]]
 name = "gls-cli"
-version = "0.9.9"
+version = "0.9.10"
 dependencies = [
  "gls-science",
 ]
 
 [[package]]
 name = "gls-science"
-version = "0.9.9"
+version = "0.9.10"
 dependencies = [
  "flate2",
  "serde_json",
@@ -127,7 +127,7 @@ dependencies = [
 
 [[package]]
 name = "gls-server"
-version = "0.9.9"
+version = "0.9.10"
 dependencies = [
  "serde_json",
 ]

@@ -92,6 +92,63 @@ WSL_COMMAND_WRAPPERS = [
     "rsync",
 ]
 
+COMMAND_TOOL_SPECS: list[dict[str, object]] = [
+    {
+        "component": "java",
+        "command": "java",
+        "args": ["-version"],
+        "apt": ["default-jre"],
+        "dnf": ["java-17-openjdk"],
+        "yum": ["java-17-openjdk"],
+        "pacman": ["jre-openjdk"],
+    },
+    {
+        "component": "nextflow",
+        "command": "nextflow",
+        "args": ["-version"],
+        "apt": [],
+        "dnf": [],
+        "yum": [],
+        "pacman": [],
+    },
+    {
+        "component": "openbabel",
+        "command": "obabel",
+        "args": ["-V"],
+        "apt": ["openbabel"],
+        "dnf": ["openbabel"],
+        "yum": ["openbabel"],
+        "pacman": ["openbabel"],
+    },
+    {
+        "component": "mmseqs2",
+        "command": "mmseqs",
+        "args": ["version"],
+        "apt": ["mmseqs2"],
+        "dnf": ["mmseqs2"],
+        "yum": ["mmseqs2"],
+        "pacman": ["mmseqs2"],
+    },
+    {
+        "component": "foldseek",
+        "command": "foldseek",
+        "args": ["version"],
+        "apt": ["foldseek"],
+        "dnf": ["foldseek"],
+        "yum": ["foldseek"],
+        "pacman": ["foldseek"],
+    },
+    {
+        "component": "autodock_vina",
+        "command": "vina",
+        "args": ["--version"],
+        "apt": ["autodock-vina"],
+        "dnf": ["autodock-vina"],
+        "yum": ["autodock-vina"],
+        "pacman": ["autodock-vina"],
+    },
+]
+
 
 def repo_root() -> Path:
     return Path(__file__).resolve().parents[2]
@@ -354,7 +411,9 @@ def run_command_bytes(command: Sequence[str]) -> subprocess.CompletedProcess[byt
 def decode_process_bytes(data: bytes) -> str:
     if not data:
         return ""
-    for encoding in ("utf-16le", "utf-8", "gbk"):
+    null_ratio = data.count(b"\x00") / max(1, len(data))
+    encodings = ("utf-16le", "utf-8", "gbk") if null_ratio > 0.1 else ("utf-8", "gbk", "utf-16le")
+    for encoding in encodings:
         try:
             text = data.decode(encoding)
         except UnicodeDecodeError:
@@ -407,6 +466,30 @@ def run_wsl_command(distro: str, command: Sequence[str]) -> subprocess.Completed
     )
 
 
+def run_wsl_root_shell(distro: str, script: str) -> subprocess.CompletedProcess[str]:
+    completed = run_command_bytes(["wsl.exe", "-d", distro, "--user", "root", "--", "bash", "-lc", script])
+    return subprocess.CompletedProcess(
+        completed.args,
+        completed.returncode,
+        decode_process_bytes(completed.stdout),
+        decode_process_bytes(completed.stderr),
+    )
+
+
+def run_wsl_user_shell(distro: str, script: str) -> subprocess.CompletedProcess[str]:
+    completed = run_command_bytes(["wsl.exe", "-d", distro, "--", "bash", "-lc", script])
+    return subprocess.CompletedProcess(
+        completed.args,
+        completed.returncode,
+        decode_process_bytes(completed.stdout),
+        decode_process_bytes(completed.stderr),
+    )
+
+
+def wsl_runtime_path_prefix() -> str:
+    return "$HOME/.local/state/genoligand/python-worker-env/bin:$HOME/.local/bin:/usr/local/bin:/usr/bin:/bin"
+
+
 def write_wsl_python_wrapper(wrapper: Path, distro: str, python_path: str) -> None:
     wrapper.parent.mkdir(parents=True, exist_ok=True)
     safe_distro = distro.replace('"', "")
@@ -424,7 +507,11 @@ def write_wsl_command_wrappers(wrapper_dir: Path, distro: str) -> dict[str, obje
     for command_name in WSL_COMMAND_WRAPPERS:
         wrapper = wrapper_dir / f"{command_name}.cmd"
         wrapper.write_text(
-            f'@echo off\nwsl.exe -d {safe_distro} -- {command_name} %*\n',
+            (
+                "@echo off\n"
+                f'wsl.exe -d {safe_distro} -- bash -lc '
+                f'"export PATH=\\"{wsl_runtime_path_prefix()}:$PATH\\"; exec {command_name} %*"\n'
+            ),
             encoding="utf-8",
         )
         wrappers.append(command_name)
@@ -610,6 +697,22 @@ def ensure_wsl_python_tool_environment(env_dir: Path, distro: str, skip_install:
             "total": len(PYTHON_TOOL_PACKAGES),
             "environment": "skipped",
         }
+    run_wsl_root_shell(
+        distro,
+        (
+            "set -u; "
+            "if command -v apt-get >/dev/null 2>&1; then "
+            "apt-get update; "
+            "for pkg in python3 python3-venv python3-pip ca-certificates curl unzip; do apt-get install -y \"$pkg\" || true; done; "
+            "elif command -v dnf >/dev/null 2>&1; then "
+            "dnf install -y python3 python3-pip ca-certificates curl unzip || true; "
+            "elif command -v yum >/dev/null 2>&1; then "
+            "yum install -y python3 python3-pip ca-certificates curl unzip || true; "
+            "elif command -v pacman >/dev/null 2>&1; then "
+            "pacman -Sy --noconfirm python python-pip ca-certificates curl unzip || true; "
+            "fi"
+        ),
+    )
     create = run_wsl_command(
         distro,
         [
@@ -699,6 +802,306 @@ def probe_wsl_python_import(distro: str, python_path: str, import_name: str, ver
         "ready": False,
         "version": "",
         "notes": next((line.strip() for line in text.splitlines() if line.strip()), "import_failed"),
+    }
+
+
+def bash_words(words: Sequence[str]) -> str:
+    import shlex
+
+    return " ".join(shlex.quote(word) for word in words)
+
+
+def command_tool_path_entries(env_dir: Path) -> list[str]:
+    entries: list[Path] = []
+    if os.name == "nt":
+        entries.extend([env_dir / "Scripts", env_dir / "command-wrappers"])
+    else:
+        entries.extend([env_dir / "bin", Path.home() / ".local" / "bin"])
+    return [str(path) for path in entries if path.exists()]
+
+
+def command_tool_env(workspace_root: Path, env_dir: Path, extra_entries: Sequence[Path] | None = None) -> dict[str, str]:
+    entries = [Path(path) for path in command_tool_path_entries(env_dir)]
+    if extra_entries:
+        entries.extend(extra_entries)
+    return environment_for_science_tools(workspace_root, entries)
+
+
+def probe_local_command_tool(spec: dict[str, object], workspace_root: Path, env_dir: Path) -> dict[str, object]:
+    command = str(spec["command"])
+    args = [str(arg) for arg in spec.get("args", [])]
+    env = command_tool_env(workspace_root, env_dir)
+    completed = run_command([command, *args], env=env)
+    text = f"{completed.stdout}{completed.stderr}".strip()
+    if completed.returncode == 0:
+        return {
+            "component": spec["component"],
+            "status": "ready",
+            "command": command,
+            "version": next((line.strip() for line in text.splitlines() if line.strip()), "installed"),
+            "notes": "command_detected",
+        }
+    return {
+        "component": spec["component"],
+        "status": "missing",
+        "command": command,
+        "version": "",
+        "notes": next((line.strip() for line in text.splitlines() if line.strip()), "command_missing"),
+    }
+
+
+def probe_wsl_command_tool(spec: dict[str, object], distro: str) -> dict[str, object]:
+    command = str(spec["command"])
+    args = [str(arg) for arg in spec.get("args", [])]
+    script = f'export PATH="{wsl_runtime_path_prefix()}:$PATH"; {bash_words([command, *args])}'
+    completed = run_wsl_user_shell(distro, script)
+    text = f"{completed.stdout}{completed.stderr}".strip()
+    if completed.returncode == 0:
+        return {
+            "component": spec["component"],
+            "status": "ready",
+            "command": command,
+            "version": next((line.strip() for line in text.splitlines() if line.strip()), "installed"),
+            "notes": "command_detected",
+        }
+    return {
+        "component": spec["component"],
+        "status": "missing",
+        "command": command,
+        "version": "",
+        "notes": next((line.strip() for line in text.splitlines() if line.strip()), "command_missing"),
+    }
+
+
+def missing_command_tools(
+    rows: Sequence[dict[str, object]],
+    specs: Sequence[dict[str, object]] = COMMAND_TOOL_SPECS,
+) -> list[dict[str, object]]:
+    missing = {str(row.get("component", "")) for row in rows if row.get("status") != "ready"}
+    return [spec for spec in specs if str(spec.get("component", "")) in missing]
+
+
+def write_command_tool_manifest(path: Path, rows: Sequence[dict[str, object]]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("w", encoding="utf-8", newline="") as handle:
+        writer = csv.DictWriter(
+            handle,
+            delimiter="\t",
+            fieldnames=["component", "status", "command", "version", "notes"],
+        )
+        writer.writeheader()
+        for row in rows:
+            writer.writerow(
+                {
+                    key: str(row.get(key, ""))
+                    .replace("\t", " ")
+                    .replace("\r", " ")
+                    .replace("\n", " ")
+                    for key in writer.fieldnames
+                }
+            )
+
+
+def package_names_for(specs: Sequence[dict[str, object]], manager: str) -> list[str]:
+    packages: list[str] = []
+    for spec in specs:
+        for package in spec.get(manager, []):
+            text = str(package).strip()
+            if text and text not in packages:
+                packages.append(text)
+    return packages
+
+
+def install_nextflow_wsl(distro: str) -> subprocess.CompletedProcess[str]:
+    script = (
+        f"set -u; mkdir -p \"$HOME/.local/bin\"; export PATH=\"{wsl_runtime_path_prefix()}:$PATH\"; "
+        "if ! command -v nextflow >/dev/null 2>&1; then "
+        "curl -fsSL https://get.nextflow.io -o /tmp/genoligand-nextflow-install && "
+        "(cd \"$HOME/.local/bin\" && bash /tmp/genoligand-nextflow-install) && "
+        "chmod +x \"$HOME/.local/bin/nextflow\"; "
+        "fi"
+    )
+    return run_wsl_user_shell(distro, script)
+
+
+def install_vina_user_wsl(distro: str) -> subprocess.CompletedProcess[str]:
+    python_path = "$HOME/.local/state/genoligand/python-worker-env/bin/python"
+    script = (
+        f"set -u; export PATH=\"{wsl_runtime_path_prefix()}:$PATH\"; "
+        f"if ! command -v vina >/dev/null 2>&1 && [ -x \"{python_path}\" ]; then "
+        f"{python_path} -m pip install vina || {python_path} -m pip install --break-system-packages vina || true; "
+        "fi"
+    )
+    return run_wsl_user_shell(distro, script)
+
+
+def install_wsl_command_tools(distro: str, specs: Sequence[dict[str, object]]) -> str:
+    apt_packages = package_names_for(specs, "apt")
+    dnf_packages = package_names_for(specs, "dnf")
+    yum_packages = package_names_for(specs, "yum")
+    pacman_packages = package_names_for(specs, "pacman")
+    root_script = (
+        "set -u; "
+        "if command -v apt-get >/dev/null 2>&1; then "
+        "apt-get update; "
+        "for pkg in python3 python3-venv python3-pip ca-certificates curl unzip "
+        f"{' '.join(apt_packages)}; do apt-get install -y \"$pkg\" || true; done; "
+        "elif command -v dnf >/dev/null 2>&1; then "
+        f"dnf install -y python3 python3-pip ca-certificates curl unzip {' '.join(dnf_packages)} || true; "
+        "elif command -v yum >/dev/null 2>&1; then "
+        f"yum install -y python3 python3-pip ca-certificates curl unzip {' '.join(yum_packages)} || true; "
+        "elif command -v pacman >/dev/null 2>&1; then "
+        f"pacman -Sy --noconfirm python python-pip ca-certificates curl unzip {' '.join(pacman_packages)} || true; "
+        "else exit 9; fi"
+    )
+    root = run_wsl_root_shell(distro, root_script)
+    nextflow = install_nextflow_wsl(distro)
+    return " | ".join(
+        part
+        for part in [
+            next((line.strip() for line in f"{root.stdout}{root.stderr}".splitlines() if line.strip()), ""),
+            next((line.strip() for line in f"{nextflow.stdout}{nextflow.stderr}".splitlines() if line.strip()), ""),
+        ]
+        if part
+    )
+
+
+def install_local_command_tools(specs: Sequence[dict[str, object]]) -> str:
+    if os.name == "nt":
+        winget = shutil.which("winget")
+        if not winget:
+            return "winget_unavailable"
+        java = run_package_install(
+            [
+                winget,
+                "install",
+                "--id",
+                "EclipseAdoptium.Temurin.17.JRE",
+                "--exact",
+                "--source",
+                "winget",
+                "--accept-package-agreements",
+                "--accept-source-agreements",
+            ]
+        )
+        return "winget_java_attempted" if java else "winget_java_failed"
+    sudo = [] if os.geteuid() == 0 else ["sudo"]
+    attempts: list[str] = []
+    for manager, update, install_prefix in [
+        ("apt", [*sudo, "apt-get", "update"], [*sudo, "apt-get", "install", "-y"]),
+        ("dnf", [], [*sudo, "dnf", "install", "-y"]),
+        ("yum", [], [*sudo, "yum", "install", "-y"]),
+        ("pacman", [], [*sudo, "pacman", "-Sy", "--noconfirm"]),
+    ]:
+        command = "apt-get" if manager == "apt" else manager
+        if shutil.which(command):
+            packages = package_names_for(specs, manager)
+            base_packages = ["python3", "python3-pip", "ca-certificates", "curl", "unzip"]
+            if manager == "pacman":
+                base_packages = ["python", "python-pip", "ca-certificates", "curl", "unzip"]
+            if update:
+                run_package_install(update)
+            for package in [*base_packages, *packages]:
+                if package:
+                    run_package_install([*install_prefix, package])
+            attempts.append(f"{manager}_packages_attempted")
+            break
+    if shutil.which("curl") and not shutil.which("nextflow"):
+        target = Path.home() / ".local" / "bin"
+        target.mkdir(parents=True, exist_ok=True)
+        installer = Path("/tmp/genoligand-nextflow-install")
+        downloaded = run_command(["curl", "-fsSL", "https://get.nextflow.io", "-o", str(installer)])
+        if downloaded.returncode == 0:
+            run_command(["bash", str(installer)], env={**os.environ, "NXF_HOME": str(target)})
+            candidate = Path("nextflow")
+            if candidate.exists():
+                shutil.move(str(candidate), str(target / "nextflow"))
+                (target / "nextflow").chmod(0o755)
+    return ";".join(attempts) if attempts else "no_package_manager"
+
+
+def ensure_command_tool_environment(
+    workspace_root: Path,
+    env_dir: Path,
+    skip_install: bool,
+    backend: str = "local",
+    wsl_distro: str | None = None,
+) -> dict[str, object]:
+    manifest = env_dir / "command_tool_environment_manifest.tsv"
+    if backend == "wsl":
+        if not wsl_distro:
+            rows = [
+                {
+                    "component": spec["component"],
+                    "status": "failed",
+                    "command": spec["command"],
+                    "version": "",
+                    "notes": "missing_wsl_distribution",
+                }
+                for spec in COMMAND_TOOL_SPECS
+            ]
+            write_command_tool_manifest(manifest, rows)
+            return {
+                "status": "failed",
+                "backend": "wsl",
+                "wsl_distro": "",
+                "manifest": str(manifest),
+                "ready": 0,
+                "total": len(rows),
+            }
+        rows = [probe_wsl_command_tool(spec, wsl_distro) for spec in COMMAND_TOOL_SPECS]
+        if any(row["status"] != "ready" for row in rows) and not skip_install:
+            notes = install_wsl_command_tools(wsl_distro, missing_command_tools(rows))
+            install_vina_user_wsl(wsl_distro)
+            rows = [probe_wsl_command_tool(spec, wsl_distro) for spec in COMMAND_TOOL_SPECS]
+            for row in rows:
+                if row["status"] != "ready" and notes:
+                    row["notes"] = f"{row['notes']}; install_attempt:{notes}"
+        write_command_tool_manifest(manifest, rows)
+        ready = sum(1 for row in rows if row["status"] == "ready")
+        return {
+            "status": "ready" if ready == len(rows) else "needs_repair" if not skip_install else "skipped",
+            "backend": "wsl",
+            "wsl_distro": wsl_distro,
+            "manifest": str(manifest),
+            "ready": ready,
+            "total": len(rows),
+        }
+    rows = [probe_local_command_tool(spec, workspace_root, env_dir) for spec in COMMAND_TOOL_SPECS]
+    if any(row["status"] != "ready" for row in rows) and not skip_install:
+        notes = install_local_command_tools(missing_command_tools(rows))
+        rows = [probe_local_command_tool(spec, workspace_root, env_dir) for spec in COMMAND_TOOL_SPECS]
+        for row in rows:
+            if row["status"] != "ready" and notes:
+                row["notes"] = f"{row['notes']}; install_attempt:{notes}"
+    write_command_tool_manifest(manifest, rows)
+    ready = sum(1 for row in rows if row["status"] == "ready")
+    return {
+        "status": "ready" if ready == len(rows) else "needs_repair" if not skip_install else "skipped",
+        "backend": "local",
+        "manifest": str(manifest),
+        "ready": ready,
+        "total": len(rows),
+    }
+
+
+def combine_tool_environment_result(
+    python_result: dict[str, object],
+    command_result: dict[str, object],
+) -> dict[str, object]:
+    python_ready = int(python_result.get("ready", 0) or 0)
+    python_total = int(python_result.get("total", 0) or 0)
+    command_ready = int(command_result.get("ready", 0) or 0)
+    command_total = int(command_result.get("total", 0) or 0)
+    status = "ready" if python_result.get("status") == "ready" and command_result.get("status") == "ready" else "needs_repair"
+    return {
+        **python_result,
+        "status": status,
+        "ready": python_ready + command_ready,
+        "total": python_total + command_total,
+        "python_environment": python_result,
+        "command_tools": command_result,
+        "command_tool_manifest": command_result.get("manifest", ""),
     }
 
 
@@ -2342,8 +2745,8 @@ def installation_status(
         next_action = "保持联网后重新运行安装/修复"
     elif tool_status != "ready":
         status = "needs_repair"
-        summary = "Python 科学计算环境尚未准备完成。"
-        next_action = "保持联网后重新运行安装/修复，或检查 Python 环境安装日志"
+        summary = "科学计算工具尚未准备完成。"
+        next_action = "保持联网后重新运行安装/修复，或检查工具安装日志"
     elif external_status == "needs_sync":
         status = "needs_repair"
         summary = "大型科学资源尚未闭合，科学仓库尚未准备完成。"
@@ -2497,11 +2900,31 @@ def main() -> int:
         total_steps=6,
         message="正在检查科学计算工具",
     )
-    tool_environment_result = ensure_python_tool_environment(
+    python_tool_environment_result = ensure_python_tool_environment(
         python_env_dir,
         args.no_tool_install,
         python_backend,
         selected_wsl,
+    )
+    write_install_progress(
+        science_store,
+        status="running",
+        stage="准备工具",
+        current_resource="命令行科学工具",
+        completed_steps=4,
+        total_steps=6,
+        message="正在检查并补齐命令行科学工具",
+    )
+    command_tool_environment_result = ensure_command_tool_environment(
+        workspace_root,
+        python_env_dir,
+        args.no_tool_install,
+        python_backend,
+        selected_wsl,
+    )
+    tool_environment_result = combine_tool_environment_result(
+        python_tool_environment_result,
+        command_tool_environment_result,
     )
     write_install_progress(
         science_store,
