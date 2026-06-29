@@ -127,6 +127,12 @@ const WORKER_TASKS: &[WorkerTask] = &[
         module: "genoligand_workers.trajectory_worker",
         stage: "trajectory_feature_primitive",
     },
+    WorkerTask {
+        job_id: "md_summary_ligand_dynamics",
+        worker: "md_summary",
+        module: "genoligand_workers.md_summary_worker",
+        stage: "dynamics_summary_primitive",
+    },
 ];
 
 #[derive(Clone, Debug)]
@@ -3388,6 +3394,14 @@ fn build_evidence(options: &ScienceOptions) -> Result<String, String> {
         "structure_patch_summary.tsv",
         "docking_summary.tsv",
         "md_summary.tsv",
+        "tool_outputs/md_summary.tsv",
+        "tool_outputs/md_rmsd.tsv",
+        "tool_outputs/md_rmsf.tsv",
+        "tool_outputs/md_ligand_drift.tsv",
+        "tool_outputs/md_contacts.tsv",
+        "tool_outputs/md_hbonds.tsv",
+        "tool_outputs/md_trajectory.tsv",
+        "tool_outputs/md_run_manifest.json",
         "target_candidate_ranking.tsv",
         "score_decomposition.tsv",
         "candidate_detail.json",
@@ -3500,6 +3514,13 @@ fn artifact_evidence_status(file: &str, path: &Path) -> Result<ArtifactEvidenceS
                 ("available", format!("{rows} dynamics rows"))
             } else {
                 ("not_generated", "no dynamics rows".to_string())
+            }
+        }
+        file if file.starts_with("tool_outputs/md_") && file.ends_with(".tsv") => {
+            if rows > 0 {
+                ("available", format!("{rows} MD metric artifact rows"))
+            } else {
+                ("not_generated", "no MD metric artifact rows".to_string())
             }
         }
         "target_candidate_ranking.tsv" => {
@@ -3836,7 +3857,47 @@ fn write_artifact_source_map(options: &ScienceOptions) -> Result<(), String> {
         ),
         (
             "md_summary.tsv",
-            "schema-bound dynamics output when present;otherwise no generated rows",
+            "tool_outputs/md_summary.tsv;tool_outputs/md_rmsd.tsv;tool_outputs/md_rmsf.tsv;tool_outputs/md_ligand_drift.tsv;tool_outputs/md_contacts.tsv;tool_outputs/md_hbonds.tsv",
+            "evidence_ledger.tsv",
+        ),
+        (
+            "tool_outputs/md_summary.tsv",
+            "schema-bound MD summary worker output",
+            "md_summary.tsv",
+        ),
+        (
+            "tool_outputs/md_rmsd.tsv",
+            "OpenMM ligand dynamics trajectory",
+            "md_summary.tsv",
+        ),
+        (
+            "tool_outputs/md_rmsf.tsv",
+            "OpenMM ligand dynamics trajectory",
+            "md_summary.tsv",
+        ),
+        (
+            "tool_outputs/md_ligand_drift.tsv",
+            "OpenMM ligand dynamics trajectory",
+            "md_summary.tsv",
+        ),
+        (
+            "tool_outputs/md_contacts.tsv",
+            "OpenMM ligand dynamics trajectory",
+            "md_summary.tsv",
+        ),
+        (
+            "tool_outputs/md_hbonds.tsv",
+            "OpenMM ligand dynamics trajectory",
+            "md_summary.tsv",
+        ),
+        (
+            "tool_outputs/md_trajectory.tsv",
+            "OpenMM ligand dynamics trajectory",
+            "md_summary.tsv",
+        ),
+        (
+            "tool_outputs/md_run_manifest.json",
+            "current run input and selected OpenMM platform",
             "evidence_ledger.tsv",
         ),
         (
@@ -5448,13 +5509,15 @@ mod tests {
         assert!(source_map.contains("research_report.md"));
         assert!(source_map.contains("structure_interaction_matches.tsv"));
         assert!(source_map.contains("schema-bound structure output when present"));
-        assert!(source_map.contains("schema-bound dynamics output when present"));
+        assert!(source_map.contains("tool_outputs/md_summary.tsv"));
+        assert!(source_map.contains("tool_outputs/md_rmsd.tsv"));
         assert!(source_map.contains("worker_runtime_summary.tsv"));
         assert!(source_map.contains("Rust-generated worker job specs"));
         assert!(source_map.contains("docking_summary.tsv\t"));
         assert!(source_map.contains("md_summary.tsv\t"));
         assert!(source_map.contains("docking_summary.tsv\tschema-bound docking output when present;otherwise no generated rows\tevidence_ledger.tsv\tno_rows"));
-        assert!(source_map.contains("md_summary.tsv\tschema-bound dynamics output when present;otherwise no generated rows\tevidence_ledger.tsv\tno_rows"));
+        assert!(source_map.contains("md_summary.tsv\ttool_outputs/md_summary.tsv;tool_outputs/md_rmsd.tsv;tool_outputs/md_rmsf.tsv;tool_outputs/md_ligand_drift.tsv;tool_outputs/md_contacts.tsv;tool_outputs/md_hbonds.tsv\tevidence_ledger.tsv\tno_rows"));
+        assert!(source_map.contains("tool_outputs/md_summary.tsv\tschema-bound MD summary worker output\tmd_summary.tsv\tnot_yet_written"));
         assert!(evidence.contains("structure_interaction_matches"));
         assert!(evidence.contains("worker_runtime_summary"));
         assert!(evidence.contains("score_decomposition"));

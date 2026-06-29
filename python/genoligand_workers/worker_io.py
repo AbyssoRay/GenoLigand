@@ -18,7 +18,7 @@ def parse_worker_args() -> argparse.Namespace:
 
 
 def read_job(path: str | Path) -> dict[str, Any]:
-    with Path(path).open("r", encoding="utf-8") as handle:
+    with Path(path).open("r", encoding="utf-8-sig") as handle:
         job = json.load(handle)
     if job.get("schema_version") != SCHEMA_VERSION:
         raise ValueError("unsupported worker job schema_version")
