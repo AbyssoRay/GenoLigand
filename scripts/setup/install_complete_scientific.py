@@ -362,6 +362,111 @@ def resolve_binary_command(
     return [binary_name]
 
 
+def runtime_executable_name(binary_name: str) -> str:
+    return f"{binary_name}.exe" if os.name == "nt" else binary_name
+
+
+def publish_runtime_binary(command: list[str], runtime_dir: Path, binary_name: str) -> tuple[list[str], dict[str, object]]:
+    bin_dir = runtime_dir / "bin"
+    bin_dir.mkdir(parents=True, exist_ok=True)
+    executable = runtime_executable_name(binary_name)
+    status: dict[str, object] = {
+        "binary": binary_name,
+        "bin_dir": str(bin_dir),
+        "published": False,
+        "command": command,
+    }
+    if not command:
+        status["status"] = "missing_command"
+        return command, status
+    source = Path(command[0])
+    if len(command) == 1 and source.exists() and source.is_file():
+        target = bin_dir / executable
+        if source.resolve() != target.resolve():
+            shutil.copy2(source, target)
+        try:
+            target.chmod(target.stat().st_mode | 0o755)
+        except OSError:
+            pass
+        published = [str(target)]
+        status.update({"status": "ready", "published": True, "path": str(target), "command": published})
+        return published, status
+    status["status"] = "external_command"
+    return command, status
+
+
+def command_env_value(command: list[str]) -> str:
+    if len(command) == 1:
+        return command[0]
+    return subprocess.list2cmdline(command) if os.name == "nt" else " ".join(shell_quote(part) for part in command)
+
+
+def shell_quote(value: str) -> str:
+    return "'" + value.replace("'", "'\"'\"'") + "'"
+
+
+def write_runtime_launch_environment(
+    runtime_dir: Path,
+    science_store: Path,
+    workspace_root: Path,
+    host: str,
+    port: str,
+    cli_command: list[str],
+    server_command: list[str],
+    tool_python: str,
+    science_env: dict[str, str],
+) -> dict[str, object]:
+    runtime_dir.mkdir(parents=True, exist_ok=True)
+    env = {
+        "GENOLIGAND_SCIENCE_STORE": str(science_store),
+        "GENOLIGAND_GLS_CLI": command_env_value(cli_command),
+        "GENOLIGAND_GLS_SERVER": command_env_value(server_command[:1]),
+    }
+    if tool_python:
+        env["GENOLIGAND_PYTHON"] = tool_python
+    path_prepend = [str(runtime_dir / "bin")]
+    science_path = science_env.get("PATH", "")
+    if science_path:
+        path_prepend.append(science_path)
+    launch_json = runtime_dir / "launch_environment.json"
+    launch_payload = {
+        "status": "ready",
+        "runtime_dir": str(runtime_dir),
+        "workspace_root": str(workspace_root),
+        "science_store": str(science_store),
+        "host": host,
+        "port": port,
+        "environment": env,
+        "path_prepend": path_prepend,
+        "server_command": server_command,
+    }
+    launch_json.write_text(json.dumps(launch_payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    if os.name == "nt":
+        launcher = runtime_dir / "start-genoligand-webui.cmd"
+        lines = ["@echo off", "setlocal"]
+        for key, value in env.items():
+            lines.append(f'set "{key}={value}"')
+        lines.append(f'set "PATH={";".join(path_prepend)};%PATH%"')
+        lines.append(subprocess.list2cmdline(server_command))
+        launcher.write_text("\r\n".join(lines) + "\r\n", encoding="utf-8")
+    else:
+        launcher = runtime_dir / "start-genoligand-webui.sh"
+        lines = ["#!/usr/bin/env sh", "set -eu"]
+        for key, value in env.items():
+            lines.append(f"export {key}={shell_quote(value)}")
+        lines.append(f"export PATH={shell_quote(':'.join(path_prepend))}:$PATH")
+        lines.append(" ".join(shell_quote(part) for part in server_command))
+        launcher.write_text("\n".join(lines) + "\n", encoding="utf-8")
+        launcher.chmod(0o755)
+    return {
+        "status": "ready",
+        "launcher": str(launcher),
+        "environment": str(launch_json),
+        "runtime_dir": str(runtime_dir),
+        "bin_dir": str(runtime_dir / "bin"),
+    }
+
+
 def runtime_backend() -> str:
     if os.name == "nt":
         return "windows_wsl2_capable"
@@ -3004,12 +3109,18 @@ def install_ready(payload: dict[str, object]) -> bool:
     resource_status = resources.get("status") if isinstance(resources, dict) else None
     tool_status = tool_environment.get("status") if isinstance(tool_environment, dict) else None
     source_manifest_status = source_manifests.get("status") if isinstance(source_manifests, dict) else None
+    download_ok = download_status == "ready" or (
+        download_status == "skipped"
+        and resource_status == "ready"
+        and external_status == "ready"
+        and source_manifest_status == "ready"
+    )
     return (
         payload.get("status") == "ready"
         and resource_status == "ready"
         and external_status == "ready"
         and tool_status == "ready"
-        and download_status == "ready"
+        and download_ok
         and source_manifest_status == "ready"
     )
 
@@ -3021,11 +3132,16 @@ def installation_status(
     external_sync_result: dict[str, object],
     tool_environment_result: dict[str, object],
     source_manifest_result: dict[str, object],
+    external_source_summary: dict[str, object],
+    resource_result: dict[str, object],
 ) -> dict[str, object]:
     status_payload = load_json(science_store / "install_status.json")
     store_status = str(status_payload.get("status", "")).strip()
     download_status = str(download_result.get("status", "unknown"))
-    external_status = str(external_sync_result.get("status", "unknown"))
+    external_status = str(
+        external_source_summary.get("status") or external_sync_result.get("status", "unknown")
+    )
+    resource_status = str(resource_result.get("status", "unknown"))
     tool_status = str(tool_environment_result.get("status", "unknown"))
     source_manifest_status = str(source_manifest_result.get("status", "unknown"))
     missing = status_payload.get("missing_components", [])
@@ -3042,6 +3158,18 @@ def installation_status(
         status = "needs_repair"
         summary = "部分科学资源下载或校验失败，科学仓库尚未准备完成。"
         next_action = "检查网络、磁盘空间后重新运行安装/修复"
+    elif (
+        download_status == "skipped"
+        and store_status == "ready"
+        and missing_count == 0
+        and resource_status == "ready"
+        and external_status == "ready"
+        and tool_status == "ready"
+        and source_manifest_status == "ready"
+    ):
+        status = "ready"
+        summary = "科学仓库已就绪。"
+        next_action = "打开 WebUI 并输入研究对象"
     elif download_status == "skipped":
         status = "needs_repair"
         summary = "本次未执行科学资源下载，科学仓库不能标记为完成。"
@@ -3103,6 +3231,7 @@ def main() -> int:
     workspace_root = Path(args.workspace_root).resolve()
     science_store = Path(args.science_store).resolve()
     runtime_dir = Path(args.runtime_dir).resolve()
+    runtime_dir.mkdir(parents=True, exist_ok=True)
     python_env_dir = (
         Path(args.python_env_dir).resolve()
         if args.python_env_dir
@@ -3245,6 +3374,7 @@ def main() -> int:
         "gls-cli",
         workspace_root,
     )
+    cli_command, cli_runtime_status = publish_runtime_binary(cli_command, runtime_dir, "gls-cli")
     command = cli_command + [
         "install",
         "prepare-science-store",
@@ -3267,6 +3397,12 @@ def main() -> int:
         message="正在构建数据库索引",
     )
     completed = run_command(command, env=command_env)
+    external_source_summary = source_sync_summary(
+        source_sync_plan,
+        science_store,
+        external_sync_result,
+    )
+    resource_result = resource_summary(science_store)
     install_status = installation_status(
         science_store,
         completed,
@@ -3274,20 +3410,21 @@ def main() -> int:
         external_sync_result,
         tool_environment_result,
         source_manifest_result,
+        external_source_summary,
+        resource_result,
     )
     payload: dict[str, object] = {
         **install_status,
         "returncode": completed.returncode,
         "downloads": download_summary(download_result),
-        "external_sources": source_sync_summary(
-            source_sync_plan,
-            science_store,
-            external_sync_result,
-        ),
+        "external_sources": external_source_summary,
         "source_manifests": source_manifest_result,
-        "resources": resource_summary(science_store),
+        "resources": resource_result,
         "tool_environment": tool_environment_result,
         "cuda_toolkit": cuda_toolkit_summary(),
+        "runtime_binaries": {
+            "gls_cli": cli_runtime_status,
+        },
         "runtime_backend": runtime_backend(),
         "access_url": f"http://{args.host}:{args.port}/",
     }
@@ -3322,10 +3459,45 @@ def main() -> int:
             "source_catalog": download_result.get("catalog", ""),
             "source_sync_plan": str(source_sync_plan),
         }
-    print(json.dumps(payload, ensure_ascii=False, indent=2))
     exit_code = 0 if payload["install_ready"] else 2
     if completed.returncode != 0:
         exit_code = completed.returncode
+    server_base_command = resolve_binary_command(
+        args.gls_server,
+        "GENOLIGAND_GLS_SERVER",
+        "gls-server",
+        "gls-server",
+        workspace_root,
+    )
+    server_base_command, server_runtime_status = publish_runtime_binary(
+        server_base_command,
+        runtime_dir,
+        "gls-server",
+    )
+    server_command = server_base_command + [
+        "--host",
+        args.host,
+        "--port",
+        str(args.port),
+        "--artifact-dir",
+        str(runtime_dir),
+        "--workspace-root",
+        str(workspace_root),
+    ]
+    launch_environment = write_runtime_launch_environment(
+        runtime_dir,
+        science_store,
+        workspace_root,
+        args.host,
+        str(args.port),
+        cli_command,
+        server_command,
+        tool_python,
+        science_env,
+    )
+    payload["runtime_binaries"]["gls_server"] = server_runtime_status
+    payload["launch_environment"] = launch_environment
+    print(json.dumps(payload, ensure_ascii=False, indent=2))
     release_install_lock(install_lock)
     install_lock = None
     if not args.start_webui:
@@ -3344,26 +3516,9 @@ def main() -> int:
             )
         )
 
-    runtime_dir.mkdir(parents=True, exist_ok=True)
-    server_command = resolve_binary_command(
-        args.gls_server,
-        "GENOLIGAND_GLS_SERVER",
-        "gls-server",
-        "gls-server",
-        workspace_root,
-    )
-    server_command += [
-        "--host",
-        args.host,
-        "--port",
-        str(args.port),
-        "--artifact-dir",
-        str(runtime_dir),
-        "--workspace-root",
-        str(workspace_root),
-    ]
     env = dict(science_env)
     env["GENOLIGAND_SCIENCE_STORE"] = str(science_store)
+    env["GENOLIGAND_GLS_CLI"] = command_env_value(cli_command)
     if tool_python:
         env["GENOLIGAND_PYTHON"] = tool_python
     print(
@@ -3372,6 +3527,7 @@ def main() -> int:
                 "status": "starting_webui",
                 "summary": "WebUI 正在启动。",
                 "access_url": f"http://{args.host}:{args.port}/",
+                "launcher": launch_environment.get("launcher", ""),
             },
             ensure_ascii=False,
             indent=2,

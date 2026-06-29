@@ -8,7 +8,7 @@ use std::process::{Command, Stdio};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 pub const PRODUCT_NAME: &str = "GenoLigand Local WebUI";
-pub const PRODUCT_VERSION: &str = "0.9.16";
+pub const PRODUCT_VERSION: &str = env!("CARGO_PKG_VERSION");
 
 const REQUIRED_TOOL_IDS: &[&str] = &[
     "java",
@@ -754,6 +754,10 @@ fn gls_cli_invocation(options: &ServerOptions) -> Vec<String> {
     } else {
         "gls-cli"
     };
+    let runtime_candidate = options.artifact_dir.join("bin").join(exe);
+    if runtime_candidate.exists() {
+        return vec![runtime_candidate.display().to_string()];
+    }
     let candidate = options
         .workspace_root
         .join("target")
@@ -3245,6 +3249,30 @@ mod tests {
             artifact_dir: workspace_root.join(".genoligand-test-runtime"),
             workspace_root,
         }
+    }
+
+    #[test]
+    fn gls_cli_invocation_prefers_runtime_bin_over_cargo_fallback() {
+        let root = std::env::temp_dir().join(format!("genoligand-runtime-bin-{}", now_millis()));
+        fs::create_dir_all(&root).expect("create root");
+        fs::write(root.join("Cargo.toml"), "[workspace]\n").expect("cargo marker");
+        let options = server_options(root.clone());
+        let bin_dir = options.artifact_dir.join("bin");
+        fs::create_dir_all(&bin_dir).expect("runtime bin");
+        let exe = if cfg!(windows) {
+            "gls-cli.exe"
+        } else {
+            "gls-cli"
+        };
+        let runtime_cli = bin_dir.join(exe);
+        fs::write(&runtime_cli, "runtime cli").expect("runtime cli");
+
+        let command = gls_cli_invocation(&options);
+        let joined = command.join(" ");
+
+        assert_eq!(command, vec![runtime_cli.display().to_string()]);
+        assert!(!joined.contains("cargo"));
+        fs::remove_dir_all(&root).ok();
     }
 
     fn write_ready_source_records(store: &Path) {

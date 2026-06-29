@@ -15,6 +15,11 @@ const MAX_INDEX_ROWS: usize = 30_000;
 const MAX_SOURCE_INDEX_ROWS: usize = 5_000;
 const MAX_FASTA_INDEX_ROWS: usize = MAX_SOURCE_INDEX_ROWS;
 const MAX_SEQUENCE_TOKEN_CHARS: usize = 96;
+const KNOWN_SCORE_WEIGHT: f64 = 0.55;
+const METAGENOME_SCORE_WEIGHT: f64 = 0.35;
+const STRUCTURE_SCORE_WEIGHT: f64 = 0.10;
+const DOCKING_SCORE_WEIGHT: f64 = 0.0;
+const MD_SCORE_WEIGHT: f64 = 0.10;
 
 #[derive(Clone, Debug)]
 pub struct ScienceOptions {
@@ -3449,12 +3454,13 @@ fn rank_targets(options: &ScienceOptions) -> Result<String, String> {
         &mut by_target,
     )?;
     let mut candidates = by_target.into_values().collect::<Vec<_>>();
+    apply_md_scores(&mut candidates, &options.run_dir.join("md_summary.tsv"))?;
     for candidate in &mut candidates {
-        candidate.final_score = (candidate.known_score * 0.55
-            + candidate.metagenome_score * 0.35
-            + candidate.structure_score * 0.10
-            + candidate.docking_score * 0.0
-            + candidate.dynamics_score * 0.0)
+        candidate.final_score = (candidate.known_score * KNOWN_SCORE_WEIGHT
+            + candidate.metagenome_score * METAGENOME_SCORE_WEIGHT
+            + candidate.structure_score * STRUCTURE_SCORE_WEIGHT
+            + candidate.docking_score * DOCKING_SCORE_WEIGHT
+            + candidate.dynamics_score * MD_SCORE_WEIGHT)
             .min(1.0);
     }
     candidates.sort_by(|left, right| right.final_score.total_cmp(&left.final_score));
@@ -3485,6 +3491,109 @@ fn rank_targets(options: &ScienceOptions) -> Result<String, String> {
         "targets_ranked\tcandidate_count={}",
         candidates.len()
     ))
+}
+
+fn apply_md_scores(candidates: &mut [Candidate], path: &Path) -> Result<(), String> {
+    let md_scores = read_md_scores(path)?;
+    if md_scores.is_empty() {
+        return Ok(());
+    }
+    for candidate in candidates {
+        if let Some(score) = md_scores.get(&candidate.candidate_id) {
+            candidate.dynamics_score = *score;
+            append_evidence_once(&mut candidate.evidence, "MD:md_summary_stability_score");
+        }
+    }
+    Ok(())
+}
+
+fn read_md_scores(path: &Path) -> Result<BTreeMap<String, f64>, String> {
+    if !path.exists() {
+        return Ok(BTreeMap::new());
+    }
+    let text = read_text(path)?;
+    let mut lines = text.lines();
+    let Some(header) = lines.next() else {
+        return Ok(BTreeMap::new());
+    };
+    let headers = split_tsv(header);
+    let candidate_idx = find_header(&headers, &["candidate_id"]);
+    let stability_idx = find_header(&headers, &["md_stability_score"]);
+    let rmsd_idx = find_header(&headers, &["rmsd"]);
+    let drift_idx = find_header(&headers, &["ligand_drift"]);
+    let hbond_idx = find_header(&headers, &["hydrogen_bond_occupancy"]);
+    let contact_idx = find_header(&headers, &["contact_occupancy"]);
+    let persistence_idx = find_header(&headers, &["interaction_persistence"]);
+    let mut scores = BTreeMap::new();
+    for line in lines {
+        let cols = split_tsv(line);
+        let candidate_id = cell(&cols, candidate_idx);
+        if candidate_id.is_empty() {
+            continue;
+        }
+        if let Some(score) = md_score_from_row(
+            &cols,
+            stability_idx,
+            rmsd_idx,
+            drift_idx,
+            hbond_idx,
+            contact_idx,
+            persistence_idx,
+        ) {
+            scores.insert(candidate_id, score);
+        }
+    }
+    Ok(scores)
+}
+
+fn md_score_from_row(
+    cols: &[String],
+    stability_idx: Option<usize>,
+    rmsd_idx: Option<usize>,
+    drift_idx: Option<usize>,
+    hbond_idx: Option<usize>,
+    contact_idx: Option<usize>,
+    persistence_idx: Option<usize>,
+) -> Option<f64> {
+    parse_score_cell(&cell(cols, stability_idx)).or_else(|| {
+        let rmsd = parse_score_cell(&cell(cols, rmsd_idx))?;
+        let drift = parse_score_cell(&cell(cols, drift_idx))?;
+        let hbond = parse_score_cell(&cell(cols, hbond_idx)).unwrap_or(0.0);
+        let contact = parse_score_cell(&cell(cols, contact_idx)).unwrap_or(0.0);
+        let persistence = parse_score_cell(&cell(cols, persistence_idx)).unwrap_or(contact);
+        let rmsd_component = 1.0 - (rmsd / 4.0).min(1.0);
+        let drift_component = 1.0 - (drift / 3.0).min(1.0);
+        Some(clamp_score(
+            rmsd_component * 0.30
+                + drift_component * 0.25
+                + contact * 0.20
+                + hbond * 0.10
+                + persistence * 0.15,
+        ))
+    })
+}
+
+fn parse_score_cell(value: &str) -> Option<f64> {
+    let score = value.trim().parse::<f64>().ok()?;
+    if score.is_finite() {
+        Some(clamp_score(score))
+    } else {
+        None
+    }
+}
+
+fn clamp_score(value: f64) -> f64 {
+    value.clamp(0.0, 1.0)
+}
+
+fn append_evidence_once(evidence: &mut String, item: &str) {
+    if evidence.split(';').any(|part| part == item) {
+        return;
+    }
+    if !evidence.is_empty() {
+        evidence.push(';');
+    }
+    evidence.push_str(item);
 }
 
 fn build_evidence(options: &ScienceOptions) -> Result<String, String> {
@@ -3619,7 +3728,12 @@ fn artifact_evidence_status(file: &str, path: &Path) -> Result<ArtifactEvidenceS
         }
         "md_summary.tsv" => {
             if rows > 0 {
-                ("available", format!("{rows} dynamics rows"))
+                (
+                    "available",
+                    format!(
+                        "{rows} dynamics rows; md_stability_score feeds md_score and final_score with weight {MD_SCORE_WEIGHT:.2}"
+                    ),
+                )
             } else {
                 ("not_generated", "no dynamics rows".to_string())
             }
@@ -3633,7 +3747,16 @@ fn artifact_evidence_status(file: &str, path: &Path) -> Result<ArtifactEvidenceS
         }
         "target_candidate_ranking.tsv" => {
             if rows > 0 {
-                ("available", format!("{rows} ranked candidate rows"))
+                let md_ranked = read_candidates(path)?
+                    .iter()
+                    .filter(|candidate| candidate.dynamics_score > 0.0)
+                    .count();
+                (
+                    "available",
+                    format!(
+                        "{rows} ranked candidate rows; {md_ranked} rows include md_score from current run MD Summary"
+                    ),
+                )
             } else {
                 ("no_candidate", "no ranked candidate rows".to_string())
             }
@@ -3680,6 +3803,7 @@ fn render_report(options: &ScienceOptions) -> Result<String, String> {
         "\u{672c}\u{62a5}\u{544a}\u{53ea}\u{5305}\u{542b}\u{8ba1}\u{7b97}\u{9884}\u{6d4b}\u{3001}\u{5019}\u{9009}\u{4f18}\u{5148}\u{7ea7}\u{548c}\u{8bc1}\u{636e}\u{6458}\u{8981}\u{ff0c}\u{4e0d}\u{4ee3}\u{8868}\u{5b9e}\u{9a8c}\u{9a8c}\u{8bc1}\u{3001}\u{4f53}\u{5185}\u{7ed3}\u{5408}\u{3001}\u{836f}\u{6548}\u{6216}\u{4f5c}\u{7528}\u{673a}\u{5236}\u{786e}\u{8ba4}\u{3002}\n\n",
     );
     text.push_str(&report_source_summary(options, candidates.len()));
+    text.push_str(&report_md_score_summary(options, &candidates)?);
     text.push_str("## \u{5019}\u{9009}\u{9776}\u{70b9}\n\n");
     if candidates.is_empty() {
         text.push_str("\u{5f53}\u{524d}\u{8fd0}\u{884c}\u{6ca1}\u{6709}\u{751f}\u{6210}\u{5019}\u{9009}\u{9776}\u{70b9}\u{3002}\u{53ef}\u{80fd}\u{539f}\u{56e0}\u{662f}\u{6ca1}\u{6709}\u{5339}\u{914d}\u{8bc1}\u{636e}\u{ff0c}\u{6216}\u{8ba1}\u{7b97}\u{5728}\u{5f00}\u{59cb}\u{524d}\u{88ab}\u{8fd0}\u{884c}\u{6761}\u{4ef6}\u{963b}\u{585e}\u{3002}\n");
@@ -3704,6 +3828,42 @@ fn render_report(options: &ScienceOptions) -> Result<String, String> {
     }
     write_text(&options.run_dir.join("research_report.md"), &text)?;
     Ok("report_rendered".to_string())
+}
+
+fn report_md_score_summary(
+    options: &ScienceOptions,
+    candidates: &[Candidate],
+) -> Result<String, String> {
+    let md_path = options.run_dir.join("md_summary.tsv");
+    let md_rows = rows_in_tsv(&md_path).unwrap_or(0);
+    let ranked_md = candidates
+        .iter()
+        .filter(|candidate| candidate.dynamics_score > 0.0)
+        .count();
+    if md_rows == 0 {
+        return Ok(
+            "## \u{52a8}\u{529b}\u{5b66}\u{8bc4}\u{5206}\n\n\u{5f53}\u{524d}\u{8fd0}\u{884c}\u{6ca1}\u{6709}\u{53ef}\u{7528}\u{7684} MD Summary \u{884c}\u{ff0c}md_score \u{4fdd}\u{6301} 0.0000\u{ff0c}\u{5bf9} final_score \u{8d21}\u{732e}\u{4e3a} 0\u{3002}\n\n".to_string(),
+        );
+    }
+    let platform =
+        read_md_manifest_field(options, "platform").unwrap_or_else(|| "unknown".to_string());
+    let trajectory = read_md_manifest_field(options, "trajectory")
+        .unwrap_or_else(|| "tool_outputs/md_trajectory.tsv".to_string());
+    Ok(format!(
+        "## \u{52a8}\u{529b}\u{5b66}\u{8bc4}\u{5206}\n\n- \u{6765}\u{6e90}\u{ff1a}md_summary.tsv \u{4e2d}\u{7684} md_stability_score\u{ff0c}\u{7531} RMSD\u{3001}RMSF\u{3001}\u{914d}\u{4f53}\u{6f02}\u{79fb}\u{3001}\u{63a5}\u{89e6}\u{5360}\u{6709}\u{7387}\u{548c}\u{6c22}\u{952e}\u{5360}\u{6709}\u{7387}\u{7b49}\u{5f53}\u{524d}\u{8fd0}\u{884c}\u{8f68}\u{8ff9}\u{6307}\u{6807}\u{6c47}\u{603b}\u{5f97}\u{5230}\u{3002}\n- \u{7528}\u{9014}\u{ff1a}\u{5199}\u{5165} Candidate Ranking \u{7684} md_score\u{ff0c}\u{5e76}\u{4ee5} {MD_SCORE_WEIGHT:.2} \u{6743}\u{91cd}\u{53c2}\u{4e0e} final_score\u{ff1b}\u{672c}\u{8fd0}\u{884c} {ranked_md} \u{4e2a}\u{5019}\u{9009}\u{6709} MD \u{5206}\u{6570}\u{3002}\n- OpenMM \u{5e73}\u{53f0}\u{ff1a}{platform}\u{ff1b}\u{8f68}\u{8ff9}\u{4ea7}\u{7269}\u{ff1a}{trajectory}\u{3002}\n\n"
+    ))
+}
+
+fn read_md_manifest_field(options: &ScienceOptions, field: &str) -> Option<String> {
+    read_text(&options.run_dir.join("tool_outputs/md_run_manifest.json"))
+        .ok()
+        .and_then(|text| serde_json::from_str::<Value>(text.trim_start_matches('\u{feff}')).ok())
+        .and_then(|value| {
+            value
+                .get(field)
+                .and_then(Value::as_str)
+                .map(ToOwned::to_owned)
+        })
 }
 
 fn report_source_summary(options: &ScienceOptions, candidate_count: usize) -> String {
@@ -3864,9 +4024,32 @@ fn write_candidate_detail(
 ) -> Result<(), String> {
     let project_id = infer_project_id(&options.run_dir);
     let run_id = infer_run_id(&options.run_dir);
+    let md_available = rows_in_tsv(&options.run_dir.join("md_summary.tsv")).unwrap_or(0) > 0;
     let rows = candidates
         .iter()
         .map(|candidate| {
+            let mut source_artifacts = vec![
+                "input_normalized_manifest.tsv",
+                "feature_manifest.tsv",
+                "known_database_matches.tsv",
+                "metagenome_potential_matches.tsv",
+                "structure_interaction_matches.tsv",
+                "target_candidate_ranking.tsv",
+                "score_decomposition.tsv",
+                "evidence_ledger.tsv",
+            ];
+            if md_available && candidate.dynamics_score > 0.0 {
+                source_artifacts.extend([
+                    "md_summary.tsv",
+                    "tool_outputs/md_run_manifest.json",
+                    "tool_outputs/md_trajectory.tsv",
+                    "tool_outputs/md_rmsd.tsv",
+                    "tool_outputs/md_rmsf.tsv",
+                    "tool_outputs/md_ligand_drift.tsv",
+                    "tool_outputs/md_contacts.tsv",
+                    "tool_outputs/md_hbonds.tsv",
+                ]);
+            }
             json!({
                 "candidate_id": candidate.candidate_id,
                 "target_id": candidate.target_id,
@@ -3882,15 +4065,7 @@ fn write_candidate_detail(
                     "md": candidate.dynamics_score
                 },
                 "evidence_summary": candidate.evidence,
-                "source_artifacts": [
-                    "input_normalized_manifest.tsv",
-                    "feature_manifest.tsv",
-                    "known_database_matches.tsv",
-                    "metagenome_potential_matches.tsv",
-                    "structure_interaction_matches.tsv",
-                    "target_candidate_ranking.tsv",
-                    "evidence_ledger.tsv"
-                ],
+                "source_artifacts": source_artifacts,
                 "project_id": project_id,
                 "run_id": run_id
             })
@@ -3940,8 +4115,8 @@ fn write_artifact_source_map(options: &ScienceOptions) -> Result<(), String> {
         ),
         (
             "target_candidate_ranking.tsv",
-            "known_database_matches.tsv;metagenome_potential_matches.tsv;structure_interaction_matches.tsv",
-            "candidate_detail.json",
+            "known_database_matches.tsv;metagenome_potential_matches.tsv;structure_interaction_matches.tsv;md_summary.tsv",
+            "candidate_detail.json;score_decomposition.tsv",
         ),
         (
             "structure_interaction_matches.tsv",
@@ -3966,7 +4141,7 @@ fn write_artifact_source_map(options: &ScienceOptions) -> Result<(), String> {
         (
             "md_summary.tsv",
             "structure_viewer.cif;structure_viewer.pdb;tool_outputs/md_run_manifest.json;tool_outputs/md_summary.tsv;tool_outputs/md_rmsd.tsv;tool_outputs/md_rmsf.tsv;tool_outputs/md_ligand_drift.tsv;tool_outputs/md_contacts.tsv;tool_outputs/md_hbonds.tsv",
-            "evidence_ledger.tsv",
+            "target_candidate_ranking.tsv;evidence_ledger.tsv",
         ),
         (
             "tool_outputs/md_summary.tsv",
@@ -4011,7 +4186,7 @@ fn write_artifact_source_map(options: &ScienceOptions) -> Result<(), String> {
         (
             "score_decomposition.tsv",
             "target_candidate_ranking.tsv",
-            "evidence_ledger.tsv",
+            "candidate_detail.json;evidence_ledger.tsv;md_summary.tsv",
         ),
         (
             "candidate_detail.json",
@@ -4067,6 +4242,11 @@ fn write_score_decomposition(options: &ScienceOptions) -> Result<(), String> {
             ("structure_score", candidate.structure_score),
             ("docking_score", candidate.docking_score),
             ("md_score", candidate.dynamics_score),
+            ("md_score_weight", MD_SCORE_WEIGHT),
+            (
+                "md_score_contribution",
+                candidate.dynamics_score * MD_SCORE_WEIGHT,
+            ),
             ("final_score", candidate.final_score),
         ] {
             text.push_str(&format!(
@@ -5624,7 +5804,7 @@ mod tests {
         assert!(source_map.contains("docking_summary.tsv\t"));
         assert!(source_map.contains("md_summary.tsv\t"));
         assert!(source_map.contains("docking_summary.tsv\tschema-bound docking output when present;otherwise no generated rows\tevidence_ledger.tsv\tno_rows"));
-        assert!(source_map.contains("md_summary.tsv\tstructure_viewer.cif;structure_viewer.pdb;tool_outputs/md_run_manifest.json;tool_outputs/md_summary.tsv;tool_outputs/md_rmsd.tsv;tool_outputs/md_rmsf.tsv;tool_outputs/md_ligand_drift.tsv;tool_outputs/md_contacts.tsv;tool_outputs/md_hbonds.tsv\tevidence_ledger.tsv\tno_rows"));
+        assert!(source_map.contains("md_summary.tsv\tstructure_viewer.cif;structure_viewer.pdb;tool_outputs/md_run_manifest.json;tool_outputs/md_summary.tsv;tool_outputs/md_rmsd.tsv;tool_outputs/md_rmsf.tsv;tool_outputs/md_ligand_drift.tsv;tool_outputs/md_contacts.tsv;tool_outputs/md_hbonds.tsv\ttarget_candidate_ranking.tsv;evidence_ledger.tsv\tno_rows"));
         assert!(source_map.contains("tool_outputs/md_summary.tsv\tschema-bound MD summary worker output\tmd_summary.tsv\tnot_yet_written"));
         assert!(evidence.contains("structure_interaction_matches"));
         assert!(evidence.contains("worker_runtime_summary"));
@@ -5880,6 +6060,61 @@ mod tests {
         assert!(structure_text.contains("worker_structure"));
         assert!(docking_text.contains("worker_pose"));
         assert!(md_text.contains("worker_md"));
+        fs::remove_dir_all(&root).expect("cleanup temp root");
+        assert!(!root.exists());
+    }
+
+    #[test]
+    fn md_summary_score_participates_in_ranking_and_report() {
+        let root = temp_root("md_score_ranking");
+        let run = root.join("run");
+        let store = create_temporary_test_store(&root).expect("store");
+        let input = root.join("input.json");
+        write_text(
+            &input,
+            "{\"inputs\":[{\"field\":\"small_molecule\",\"value\":\"CCO\"}],\"files\":[]}\n",
+        )
+        .expect("input");
+        write_text(
+            &run.join("known_database_matches.tsv"),
+            "input_id\tsource\ttarget_id\ttarget_name\torganism\ttarget_class\tmatch_score\tmatched_features\tevidence\ninput_1\tChEMBL\tT1\tTarget 1\tHomo sapiens\tenzyme\t1.0\tcco\tchembl_activity_row\n",
+        )
+        .expect("known match");
+        write_text(
+            &run.join("md_summary.tsv"),
+            "candidate_id\trmsd\trmsf\tligand_drift\thydrogen_bond_occupancy\tcontact_occupancy\tinteraction_persistence\tmd_risk_flags\tmd_score_decomposition\tmd_stability_score\ntarget_T1\t1.2\t0.4\t0.6\t0.72\t0.81\t0.77\tstable\tworker_md\t0.8\n",
+        )
+        .expect("md summary");
+        let options = ScienceOptions {
+            workspace_root: root.clone(),
+            science_store: store,
+            input_manifest: input,
+            run_dir: run.clone(),
+        };
+
+        rank_targets(&options).expect("rank");
+        build_evidence(&options).expect("evidence");
+        render_report(&options).expect("report");
+
+        let ranking = read_text(&run.join("target_candidate_ranking.tsv")).expect("ranking");
+        let detail = read_text(&run.join("candidate_detail.json")).expect("detail");
+        let evidence = read_text(&run.join("evidence_ledger.tsv")).expect("evidence");
+        let score = read_text(&run.join("score_decomposition.tsv")).expect("score");
+        let report = read_text(&run.join("research_report.md")).expect("report");
+        let source_map = read_text(&run.join("artifact_source_map.tsv")).expect("source map");
+
+        assert!(ranking.contains("0.6300\t1.0000\t0.0000\t0.0000\t0.0000\t0.8000"));
+        assert!(ranking.contains("ChEMBL:chembl_activity_row;MD:md_summary_stability_score"));
+        assert!(detail.contains("\"md\":0.8"));
+        assert!(detail.contains("tool_outputs/md_run_manifest.json"));
+        assert!(
+            evidence.contains("md_stability_score feeds md_score and final_score with weight 0.10")
+        );
+        assert!(evidence.contains("1 rows include md_score from current run MD Summary"));
+        assert!(score.contains("target_T1\tmd_score_contribution\t0.0800\tGenoLigand"));
+        assert!(report.contains("md_stability_score"));
+        assert!(report.contains("0.10"));
+        assert!(source_map.contains("target_candidate_ranking.tsv\tknown_database_matches.tsv;metagenome_potential_matches.tsv;structure_interaction_matches.tsv;md_summary.tsv"));
         fs::remove_dir_all(&root).expect("cleanup temp root");
         assert!(!root.exists());
     }
