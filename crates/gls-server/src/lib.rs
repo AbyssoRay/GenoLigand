@@ -8,7 +8,7 @@ use std::process::{Command, Stdio};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 pub const PRODUCT_NAME: &str = "GenoLigand Local WebUI";
-pub const PRODUCT_VERSION: &str = "0.9.15";
+pub const PRODUCT_VERSION: &str = "0.9.16";
 
 const REQUIRED_TOOL_IDS: &[&str] = &[
     "java",
@@ -2563,6 +2563,10 @@ fn openmm_platform_status(store: &Path) -> Value {
     let cuda_path_ready =
         detail_value(&detail, "cuda_path_ready").is_some_and(|value| value == "true");
     let cuda_failure_reason = detail_value(&detail, "cuda_failure_reason").unwrap_or_default();
+    let openmm_plugin_dir = detail_value(&detail, "openmm_plugin_dir").unwrap_or_default();
+    let openmm_cuda_package = detail_value(&detail, "openmm_cuda_package").unwrap_or_default();
+    let wsl_gpu = detail_value(&detail, "wsl_gpu").unwrap_or_default();
+    let wsl_libcuda = detail_value(&detail, "wsl_libcuda").unwrap_or_default();
     let cuda_ready = cuda
         .as_ref()
         .and_then(|row| row.get("status"))
@@ -2591,6 +2595,10 @@ fn openmm_platform_status(store: &Path) -> Value {
         "cuda_toolkit_path": cuda_toolkit_path,
         "cuda_path_ready": cuda_path_ready,
         "cuda_reason": cuda_failure_reason,
+        "openmm_plugin_dir": openmm_plugin_dir,
+        "openmm_cuda_package": openmm_cuda_package,
+        "wsl_gpu": wsl_gpu,
+        "wsl_libcuda": wsl_libcuda,
         "platforms": platforms,
         "summary": summary,
         "next_action": if openmm_ready {"继续"} else {"运行安装/修复"}
@@ -4900,7 +4908,7 @@ mod tests {
         .expect("structure");
         fs::write(
             run_dir.join("structure_viewer_status.tsv"),
-            "status\ttarget_id\tartifact\treason\nnot_ready\t10GS\t\tmatched structure rows did not have a local coordinate artifact\n",
+            "status\ttarget_id\tpdb_id\tartifact\texpected_path\treason\nnot_ready\t10GS\t10GS\t\tdownloads/rcsb/mmcif/0g/10gs.cif.gz\tmatched structure rows did not have a local coordinate artifact\n",
         )
         .expect("viewer status");
 

@@ -3,10 +3,24 @@ from __future__ import annotations
 import csv
 import json
 import math
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
 from genoligand_workers.worker_io import parse_worker_args, read_job, write_result
+
+
+MAX_RECEPTOR_ATOMS = 900
+SIMULATION_SEED = 20260629
+
+
+@dataclass
+class ReceptorCoordinate:
+    path: Path
+    atoms: list[dict[str, str]]
+    positions_angstrom: Any
+    preparation: str
+    risk_flags: list[str]
 
 
 def main() -> int:
@@ -33,20 +47,27 @@ def run_md_summary_job(job: dict[str, Any]) -> str:
     run_dir = runtime_path(str(job["run_dir"]))
     smiles, input_id = read_small_molecule_input(input_manifest)
     if not smiles:
-        raise ValueError("no small_molecule input available for MD summary")
+        write_md_not_ready(run_dir, "no small_molecule input available for MD summary", [])
+        return openmm_version_text(openmm, "not_ready", "missing_small_molecule")
 
-    mol = Chem.MolFromSmiles(smiles)
-    if mol is None:
-        raise ValueError("small_molecule input is not a valid SMILES string")
-    mol = Chem.AddHs(mol)
-    embed = AllChem.ETKDGv3()
-    embed.randomSeed = 20260629
-    if AllChem.EmbedMolecule(mol, embed) != 0:
-        raise ValueError("RDKit conformer embedding failed")
-    if AllChem.MMFFHasAllMoleculeParams(mol):
-        AllChem.MMFFOptimizeMolecule(mol, maxIters=200)
-    else:
-        AllChem.UFFOptimizeMolecule(mol, maxIters=200)
+    receptor_path = find_receptor_coordinate(run_dir)
+    if receptor_path is None:
+        write_md_not_ready(run_dir, "missing receptor coordinate artifact for complex MD", ["missing_receptor_coordinate"])
+        return openmm_version_text(openmm, "not_ready", "missing_receptor_coordinate")
+
+    mol = prepare_ligand(smiles, Chem, AllChem)
+    try:
+        receptor = load_receptor_coordinate(receptor_path, unit)
+    except Exception as exc:  # noqa: BLE001 - not-ready artifact is the contract for unusable coordinates
+        write_md_not_ready(
+            run_dir,
+            f"receptor coordinate preparation failed: {safe_note(str(exc))}",
+            ["receptor_coordinate_preparation_failed"],
+        )
+        return openmm_version_text(openmm, "not_ready", "receptor_coordinate_preparation_failed")
+    if not receptor.atoms:
+        write_md_not_ready(run_dir, "receptor coordinate file did not contain usable heavy atoms", ["receptor_coordinate_parse_failed"])
+        return openmm_version_text(openmm, "not_ready", "receptor_coordinate_parse_failed")
 
     conformer = mol.GetConformer()
     initial_angstrom = np.array(
@@ -60,20 +81,28 @@ def run_md_summary_job(job: dict[str, Any]) -> str:
         ],
         dtype=float,
     )
-
+    ligand_positions = place_ligand_near_receptor(initial_angstrom, receptor.positions_angstrom)
+    parameterization, parameter_flags = ligand_parameterization_status(mol)
     platform_name = select_openmm_platform(openmm)
-    system = build_ligand_system(openmm, unit, mol, initial_angstrom)
+    system, role_ranges = build_complex_system(
+        openmm,
+        unit,
+        mol,
+        receptor,
+        ligand_positions,
+    )
     integrator = openmm.LangevinMiddleIntegrator(
         300 * unit.kelvin,
         1 / unit.picosecond,
         0.001 * unit.picoseconds,
     )
-    integrator.setRandomNumberSeed(20260629)
+    integrator.setRandomNumberSeed(SIMULATION_SEED)
     platform = openmm.Platform.getPlatformByName(platform_name)
     context = openmm.Context(system, integrator, platform)
-    positions_nm = [Vec3(*(coord / 10.0)) for coord in initial_angstrom]
+    combined_positions = np.vstack([receptor.positions_angstrom, ligand_positions])
+    positions_nm = [Vec3(*(coord / 10.0)) for coord in combined_positions]
     context.setPositions(unit.Quantity(positions_nm, unit.nanometer))
-    context.setVelocitiesToTemperature(300 * unit.kelvin, 20260629)
+    context.setVelocitiesToTemperature(300 * unit.kelvin, SIMULATION_SEED)
 
     frames = [current_positions(context, unit)]
     for _ in range(20):
@@ -83,7 +112,13 @@ def run_md_summary_job(job: dict[str, Any]) -> str:
     del integrator
 
     candidate_id = top_candidate_id(run_dir) or input_id
-    metrics = summarize_frames(mol, frames)
+    risk_flags = [
+        *receptor.risk_flags,
+        *parameter_flags,
+        "ligand_placement_inferred_from_receptor_coordinate",
+        "coarse_restrained_complex_model",
+    ]
+    metrics = summarize_complex_frames(mol, receptor, frames, role_ranges)
     write_md_artifacts(
         run_dir,
         candidate_id,
@@ -93,10 +128,14 @@ def run_md_summary_job(job: dict[str, Any]) -> str:
         metrics,
         frames,
         mol,
+        receptor,
+        role_ranges,
+        parameterization,
+        risk_flags,
     )
     return (
         f"OpenMM {openmm.version.full_version}; platform={platform_name}; "
-        f"RDKit {getattr(Chem, 'rdBase', Chem).rdkitVersion}"
+        f"method=openmm_receptor_ligand_complex_dynamics; receptor={receptor.path.name}"
     )
 
 
@@ -136,6 +175,161 @@ def top_candidate_id(run_dir: Path) -> str:
     return ""
 
 
+def prepare_ligand(smiles: str, Chem: Any, AllChem: Any) -> Any:
+    mol = Chem.MolFromSmiles(smiles)
+    if mol is None:
+        raise ValueError("small_molecule input is not a valid SMILES string")
+    mol = Chem.AddHs(mol)
+    embed = AllChem.ETKDGv3()
+    embed.randomSeed = SIMULATION_SEED
+    if AllChem.EmbedMolecule(mol, embed) != 0:
+        raise ValueError("RDKit conformer embedding failed")
+    if AllChem.MMFFHasAllMoleculeParams(mol):
+        AllChem.MMFFOptimizeMolecule(mol, maxIters=200)
+    else:
+        AllChem.UFFOptimizeMolecule(mol, maxIters=200)
+    return mol
+
+
+def find_receptor_coordinate(run_dir: Path) -> Path | None:
+    for rel in [
+        "structure_viewer.pdb",
+        "structure_viewer.cif",
+        "structure_viewer.mmcif",
+        "tool_outputs/structure_viewer.pdb",
+        "tool_outputs/structure_viewer.cif",
+        "tool_outputs/structure_viewer.mmcif",
+    ]:
+        path = run_dir / rel
+        if path.exists() and path.stat().st_size > 0:
+            return path
+    return None
+
+
+def load_receptor_coordinate(path: Path, unit: Any) -> ReceptorCoordinate:
+    try:
+        return load_receptor_with_pdbfixer(path, unit)
+    except Exception as pdbfixer_error:  # noqa: BLE001 - fallback keeps real coordinate provenance
+        receptor = load_receptor_with_openmm_app(path, unit)
+        receptor.risk_flags.append(f"pdbfixer_failed:{safe_note(str(pdbfixer_error))}")
+        return receptor
+
+
+def load_receptor_with_pdbfixer(path: Path, unit: Any) -> ReceptorCoordinate:
+    import numpy as np
+    from openmm import app
+    from pdbfixer import PDBFixer
+
+    fixer = PDBFixer(filename=str(path))
+    fixer.findMissingResidues()
+    fixer.findNonstandardResidues()
+    fixer.replaceNonstandardResidues()
+    fixer.removeHeterogens(keepWater=False)
+    fixer.findMissingAtoms()
+    fixer.addMissingAtoms()
+    fixer.addMissingHydrogens(7.0)
+    atoms, positions = atoms_from_topology(fixer.topology, fixer.positions, unit)
+    atoms, positions, flags = receptor_heavy_atom_subset(atoms, positions)
+    prepared = path.parent / "tool_outputs" / "receptor_prepared.pdb"
+    prepared.parent.mkdir(parents=True, exist_ok=True)
+    with prepared.open("w", encoding="utf-8") as handle:
+        app.PDBFile.writeFile(fixer.topology, fixer.positions, handle)
+    return ReceptorCoordinate(
+        path=path,
+        atoms=atoms,
+        positions_angstrom=np.asarray(positions, dtype=float),
+        preparation="pdbfixer_prepared_receptor",
+        risk_flags=flags,
+    )
+
+
+def load_receptor_with_openmm_app(path: Path, unit: Any) -> ReceptorCoordinate:
+    import numpy as np
+    from openmm import app
+
+    lower = path.name.lower()
+    if lower.endswith(".pdb") or lower.endswith(".ent"):
+        structure = app.PDBFile(str(path))
+    else:
+        structure = app.PDBxFile(str(path))
+    atoms, positions = atoms_from_topology(structure.topology, structure.positions, unit)
+    atoms, positions, flags = receptor_heavy_atom_subset(atoms, positions)
+    return ReceptorCoordinate(
+        path=path,
+        atoms=atoms,
+        positions_angstrom=np.asarray(positions, dtype=float),
+        preparation="openmm_coordinate_parse",
+        risk_flags=["pdbfixer_not_applied", *flags],
+    )
+
+
+def atoms_from_topology(topology: Any, positions: Any, unit: Any) -> tuple[list[dict[str, str]], list[list[float]]]:
+    coords = positions.value_in_unit(unit.angstrom)
+    atoms: list[dict[str, str]] = []
+    out_positions: list[list[float]] = []
+    for index, atom in enumerate(topology.atoms()):
+        element = getattr(getattr(atom, "element", None), "symbol", "") or "C"
+        residue = getattr(atom.residue, "name", "")
+        if residue.upper() in {"HOH", "WAT", "DOD"} or element.upper() == "H":
+            continue
+        chain = getattr(getattr(atom, "residue", None), "chain", None)
+        atoms.append(
+            {
+                "element": element,
+                "name": getattr(atom, "name", f"atom_{index}"),
+                "residue": residue,
+                "residue_id": str(getattr(atom.residue, "id", "")),
+                "chain": str(getattr(chain, "id", "")),
+            }
+        )
+        pos = coords[index]
+        out_positions.append([float(pos[0]), float(pos[1]), float(pos[2])])
+    return atoms, out_positions
+
+
+def receptor_heavy_atom_subset(
+    atoms: list[dict[str, str]],
+    positions: list[list[float]],
+) -> tuple[list[dict[str, str]], list[list[float]], list[str]]:
+    if len(atoms) <= MAX_RECEPTOR_ATOMS:
+        return atoms, positions, []
+    import numpy as np
+
+    array = np.asarray(positions, dtype=float)
+    centroid = array.mean(axis=0)
+    distances = np.sqrt(((array - centroid) ** 2).sum(axis=1))
+    selected = sorted(np.argsort(distances)[:MAX_RECEPTOR_ATOMS])
+    return (
+        [atoms[index] for index in selected],
+        [positions[index] for index in selected],
+        [f"receptor_atom_subset:{MAX_RECEPTOR_ATOMS}_of_{len(atoms)}"],
+    )
+
+
+def ligand_parameterization_status(mol: Any) -> tuple[str, list[str]]:
+    try:
+        from openff.toolkit import Molecule
+
+        off_mol = Molecule.from_rdkit(mol, allow_undefined_stereo=True, hydrogens_are_explicit=True)
+        if off_mol.n_atoms:
+            return "openff_toolkit_molecule_from_rdkit", []
+    except Exception as exc:  # noqa: BLE001 - RDKit fallback remains recorded in manifest
+        return "rdkit_mmff_or_uff", [f"openff_parameterization_failed:{safe_note(str(exc))}"]
+    return "rdkit_mmff_or_uff", ["openff_parameterization_empty"]
+
+
+def place_ligand_near_receptor(initial_angstrom: Any, receptor_positions: Any) -> Any:
+    import numpy as np
+
+    receptor = np.asarray(receptor_positions, dtype=float)
+    ligand = np.asarray(initial_angstrom, dtype=float)
+    receptor_center = receptor.mean(axis=0)
+    ligand_center = ligand.mean(axis=0)
+    receptor_radius = float(np.percentile(np.sqrt(((receptor - receptor_center) ** 2).sum(axis=1)), 35))
+    offset = np.array([max(2.5, min(8.0, receptor_radius * 0.2)), 0.0, 0.0])
+    return ligand - ligand_center + receptor_center + offset
+
+
 def select_openmm_platform(openmm: Any) -> str:
     names = [
         openmm.Platform.getPlatform(index).getName()
@@ -149,34 +343,66 @@ def select_openmm_platform(openmm: Any) -> str:
     return names[0]
 
 
-def build_ligand_system(openmm: Any, unit: Any, mol: Any, initial_angstrom: Any) -> Any:
+def build_complex_system(
+    openmm: Any,
+    unit: Any,
+    mol: Any,
+    receptor: ReceptorCoordinate,
+    ligand_positions: Any,
+) -> tuple[Any, dict[str, range]]:
+    import numpy as np
+
     system = openmm.System()
+    receptor_positions = np.asarray(receptor.positions_angstrom, dtype=float)
+    for atom in receptor.atoms:
+        system.addParticle(element_mass(atom["element"]) * unit.dalton)
     for atom in mol.GetAtoms():
         mass = atom.GetMass() or 12.0
         system.addParticle(mass * unit.dalton)
 
-    bond_force = openmm.HarmonicBondForce()
+    receptor_range = range(0, len(receptor.atoms))
+    ligand_range = range(len(receptor.atoms), len(receptor.atoms) + mol.GetNumAtoms())
+
+    receptor_restraint = openmm.CustomExternalForce("0.5*k_receptor*((x-x0)^2+(y-y0)^2+(z-z0)^2)")
+    receptor_restraint.addGlobalParameter("k_receptor", 150 * unit.kilojoule_per_mole / unit.nanometer**2)
+    for name in ["x0", "y0", "z0"]:
+        receptor_restraint.addPerParticleParameter(name)
+    for index, coord in enumerate(receptor_positions):
+        receptor_restraint.addParticle(index, [coord[0] / 10.0, coord[1] / 10.0, coord[2] / 10.0])
+    system.addForce(receptor_restraint)
+
+    ligand_bonds = openmm.HarmonicBondForce()
     for bond in mol.GetBonds():
-        i = bond.GetBeginAtomIdx()
-        j = bond.GetEndAtomIdx()
-        distance_nm = distance(initial_angstrom[i], initial_angstrom[j]) / 10.0
-        bond_force.addBond(
+        i = len(receptor.atoms) + bond.GetBeginAtomIdx()
+        j = len(receptor.atoms) + bond.GetEndAtomIdx()
+        distance_nm = distance(ligand_positions[bond.GetBeginAtomIdx()], ligand_positions[bond.GetEndAtomIdx()]) / 10.0
+        ligand_bonds.addBond(
             i,
             j,
             distance_nm * unit.nanometer,
             250000 * unit.kilojoule_per_mole / unit.nanometer**2,
         )
-    system.addForce(bond_force)
+    system.addForce(ligand_bonds)
 
-    restraint = openmm.CustomExternalForce("0.5*k*((x-x0)^2+(y-y0)^2+(z-z0)^2)")
-    restraint.addGlobalParameter("k", 25 * unit.kilojoule_per_mole / unit.nanometer**2)
-    restraint.addPerParticleParameter("x0")
-    restraint.addPerParticleParameter("y0")
-    restraint.addPerParticleParameter("z0")
-    for index, coord in enumerate(initial_angstrom):
-        restraint.addParticle(index, [coord[0] / 10.0, coord[1] / 10.0, coord[2] / 10.0])
-    system.addForce(restraint)
-    return system
+    ligand_anchor = openmm.CustomExternalForce("0.5*k_ligand*((x-x0)^2+(y-y0)^2+(z-z0)^2)")
+    ligand_anchor.addGlobalParameter("k_ligand", 8 * unit.kilojoule_per_mole / unit.nanometer**2)
+    for name in ["x0", "y0", "z0"]:
+        ligand_anchor.addPerParticleParameter(name)
+    for offset, coord in enumerate(ligand_positions):
+        ligand_anchor.addParticle(len(receptor.atoms) + offset, [coord[0] / 10.0, coord[1] / 10.0, coord[2] / 10.0])
+    system.addForce(ligand_anchor)
+
+    centroid = openmm.CustomCentroidBondForce(2, "0.5*k_centroid*(distance(g1,g2)-r0)^2")
+    centroid.addGlobalParameter("k_centroid", 5 * unit.kilojoule_per_mole / unit.nanometer**2)
+    centroid.addPerBondParameter("r0")
+    centroid.addGroup(list(receptor_range))
+    centroid.addGroup(list(ligand_range))
+    receptor_center = receptor_positions.mean(axis=0)
+    ligand_center = np.asarray(ligand_positions, dtype=float).mean(axis=0)
+    centroid.addBond([0, 1], [distance(receptor_center, ligand_center) / 10.0])
+    system.addForce(centroid)
+
+    return system, {"receptor": receptor_range, "ligand": ligand_range}
 
 
 def current_positions(context: Any, unit: Any) -> Any:
@@ -185,22 +411,33 @@ def current_positions(context: Any, unit: Any) -> Any:
     )
 
 
-def summarize_frames(mol: Any, frames: list[Any]) -> dict[str, float]:
+def summarize_complex_frames(
+    mol: Any,
+    receptor: ReceptorCoordinate,
+    frames: list[Any],
+    role_ranges: dict[str, range],
+) -> dict[str, float]:
     import numpy as np
 
-    heavy = [atom.GetIdx() for atom in mol.GetAtoms() if atom.GetAtomicNum() > 1]
-    if not heavy:
-        heavy = list(range(mol.GetNumAtoms()))
-    heavy_frames = [np.asarray(frame, dtype=float)[heavy, :] for frame in frames]
-    reference = heavy_frames[0]
-    rmsd_values = [kabsch_rmsd(frame, reference) for frame in heavy_frames[1:]]
-    stack = np.stack(heavy_frames, axis=0)
+    receptor_indices = list(role_ranges["receptor"])
+    ligand_indices = list(role_ranges["ligand"])
+    ligand_heavy_local = [atom.GetIdx() for atom in mol.GetAtoms() if atom.GetAtomicNum() > 1]
+    if not ligand_heavy_local:
+        ligand_heavy_local = list(range(mol.GetNumAtoms()))
+    ligand_heavy = [ligand_indices[index] for index in ligand_heavy_local]
+    receptor_heavy = receptor_indices
+
+    receptor_frames = [np.asarray(frame, dtype=float)[receptor_heavy, :] for frame in frames]
+    ligand_frames = [np.asarray(frame, dtype=float)[ligand_heavy, :] for frame in frames]
+    receptor_reference = receptor_frames[0]
+    rmsd_values = [kabsch_rmsd(frame, receptor_reference) for frame in receptor_frames[1:]]
+    stack = np.stack([np.vstack([r_frame, l_frame]) for r_frame, l_frame in zip(receptor_frames, ligand_frames)], axis=0)
     mean_by_atom = stack.mean(axis=0)
     rmsf_by_atom = np.sqrt(((stack - mean_by_atom) ** 2).sum(axis=2).mean(axis=0))
-    centers = np.array([frame.mean(axis=0) for frame in heavy_frames])
+    centers = np.array([frame.mean(axis=0) for frame in ligand_frames])
     drift_values = np.sqrt(((centers - centers[0]) ** 2).sum(axis=1))[1:]
-    contact = contact_occupancy(mol, heavy, heavy_frames)
-    hbond = hbond_occupancy(mol, heavy_frames)
+    contact = receptor_ligand_contact_occupancy(receptor_frames, ligand_frames)
+    hbond = receptor_ligand_hbond_occupancy(receptor, mol, receptor_frames, ligand_frames, ligand_heavy_local)
     rmsd = float(np.mean(rmsd_values)) if rmsd_values else 0.0
     rmsf = float(np.mean(rmsf_by_atom)) if len(rmsf_by_atom) else 0.0
     drift = float(np.mean(drift_values)) if len(drift_values) else 0.0
@@ -231,54 +468,89 @@ def kabsch_rmsd(frame: Any, reference: Any) -> float:
     return float(np.sqrt(((aligned - right) ** 2).sum(axis=1).mean()))
 
 
-def contact_occupancy(mol: Any, heavy: list[int], frames: list[Any]) -> float:
-    from rdkit import Chem
+def receptor_ligand_contact_occupancy(receptor_frames: list[Any], ligand_frames: list[Any]) -> float:
+    import numpy as np
 
-    graph = Chem.GetDistanceMatrix(mol)
-    pairs: list[tuple[int, int]] = []
-    for left_index, left in enumerate(heavy):
-        for right in heavy[left_index + 1 :]:
-            if graph[left, right] > 2:
-                pairs.append((left_index, heavy.index(right)))
-    if not pairs:
-        return 0.0
     occupied = 0
     total = 0
-    for frame in frames:
-        for left, right in pairs:
-            total += 1
-            if distance(frame[left], frame[right]) <= 4.5:
-                occupied += 1
+    for receptor_frame, ligand_frame in zip(receptor_frames, ligand_frames):
+        distances = np.sqrt(((receptor_frame[:, None, :] - ligand_frame[None, :, :]) ** 2).sum(axis=2))
+        occupied += int((distances <= 4.5).sum())
+        total += int(distances.size)
     return occupied / total if total else 0.0
 
 
-def hbond_occupancy(mol: Any, heavy_frames: list[Any]) -> float:
-    atoms = list(mol.GetAtoms())
-    heavy_atoms = [atom for atom in atoms if atom.GetAtomicNum() > 1]
-    donors = [
-        index
-        for index, atom in enumerate(heavy_atoms)
-        if atom.GetAtomicNum() in {7, 8, 16}
-        and any(neighbor.GetAtomicNum() == 1 for neighbor in atom.GetNeighbors())
+def receptor_ligand_hbond_occupancy(
+    receptor: ReceptorCoordinate,
+    mol: Any,
+    receptor_frames: list[Any],
+    ligand_frames: list[Any],
+    ligand_heavy_local: list[int],
+) -> float:
+    import numpy as np
+
+    receptor_polar = [
+        index for index, atom in enumerate(receptor.atoms) if atom["element"].upper() in {"N", "O", "S"}
     ]
-    acceptors = [
-        index for index, atom in enumerate(heavy_atoms) if atom.GetAtomicNum() in {7, 8, 16}
+    ligand_polar = [
+        out_index
+        for out_index, atom_index in enumerate(ligand_heavy_local)
+        if mol.GetAtomWithIdx(atom_index).GetAtomicNum() in {7, 8, 16}
     ]
-    pairs = [(donor, acceptor) for donor in donors for acceptor in acceptors if donor != acceptor]
-    if not pairs:
+    if not receptor_polar or not ligand_polar:
         return 0.0
     occupied = 0
     total = 0
-    for frame in heavy_frames:
-        for donor, acceptor in pairs:
-            total += 1
-            if distance(frame[donor], frame[acceptor]) <= 3.5:
-                occupied += 1
+    for receptor_frame, ligand_frame in zip(receptor_frames, ligand_frames):
+        distances = np.sqrt(
+            ((receptor_frame[receptor_polar, None, :] - ligand_frame[None, ligand_polar, :]) ** 2).sum(axis=2)
+        )
+        occupied += int((distances <= 3.5).sum())
+        total += int(distances.size)
     return occupied / total if total else 0.0
 
 
 def distance(left: Any, right: Any) -> float:
     return math.sqrt(sum((float(a) - float(b)) ** 2 for a, b in zip(left, right)))
+
+
+def element_mass(symbol: str) -> float:
+    return {
+        "H": 1.008,
+        "C": 12.011,
+        "N": 14.007,
+        "O": 15.999,
+        "P": 30.974,
+        "S": 32.06,
+        "FE": 55.845,
+        "ZN": 65.38,
+        "MG": 24.305,
+        "CA": 40.078,
+    }.get(symbol.strip().upper(), 12.0)
+
+
+def write_md_not_ready(run_dir: Path, reason: str, risk_flags: list[str]) -> None:
+    tool_outputs = run_dir / "tool_outputs"
+    tool_outputs.mkdir(parents=True, exist_ok=True)
+    write_tsv(
+        tool_outputs / "md_not_ready.tsv",
+        ["reason", "risk_flags"],
+        [[reason, ";".join(risk_flags)]],
+    )
+    with (tool_outputs / "md_run_manifest.json").open("w", encoding="utf-8") as handle:
+        json.dump(
+            {
+                "method": "not_ready",
+                "reason": reason,
+                "risk_flags": risk_flags,
+                "metric_artifacts": [],
+                "trajectory": "",
+            },
+            handle,
+            indent=2,
+            sort_keys=True,
+        )
+        handle.write("\n")
 
 
 def write_md_artifacts(
@@ -290,11 +562,15 @@ def write_md_artifacts(
     metrics: dict[str, float],
     frames: list[Any],
     mol: Any,
+    receptor: ReceptorCoordinate,
+    role_ranges: dict[str, range],
+    parameterization: str,
+    risk_flags: list[str],
 ) -> None:
     tool_outputs = run_dir / "tool_outputs"
     tool_outputs.mkdir(parents=True, exist_ok=True)
-    risk_flags = "ligand_only_no_receptor_coordinate"
     score_note = "score_decomposition.tsv records Rust-owned candidate scores"
+    risk_text = ";".join(risk_flags)
     summary_header = [
         "candidate_id",
         "rmsd",
@@ -319,7 +595,7 @@ def write_md_artifacts(
                 fmt(metrics["hydrogen_bond_occupancy"]),
                 fmt(metrics["contact_occupancy"]),
                 fmt(metrics["interaction_persistence"]),
-                risk_flags,
+                risk_text,
                 score_note,
                 fmt(metrics["md_stability_score"]),
             ]
@@ -336,19 +612,34 @@ def write_md_artifacts(
         write_tsv(
             tool_outputs / file_name,
             ["candidate_id", "input_id", "metric", "value", "source"],
-            [[candidate_id, input_id, metric, fmt(metrics[metric]), "openmm_ligand_dynamics"]],
+            [[candidate_id, input_id, metric, fmt(metrics[metric]), "openmm_receptor_ligand_complex_dynamics"]],
         )
-    write_trajectory(tool_outputs / "md_trajectory.tsv", candidate_id, frames, mol)
+    write_trajectory(tool_outputs / "md_trajectory.tsv", candidate_id, frames, mol, receptor, role_ranges)
     with (tool_outputs / "md_run_manifest.json").open("w", encoding="utf-8") as handle:
         json.dump(
             {
                 "candidate_id": candidate_id,
                 "input_id": input_id,
                 "input_smiles": smiles,
-                "method": "openmm_ligand_dynamics",
+                "method": "openmm_receptor_ligand_complex_dynamics",
                 "platform": platform_name,
+                "cuda_ready": platform_name == "CUDA",
+                "receptor_coordinate": str(receptor.path),
+                "receptor_preparation": receptor.preparation,
+                "receptor_atom_count": len(receptor.atoms),
+                "ligand_parameterization": parameterization,
+                "ligand_placement": "inferred_from_receptor_coordinate_centroid",
                 "frame_count": len(frames),
-                "risk_flags": [risk_flags],
+                "trajectory": "tool_outputs/md_trajectory.tsv",
+                "metric_artifacts": [
+                    "tool_outputs/md_summary.tsv",
+                    "tool_outputs/md_rmsd.tsv",
+                    "tool_outputs/md_rmsf.tsv",
+                    "tool_outputs/md_ligand_drift.tsv",
+                    "tool_outputs/md_contacts.tsv",
+                    "tool_outputs/md_hbonds.tsv",
+                ],
+                "risk_flags": risk_flags,
                 "score_decomposition": "score_decomposition.tsv",
             },
             handle,
@@ -358,23 +649,51 @@ def write_md_artifacts(
         handle.write("\n")
 
 
-def write_trajectory(path: Path, candidate_id: str, frames: list[Any], mol: Any) -> None:
+def write_trajectory(
+    path: Path,
+    candidate_id: str,
+    frames: list[Any],
+    mol: Any,
+    receptor: ReceptorCoordinate,
+    role_ranges: dict[str, range],
+) -> None:
     rows = []
-    elements = [atom.GetSymbol() for atom in mol.GetAtoms()]
+    ligand_elements = [atom.GetSymbol() for atom in mol.GetAtoms()]
+    receptor_indices = list(role_ranges["receptor"])
+    ligand_indices = list(role_ranges["ligand"])
     for frame_index, frame in enumerate(frames):
-        for atom_index, coord in enumerate(frame):
+        for local_index, global_index in enumerate(receptor_indices):
+            coord = frame[global_index]
+            atom = receptor.atoms[local_index]
             rows.append(
                 [
                     candidate_id,
                     str(frame_index),
-                    str(atom_index),
-                    elements[atom_index],
+                    str(global_index),
+                    "receptor",
+                    atom["element"],
+                    atom["residue"],
                     fmt(coord[0]),
                     fmt(coord[1]),
                     fmt(coord[2]),
                 ]
             )
-    write_tsv(path, ["candidate_id", "frame", "atom_index", "element", "x", "y", "z"], rows)
+        for local_index, global_index in enumerate(ligand_indices):
+            coord = frame[global_index]
+            rows.append(
+                [
+                    candidate_id,
+                    str(frame_index),
+                    str(global_index),
+                    "ligand",
+                    ligand_elements[local_index],
+                    "LIG",
+                    fmt(coord[0]),
+                    fmt(coord[1]),
+                    fmt(coord[2]),
+                ]
+            )
+    write_tsv(path, ["candidate_id", "frame", "atom_index", "role", "element", "residue", "x", "y", "z"], rows)
 
 
 def write_tsv(path: Path, header: list[str], rows: list[list[str]]) -> None:
@@ -386,6 +705,14 @@ def write_tsv(path: Path, header: list[str], rows: list[list[str]]) -> None:
 
 def fmt(value: float) -> str:
     return f"{float(value):.4f}"
+
+
+def safe_note(value: str) -> str:
+    return value.replace("\t", " ").replace("\n", " ")[:160]
+
+
+def openmm_version_text(openmm: Any, state: str, reason: str) -> str:
+    return f"OpenMM {openmm.version.full_version}; md_summary={state}; reason={reason}"
 
 
 if __name__ == "__main__":

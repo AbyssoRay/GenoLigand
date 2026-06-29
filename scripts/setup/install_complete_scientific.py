@@ -45,6 +45,36 @@ PYTHON_TOOL_PACKAGES: list[dict[str, str]] = [
         "version_expr": "'installed'",
     },
     {
+        "component": "openff_utilities",
+        "package": "git+https://github.com/openforcefield/openff-utilities.git",
+        "import_name": "openff.utilities",
+        "version_expr": "openff.utilities.__version__",
+    },
+    {
+        "component": "openff_units",
+        "package": "git+https://github.com/openforcefield/openff-units.git",
+        "import_name": "openff.units",
+        "version_expr": "openff.units.__version__",
+    },
+    {
+        "component": "cachetools",
+        "package": "cachetools",
+        "import_name": "cachetools",
+        "version_expr": "cachetools.__version__",
+    },
+    {
+        "component": "networkx",
+        "package": "networkx",
+        "import_name": "networkx",
+        "version_expr": "networkx.__version__",
+    },
+    {
+        "component": "pydantic",
+        "package": "pydantic",
+        "import_name": "pydantic",
+        "version_expr": "pydantic.__version__",
+    },
+    {
         "component": "mdtraj",
         "package": "mdtraj",
         "import_name": "mdtraj",
@@ -64,6 +94,7 @@ PYTHON_TOOL_PACKAGES: list[dict[str, str]] = [
     },
 ]
 
+OPENMM_CUDA_PIP_PACKAGE = "openmm-cuda-12"
 RESERVED_WSL_DISTROS = {"Ubuntu-24.04"}
 DOWNLOAD_RETRIES = 3
 DOWNLOAD_TIMEOUT_SECONDS = 120
@@ -542,7 +573,10 @@ def write_wsl_python_wrapper(wrapper: Path, distro: str, python_path: str) -> No
     safe_distro = distro.replace('"', "")
     safe_python = python_path.replace('"', "")
     wrapper.write_text(
-        f'@echo off\nwsl.exe -d {safe_distro} -- "{safe_python}" %*\n',
+        (
+            "@echo off\n"
+            f'wsl.exe -d {safe_distro} -- env LD_LIBRARY_PATH=/usr/lib/wsl/lib:/usr/local/cuda/lib64 "{safe_python}" %*\n'
+        ),
         encoding="utf-8",
     )
 
@@ -591,6 +625,165 @@ def probe_python_import(python: Path, import_name: str, version_expr: str) -> di
     }
 
 
+def python_tool_total() -> int:
+    return len(PYTHON_TOOL_PACKAGES) + 1
+
+
+OPENMM_CUDA_PROBE_CODE = r"""
+import json
+import os
+import pathlib
+import site
+
+payload = {
+    "openmm_ready": False,
+    "version": "",
+    "platforms": [],
+    "cuda_ready": False,
+    "plugin_dir": "",
+    "failure_reason": "",
+}
+try:
+    import openmm
+
+    payload["openmm_ready"] = True
+    payload["version"] = getattr(openmm.version, "version", getattr(openmm, "__version__", "installed"))
+    payload["platforms"] = [
+        openmm.Platform.getPlatform(index).getName()
+        for index in range(openmm.Platform.getNumPlatforms())
+    ]
+    payload["cuda_ready"] = any(name.lower() == "cuda" for name in payload["platforms"])
+    roots = []
+    try:
+        roots.extend(site.getsitepackages())
+    except Exception:
+        pass
+    try:
+        roots.append(str(pathlib.Path(openmm.__file__).resolve().parent.parent))
+    except Exception:
+        pass
+    for root in roots:
+        candidate = pathlib.Path(root) / "OpenMM.libs" / "lib" / "plugins"
+        if candidate.exists():
+            payload["plugin_dir"] = str(candidate)
+            break
+except Exception as exc:
+    payload["failure_reason"] = f"openmm_probe_failed:{exc}"
+print(json.dumps(payload, sort_keys=True))
+"""
+
+
+def parse_openmm_cuda_probe(completed: subprocess.CompletedProcess[str]) -> dict[str, object]:
+    text = f"{completed.stdout}{completed.stderr}".strip()
+    for line in text.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            payload = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(payload, dict):
+            return payload
+    return {
+        "openmm_ready": False,
+        "version": "",
+        "platforms": [],
+        "cuda_ready": False,
+        "plugin_dir": "",
+        "failure_reason": next((line.strip() for line in text.splitlines() if line.strip()), "openmm_cuda_probe_failed"),
+    }
+
+
+def probe_local_openmm_cuda(python: Path) -> dict[str, object]:
+    return parse_openmm_cuda_probe(run_command([str(python), "-c", OPENMM_CUDA_PROBE_CODE]))
+
+
+def probe_wsl_openmm_cuda(distro: str, python_path: str) -> dict[str, object]:
+    return parse_openmm_cuda_probe(run_wsl_command(distro, [python_path, "-c", OPENMM_CUDA_PROBE_CODE]))
+
+
+def openmm_cuda_notes(
+    probe: dict[str, object],
+    repair_action: str,
+    runtime_notes: str = "",
+) -> str:
+    platforms = ",".join(str(item) for item in probe.get("platforms", []) if str(item))
+    cuda = "ready" if probe.get("cuda_ready") else "missing"
+    reason = "ready" if probe.get("cuda_ready") else str(probe.get("failure_reason") or "openmm_platform_list_does_not_include_CUDA")
+    parts = [
+        f"platforms={platforms}",
+        f"cuda={cuda}",
+        f"cuda_failure_reason={reason}",
+        f"openmm_plugin_dir={probe.get('plugin_dir', '')}",
+        f"repair_action={repair_action}",
+    ]
+    if runtime_notes:
+        parts.append(runtime_notes)
+    return ";".join(parts)
+
+
+def openmm_cuda_manifest_row(
+    python: str,
+    probe: dict[str, object],
+    repair_action: str,
+    runtime_notes: str = "",
+) -> dict[str, object]:
+    ready = bool(probe.get("cuda_ready"))
+    status = "ready" if ready else "missing"
+    if not probe.get("openmm_ready"):
+        status = "failed"
+    return {
+        "component": "openmm_cuda",
+        "status": status,
+        "python": python,
+        "package": OPENMM_CUDA_PIP_PACKAGE,
+        "import_name": "openmm",
+        "version": str(probe.get("version") or ""),
+        "notes": openmm_cuda_notes(probe, repair_action, runtime_notes),
+    }
+
+
+def ensure_local_openmm_cuda(python: Path, skip_install: bool) -> dict[str, object]:
+    probe = probe_local_openmm_cuda(python)
+    repair_action = "not_needed" if probe.get("cuda_ready") else "pending"
+    if not probe.get("cuda_ready") and not skip_install:
+        installed = run_command([str(python), "-m", "pip", "install", OPENMM_CUDA_PIP_PACKAGE])
+        repair_action = "pip_install_openmm_cuda_12_succeeded" if installed.returncode == 0 else "pip_install_openmm_cuda_12_failed"
+        probe = probe_local_openmm_cuda(python)
+        if not probe.get("cuda_ready") and installed.returncode != 0:
+            probe["failure_reason"] = installed.stderr.strip() or installed.stdout.strip() or probe.get("failure_reason", "")
+    elif not probe.get("cuda_ready"):
+        repair_action = "tool_install_skipped"
+    return openmm_cuda_manifest_row(str(python), probe, repair_action)
+
+
+def probe_wsl_cuda_runtime(distro: str) -> str:
+    code = (
+        "import pathlib, shutil, subprocess; "
+        "gpu = bool(shutil.which('nvidia-smi')) and subprocess.run(['nvidia-smi','-L'], capture_output=True, text=True).returncode == 0; "
+        "libcuda = pathlib.Path('/usr/lib/wsl/lib/libcuda.so').exists() or pathlib.Path('/usr/lib/wsl/lib/libcuda.so.1').exists(); "
+        "print('wsl_gpu=' + str(gpu).lower() + ';wsl_driver=' + str(gpu).lower() + ';wsl_libcuda=' + str(libcuda).lower())"
+    )
+    completed = run_wsl_command(distro, ["python3", "-c", code])
+    return (completed.stdout or completed.stderr or "wsl_cuda_probe_failed").strip().replace("\n", " ")
+
+
+def ensure_wsl_openmm_cuda(distro: str, python_path: str, wrapper: Path, skip_install: bool) -> dict[str, object]:
+    runtime_notes = probe_wsl_cuda_runtime(distro)
+    probe = probe_wsl_openmm_cuda(distro, python_path)
+    repair_action = "not_needed" if probe.get("cuda_ready") else "pending"
+    if not probe.get("cuda_ready") and not skip_install:
+        installed = run_wsl_command(distro, [python_path, "-m", "pip", "install", OPENMM_CUDA_PIP_PACKAGE])
+        repair_action = "pip_install_openmm_cuda_12_succeeded" if installed.returncode == 0 else "pip_install_openmm_cuda_12_failed"
+        probe = probe_wsl_openmm_cuda(distro, python_path)
+        if not probe.get("cuda_ready") and installed.returncode != 0:
+            probe["failure_reason"] = installed.stderr.strip() or installed.stdout.strip() or probe.get("failure_reason", "")
+    elif not probe.get("cuda_ready"):
+        repair_action = "tool_install_skipped"
+    return openmm_cuda_manifest_row(str(wrapper), probe, repair_action, runtime_notes)
+
+
 def ensure_python_tool_environment(
     env_dir: Path,
     skip_install: bool,
@@ -605,7 +798,7 @@ def ensure_python_tool_environment(
                 "python": "",
                 "manifest": str(env_dir / "tool_environment_manifest.tsv"),
                 "ready": 0,
-                "total": len(PYTHON_TOOL_PACKAGES),
+                "total": python_tool_total(),
                 "environment": "missing_wsl_distribution",
             }
         return ensure_wsl_python_tool_environment(env_dir, wsl_distro, skip_install)
@@ -641,10 +834,10 @@ def ensure_local_python_tool_environment(env_dir: Path, skip_install: bool) -> d
             return {
                 "status": "failed",
                 "python": str(python),
-                "manifest": str(manifest),
-                "ready": 0,
-                "total": len(PYTHON_TOOL_PACKAGES),
-            }
+                    "manifest": str(manifest),
+                    "ready": 0,
+                    "total": python_tool_total(),
+                }
         create_status = "created"
     if not skip_install:
         run_command([str(python), "-m", "pip", "install", "--upgrade", "pip"])
@@ -675,8 +868,12 @@ def ensure_local_python_tool_environment(env_dir: Path, skip_install: bool) -> d
                 "notes": notes,
             }
         )
+    cuda_row = ensure_local_openmm_cuda(python, skip_install)
+    if cuda_row["status"] == "ready":
+        ready += 1
+    rows.append(cuda_row)
     write_python_tool_manifest(manifest, rows)
-    total = len(PYTHON_TOOL_PACKAGES)
+    total = python_tool_total()
     return {
         "status": "ready" if ready == total else "needs_repair" if not skip_install else "skipped",
         "backend": "local",
@@ -713,11 +910,11 @@ def ensure_wsl_python_tool_environment(env_dir: Path, distro: str, skip_install:
             "backend": "wsl",
             "wsl_distro": distro,
             "python": str(wrapper),
-            "manifest": str(manifest),
-            "ready": 0,
-            "total": len(PYTHON_TOOL_PACKAGES),
-            "environment": "wsl_unavailable",
-        }
+                    "manifest": str(manifest),
+                    "ready": 0,
+                    "total": python_tool_total(),
+                    "environment": "wsl_unavailable",
+                }
     python_path = f"{home}/.local/state/genoligand/python-worker-env/bin/python"
     write_wsl_python_wrapper(wrapper, distro, python_path)
     if skip_install:
@@ -733,6 +930,17 @@ def ensure_wsl_python_tool_environment(env_dir: Path, distro: str, skip_install:
             }
             for spec in PYTHON_TOOL_PACKAGES
         ]
+        rows.append(
+            {
+                "component": "openmm_cuda",
+                "status": "skipped",
+                "python": str(wrapper),
+                "package": OPENMM_CUDA_PIP_PACKAGE,
+                "import_name": "openmm",
+                "version": "",
+                "notes": "tool_install_skipped",
+            }
+        )
         write_python_tool_manifest(manifest, rows)
         return {
             "status": "skipped",
@@ -741,7 +949,7 @@ def ensure_wsl_python_tool_environment(env_dir: Path, distro: str, skip_install:
             "python": str(wrapper),
             "manifest": str(manifest),
             "ready": 0,
-            "total": len(PYTHON_TOOL_PACKAGES),
+            "total": python_tool_total(),
             "environment": "skipped",
         }
     run_wsl_root_shell(
@@ -788,11 +996,11 @@ def ensure_wsl_python_tool_environment(env_dir: Path, distro: str, skip_install:
             "backend": "wsl",
             "wsl_distro": distro,
             "python": str(wrapper),
-            "manifest": str(manifest),
-            "ready": 0,
-            "total": len(PYTHON_TOOL_PACKAGES),
-            "environment": "failed",
-        }
+                    "manifest": str(manifest),
+                    "ready": 0,
+                    "total": python_tool_total(),
+                    "environment": "failed",
+                }
     ready = 0
     rows: list[dict[str, object]] = []
     for spec in PYTHON_TOOL_PACKAGES:
@@ -824,8 +1032,12 @@ def ensure_wsl_python_tool_environment(env_dir: Path, distro: str, skip_install:
                 "notes": notes,
             }
         )
+    cuda_row = ensure_wsl_openmm_cuda(distro, python_path, wrapper, skip_install)
+    if cuda_row["status"] == "ready":
+        ready += 1
+    rows.append(cuda_row)
     write_python_tool_manifest(manifest, rows)
-    total = len(PYTHON_TOOL_PACKAGES)
+    total = python_tool_total()
     return {
         "status": "ready" if ready == total else "needs_repair",
         "backend": "wsl",
@@ -2041,6 +2253,9 @@ def ligand_bound_pdb_scope(science_store: Path) -> set[str]:
     explicit = science_store / "downloads/rcsb/ligand_bound_pdb_ids.txt"
     if explicit.exists():
         pdb_ids.update(extract_pdb_ids(explicit.read_text(encoding="utf-8", errors="replace")))
+    structure_index = science_store / "indexes/structure_targets.tsv"
+    if structure_index.exists():
+        pdb_ids.update(extract_pdb_ids_from_structure_index(structure_index))
     for path in [
         science_store / "downloads/binding_moad/bindingmoad.csv",
         science_store / "downloads/binding_moad/BindingMOAD_data_for_PDB_1_31_2022.csv",
@@ -2052,7 +2267,30 @@ def ligand_bound_pdb_scope(science_store: Path) -> set[str]:
                 pdb_ids.update(extract_pdb_ids_from_source_file(path))
             except OSError:
                 continue
-    return {pdb_id for pdb_id in pdb_ids if valid_pdb_id(pdb_id)}
+    explicit_filter = os.environ.get("GENOLIGAND_RCSB_PDB_IDS", "").strip()
+    if explicit_filter:
+        requested = extract_pdb_ids(explicit_filter)
+        pdb_ids = {pdb_id for pdb_id in pdb_ids if pdb_id in requested} | requested
+    limit_text = os.environ.get("GENOLIGAND_RCSB_SCOPE_LIMIT", "").strip()
+    valid_ids = sorted(pdb_id for pdb_id in pdb_ids if valid_pdb_id(pdb_id))
+    if limit_text:
+        try:
+            limit = int(limit_text)
+        except ValueError:
+            limit = 0
+        if limit > 0:
+            valid_ids = valid_ids[:limit]
+    return set(valid_ids)
+
+
+def extract_pdb_ids_from_structure_index(path: Path) -> set[str]:
+    ids: set[str] = set()
+    with path.open("r", encoding="utf-8-sig", newline="") as handle:
+        reader = csv.DictReader(handle, delimiter="\t")
+        for row in reader:
+            for key in ("target_id", "target_name", "structure_tokens", "evidence"):
+                ids.update(extract_pdb_ids(row.get(key, "")))
+    return ids
 
 
 def read_text_or_gzip(path: Path) -> str:
@@ -2130,6 +2368,20 @@ def sync_external_row(
     }
 
 
+def rcsb_scope_has_missing_coordinates(science_store: Path, target: Path | None) -> bool:
+    if target is None:
+        return True
+    pdb_ids = ligand_bound_pdb_scope(science_store)
+    if not pdb_ids:
+        return False
+    for pdb_id in pdb_ids:
+        upper = pdb_id.upper()
+        destination = target / upper[1:3].lower() / f"{upper.lower()}.cif.gz"
+        if not path_has_payload(destination):
+            return True
+    return False
+
+
 def sync_external_sources(
     plan: Path,
     science_store: Path,
@@ -2202,7 +2454,11 @@ def sync_external_sources(
             ready_marker = row.get("ready_marker") or target_rel
             target = science_store / target_rel if target_rel else None
             marker = science_store / ready_marker if ready_marker else target
-            if marker and path_has_payload(marker):
+            method = (row.get("sync_method") or "direct").strip().lower()
+            marker_ready = bool(marker and path_has_payload(marker))
+            if marker_ready and method == "rcsb_ligand_bound_scope":
+                marker_ready = not rcsb_scope_has_missing_coordinates(science_store, target)
+            if marker_ready:
                 ready += 1
                 write_install_progress(
                     science_store,

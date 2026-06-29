@@ -1902,7 +1902,7 @@ fn probe_tool(tool: &RequiredTool) -> ToolProbe {
         "autodock_vina" => probe_command(tool.id, "vina", &["--version"]),
         "openmm" => probe_openmm(),
         "pdbfixer" => probe_python_module(tool.id, "pdbfixer", "'installed'"),
-        "openff_toolkit" => probe_python_module(tool.id, "openff.toolkit", "'installed'"),
+        "openff_toolkit" => probe_openff_toolkit(),
         "mdtraj" => probe_python_module(tool.id, "mdtraj", "mdtraj.__version__"),
         "mdanalysis" => probe_python_module(tool.id, "MDAnalysis", "MDAnalysis.__version__"),
         _ => ToolProbe {
@@ -1915,11 +1915,17 @@ fn probe_tool(tool: &RequiredTool) -> ToolProbe {
 
 fn probe_openmm() -> ToolProbe {
     let code = concat!(
-        "import openmm; ",
+        "import openmm, importlib.metadata as metadata, pathlib, site, subprocess, shutil; ",
         "version = getattr(openmm.version, 'version', getattr(openmm, '__version__', 'installed')); ",
         "platforms = [openmm.Platform.getPlatform(i).getName() for i in range(openmm.Platform.getNumPlatforms())]; ",
         "cuda_probe = 'ready' if any(name.lower() == 'cuda' for name in platforms) else 'missing:openmm_platform_list_does_not_include_CUDA'; ",
-        "print(str(version) + '\\t' + ','.join(platforms) + '\\t' + cuda_probe)"
+        "roots = site.getsitepackages() + [str(pathlib.Path(openmm.__file__).resolve().parent.parent)]; ",
+        "plugin_dirs = [str(pathlib.Path(root) / 'OpenMM.libs' / 'lib' / 'plugins') for root in roots if (pathlib.Path(root) / 'OpenMM.libs' / 'lib' / 'plugins').exists()]; ",
+        "plugin_dir = plugin_dirs[0] if plugin_dirs else ''; ",
+        "cuda_pkg = next((dist.version for dist in metadata.distributions() if dist.metadata.get('Name', '').lower() == 'openmm-cuda-12'), ''); ",
+        "wsl_libcuda = 'true' if pathlib.Path('/usr/lib/wsl/lib/libcuda.so').exists() or pathlib.Path('/usr/lib/wsl/lib/libcuda.so.1').exists() else 'false'; ",
+        "wsl_gpu = 'true' if shutil.which('nvidia-smi') and subprocess.run(['nvidia-smi','-L'], capture_output=True, text=True, timeout=5).returncode == 0 else 'false'; ",
+        "print(str(version) + '\\t' + ','.join(platforms) + '\\t' + cuda_probe + '\\t' + plugin_dir + '\\t' + cuda_pkg + '\\t' + wsl_gpu + '\\t' + wsl_libcuda)"
     );
     let mut errors = Vec::new();
     let cuda_toolkit = cuda_toolkit_detail();
@@ -1936,6 +1942,10 @@ fn probe_openmm() -> ToolProbe {
                     let version = cols.first().copied().unwrap_or("installed");
                     let platforms = cols.get(1).copied().unwrap_or("");
                     let cuda_probe = cols.get(2).copied().unwrap_or("");
+                    let plugin_dir = cols.get(3).copied().unwrap_or("");
+                    let cuda_package = cols.get(4).copied().unwrap_or("");
+                    let wsl_gpu = cols.get(5).copied().unwrap_or("");
+                    let wsl_libcuda = cols.get(6).copied().unwrap_or("");
                     let cuda = platforms
                         .split(',')
                         .any(|name| name.trim().eq_ignore_ascii_case("cuda"));
@@ -1950,10 +1960,14 @@ fn probe_openmm() -> ToolProbe {
                         ready: true,
                         version: version.to_string(),
                         detail: format!(
-                            "openmm_python_module_detected;platforms={};cuda={};cuda_failure_reason={};{}",
+                            "openmm_python_module_detected;platforms={};cuda={};cuda_failure_reason={};openmm_plugin_dir={};openmm_cuda_package={};wsl_gpu={};wsl_libcuda={};{}",
                             platforms,
                             if cuda { "ready" } else { "missing" },
                             cuda_reason,
+                            plugin_dir,
+                            cuda_package,
+                            wsl_gpu,
+                            wsl_libcuda,
                             cuda_toolkit
                         ),
                     };
@@ -2094,6 +2108,49 @@ fn probe_python_module(tool_id: &str, module: &str, version_expr: &str) -> ToolP
     }
 }
 
+fn probe_openff_toolkit() -> ToolProbe {
+    let code = concat!(
+        "from rdkit import Chem; ",
+        "from openff.toolkit import Molecule; ",
+        "mol = Chem.AddHs(Chem.MolFromSmiles('CCO')); ",
+        "off = Molecule.from_rdkit(mol, allow_undefined_stereo=True, hydrogens_are_explicit=True); ",
+        "print('installed;openff_molecule_from_rdkit_atoms=' + str(off.n_atoms))"
+    );
+    let mut errors = Vec::new();
+    for python in python_command_candidates() {
+        let mut command = python.clone();
+        command.extend(["-c".to_string(), code.to_string()]);
+        match command_output(&command) {
+            Ok(output) => {
+                let text = process_output_text(&output);
+                if output.status.success() {
+                    return ToolProbe {
+                        ready: true,
+                        version: first_nonempty_line(&text)
+                            .unwrap_or_else(|| "installed".to_string()),
+                        detail: "openff_toolkit_functional_probe_detected".to_string(),
+                    };
+                }
+                errors.push(format!(
+                    "{}:{}",
+                    python.join(" "),
+                    first_nonempty_line(&text)
+                        .unwrap_or_else(|| "openff_functional_probe_failed".to_string())
+                ));
+            }
+            Err(err) => errors.push(format!("{}:{err}", python.join(" "))),
+        }
+    }
+    ToolProbe {
+        ready: false,
+        version: "missing".to_string(),
+        detail: format!(
+            "openff_toolkit_functional_probe_missing:{}",
+            errors.join("|")
+        ),
+    }
+}
+
 fn command_candidates(program: &str) -> Vec<String> {
     let mut candidates = vec![program.to_string()];
     if cfg!(windows) && !program.contains(['\\', '/']) {
@@ -2212,8 +2269,8 @@ fn run_pipeline(options: &ScienceOptions) -> Result<String, String> {
     match_known(options)?;
     match_metagenome(options)?;
     rank_targets(options)?;
-    run_schema_bound_workers(options)?;
     evaluate_structure(options)?;
+    run_schema_bound_workers(options)?;
     screen_dynamics(options)?;
     rank_targets(options)?;
     build_evidence(options)?;
@@ -2931,7 +2988,9 @@ fn copy_structure_viewer_artifact_if_available(options: &ScienceOptions) -> Resu
                 options,
                 "ready",
                 "",
+                "",
                 &artifact,
+                &relative_display(&options.run_dir, &source),
                 "worker coordinate artifact copied from current run output",
             )?;
             return Ok(true);
@@ -2947,11 +3006,18 @@ fn write_structure_viewer_from_matches(
     let mut ordered = matches.iter().collect::<Vec<_>>();
     ordered.sort_by(|left, right| right.match_score.total_cmp(&left.match_score));
     let mut first_target = String::new();
+    let mut first_pdb_id = String::new();
+    let mut first_expected_path = String::new();
     for item in ordered {
         if first_target.is_empty() {
             first_target = item.target_id.clone();
         }
         for pdb_id in structure_coordinate_ids(item) {
+            if first_pdb_id.is_empty() {
+                first_pdb_id = pdb_id.clone();
+                first_expected_path =
+                    expected_structure_coordinate_paths(&options.science_store, &pdb_id);
+            }
             if let Some(path) = find_structure_coordinate_file(&options.science_store, &pdb_id)
                 && let Some(artifact) = write_coordinate_viewer_artifact(&options.run_dir, &path)
             {
@@ -2959,7 +3025,9 @@ fn write_structure_viewer_from_matches(
                     options,
                     "ready",
                     &item.target_id,
+                    &pdb_id,
                     &artifact,
+                    &relative_display(&options.science_store, &path),
                     "coordinate artifact resolved from local structure database",
                 )?;
                 return Ok(true);
@@ -2971,7 +3039,15 @@ fn write_structure_viewer_from_matches(
     } else {
         "matched structure rows did not have a local coordinate artifact"
     };
-    write_structure_viewer_status(options, "not_ready", &first_target, "", reason)?;
+    write_structure_viewer_status(
+        options,
+        "not_ready",
+        &first_target,
+        &first_pdb_id,
+        "",
+        &first_expected_path,
+        reason,
+    )?;
     Ok(false)
 }
 
@@ -2979,16 +3055,20 @@ fn write_structure_viewer_status(
     options: &ScienceOptions,
     status: &str,
     target_id: &str,
+    pdb_id: &str,
     artifact: &str,
+    expected_path: &str,
     reason: &str,
 ) -> Result<(), String> {
     write_text(
         &options.run_dir.join("structure_viewer_status.tsv"),
         &format!(
-            "status\ttarget_id\tartifact\treason\n{}\t{}\t{}\t{}\n",
+            "status\ttarget_id\tpdb_id\tartifact\texpected_path\treason\n{}\t{}\t{}\t{}\t{}\t{}\n",
             clean_cell(status),
             clean_cell(target_id),
+            clean_cell(pdb_id),
             clean_cell(artifact),
+            clean_cell(expected_path),
             clean_cell(reason)
         ),
     )
@@ -3019,6 +3099,21 @@ fn is_pdb_id(value: &str) -> bool {
 }
 
 fn find_structure_coordinate_file(science_store: &Path, pdb_id: &str) -> Option<PathBuf> {
+    structure_coordinate_candidate_paths(science_store, pdb_id)
+        .into_iter()
+        .find(|path| path.exists())
+}
+
+fn expected_structure_coordinate_paths(science_store: &Path, pdb_id: &str) -> String {
+    structure_coordinate_candidate_paths(science_store, pdb_id)
+        .into_iter()
+        .take(4)
+        .map(|path| relative_display(science_store, &path))
+        .collect::<Vec<_>>()
+        .join(";")
+}
+
+fn structure_coordinate_candidate_paths(science_store: &Path, pdb_id: &str) -> Vec<PathBuf> {
     let lower = pdb_id.to_ascii_lowercase();
     let split = if lower.len() >= 3 { &lower[1..3] } else { "" };
     let root = science_store.join("downloads/rcsb/mmcif");
@@ -3038,7 +3133,7 @@ fn find_structure_coordinate_file(science_store: &Path, pdb_id: &str) -> Option<
         }
         candidates.push(root.join(&name));
     }
-    candidates.into_iter().find(|path| path.exists())
+    candidates
 }
 
 fn write_coordinate_viewer_artifact(run_dir: &Path, source: &Path) -> Option<String> {
@@ -3252,6 +3347,19 @@ fn md_not_ready_reason(options: &ScienceOptions) -> String {
     let mut reasons = Vec::new();
     if !options.run_dir.join("tool_outputs/md_summary.tsv").exists() {
         reasons.push("no md_summary.tsv in current run tool_outputs".to_string());
+    }
+    if options
+        .run_dir
+        .join("tool_outputs/md_not_ready.tsv")
+        .exists()
+        && let Ok(rows) =
+            read_simple_tsv_rows(&options.run_dir.join("tool_outputs/md_not_ready.tsv"))
+    {
+        for row in rows {
+            if let Some(reason) = first_metric_value(&row, &["reason", "message", "risk_flags"]) {
+                reasons.push(reason.to_string());
+            }
+        }
     }
     if !options.run_dir.join("tool_outputs/md_rmsd.tsv").exists()
         && !options.run_dir.join("tool_outputs/rmsd.tsv").exists()
@@ -3857,7 +3965,7 @@ fn write_artifact_source_map(options: &ScienceOptions) -> Result<(), String> {
         ),
         (
             "md_summary.tsv",
-            "tool_outputs/md_summary.tsv;tool_outputs/md_rmsd.tsv;tool_outputs/md_rmsf.tsv;tool_outputs/md_ligand_drift.tsv;tool_outputs/md_contacts.tsv;tool_outputs/md_hbonds.tsv",
+            "structure_viewer.cif;structure_viewer.pdb;tool_outputs/md_run_manifest.json;tool_outputs/md_summary.tsv;tool_outputs/md_rmsd.tsv;tool_outputs/md_rmsf.tsv;tool_outputs/md_ligand_drift.tsv;tool_outputs/md_contacts.tsv;tool_outputs/md_hbonds.tsv",
             "evidence_ledger.tsv",
         ),
         (
@@ -3867,37 +3975,37 @@ fn write_artifact_source_map(options: &ScienceOptions) -> Result<(), String> {
         ),
         (
             "tool_outputs/md_rmsd.tsv",
-            "OpenMM ligand dynamics trajectory",
+            "OpenMM receptor-ligand dynamics trajectory",
             "md_summary.tsv",
         ),
         (
             "tool_outputs/md_rmsf.tsv",
-            "OpenMM ligand dynamics trajectory",
+            "OpenMM receptor-ligand dynamics trajectory",
             "md_summary.tsv",
         ),
         (
             "tool_outputs/md_ligand_drift.tsv",
-            "OpenMM ligand dynamics trajectory",
+            "OpenMM receptor-ligand dynamics trajectory",
             "md_summary.tsv",
         ),
         (
             "tool_outputs/md_contacts.tsv",
-            "OpenMM ligand dynamics trajectory",
+            "OpenMM receptor-ligand dynamics trajectory",
             "md_summary.tsv",
         ),
         (
             "tool_outputs/md_hbonds.tsv",
-            "OpenMM ligand dynamics trajectory",
+            "OpenMM receptor-ligand dynamics trajectory",
             "md_summary.tsv",
         ),
         (
             "tool_outputs/md_trajectory.tsv",
-            "OpenMM ligand dynamics trajectory",
+            "OpenMM receptor-ligand dynamics trajectory",
             "md_summary.tsv",
         ),
         (
             "tool_outputs/md_run_manifest.json",
-            "current run input and selected OpenMM platform",
+            "current run receptor coordinate, ligand placement, OpenMM platform, trajectory and metric artifacts",
             "evidence_ledger.tsv",
         ),
         (
@@ -5516,7 +5624,7 @@ mod tests {
         assert!(source_map.contains("docking_summary.tsv\t"));
         assert!(source_map.contains("md_summary.tsv\t"));
         assert!(source_map.contains("docking_summary.tsv\tschema-bound docking output when present;otherwise no generated rows\tevidence_ledger.tsv\tno_rows"));
-        assert!(source_map.contains("md_summary.tsv\ttool_outputs/md_summary.tsv;tool_outputs/md_rmsd.tsv;tool_outputs/md_rmsf.tsv;tool_outputs/md_ligand_drift.tsv;tool_outputs/md_contacts.tsv;tool_outputs/md_hbonds.tsv\tevidence_ledger.tsv\tno_rows"));
+        assert!(source_map.contains("md_summary.tsv\tstructure_viewer.cif;structure_viewer.pdb;tool_outputs/md_run_manifest.json;tool_outputs/md_summary.tsv;tool_outputs/md_rmsd.tsv;tool_outputs/md_rmsf.tsv;tool_outputs/md_ligand_drift.tsv;tool_outputs/md_contacts.tsv;tool_outputs/md_hbonds.tsv\tevidence_ledger.tsv\tno_rows"));
         assert!(source_map.contains("tool_outputs/md_summary.tsv\tschema-bound MD summary worker output\tmd_summary.tsv\tnot_yet_written"));
         assert!(evidence.contains("structure_interaction_matches"));
         assert!(evidence.contains("worker_runtime_summary"));
@@ -5815,7 +5923,7 @@ mod tests {
 
         assert!(out.contains("viewer_artifact=ready"));
         assert!(viewer.contains("ATOM 1"));
-        assert!(status.contains("ready\t10GS\tstructure_viewer.cif"));
+        assert!(status.contains("ready\t10GS\t10GS\tstructure_viewer.cif"));
         fs::remove_dir_all(&root).expect("cleanup temp root");
         assert!(!root.exists());
     }
