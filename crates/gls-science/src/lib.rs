@@ -2,6 +2,7 @@ use flate2::read::GzDecoder;
 use serde_json::{Value, json};
 use std::collections::{BTreeMap, BTreeSet};
 use std::env;
+use std::ffi::OsString;
 use std::fs;
 use std::io::{BufRead, BufReader, Read};
 use std::path::{Path, PathBuf};
@@ -1911,9 +1912,11 @@ fn probe_openmm() -> ToolProbe {
         "import openmm; ",
         "version = getattr(openmm.version, 'version', getattr(openmm, '__version__', 'installed')); ",
         "platforms = [openmm.Platform.getPlatform(i).getName() for i in range(openmm.Platform.getNumPlatforms())]; ",
-        "print(str(version) + '\\t' + ','.join(platforms))"
+        "cuda_probe = 'ready' if any(name.lower() == 'cuda' for name in platforms) else 'missing:openmm_platform_list_does_not_include_CUDA'; ",
+        "print(str(version) + '\\t' + ','.join(platforms) + '\\t' + cuda_probe)"
     );
     let mut errors = Vec::new();
+    let cuda_toolkit = cuda_toolkit_detail();
     for python in python_command_candidates() {
         let mut command = python.clone();
         command.extend(["-c".to_string(), code.to_string()]);
@@ -1923,17 +1926,29 @@ fn probe_openmm() -> ToolProbe {
                 if output.status.success() {
                     let line =
                         first_nonempty_line(&text).unwrap_or_else(|| "installed\t".to_string());
-                    let (version, platforms) = line.split_once('\t').unwrap_or((line.as_str(), ""));
+                    let cols = line.split('\t').collect::<Vec<_>>();
+                    let version = cols.first().copied().unwrap_or("installed");
+                    let platforms = cols.get(1).copied().unwrap_or("");
+                    let cuda_probe = cols.get(2).copied().unwrap_or("");
                     let cuda = platforms
                         .split(',')
                         .any(|name| name.trim().eq_ignore_ascii_case("cuda"));
+                    let cuda_reason = if cuda {
+                        "ready".to_string()
+                    } else if cuda_probe.is_empty() {
+                        "openmm_cuda_platform_missing".to_string()
+                    } else {
+                        clean_cell(cuda_probe)
+                    };
                     return ToolProbe {
                         ready: true,
                         version: version.to_string(),
                         detail: format!(
-                            "openmm_python_module_detected;platforms={};cuda={}",
+                            "openmm_python_module_detected;platforms={};cuda={};cuda_failure_reason={};{}",
                             platforms,
-                            if cuda { "ready" } else { "missing" }
+                            if cuda { "ready" } else { "missing" },
+                            cuda_reason,
+                            cuda_toolkit
                         ),
                     };
                 }
@@ -1949,7 +1964,54 @@ fn probe_openmm() -> ToolProbe {
     ToolProbe {
         ready: false,
         version: "missing".to_string(),
-        detail: format!("openmm_python_module_missing:{}", errors.join("|")),
+        detail: format!(
+            "openmm_python_module_missing:{};{}",
+            errors.join("|"),
+            cuda_toolkit
+        ),
+    }
+}
+
+fn cuda_toolkit_detail() -> String {
+    match detect_cuda_toolkit() {
+        Some(path) => {
+            let nvcc = cuda_nvcc_path(&path);
+            let nvcc_status = if nvcc.is_file() { "present" } else { "missing" };
+            format!(
+                "cuda_toolkit_path={};cuda_path_ready=true;cuda_nvcc={nvcc_status};cuda_wsl_path={}",
+                clean_cell(&path.display().to_string()),
+                clean_cell(&windows_path_to_wsl(&path.display().to_string()).unwrap_or_default())
+            )
+        }
+        None => {
+            "cuda_toolkit_path=;cuda_path_ready=false;cuda_nvcc=missing;cuda_wsl_path=".to_string()
+        }
+    }
+}
+
+fn detect_cuda_toolkit() -> Option<PathBuf> {
+    let mut candidates = Vec::new();
+    for key in ["CUDA_PATH", "CUDA_HOME", "CUDA_ROOT"] {
+        if let Some(path) = std::env::var_os(key).map(PathBuf::from) {
+            candidates.push(path);
+        }
+    }
+    if cfg!(windows) {
+        candidates.push(PathBuf::from(r"D:\Program Files\CUDA"));
+        if let Some(program_files) = std::env::var_os("ProgramFiles").map(PathBuf::from) {
+            candidates.push(program_files.join("NVIDIA GPU Computing Toolkit/CUDA"));
+        }
+    }
+    candidates.into_iter().find(|path| {
+        path.is_dir() && (cuda_nvcc_path(path).is_file() || path.join("version.json").is_file())
+    })
+}
+
+fn cuda_nvcc_path(path: &Path) -> PathBuf {
+    if cfg!(windows) {
+        path.join("bin/nvcc.exe")
+    } else {
+        path.join("bin/nvcc")
     }
 }
 
@@ -2028,11 +2090,16 @@ fn probe_python_module(tool_id: &str, module: &str, version_expr: &str) -> ToolP
 
 fn command_candidates(program: &str) -> Vec<String> {
     let mut candidates = vec![program.to_string()];
-    if cfg!(windows)
-        && !program.contains(['\\', '/'])
-        && let Some(path_var) = env::var_os("PATH")
-    {
-        for dir in env::split_paths(&path_var) {
+    if cfg!(windows) && !program.contains(['\\', '/']) {
+        let mut dirs = Vec::new();
+        if let Some(path_var) = env::var_os("PATH") {
+            dirs.extend(env::split_paths(&path_var));
+        }
+        dirs.extend(command_wrapper_dirs_from_env(
+            env::var_os("LOCALAPPDATA"),
+            env::var_os("GENOLIGAND_PYTHON"),
+        ));
+        for dir in dirs {
             for ext in ["exe", "cmd", "bat"] {
                 let candidate = dir.join(format!("{program}.{ext}"));
                 if candidate.is_file() {
@@ -2044,6 +2111,28 @@ fn command_candidates(program: &str) -> Vec<String> {
     candidates.sort();
     candidates.dedup();
     candidates
+}
+
+fn command_wrapper_dirs_from_env(
+    local_appdata: Option<OsString>,
+    genoligand_python: Option<OsString>,
+) -> Vec<PathBuf> {
+    let mut dirs = Vec::new();
+    if let Some(python) = genoligand_python
+        && let Some(parent) = Path::new(&python).parent()
+    {
+        dirs.push(parent.join("command-wrappers"));
+    }
+    if let Some(local_appdata) = local_appdata {
+        dirs.push(
+            PathBuf::from(local_appdata)
+                .join("GenoLigand")
+                .join("runtime")
+                .join("python-worker-env")
+                .join("command-wrappers"),
+        );
+    }
+    dirs.into_iter().filter(|dir| dir.is_dir()).collect()
 }
 
 fn command_output(command: &[String]) -> Result<Output, std::io::Error> {
@@ -2454,14 +2543,17 @@ fn evaluate_structure(options: &ScienceOptions) -> Result<String, String> {
         "candidate_id\tdocking_status\tdocking_score\tdocking_engine\tnotes\n",
         &docking,
     )?;
+    let viewer_ready = copy_structure_viewer_artifact_if_available(options)?
+        || write_structure_viewer_from_matches(options, &structure_matches)?;
     Ok(format!(
-        "structure_evaluated\tstructure_artifact={}\tdocking_artifact={}",
+        "structure_evaluated\tstructure_artifact={}\tdocking_artifact={}\tviewer_artifact={}",
         if structure_ready {
             "ready"
         } else {
             "not_ready"
         },
-        if docking_ready { "ready" } else { "not_ready" }
+        if docking_ready { "ready" } else { "not_ready" },
+        if viewer_ready { "ready" } else { "not_ready" }
     ))
 }
 
@@ -2590,21 +2682,29 @@ fn run_worker_task(
             .arg("-m")
             .arg(task.module)
             .arg("--job")
-            .arg(job_path)
+            .arg(python_script_arg(
+                &candidate,
+                &job_path.display().to_string(),
+            ))
             .arg("--out")
-            .arg(result_path);
-        if python_root.exists() {
-            let mut paths = vec![python_root.clone()];
-            if let Some(existing) = std::env::var_os("PYTHONPATH") {
-                paths.extend(std::env::split_paths(&existing));
-            }
-            if let Ok(joined) = std::env::join_paths(paths) {
-                command.env("PYTHONPATH", joined);
+            .arg(python_script_arg(
+                &candidate,
+                &result_path.display().to_string(),
+            ));
+        if python_root.exists()
+            && let Some(joined) = worker_pythonpath_env(&candidate, &python_root)
+        {
+            command.env("PYTHONPATH", joined);
+            if is_wsl_python_wrapper(&candidate) {
+                command.env("WSLENV", wsl_env_with_pythonpath());
             }
         }
         match command.output() {
             Ok(output) if output.status.success() => return Ok(()),
             Ok(output) => {
+                if worker_result_file_is_valid(result_path, task) {
+                    return Ok(());
+                }
                 let stderr = String::from_utf8_lossy(&output.stderr);
                 let stdout = String::from_utf8_lossy(&output.stdout);
                 let detail = stderr
@@ -2622,6 +2722,55 @@ fn run_worker_task(
         task.worker,
         clean_cell(&errors.join(" | "))
     ))
+}
+
+fn worker_result_file_is_valid(path: &Path, task: &WorkerTask) -> bool {
+    read_text(path)
+        .ok()
+        .and_then(|text| serde_json::from_str::<Value>(text.trim_start_matches('\u{feff}')).ok())
+        .is_some_and(|value| validate_worker_result(&value, task))
+}
+
+fn worker_pythonpath_env(candidate: &[String], python_root: &Path) -> Option<OsString> {
+    let mut paths = vec![python_root.to_path_buf()];
+    if let Some(existing) = std::env::var_os("PYTHONPATH") {
+        paths.extend(std::env::split_paths(&existing));
+    }
+    worker_pythonpath_env_from_paths(candidate, paths)
+}
+
+fn worker_pythonpath_env_from_paths(candidate: &[String], paths: Vec<PathBuf>) -> Option<OsString> {
+    if is_wsl_python_wrapper(candidate) {
+        let converted = paths
+            .into_iter()
+            .map(|path| {
+                let value = path.display().to_string();
+                windows_path_to_wsl(&value).unwrap_or(value)
+            })
+            .collect::<Vec<_>>();
+        return Some(OsString::from(converted.join(":")));
+    }
+    std::env::join_paths(paths).ok()
+}
+
+fn wsl_env_with_pythonpath() -> OsString {
+    let mut entries = std::env::var("WSLENV")
+        .ok()
+        .map(|value| {
+            value
+                .split(':')
+                .filter(|entry| !entry.trim().is_empty())
+                .map(str::to_string)
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    if !entries
+        .iter()
+        .any(|entry| entry.split('/').next() == Some("PYTHONPATH"))
+    {
+        entries.push("PYTHONPATH/u".to_string());
+    }
+    OsString::from(entries.join(":"))
 }
 
 fn read_worker_result_or_failure(path: &Path, task: &WorkerTask) -> Result<Value, String> {
@@ -2757,17 +2906,385 @@ fn write_structure_summary_from_matches(path: &Path, matches: &[IndexMatch]) -> 
     write_text(path, &text)
 }
 
+fn copy_structure_viewer_artifact_if_available(options: &ScienceOptions) -> Result<bool, String> {
+    for rel in [
+        "structure_viewer.json",
+        "structure_viewer.pdb",
+        "structure_viewer.cif",
+        "structure_viewer.mmcif",
+        "structure_viewer.pdb.gz",
+        "structure_viewer.cif.gz",
+        "structure_viewer.mmcif.gz",
+    ] {
+        let source = options.run_dir.join("tool_outputs").join(rel);
+        if !source.exists() {
+            continue;
+        }
+        if let Some(artifact) = write_coordinate_viewer_artifact(&options.run_dir, &source) {
+            write_structure_viewer_status(
+                options,
+                "ready",
+                "",
+                &artifact,
+                "worker coordinate artifact copied from current run output",
+            )?;
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+fn write_structure_viewer_from_matches(
+    options: &ScienceOptions,
+    matches: &[IndexMatch],
+) -> Result<bool, String> {
+    let mut ordered = matches.iter().collect::<Vec<_>>();
+    ordered.sort_by(|left, right| right.match_score.total_cmp(&left.match_score));
+    let mut first_target = String::new();
+    for item in ordered {
+        if first_target.is_empty() {
+            first_target = item.target_id.clone();
+        }
+        for pdb_id in structure_coordinate_ids(item) {
+            if let Some(path) = find_structure_coordinate_file(&options.science_store, &pdb_id)
+                && let Some(artifact) = write_coordinate_viewer_artifact(&options.run_dir, &path)
+            {
+                write_structure_viewer_status(
+                    options,
+                    "ready",
+                    &item.target_id,
+                    &artifact,
+                    "coordinate artifact resolved from local structure database",
+                )?;
+                return Ok(true);
+            }
+        }
+    }
+    let reason = if first_target.is_empty() {
+        "no structure interaction match rows for this run"
+    } else {
+        "matched structure rows did not have a local coordinate artifact"
+    };
+    write_structure_viewer_status(options, "not_ready", &first_target, "", reason)?;
+    Ok(false)
+}
+
+fn write_structure_viewer_status(
+    options: &ScienceOptions,
+    status: &str,
+    target_id: &str,
+    artifact: &str,
+    reason: &str,
+) -> Result<(), String> {
+    write_text(
+        &options.run_dir.join("structure_viewer_status.tsv"),
+        &format!(
+            "status\ttarget_id\tartifact\treason\n{}\t{}\t{}\t{}\n",
+            clean_cell(status),
+            clean_cell(target_id),
+            clean_cell(artifact),
+            clean_cell(reason)
+        ),
+    )
+}
+
+fn structure_coordinate_ids(item: &IndexMatch) -> Vec<String> {
+    let mut ids = BTreeSet::new();
+    for value in [
+        item.target_id.as_str(),
+        item.target_name.as_str(),
+        item.matched_features.as_str(),
+        item.evidence.as_str(),
+    ] {
+        for token in value.split(|ch: char| !ch.is_ascii_alphanumeric()) {
+            let upper = token.trim().to_ascii_uppercase();
+            if is_pdb_id(&upper) {
+                ids.insert(upper);
+            }
+        }
+    }
+    ids.into_iter().collect()
+}
+
+fn is_pdb_id(value: &str) -> bool {
+    value.len() == 4
+        && value.chars().next().is_some_and(|ch| ch.is_ascii_digit())
+        && value.chars().all(|ch| ch.is_ascii_alphanumeric())
+}
+
+fn find_structure_coordinate_file(science_store: &Path, pdb_id: &str) -> Option<PathBuf> {
+    let lower = pdb_id.to_ascii_lowercase();
+    let split = if lower.len() >= 3 { &lower[1..3] } else { "" };
+    let root = science_store.join("downloads/rcsb/mmcif");
+    let mut candidates = Vec::new();
+    for name in [
+        format!("{lower}.cif.gz"),
+        format!("{lower}.mmcif.gz"),
+        format!("{lower}.pdb.gz"),
+        format!("pdb{lower}.ent.gz"),
+        format!("{lower}.cif"),
+        format!("{lower}.mmcif"),
+        format!("{lower}.pdb"),
+        format!("pdb{lower}.ent"),
+    ] {
+        if !split.is_empty() {
+            candidates.push(root.join(split).join(&name));
+        }
+        candidates.push(root.join(&name));
+    }
+    candidates.into_iter().find(|path| path.exists())
+}
+
+fn write_coordinate_viewer_artifact(run_dir: &Path, source: &Path) -> Option<String> {
+    let text = read_maybe_gz_text(source).ok()?;
+    let lower = lower_file_name(source);
+    let artifact = if lower.contains(".json") {
+        if !text.contains("\"atoms\"") {
+            return None;
+        }
+        "structure_viewer.json"
+    } else if lower.contains(".pdb") || lower.contains(".ent") {
+        if !coordinate_text_has_atoms(&text) {
+            return None;
+        }
+        "structure_viewer.pdb"
+    } else {
+        if !coordinate_text_has_atoms(&text) {
+            return None;
+        }
+        "structure_viewer.cif"
+    };
+    write_text(&run_dir.join(artifact), &text).ok()?;
+    Some(artifact.to_string())
+}
+
+fn read_maybe_gz_text(path: &Path) -> Result<String, String> {
+    let name = lower_file_name(path);
+    if name.ends_with(".gz") {
+        let file =
+            fs::File::open(path).map_err(|err| format!("open_failed:{}:{err}", path.display()))?;
+        let mut decoder = GzDecoder::new(file);
+        let mut text = String::new();
+        decoder
+            .read_to_string(&mut text)
+            .map_err(|err| format!("gzip_read_failed:{}:{err}", path.display()))?;
+        return Ok(text);
+    }
+    read_text(path)
+}
+
+fn coordinate_text_has_atoms(text: &str) -> bool {
+    text.lines()
+        .any(|line| line.starts_with("ATOM") || line.starts_with("HETATM"))
+}
+
 fn screen_dynamics(options: &ScienceOptions) -> Result<String, String> {
-    let ready = copy_tool_output_or_header(
-        options,
-        "md_summary.tsv",
-        "candidate_id\trmsd\trmsf\tligand_drift\thydrogen_bond_occupancy\tcontact_occupancy\tinteraction_persistence\tmd_risk_flags\tmd_score_decomposition\tmd_stability_score\n",
-        &options.run_dir.join("md_summary.tsv"),
-    )?;
+    let md_path = options.run_dir.join("md_summary.tsv");
+    let ready = copy_tool_output_if_available(options, "md_summary.tsv", &md_path)?
+        || write_md_summary_from_metric_artifacts(options, &md_path)?;
+    if ready {
+        write_md_summary_status(
+            options,
+            "ready",
+            "real MD summary artifact available for this run",
+        )?;
+    } else {
+        write_text(&md_path, md_summary_header())?;
+        write_md_summary_status(options, "not_ready", &md_not_ready_reason(options))?;
+    }
     Ok(format!(
         "dynamics_screened\tmd_artifact={}",
         if ready { "ready" } else { "not_ready" }
     ))
+}
+
+fn md_summary_header() -> &'static str {
+    "candidate_id\trmsd\trmsf\tligand_drift\thydrogen_bond_occupancy\tcontact_occupancy\tinteraction_persistence\tmd_risk_flags\tmd_score_decomposition\tmd_stability_score\n"
+}
+
+fn write_md_summary_from_metric_artifacts(
+    options: &ScienceOptions,
+    out_path: &Path,
+) -> Result<bool, String> {
+    let mut rows = BTreeMap::<String, BTreeMap<String, String>>::new();
+    for (metric, files) in [
+        ("rmsd", &["md_rmsd.tsv", "rmsd.tsv"][..]),
+        ("rmsf", &["md_rmsf.tsv", "rmsf.tsv"][..]),
+        (
+            "ligand_drift",
+            &["md_ligand_drift.tsv", "ligand_drift.tsv"][..],
+        ),
+        (
+            "hydrogen_bond_occupancy",
+            &["md_hbonds.tsv", "hydrogen_bonds.tsv", "hbond_occupancy.tsv"][..],
+        ),
+        (
+            "contact_occupancy",
+            &["md_contacts.tsv", "contacts.tsv", "contact_occupancy.tsv"][..],
+        ),
+    ] {
+        for (candidate, value) in read_metric_values(options, files)? {
+            rows.entry(candidate)
+                .or_default()
+                .insert(metric.to_string(), value);
+        }
+    }
+    if rows.is_empty() {
+        return Ok(false);
+    }
+    let mut text = String::from(md_summary_header());
+    for (candidate, metrics) in rows {
+        let rmsd = metrics.get("rmsd").cloned().unwrap_or_default();
+        let rmsf = metrics.get("rmsf").cloned().unwrap_or_default();
+        let drift = metrics.get("ligand_drift").cloned().unwrap_or_default();
+        let hbond = metrics
+            .get("hydrogen_bond_occupancy")
+            .cloned()
+            .unwrap_or_default();
+        let contact = metrics
+            .get("contact_occupancy")
+            .cloned()
+            .unwrap_or_default();
+        text.push_str(&format!(
+            "{}\t{}\t{}\t{}\t{}\t{}\t\t\tmetric_artifacts\t\n",
+            clean_cell(&candidate),
+            clean_cell(&rmsd),
+            clean_cell(&rmsf),
+            clean_cell(&drift),
+            clean_cell(&hbond),
+            clean_cell(&contact)
+        ));
+    }
+    write_text(out_path, &text)?;
+    Ok(true)
+}
+
+fn read_metric_values(
+    options: &ScienceOptions,
+    file_names: &[&str],
+) -> Result<BTreeMap<String, String>, String> {
+    let mut values = BTreeMap::new();
+    for file_name in file_names {
+        let path = options.run_dir.join("tool_outputs").join(file_name);
+        if !path.exists() {
+            continue;
+        }
+        for row in read_simple_tsv_rows(&path)? {
+            let candidate =
+                first_metric_value(&row, &["candidate_id", "candidate", "target_id", "id"])
+                    .unwrap_or("current_run");
+            let value =
+                first_metric_value(&row, &["value", "mean", "average", "summary", "occupancy"])
+                    .or_else(|| {
+                        row.iter()
+                            .find(|(key, _)| {
+                                !matches!(
+                                    key.as_str(),
+                                    "candidate_id" | "candidate" | "target_id" | "id" | "time"
+                                )
+                            })
+                            .map(|(_, value)| value.as_str())
+                    })
+                    .unwrap_or("");
+            if !candidate.trim().is_empty() && !value.trim().is_empty() {
+                values.insert(candidate.to_string(), value.to_string());
+            }
+        }
+    }
+    Ok(values)
+}
+
+fn read_simple_tsv_rows(path: &Path) -> Result<Vec<BTreeMap<String, String>>, String> {
+    let text = read_text(path)?;
+    let mut lines = text.lines();
+    let Some(header) = lines.next() else {
+        return Ok(Vec::new());
+    };
+    let headers = split_tsv(header.trim_start_matches('\u{feff}'));
+    let mut rows = Vec::new();
+    for line in lines {
+        if line.trim().is_empty() {
+            continue;
+        }
+        let cols = split_tsv(line);
+        let mut row = BTreeMap::new();
+        for (index, header) in headers.iter().enumerate() {
+            row.insert(
+                header.to_string(),
+                cols.get(index).cloned().unwrap_or_default(),
+            );
+        }
+        rows.push(row);
+    }
+    Ok(rows)
+}
+
+fn first_metric_value<'a>(row: &'a BTreeMap<String, String>, keys: &[&str]) -> Option<&'a str> {
+    keys.iter().find_map(|key| {
+        row.get(*key)
+            .map(String::as_str)
+            .filter(|value| !value.trim().is_empty())
+    })
+}
+
+fn write_md_summary_status(
+    options: &ScienceOptions,
+    status: &str,
+    reason: &str,
+) -> Result<(), String> {
+    write_text(
+        &options.run_dir.join("md_summary_status.tsv"),
+        &format!(
+            "status\treason\n{}\t{}\n",
+            clean_cell(status),
+            clean_cell(reason)
+        ),
+    )
+}
+
+fn md_not_ready_reason(options: &ScienceOptions) -> String {
+    let mut reasons = Vec::new();
+    if !options.run_dir.join("tool_outputs/md_summary.tsv").exists() {
+        reasons.push("no md_summary.tsv in current run tool_outputs".to_string());
+    }
+    if !options.run_dir.join("tool_outputs/md_rmsd.tsv").exists()
+        && !options.run_dir.join("tool_outputs/rmsd.tsv").exists()
+    {
+        reasons.push("no RMSD metric artifact".to_string());
+    }
+    if !options.run_dir.join("tool_outputs/md_rmsf.tsv").exists()
+        && !options.run_dir.join("tool_outputs/rmsf.tsv").exists()
+    {
+        reasons.push("no RMSF metric artifact".to_string());
+    }
+    if !options
+        .run_dir
+        .join("tool_outputs/md_ligand_drift.tsv")
+        .exists()
+        && !options
+            .run_dir
+            .join("tool_outputs/ligand_drift.tsv")
+            .exists()
+    {
+        reasons.push("no ligand drift metric artifact".to_string());
+    }
+    if !options
+        .run_dir
+        .join("tool_outputs/md_contacts.tsv")
+        .exists()
+        && !options.run_dir.join("tool_outputs/contacts.tsv").exists()
+    {
+        reasons.push("no contact metric artifact".to_string());
+    }
+    if !options.run_dir.join("tool_outputs/md_hbonds.tsv").exists()
+        && !options
+            .run_dir
+            .join("tool_outputs/hydrogen_bonds.tsv")
+            .exists()
+    {
+        reasons.push("no hydrogen-bond metric artifact".to_string());
+    }
+    reasons.join(";")
 }
 
 fn copy_tool_output_if_available(
@@ -4686,12 +5203,15 @@ fn script_python_command_candidates() -> Vec<Vec<String>> {
     candidates
 }
 
-fn python_script_arg(candidate: &[String], arg: &str) -> String {
-    if cfg!(windows)
+fn is_wsl_python_wrapper(candidate: &[String]) -> bool {
+    cfg!(windows)
         && candidate.first().is_some_and(|python| {
             is_windows_script(python) && python.contains("genoligand-wsl-python")
         })
-    {
+}
+
+fn python_script_arg(candidate: &[String], arg: &str) -> String {
+    if is_wsl_python_wrapper(candidate) {
         return windows_path_to_wsl(arg).unwrap_or_else(|| arg.to_string());
     }
     arg.to_string()
@@ -4748,6 +5268,83 @@ mod tests {
         };
         assert!(openmm_cuda_ready(&cuda_probe));
         assert!(!openmm_cuda_ready(&cpu_probe));
+    }
+
+    #[test]
+    fn command_wrapper_dirs_include_genoligand_runtime_paths() {
+        let root = temp_root("command_wrapper_dirs");
+        let local = root.join("local");
+        let default_wrappers = local.join("GenoLigand/runtime/python-worker-env/command-wrappers");
+        let python_root = root.join("python-worker-env");
+        let sibling_wrappers = python_root.join("command-wrappers");
+        fs::create_dir_all(&default_wrappers).expect("default wrappers");
+        fs::create_dir_all(&sibling_wrappers).expect("sibling wrappers");
+        let python = python_root.join("genoligand-wsl-python.cmd");
+
+        let dirs = command_wrapper_dirs_from_env(
+            Some(local.into_os_string()),
+            Some(python.into_os_string()),
+        );
+
+        assert!(dirs.contains(&default_wrappers));
+        assert!(dirs.contains(&sibling_wrappers));
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn wsl_python_wrapper_uses_wsl_paths_for_worker_inputs() {
+        if !cfg!(windows) {
+            return;
+        }
+        let candidate = vec![r"C:\Users\tester\genoligand-wsl-python.cmd".to_string()];
+        let python_root = PathBuf::from(r"D:\Project\rust\GenoLigand\python");
+        let job = r"D:\user\codex\run\worker_job.json";
+
+        let pythonpath =
+            worker_pythonpath_env_from_paths(&candidate, vec![python_root]).expect("pythonpath");
+
+        assert_eq!(
+            pythonpath.to_string_lossy(),
+            "/mnt/d/Project/rust/GenoLigand/python"
+        );
+        assert_eq!(
+            python_script_arg(&candidate, job),
+            "/mnt/d/user/codex/run/worker_job.json"
+        );
+        assert!(
+            wsl_env_with_pythonpath()
+                .to_string_lossy()
+                .split(':')
+                .any(|entry| entry.split('/').next() == Some("PYTHONPATH"))
+        );
+    }
+
+    #[test]
+    fn valid_worker_fail_result_counts_as_executed_worker() {
+        let root = temp_root("worker_fail_result");
+        let path = root.join("worker_result.json");
+        let task = &WORKER_TASKS[0];
+        write_text(
+            &path,
+            &format!(
+                "{}\n",
+                json!({
+                    "schema_version": WORKER_SCHEMA_VERSION,
+                    "job_id": task.job_id,
+                    "worker": task.worker,
+                    "status": "FAIL",
+                    "engine_version": "OpenMM platforms=Reference,CPU",
+                    "python_owns_final_score": false,
+                    "python_owns_report_semantics": false,
+                    "primitive_execution_only": true
+                })
+            ),
+        )
+        .expect("write result");
+
+        assert!(worker_result_file_is_valid(&path, task));
+        fs::remove_dir_all(&root).expect("cleanup temp root");
+        assert!(!root.exists());
     }
 
     #[test]
@@ -5112,6 +5709,115 @@ mod tests {
         assert!(structure_text.contains("worker_structure"));
         assert!(docking_text.contains("worker_pose"));
         assert!(md_text.contains("worker_md"));
+        fs::remove_dir_all(&root).expect("cleanup temp root");
+        assert!(!root.exists());
+    }
+
+    #[test]
+    fn structure_evaluate_writes_viewer_from_real_coordinate_file() {
+        let root = temp_root("structure_viewer_real");
+        let run = root.join("run");
+        let store = root.join("science_store");
+        let input = root.join("input.json");
+        ensure_dir(&store.join("indexes")).expect("indexes");
+        ensure_dir(&store.join("downloads/rcsb/mmcif/0g")).expect("coords");
+        write_text(&input, "{\"inputs\":[],\"files\":[]}\n").expect("input");
+        write_text(&run.join("input_normalized_manifest.tsv"), "input_id\n").expect("manifest");
+        write_text(
+            &run.join("feature_manifest.tsv"),
+            "input_id\tinput_kind\tfeature_family\tfeature_name\tfeature_value\tfeature_source\tfeature_token\ninput_1\tsmall_molecule\tligand\ttext\taspirin\tuser\taspirin\n",
+        )
+        .expect("features");
+        write_text(
+            &store.join("indexes/structure_targets.tsv"),
+            "source\ttarget_id\ttarget_name\torganism\ttarget_class\tligand_tokens\tsequence_tokens\tstructure_tokens\tevidence\nRCSB\t10GS\tRCSB structure 10GS\tunknown\tstructure_record\taspirin\t10gs\t10gs pocket\trcsb_structure_file\n",
+        )
+        .expect("structure index");
+        write_text(
+            &store.join("downloads/rcsb/mmcif/0g/10gs.cif"),
+            "ATOM 1 N N . GLY A 1 1 ? 11.104 13.207 2.100 1.00 20.00 ? 1 GLY A N 1\nATOM 2 C CA . GLY A 1 1 ? 12.456 13.607 2.500 1.00 20.00 ? 1 GLY A CA 1\n",
+        )
+        .expect("coordinate cif");
+        let options = ScienceOptions {
+            workspace_root: root.clone(),
+            science_store: store,
+            input_manifest: input,
+            run_dir: run.clone(),
+        };
+
+        let out =
+            run_science_command(ScienceCommand::StructureEvaluate, &options).expect("structure");
+        let viewer = read_text(&run.join("structure_viewer.cif")).expect("viewer cif");
+        let status = read_text(&run.join("structure_viewer_status.tsv")).expect("viewer status");
+
+        assert!(out.contains("viewer_artifact=ready"));
+        assert!(viewer.contains("ATOM 1"));
+        assert!(status.contains("ready\t10GS\tstructure_viewer.cif"));
+        fs::remove_dir_all(&root).expect("cleanup temp root");
+        assert!(!root.exists());
+    }
+
+    #[test]
+    fn dynamics_screen_aggregates_real_metric_artifacts() {
+        let root = temp_root("md_metric_artifacts");
+        let run = root.join("run");
+        let store = root.join("science_store");
+        let input = root.join("input.json");
+        ensure_dir(&run.join("tool_outputs")).expect("tool outputs");
+        write_text(&input, "{\"inputs\":[],\"files\":[]}\n").expect("input");
+        for (file, value) in [
+            ("rmsd.tsv", "1.2"),
+            ("rmsf.tsv", "0.4"),
+            ("ligand_drift.tsv", "0.6"),
+            ("hydrogen_bonds.tsv", "0.72"),
+            ("contacts.tsv", "0.81"),
+        ] {
+            write_text(
+                &run.join("tool_outputs").join(file),
+                &format!("candidate_id\tvalue\nC1\t{value}\n"),
+            )
+            .expect("metric");
+        }
+        let options = ScienceOptions {
+            workspace_root: root.clone(),
+            science_store: store,
+            input_manifest: input,
+            run_dir: run.clone(),
+        };
+
+        let out = run_science_command(ScienceCommand::DynamicsScreen, &options).expect("dynamics");
+        let md = read_text(&run.join("md_summary.tsv")).expect("md summary");
+        let status = read_text(&run.join("md_summary_status.tsv")).expect("md status");
+
+        assert!(out.contains("md_artifact=ready"));
+        assert!(md.contains("C1\t1.2\t0.4\t0.6\t0.72\t0.81"));
+        assert!(status.contains("ready"));
+        fs::remove_dir_all(&root).expect("cleanup temp root");
+        assert!(!root.exists());
+    }
+
+    #[test]
+    fn dynamics_screen_records_missing_md_reason_without_rows() {
+        let root = temp_root("md_missing_reason");
+        let run = root.join("run");
+        let store = root.join("science_store");
+        let input = root.join("input.json");
+        write_text(&input, "{\"inputs\":[],\"files\":[]}\n").expect("input");
+        let options = ScienceOptions {
+            workspace_root: root.clone(),
+            science_store: store,
+            input_manifest: input,
+            run_dir: run.clone(),
+        };
+
+        let out = run_science_command(ScienceCommand::DynamicsScreen, &options).expect("dynamics");
+        let md = read_text(&run.join("md_summary.tsv")).expect("md summary");
+        let status = read_text(&run.join("md_summary_status.tsv")).expect("md status");
+
+        assert!(out.contains("md_artifact=not_ready"));
+        assert_eq!(md.lines().count(), 1);
+        assert!(status.contains("no md_summary.tsv"));
+        assert!(status.contains("no RMSD metric artifact"));
         fs::remove_dir_all(&root).expect("cleanup temp root");
         assert!(!root.exists());
     }

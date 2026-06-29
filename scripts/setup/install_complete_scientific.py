@@ -361,12 +361,59 @@ def tool_path_entries(workspace_root: Path, extra_entries: Sequence[Path] | None
     return [str(path) for path in entries if path.exists()]
 
 
+def cuda_toolkit_candidates() -> list[Path]:
+    candidates: list[Path] = []
+    for key in ("CUDA_PATH", "CUDA_HOME", "CUDA_ROOT"):
+        value = os.environ.get(key)
+        if value:
+            candidates.append(Path(value))
+    if os.name == "nt":
+        candidates.append(Path("D:/Program Files/CUDA"))
+        program_files = os.environ.get("ProgramFiles")
+        if program_files:
+            candidates.append(Path(program_files) / "NVIDIA GPU Computing Toolkit" / "CUDA")
+    return candidates
+
+
+def detected_cuda_toolkit() -> Path | None:
+    for path in cuda_toolkit_candidates():
+        nvcc = path / "bin" / ("nvcc.exe" if os.name == "nt" else "nvcc")
+        if path.is_dir() and (nvcc.is_file() or (path / "version.json").is_file()):
+            return path
+    return None
+
+
+def cuda_toolkit_summary() -> dict[str, object]:
+    path = detected_cuda_toolkit()
+    if not path:
+        return {
+            "status": "missing",
+            "path": "",
+            "nvcc": "missing",
+            "notes": "CUDA Toolkit path not detected",
+        }
+    nvcc = path / "bin" / ("nvcc.exe" if os.name == "nt" else "nvcc")
+    return {
+        "status": "ready",
+        "path": str(path),
+        "nvcc": "present" if nvcc.is_file() else "missing",
+        "notes": "CUDA Toolkit path detected",
+    }
+
+
 def environment_for_science_tools(
     workspace_root: Path,
     extra_entries: Sequence[Path] | None = None,
 ) -> dict[str, str]:
     env = os.environ.copy()
     entries = tool_path_entries(workspace_root, extra_entries)
+    cuda = detected_cuda_toolkit()
+    if cuda:
+        cuda_bin = cuda / "bin"
+        if cuda_bin.exists():
+            entries.append(str(cuda_bin))
+        env.setdefault("CUDA_PATH", str(cuda))
+        env.setdefault("CUDA_HOME", str(cuda))
     if entries:
         env["PATH"] = os.pathsep.join([*entries, env.get("PATH", "")])
     return env
@@ -2984,6 +3031,7 @@ def main() -> int:
         "source_manifests": source_manifest_result,
         "resources": resource_summary(science_store),
         "tool_environment": tool_environment_result,
+        "cuda_toolkit": cuda_toolkit_summary(),
         "runtime_backend": runtime_backend(),
         "access_url": f"http://{args.host}:{args.port}/",
     }

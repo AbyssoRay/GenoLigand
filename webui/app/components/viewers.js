@@ -3,7 +3,7 @@ function renderStructureViewer(viewer) {
     return `
       <div class="viewer-empty">
         <strong>三维查看未就绪</strong>
-        <span>当前运行没有可显示的结构坐标输出。</span>
+        <span>${escapeHtml(viewer?.reason || "当前运行没有可显示的结构坐标输出。")}</span>
       </div>`;
   }
   return `
@@ -124,7 +124,7 @@ function renderMdCharts(charts) {
     return `
       <div class="viewer-empty">
         <strong>动力学图未就绪</strong>
-        <span>当前运行没有轨迹摘要或分数拆解输出。</span>
+        <span>当前运行没有真实 MD 摘要图形输出。</span>
       </div>`;
   }
   const max = Math.max(...items.map((item) => Number(item.value) || 0), 1);

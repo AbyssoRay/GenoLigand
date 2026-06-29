@@ -8,7 +8,7 @@ use std::process::{Command, Stdio};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 pub const PRODUCT_NAME: &str = "GenoLigand Local WebUI";
-pub const PRODUCT_VERSION: &str = "0.9.13";
+pub const PRODUCT_VERSION: &str = "0.9.14";
 
 const REQUIRED_TOOL_IDS: &[&str] = &[
     "java",
@@ -1032,7 +1032,7 @@ fn candidate_detail_json(options: &ServerOptions, run_id: &str) -> Value {
 
 fn structure_endpoint_json(options: &ServerOptions, run_id: &str) -> Value {
     let Some(run_dir) = completed_run_dir(options, run_id) else {
-        return json!({"run_id":run_id,"structure_rows":[],"row_count":0,"has_output":false,"viewer":structure_viewer_unavailable()});
+        return json!({"run_id":run_id,"structure_rows":[],"row_count":0,"has_output":false,"viewer":structure_viewer_unavailable("等待运行完成后读取结构坐标输出")});
     };
     let rows = user_structure_rows(&run_dir);
     let viewer = structure_viewer_payload(&run_dir);
@@ -1047,16 +1047,18 @@ fn structure_endpoint_json(options: &ServerOptions, run_id: &str) -> Value {
 
 fn md_endpoint_json(options: &ServerOptions, run_id: &str) -> Value {
     let Some(run_dir) = completed_run_dir(options, run_id) else {
-        return json!({"run_id":run_id,"md_rows":[],"row_count":0,"has_output":false,"charts":[]});
+        return json!({"run_id":run_id,"md_rows":[],"row_count":0,"has_output":false,"charts":[],"readiness":{"ready":false,"reason":"等待运行完成后读取 MD 摘要输出","chart_ready":false}});
     };
     let rows = user_md_rows(&run_dir);
     let charts = md_chart_rows(&run_dir, &rows);
+    let readiness = md_readiness_payload(&run_dir, &rows, &charts);
     json!({
         "run_id": run_id,
         "md_rows": rows,
         "row_count": rows.len(),
         "has_output": !rows.is_empty(),
-        "charts": charts
+        "charts": charts,
+        "readiness": readiness
     })
 }
 
@@ -1112,11 +1114,12 @@ fn user_md_rows(run_dir: &Path) -> Vec<Value> {
         .collect()
 }
 
-fn structure_viewer_unavailable() -> Value {
+fn structure_viewer_unavailable(reason: &str) -> Value {
     json!({
         "ready": false,
         "source": "等待当前运行结构坐标输出",
         "artifact": "",
+        "reason": reason,
         "atom_count": 0,
         "atoms": []
     })
@@ -1159,7 +1162,7 @@ fn structure_viewer_payload(run_dir: &Path) -> Value {
             return value;
         }
     }
-    structure_viewer_unavailable()
+    structure_viewer_unavailable(&structure_viewer_reason(run_dir))
 }
 
 fn read_viewer_json(path: &Path, artifact: &str) -> Option<Value> {
@@ -1179,6 +1182,7 @@ fn read_viewer_json(path: &Path, artifact: &str) -> Option<Value> {
         "ready": true,
         "source": "当前运行结构坐标输出",
         "artifact": artifact,
+        "reason": "已读取当前运行坐标产物",
         "atom_count": atoms.len(),
         "atoms": atoms
     }))
@@ -1215,9 +1219,17 @@ fn read_coordinate_text(path: &Path, artifact: &str, format: CoordinateFormat) -
         "ready": true,
         "source": "当前运行结构坐标输出",
         "artifact": artifact,
+        "reason": "已读取当前运行坐标产物",
         "atom_count": atoms.len(),
         "atoms": atoms
     }))
+}
+
+fn structure_viewer_reason(run_dir: &Path) -> String {
+    read_status_reason(
+        &run_dir.join("structure_viewer_status.tsv"),
+        "当前运行没有可显示的结构坐标输出。",
+    )
 }
 
 fn parse_pdb_atoms(text: &str) -> Vec<Value> {
@@ -1274,6 +1286,9 @@ fn clean_element(value: &str) -> String {
 }
 
 fn md_chart_rows(run_dir: &Path, rows: &[Value]) -> Vec<Value> {
+    if rows.is_empty() {
+        return Vec::new();
+    }
     let mut charts = Vec::new();
     for row in rows.iter().take(3) {
         let candidate = row_text(row, "candidate_id");
@@ -1300,6 +1315,33 @@ fn md_chart_rows(run_dir: &Path, rows: &[Value]) -> Vec<Value> {
     }
     charts.extend(score_chart_rows(run_dir));
     charts
+}
+
+fn md_readiness_payload(run_dir: &Path, rows: &[Value], charts: &[Value]) -> Value {
+    if !rows.is_empty() {
+        return json!({
+            "ready": true,
+            "reason": "已读取当前运行的 MD 摘要 artifact",
+            "chart_ready": !charts.is_empty()
+        });
+    }
+    json!({
+        "ready": false,
+        "reason": read_status_reason(
+            &run_dir.join("md_summary_status.tsv"),
+            "当前运行没有真实轨迹或 MD 摘要 artifact。"
+        ),
+        "chart_ready": false
+    })
+}
+
+fn read_status_reason(path: &Path, fallback: &str) -> String {
+    let rows = read_tsv_rows(path);
+    rows.first()
+        .and_then(|row| row.get("reason").and_then(Value::as_str))
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or(fallback)
+        .to_string()
 }
 
 fn score_chart_rows(run_dir: &Path) -> Vec<Value> {
@@ -1466,7 +1508,9 @@ fn user_md_row(row: &Value, targets: &BTreeMap<String, (String, String)>) -> Val
         "rmsd": row_text(row, "rmsd"),
         "rmsf": row_text(row, "rmsf"),
         "ligand_drift": row_text(row, "ligand_drift"),
+        "hydrogen_bond_occupancy": hydrogen_bond_occupancy,
         "contact_occupancy": contact_occupancy,
+        "interaction_persistence": interaction_persistence,
         "summary": summary,
         "status": if md_score.is_empty() && row_text(row, "rmsd").is_empty() {
             "\u{7b49}\u{5f85}\u{52a8}\u{529b}\u{5b66}\u{8f93}\u{51fa}"
@@ -2515,6 +2559,10 @@ fn openmm_platform_status(store: &Path) -> Value {
         .or_else(|| openmm.as_ref().and_then(|row| row.get("detail")).cloned())
         .unwrap_or_default();
     let platforms = detail_value(&detail, "platforms").unwrap_or_default();
+    let cuda_toolkit_path = detail_value(&detail, "cuda_toolkit_path").unwrap_or_default();
+    let cuda_path_ready =
+        detail_value(&detail, "cuda_path_ready").is_some_and(|value| value == "true");
+    let cuda_failure_reason = detail_value(&detail, "cuda_failure_reason").unwrap_or_default();
     let cuda_ready = cuda
         .as_ref()
         .and_then(|row| row.get("status"))
@@ -2526,6 +2574,12 @@ fn openmm_platform_status(store: &Path) -> Value {
         format!("OpenMM {version} 已就绪；CUDA 平台状态等待安装器刷新")
     } else if cuda_ready {
         format!("OpenMM {version} 平台：{platforms}；CUDA 可用")
+    } else if !cuda_toolkit_path.is_empty() && !cuda_failure_reason.is_empty() {
+        format!(
+            "OpenMM {version} 平台：{platforms}；CUDA 未检测到；Toolkit：{cuda_toolkit_path}；原因：{cuda_failure_reason}"
+        )
+    } else if !cuda_toolkit_path.is_empty() {
+        format!("OpenMM {version} 平台：{platforms}；CUDA 未检测到；Toolkit：{cuda_toolkit_path}")
     } else {
         format!("OpenMM {version} 平台：{platforms}；CUDA 未检测到")
     };
@@ -2534,6 +2588,9 @@ fn openmm_platform_status(store: &Path) -> Value {
         "label": "OpenMM/CUDA 平台",
         "openmm_ready": openmm_ready,
         "cuda_ready": cuda_ready,
+        "cuda_toolkit_path": cuda_toolkit_path,
+        "cuda_path_ready": cuda_path_ready,
+        "cuda_reason": cuda_failure_reason,
         "platforms": platforms,
         "summary": summary,
         "next_action": if openmm_ready {"继续"} else {"运行安装/修复"}
@@ -3919,11 +3976,47 @@ mod tests {
         assert_eq!(status["openmm_ready"], true);
         assert_eq!(status["cuda_ready"], true);
         assert_eq!(status["platforms"], "Reference,CPU,CUDA");
+        assert_eq!(status["cuda_path_ready"], false);
         assert!(
             status["summary"]
                 .as_str()
                 .unwrap_or_default()
                 .contains("CUDA")
+        );
+
+        fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn openmm_platform_status_reports_cuda_toolkit_and_failure_reason() {
+        let root =
+            std::env::temp_dir().join(format!("genoligand-openmm-cuda-reason-{}", now_millis()));
+        let store = root.join("science_store");
+        let index_dir = store.join("indexes");
+        fs::create_dir_all(&index_dir).expect("index dir");
+        fs::write(
+            index_dir.join("tool_versions.tsv"),
+            "tool\tstatus\tversion\tlicense\tlabel\tdetail\nopenmm\tready\t8.5.2\tMIT\tOpenMM\topenmm_python_module_detected;platforms=Reference,CPU;cuda=missing;cuda_failure_reason=missing:CUDA platform plugin not loaded;cuda_toolkit_path=D:\\Program Files\\CUDA;cuda_path_ready=true;cuda_nvcc=present\nopenmm_cuda\tmissing\t8.5.2\tMIT\tOpenMM CUDA Platform\topenmm_python_module_detected;platforms=Reference,CPU;cuda=missing;cuda_failure_reason=missing:CUDA platform plugin not loaded;cuda_toolkit_path=D:\\Program Files\\CUDA;cuda_path_ready=true;cuda_nvcc=present\n",
+        )
+        .expect("tool versions");
+
+        let status = openmm_platform_status(&store);
+
+        assert_eq!(status["openmm_ready"], true);
+        assert_eq!(status["cuda_ready"], false);
+        assert_eq!(status["cuda_path_ready"], true);
+        assert_eq!(status["cuda_toolkit_path"], r"D:\Program Files\CUDA");
+        assert!(
+            status["cuda_reason"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("plugin")
+        );
+        assert!(
+            status["summary"]
+                .as_str()
+                .unwrap_or_default()
+                .contains(r"D:\Program Files\CUDA")
         );
 
         fs::remove_dir_all(&root).ok();
@@ -4791,6 +4884,39 @@ mod tests {
     }
 
     #[test]
+    fn structure_endpoint_reports_missing_viewer_reason() {
+        let root = std::env::temp_dir().join(format!("genoligand-viewer-reason-{}", now_millis()));
+        let options = server_options(root.clone());
+        let run_dir = projects_root(&options)
+            .join("project-1")
+            .join("runs")
+            .join("run-1");
+        fs::create_dir_all(&run_dir).expect("create run dir");
+        fs::write(run_dir.join("run_state.txt"), "completed\n").expect("state");
+        fs::write(
+            run_dir.join("structure_patch_summary.tsv"),
+            "candidate_id\tstructure_score\tstructure_evidence\nC1\t0.60\tcurrent_run_structure\n",
+        )
+        .expect("structure");
+        fs::write(
+            run_dir.join("structure_viewer_status.tsv"),
+            "status\ttarget_id\tartifact\treason\nnot_ready\t10GS\t\tmatched structure rows did not have a local coordinate artifact\n",
+        )
+        .expect("viewer status");
+
+        let payload = structure_endpoint_json(&options, "run-1");
+
+        assert_eq!(payload["viewer"]["ready"], false);
+        assert!(
+            payload["viewer"]["reason"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("local coordinate artifact")
+        );
+        fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
     fn md_endpoint_builds_chart_rows_from_current_run_summaries() {
         let root = std::env::temp_dir().join(format!("genoligand-md-chart-{}", now_millis()));
         let options = server_options(root.clone());
@@ -4813,12 +4939,45 @@ mod tests {
 
         let payload = md_endpoint_json(&options, "run-1");
         assert_eq!(payload["has_output"], true);
+        assert_eq!(payload["readiness"]["ready"], true);
         assert!(payload["charts"].as_array().unwrap().len() >= 5);
         let text = payload.to_string();
         assert!(text.contains("md_summary.tsv"));
         assert!(text.contains("score_decomposition.tsv"));
         assert!(!text.contains(&root.display().to_string()));
 
+        fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn md_endpoint_reports_missing_md_reason() {
+        let root = std::env::temp_dir().join(format!("genoligand-md-reason-{}", now_millis()));
+        let options = server_options(root.clone());
+        let run_dir = projects_root(&options)
+            .join("project-1")
+            .join("runs")
+            .join("run-1");
+        fs::create_dir_all(&run_dir).expect("create run dir");
+        fs::write(run_dir.join("run_state.txt"), "completed\n").expect("state");
+        fs::write(run_dir.join("md_summary.tsv"), "candidate_id\trmsd\n").expect("md");
+        fs::write(
+            run_dir.join("md_summary_status.tsv"),
+            "status\treason\nnot_ready\tno RMSD metric artifact;no trajectory artifact\n",
+        )
+        .expect("md status");
+
+        let payload = md_endpoint_json(&options, "run-1");
+
+        assert_eq!(payload["has_output"], false);
+        assert_eq!(payload["readiness"]["ready"], false);
+        assert_eq!(payload["readiness"]["chart_ready"], false);
+        assert!(payload["charts"].as_array().unwrap().is_empty());
+        assert!(
+            payload["readiness"]["reason"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("RMSD")
+        );
         fs::remove_dir_all(&root).ok();
     }
 }

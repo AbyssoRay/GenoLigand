@@ -141,23 +141,26 @@ function structureSection(rows) {
 }
 
 function mdSection(rows) {
-  const charts = state.runData?.md?.charts || [];
+  const readiness = state.runData?.md?.readiness || {};
+  const charts = readiness.ready === true ? state.runData?.md?.charts || [] : [];
+  const chartReady = readiness.chart_ready === true && charts.length > 0;
+  const emptyText = readiness.reason || "未生成 RMSD、RMSF、接触、氢键或配体漂移摘要。";
   return `
     <section class="panel full">
       <div class="panel-header">
         <div>
           <h2>动力学摘要</h2>
-          <p>${rows.length ? "当前显示动力学表格和图形摘要；全部来自当前运行轨迹摘要或分数拆解。" : "当前运行没有轨迹摘要；轨迹图未就绪。"}</p>
+          <p>${rows.length ? "当前显示动力学表格和图形摘要；全部来自当前运行轨迹摘要或分数拆解。" : emptyText}</p>
         </div>
         <span class="status-pill ${outputStatusClass(rows)}">${rows.length ? `${rows.length} 行` : "未就绪"}</span>
       </div>
       ${visualStatus([
         { label: "摘要表", value: rows.length ? "已生成" : "未生成", ready: rows.length > 0 },
-        { label: "轨迹图", value: charts.length ? "已生成图形摘要" : "未就绪", ready: charts.length > 0, waiting: charts.length === 0 },
-        { label: "数据来源", value: rows.length ? "当前运行输出" : "等待运行输出", ready: rows.length > 0 },
+        { label: "轨迹图", value: chartReady ? "已生成图形摘要" : "轨迹图未就绪", ready: chartReady, waiting: !chartReady },
+        { label: "数据来源", value: rows.length ? "当前运行输出" : emptyText, ready: rows.length > 0, waiting: !rows.length },
       ])}
       ${renderMdCharts(charts)}
-      ${rows.length ? table(rows, columnsFor("md")) : `<div class="empty">未生成 RMSD、RMSF、接触或配体漂移摘要。</div>`}
+      ${rows.length ? table(rows, columnsFor("md")) : `<div class="empty">${escapeHtml(emptyText)}</div>`}
     </section>`;
 }
 
