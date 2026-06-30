@@ -1208,6 +1208,11 @@ fn download_artifact_response(
                 ("\u{7ed3}\u{6784}\u{5206}\u{6570}", "structure_score"),
                 ("\u{5bf9}\u{63a5}\u{5206}\u{6570}", "docking_score"),
                 ("\u{52a8}\u{529b}\u{5b66}\u{5206}\u{6570}", "md_score"),
+                (
+                    "\u{52a8}\u{529b}\u{5b66}\u{652f}\u{6301}",
+                    "md_support_label",
+                ),
+                ("\u{98ce}\u{9669}\u{63d0}\u{793a}", "risk_note"),
                 ("\u{8bc1}\u{636e}\u{6458}\u{8981}", "evidence_summary"),
                 ("\u{72b6}\u{6001}", "status_label"),
                 ("\u{8f93}\u{51fa}\u{6750}\u{6599}", "result_source"),
@@ -1652,6 +1657,36 @@ fn row_number(row: &Value, key: &str) -> Option<f64> {
         .and_then(|value| value.trim().parse::<f64>().ok())
 }
 
+fn json_number(value: Option<&Value>) -> Option<f64> {
+    value.and_then(|value| {
+        value.as_f64().or_else(|| {
+            value
+                .as_str()
+                .and_then(|text| text.trim().parse::<f64>().ok())
+        })
+    })
+}
+
+fn md_support_label(md_score: Option<f64>) -> &'static str {
+    match md_score {
+        Some(value) if value > 0.0 => "\u{6709}\u{77ed}\u{7a0b} MD \u{652f}\u{6301}",
+        _ => "\u{672a}\u{751f}\u{6210} MD \u{652f}\u{6301}",
+    }
+}
+
+fn candidate_risk_note(scope: &str, md_score: Option<f64>) -> String {
+    let mut parts = Vec::new();
+    if scope == "known_nonhuman_protein" {
+        parts.push("\u{975e}\u{4eba}\u{6e90}\u{5df2}\u{77e5}\u{86cb}\u{767d}\u{ff1b}\u{7ed3}\u{5408}\u{7814}\u{7a76}\u{5bf9}\u{8c61}\u{89e3}\u{8bfb}");
+    }
+    if matches!(md_score, Some(value) if value > 0.0) {
+        parts.push("\u{77ed}\u{7a0b}\u{53d7}\u{9650} receptor \u{6a21}\u{578b}\u{ff1b}\u{7528}\u{4e8e}\u{5019}\u{9009}\u{6392}\u{5e8f}");
+    } else {
+        parts.push("MD \u{652f}\u{6301}\u{672a}\u{751f}\u{6210}\u{ff1b}\u{6309}\u{5176}\u{4ed6}\u{8bc1}\u{636e}\u{6392}\u{5e8f}");
+    }
+    parts.join("\u{ff1b}")
+}
+
 fn format_metric_value(value: f64, unit: &str) -> String {
     if unit == "fraction" {
         format!("{value:.3}")
@@ -1670,6 +1705,7 @@ fn user_genome_rows(run_dir: &Path) -> Vec<Value> {
 fn user_candidate_row(row: &Value) -> Value {
     let scope = row_text(row, "candidate_scope");
     let status = first_non_empty(row_text(row, "status"), "computed_prediction");
+    let md_score = row_number(row, "md_score");
     json!({
         "rank": row_text(row, "rank"),
         "candidate_id": row_text(row, "candidate_id"),
@@ -1684,6 +1720,8 @@ fn user_candidate_row(row: &Value) -> Value {
         "structure_score": row_text(row, "structure_score"),
         "docking_score": row_text(row, "docking_score"),
         "md_score": row_text(row, "md_score"),
+        "md_support_label": md_support_label(md_score),
+        "risk_note": candidate_risk_note(scope, md_score),
         "evidence_summary": row_text(row, "evidence_summary"),
         "status": status,
         "status_label": friendly_status_label(status),
@@ -1710,6 +1748,7 @@ fn user_candidate_detail_row(row: &Value) -> Value {
         .get("candidate_scope")
         .and_then(Value::as_str)
         .unwrap_or_default();
+    let md_score = json_number(scores.get("md"));
     json!({
         "candidate_id": row.get("candidate_id").cloned().unwrap_or_else(|| json!("")),
         "target_id": row.get("target_id").cloned().unwrap_or_else(|| json!("")),
@@ -1723,6 +1762,8 @@ fn user_candidate_detail_row(row: &Value) -> Value {
         "structure_score": scores.get("structure").cloned().unwrap_or_else(|| json!("")),
         "docking_score": scores.get("docking").cloned().unwrap_or_else(|| json!("")),
         "md_score": scores.get("md").cloned().unwrap_or_else(|| json!("")),
+        "md_support_label": md_support_label(md_score),
+        "risk_note": candidate_risk_note(scope, md_score),
         "evidence_summary": row.get("evidence_summary").cloned().unwrap_or_else(|| json!("")),
         "status": "\u{8ba1}\u{7b97}\u{5019}\u{9009}",
         "status_label": "\u{8ba1}\u{7b97}\u{5019}\u{9009}",
@@ -5262,7 +5303,7 @@ mod tests {
         fs::write(run_dir.join("current_command.txt"), "cargo run hidden\n").expect("command");
         fs::write(
             run_dir.join("target_candidate_ranking.tsv"),
-            "rank\tcandidate_id\ttarget_id\ttarget_name\tcandidate_scope\torganism\tfinal_score\tknown_database_score\tmetagenome_score\tstructure_score\tdocking_score\tmd_score\tevidence_summary\tstatus\tsha256\tdebug_path\n1\tC1\tP24941\tCDK2\tknown_nonhuman_protein\tStreptococcus pneumoniae\t0.80\t0.70\t0.00\t0.10\t0.00\t0.00\tmatched current run\tcomputed_prediction\tabc123\tD:/hidden\n",
+            "rank\tcandidate_id\ttarget_id\ttarget_name\tcandidate_scope\torganism\tfinal_score\tknown_database_score\tmetagenome_score\tstructure_score\tdocking_score\tmd_score\tevidence_summary\tstatus\tsha256\tdebug_path\n1\tC1\tP24941\tCDK2\tknown_nonhuman_protein\tStreptococcus pneumoniae\t0.80\t0.70\t0.00\t0.10\t0.00\t0.80\tmatched current run\tcomputed_prediction\tabc123\tD:/hidden\n",
         )
         .expect("candidate table");
         fs::write(
@@ -5280,7 +5321,7 @@ mod tests {
         .expect("evidence");
         fs::write(
             run_dir.join("candidate_detail.json"),
-            r#"{"candidate_count":1,"candidates":[{"candidate_id":"C1","target_id":"P24941","target_name":"CDK2","candidate_scope":"known_nonhuman_protein","organism":"Streptococcus pneumoniae","scores":{"final":0.8,"known_database":0.7,"metagenome":0.0,"structure":0.1,"docking":0.0,"md":0.0},"evidence_summary":"matched current run","source_artifacts":["target_candidate_ranking.tsv"],"sha256":"abc123","path":"D:/hidden"}]}"#,
+            r#"{"candidate_count":1,"candidates":[{"candidate_id":"C1","target_id":"P24941","target_name":"CDK2","candidate_scope":"known_nonhuman_protein","organism":"Streptococcus pneumoniae","scores":{"final":0.8,"known_database":0.7,"metagenome":0.0,"structure":0.1,"docking":0.0,"md":0.8},"evidence_summary":"matched current run","source_artifacts":["target_candidate_ranking.tsv"],"sha256":"abc123","path":"D:/hidden"}]}"#,
         )
         .expect("candidate detail");
         fs::write(
@@ -5312,6 +5353,16 @@ mod tests {
         assert_eq!(
             candidates["candidates"][0]["candidate_scope_label"],
             "已知非人源蛋白数据库"
+        );
+        assert_eq!(
+            candidates["candidates"][0]["md_support_label"],
+            "有短程 MD 支持"
+        );
+        assert!(
+            candidates["candidates"][0]["risk_note"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("短程受限 receptor 模型")
         );
 
         let responses = [

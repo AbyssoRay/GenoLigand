@@ -65,6 +65,8 @@ def main() -> int:
         'known_nonhuman_protein: "已知非人源蛋白数据库"' in common,
         "known_nonhuman_protein must render as a user-readable scope label",
     )
+    require('{ key: "md_support_label", label: "MD 支持" }' in common, "ranking must show MD support")
+    require('{ key: "risk_note", label: "风险提示" }' in common, "ranking must show risk notes")
 
     mojibake_terms = [
         chr(0x9428),
