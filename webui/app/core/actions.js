@@ -45,6 +45,21 @@ async function saveInput() {
   return true;
 }
 
+async function openExistingProject(projectId) {
+  state.alert = "";
+  state.project = await api(`/api/user/projects/${projectId}`);
+  state.preflight = null;
+  state.run = null;
+  state.runData = null;
+  if (state.project.latest_run_id) {
+    state.run = await api(`/api/user/runs/${state.project.latest_run_id}`);
+    await loadRunData();
+    setStep(state.run.state === "completed" ? "results" : "run");
+    return;
+  }
+  setStep("configure");
+}
+
 async function runPreflight() {
   if (!state.project) {
     state.preflight = null;

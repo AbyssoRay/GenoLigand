@@ -3617,7 +3617,9 @@ fn build_evidence(options: &ScienceOptions) -> Result<String, String> {
         "tool_outputs/md_ligand_drift.tsv",
         "tool_outputs/md_contacts.tsv",
         "tool_outputs/md_hbonds.tsv",
+        "tool_outputs/ligand_placement.tsv",
         "tool_outputs/md_trajectory.tsv",
+        "tool_outputs/complex_md_manifest.json",
         "tool_outputs/md_run_manifest.json",
         "target_candidate_ranking.tsv",
         "score_decomposition.tsv",
@@ -3743,6 +3745,19 @@ fn artifact_evidence_status(file: &str, path: &Path) -> Result<ArtifactEvidenceS
                 ("available", format!("{rows} MD metric artifact rows"))
             } else {
                 ("not_generated", "no MD metric artifact rows".to_string())
+            }
+        }
+        "tool_outputs/ligand_placement.tsv" => {
+            if rows > 0 {
+                (
+                    "available",
+                    format!("{rows} ligand placement coordinate rows"),
+                )
+            } else {
+                (
+                    "not_generated",
+                    "no ligand placement coordinate rows".to_string(),
+                )
             }
         }
         "target_candidate_ranking.tsv" => {
@@ -3916,7 +3931,7 @@ fn report_scope_label(value: &str) -> &'static str {
         "metagenome_potential" | "metagenome_potential_protein" => {
             "\u{5b8f}\u{57fa}\u{56e0}\u{7ec4}\u{6f5c}\u{5728}\u{5e8f}\u{5217}"
         }
-        "structure_interaction" => "\u{7ed3}\u{6784}\u{4e92}\u{4f5c}\u{8bc1}\u{636e}",
+        "structure_interaction" => "\u{7ed3}\u{6784}\u{7d22}\u{5f15}\u{8bc1}\u{636e}",
         _ => "\u{8ba1}\u{7b97}\u{5019}\u{9009}",
     }
 }
@@ -4041,6 +4056,8 @@ fn write_candidate_detail(
             if md_available && candidate.dynamics_score > 0.0 {
                 source_artifacts.extend([
                     "md_summary.tsv",
+                    "tool_outputs/complex_md_manifest.json",
+                    "tool_outputs/ligand_placement.tsv",
                     "tool_outputs/md_run_manifest.json",
                     "tool_outputs/md_trajectory.tsv",
                     "tool_outputs/md_rmsd.tsv",
@@ -4140,7 +4157,7 @@ fn write_artifact_source_map(options: &ScienceOptions) -> Result<(), String> {
         ),
         (
             "md_summary.tsv",
-            "structure_viewer.cif;structure_viewer.pdb;tool_outputs/md_run_manifest.json;tool_outputs/md_summary.tsv;tool_outputs/md_rmsd.tsv;tool_outputs/md_rmsf.tsv;tool_outputs/md_ligand_drift.tsv;tool_outputs/md_contacts.tsv;tool_outputs/md_hbonds.tsv",
+            "structure_viewer.cif;structure_viewer.pdb;tool_outputs/complex_md_manifest.json;tool_outputs/ligand_placement.tsv;tool_outputs/md_run_manifest.json;tool_outputs/md_summary.tsv;tool_outputs/md_rmsd.tsv;tool_outputs/md_rmsf.tsv;tool_outputs/md_ligand_drift.tsv;tool_outputs/md_contacts.tsv;tool_outputs/md_hbonds.tsv",
             "target_candidate_ranking.tsv;evidence_ledger.tsv",
         ),
         (
@@ -4174,9 +4191,19 @@ fn write_artifact_source_map(options: &ScienceOptions) -> Result<(), String> {
             "md_summary.tsv",
         ),
         (
+            "tool_outputs/ligand_placement.tsv",
+            "current run ligand coordinates placed with receptor coordinate context",
+            "md_summary.tsv;tool_outputs/complex_md_manifest.json;tool_outputs/md_run_manifest.json",
+        ),
+        (
             "tool_outputs/md_trajectory.tsv",
             "OpenMM receptor-ligand dynamics trajectory",
             "md_summary.tsv",
+        ),
+        (
+            "tool_outputs/complex_md_manifest.json",
+            "current run receptor coordinate, ligand coordinate, OpenMM platform, trajectory and metric artifacts",
+            "evidence_ledger.tsv;tool_outputs/md_run_manifest.json",
         ),
         (
             "tool_outputs/md_run_manifest.json",
@@ -5799,12 +5826,14 @@ mod tests {
         assert!(source_map.contains("schema-bound structure output when present"));
         assert!(source_map.contains("tool_outputs/md_summary.tsv"));
         assert!(source_map.contains("tool_outputs/md_rmsd.tsv"));
+        assert!(source_map.contains("tool_outputs/ligand_placement.tsv"));
+        assert!(source_map.contains("tool_outputs/complex_md_manifest.json"));
         assert!(source_map.contains("worker_runtime_summary.tsv"));
         assert!(source_map.contains("Rust-generated worker job specs"));
         assert!(source_map.contains("docking_summary.tsv\t"));
         assert!(source_map.contains("md_summary.tsv\t"));
         assert!(source_map.contains("docking_summary.tsv\tschema-bound docking output when present;otherwise no generated rows\tevidence_ledger.tsv\tno_rows"));
-        assert!(source_map.contains("md_summary.tsv\tstructure_viewer.cif;structure_viewer.pdb;tool_outputs/md_run_manifest.json;tool_outputs/md_summary.tsv;tool_outputs/md_rmsd.tsv;tool_outputs/md_rmsf.tsv;tool_outputs/md_ligand_drift.tsv;tool_outputs/md_contacts.tsv;tool_outputs/md_hbonds.tsv\ttarget_candidate_ranking.tsv;evidence_ledger.tsv\tno_rows"));
+        assert!(source_map.contains("md_summary.tsv\tstructure_viewer.cif;structure_viewer.pdb;tool_outputs/complex_md_manifest.json;tool_outputs/ligand_placement.tsv;tool_outputs/md_run_manifest.json;tool_outputs/md_summary.tsv;tool_outputs/md_rmsd.tsv;tool_outputs/md_rmsf.tsv;tool_outputs/md_ligand_drift.tsv;tool_outputs/md_contacts.tsv;tool_outputs/md_hbonds.tsv\ttarget_candidate_ranking.tsv;evidence_ledger.tsv\tno_rows"));
         assert!(source_map.contains("tool_outputs/md_summary.tsv\tschema-bound MD summary worker output\tmd_summary.tsv\tnot_yet_written"));
         assert!(evidence.contains("structure_interaction_matches"));
         assert!(evidence.contains("worker_runtime_summary"));
@@ -6107,6 +6136,8 @@ mod tests {
         assert!(ranking.contains("ChEMBL:chembl_activity_row;MD:md_summary_stability_score"));
         assert!(detail.contains("\"md\":0.8"));
         assert!(detail.contains("tool_outputs/md_run_manifest.json"));
+        assert!(detail.contains("tool_outputs/complex_md_manifest.json"));
+        assert!(detail.contains("tool_outputs/ligand_placement.tsv"));
         assert!(
             evidence.contains("md_stability_score feeds md_score and final_score with weight 0.10")
         );

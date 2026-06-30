@@ -1,6 +1,8 @@
 ﻿const state = {
   step: "input",
   selectedInput: "small_molecule",
+  projects: [],
+  workspaceSummary: null,
   project: null,
   run: null,
   health: null,

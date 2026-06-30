@@ -18,14 +18,27 @@ async function boot() {
 async function refreshAll() {
   try {
     state.alert = "";
-    [state.health, state.databases, state.diagnostics, state.setup, state.setupPlan, state.setupProgress] = await Promise.all([
+    let projectList;
+    [
+      state.health,
+      state.databases,
+      state.diagnostics,
+      state.setup,
+      state.setupPlan,
+      state.setupProgress,
+      state.workspaceSummary,
+      projectList,
+    ] = await Promise.all([
       api("/api/user/health"),
       api("/api/user/databases"),
       api("/api/user/diagnostics"),
       api("/api/user/setup/status"),
       api("/api/user/setup/install-plan"),
       api("/api/user/setup/progress"),
+      api("/api/user/workspace-summary"),
+      api("/api/user/projects"),
     ]);
+    state.projects = projectList.projects || [];
     if (state.run?.run_id) {
       state.run = await api(`/api/user/runs/${state.run.run_id}`);
       await loadRunData();
@@ -58,7 +71,9 @@ function renderShellStatus() {
   health.className = `status-pill ${ready ? "ready" : "blocked"}`;
   document.querySelector("[data-project-pill]").textContent = state.project
     ? state.project.project_name || "当前项目"
-    : "空白工作台";
+    : state.projects.length
+      ? `已有 ${state.projects.length} 个项目`
+      : "空白工作台";
 }
 
 function renderAlert() {

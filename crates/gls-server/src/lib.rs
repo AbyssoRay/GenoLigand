@@ -576,7 +576,7 @@ fn preflight_json(options: &ServerOptions, project_id: &str) -> Value {
                 .to_string(),
         ),
         check(
-            "structure_interaction",
+            "structure_index",
             store.join("indexes/structure_targets.tsv").exists(),
             store
                 .join("indexes/structure_targets.tsv")
@@ -946,7 +946,7 @@ fn download_artifact_response(
             ],
         ),
         "structure_patch" => user_tsv_download(
-            user_structure_rows(&run_dir),
+            user_structure_rows(&run_dir, &structure_viewer_payload(&run_dir)),
             &[
                 ("\u{5019}\u{9009}\u{7f16}\u{53f7}", "candidate_id"),
                 ("\u{76ee}\u{6807}\u{7f16}\u{53f7}", "target_id"),
@@ -1038,8 +1038,8 @@ fn structure_endpoint_json(options: &ServerOptions, run_id: &str) -> Value {
     let Some(run_dir) = completed_run_dir(options, run_id) else {
         return json!({"run_id":run_id,"structure_rows":[],"row_count":0,"has_output":false,"viewer":structure_viewer_unavailable("等待运行完成后读取结构坐标输出")});
     };
-    let rows = user_structure_rows(&run_dir);
     let viewer = structure_viewer_payload(&run_dir);
+    let rows = user_structure_rows(&run_dir, &viewer);
     json!({
         "run_id": run_id,
         "structure_rows": rows,
@@ -1102,11 +1102,11 @@ fn user_evidence_rows(run_dir: &Path) -> Vec<Value> {
         .collect()
 }
 
-fn user_structure_rows(run_dir: &Path) -> Vec<Value> {
+fn user_structure_rows(run_dir: &Path, viewer: &Value) -> Vec<Value> {
     let targets = candidate_target_lookup(run_dir);
     read_tsv_rows(&run_dir.join("structure_patch_summary.tsv"))
         .into_iter()
-        .map(|row| user_structure_row(&row, &targets))
+        .map(|row| user_structure_row(&row, &targets, viewer))
         .collect()
 }
 
@@ -1447,7 +1447,11 @@ fn user_candidate_detail_row(row: &Value) -> Value {
     })
 }
 
-fn user_structure_row(row: &Value, targets: &BTreeMap<String, (String, String)>) -> Value {
+fn user_structure_row(
+    row: &Value,
+    targets: &BTreeMap<String, (String, String)>,
+    viewer: &Value,
+) -> Value {
     let candidate_id = row_text(row, "candidate_id");
     let (fallback_target_id, fallback_target_name) = targets
         .get(candidate_id)
@@ -1479,9 +1483,21 @@ fn user_structure_row(row: &Value, targets: &BTreeMap<String, (String, String)>)
         } else {
             "\u{5df2}\u{751f}\u{6210}\u{7ed3}\u{6784}\u{6458}\u{8981}"
         },
-        "viewer_status": "三维查看未就绪",
+        "viewer_status": structure_viewer_status_text(viewer),
         "result_source": "\u{7ed3}\u{6784}\u{4e0e}\u{53e3}\u{888b}\u{6458}\u{8981}\u{8f93}\u{51fa}"
     })
+}
+
+fn structure_viewer_status_text(viewer: &Value) -> &'static str {
+    if viewer
+        .get("ready")
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+    {
+        "三维查看已就绪"
+    } else {
+        "三维查看未就绪"
+    }
 }
 
 fn user_md_row(row: &Value, targets: &BTreeMap<String, (String, String)>) -> Value {
@@ -1631,7 +1647,7 @@ fn friendly_candidate_scope(scope: &str) -> &'static str {
         "metagenome_potential" | "metagenome_potential_protein" => {
             "\u{5b8f}\u{57fa}\u{56e0}\u{7ec4}\u{6f5c}\u{5728}\u{5e8f}\u{5217}"
         }
-        "structure_interaction" => "\u{7ed3}\u{6784}\u{4e92}\u{4f5c}",
+        "structure_index" | "structure_interaction" => "\u{7ed3}\u{6784}\u{7d22}\u{5f15}",
         _ => "\u{672a}\u{5206}\u{7c7b}",
     }
 }
@@ -1855,6 +1871,7 @@ fn user_setup_status_json(options: &ServerOptions) -> Value {
         "repair_action": if ready {"继续"} else {"运行安装/修复"},
         "checks": required,
         "missing": missing_resource_rows(&required),
+        "source_records": source_records_status(&store),
         "tool_platforms": [openmm_platform_status(&store)]
     })
 }
@@ -1881,6 +1898,7 @@ fn run_setup_repair_json(options: &ServerOptions) -> Value {
             "message": "安装/修复正在运行，请保持页面打开并查看进度。",
             "checks": required,
             "missing": missing_resource_rows(&required),
+            "source_records": source_records_status(&science_store_path(options)),
             "progress": user_setup_progress_json(options)
         });
     }
@@ -1917,7 +1935,8 @@ fn run_setup_repair_json(options: &ServerOptions) -> Value {
         "database_ready": ready,
         "message": user_message,
         "checks": required,
-        "missing": missing_resource_rows(&required)
+        "missing": missing_resource_rows(&required),
+        "source_records": source_records_status(&science_store_path(options))
     });
     if let Some(installer_payload) = installer_payload {
         payload["installer"] = installer_payload;
@@ -1982,6 +2001,7 @@ fn user_setup_install_plan_json(options: &ServerOptions) -> Value {
         "description":"准备数据库、索引、计算工具、许可证和来源记录。普通运行不配置数据库路径。",
         "database_ready": preflight_store_ready(options),
         "tool_platforms": [openmm_platform_status(&store)],
+        "source_records": source_records_status(&store),
         "direct_sources": {
             "ready": catalog_rows > 0,
             "source_count": catalog_rows,
@@ -2157,6 +2177,27 @@ fn setup_user_source_manifests(source_manifests: Option<&Value>) -> Value {
     let completed = status == "ready";
     json!({
         "completed": completed,
+        "record_directory": "manifests",
+        "record_sets": [
+            {
+                "label": "来源文件记录",
+                "ready": ready,
+                "total": total,
+                "completed": ready >= total && total > 0
+            },
+            {
+                "label": "完整性记录",
+                "ready": integrity_ready,
+                "total": total,
+                "completed": integrity_ready >= total && total > 0
+            },
+            {
+                "label": "许可证记录",
+                "ready": license_ready,
+                "total": total,
+                "completed": license_ready >= total && total > 0
+            }
+        ],
         "ready": ready,
         "total": total,
         "integrity_ready": integrity_ready,
@@ -2419,6 +2460,82 @@ fn source_manifests_ready(dir: &Path) -> bool {
         && tsv_status_column_ready(&dir.join("license_manifest.tsv"), "status", &["recorded"])
 }
 
+fn source_records_status(store: &Path) -> Value {
+    let dir = store.join("manifests");
+    let source_total = rows_len(&dir.join("source_file_manifest.tsv"));
+    let integrity_total = rows_len(&dir.join("hash_manifest.tsv"));
+    let license_total = rows_len(&dir.join("license_manifest.tsv"));
+    let total = source_total.max(integrity_total).max(license_total);
+    let source_ready =
+        tsv_ready_row_count(&dir.join("source_file_manifest.tsv"), "status", &["ready"]);
+    let integrity_ready = tsv_ready_row_count(&dir.join("hash_manifest.tsv"), "status", &["ready"]);
+    let license_ready =
+        tsv_ready_row_count(&dir.join("license_manifest.tsv"), "status", &["recorded"]);
+    let completed =
+        total > 0 && source_ready >= total && integrity_ready >= total && license_ready >= total;
+    json!({
+        "completed": completed,
+        "record_directory": "manifests",
+        "ready": source_ready,
+        "total": total,
+        "integrity_ready": integrity_ready,
+        "license_ready": license_ready,
+        "needs_action": !completed,
+        "record_sets": [
+            {
+                "label": "来源文件记录",
+                "ready": source_ready,
+                "total": total,
+                "completed": source_ready >= total && total > 0
+            },
+            {
+                "label": "完整性记录",
+                "ready": integrity_ready,
+                "total": total,
+                "completed": integrity_ready >= total && total > 0
+            },
+            {
+                "label": "许可证记录",
+                "ready": license_ready,
+                "total": total,
+                "completed": license_ready >= total && total > 0
+            }
+        ],
+        "message": if completed {
+            "来源、完整性和许可证记录已就绪"
+        } else {
+            "来源、完整性或许可证记录需要补齐"
+        },
+        "next_action": if completed {
+            "继续"
+        } else {
+            "运行安装/修复"
+        }
+    })
+}
+
+fn tsv_ready_row_count(path: &Path, column_name: &str, ready_values: &[&str]) -> usize {
+    let Ok(text) = fs::read_to_string(path) else {
+        return 0;
+    };
+    let mut lines = text.lines();
+    let Some(header) = lines.next() else {
+        return 0;
+    };
+    let headers = header.split('\t').collect::<Vec<_>>();
+    let Some(status_index) = headers.iter().position(|value| *value == column_name) else {
+        return 0;
+    };
+    lines
+        .filter(|line| !line.trim().is_empty())
+        .filter(|line| {
+            let cols = line.split('\t').collect::<Vec<_>>();
+            let status = cols.get(status_index).copied().unwrap_or_default();
+            ready_values.contains(&status)
+        })
+        .count()
+}
+
 fn tsv_status_column_ready(path: &Path, column_name: &str, ready_values: &[&str]) -> bool {
     let Ok(text) = fs::read_to_string(path) else {
         return false;
@@ -2464,10 +2581,10 @@ fn required_resource_rows(store: &Path) -> Vec<Value> {
             "运行安装/修复以准备宏基因组索引",
         ),
         (
-            "structure_interaction",
+            "structure_index",
             "indexes/structure_targets.tsv",
-            "结构互作索引",
-            "运行安装/修复以准备结构互作索引",
+            "结构索引",
+            "运行安装/修复以准备结构索引",
         ),
         (
             "tools",
@@ -2684,7 +2801,7 @@ fn friendly_source_category(raw: &str) -> &'static str {
         "known_activity" => "已知活性",
         "known_protein" => "已知蛋白",
         "structure" => "结构数据",
-        "structure_interaction" => "结构互作",
+        "structure_index" | "structure_interaction" => "结构索引",
         "metagenome" => "宏基因组序列",
         _ => "科学资源",
     }
@@ -3080,7 +3197,9 @@ fn friendly_failure_summary(raw: Option<&str>) -> String {
                     "missing_science_store_manifest" => "缺少科学仓库".to_string(),
                     "missing_known_database_index" => "缺少已知蛋白索引".to_string(),
                     "missing_metagenome_potential_index" => "缺少宏基因组索引".to_string(),
-                    "missing_structure_interaction_index" => "缺少结构互作索引".to_string(),
+                    "missing_structure_index" | "missing_structure_interaction_index" => {
+                        "缺少结构索引".to_string()
+                    }
                     "missing_tool_versions_manifest" => "计算工具未就绪".to_string(),
                     _ if value.starts_with("missing_or_unready_tool:") => {
                         "计算工具未就绪".to_string()
@@ -3296,6 +3415,30 @@ mod tests {
     }
 
     #[test]
+    fn setup_status_exposes_user_readable_source_record_sets() {
+        let root = std::env::temp_dir().join(format!("genoligand-source-records-{}", now_millis()));
+        let options = server_options(root.clone());
+        let store = root.join("science_store");
+        write_ready_source_records(&store);
+
+        let records = source_records_status(&store);
+        let status = user_setup_status_json(&options);
+
+        assert!(status.get("source_records").is_some());
+        assert_eq!(records["completed"], true);
+        assert_eq!(records["record_directory"], "manifests");
+        assert_eq!(records["record_sets"][0]["label"], "来源文件记录");
+        assert_eq!(records["record_sets"][1]["label"], "完整性记录");
+        assert_eq!(records["record_sets"][2]["label"], "许可证记录");
+        let text = records.to_string();
+        assert!(!text.contains("source_file_manifest"));
+        assert!(!text.contains("hash_manifest"));
+        assert!(!text.contains("license_manifest"));
+        assert!(!text.contains("sha256"));
+        fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
     fn setup_repair_uses_complete_installer_when_available() {
         let workspace_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .parent()
@@ -3463,6 +3606,19 @@ mod tests {
         assert_eq!(payload["source_records"]["integrity_ready"], 2);
         assert_eq!(payload["source_records"]["license_ready"], 3);
         assert_eq!(payload["source_records"]["completed"], false);
+        assert_eq!(payload["source_records"]["record_directory"], "manifests");
+        assert_eq!(
+            payload["source_records"]["record_sets"][0]["label"],
+            "来源文件记录"
+        );
+        assert_eq!(
+            payload["source_records"]["record_sets"][1]["label"],
+            "完整性记录"
+        );
+        assert_eq!(
+            payload["source_records"]["record_sets"][2]["label"],
+            "许可证记录"
+        );
         let text = payload.to_string();
         assert!(!text.contains("source_manifests"));
         assert!(!text.contains("source_file_manifest"));
@@ -3873,15 +4029,46 @@ mod tests {
     }
 
     #[test]
+    fn webui_loads_existing_projects_without_seeding_workspace() {
+        let app = web_asset_text("app.js");
+        let input = web_asset_text("pages/input.js");
+
+        assert!(app.contains("/api/user/workspace-summary"));
+        assert!(app.contains("/api/user/projects"));
+        assert!(input.contains("继续已有项目"));
+        assert!(input.contains("data-open-project"));
+        assert!(input.contains("openExistingProject"));
+    }
+
+    #[test]
+    fn webui_uses_structure_index_requirement_id() {
+        let selectors = web_asset_text("core/selectors.js");
+        assert!(selectors.contains("row.id === \"structure_index\""));
+        assert!(selectors.contains("checkRow(byId, \"structure_index\""));
+        assert!(!selectors.contains("row.id === \"structure_interaction\""));
+        assert!(!selectors.contains("checkRow(byId, \"structure_interaction\""));
+    }
+
+    #[test]
     fn visual_result_sections_use_clear_not_ready_language() {
         let app = web_asset_text("pages/results.js");
         assert!(app.contains("三维查看未就绪"));
         assert!(app.contains("轨迹图未就绪"));
         assert!(!app.contains("未接入可用输出"));
 
-        let structure = user_structure_row(&json!({"candidate_id":"C1"}), &BTreeMap::new());
+        let structure = user_structure_row(
+            &json!({"candidate_id":"C1"}),
+            &BTreeMap::new(),
+            &json!({"ready": false}),
+        );
+        let ready_structure = user_structure_row(
+            &json!({"candidate_id":"C1"}),
+            &BTreeMap::new(),
+            &json!({"ready": true}),
+        );
         let md = user_md_row(&json!({"candidate_id":"C1"}), &BTreeMap::new());
         assert_eq!(structure["viewer_status"], "三维查看未就绪");
+        assert_eq!(ready_structure["viewer_status"], "三维查看已就绪");
         assert_eq!(md["trajectory_status"], "轨迹图未就绪");
     }
 
@@ -4177,7 +4364,7 @@ mod tests {
         assert!(text.contains("科学仓库"));
         assert!(text.contains("已知蛋白索引"));
         assert!(text.contains("宏基因组索引"));
-        assert!(text.contains("结构互作索引"));
+        assert!(text.contains("结构索引"));
         assert!(text.contains("计算工具"));
         assert!(text.contains("安装状态"));
         assert!(text.contains("科学资源状态"));
@@ -4213,7 +4400,7 @@ mod tests {
         assert!(summary.contains("缺少科学仓库"));
         assert!(summary.contains("计算工具未就绪"));
         assert!(summary.contains("缺少已知蛋白索引"));
-        assert!(summary.contains("缺少结构互作索引"));
+        assert!(summary.contains("缺少结构索引"));
         assert!(!summary.contains("manifest"));
         assert!(!summary.contains("tool_versions"));
         assert!(!summary.contains("science_store"));
@@ -4912,6 +5099,10 @@ mod tests {
         assert_eq!(payload["viewer"]["ready"], true);
         assert_eq!(payload["viewer"]["atom_count"], 2);
         assert_eq!(payload["viewer"]["artifact"], "structure_viewer.pdb");
+        assert_eq!(
+            payload["structure_rows"][0]["viewer_status"],
+            "三维查看已就绪"
+        );
         let text = payload.to_string();
         assert!(!text.contains(&root.display().to_string()));
         assert!(!text.contains("debug_path"));
@@ -4943,6 +5134,10 @@ mod tests {
         let payload = structure_endpoint_json(&options, "run-1");
 
         assert_eq!(payload["viewer"]["ready"], false);
+        assert_eq!(
+            payload["structure_rows"][0]["viewer_status"],
+            "三维查看未就绪"
+        );
         assert!(
             payload["viewer"]["reason"]
                 .as_str()

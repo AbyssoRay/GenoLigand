@@ -156,6 +156,7 @@ function friendlyRequirement(item) {
     science_store: "科学仓库",
     known_database: "已知蛋白索引",
     metagenome: "宏基因组索引",
+    structure_index: "结构索引",
     tools: "计算工具",
   }[item] || item;
 }
@@ -176,7 +177,7 @@ function friendlyScope(value) {
     known_human_protein: "已知蛋白数据库",
     metagenome_potential: "宏基因组潜在序列",
     metagenome_potential_protein: "宏基因组潜在序列",
-    structure_interaction: "结构互作",
+    structure_interaction: "结构索引证据",
   }[value] || value || "未提供";
 }
 

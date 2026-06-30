@@ -115,7 +115,7 @@ def run_md_summary_job(job: dict[str, Any]) -> str:
     risk_flags = [
         *receptor.risk_flags,
         *parameter_flags,
-        "ligand_placement_inferred_from_receptor_coordinate",
+        "ligand_placement_recorded_from_rdkit_conformer_centroid",
         "coarse_restrained_complex_model",
     ]
     metrics = summarize_complex_frames(mol, receptor, frames, role_ranges)
@@ -128,6 +128,7 @@ def run_md_summary_job(job: dict[str, Any]) -> str:
         metrics,
         frames,
         mol,
+        ligand_positions,
         receptor,
         role_ranges,
         parameterization,
@@ -544,6 +545,9 @@ def write_md_not_ready(run_dir: Path, reason: str, risk_flags: list[str]) -> Non
                 "reason": reason,
                 "risk_flags": risk_flags,
                 "metric_artifacts": [],
+                "ligand_coordinate": "",
+                "ligand_placement_manifest": "",
+                "complex_manifest": "",
                 "trajectory": "",
             },
             handle,
@@ -562,6 +566,7 @@ def write_md_artifacts(
     metrics: dict[str, float],
     frames: list[Any],
     mol: Any,
+    ligand_positions: Any,
     receptor: ReceptorCoordinate,
     role_ranges: dict[str, range],
     parameterization: str,
@@ -614,7 +619,32 @@ def write_md_artifacts(
             ["candidate_id", "input_id", "metric", "value", "source"],
             [[candidate_id, input_id, metric, fmt(metrics[metric]), "openmm_receptor_ligand_complex_dynamics"]],
         )
+    metric_artifacts = [
+        "tool_outputs/md_summary.tsv",
+        "tool_outputs/md_rmsd.tsv",
+        "tool_outputs/md_rmsf.tsv",
+        "tool_outputs/md_ligand_drift.tsv",
+        "tool_outputs/md_contacts.tsv",
+        "tool_outputs/md_hbonds.tsv",
+    ]
+    write_ligand_placement(
+        tool_outputs / "ligand_placement.tsv",
+        candidate_id,
+        input_id,
+        mol,
+        ligand_positions,
+    )
     write_trajectory(tool_outputs / "md_trajectory.tsv", candidate_id, frames, mol, receptor, role_ranges)
+    write_complex_md_manifest(
+        tool_outputs / "complex_md_manifest.json",
+        candidate_id,
+        input_id,
+        platform_name,
+        receptor,
+        parameterization,
+        risk_flags,
+        metric_artifacts,
+    )
     with (tool_outputs / "md_run_manifest.json").open("w", encoding="utf-8") as handle:
         json.dump(
             {
@@ -628,19 +658,91 @@ def write_md_artifacts(
                 "receptor_preparation": receptor.preparation,
                 "receptor_atom_count": len(receptor.atoms),
                 "ligand_parameterization": parameterization,
-                "ligand_placement": "inferred_from_receptor_coordinate_centroid",
+                "ligand_coordinate": "tool_outputs/ligand_placement.tsv",
+                "ligand_coordinate_format": "tsv_angstrom",
+                "ligand_atom_count": mol.GetNumAtoms(),
+                "ligand_placement": "rdkit_conformer_translated_near_receptor_centroid",
+                "ligand_placement_manifest": "tool_outputs/ligand_placement.tsv",
+                "complex_manifest": "tool_outputs/complex_md_manifest.json",
                 "frame_count": len(frames),
                 "trajectory": "tool_outputs/md_trajectory.tsv",
-                "metric_artifacts": [
-                    "tool_outputs/md_summary.tsv",
-                    "tool_outputs/md_rmsd.tsv",
-                    "tool_outputs/md_rmsf.tsv",
-                    "tool_outputs/md_ligand_drift.tsv",
-                    "tool_outputs/md_contacts.tsv",
-                    "tool_outputs/md_hbonds.tsv",
-                ],
+                "metric_artifacts": metric_artifacts,
                 "risk_flags": risk_flags,
                 "score_decomposition": "score_decomposition.tsv",
+            },
+            handle,
+            indent=2,
+            sort_keys=True,
+        )
+        handle.write("\n")
+
+
+def write_ligand_placement(
+    path: Path,
+    candidate_id: str,
+    input_id: str,
+    mol: Any,
+    ligand_positions: Any,
+) -> None:
+    rows = []
+    for atom_index, atom in enumerate(mol.GetAtoms()):
+        coord = ligand_positions[atom_index]
+        rows.append(
+            [
+                candidate_id,
+                input_id,
+                str(atom_index),
+                atom.GetSymbol(),
+                fmt(coord[0]),
+                fmt(coord[1]),
+                fmt(coord[2]),
+                "angstrom",
+                "rdkit_conformer_translated_near_receptor_centroid",
+            ]
+        )
+    write_tsv(
+        path,
+        [
+            "candidate_id",
+            "input_id",
+            "atom_index",
+            "element",
+            "x",
+            "y",
+            "z",
+            "unit",
+            "placement_method",
+        ],
+        rows,
+    )
+
+
+def write_complex_md_manifest(
+    path: Path,
+    candidate_id: str,
+    input_id: str,
+    platform_name: str,
+    receptor: ReceptorCoordinate,
+    parameterization: str,
+    risk_flags: list[str],
+    metric_artifacts: list[str],
+) -> None:
+    with path.open("w", encoding="utf-8") as handle:
+        json.dump(
+            {
+                "candidate_id": candidate_id,
+                "input_id": input_id,
+                "method": "openmm_receptor_ligand_complex_dynamics",
+                "platform": platform_name,
+                "cuda_ready": platform_name == "CUDA",
+                "receptor_coordinate": str(receptor.path),
+                "receptor_preparation": receptor.preparation,
+                "ligand_coordinate": "tool_outputs/ligand_placement.tsv",
+                "ligand_parameterization": parameterization,
+                "ligand_placement": "rdkit_conformer_translated_near_receptor_centroid",
+                "trajectory": "tool_outputs/md_trajectory.tsv",
+                "metric_artifacts": metric_artifacts,
+                "risk_flags": risk_flags,
             },
             handle,
             indent=2,
