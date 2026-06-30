@@ -101,7 +101,7 @@ function candidateDetailSection(rows) {
       </div>
       ${metricRow("目标名称", valueOrMissing(first.target_name))}
       ${metricRow("目标编号", valueOrMissing(first.target_id))}
-      ${metricRow("候选范围", friendlyScope(first.candidate_scope))}
+      ${metricRow("候选范围", valueOrMissing(first.candidate_scope_label, friendlyScope(first.candidate_scope)))}
       ${metricRow("物种", valueOrMissing(first.organism))}
       ${metricRow("综合分数", valueOrMissing(first.final_score))}
       ${metricRow("证据摘要", valueOrMissing(first.evidence_summary))}

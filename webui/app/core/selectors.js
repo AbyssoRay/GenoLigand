@@ -150,7 +150,10 @@ function preflightGroups() {
     },
     {
       title: "运行环境",
-      rows: [checkRow(byId, "tools", "计算工具", "准备运行环境")],
+      rows: [
+        checkRow(byId, "tools", "计算工具", "准备运行环境"),
+        checkRow(byId, "python_worker", "Python worker", "使用正式启动入口或运行安装/修复"),
+      ],
     },
     {
       title: "存储",

@@ -18,7 +18,7 @@ function columnsFor(kind) {
     { key: "candidate_id", label: "候选编号" },
     { key: "target_id", label: "目标编号" },
     { key: "target_name", label: "目标名称" },
-    { key: "candidate_scope", label: "候选范围" },
+    { key: "candidate_scope_label", label: "候选范围" },
     { key: "organism", label: "物种" },
     { key: "final_score", label: "综合分数" },
     { key: "known_database_score", label: "已知库分数" },
@@ -27,7 +27,7 @@ function columnsFor(kind) {
     { key: "docking_score", label: "对接分数" },
     { key: "md_score", label: "动力学分数" },
     { key: "evidence_summary", label: "证据摘要" },
-    { key: "status", label: "状态" },
+    { key: "status_label", label: "状态" },
     { key: "result_source", label: "输出材料" },
   ];
   if (kind === "ranking") return common;
@@ -36,7 +36,7 @@ function columnsFor(kind) {
       { key: "candidate_id", label: "候选编号" },
       { key: "target_id", label: "目标编号" },
       { key: "target_name", label: "目标名称" },
-      { key: "candidate_scope", label: "候选范围" },
+      { key: "candidate_scope_label", label: "候选范围" },
       { key: "organism", label: "物种" },
       { key: "final_score", label: "综合分数" },
       { key: "known_database_score", label: "已知库分数" },
@@ -45,6 +45,7 @@ function columnsFor(kind) {
       { key: "docking_score", label: "对接分数" },
       { key: "md_score", label: "动力学分数" },
       { key: "evidence_summary", label: "证据摘要" },
+      { key: "status_label", label: "状态" },
       { key: "detail_source", label: "详情来源" },
       { key: "result_source", label: "输出材料" },
     ];

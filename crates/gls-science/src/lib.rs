@@ -3733,7 +3733,7 @@ fn artifact_evidence_status(file: &str, path: &Path) -> Result<ArtifactEvidenceS
                 (
                     "available",
                     format!(
-                        "{rows} dynamics rows; md_stability_score feeds md_score and final_score with weight {MD_SCORE_WEIGHT:.2}"
+                        "{rows} short dynamics screening rows from current run metrics; md_stability_score feeds md_score and final_score with weight {MD_SCORE_WEIGHT:.2}; restricted receptor model screening evidence"
                     ),
                 )
             } else {
@@ -3742,7 +3742,10 @@ fn artifact_evidence_status(file: &str, path: &Path) -> Result<ArtifactEvidenceS
         }
         file if file.starts_with("tool_outputs/md_") && file.ends_with(".tsv") => {
             if rows > 0 {
-                ("available", format!("{rows} MD metric artifact rows"))
+                (
+                    "available",
+                    format!("{rows} current-run MD metric artifact rows for screening summary"),
+                )
             } else {
                 ("not_generated", "no MD metric artifact rows".to_string())
             }
@@ -3815,7 +3818,7 @@ fn render_report(options: &ScienceOptions) -> Result<String, String> {
     let candidates = read_candidates(&options.run_dir.join("target_candidate_ranking.tsv"))?;
     let mut text = String::from("# GenoLigand \u{79d1}\u{7814}\u{62a5}\u{544a}\n\n");
     text.push_str(
-        "\u{672c}\u{62a5}\u{544a}\u{53ea}\u{5305}\u{542b}\u{8ba1}\u{7b97}\u{9884}\u{6d4b}\u{3001}\u{5019}\u{9009}\u{4f18}\u{5148}\u{7ea7}\u{548c}\u{8bc1}\u{636e}\u{6458}\u{8981}\u{ff0c}\u{4e0d}\u{4ee3}\u{8868}\u{5b9e}\u{9a8c}\u{9a8c}\u{8bc1}\u{3001}\u{4f53}\u{5185}\u{7ed3}\u{5408}\u{3001}\u{836f}\u{6548}\u{6216}\u{4f5c}\u{7528}\u{673a}\u{5236}\u{786e}\u{8ba4}\u{3002}\n\n",
+        "\u{672c}\u{62a5}\u{544a}\u{5305}\u{542b}\u{8ba1}\u{7b97}\u{9884}\u{6d4b}\u{3001}\u{5019}\u{9009}\u{4f18}\u{5148}\u{7ea7}\u{548c}\u{8bc1}\u{636e}\u{6458}\u{8981}\u{ff1b}\u{5b9e}\u{9a8c}\u{9a8c}\u{8bc1}\u{3001}\u{4f53}\u{5185}\u{7ed3}\u{5408}\u{3001}\u{836f}\u{6548}\u{548c}\u{4f5c}\u{7528}\u{673a}\u{5236}\u{7ed3}\u{8bba}\u{7531}\u{540e}\u{7eed}\u{5b9e}\u{9a8c}\u{8865}\u{5145}\u{3002}\n\n",
     );
     text.push_str(&report_source_summary(options, candidates.len()));
     text.push_str(&report_md_score_summary(options, &candidates)?);
@@ -3838,7 +3841,7 @@ fn render_report(options: &ScienceOptions) -> Result<String, String> {
             ));
         }
         text.push_str(
-            "\n\u{5efa}\u{8bae}\u{628a}\u{6392}\u{5e8f}\u{9760}\u{524d}\u{7684}\u{5019}\u{9009}\u{4f5c}\u{4e3a}\u{540e}\u{7eed}\u{5b9e}\u{9a8c}\u{9a8c}\u{8bc1}\u{7684}\u{4f18}\u{5148}\u{5bf9}\u{8c61}\u{ff0c}\u{800c}\u{4e0d}\u{662f}\u{76f4}\u{63a5}\u{89c6}\u{4e3a}\u{5df2}\u{786e}\u{8ba4}\u{9776}\u{70b9}\u{3002}\n",
+            "\n\u{5efa}\u{8bae}\u{628a}\u{6392}\u{5e8f}\u{9760}\u{524d}\u{7684}\u{5019}\u{9009}\u{4f5c}\u{4e3a}\u{540e}\u{7eed}\u{5b9e}\u{9a8c}\u{9a8c}\u{8bc1}\u{7684}\u{4f18}\u{5148}\u{5bf9}\u{8c61}\u{ff0c}\u{5e76}\u{7ed3}\u{5408}\u{5b9e}\u{9a8c}\u{7ed3}\u{679c}\u{5f62}\u{6210}\u{751f}\u{7269}\u{5b66}\u{7ed3}\u{8bba}\u{3002}\n",
         );
     }
     write_text(&options.run_dir.join("research_report.md"), &text)?;
@@ -3865,7 +3868,7 @@ fn report_md_score_summary(
     let trajectory = read_md_manifest_field(options, "trajectory")
         .unwrap_or_else(|| "tool_outputs/md_trajectory.tsv".to_string());
     Ok(format!(
-        "## \u{52a8}\u{529b}\u{5b66}\u{8bc4}\u{5206}\n\n- \u{6765}\u{6e90}\u{ff1a}md_summary.tsv \u{4e2d}\u{7684} md_stability_score\u{ff0c}\u{7531} RMSD\u{3001}RMSF\u{3001}\u{914d}\u{4f53}\u{6f02}\u{79fb}\u{3001}\u{63a5}\u{89e6}\u{5360}\u{6709}\u{7387}\u{548c}\u{6c22}\u{952e}\u{5360}\u{6709}\u{7387}\u{7b49}\u{5f53}\u{524d}\u{8fd0}\u{884c}\u{8f68}\u{8ff9}\u{6307}\u{6807}\u{6c47}\u{603b}\u{5f97}\u{5230}\u{3002}\n- \u{7528}\u{9014}\u{ff1a}\u{5199}\u{5165} Candidate Ranking \u{7684} md_score\u{ff0c}\u{5e76}\u{4ee5} {MD_SCORE_WEIGHT:.2} \u{6743}\u{91cd}\u{53c2}\u{4e0e} final_score\u{ff1b}\u{672c}\u{8fd0}\u{884c} {ranked_md} \u{4e2a}\u{5019}\u{9009}\u{6709} MD \u{5206}\u{6570}\u{3002}\n- OpenMM \u{5e73}\u{53f0}\u{ff1a}{platform}\u{ff1b}\u{8f68}\u{8ff9}\u{4ea7}\u{7269}\u{ff1a}{trajectory}\u{3002}\n\n"
+        "## \u{52a8}\u{529b}\u{5b66}\u{8bc4}\u{5206}\n\n- \u{6765}\u{6e90}\u{ff1a}md_summary.tsv \u{4e2d}\u{7684} md_stability_score\u{ff0c}\u{7531} tool_outputs/md_rmsd.tsv\u{3001}tool_outputs/md_rmsf.tsv\u{3001}tool_outputs/md_ligand_drift.tsv\u{3001}tool_outputs/md_contacts.tsv \u{548c} tool_outputs/md_hbonds.tsv \u{7b49}\u{5f53}\u{524d}\u{8fd0}\u{884c}\u{8f68}\u{8ff9}\u{6307}\u{6807}\u{6c47}\u{603b}\u{5f97}\u{5230}\u{3002}\n- \u{7528}\u{9014}\u{ff1a}\u{5199}\u{5165} Candidate Ranking \u{7684} md_score\u{ff0c}\u{5e76}\u{4ee5} {MD_SCORE_WEIGHT:.2} \u{6743}\u{91cd}\u{53c2}\u{4e0e} final_score\u{ff1b}\u{672c}\u{8fd0}\u{884c} {ranked_md} \u{4e2a}\u{5019}\u{9009}\u{6709} MD \u{5206}\u{6570}\u{3002}\n- \u{4f7f}\u{7528}\u{8bf4}\u{660e}\u{ff1a}\u{5f53}\u{524d} MD \u{4f5c}\u{4e3a}\u{77ed}\u{7a0b}\u{7a33}\u{5b9a}\u{6027}\u{7b5b}\u{9009}\u{8bc1}\u{636e}\u{ff0c}\u{4f7f}\u{7528}\u{5f53}\u{524d}\u{8fd0}\u{884c}\u{7684}\u{914d}\u{4f53}\u{653e}\u{7f6e}\u{548c}\u{53d7}\u{9650} receptor \u{6a21}\u{578b}\u{ff1b}\u{9002}\u{5408}\u{5019}\u{9009}\u{4f18}\u{5148}\u{7ea7}\u{5224}\u{65ad}\u{ff0c}\u{5b8c}\u{6574}\u{751f}\u{4ea7}\u{7ea7} MD \u{548c}\u{5b9e}\u{9a8c}\u{7ed3}\u{679c}\u{7531}\u{540e}\u{7eed}\u{5b9e}\u{9a8c}\u{4e0e}\u{957f}\u{7a0b}\u{6a21}\u{62df}\u{8865}\u{5145}\u{3002}\n- OpenMM \u{5e73}\u{53f0}\u{ff1a}{platform}\u{ff1b}\u{8f68}\u{8ff9}\u{4ea7}\u{7269}\u{ff1a}{trajectory}\u{3002}\n\n"
     ))
 }
 
@@ -5857,6 +5860,10 @@ mod tests {
         assert!(!report.contains("target_candidate_ranking.tsv"));
         assert!(!report.contains("known_database"));
         assert!(!report.contains("metagenome_potential"));
+        assert!(!report.contains("只包含"));
+        assert!(!report.contains("不代表"));
+        assert!(!report.contains("解释边界"));
+        assert!(!report.contains("不应"));
         assert_eq!(structure.lines().count(), 2);
         assert_eq!(docking.lines().count(), 1);
         assert_eq!(md.lines().count(), 1);

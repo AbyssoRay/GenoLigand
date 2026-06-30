@@ -28,7 +28,7 @@ def main() -> int:
     require("md_chart_rows" in server, "server must derive MD charts from run MD artifacts")
     require("structure_viewer.pdb" in server, "viewer must be backed by explicit structure coordinate artifacts")
     require("当前运行没有可展示的候选假设" in science, "report must preserve empty-result language")
-    forbidden_report_claims = ["已确认靶点", "已确认机制", "真实靶点"]
+    forbidden_report_claims = ["已确认靶点", "确认靶点", "已确认机制", "确认机制", "真实亲和力", "真实靶点"]
     for term in forbidden_report_claims:
         require(term not in science and term not in server, f"confirmed biological claim is not allowed: {term}")
 

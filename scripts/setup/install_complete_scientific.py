@@ -3125,6 +3125,77 @@ def install_ready(payload: dict[str, object]) -> bool:
     )
 
 
+def source_record_summary(source_manifest_result: dict[str, object]) -> dict[str, object]:
+    total = int(source_manifest_result.get("total", 0) or 0)
+    ready = int(source_manifest_result.get("ready", 0) or 0)
+    integrity_ready = int(source_manifest_result.get("hash_ready", 0) or 0)
+    license_ready = int(source_manifest_result.get("license_ready", 0) or 0)
+    completed = total > 0 and ready >= total and integrity_ready >= total and license_ready >= total
+    return {
+        "completed": completed,
+        "ready": ready,
+        "total": total,
+        "integrity_ready": integrity_ready,
+        "license_ready": license_ready,
+        "record_sets": [
+            {"label": "来源文件记录", "ready": ready, "total": total, "completed": total > 0 and ready >= total},
+            {"label": "完整性记录", "ready": integrity_ready, "total": total, "completed": total > 0 and integrity_ready >= total},
+            {"label": "许可证记录", "ready": license_ready, "total": total, "completed": total > 0 and license_ready >= total},
+        ],
+        "next_action": "继续" if completed else "运行安装/修复",
+    }
+
+
+def tool_environment_user_summary(tool_environment_result: dict[str, object]) -> dict[str, object]:
+    status = str(tool_environment_result.get("status", "unknown"))
+    ready = int(tool_environment_result.get("ready", 0) or 0)
+    total = int(tool_environment_result.get("total", 0) or 0)
+    return {
+        "completed": status == "ready",
+        "ready": ready,
+        "total": total,
+        "next_action": "继续" if status == "ready" else "运行安装/修复",
+    }
+
+
+def runtime_user_summary(payload: dict[str, object]) -> dict[str, object]:
+    binaries = payload.get("runtime_binaries")
+    launch_environment = payload.get("launch_environment")
+    if not isinstance(binaries, dict):
+        binaries = {}
+    if not isinstance(launch_environment, dict):
+        launch_environment = {}
+    def binary_ready(name: str) -> bool:
+        item = binaries.get(name)
+        return isinstance(item, dict) and item.get("status") == "ready"
+
+    launcher = str(launch_environment.get("launcher", ""))
+    return {
+        "gls_cli_ready": binary_ready("gls_cli"),
+        "gls_server_ready": binary_ready("gls_server"),
+        "launcher": Path(launcher).name if launcher else "",
+        "next_action": "使用 start-genoligand-webui 启动 WebUI",
+    }
+
+
+def install_user_summary(payload: dict[str, object]) -> dict[str, object]:
+    return {
+        "status": payload.get("status", "unknown"),
+        "install_ready": bool(payload.get("install_ready", False)),
+        "summary": payload.get("summary", ""),
+        "next_action": payload.get("next_action", "运行安装/修复"),
+        "access_url": payload.get("access_url", ""),
+        "progress": payload.get("progress", {}),
+        "downloads": payload.get("downloads", {}),
+        "external_sources": payload.get("external_sources", {}),
+        "resources": payload.get("resources", {}),
+        "source_records": source_record_summary(payload.get("source_manifests", {}) if isinstance(payload.get("source_manifests"), dict) else {}),
+        "tool_environment": tool_environment_user_summary(payload.get("tool_environment", {}) if isinstance(payload.get("tool_environment"), dict) else {}),
+        "cuda_toolkit": payload.get("cuda_toolkit", {}),
+        "runtime": runtime_user_summary(payload),
+    }
+
+
 def installation_status(
     science_store: Path,
     completed: subprocess.CompletedProcess[str],
@@ -3497,7 +3568,8 @@ def main() -> int:
     )
     payload["runtime_binaries"]["gls_server"] = server_runtime_status
     payload["launch_environment"] = launch_environment
-    print(json.dumps(payload, ensure_ascii=False, indent=2))
+    output_payload = payload if args.debug_output else install_user_summary(payload)
+    print(json.dumps(output_payload, ensure_ascii=False, indent=2))
     release_install_lock(install_lock)
     install_lock = None
     if not args.start_webui:
@@ -3523,12 +3595,12 @@ def main() -> int:
         env["GENOLIGAND_PYTHON"] = tool_python
     print(
         json.dumps(
-            {
-                "status": "starting_webui",
-                "summary": "WebUI 正在启动。",
-                "access_url": f"http://{args.host}:{args.port}/",
-                "launcher": launch_environment.get("launcher", ""),
-            },
+                {
+                    "status": "starting_webui",
+                    "summary": "WebUI 正在启动。",
+                    "access_url": f"http://{args.host}:{args.port}/",
+                    "launcher": Path(str(launch_environment.get("launcher", ""))).name,
+                },
             ensure_ascii=False,
             indent=2,
         )

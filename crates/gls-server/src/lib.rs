@@ -38,6 +38,24 @@ pub struct ServerOptions {
 pub fn run_server(options: &ServerOptions) -> Result<(), String> {
     fs::create_dir_all(projects_root(options))
         .map_err(|err| format!("create_projects_root_failed:{err}"))?;
+    let worker = worker_environment_status(options);
+    let worker_ready = worker
+        .get("ready")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let worker_summary = worker
+        .get("summary")
+        .and_then(Value::as_str)
+        .unwrap_or("Python worker environment status unknown");
+    println!(
+        "gls_worker_environment\tstatus={}\tsummary={}",
+        if worker_ready {
+            "ready"
+        } else {
+            "needs_repair"
+        },
+        worker_summary
+    );
     let listener = TcpListener::bind(format!("{}:{}", options.host, options.port))
         .map_err(|err| format!("server_bind_failed:{err}"))?;
     println!(
@@ -591,6 +609,14 @@ fn preflight_json(options: &ServerOptions, project_id: &str) -> Value {
                 .display()
                 .to_string(),
         ),
+        check(
+            "python_worker",
+            worker_environment_status(options)
+                .get("ready")
+                .and_then(Value::as_bool)
+                .unwrap_or(false),
+            "Python worker environment".to_string(),
+        ),
     ];
     let ready = checks
         .iter()
@@ -629,6 +655,226 @@ fn user_preflight_checks(checks: Option<&Value>) -> Value {
     )
 }
 
+fn runtime_command_environment(options: &ServerOptions) -> BTreeMap<String, String> {
+    let mut values = launch_environment_values(options);
+    for key in [
+        "GENOLIGAND_PYTHON",
+        "GENOLIGAND_GLS_CLI",
+        "GENOLIGAND_GLS_SERVER",
+        "GENOLIGAND_SCIENCE_STORE",
+    ] {
+        if !values.contains_key(key)
+            && let Ok(value) = std::env::var(key)
+            && !value.trim().is_empty()
+        {
+            values.insert(key.to_string(), value);
+        }
+    }
+    values
+        .entry("GENOLIGAND_SCIENCE_STORE".to_string())
+        .or_insert_with(|| science_store_path(options).display().to_string());
+    if let Some(path) = launch_environment_path(options) {
+        values.entry("PATH".to_string()).or_insert(path);
+    }
+    values
+}
+
+fn runtime_env_value(options: &ServerOptions, key: &str) -> Option<String> {
+    runtime_command_environment(options).remove(key)
+}
+
+fn launch_environment_values(options: &ServerOptions) -> BTreeMap<String, String> {
+    let value = read_json_or(
+        &options.artifact_dir.join("launch_environment.json"),
+        json!({}),
+    );
+    value
+        .get("environment")
+        .and_then(Value::as_object)
+        .map(|object| {
+            object
+                .iter()
+                .filter_map(|(key, value)| {
+                    value
+                        .as_str()
+                        .filter(|text| !text.trim().is_empty())
+                        .map(|text| (key.clone(), text.to_string()))
+                })
+                .collect::<BTreeMap<_, _>>()
+        })
+        .unwrap_or_default()
+}
+
+fn launch_environment_path(options: &ServerOptions) -> Option<String> {
+    let value = read_json_or(
+        &options.artifact_dir.join("launch_environment.json"),
+        json!({}),
+    );
+    let mut parts = value
+        .get("path_prepend")
+        .and_then(Value::as_array)
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(Value::as_str)
+                .filter(|text| !text.trim().is_empty())
+                .map(ToOwned::to_owned)
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    if parts.is_empty() {
+        return None;
+    }
+    if let Ok(current) = std::env::var("PATH")
+        && !current.trim().is_empty()
+    {
+        parts.push(current);
+    }
+    Some(parts.join(if cfg!(windows) { ";" } else { ":" }))
+}
+
+fn worker_environment_status(options: &ServerOptions) -> Value {
+    let env = runtime_command_environment(options);
+    let python = env.get("GENOLIGAND_PYTHON").cloned().unwrap_or_default();
+    let managed_python = worker_python_looks_managed(&python);
+    let tools_ready =
+        tool_versions_ready(&science_store_path(options).join("indexes/tool_versions.tsv"));
+    let (dependencies_ready, dependency_summary) = if managed_python && tools_ready {
+        worker_python_dependency_status(options, &env, &python)
+    } else {
+        (false, String::new())
+    };
+    let ready = managed_python && tools_ready && dependencies_ready;
+    let summary = if python.trim().is_empty() {
+        "未找到安装器写入的 Python worker 环境；请通过 start-genoligand-webui 启动，或运行安装/修复。"
+    } else if !managed_python {
+        "当前 Python 不是安装器管理的 worker 环境；请使用 start-genoligand-webui 启动，避免系统 Python 缺依赖。"
+    } else if !tools_ready {
+        "Python worker 环境已指定，但科学工具记录未就绪；请运行安装/修复。"
+    } else if !dependencies_ready {
+        dependency_summary.as_str()
+    } else {
+        "Python worker 环境来自安装器启动配置，科学工具记录已就绪。"
+    };
+    json!({
+        "id": "python_worker",
+        "label": "Python worker 环境",
+        "ready": ready,
+        "status": if ready {"就绪"} else {"需要处理"},
+        "summary": summary,
+        "next_action": if ready {"继续"} else {"通过 start-genoligand-webui 启动，或运行安装/修复"}
+    })
+}
+
+fn worker_python_looks_managed(value: &str) -> bool {
+    let normalized = value.replace('\\', "/").to_ascii_lowercase();
+    normalized.contains("python-worker-env") || normalized.contains("genoligand-wsl-python")
+}
+
+fn worker_python_dependency_status(
+    options: &ServerOptions,
+    env: &BTreeMap<String, String>,
+    python: &str,
+) -> (bool, String) {
+    let code = concat!(
+        "import importlib, sys\n",
+        "mods=['rdkit','openmm','pdbfixer','openff.toolkit','mdtraj','MDAnalysis']\n",
+        "missing=[]\n",
+        "for mod in mods:\n",
+        "    try:\n",
+        "        importlib.import_module(mod)\n",
+        "    except Exception:\n",
+        "        missing.append(mod)\n",
+        "if missing:\n",
+        "    print('missing:'+','.join(missing))\n",
+        "    raise SystemExit(2)\n",
+        "print('worker_python_ready')\n",
+    );
+    match worker_python_probe_output(options, env, python, code) {
+        Ok(output) if output.status.success() => {
+            (true, "Python worker 关键依赖可导入。".to_string())
+        }
+        Ok(output) => {
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            let detail = stdout
+                .lines()
+                .chain(stderr.lines())
+                .find(|line| !line.trim().is_empty())
+                .unwrap_or("dependency probe failed");
+            (
+                false,
+                format!("Python worker 环境缺少依赖或无法启动：{detail}；请运行安装/修复。"),
+            )
+        }
+        Err(err) => (
+            false,
+            format!(
+                "Python worker 环境无法启动：{err}；请通过 start-genoligand-webui 启动，或运行安装/修复。"
+            ),
+        ),
+    }
+}
+
+fn worker_python_probe_output(
+    options: &ServerOptions,
+    env: &BTreeMap<String, String>,
+    python: &str,
+    code: &str,
+) -> Result<std::process::Output, std::io::Error> {
+    if cfg!(windows) && is_windows_script(python) {
+        fs::create_dir_all(&options.artifact_dir)?;
+        let probe = options
+            .artifact_dir
+            .join(format!("worker-dependency-probe-{}.py", now_millis()));
+        fs::write(&probe, code)?;
+        let output = Command::new("cmd.exe")
+            .arg("/C")
+            .arg(python)
+            .arg(python_probe_script_arg(python, &probe))
+            .current_dir(&options.workspace_root)
+            .envs(env)
+            .output();
+        let _ = fs::remove_file(probe);
+        return output;
+    }
+    Command::new(python)
+        .arg("-c")
+        .arg(code)
+        .current_dir(&options.workspace_root)
+        .envs(env)
+        .output()
+}
+
+fn is_windows_script(command: &str) -> bool {
+    Path::new(command)
+        .extension()
+        .and_then(|ext| ext.to_str())
+        .is_some_and(|ext| ext.eq_ignore_ascii_case("cmd") || ext.eq_ignore_ascii_case("bat"))
+}
+
+fn python_probe_script_arg(python: &str, script: &Path) -> String {
+    let path = script.display().to_string();
+    if python.replace('\\', "/").contains("genoligand-wsl-python") {
+        return windows_path_to_wsl(&path).unwrap_or(path);
+    }
+    path
+}
+
+fn windows_path_to_wsl(value: &str) -> Option<String> {
+    let bytes = value.as_bytes();
+    if bytes.len() < 3 || bytes[1] != b':' || !bytes[0].is_ascii_alphabetic() {
+        return None;
+    }
+    let slash = bytes[2];
+    if slash != b'\\' && slash != b'/' {
+        return None;
+    }
+    let drive = (bytes[0] as char).to_ascii_lowercase();
+    let rest = value[3..].replace('\\', "/");
+    Some(format!("/mnt/{drive}/{rest}"))
+}
+
 fn start_run(options: &ServerOptions, project_id: &str) -> Value {
     let project = project_dir(options, project_id);
     let run_id = format!("run-{}", now_millis());
@@ -636,6 +882,29 @@ fn start_run(options: &ServerOptions, project_id: &str) -> Value {
     let _ = fs::create_dir_all(&run_dir);
     let _ = write_text(&run_dir.join("run_state.txt"), "running\n");
     let _ = write_text(&run_dir.join("current_stage.txt"), "pipeline_run\n");
+    let worker = worker_environment_status(options);
+    if !worker
+        .get("ready")
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+    {
+        let reason = worker
+            .get("summary")
+            .and_then(Value::as_str)
+            .unwrap_or("Python worker environment needs repair")
+            .to_string();
+        let _ = write_text(&run_dir.join("run_state.txt"), "blocked\n");
+        let _ = write_text(
+            &run_dir.join("failure_reason.txt"),
+            &(reason.clone() + "\n"),
+        );
+        let _ = write_text(
+            &run_dir.join("run.log"),
+            &format!("state\tblocked\nreason\t{reason}\n"),
+        );
+        let _ = write_text(&project.join("latest_run_id.txt"), &run_id);
+        return json!({"status":"blocked","run":run_json(options,&run_id)});
+    }
     let input = project.join("input_manifest.json");
     let command = gls_cli_command(options, &input, &run_dir);
     let command_text = command.join(" ");
@@ -643,6 +912,7 @@ fn start_run(options: &ServerOptions, project_id: &str) -> Value {
     let output = Command::new(&command[0])
         .args(&command[1..])
         .current_dir(&options.workspace_root)
+        .envs(runtime_command_environment(options))
         .output();
     let (state, reason, stdout, stderr) = match output {
         Ok(output) => {
@@ -749,6 +1019,9 @@ fn gls_cli_invocation(options: &ServerOptions) -> Vec<String> {
     {
         return vec![path];
     }
+    if let Some(path) = runtime_env_value(options, "GENOLIGAND_GLS_CLI") {
+        return vec![path];
+    }
     let exe = if cfg!(windows) {
         "gls-cli.exe"
     } else {
@@ -785,6 +1058,11 @@ fn gls_cli_help_command(options: &ServerOptions) -> Vec<String> {
 }
 
 fn science_store_path(options: &ServerOptions) -> PathBuf {
+    if let Some(path) = launch_environment_values(options).remove("GENOLIGAND_SCIENCE_STORE")
+        && !path.trim().is_empty()
+    {
+        return PathBuf::from(path);
+    }
     std::env::var("GENOLIGAND_SCIENCE_STORE")
         .map(PathBuf::from)
         .unwrap_or_else(|_| {
@@ -1428,11 +1706,16 @@ fn user_genome_row(row: &Value) -> Value {
 
 fn user_candidate_detail_row(row: &Value) -> Value {
     let scores = row.get("scores").unwrap_or(&Value::Null);
+    let scope = row
+        .get("candidate_scope")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
     json!({
         "candidate_id": row.get("candidate_id").cloned().unwrap_or_else(|| json!("")),
         "target_id": row.get("target_id").cloned().unwrap_or_else(|| json!("")),
         "target_name": row.get("target_name").cloned().unwrap_or_else(|| json!("")),
-        "candidate_scope": row.get("candidate_scope").cloned().unwrap_or_else(|| json!("")),
+        "candidate_scope": scope,
+        "candidate_scope_label": friendly_candidate_scope(scope),
         "organism": row.get("organism").cloned().unwrap_or_else(|| json!("")),
         "final_score": scores.get("final").cloned().unwrap_or_else(|| json!("")),
         "known_database_score": scores.get("known_database").cloned().unwrap_or_else(|| json!("")),
@@ -1442,6 +1725,7 @@ fn user_candidate_detail_row(row: &Value) -> Value {
         "md_score": scores.get("md").cloned().unwrap_or_else(|| json!("")),
         "evidence_summary": row.get("evidence_summary").cloned().unwrap_or_else(|| json!("")),
         "status": "\u{8ba1}\u{7b97}\u{5019}\u{9009}",
+        "status_label": "\u{8ba1}\u{7b97}\u{5019}\u{9009}",
         "detail_source": "\u{5f53}\u{524d}\u{8fd0}\u{884c}\u{7684}\u{5019}\u{9009}\u{8be6}\u{60c5}\u{8f93}\u{51fa}",
         "result_source": "\u{5019}\u{9009}\u{8be6}\u{60c5}\u{8f93}\u{51fa}"
     })
@@ -1843,10 +2127,17 @@ fn user_diagnostics_json(options: &ServerOptions) -> Value {
     let store = science_store_path(options);
     let missing = missing_resource_rows(&required_resource_rows(&store));
     let openmm_platforms = openmm_platform_status(&store);
+    let worker = worker_environment_status(options);
     let mut checks = vec![
         json!({"label":"服务", "ready":true, "next_action":"继续"}),
         json!({"label":"运行组件", "ready":gls_cli.0, "next_action": if gls_cli.0 {"继续"} else {"重新运行安装程序"}}),
         json!({"label":"科学仓库", "ready":database_ready, "next_action": if database_ready {"继续"} else {"运行安装/修复"}}),
+        json!({
+            "label": "Python worker",
+            "ready": worker["ready"].as_bool().unwrap_or(false),
+            "next_action": worker["next_action"].clone(),
+            "detail": worker["summary"].clone()
+        }),
     ];
     checks.push(json!({
         "label": "OpenMM/CUDA",
@@ -1857,6 +2148,7 @@ fn user_diagnostics_json(options: &ServerOptions) -> Value {
     json!({
         "checks": checks,
         "missing": missing,
+        "worker_environment": worker,
         "science_store": user_databases_json(options),
         "tool_platforms": [openmm_platforms]
     })
@@ -1866,11 +2158,13 @@ fn user_setup_status_json(options: &ServerOptions) -> Value {
     let ready = preflight_store_ready(options);
     let store = science_store_path(options);
     let required = required_resource_rows(&store);
+    let worker = worker_environment_status(options);
     json!({
-        "database_ready": ready,
-        "repair_action": if ready {"继续"} else {"运行安装/修复"},
+        "database_ready": ready && worker.get("ready").and_then(Value::as_bool).unwrap_or(false),
+        "repair_action": if ready && worker.get("ready").and_then(Value::as_bool).unwrap_or(false) {"继续"} else {"运行安装/修复"},
         "checks": required,
         "missing": missing_resource_rows(&required),
+        "worker_environment": worker,
         "source_records": source_records_status(&store),
         "tool_platforms": [openmm_platform_status(&store)]
     })
@@ -3394,6 +3688,135 @@ mod tests {
         fs::remove_dir_all(&root).ok();
     }
 
+    fn write_ready_tool_versions(store: &Path) {
+        let indexes = store.join("indexes");
+        fs::create_dir_all(&indexes).expect("indexes");
+        let mut text = String::from("tool\tstatus\tversion\tdetail\n");
+        for tool in REQUIRED_TOOL_IDS {
+            text.push_str(&format!("{tool}\tready\ttest\tok\n"));
+        }
+        fs::write(indexes.join("tool_versions.tsv"), text).expect("tool versions");
+    }
+
+    fn write_launch_environment(options: &ServerOptions, python: &str, cli: &str) {
+        fs::create_dir_all(&options.artifact_dir).expect("runtime");
+        let payload = json!({
+            "status": "ready",
+            "environment": {
+                "GENOLIGAND_SCIENCE_STORE": options.workspace_root.join("science_store").display().to_string(),
+                "GENOLIGAND_GLS_CLI": cli,
+                "GENOLIGAND_PYTHON": python
+            },
+            "path_prepend": [options.artifact_dir.join("bin").display().to_string()]
+        });
+        fs::write(
+            options.artifact_dir.join("launch_environment.json"),
+            payload.to_string(),
+        )
+        .expect("launch environment");
+    }
+
+    #[test]
+    fn worker_environment_uses_installed_launch_environment() {
+        let root = std::env::temp_dir().join(format!("genoligand-worker-env-{}", now_millis()));
+        let options = server_options(root.clone());
+        let managed_python =
+            options
+                .artifact_dir
+                .join("python-worker-env")
+                .join(if cfg!(windows) {
+                    "genoligand-wsl-python.cmd"
+                } else {
+                    "bin/python"
+                });
+        fs::create_dir_all(managed_python.parent().expect("managed python parent"))
+            .expect("managed python dir");
+        if cfg!(windows) {
+            fs::write(&managed_python, "@echo off\r\nexit /b 0\r\n").expect("fake wrapper");
+        } else {
+            fs::write(&managed_python, "#!/usr/bin/env sh\nexit 0\n").expect("fake wrapper");
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let mut permissions = fs::metadata(&managed_python)
+                    .expect("metadata")
+                    .permissions();
+                permissions.set_mode(0o755);
+                fs::set_permissions(&managed_python, permissions).expect("chmod");
+            }
+        }
+        write_ready_tool_versions(&root.join("science_store"));
+        write_launch_environment(
+            &options,
+            &managed_python.display().to_string(),
+            &options
+                .artifact_dir
+                .join("bin")
+                .join("gls-cli.exe")
+                .display()
+                .to_string(),
+        );
+
+        let status = worker_environment_status(&options);
+        let env = runtime_command_environment(&options);
+
+        assert_eq!(status["ready"], true);
+        assert_eq!(
+            env.get("GENOLIGAND_PYTHON").cloned(),
+            Some(managed_python.display().to_string())
+        );
+        fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn python_probe_script_arg_uses_wsl_path_for_wsl_wrapper() {
+        let script = PathBuf::from(r"D:\Project\rust\GenoLigand\work\probe.py");
+
+        assert_eq!(
+            python_probe_script_arg(
+                r"D:\runtime\python-worker-env\genoligand-wsl-python.cmd",
+                &script
+            ),
+            "/mnt/d/Project/rust/GenoLigand/work/probe.py"
+        );
+        assert_eq!(
+            python_probe_script_arg(r"D:\runtime\python-worker-env\python.cmd", &script),
+            r"D:\Project\rust\GenoLigand\work\probe.py"
+        );
+    }
+
+    #[test]
+    fn start_run_blocks_system_python_worker_environment() {
+        let root = std::env::temp_dir().join(format!("genoligand-system-python-{}", now_millis()));
+        let options = server_options(root.clone());
+        let project_id = "project-1";
+        let project = project_dir(&options, project_id);
+        fs::create_dir_all(&project).expect("project");
+        fs::write(
+            project.join("input_manifest.json"),
+            r#"{"inputs":[{"value":"CCO"}]}"#,
+        )
+        .expect("input");
+        write_ready_tool_versions(&root.join("science_store"));
+        write_launch_environment(&options, "python", "gls-cli");
+
+        let response = start_run(&options, project_id);
+        let run_id = response["run"]["run_id"].as_str().expect("run id");
+        let run_dir = project.join("runs").join(run_id);
+
+        assert_eq!(response["status"], "blocked");
+        assert_eq!(
+            fs::read_to_string(run_dir.join("run_state.txt")).expect("run state"),
+            "blocked\n"
+        );
+        assert!(
+            fs::read_to_string(run_dir.join("failure_reason.txt"))
+                .expect("failure")
+                .contains("worker")
+        );
+        fs::remove_dir_all(&root).ok();
+    }
+
     fn write_ready_source_records(store: &Path) {
         let dir = store.join("manifests");
         fs::create_dir_all(&dir).expect("source records dir");
@@ -3416,7 +3839,8 @@ mod tests {
 
     #[test]
     fn setup_status_exposes_user_readable_source_record_sets() {
-        let root = std::env::temp_dir().join(format!("genoligand-source-records-{}", now_millis()));
+        let root =
+            std::env::temp_dir().join(format!("genoligand-source-record-status-{}", now_millis()));
         let options = server_options(root.clone());
         let store = root.join("science_store");
         write_ready_source_records(&store);
