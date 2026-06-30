@@ -3931,6 +3931,9 @@ fn report_scope_label(value: &str) -> &'static str {
         "known_database" | "known_human_protein" => {
             "\u{5df2}\u{77e5}\u{86cb}\u{767d}\u{6570}\u{636e}\u{5e93}"
         }
+        "known_nonhuman_protein" => {
+            "\u{5df2}\u{77e5}\u{975e}\u{4eba}\u{6e90}\u{86cb}\u{767d}\u{6570}\u{636e}\u{5e93}"
+        }
         "metagenome_potential" | "metagenome_potential_protein" => {
             "\u{5b8f}\u{57fa}\u{56e0}\u{7ec4}\u{6f5c}\u{5728}\u{5e8f}\u{5217}"
         }

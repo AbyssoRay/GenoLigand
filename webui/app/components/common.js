@@ -176,6 +176,7 @@ function friendlyScope(value) {
   return {
     known_database: "已知蛋白数据库",
     known_human_protein: "已知蛋白数据库",
+    known_nonhuman_protein: "已知非人源蛋白数据库",
     metagenome_potential: "宏基因组潜在序列",
     metagenome_potential_protein: "宏基因组潜在序列",
     structure_interaction: "结构索引证据",

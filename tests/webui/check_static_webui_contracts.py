@@ -60,6 +60,12 @@ def main() -> int:
     for term in forbidden:
         require(term not in user_text, f"user web assets expose developer term: {term}")
 
+    common = read(WEB / "components/common.js")
+    require(
+        'known_nonhuman_protein: "已知非人源蛋白数据库"' in common,
+        "known_nonhuman_protein must render as a user-readable scope label",
+    )
+
     mojibake_terms = [
         chr(0x9428),
         chr(0x7ECC),

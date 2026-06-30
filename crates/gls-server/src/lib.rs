@@ -1928,6 +1928,9 @@ fn friendly_candidate_scope(scope: &str) -> &'static str {
         "known_database" | "known_human_protein" => {
             "\u{5df2}\u{77e5}\u{86cb}\u{767d}\u{6570}\u{636e}\u{5e93}"
         }
+        "known_nonhuman_protein" => {
+            "\u{5df2}\u{77e5}\u{975e}\u{4eba}\u{6e90}\u{86cb}\u{767d}\u{6570}\u{636e}\u{5e93}"
+        }
         "metagenome_potential" | "metagenome_potential_protein" => {
             "\u{5b8f}\u{57fa}\u{56e0}\u{7ec4}\u{6f5c}\u{5728}\u{5e8f}\u{5217}"
         }
@@ -5259,7 +5262,7 @@ mod tests {
         fs::write(run_dir.join("current_command.txt"), "cargo run hidden\n").expect("command");
         fs::write(
             run_dir.join("target_candidate_ranking.tsv"),
-            "rank\tcandidate_id\ttarget_id\ttarget_name\tcandidate_scope\torganism\tfinal_score\tknown_database_score\tmetagenome_score\tstructure_score\tdocking_score\tmd_score\tevidence_summary\tstatus\tsha256\tdebug_path\n1\tC1\tP24941\tCDK2\tknown_database\tHomo sapiens\t0.80\t0.70\t0.00\t0.10\t0.00\t0.00\tmatched current run\tcomputed_prediction\tabc123\tD:/hidden\n",
+            "rank\tcandidate_id\ttarget_id\ttarget_name\tcandidate_scope\torganism\tfinal_score\tknown_database_score\tmetagenome_score\tstructure_score\tdocking_score\tmd_score\tevidence_summary\tstatus\tsha256\tdebug_path\n1\tC1\tP24941\tCDK2\tknown_nonhuman_protein\tStreptococcus pneumoniae\t0.80\t0.70\t0.00\t0.10\t0.00\t0.00\tmatched current run\tcomputed_prediction\tabc123\tD:/hidden\n",
         )
         .expect("candidate table");
         fs::write(
@@ -5277,7 +5280,7 @@ mod tests {
         .expect("evidence");
         fs::write(
             run_dir.join("candidate_detail.json"),
-            r#"{"candidate_count":1,"candidates":[{"candidate_id":"C1","target_id":"P24941","target_name":"CDK2","candidate_scope":"known_database","organism":"Homo sapiens","scores":{"final":0.8,"known_database":0.7,"metagenome":0.0,"structure":0.1,"docking":0.0,"md":0.0},"evidence_summary":"matched current run","source_artifacts":["target_candidate_ranking.tsv"],"sha256":"abc123","path":"D:/hidden"}]}"#,
+            r#"{"candidate_count":1,"candidates":[{"candidate_id":"C1","target_id":"P24941","target_name":"CDK2","candidate_scope":"known_nonhuman_protein","organism":"Streptococcus pneumoniae","scores":{"final":0.8,"known_database":0.7,"metagenome":0.0,"structure":0.1,"docking":0.0,"md":0.0},"evidence_summary":"matched current run","source_artifacts":["target_candidate_ranking.tsv"],"sha256":"abc123","path":"D:/hidden"}]}"#,
         )
         .expect("candidate detail");
         fs::write(
@@ -5300,6 +5303,17 @@ mod tests {
         assert_eq!(run["trace"]["candidate_count"], 1);
         assert_eq!(run["trace"]["evidence_count"], 1);
 
+        let candidate_detail = candidate_detail_json(&options, "run-1");
+        let candidates = candidates_endpoint_json(&options, "run-1");
+        assert_eq!(
+            candidate_detail["candidate_details"][0]["candidate_scope_label"],
+            "已知非人源蛋白数据库"
+        );
+        assert_eq!(
+            candidates["candidates"][0]["candidate_scope_label"],
+            "已知非人源蛋白数据库"
+        );
+
         let responses = [
             read_project(&options, "project-1"),
             run,
@@ -5309,9 +5323,9 @@ mod tests {
             user_setup_install_plan_json(&options),
             preflight_json(&options, "project-1"),
             logs_json(&options, "run-1"),
-            candidate_detail_json(&options, "run-1"),
+            candidate_detail,
             evidence_endpoint_json(&options, "run-1"),
-            candidates_endpoint_json(&options, "run-1"),
+            candidates,
             genome_endpoint_json(&options, "run-1"),
             structure_endpoint_json(&options, "run-1"),
             md_endpoint_json(&options, "run-1"),
