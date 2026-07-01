@@ -28,6 +28,8 @@ def main() -> int:
     require("structure_viewer_payload" in server, "server must expose viewer data only from run structure artifacts")
     require("md_chart_rows" in server, "server must derive MD charts from run MD artifacts")
     require("structure_viewer.pdb" in server, "viewer must be backed by explicit structure coordinate artifacts")
+    require("input_conversion_manifest.tsv" in science, "science pipeline must write input conversion manifest")
+    require("read_input_conversion_manifest" in md_worker, "MD worker must prefer canonical converted inputs")
     require("read_peptide_sequence_input" in md_worker, "MD worker must accept peptide sequence inputs")
     require("MolFromFASTA" in md_worker, "MD worker must build peptide molecules through RDKit peptide conversion")
     require("rdkit_peptide_conformer_ensemble" in md_worker, "peptide MD artifacts must identify the real conformer calculation method")

@@ -540,7 +540,7 @@ fn write_input_manifest(options: &ServerOptions, project_id: &str, body: &str) -
         return json!({
             "status":"failed",
             "error":"input_not_usable",
-            "message":"\u{8bf7}\u{586b}\u{5199}\u{81f3}\u{5c11}\u{4e00}\u{4e2a}\u{53ef}\u{8bc6}\u{522b}\u{7684}\u{7814}\u{7a76}\u{8f93}\u{5165}\u{3002}",
+            "message":"无法转换为可计算结构/序列，请检查输入。",
             "project": read_project(options, project_id)
         });
     }
@@ -563,12 +563,15 @@ fn clear_current_run_selection(project_dir: &Path) {
 fn preflight_json(options: &ServerOptions, project_id: &str) -> Value {
     let input = project_dir(options, project_id).join("input_manifest.json");
     let store = science_store_path(options);
+    let input_ready = input.exists() && input_has_user_value(&input);
+    let input_detail = if input_ready {
+        input_recognition_summary(&read_json_or(&input, json!({})))
+            .unwrap_or_else(|| "已识别为可计算输入".to_string())
+    } else {
+        "无法转换为可计算结构/序列".to_string()
+    };
     let checks = vec![
-        check(
-            "input",
-            input.exists() && input_has_user_value(&input),
-            input.display().to_string(),
-        ),
+        check_with_detail("input", input_ready, input_detail),
         check(
             "science_store",
             preflight_store_ready(options),
@@ -646,10 +649,14 @@ fn user_preflight_checks(checks: Option<&Value>) -> Value {
     Value::Array(
         rows.into_iter()
             .map(|row| {
-                json!({
+                let mut item = json!({
                     "id": row.get("id").cloned().unwrap_or(Value::Null),
                     "ready": row.get("ready").cloned().unwrap_or(Value::Bool(false))
-                })
+                });
+                if let Some(detail) = row.get("detail").and_then(Value::as_str) {
+                    item["detail"] = json!(detail);
+                }
+                item
             })
             .collect(),
     )
@@ -3293,6 +3300,10 @@ fn check(id: &str, ready: bool, _detail: String) -> Value {
     json!({"id":id,"ready":ready,"status":if ready {"ready"} else {"blocked"}})
 }
 
+fn check_with_detail(id: &str, ready: bool, detail: String) -> Value {
+    json!({"id":id,"ready":ready,"status":if ready {"ready"} else {"blocked"},"detail":detail})
+}
+
 fn capture(program: &str, args: &[&str], cwd: &Path) -> (bool, String) {
     match Command::new(program).args(args).current_dir(cwd).output() {
         Ok(output) => (
@@ -3497,17 +3508,78 @@ fn input_value_has_usable_user_input(value: &Value) -> bool {
     saw_usable_input
 }
 
+fn input_recognition_summary(value: &Value) -> Option<String> {
+    let inputs = value.get("inputs").and_then(Value::as_array)?;
+    let mut labels = Vec::new();
+    for item in inputs {
+        let field = item.get("field").and_then(Value::as_str).unwrap_or("");
+        let input_value = item.get("value").and_then(Value::as_str).unwrap_or("");
+        if field == "project_name" || input_value.trim().is_empty() {
+            continue;
+        }
+        let Some(label) = input_recognition_label(field, input_value) else {
+            return Some("无法转换为可计算结构/序列".to_string());
+        };
+        if !labels.iter().any(|existing| existing == &label) {
+            labels.push(label);
+        }
+    }
+    if labels.is_empty() {
+        None
+    } else {
+        Some(format!("已识别为{}", labels.join("、")))
+    }
+}
+
+fn input_recognition_label(field: &str, value: &str) -> Option<String> {
+    let field = field.to_ascii_lowercase();
+    let value = value.trim();
+    if value.is_empty() {
+        return None;
+    }
+    if looks_like_path_with_ext(value, &["sdf", "mol", "mol2"]) {
+        return Some("小分子结构文件".to_string());
+    }
+    if looks_like_path_with_ext(value, &["pdb", "cif", "mmcif", "ent"]) {
+        return Some("结构文件".to_string());
+    }
+    if field.contains("genome") && looks_like_nucleotide_sequence(value, 8) {
+        return Some("核酸序列".to_string());
+    }
+    if looks_like_peptide_sequence(value, 2) {
+        let body_len = compact_sequence_body(value).len();
+        return Some(if body_len > 80 {
+            "蛋白序列".to_string()
+        } else {
+            "多肽".to_string()
+        });
+    }
+    if looks_like_path_with_ext(value, &["fasta", "fa", "faa"]) {
+        return Some("序列文件".to_string());
+    }
+    if looks_like_path_with_ext(value, &["fna", "fastq", "fq", "gb", "gff", "gtf", "vcf"]) {
+        return Some("核酸序列文件".to_string());
+    }
+    if looks_like_inchi(value) || looks_like_smiles_text(value) {
+        return Some("小分子".to_string());
+    }
+    if field == "complex" && count_alphanumeric(value) >= 5 {
+        return Some("复合物描述".to_string());
+    }
+    None
+}
+
 fn input_field_is_usable(field: &str, value: &str) -> bool {
     let value = value.trim();
     if value.is_empty() || field == "project_name" {
         return false;
     }
     let field = field.to_ascii_lowercase();
+    if looks_like_convertible_free_text(&field, value) {
+        return true;
+    }
     match field.as_str() {
-        "small_molecule" => {
-            looks_like_path_with_ext(value, &["sdf", "mol2", "mol", "pdb", "cif", "mmcif"])
-                || count_alphanumeric(value) >= 1
-        }
+        "small_molecule" => false,
         "peptide" => {
             looks_like_path_with_ext(value, &["fasta", "fa", "pdb", "cif", "mmcif"])
                 || looks_like_peptide_sequence(value, 2)
@@ -3530,6 +3602,19 @@ fn input_field_is_usable(field: &str, value: &str) -> bool {
         }
         _ => count_alphanumeric(value) >= 2,
     }
+}
+
+fn looks_like_convertible_free_text(field: &str, value: &str) -> bool {
+    looks_like_path_with_ext(
+        value,
+        &[
+            "sdf", "mol2", "mol", "pdb", "cif", "mmcif", "fasta", "fa", "faa", "fna", "fastq",
+            "fq", "gb", "gff", "gtf", "vcf",
+        ],
+    ) || looks_like_peptide_sequence(value, 2)
+        || looks_like_inchi(value)
+        || looks_like_smiles_text(value)
+        || (field.contains("genome") && looks_like_nucleotide_sequence(value, 8))
 }
 
 fn looks_like_path_with_ext(value: &str, extensions: &[&str]) -> bool {
@@ -3599,6 +3684,83 @@ fn looks_like_nucleotide_sequence(value: &str, min_len: usize) -> bool {
                     | 'V'
             )
         })
+}
+
+fn looks_like_inchi(value: &str) -> bool {
+    value.trim_start().starts_with("InChI=")
+}
+
+fn looks_like_smiles_text(value: &str) -> bool {
+    let text = value.trim();
+    if text.is_empty() || text.chars().any(char::is_whitespace) {
+        return false;
+    }
+    if !text.chars().all(|ch| {
+        ch.is_ascii_alphanumeric()
+            || matches!(
+                ch,
+                '[' | ']' | '(' | ')' | '=' | '#' | '@' | '+' | '-' | '\\' | '/' | '%' | '.' | ':'
+            )
+    }) {
+        return false;
+    }
+    let mut saw_atom = false;
+    let chars = text.chars().collect::<Vec<_>>();
+    let mut index = 0usize;
+    while index < chars.len() {
+        let ch = chars[index];
+        if ch.is_ascii_uppercase() {
+            let mut symbol = ch.to_string();
+            if index + 1 < chars.len() && chars[index + 1].is_ascii_lowercase() {
+                symbol.push(chars[index + 1]);
+                if valid_element_symbol(&symbol) {
+                    saw_atom = true;
+                    index += 2;
+                    continue;
+                }
+                return false;
+            }
+            if valid_element_symbol(&symbol) {
+                saw_atom = true;
+                index += 1;
+                continue;
+            }
+            return false;
+        }
+        if matches!(ch, 'b' | 'c' | 'n' | 'o' | 'p' | 's') {
+            saw_atom = true;
+            index += 1;
+            continue;
+        }
+        if ch.is_ascii_lowercase() {
+            return false;
+        }
+        index += 1;
+    }
+    saw_atom
+}
+
+fn valid_element_symbol(symbol: &str) -> bool {
+    matches!(
+        symbol,
+        "B" | "C"
+            | "N"
+            | "O"
+            | "P"
+            | "S"
+            | "F"
+            | "I"
+            | "H"
+            | "Cl"
+            | "Br"
+            | "Na"
+            | "K"
+            | "Li"
+            | "Mg"
+            | "Ca"
+            | "Zn"
+            | "Fe"
+    )
 }
 
 fn count_alphanumeric(value: &str) -> usize {
@@ -4940,6 +5102,9 @@ mod tests {
         assert!(!input_value_has_usable_user_input(&json!({
             "inputs":[{"field":"genome_or_metagenome","value":"lqtu0we9ur"}]
         })));
+        assert!(!input_value_has_usable_user_input(&json!({
+            "inputs":[{"field":"small_molecule","value":"lqtu0we9ur"}]
+        })));
 
         let preflight = preflight_json(&options, "project-1");
         let input_ready = preflight["checks"]
@@ -4959,6 +5124,7 @@ mod tests {
     fn input_validation_accepts_supported_input_types() {
         for (field, value) in [
             ("small_molecule", "CCO"),
+            ("small_molecule", "IKVAV"),
             ("peptide", "ACDEFG"),
             ("protein_ligand", ">protein\nMSTNPKPQR"),
             ("complex", "complex_chain_A_ligand_LIG.pdb"),
@@ -4971,6 +5137,49 @@ mod tests {
                 "{field} should be accepted"
             );
         }
+    }
+
+    #[test]
+    fn preflight_reports_user_facing_input_recognition() {
+        assert_eq!(
+            input_recognition_summary(&json!({
+                "inputs":[{"field":"small_molecule","value":"ikv AV"}]
+            }))
+            .as_deref(),
+            Some("已识别为多肽")
+        );
+        assert_eq!(
+            input_recognition_summary(&json!({
+                "inputs":[{"field":"small_molecule","value":"CC(=O)OC1=CC=CC=C1C(=O)O"}]
+            }))
+            .as_deref(),
+            Some("已识别为小分子")
+        );
+
+        let root =
+            std::env::temp_dir().join(format!("genoligand-preflight-input-{}", now_millis()));
+        let options = server_options(root.clone());
+        let project_dir = project_dir(&options, "project-1");
+        fs::create_dir_all(&project_dir).expect("project dir");
+        fs::write(
+            project_dir.join("input_manifest.json"),
+            r#"{"inputs":[{"field":"small_molecule","value":"ikv AV"}],"files":[]}"#,
+        )
+        .expect("input");
+
+        let preflight = user_preflight_json(&options, "project-1");
+        let input_detail = preflight["checks"]
+            .as_array()
+            .and_then(|rows| {
+                rows.iter()
+                    .find(|row| row.get("id").and_then(Value::as_str) == Some("input"))
+            })
+            .and_then(|row| row.get("detail").and_then(Value::as_str))
+            .unwrap_or("");
+        assert_eq!(input_detail, "已识别为多肽");
+        assert!(!preflight.to_string().contains(&root.display().to_string()));
+
+        fs::remove_dir_all(&root).ok();
     }
 
     #[test]

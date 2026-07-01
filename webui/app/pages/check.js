@@ -55,7 +55,7 @@ function renderCheckGroup(group) {
         <h2>${group.title}</h2>
         <span class="status-pill ${group.rows.every((row) => row.ready) ? "ready" : "blocked"}">${group.rows.every((row) => row.ready) ? "通过" : "待处理"}</span>
       </div>
-      ${group.rows.map((row) => metricRow(row.label, row.ready ? "通过" : row.next)).join("")}
+      ${group.rows.map((row) => metricRow(row.label, row.ready ? row.readyText || "通过" : row.next)).join("")}
     </section>`;
 }
 

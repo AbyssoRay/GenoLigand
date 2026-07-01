@@ -48,9 +48,13 @@ def run_md_summary_job(job: dict[str, Any]) -> str:
 
     input_manifest = runtime_path(str(job["input_manifest"]))
     run_dir = runtime_path(str(job["run_dir"]))
-    smiles, input_id = read_small_molecule_input(input_manifest)
+    smiles, input_id = read_input_conversion_manifest(run_dir, "small_molecule")
     if not smiles:
-        sequence, input_id = read_peptide_sequence_input(input_manifest)
+        smiles, input_id = read_small_molecule_input(input_manifest)
+    if not smiles:
+        sequence, input_id = read_input_conversion_manifest(run_dir, "peptide")
+        if not sequence:
+            sequence, input_id = read_peptide_sequence_input(input_manifest)
         if sequence:
             try:
                 mol, frames, parameterization, parameter_flags = prepare_peptide_conformer_ensemble(
@@ -201,9 +205,29 @@ def read_small_molecule_input(path: Path) -> tuple[str, str]:
         label = str(row.get("label", "")).lower()
         value = str(row.get("value", "")).strip()
         text = f"{field} {label}"
-        explicit_ligand = "ligand" in text and not normalize_peptide_sequence(value)
+        if normalize_peptide_sequence(value):
+            continue
+        explicit_ligand = "ligand" in text
         if value and (any(token in text for token in ["small_molecule", "smiles"]) or explicit_ligand):
             return value, f"input_{index}"
+    return "", "input_1"
+
+
+def read_input_conversion_manifest(run_dir: Path, canonical_kind: str) -> tuple[str, str]:
+    path = run_dir / "input_conversion_manifest.tsv"
+    if not path.exists():
+        return "", "input_1"
+    with path.open("r", encoding="utf-8-sig", newline="") as handle:
+        reader = csv.DictReader(handle, delimiter="\t")
+        for row in reader:
+            if str(row.get("conversion_status", "")).strip() != "converted":
+                continue
+            if str(row.get("canonical_kind", "")).strip() != canonical_kind:
+                continue
+            value = decode_tsv_cell(str(row.get("canonical_value", ""))).strip()
+            input_id = str(row.get("input_id", "input_1")).strip() or "input_1"
+            if value:
+                return value, input_id
     return "", "input_1"
 
 
@@ -218,6 +242,31 @@ def read_peptide_sequence_input(path: Path) -> tuple[str, str]:
         if value and any(token in text for token in ["peptide", "protein_ligand", "protein_sequence"]):
             return value, f"input_{index}"
     return "", "input_1"
+
+
+def decode_tsv_cell(value: str) -> str:
+    out = []
+    index = 0
+    while index < len(value):
+        ch = value[index]
+        if ch != "\\" or index + 1 >= len(value):
+            out.append(ch)
+            index += 1
+            continue
+        marker = value[index + 1]
+        if marker == "n":
+            out.append("\n")
+        elif marker == "r":
+            out.append("\r")
+        elif marker == "t":
+            out.append("\t")
+        elif marker == "\\":
+            out.append("\\")
+        else:
+            out.append(ch)
+            out.append(marker)
+        index += 2
+    return "".join(out)
 
 
 def normalize_peptide_sequence(value: str) -> str:
@@ -248,7 +297,10 @@ def top_candidate_id(run_dir: Path) -> str:
 
 
 def prepare_ligand(smiles: str, Chem: Any, AllChem: Any) -> Any:
-    mol = Chem.MolFromSmiles(smiles)
+    if smiles.strip().startswith("InChI=") and hasattr(Chem, "MolFromInchi"):
+        mol = Chem.MolFromInchi(smiles.strip())
+    else:
+        mol = Chem.MolFromSmiles(smiles)
     if mol is None:
         raise ValueError("small_molecule input is not a valid SMILES string")
     mol = Chem.AddHs(mol)

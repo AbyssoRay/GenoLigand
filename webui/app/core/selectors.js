@@ -65,8 +65,9 @@ function inputValidation(spec) {
 function inputValueUsable(field, value) {
   const text = String(value || "").trim();
   if (!text) return false;
+  if (looksLikeConvertibleFreeText(field, text)) return true;
   if (field === "small_molecule") {
-    return looksLikePathWithExt(text, ["sdf", "mol2", "mol", "pdb", "cif", "mmcif"]) || alnumCount(text) >= 1;
+    return false;
   }
   if (field === "peptide") {
     return looksLikePathWithExt(text, ["fasta", "fa", "pdb", "cif", "mmcif"]) || looksLikePeptideSequence(text, 2);
@@ -84,6 +85,33 @@ function inputValueUsable(field, value) {
     );
   }
   return alnumCount(text) >= 2;
+}
+
+function looksLikeConvertibleFreeText(field, value) {
+  return (
+    looksLikePathWithExt(value, [
+      "sdf",
+      "mol2",
+      "mol",
+      "pdb",
+      "cif",
+      "mmcif",
+      "fasta",
+      "fa",
+      "faa",
+      "fna",
+      "fastq",
+      "fq",
+      "gb",
+      "gff",
+      "gtf",
+      "vcf",
+    ]) ||
+    looksLikePeptideSequence(value, 2) ||
+    looksLikeInchi(value) ||
+    looksLikeSmilesText(value) ||
+    (field === "genome_or_metagenome" && looksLikeNucleotideSequence(value, 8))
+  );
 }
 
 function looksLikePathWithExt(value, extensions) {
@@ -109,6 +137,49 @@ function looksLikePeptideSequence(value, minLength) {
 function looksLikeNucleotideSequence(value, minLength) {
   const body = sequenceBody(value);
   return body.length >= minLength && /^[ACGTUNRYSWKMBDHV]+$/i.test(body);
+}
+
+function looksLikeInchi(value) {
+  return value.trim().startsWith("InChI=");
+}
+
+function looksLikeSmilesText(value) {
+  const text = value.trim();
+  if (!text || /\s/.test(text)) return false;
+  if (!/^[A-Za-z0-9[\]()=#@+\-\\/%.:]+$/.test(text)) return false;
+  let sawAtom = false;
+  for (let index = 0; index < text.length; ) {
+    const ch = text[index];
+    if (/[A-Z]/.test(ch)) {
+      const two = text.slice(index, index + 2);
+      if (/[a-z]/.test(text[index + 1] || "")) {
+        if (validElementSymbol(two)) {
+          sawAtom = true;
+          index += 2;
+          continue;
+        }
+        return false;
+      }
+      if (validElementSymbol(ch)) {
+        sawAtom = true;
+        index += 1;
+        continue;
+      }
+      return false;
+    }
+    if (/[bcnops]/.test(ch)) {
+      sawAtom = true;
+      index += 1;
+      continue;
+    }
+    if (/[a-z]/.test(ch)) return false;
+    index += 1;
+  }
+  return sawAtom;
+}
+
+function validElementSymbol(symbol) {
+  return ["B", "C", "N", "O", "P", "S", "F", "I", "H", "Cl", "Br", "Na", "K", "Li", "Mg", "Ca", "Zn", "Fe"].includes(symbol);
 }
 
 function alnumCount(value) {
@@ -137,7 +208,8 @@ function storeStatusRows() {
 
 function preflightGroups() {
   const byId = new Map((state.preflight?.checks || []).map((row) => [row.id, row]));
-  const inputReady = state.project && byId.get("input")?.ready;
+  const inputRow = byId.get("input");
+  const inputReady = state.project && inputRow?.ready;
   return [
     {
       title: "输入",
@@ -145,7 +217,8 @@ function preflightGroups() {
         {
           label: "研究输入",
           ready: Boolean(inputReady),
-          next: state.project ? "保存有效输入" : "先保存输入",
+          readyText: inputRow?.detail || "通过",
+          next: inputRow?.detail || (state.project ? "保存有效输入" : "先保存输入"),
         },
       ],
     },
@@ -190,7 +263,7 @@ function preflightGroups() {
 
 function checkRow(byId, id, label, next) {
   const row = byId.get(id);
-  return { label, ready: Boolean(row?.ready), next };
+  return { label, ready: Boolean(row?.ready), readyText: row?.detail || "通过", next };
 }
 
 function canStartRun() {

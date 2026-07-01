@@ -98,9 +98,12 @@ def main() -> int:
             read(WEB / "core/selectors.js")
             + """
 const checks = {
+  invalidSmallMoleculeText: inputValueUsable("small_molecule", "lqtu0we9ur"),
   invalidPeptide: inputValueUsable("peptide", "lqtu0we9ur"),
   invalidProteinLigand: inputValueUsable("protein_ligand", "lqtu0we9ur"),
   invalidGenome: inputValueUsable("genome_or_metagenome", "lqtu0we9ur"),
+  validSmallMoleculeSmiles: inputValueUsable("small_molecule", "CCO"),
+  validSmallMoleculePeptide: inputValueUsable("small_molecule", "IKVAV"),
   validPeptide: inputValueUsable("peptide", "ACDEFG"),
   validProteinLigand: inputValueUsable("protein_ligand", ">protein\\nMSTNPKPQR"),
   validGenome: inputValueUsable("genome_or_metagenome", ">orf1\\nATGCGTACGTAA")
@@ -115,12 +118,15 @@ console.log(JSON.stringify(checks));
         check=True,
     )
     selector_checks = json.loads(selector_probe.stdout)
+    require(not selector_checks["invalidSmallMoleculeText"], "small molecule input must reject random alphanumeric text")
     require(not selector_checks["invalidPeptide"], "peptide input must reject random alphanumeric text")
     require(
         not selector_checks["invalidProteinLigand"],
         "protein input must reject random alphanumeric text",
     )
     require(not selector_checks["invalidGenome"], "genome input must reject random alphanumeric text")
+    require(selector_checks["validSmallMoleculeSmiles"], "small molecule input must accept SMILES")
+    require(selector_checks["validSmallMoleculePeptide"], "small molecule input must accept peptide text for backend conversion")
     require(selector_checks["validPeptide"], "peptide input must accept amino-acid sequences")
     require(selector_checks["validProteinLigand"], "protein input must accept FASTA amino-acid sequences")
     require(selector_checks["validGenome"], "genome input must accept FASTA nucleotide sequences")
