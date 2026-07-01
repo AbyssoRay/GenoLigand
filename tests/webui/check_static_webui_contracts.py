@@ -70,6 +70,20 @@ def main() -> int:
     require('{ key: "md_support_label", label: "MD 支持" }' in common, "ranking must show MD support")
     require('{ key: "risk_note", label: "风险提示" }' in common, "ranking must show risk notes")
 
+    run_page = read(WEB / "pages/run.js")
+    require(
+        "runStageRows().map(renderStage).join(\"\")" in run_page,
+        "run view must render backend stage readiness instead of fixed completed labels",
+    )
+    require(
+        "stage.status === \"not_generated\"" in run_page,
+        "run view must show not-generated stages for missing current-run artifacts",
+    )
+    require(
+        "const completed = runState === \"completed\"" not in run_page,
+        "run view must not mark every stage complete solely from run state",
+    )
+
     selector_probe = subprocess.run(
         [
             "node",

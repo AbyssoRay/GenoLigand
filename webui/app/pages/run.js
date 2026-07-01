@@ -20,7 +20,7 @@
       </section>
       <section class="panel">
         <h2>流程阶段</h2>
-        <div class="stage-list">${stageLabels.map(renderStage).join("")}</div>
+        <div class="stage-list">${runStageRows().map(renderStage).join("")}</div>
       </section>
       <section class="panel">
         <h2>运行摘要</h2>
@@ -67,15 +67,37 @@
   page.querySelector("[data-action='to-results']")?.addEventListener("click", () => setStep("results"));
 }
 
-function renderStage(label, index) {
-  const runState = state.run?.state;
-  const completed = runState === "completed";
-  const active = runState === "running" && index === 0;
-  const waiting = !completed && !active;
+function runStageRows() {
+  if (Array.isArray(state.run?.stages) && state.run.stages.length) return state.run.stages;
+  return stageLabels.map((label) => ({ label, status: "waiting", status_label: "等待", reason: "" }));
+}
+
+function renderStage(stage, index) {
+  const label = typeof stage === "string" ? stage : stage.label;
+  const status = typeof stage === "string" ? "waiting" : stage.status || "waiting";
+  const statusLabel = typeof stage === "string" ? "等待" : stage.status_label || stageStatusLabel(status);
+  const reason = typeof stage === "string" ? "" : stage.reason || "";
   return `
     <div class="stage">
       <span class="stage-index">${index + 1}</span>
-      <span>${label}</span>
-      <span class="status-pill ${completed ? "ready" : active ? "loading" : waiting ? "waiting" : "blocked"}">${completed ? "完成" : active ? "进行中" : "等待"}</span>
+      <span>${escapeHtml(label)}</span>
+      <span class="status-pill ${stageStatusClass(stage)}">${escapeHtml(statusLabel)}</span>
+      ${reason ? `<small>${escapeHtml(reason)}</small>` : ""}
     </div>`;
+}
+
+function stageStatusClass(stage) {
+  if (stage.status === "ready") return "ready";
+  if (stage.status === "running") return "loading";
+  if (stage.status === "not_generated") return "waiting";
+  if (stage.status === "blocked") return "blocked";
+  return "waiting";
+}
+
+function stageStatusLabel(status) {
+  if (status === "ready") return "完成";
+  if (status === "running") return "进行中";
+  if (status === "not_generated") return "未生成";
+  if (status === "blocked") return "需处理";
+  return "等待";
 }

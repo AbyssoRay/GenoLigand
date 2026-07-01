@@ -1141,9 +1141,102 @@ fn user_run_json(options: &ServerOptions, run_id: &str) -> Value {
     if let Some(stage) = run.get("current_stage").and_then(Value::as_str) {
         run["current_stage"] = json!(stage_user_label(stage));
     }
-    let state = run.get("state").and_then(Value::as_str).unwrap_or_default();
-    run["state_label"] = json!(run_state_user_label(state));
+    let state = run
+        .get("state")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_string();
+    run["state_label"] = json!(run_state_user_label(&state));
+    if let Some(run_dir) = find_run_dir(options, run_id) {
+        run["stages"] = json!(user_run_stages(&run_dir, &state));
+    }
     run
+}
+
+fn user_run_stages(run_dir: &Path, state: &str) -> Vec<Value> {
+    let specs = [
+        ("input", "输入归一化", "input_normalize"),
+        ("features", "特征计算", "features_compute"),
+        ("known", "已知数据库比对", "database_match_known"),
+        (
+            "metagenome",
+            "宏基因组潜在序列比对",
+            "metagenome_match_potential",
+        ),
+        ("structure", "结构与口袋评估", "structure_evaluate"),
+        ("md", "对接与短动力学筛选", "dynamics_screen"),
+        ("ranking", "联合排序", "target_rank"),
+        ("evidence", "证据链与报告", "evidence_build"),
+    ];
+    let current = read_trimmed(&run_dir.join("current_stage.txt")).unwrap_or_default();
+    specs
+        .iter()
+        .map(|(id, label, stage_key)| {
+            let (status, reason) = user_stage_status(run_dir, state, id, stage_key, &current);
+            json!({
+                "id": id,
+                "label": label,
+                "status": status,
+                "status_label": user_stage_status_label(status),
+                "reason": reason
+            })
+        })
+        .collect()
+}
+
+fn user_stage_status<'a>(
+    run_dir: &Path,
+    state: &str,
+    id: &str,
+    stage_key: &str,
+    current: &str,
+) -> (&'a str, String) {
+    if state == "completed" {
+        return completed_stage_status(run_dir, id);
+    }
+    if state == "running" && current == stage_key {
+        return ("running", String::new());
+    }
+    if matches!(state, "failed" | "blocked" | "cancelled") {
+        return ("blocked", String::new());
+    }
+    ("waiting", String::new())
+}
+
+fn completed_stage_status(run_dir: &Path, id: &str) -> (&'static str, String) {
+    match id {
+        "structure" => {
+            if rows_len(&run_dir.join("structure_patch_summary.tsv")) > 0 {
+                ("ready", String::new())
+            } else {
+                ("not_generated", structure_viewer_reason(run_dir))
+            }
+        }
+        "md" => {
+            if rows_len(&run_dir.join("md_summary.tsv")) > 0 {
+                ("ready", String::new())
+            } else {
+                (
+                    "not_generated",
+                    read_status_reason(
+                        &run_dir.join("md_summary_status.tsv"),
+                        "当前运行没有生成 MD 摘要。",
+                    ),
+                )
+            }
+        }
+        _ => ("ready", String::new()),
+    }
+}
+
+fn user_stage_status_label(status: &str) -> &'static str {
+    match status {
+        "ready" => "完成",
+        "running" => "进行中",
+        "not_generated" => "未生成",
+        "blocked" => "需处理",
+        _ => "等待",
+    }
 }
 
 fn logs_json(options: &ServerOptions, run_id: &str) -> Value {
@@ -1406,7 +1499,7 @@ fn structure_viewer_unavailable(reason: &str) -> Value {
         "ready": false,
         "source": "等待当前运行结构坐标输出",
         "artifact": "",
-        "reason": reason,
+        "reason": user_artifact_reason(reason),
         "atom_count": 0,
         "atoms": []
     })
@@ -1624,11 +1717,27 @@ fn md_readiness_payload(run_dir: &Path, rows: &[Value], charts: &[Value]) -> Val
 
 fn read_status_reason(path: &Path, fallback: &str) -> String {
     let rows = read_tsv_rows(path);
-    rows.first()
+    let reason = rows
+        .first()
         .and_then(|row| row.get("reason").and_then(Value::as_str))
         .filter(|value| !value.trim().is_empty())
         .unwrap_or(fallback)
-        .to_string()
+        .to_string();
+    user_artifact_reason(&reason)
+}
+
+fn user_artifact_reason(reason: &str) -> String {
+    let lower = reason.to_ascii_lowercase();
+    if lower.contains("no small_molecule input available for md summary") {
+        return "没有可用于 MD 的小分子输入；当前输入已完成候选和序列匹配。".to_string();
+    }
+    if lower.contains("no structure interaction match rows") {
+        return "当前运行没有结构匹配，因此未生成结构查看数据或口袋摘要。".to_string();
+    }
+    if lower.contains("no md_summary.tsv") || lower.contains("no rmsd metric artifact") {
+        return "当前运行没有真实 MD 轨迹或 RMSD 等指标，因此未生成动力学摘要。".to_string();
+    }
+    reason.to_string()
 }
 
 fn score_chart_rows(run_dir: &Path) -> Vec<Value> {
@@ -5313,6 +5422,74 @@ mod tests {
         assert!(!text.contains("pipeline_run"));
         assert!(!text.contains("current_command"));
         assert!(!text.contains("artifact_index"));
+
+        fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn completed_run_marks_missing_structure_and_md_stages_not_generated() {
+        let root =
+            std::env::temp_dir().join(format!("genoligand-user-run-stages-{}", now_millis()));
+        let options = server_options(root.clone());
+        let run_dir = project_dir(&options, "project-1")
+            .join("runs")
+            .join("run-1");
+        fs::create_dir_all(&run_dir).expect("run dir");
+        fs::write(run_dir.join("run_state.txt"), "completed\n").expect("state");
+        fs::write(run_dir.join("current_stage.txt"), "pipeline_run\n").expect("stage");
+        fs::write(
+            run_dir.join("target_candidate_ranking.tsv"),
+            "rank\tcandidate_id\tfinal_score\n1\tC1\t0.5\n",
+        )
+        .expect("ranking");
+        fs::write(
+            run_dir.join("structure_patch_summary.tsv"),
+            "candidate_id\tstructure_score\n",
+        )
+        .expect("structure header");
+        fs::write(
+            run_dir.join("structure_viewer_status.tsv"),
+            "status\treason\nnot_ready\tno structure interaction match rows for this run\n",
+        )
+        .expect("structure status");
+        fs::write(
+            run_dir.join("md_summary.tsv"),
+            "candidate_id\trmsd\tmd_stability_score\n",
+        )
+        .expect("md header");
+        fs::write(
+            run_dir.join("md_summary_status.tsv"),
+            "status\treason\nnot_ready\tno small_molecule input available for MD summary\n",
+        )
+        .expect("md status");
+
+        let payload = user_run_json(&options, "run-1");
+        let stages = payload["stages"].as_array().expect("stages");
+        let structure = stages
+            .iter()
+            .find(|stage| stage.get("id").and_then(Value::as_str) == Some("structure"))
+            .expect("structure stage");
+        let md = stages
+            .iter()
+            .find(|stage| stage.get("id").and_then(Value::as_str) == Some("md"))
+            .expect("md stage");
+
+        assert_eq!(structure["status"], "not_generated");
+        assert_eq!(structure["status_label"], "未生成");
+        assert_eq!(md["status"], "not_generated");
+        assert_eq!(md["status_label"], "未生成");
+        assert!(
+            structure["reason"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("没有结构匹配")
+        );
+        assert!(
+            md["reason"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("没有可用于 MD 的小分子输入")
+        );
 
         fs::remove_dir_all(&root).ok();
     }
