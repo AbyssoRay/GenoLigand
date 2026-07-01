@@ -3401,11 +3401,11 @@ fn input_field_is_usable(field: &str, value: &str) -> bool {
         }
         "peptide" => {
             looks_like_path_with_ext(value, &["fasta", "fa", "pdb", "cif", "mmcif"])
-                || count_alphanumeric(value) >= 2
+                || looks_like_peptide_sequence(value, 2)
         }
         "protein_ligand" => {
             looks_like_path_with_ext(value, &["fasta", "fa", "faa", "pdb", "cif", "mmcif"])
-                || looks_like_fasta_or_sequence(value, 5)
+                || looks_like_peptide_sequence(value, 5)
         }
         "complex" => {
             looks_like_path_with_ext(value, &["pdb", "cif", "mmcif", "ent"])
@@ -3417,7 +3417,7 @@ fn input_field_is_usable(field: &str, value: &str) -> bool {
                 &[
                     "fasta", "fa", "fna", "faa", "fastq", "fq", "gb", "gff", "gtf", "vcf",
                 ],
-            ) || looks_like_fasta_or_sequence(value, 8)
+            ) || looks_like_nucleotide_sequence(value, 8)
         }
         _ => count_alphanumeric(value) >= 2,
     }
@@ -3430,13 +3430,66 @@ fn looks_like_path_with_ext(value: &str, extensions: &[&str]) -> bool {
         .any(|ext| value.ends_with(&format!(".{ext}")) || value.contains(&format!(".{ext}\n")))
 }
 
-fn looks_like_fasta_or_sequence(value: &str, min_alphanumeric: usize) -> bool {
+fn compact_sequence_body(value: &str) -> String {
     let trimmed = value.trim();
     if trimmed.starts_with('>') {
-        return count_alphanumeric(trimmed.lines().skip(1).collect::<String>().as_str())
-            >= min_alphanumeric;
+        return trimmed.lines().skip(1).collect::<String>();
     }
-    count_alphanumeric(trimmed) >= min_alphanumeric
+    trimmed.chars().filter(|ch| !ch.is_whitespace()).collect()
+}
+
+fn looks_like_peptide_sequence(value: &str, min_len: usize) -> bool {
+    let body = compact_sequence_body(value);
+    body.len() >= min_len
+        && body.chars().all(|ch| {
+            matches!(
+                ch.to_ascii_uppercase(),
+                'A' | 'C'
+                    | 'D'
+                    | 'E'
+                    | 'F'
+                    | 'G'
+                    | 'H'
+                    | 'I'
+                    | 'K'
+                    | 'L'
+                    | 'M'
+                    | 'N'
+                    | 'P'
+                    | 'Q'
+                    | 'R'
+                    | 'S'
+                    | 'T'
+                    | 'V'
+                    | 'W'
+                    | 'Y'
+            )
+        })
+}
+
+fn looks_like_nucleotide_sequence(value: &str, min_len: usize) -> bool {
+    let body = compact_sequence_body(value);
+    body.len() >= min_len
+        && body.chars().all(|ch| {
+            matches!(
+                ch.to_ascii_uppercase(),
+                'A' | 'C'
+                    | 'G'
+                    | 'T'
+                    | 'U'
+                    | 'N'
+                    | 'R'
+                    | 'Y'
+                    | 'S'
+                    | 'W'
+                    | 'K'
+                    | 'M'
+                    | 'B'
+                    | 'D'
+                    | 'H'
+                    | 'V'
+            )
+        })
 }
 
 fn count_alphanumeric(value: &str) -> usize {
@@ -4768,6 +4821,15 @@ mod tests {
                 {"field":"small_molecule","value":"CCO"},
                 {"field":"protein_ligand","value":"???"}
             ]
+        })));
+        assert!(!input_value_has_usable_user_input(&json!({
+            "inputs":[{"field":"peptide","value":"lqtu0we9ur"}]
+        })));
+        assert!(!input_value_has_usable_user_input(&json!({
+            "inputs":[{"field":"protein_ligand","value":"lqtu0we9ur"}]
+        })));
+        assert!(!input_value_has_usable_user_input(&json!({
+            "inputs":[{"field":"genome_or_metagenome","value":"lqtu0we9ur"}]
         })));
 
         let preflight = preflight_json(&options, "project-1");

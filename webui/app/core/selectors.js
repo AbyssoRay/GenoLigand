@@ -69,10 +69,10 @@ function inputValueUsable(field, value) {
     return looksLikePathWithExt(text, ["sdf", "mol2", "mol", "pdb", "cif", "mmcif"]) || alnumCount(text) >= 1;
   }
   if (field === "peptide") {
-    return looksLikePathWithExt(text, ["fasta", "fa", "pdb", "cif", "mmcif"]) || alnumCount(text) >= 2;
+    return looksLikePathWithExt(text, ["fasta", "fa", "pdb", "cif", "mmcif"]) || looksLikePeptideSequence(text, 2);
   }
   if (field === "protein_ligand") {
-    return looksLikePathWithExt(text, ["fasta", "fa", "faa", "pdb", "cif", "mmcif"]) || looksLikeSequence(text, 5);
+    return looksLikePathWithExt(text, ["fasta", "fa", "faa", "pdb", "cif", "mmcif"]) || looksLikePeptideSequence(text, 5);
   }
   if (field === "complex") {
     return looksLikePathWithExt(text, ["pdb", "cif", "mmcif", "ent"]) || alnumCount(text) >= 5;
@@ -80,7 +80,7 @@ function inputValueUsable(field, value) {
   if (field === "genome_or_metagenome") {
     return (
       looksLikePathWithExt(text, ["fasta", "fa", "fna", "faa", "fastq", "fq", "gb", "gff", "gtf", "vcf"]) ||
-      looksLikeSequence(text, 8)
+      looksLikeNucleotideSequence(text, 8)
     );
   }
   return alnumCount(text) >= 2;
@@ -91,14 +91,24 @@ function looksLikePathWithExt(value, extensions) {
   return extensions.some((ext) => lower.endsWith(`.${ext}`) || lower.includes(`.${ext}\n`));
 }
 
-function looksLikeSequence(value, minLength) {
+function sequenceBody(value) {
   const body = value.trim().startsWith(">")
     ? value
         .split(/\r?\n/)
         .slice(1)
         .join("")
     : value;
-  return alnumCount(body) >= minLength;
+  return body.replace(/\s+/g, "");
+}
+
+function looksLikePeptideSequence(value, minLength) {
+  const body = sequenceBody(value);
+  return body.length >= minLength && /^[ACDEFGHIKLMNPQRSTVWY]+$/i.test(body);
+}
+
+function looksLikeNucleotideSequence(value, minLength) {
+  const body = sequenceBody(value);
+  return body.length >= minLength && /^[ACGTUNRYSWKMBDHV]+$/i.test(body);
 }
 
 function alnumCount(value) {

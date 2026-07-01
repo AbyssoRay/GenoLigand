@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import sys
+import json
+import subprocess
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -67,6 +69,40 @@ def main() -> int:
     )
     require('{ key: "md_support_label", label: "MD 支持" }' in common, "ranking must show MD support")
     require('{ key: "risk_note", label: "风险提示" }' in common, "ranking must show risk notes")
+
+    selector_probe = subprocess.run(
+        [
+            "node",
+            "-e",
+            read(WEB / "core/selectors.js")
+            + """
+const checks = {
+  invalidPeptide: inputValueUsable("peptide", "lqtu0we9ur"),
+  invalidProteinLigand: inputValueUsable("protein_ligand", "lqtu0we9ur"),
+  invalidGenome: inputValueUsable("genome_or_metagenome", "lqtu0we9ur"),
+  validPeptide: inputValueUsable("peptide", "ACDEFG"),
+  validProteinLigand: inputValueUsable("protein_ligand", ">protein\\nMSTNPKPQR"),
+  validGenome: inputValueUsable("genome_or_metagenome", ">orf1\\nATGCGTACGTAA")
+};
+console.log(JSON.stringify(checks));
+""",
+        ],
+        cwd=ROOT,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        check=True,
+    )
+    selector_checks = json.loads(selector_probe.stdout)
+    require(not selector_checks["invalidPeptide"], "peptide input must reject random alphanumeric text")
+    require(
+        not selector_checks["invalidProteinLigand"],
+        "protein input must reject random alphanumeric text",
+    )
+    require(not selector_checks["invalidGenome"], "genome input must reject random alphanumeric text")
+    require(selector_checks["validPeptide"], "peptide input must accept amino-acid sequences")
+    require(selector_checks["validProteinLigand"], "protein input must accept FASTA amino-acid sequences")
+    require(selector_checks["validGenome"], "genome input must accept FASTA nucleotide sequences")
 
     mojibake_terms = [
         chr(0x9428),
