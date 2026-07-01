@@ -110,7 +110,7 @@ function looksLikeConvertibleFreeText(field, value) {
     looksLikePeptideSequence(value, 2) ||
     looksLikeInchi(value) ||
     looksLikeSmilesText(value) ||
-    (field === "genome_or_metagenome" && looksLikeNucleotideSequence(value, 8))
+    looksLikeNucleotideSequence(value, 8)
   );
 }
 

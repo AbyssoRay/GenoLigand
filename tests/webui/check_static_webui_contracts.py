@@ -104,6 +104,7 @@ const checks = {
   invalidGenome: inputValueUsable("genome_or_metagenome", "lqtu0we9ur"),
   validSmallMoleculeSmiles: inputValueUsable("small_molecule", "CCO"),
   validSmallMoleculePeptide: inputValueUsable("small_molecule", "IKVAV"),
+  validSmallMoleculeNucleotide: inputValueUsable("small_molecule", "ATGCGTACGTAA"),
   validPeptide: inputValueUsable("peptide", "ACDEFG"),
   validProteinLigand: inputValueUsable("protein_ligand", ">protein\\nMSTNPKPQR"),
   validGenome: inputValueUsable("genome_or_metagenome", ">orf1\\nATGCGTACGTAA")
@@ -127,6 +128,7 @@ console.log(JSON.stringify(checks));
     require(not selector_checks["invalidGenome"], "genome input must reject random alphanumeric text")
     require(selector_checks["validSmallMoleculeSmiles"], "small molecule input must accept SMILES")
     require(selector_checks["validSmallMoleculePeptide"], "small molecule input must accept peptide text for backend conversion")
+    require(selector_checks["validSmallMoleculeNucleotide"], "small molecule input must accept nucleotide text for backend conversion")
     require(selector_checks["validPeptide"], "peptide input must accept amino-acid sequences")
     require(selector_checks["validProteinLigand"], "protein input must accept FASTA amino-acid sequences")
     require(selector_checks["validGenome"], "genome input must accept FASTA nucleotide sequences")
