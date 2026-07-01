@@ -4163,7 +4163,7 @@ fn write_artifact_source_map(options: &ScienceOptions) -> Result<(), String> {
         ),
         (
             "md_summary.tsv",
-            "structure_viewer.cif;structure_viewer.pdb;tool_outputs/complex_md_manifest.json;tool_outputs/ligand_placement.tsv;tool_outputs/md_run_manifest.json;tool_outputs/md_summary.tsv;tool_outputs/md_rmsd.tsv;tool_outputs/md_rmsf.tsv;tool_outputs/md_ligand_drift.tsv;tool_outputs/md_contacts.tsv;tool_outputs/md_hbonds.tsv",
+            "tool_outputs/md_run_manifest.json;tool_outputs/md_summary.tsv;tool_outputs/md_rmsd.tsv;tool_outputs/md_rmsf.tsv;tool_outputs/md_ligand_drift.tsv;tool_outputs/md_contacts.tsv;tool_outputs/md_hbonds.tsv",
             "target_candidate_ranking.tsv;evidence_ledger.tsv",
         ),
         (
@@ -4173,37 +4173,37 @@ fn write_artifact_source_map(options: &ScienceOptions) -> Result<(), String> {
         ),
         (
             "tool_outputs/md_rmsd.tsv",
-            "OpenMM receptor-ligand dynamics trajectory",
+            "current run MD or peptide conformer trajectory metrics",
             "md_summary.tsv",
         ),
         (
             "tool_outputs/md_rmsf.tsv",
-            "OpenMM receptor-ligand dynamics trajectory",
+            "current run MD or peptide conformer trajectory metrics",
             "md_summary.tsv",
         ),
         (
             "tool_outputs/md_ligand_drift.tsv",
-            "OpenMM receptor-ligand dynamics trajectory",
+            "current run MD or peptide conformer trajectory metrics",
             "md_summary.tsv",
         ),
         (
             "tool_outputs/md_contacts.tsv",
-            "OpenMM receptor-ligand dynamics trajectory",
+            "current run MD or peptide conformer contact metrics",
             "md_summary.tsv",
         ),
         (
             "tool_outputs/md_hbonds.tsv",
-            "OpenMM receptor-ligand dynamics trajectory",
+            "current run MD or peptide conformer hydrogen-bond metrics",
             "md_summary.tsv",
         ),
         (
             "tool_outputs/ligand_placement.tsv",
-            "current run ligand coordinates placed with receptor coordinate context",
+            "current run ligand or peptide coordinates from worker calculation",
             "md_summary.tsv;tool_outputs/complex_md_manifest.json;tool_outputs/md_run_manifest.json",
         ),
         (
             "tool_outputs/md_trajectory.tsv",
-            "OpenMM receptor-ligand dynamics trajectory",
+            "current run MD or peptide conformer trajectory coordinates",
             "md_summary.tsv",
         ),
         (
@@ -4213,7 +4213,7 @@ fn write_artifact_source_map(options: &ScienceOptions) -> Result<(), String> {
         ),
         (
             "tool_outputs/md_run_manifest.json",
-            "current run receptor coordinate, ligand placement, OpenMM platform, trajectory and metric artifacts",
+            "current run MD method, platform or runtime, coordinates, trajectory and metric artifacts",
             "evidence_ledger.tsv",
         ),
         (
@@ -5550,11 +5550,46 @@ fn python_command_candidates() -> Vec<Vec<String>> {
     {
         return vec![preferred];
     }
-    vec![
+    python_worker_candidates_from_env(env::var_os("LOCALAPPDATA"))
+}
+
+fn python_worker_candidates_from_env(local_appdata: Option<OsString>) -> Vec<Vec<String>> {
+    let mut candidates = Vec::new();
+    if let Some(local_appdata) = local_appdata {
+        let runtime = PathBuf::from(local_appdata)
+            .join("GenoLigand")
+            .join("runtime")
+            .join("python-worker-env");
+        for rel in [
+            PathBuf::from("genoligand-wsl-python.cmd"),
+            PathBuf::from("Scripts").join("python.exe"),
+            PathBuf::from("python.exe"),
+            PathBuf::from("bin").join("python"),
+        ] {
+            let candidate = runtime.join(rel);
+            if candidate.is_file() {
+                candidates.push(vec![candidate.display().to_string()]);
+            }
+        }
+    }
+    candidates.extend([
         vec!["python".to_string()],
         vec!["python3".to_string()],
         vec!["py".to_string(), "-3".to_string()],
-    ]
+    ]);
+    dedup_command_vecs(candidates)
+}
+
+fn dedup_command_vecs(candidates: Vec<Vec<String>>) -> Vec<Vec<String>> {
+    let mut seen = BTreeSet::new();
+    let mut out = Vec::new();
+    for candidate in candidates {
+        let key = candidate.join("\u{1f}");
+        if seen.insert(key) {
+            out.push(candidate);
+        }
+    }
+    out
 }
 
 fn safe_id(value: &str) -> String {
@@ -5670,6 +5705,32 @@ mod tests {
 
         assert!(dirs.contains(&default_wrappers));
         assert!(dirs.contains(&sibling_wrappers));
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn worker_python_candidates_prefer_installed_genoligand_runtime() {
+        let root = temp_root("worker_python_candidates");
+        let local = root.join("local");
+        let runtime = local
+            .join("GenoLigand")
+            .join("runtime")
+            .join("python-worker-env");
+        fs::create_dir_all(&runtime).expect("runtime dir");
+        let wrapper = runtime.join("genoligand-wsl-python.cmd");
+        write_text(&wrapper, "@echo off\n").expect("wrapper");
+
+        let candidates = python_worker_candidates_from_env(Some(local.into_os_string()));
+
+        assert_eq!(
+            candidates.first(),
+            Some(&vec![wrapper.display().to_string()])
+        );
+        assert!(
+            candidates
+                .iter()
+                .any(|candidate| candidate == &vec!["python".to_string()])
+        );
         fs::remove_dir_all(root).ok();
     }
 
@@ -5839,7 +5900,7 @@ mod tests {
         assert!(source_map.contains("docking_summary.tsv\t"));
         assert!(source_map.contains("md_summary.tsv\t"));
         assert!(source_map.contains("docking_summary.tsv\tschema-bound docking output when present;otherwise no generated rows\tevidence_ledger.tsv\tno_rows"));
-        assert!(source_map.contains("md_summary.tsv\tstructure_viewer.cif;structure_viewer.pdb;tool_outputs/complex_md_manifest.json;tool_outputs/ligand_placement.tsv;tool_outputs/md_run_manifest.json;tool_outputs/md_summary.tsv;tool_outputs/md_rmsd.tsv;tool_outputs/md_rmsf.tsv;tool_outputs/md_ligand_drift.tsv;tool_outputs/md_contacts.tsv;tool_outputs/md_hbonds.tsv\ttarget_candidate_ranking.tsv;evidence_ledger.tsv\tno_rows"));
+        assert!(source_map.contains("md_summary.tsv\ttool_outputs/md_run_manifest.json;tool_outputs/md_summary.tsv;tool_outputs/md_rmsd.tsv;tool_outputs/md_rmsf.tsv;tool_outputs/md_ligand_drift.tsv;tool_outputs/md_contacts.tsv;tool_outputs/md_hbonds.tsv\ttarget_candidate_ranking.tsv;evidence_ledger.tsv\tno_rows"));
         assert!(source_map.contains("tool_outputs/md_summary.tsv\tschema-bound MD summary worker output\tmd_summary.tsv\tnot_yet_written"));
         assert!(evidence.contains("structure_interaction_matches"));
         assert!(evidence.contains("worker_runtime_summary"));

@@ -19,6 +19,7 @@ def main() -> int:
     architecture = read("docs/architecture.md")
     science = read("crates/gls-science/src/lib.rs")
     server = read("crates/gls-server/src/lib.rs")
+    md_worker = read("python/genoligand_workers/md_summary_worker.py")
 
     require("无输入、无数据库、无工具或无运行产物时" in architecture, "authenticity rule missing from architecture docs")
     require("candidate_count" in science, "science pipeline must write candidate count metadata")
@@ -27,6 +28,10 @@ def main() -> int:
     require("structure_viewer_payload" in server, "server must expose viewer data only from run structure artifacts")
     require("md_chart_rows" in server, "server must derive MD charts from run MD artifacts")
     require("structure_viewer.pdb" in server, "viewer must be backed by explicit structure coordinate artifacts")
+    require("read_peptide_sequence_input" in md_worker, "MD worker must accept peptide sequence inputs")
+    require("MolFromFASTA" in md_worker, "MD worker must build peptide molecules through RDKit peptide conversion")
+    require("rdkit_peptide_conformer_ensemble" in md_worker, "peptide MD artifacts must identify the real conformer calculation method")
+    require("no_receptor_contact_model" in md_worker, "peptide MD artifacts must mark missing receptor contact modeling")
     require("当前运行没有可展示的候选假设" in science, "report must preserve empty-result language")
     forbidden_report_claims = ["已确认靶点", "确认靶点", "已确认机制", "确认机制", "真实亲和力", "真实靶点"]
     for term in forbidden_report_claims:

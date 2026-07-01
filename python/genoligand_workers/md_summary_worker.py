@@ -11,7 +11,10 @@ from genoligand_workers.worker_io import parse_worker_args, read_job, write_resu
 
 
 MAX_RECEPTOR_ATOMS = 900
+MAX_PEPTIDE_RESIDUES = 80
+PEPTIDE_CONFORMER_COUNT = 12
 SIMULATION_SEED = 20260629
+STANDARD_AMINO_ACIDS = set("ACDEFGHIKLMNPQRSTVWY")
 
 
 @dataclass
@@ -40,13 +43,52 @@ def run_md_summary_job(job: dict[str, Any]) -> str:
     import numpy as np
     import openmm
     from openmm import Vec3, unit
-    from rdkit import Chem
+    from rdkit import Chem, rdBase
     from rdkit.Chem import AllChem
 
     input_manifest = runtime_path(str(job["input_manifest"]))
     run_dir = runtime_path(str(job["run_dir"]))
     smiles, input_id = read_small_molecule_input(input_manifest)
     if not smiles:
+        sequence, input_id = read_peptide_sequence_input(input_manifest)
+        if sequence:
+            try:
+                mol, frames, parameterization, parameter_flags = prepare_peptide_conformer_ensemble(
+                    sequence,
+                    Chem,
+                    AllChem,
+                    np,
+                )
+            except Exception as exc:  # noqa: BLE001 - not-ready artifact is the contract for unusable sequence inputs
+                write_md_not_ready(
+                    run_dir,
+                    f"peptide conformer calculation failed: {safe_note(str(exc))}",
+                    ["peptide_conformer_calculation_failed"],
+                )
+                return openmm_version_text(openmm, "not_ready", "peptide_conformer_calculation_failed")
+            candidate_id = top_candidate_id(run_dir) or input_id
+            risk_flags = [
+                *parameter_flags,
+                "no_receptor_contact_model",
+                "rdkit_peptide_conformer_ensemble",
+            ]
+            metrics = summarize_peptide_conformer_frames(mol, frames, np)
+            write_peptide_conformer_artifacts(
+                run_dir,
+                candidate_id,
+                input_id,
+                sequence,
+                metrics,
+                frames,
+                mol,
+                parameterization,
+                risk_flags,
+                rdBase.rdkitVersion,
+            )
+            return (
+                f"RDKit {rdBase.rdkitVersion}; "
+                "method=rdkit_peptide_conformer_ensemble; input_kind=peptide"
+            )
         write_md_not_ready(run_dir, "no small_molecule input available for MD summary", [])
         return openmm_version_text(openmm, "not_ready", "missing_small_molecule")
 
@@ -158,9 +200,38 @@ def read_small_molecule_input(path: Path) -> tuple[str, str]:
         field = str(row.get("field", "")).lower()
         label = str(row.get("label", "")).lower()
         value = str(row.get("value", "")).strip()
-        if value and any(token in f"{field} {label}" for token in ["small_molecule", "smiles", "ligand"]):
+        text = f"{field} {label}"
+        explicit_ligand = "ligand" in text and not normalize_peptide_sequence(value)
+        if value and (any(token in text for token in ["small_molecule", "smiles"]) or explicit_ligand):
             return value, f"input_{index}"
     return "", "input_1"
+
+
+def read_peptide_sequence_input(path: Path) -> tuple[str, str]:
+    with path.open("r", encoding="utf-8-sig") as handle:
+        payload = json.load(handle)
+    for index, row in enumerate(payload.get("inputs", []), start=1):
+        field = str(row.get("field", "")).lower()
+        label = str(row.get("label", "")).lower()
+        value = normalize_peptide_sequence(str(row.get("value", "")))
+        text = f"{field} {label}"
+        if value and any(token in text for token in ["peptide", "protein_ligand", "protein_sequence"]):
+            return value, f"input_{index}"
+    return "", "input_1"
+
+
+def normalize_peptide_sequence(value: str) -> str:
+    lines = []
+    for raw_line in value.replace("\r", "\n").split("\n"):
+        line = raw_line.strip()
+        if line and not line.startswith(">"):
+            lines.append(line)
+    sequence = "".join(lines).replace(" ", "").replace("-", "").upper()
+    if not sequence or len(sequence) > MAX_PEPTIDE_RESIDUES:
+        return ""
+    if any(ch not in STANDARD_AMINO_ACIDS for ch in sequence):
+        return ""
+    return sequence
 
 
 def top_candidate_id(run_dir: Path) -> str:
@@ -190,6 +261,65 @@ def prepare_ligand(smiles: str, Chem: Any, AllChem: Any) -> Any:
     else:
         AllChem.UFFOptimizeMolecule(mol, maxIters=200)
     return mol
+
+
+def prepare_peptide_conformer_ensemble(sequence: str, Chem: Any, AllChem: Any, np: Any) -> tuple[Any, list[Any], str, list[str]]:
+    base_mol = Chem.MolFromFASTA(sequence)
+    if base_mol is None:
+        base_mol = Chem.MolFromSequence(sequence)
+    if base_mol is None:
+        raise ValueError("RDKit peptide conversion failed")
+    mol = Chem.AddHs(base_mol)
+    params = AllChem.ETKDGv3()
+    params.randomSeed = SIMULATION_SEED
+    params.pruneRmsThresh = 0.15
+    conformer_ids = list(
+        AllChem.EmbedMultipleConfs(
+            mol,
+            numConfs=max(3, min(PEPTIDE_CONFORMER_COUNT, len(sequence) * 3)),
+            params=params,
+        )
+    )
+    if not conformer_ids:
+        if AllChem.EmbedMolecule(mol, params) != 0:
+            raise ValueError("RDKit peptide conformer embedding failed")
+        conformer_ids = [mol.GetConformer().GetId()]
+
+    flags = []
+    if AllChem.MMFFHasAllMoleculeParams(mol):
+        parameterization = "rdkit_mmff94"
+        try:
+            results = AllChem.MMFFOptimizeMoleculeConfs(mol, numThreads=0, maxIters=300)
+        except Exception as exc:  # noqa: BLE001 - UFF fallback keeps calculation available
+            flags.append(f"mmff_optimization_failed:{safe_note(str(exc))}")
+            parameterization = "rdkit_uff"
+            results = AllChem.UFFOptimizeMoleculeConfs(mol, numThreads=0, maxIters=300)
+    else:
+        parameterization = "rdkit_uff"
+        flags.append("mmff_parameters_unavailable")
+        results = AllChem.UFFOptimizeMoleculeConfs(mol, numThreads=0, maxIters=300)
+
+    energies = [float(result[1]) for result in results] if results else [0.0 for _ in conformer_ids]
+    ordered = sorted(zip(conformer_ids, energies), key=lambda item: item[1])
+    frames = [conformer_positions(mol, conf_id, np) for conf_id, _ in ordered]
+    if not frames:
+        raise ValueError("RDKit peptide conformer coordinates missing")
+    return mol, frames, parameterization, flags
+
+
+def conformer_positions(mol: Any, conformer_id: int, np: Any) -> Any:
+    conformer = mol.GetConformer(conformer_id)
+    return np.array(
+        [
+            [
+                conformer.GetAtomPosition(index).x,
+                conformer.GetAtomPosition(index).y,
+                conformer.GetAtomPosition(index).z,
+            ]
+            for index in range(mol.GetNumAtoms())
+        ],
+        dtype=float,
+    )
 
 
 def find_receptor_coordinate(run_dir: Path) -> Path | None:
@@ -455,6 +585,33 @@ def summarize_complex_frames(
     }
 
 
+def summarize_peptide_conformer_frames(mol: Any, frames: list[Any], np: Any) -> dict[str, float]:
+    heavy_indices = [atom.GetIdx() for atom in mol.GetAtoms() if atom.GetAtomicNum() > 1]
+    if not heavy_indices:
+        heavy_indices = list(range(mol.GetNumAtoms()))
+    peptide_frames = [np.asarray(frame, dtype=float)[heavy_indices, :] for frame in frames]
+    reference = peptide_frames[0]
+    rmsd_values = [kabsch_rmsd(frame, reference) for frame in peptide_frames[1:]]
+    stack = np.stack(peptide_frames, axis=0)
+    mean_by_atom = stack.mean(axis=0)
+    rmsf_by_atom = np.sqrt(((stack - mean_by_atom) ** 2).sum(axis=2).mean(axis=0))
+    centers = np.array([frame.mean(axis=0) for frame in peptide_frames])
+    drift_values = np.sqrt(((centers - centers[0]) ** 2).sum(axis=1))[1:]
+    rmsd = float(np.mean(rmsd_values)) if rmsd_values else 0.0
+    rmsf = float(np.mean(rmsf_by_atom)) if len(rmsf_by_atom) else 0.0
+    drift = float(np.mean(drift_values)) if len(drift_values) else 0.0
+    stability = max(0.0, min(1.0, 1.0 - (rmsd / 5.0 + rmsf / 5.0 + drift / 5.0) / 3.0))
+    return {
+        "rmsd": rmsd,
+        "rmsf": rmsf,
+        "ligand_drift": drift,
+        "contact_occupancy": 0.0,
+        "hydrogen_bond_occupancy": 0.0,
+        "interaction_persistence": 0.0,
+        "md_stability_score": stability,
+    }
+
+
 def kabsch_rmsd(frame: Any, reference: Any) -> float:
     import numpy as np
 
@@ -677,12 +834,122 @@ def write_md_artifacts(
         handle.write("\n")
 
 
+def write_peptide_conformer_artifacts(
+    run_dir: Path,
+    candidate_id: str,
+    input_id: str,
+    sequence: str,
+    metrics: dict[str, float],
+    frames: list[Any],
+    mol: Any,
+    parameterization: str,
+    risk_flags: list[str],
+    rdkit_version: str,
+) -> None:
+    tool_outputs = run_dir / "tool_outputs"
+    tool_outputs.mkdir(parents=True, exist_ok=True)
+    score_note = "score_decomposition.tsv records Rust-owned candidate scores"
+    risk_text = ";".join(risk_flags)
+    summary_header = [
+        "candidate_id",
+        "rmsd",
+        "rmsf",
+        "ligand_drift",
+        "hydrogen_bond_occupancy",
+        "contact_occupancy",
+        "interaction_persistence",
+        "md_risk_flags",
+        "md_score_decomposition",
+        "md_stability_score",
+    ]
+    write_tsv(
+        tool_outputs / "md_summary.tsv",
+        summary_header,
+        [
+            [
+                candidate_id,
+                fmt(metrics["rmsd"]),
+                fmt(metrics["rmsf"]),
+                fmt(metrics["ligand_drift"]),
+                fmt(metrics["hydrogen_bond_occupancy"]),
+                fmt(metrics["contact_occupancy"]),
+                fmt(metrics["interaction_persistence"]),
+                risk_text,
+                score_note,
+                fmt(metrics["md_stability_score"]),
+            ]
+        ],
+    )
+    metric_specs = [
+        ("md_rmsd.tsv", "rmsd"),
+        ("md_rmsf.tsv", "rmsf"),
+        ("md_ligand_drift.tsv", "ligand_drift"),
+        ("md_contacts.tsv", "contact_occupancy"),
+        ("md_hbonds.tsv", "hydrogen_bond_occupancy"),
+    ]
+    for file_name, metric in metric_specs:
+        write_tsv(
+            tool_outputs / file_name,
+            ["candidate_id", "input_id", "metric", "value", "source"],
+            [[candidate_id, input_id, metric, fmt(metrics[metric]), "rdkit_peptide_conformer_ensemble"]],
+        )
+    metric_artifacts = [
+        "tool_outputs/md_summary.tsv",
+        "tool_outputs/md_rmsd.tsv",
+        "tool_outputs/md_rmsf.tsv",
+        "tool_outputs/md_ligand_drift.tsv",
+        "tool_outputs/md_contacts.tsv",
+        "tool_outputs/md_hbonds.tsv",
+    ]
+    write_ligand_placement(
+        tool_outputs / "ligand_placement.tsv",
+        candidate_id,
+        input_id,
+        mol,
+        frames[0],
+        "rdkit_peptide_lowest_energy_conformer",
+    )
+    write_peptide_trajectory(tool_outputs / "md_trajectory.tsv", candidate_id, frames, mol)
+    with (tool_outputs / "md_run_manifest.json").open("w", encoding="utf-8") as handle:
+        json.dump(
+            {
+                "candidate_id": candidate_id,
+                "input_id": input_id,
+                "input_kind": "peptide",
+                "input_sequence": sequence,
+                "method": "rdkit_peptide_conformer_ensemble",
+                "platform": "RDKit",
+                "cuda_ready": False,
+                "rdkit_version": rdkit_version,
+                "sequence_length": len(sequence),
+                "ligand_parameterization": parameterization,
+                "ligand_coordinate": "tool_outputs/ligand_placement.tsv",
+                "ligand_coordinate_format": "tsv_angstrom",
+                "ligand_atom_count": mol.GetNumAtoms(),
+                "ligand_heavy_atom_count": sum(1 for atom in mol.GetAtoms() if atom.GetAtomicNum() > 1),
+                "ligand_placement": "rdkit_peptide_lowest_energy_conformer",
+                "ligand_placement_manifest": "tool_outputs/ligand_placement.tsv",
+                "complex_manifest": "",
+                "frame_count": len(frames),
+                "trajectory": "tool_outputs/md_trajectory.tsv",
+                "metric_artifacts": metric_artifacts,
+                "risk_flags": risk_flags,
+                "score_decomposition": "score_decomposition.tsv",
+            },
+            handle,
+            indent=2,
+            sort_keys=True,
+        )
+        handle.write("\n")
+
+
 def write_ligand_placement(
     path: Path,
     candidate_id: str,
     input_id: str,
     mol: Any,
     ligand_positions: Any,
+    placement_method: str = "rdkit_conformer_translated_near_receptor_centroid",
 ) -> None:
     rows = []
     for atom_index, atom in enumerate(mol.GetAtoms()):
@@ -697,7 +964,7 @@ def write_ligand_placement(
                 fmt(coord[1]),
                 fmt(coord[2]),
                 "angstrom",
-                "rdkit_conformer_translated_near_receptor_centroid",
+                placement_method,
             ]
         )
     write_tsv(
@@ -715,6 +982,31 @@ def write_ligand_placement(
         ],
         rows,
     )
+
+
+def write_peptide_trajectory(path: Path, candidate_id: str, frames: list[Any], mol: Any) -> None:
+    rows = []
+    elements = [atom.GetSymbol() for atom in mol.GetAtoms()]
+    residues = []
+    for atom in mol.GetAtoms():
+        info = atom.GetPDBResidueInfo()
+        residues.append(info.GetResidueName().strip() if info else "PEP")
+    for frame_index, frame in enumerate(frames):
+        for atom_index, coord in enumerate(frame):
+            rows.append(
+                [
+                    candidate_id,
+                    str(frame_index),
+                    str(atom_index),
+                    "peptide",
+                    elements[atom_index],
+                    residues[atom_index],
+                    fmt(coord[0]),
+                    fmt(coord[1]),
+                    fmt(coord[2]),
+                ]
+            )
+    write_tsv(path, ["candidate_id", "frame", "atom_index", "role", "element", "residue", "x", "y", "z"], rows)
 
 
 def write_complex_md_manifest(
