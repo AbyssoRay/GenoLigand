@@ -18,7 +18,7 @@ def require(condition: bool, message: str) -> None:
 def main() -> int:
     workflow = read("workflows/main.nf")
     cli = read("crates/gls-cli/src/main.rs")
-    server = read("crates/gls-server/src/lib.rs")
+    server = read("crates/gls-server/src/lib.rs") + read("crates/gls-server/src/input_recognition.rs")
 
     require("pipeline run" in workflow, "workflow must call full pipeline")
     require("pipeline" in cli and "run" in cli, "gls-cli must expose pipeline run")

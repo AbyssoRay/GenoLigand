@@ -123,7 +123,7 @@ function sequenceBody(value) {
   const body = value.trim().startsWith(">")
     ? value
         .split(/\r?\n/)
-        .slice(1)
+        .filter((line) => !line.trimStart().startsWith(">"))
         .join("")
     : value;
   return body.replace(/\s+/g, "");

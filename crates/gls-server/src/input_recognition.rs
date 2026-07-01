@@ -60,6 +60,9 @@ fn input_recognition_label(field: &str, value: &str) -> Option<String> {
     {
         return Some("核酸序列".to_string());
     }
+    if field.contains("small_molecule") && looks_like_smiles_text(value) {
+        return Some("小分子".to_string());
+    }
     if looks_like_peptide_sequence(value, 2) {
         let body_len = compact_sequence_body(value).len();
         return Some(if body_len > 80 {
@@ -141,7 +144,10 @@ fn looks_like_path_with_ext(value: &str, extensions: &[&str]) -> bool {
 fn compact_sequence_body(value: &str) -> String {
     let trimmed = value.trim();
     if trimmed.starts_with('>') {
-        return trimmed.lines().skip(1).collect::<String>();
+        return trimmed
+            .lines()
+            .filter(|line| !line.trim_start().starts_with('>'))
+            .collect::<String>();
     }
     trimmed.chars().filter(|ch| !ch.is_whitespace()).collect()
 }

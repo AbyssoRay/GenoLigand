@@ -204,12 +204,14 @@ def read_small_molecule_input(path: Path) -> tuple[str, str]:
         field = str(row.get("field", "")).lower()
         label = str(row.get("label", "")).lower()
         value = str(row.get("value", "")).strip()
-        text = f"{field} {label}"
+        explicit_small_molecule = field_mentions_small_molecule(field, label)
+        if not value or not explicit_small_molecule:
+            continue
+        if looks_like_inchi(value) or looks_like_smiles_text(value):
+            return value, f"input_{index}"
         if normalize_peptide_sequence(value):
             continue
-        explicit_ligand = "ligand" in text
-        if value and (any(token in text for token in ["small_molecule", "smiles"]) or explicit_ligand):
-            return value, f"input_{index}"
+        return value, f"input_{index}"
     return "", "input_1"
 
 
@@ -237,9 +239,12 @@ def read_peptide_sequence_input(path: Path) -> tuple[str, str]:
     for index, row in enumerate(payload.get("inputs", []), start=1):
         field = str(row.get("field", "")).lower()
         label = str(row.get("label", "")).lower()
-        value = normalize_peptide_sequence(str(row.get("value", "")))
-        text = f"{field} {label}"
-        if value and any(token in text for token in ["peptide", "protein_ligand", "protein_sequence"]):
+        raw_value = str(row.get("value", ""))
+        value = normalize_peptide_sequence(raw_value)
+        explicit_small_molecule = field_mentions_small_molecule(field, label)
+        if value and explicit_small_molecule and (looks_like_inchi(raw_value) or looks_like_smiles_text(raw_value)):
+            continue
+        if value:
             return value, f"input_{index}"
     return "", "input_1"
 
@@ -281,6 +286,74 @@ def normalize_peptide_sequence(value: str) -> str:
     if any(ch not in STANDARD_AMINO_ACIDS for ch in sequence):
         return ""
     return sequence
+
+
+def looks_like_inchi(value: str) -> bool:
+    return value.strip().startswith("InChI=")
+
+
+def field_mentions_small_molecule(field: str, label: str) -> bool:
+    text = f"{field} {label}"
+    return "small_molecule" in text or "smiles" in text or ("ligand" in text and "protein_ligand" not in field)
+
+
+def looks_like_smiles_text(value: str) -> bool:
+    text = value.strip()
+    if not text or any(ch.isspace() for ch in text):
+        return False
+    allowed_symbols = set("[]()=#@+-\\/%.:")
+    if any(not (ch.isascii() and ch.isalnum()) and ch not in allowed_symbols for ch in text):
+        return False
+
+    saw_atom = False
+    index = 0
+    while index < len(text):
+        ch = text[index]
+        if ch.isupper():
+            symbol = ch
+            if index + 1 < len(text) and text[index + 1].islower():
+                symbol += text[index + 1]
+                if valid_element_symbol(symbol):
+                    saw_atom = True
+                    index += 2
+                    continue
+                return False
+            if valid_element_symbol(symbol):
+                saw_atom = True
+                index += 1
+                continue
+            return False
+        if ch in "bcnops":
+            saw_atom = True
+            index += 1
+            continue
+        if ch.islower():
+            return False
+        index += 1
+    return saw_atom
+
+
+def valid_element_symbol(symbol: str) -> bool:
+    return symbol in {
+        "B",
+        "C",
+        "N",
+        "O",
+        "P",
+        "S",
+        "F",
+        "I",
+        "H",
+        "Cl",
+        "Br",
+        "Na",
+        "K",
+        "Li",
+        "Mg",
+        "Ca",
+        "Zn",
+        "Fe",
+    }
 
 
 def top_candidate_id(run_dir: Path) -> str:

@@ -106,6 +106,7 @@ const checks = {
   validSmallMoleculePeptide: inputValueUsable("small_molecule", "IKVAV"),
   validSmallMoleculeNucleotide: inputValueUsable("small_molecule", "ATGCGTACGTAA"),
   validPeptide: inputValueUsable("peptide", "ACDEFG"),
+  validMultiFastaPeptide: inputValueUsable("peptide", ">pep1\\nIKVAV\\n>pep2\\nIKVAV"),
   validProteinLigand: inputValueUsable("protein_ligand", ">protein\\nMSTNPKPQR"),
   validGenome: inputValueUsable("genome_or_metagenome", ">orf1\\nATGCGTACGTAA")
 };
@@ -130,6 +131,7 @@ console.log(JSON.stringify(checks));
     require(selector_checks["validSmallMoleculePeptide"], "small molecule input must accept peptide text for backend conversion")
     require(selector_checks["validSmallMoleculeNucleotide"], "small molecule input must accept nucleotide text for backend conversion")
     require(selector_checks["validPeptide"], "peptide input must accept amino-acid sequences")
+    require(selector_checks["validMultiFastaPeptide"], "peptide input must accept FASTA text with multiple headers")
     require(selector_checks["validProteinLigand"], "protein input must accept FASTA amino-acid sequences")
     require(selector_checks["validGenome"], "genome input must accept FASTA nucleotide sequences")
 

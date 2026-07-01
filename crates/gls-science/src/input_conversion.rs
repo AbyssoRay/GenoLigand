@@ -164,6 +164,20 @@ fn convert_raw_input(raw: &RawInput) -> ConvertedInput {
             },
         );
     }
+    if raw.original_field.contains("small_molecule") && looks_like_smiles_text(value) {
+        return converted_input(
+            raw,
+            ConversionDetails {
+                kind: InputKind::SmallMolecule,
+                canonical_value: value.to_string(),
+                inferred_kind: "small_molecule",
+                method: "rdkit_smiles",
+                format: "plain_text",
+                artifact: "",
+                risk_flag: "",
+            },
+        );
+    }
     if sequence.len() >= 2 && sequence.chars().all(is_standard_amino_acid) {
         let kind = if sequence.len() > 80 {
             InputKind::ProteinLigand
