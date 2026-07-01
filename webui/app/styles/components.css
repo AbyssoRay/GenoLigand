@@ -317,6 +317,23 @@ select:focus {
   font-size: 12px;
 }
 
+.stage-main {
+  min-width: 0;
+  display: grid;
+  gap: 4px;
+}
+
+.stage-label {
+  min-width: 0;
+}
+
+.stage-reason {
+  color: var(--soft);
+  font-size: 12px;
+  line-height: 1.5;
+  overflow-wrap: break-word;
+}
+
 .table-wrap {
   width: 100%;
   overflow: auto;

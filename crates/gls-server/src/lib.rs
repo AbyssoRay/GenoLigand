@@ -1729,7 +1729,7 @@ fn read_status_reason(path: &Path, fallback: &str) -> String {
 fn user_artifact_reason(reason: &str) -> String {
     let lower = reason.to_ascii_lowercase();
     if lower.contains("no small_molecule input available for md summary") {
-        return "没有可用于 MD 的小分子输入；当前输入已完成候选和序列匹配。".to_string();
+        return "当前 MD worker 需要可参数化的 SMILES/SDF 小分子配体或复合物坐标；序列类输入（包括短肽）已用于候选和序列匹配，尚未转换为 MD 配体/复合物输入。".to_string();
     }
     if lower.contains("no structure interaction match rows") {
         return "当前运行没有结构匹配，因此未生成结构查看数据或口袋摘要。".to_string();
@@ -5488,7 +5488,7 @@ mod tests {
             md["reason"]
                 .as_str()
                 .unwrap_or_default()
-                .contains("没有可用于 MD 的小分子输入")
+                .contains("序列类输入")
         );
 
         fs::remove_dir_all(&root).ok();

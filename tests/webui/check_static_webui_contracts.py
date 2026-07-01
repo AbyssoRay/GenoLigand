@@ -80,9 +80,16 @@ def main() -> int:
         "run view must show not-generated stages for missing current-run artifacts",
     )
     require(
+        'class="stage-main"' in run_page and 'class="stage-reason"' in run_page,
+        "run view must keep long stage reasons in the text column",
+    )
+    require(
         "const completed = runState === \"completed\"" not in run_page,
         "run view must not mark every stage complete solely from run state",
     )
+    components = read(WEB / "styles/components.css")
+    require(".stage-main" in components, "stage text column must have a stable width")
+    require(".stage-reason" in components, "stage reasons must wrap as normal text")
 
     selector_probe = subprocess.run(
         [

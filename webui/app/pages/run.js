@@ -80,9 +80,11 @@ function renderStage(stage, index) {
   return `
     <div class="stage">
       <span class="stage-index">${index + 1}</span>
-      <span>${escapeHtml(label)}</span>
+      <span class="stage-main">
+        <span class="stage-label">${escapeHtml(label)}</span>
+        ${reason ? `<small class="stage-reason">${escapeHtml(reason)}</small>` : ""}
+      </span>
       <span class="status-pill ${stageStatusClass(stage)}">${escapeHtml(statusLabel)}</span>
-      ${reason ? `<small>${escapeHtml(reason)}</small>` : ""}
     </div>`;
 }
 
