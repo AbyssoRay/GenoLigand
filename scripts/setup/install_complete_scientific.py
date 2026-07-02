@@ -33,6 +33,12 @@ PYTHON_TOOL_PACKAGES: list[dict[str, str]] = [
         "version_expr": "openmm.version.version",
     },
     {
+        "component": "openmmforcefields",
+        "package": "openmmforcefields",
+        "import_name": "openmmforcefields",
+        "version_expr": "'installed'",
+    },
+    {
         "component": "pdbfixer",
         "package": "git+https://github.com/openmm/pdbfixer.git",
         "import_name": "pdbfixer",
@@ -45,6 +51,12 @@ PYTHON_TOOL_PACKAGES: list[dict[str, str]] = [
         "version_expr": "'installed'",
     },
     {
+        "component": "openff_interchange",
+        "package": "git+https://github.com/openforcefield/openff-interchange.git",
+        "import_name": "openff.interchange",
+        "version_expr": "openff.interchange.__version__",
+    },
+    {
         "component": "openff_utilities",
         "package": "git+https://github.com/openforcefield/openff-utilities.git",
         "import_name": "openff.utilities",
@@ -55,6 +67,24 @@ PYTHON_TOOL_PACKAGES: list[dict[str, str]] = [
         "package": "git+https://github.com/openforcefield/openff-units.git",
         "import_name": "openff.units",
         "version_expr": "openff.units.__version__",
+    },
+    {
+        "component": "xmltodict",
+        "package": "xmltodict",
+        "import_name": "xmltodict",
+        "version_expr": "getattr(xmltodict, '__version__', 'installed')",
+    },
+    {
+        "component": "python_constraint",
+        "package": "python-constraint",
+        "import_name": "constraint",
+        "version_expr": "'installed'",
+    },
+    {
+        "component": "lxml",
+        "package": "lxml",
+        "import_name": "lxml",
+        "version_expr": "'installed'",
     },
     {
         "component": "cachetools",
@@ -95,6 +125,12 @@ PYTHON_TOOL_PACKAGES: list[dict[str, str]] = [
 ]
 
 OPENMM_CUDA_PIP_PACKAGE = "openmm-cuda-12"
+OPENFF_FORCEFIELD_FILE = "openff-2.2.1.offxml"
+OPENFF_FORCEFIELD_URL = (
+    "https://raw.githubusercontent.com/openforcefield/openff-forcefields/main/"
+    "openforcefields/offxml/openff-2.2.1.offxml"
+)
+DEFAULT_ALIGNMENT_DB_MAX_SOURCE_BYTES = 5 * 1024 * 1024 * 1024
 RESERVED_WSL_DISTROS = {"Ubuntu-24.04"}
 DOWNLOAD_RETRIES = 3
 DOWNLOAD_TIMEOUT_SECONDS = 120
@@ -366,6 +402,32 @@ def runtime_executable_name(binary_name: str) -> str:
     return f"{binary_name}.exe" if os.name == "nt" else binary_name
 
 
+def stop_runtime_binary_process(binary_name: str) -> dict[str, object]:
+    executable = runtime_executable_name(binary_name)
+    if os.name == "nt":
+        command = ["taskkill", "/F", "/IM", executable]
+    else:
+        command = ["pkill", "-f", executable]
+    completed = subprocess.run(command, capture_output=True, text=True, check=False)
+    return {
+        "command": command,
+        "returncode": completed.returncode,
+        "stdout": completed.stdout.strip(),
+        "stderr": completed.stderr.strip(),
+    }
+
+
+def copy_runtime_binary(source: Path, target: Path, binary_name: str) -> dict[str, object] | None:
+    try:
+        shutil.copy2(source, target)
+        return None
+    except PermissionError:
+        stop_result = stop_runtime_binary_process(binary_name)
+        time.sleep(1)
+        shutil.copy2(source, target)
+        return stop_result
+
+
 def publish_runtime_binary(command: list[str], runtime_dir: Path, binary_name: str) -> tuple[list[str], dict[str, object]]:
     bin_dir = runtime_dir / "bin"
     bin_dir.mkdir(parents=True, exist_ok=True)
@@ -382,14 +444,17 @@ def publish_runtime_binary(command: list[str], runtime_dir: Path, binary_name: s
     source = Path(command[0])
     if len(command) == 1 and source.exists() and source.is_file():
         target = bin_dir / executable
+        stop_result = None
         if source.resolve() != target.resolve():
-            shutil.copy2(source, target)
+            stop_result = copy_runtime_binary(source, target, binary_name)
         try:
             target.chmod(target.stat().st_mode | 0o755)
         except OSError:
             pass
         published = [str(target)]
         status.update({"status": "ready", "published": True, "path": str(target), "command": published})
+        if stop_result:
+            status["stopped_locked_process"] = stop_result
         return published, status
     status["status"] = "external_command"
     return command, status
@@ -1022,7 +1087,8 @@ def ensure_wsl_python_tool_environment(env_dir: Path, distro: str, skip_install:
                 }
     python_path = f"{home}/.local/state/genoligand/python-worker-env/bin/python"
     write_wsl_python_wrapper(wrapper, distro, python_path)
-    if skip_install:
+    python_exists = run_wsl_command(distro, ["bash", "-lc", f"test -x {bash_words([python_path])}"])
+    if skip_install and python_exists.returncode != 0:
         rows = [
             {
                 "component": spec["component"],
@@ -1057,50 +1123,51 @@ def ensure_wsl_python_tool_environment(env_dir: Path, distro: str, skip_install:
             "total": python_tool_total(),
             "environment": "skipped",
         }
-    run_wsl_root_shell(
-        distro,
-        (
-            "set -u; "
-            "if command -v apt-get >/dev/null 2>&1; then "
-            "apt-get update; "
-            "for pkg in python3 python3-venv python3-pip ca-certificates curl unzip; do apt-get install -y \"$pkg\" || true; done; "
-            "elif command -v dnf >/dev/null 2>&1; then "
-            "dnf install -y python3 python3-pip ca-certificates curl unzip || true; "
-            "elif command -v yum >/dev/null 2>&1; then "
-            "yum install -y python3 python3-pip ca-certificates curl unzip || true; "
-            "elif command -v pacman >/dev/null 2>&1; then "
-            "pacman -Sy --noconfirm python python-pip ca-certificates curl unzip || true; "
-            "fi"
-        ),
-    )
-    create = run_wsl_command(
-        distro,
-        [
-            "bash",
-            "-lc",
-            "if [ ! -x ~/.local/state/genoligand/python-worker-env/bin/python ]; then python3 -m venv ~/.local/state/genoligand/python-worker-env; fi && ~/.local/state/genoligand/python-worker-env/bin/python -m pip install --upgrade pip",
-        ],
-    )
-    if create.returncode != 0:
-        write_python_tool_manifest(
-            manifest,
+    if not skip_install:
+        run_wsl_root_shell(
+            distro,
+            (
+                "set -u; "
+                "if command -v apt-get >/dev/null 2>&1; then "
+                "apt-get update; "
+                "for pkg in python3 python3-venv python3-pip ca-certificates curl unzip; do apt-get install -y \"$pkg\" || true; done; "
+                "elif command -v dnf >/dev/null 2>&1; then "
+                "dnf install -y python3 python3-pip ca-certificates curl unzip || true; "
+                "elif command -v yum >/dev/null 2>&1; then "
+                "yum install -y python3 python3-pip ca-certificates curl unzip || true; "
+                "elif command -v pacman >/dev/null 2>&1; then "
+                "pacman -Sy --noconfirm python python-pip ca-certificates curl unzip || true; "
+                "fi"
+            ),
+        )
+        create = run_wsl_command(
+            distro,
             [
-                {
-                    "component": "python_worker_env",
-                    "status": "failed",
-                    "python": str(wrapper),
-                    "package": "venv",
-                    "import_name": "",
-                    "version": "",
-                    "notes": create.stderr.strip() or create.stdout.strip() or "wsl_venv_create_failed",
-                }
+                "bash",
+                "-lc",
+                "if [ ! -x ~/.local/state/genoligand/python-worker-env/bin/python ]; then python3 -m venv ~/.local/state/genoligand/python-worker-env; fi && ~/.local/state/genoligand/python-worker-env/bin/python -m pip install --upgrade pip",
             ],
         )
-        return {
-            "status": "failed",
-            "backend": "wsl",
-            "wsl_distro": distro,
-            "python": str(wrapper),
+        if create.returncode != 0:
+            write_python_tool_manifest(
+                manifest,
+                [
+                    {
+                        "component": "python_worker_env",
+                        "status": "failed",
+                        "python": str(wrapper),
+                        "package": "venv",
+                        "import_name": "",
+                        "version": "",
+                        "notes": create.stderr.strip() or create.stdout.strip() or "wsl_venv_create_failed",
+                    }
+                ],
+            )
+            return {
+                "status": "failed",
+                "backend": "wsl",
+                "wsl_distro": distro,
+                "python": str(wrapper),
                     "manifest": str(manifest),
                     "ready": 0,
                     "total": python_tool_total(),
@@ -1112,7 +1179,7 @@ def ensure_wsl_python_tool_environment(env_dir: Path, distro: str, skip_install:
         probe = probe_wsl_python_import(distro, python_path, spec["import_name"], spec["version_expr"])
         status = "ready" if probe["ready"] else "missing"
         notes = str(probe["notes"])
-        if not probe["ready"]:
+        if not probe["ready"] and not skip_install:
             installed = run_wsl_command(
                 distro,
                 [python_path, "-m", "pip", "install", spec["package"]],
@@ -2744,6 +2811,278 @@ def sync_external_sources(
         }
 
 
+def build_persistent_alignment_databases(
+    science_store: Path,
+    env: dict[str, str] | None = None,
+    wsl_distro: str | None = None,
+) -> dict[str, object]:
+    mmseqs_rows = build_mmseqs_target_databases(science_store, env, wsl_distro)
+    foldseek_rows = build_foldseek_target_database(science_store, env, wsl_distro)
+    all_rows = [*mmseqs_rows, *foldseek_rows]
+    ready = sum(1 for row in all_rows if row.get("status") == "ready")
+    failed = sum(1 for row in all_rows if row.get("status") == "failed")
+    deferred = sum(1 for row in all_rows if row.get("status") == "deferred_large_source")
+    total = len(all_rows)
+    status = "ready" if ready and failed == 0 else "failed" if failed else "needs_repair"
+    return {
+        "status": status,
+        "ready": ready,
+        "failed": failed,
+        "deferred": deferred,
+        "total": total,
+        "mmseqs_manifest": str(science_store / "indexes/mmseqs/mmseqs_target_databases.tsv"),
+        "foldseek_manifest": str(science_store / "indexes/foldseek/foldseek_target_databases.tsv"),
+    }
+
+
+def ensure_openff_forcefield_file(science_store: Path) -> dict[str, object]:
+    target_dir = science_store / "indexes" / "forcefields"
+    target_dir.mkdir(parents=True, exist_ok=True)
+    destination = target_dir / OPENFF_FORCEFIELD_FILE
+    manifest = target_dir / "forcefield_manifest.tsv"
+    if not path_has_payload(destination):
+        result = copy_or_download(OPENFF_FORCEFIELD_URL, destination, None)
+    else:
+        result = {
+            "status": "ready",
+            "bytes": destination.stat().st_size,
+            "sha256": sha256_file(destination),
+        }
+    row = {
+        "forcefield_id": "openff_sage_2_2_1",
+        "file": destination.name,
+        "status": str(result.get("status", "failed")),
+        "bytes": str(result.get("bytes", 0)),
+        "sha256": str(result.get("sha256", "")),
+        "source_url": OPENFF_FORCEFIELD_URL,
+        "license": "CC-BY-4.0",
+        "notes": "OpenFF Sage 2.2.1 SMIRNOFF force field",
+    }
+    write_simple_tsv(
+        manifest,
+        ["forcefield_id", "file", "status", "bytes", "sha256", "source_url", "license", "notes"],
+        [row],
+    )
+    return {
+        "status": row["status"],
+        "file": str(destination),
+        "manifest": str(manifest),
+        "sha256": row["sha256"],
+        "license": row["license"],
+    }
+
+
+def build_mmseqs_target_databases(science_store: Path, env: dict[str, str] | None, wsl_distro: str | None) -> list[dict[str, str]]:
+    index_root = science_store / "indexes" / "mmseqs"
+    manifest = index_root / "mmseqs_target_databases.tsv"
+    index_root.mkdir(parents=True, exist_ok=True)
+    command = shutil.which("mmseqs", path=(env or os.environ).get("PATH"))
+    rows: list[dict[str, str]] = []
+    for label, source in sequence_database_sources(science_store):
+        db_path = index_root / safe_file_stem(label) / "target"
+        if alignment_source_deferred(source):
+            status, notes = "deferred_large_source", "source_exceeds_sync_index_threshold"
+        else:
+            status, notes = build_mmseqs_database(command, source, db_path, env, wsl_distro)
+        rows.append(
+            {
+                "source_id": label,
+                "source_path": relative_path(science_store, source),
+                "db_path": relative_path(science_store, db_path),
+                "status": status,
+                "notes": notes,
+            }
+        )
+    write_simple_tsv(manifest, ["source_id", "source_path", "db_path", "status", "notes"], rows)
+    return rows
+
+
+def alignment_source_deferred(source: Path) -> bool:
+    limit = alignment_db_max_source_bytes()
+    if limit <= 0:
+        return False
+    try:
+        return source.stat().st_size > limit
+    except OSError:
+        return False
+
+
+def alignment_db_max_source_bytes() -> int:
+    raw = os.environ.get("GENOLIGAND_ALIGNMENT_DB_MAX_SOURCE_BYTES", "").strip()
+    if not raw:
+        return DEFAULT_ALIGNMENT_DB_MAX_SOURCE_BYTES
+    try:
+        return max(0, int(raw))
+    except ValueError:
+        return DEFAULT_ALIGNMENT_DB_MAX_SOURCE_BYTES
+
+
+def build_foldseek_target_database(science_store: Path, env: dict[str, str] | None, wsl_distro: str | None) -> list[dict[str, str]]:
+    index_root = science_store / "indexes" / "foldseek"
+    manifest = index_root / "foldseek_target_databases.tsv"
+    index_root.mkdir(parents=True, exist_ok=True)
+    command = shutil.which("foldseek", path=(env or os.environ).get("PATH"))
+    source = science_store / "downloads" / "rcsb" / "mmcif"
+    db_path = index_root / "rcsb_mmcif" / "target"
+    status, notes = build_foldseek_database(command, source, db_path, env, wsl_distro)
+    rows = [
+        {
+            "source_id": "rcsb_mmcif",
+            "source_path": relative_path(science_store, source),
+            "db_path": relative_path(science_store, db_path),
+            "status": status,
+            "notes": notes,
+        }
+    ]
+    write_simple_tsv(manifest, ["source_id", "source_path", "db_path", "status", "notes"], rows)
+    return rows
+
+
+def sequence_database_sources(science_store: Path) -> list[tuple[str, Path]]:
+    roots = [
+        ("uniprot", science_store / "downloads" / "uniprot"),
+        ("metagenome", science_store / "downloads" / "metagenome"),
+        ("biolip2", science_store / "downloads" / "biolip2"),
+    ]
+    suffixes = (".fa", ".faa", ".fasta", ".fa.gz", ".faa.gz", ".fasta.gz")
+    sources: list[tuple[str, Path]] = []
+    for label, root in roots:
+        if not root.exists():
+            continue
+        for path in sorted(root.rglob("*")):
+            name = path.name.lower()
+            if path.is_file() and name.endswith(suffixes) and not name.endswith(".part"):
+                sources.append((f"{label}_{safe_file_stem(path.stem)}", path))
+    return sources
+
+
+def build_mmseqs_database(
+    command: str | None,
+    source: Path,
+    db_path: Path,
+    env: dict[str, str] | None,
+    wsl_distro: str | None,
+) -> tuple[str, str]:
+    if not path_has_payload(source):
+        return "failed", "source_missing"
+    if database_prefix_ready(db_path):
+        return "ready", "already_available"
+    db_path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = db_path.parent / "tmp"
+    tmp.mkdir(parents=True, exist_ok=True)
+    if os.name == "nt" and wsl_distro:
+        return run_wsl_database_commands(
+            wsl_distro,
+            [
+                ["mmseqs", "createdb", wsl_path(source), wsl_path(db_path)],
+                ["mmseqs", "createindex", wsl_path(db_path), wsl_path(tmp)],
+            ],
+            "mmseqs_createdb_createindex_completed",
+        )
+    if command is None:
+        return "failed", "mmseqs_executable_missing"
+    created = run_command([command, "createdb", str(source), str(db_path)], env=env)
+    if created.returncode != 0:
+        return "failed", process_note(created)
+    indexed = run_command([command, "createindex", str(db_path), str(tmp)], env=env)
+    if indexed.returncode != 0:
+        return "failed", process_note(indexed)
+    return "ready", "mmseqs_createdb_createindex_completed"
+
+
+def build_foldseek_database(
+    command: str | None,
+    source: Path,
+    db_path: Path,
+    env: dict[str, str] | None,
+    wsl_distro: str | None,
+) -> tuple[str, str]:
+    if not path_has_payload(source):
+        return "failed", "source_missing"
+    if database_prefix_ready(db_path):
+        return "ready", "already_available"
+    db_path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = db_path.parent / "tmp"
+    tmp.mkdir(parents=True, exist_ok=True)
+    if os.name == "nt" and wsl_distro:
+        return run_wsl_database_commands(
+            wsl_distro,
+            [
+                ["foldseek", "createdb", wsl_path(source), wsl_path(db_path)],
+                ["foldseek", "createindex", wsl_path(db_path), wsl_path(tmp)],
+            ],
+            "foldseek_createdb_createindex_completed",
+        )
+    if command is None:
+        return "failed", "foldseek_executable_missing"
+    created = run_command([command, "createdb", str(source), str(db_path)], env=env)
+    if created.returncode != 0:
+        return "failed", process_note(created)
+    indexed = run_command([command, "createindex", str(db_path), str(tmp)], env=env)
+    if indexed.returncode != 0:
+        return "failed", process_note(indexed)
+    return "ready", "foldseek_createdb_createindex_completed"
+
+
+def run_wsl_database_commands(
+    distro: str,
+    commands: list[list[str]],
+    success_note: str,
+) -> tuple[str, str]:
+    script_parts = [f'export PATH="{wsl_runtime_path_prefix()}:$PATH"']
+    for command in commands:
+        script_parts.append(bash_words(command))
+    completed = run_wsl_user_shell(distro, " && ".join(script_parts))
+    if completed.returncode != 0:
+        return "failed", process_note(completed)
+    return "ready", success_note
+
+
+def wsl_path(path: Path) -> str:
+    text = str(path)
+    if len(text) >= 3 and text[1] == ":" and text[2] in "\\/":
+        drive = text[0].lower()
+        rest = text[3:].replace("\\", "/")
+        return f"/mnt/{drive}/{rest}"
+    return text.replace("\\", "/")
+
+
+def database_prefix_ready(prefix: Path) -> bool:
+    return Path(str(prefix) + ".dbtype").exists() or prefix.with_suffix(".dbtype").exists()
+
+
+def safe_file_stem(value: str) -> str:
+    text = re.sub(r"[^A-Za-z0-9_.-]+", "_", value.strip())
+    return text.strip("._-")[:80] or "target"
+
+
+def relative_path(root: Path, path: Path) -> str:
+    try:
+        return path.relative_to(root).as_posix()
+    except ValueError:
+        return str(path)
+
+
+def process_note(completed: subprocess.CompletedProcess[str]) -> str:
+    text = (completed.stderr or completed.stdout or "").strip()
+    text = text.replace("\t", " ").replace("\r", " ").replace("\n", " ")
+    return text[:240] or f"exit_code_{completed.returncode}"
+
+
+def write_simple_tsv(path: Path, fieldnames: list[str], rows: list[dict[str, str]]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("w", encoding="utf-8", newline="") as handle:
+        writer = csv.DictWriter(handle, delimiter="\t", fieldnames=fieldnames)
+        writer.writeheader()
+        for row in rows:
+            writer.writerow(
+                {
+                    key: str(row.get(key, "")).replace("\t", " ").replace("\r", " ").replace("\n", " ")
+                    for key in fieldnames
+                }
+            )
+
+
 def external_destination(target: Path, location: str) -> Path:
     if target.suffix:
         return target
@@ -3098,17 +3437,44 @@ def resource_summary(science_store: Path) -> dict[str, object]:
     }
 
 
+def tsv_has_data_rows(path: Path) -> bool:
+    return path.exists() and bool(read_tsv(path))
+
+
+def existing_science_indexes_ready(science_store: Path) -> bool:
+    status_payload = load_json(science_store / "install_status.json")
+    missing = status_payload.get("missing_components", [])
+    if status_payload.get("status") != "ready" or (isinstance(missing, list) and missing):
+        return False
+    source_rows = read_tsv(science_store / "source_requirements.tsv")
+    if not source_rows or any(row.get("status") != "ready" for row in source_rows):
+        return False
+    for rel_path in [
+        "indexes/known_targets.tsv",
+        "indexes/metagenome_targets.tsv",
+        "indexes/structure_targets.tsv",
+        "indexes/tool_versions.tsv",
+    ]:
+        if not tsv_has_data_rows(science_store / rel_path):
+            return False
+    return True
+
+
 def install_ready(payload: dict[str, object]) -> bool:
     downloads = payload.get("downloads")
     external_sources = payload.get("external_sources")
     resources = payload.get("resources")
     tool_environment = payload.get("tool_environment")
     source_manifests = payload.get("source_manifests")
+    alignment_databases = payload.get("alignment_databases")
+    forcefields = payload.get("forcefields")
     download_status = downloads.get("status") if isinstance(downloads, dict) else None
     external_status = external_sources.get("status") if isinstance(external_sources, dict) else None
     resource_status = resources.get("status") if isinstance(resources, dict) else None
     tool_status = tool_environment.get("status") if isinstance(tool_environment, dict) else None
     source_manifest_status = source_manifests.get("status") if isinstance(source_manifests, dict) else None
+    alignment_status = alignment_databases.get("status") if isinstance(alignment_databases, dict) else None
+    forcefield_status = forcefields.get("status") if isinstance(forcefields, dict) else None
     download_ok = download_status == "ready" or (
         download_status == "skipped"
         and resource_status == "ready"
@@ -3120,6 +3486,8 @@ def install_ready(payload: dict[str, object]) -> bool:
         and resource_status == "ready"
         and external_status == "ready"
         and tool_status == "ready"
+        and alignment_status == "ready"
+        and forcefield_status == "ready"
         and download_ok
         and source_manifest_status == "ready"
     )
@@ -3158,6 +3526,30 @@ def tool_environment_user_summary(tool_environment_result: dict[str, object]) ->
     }
 
 
+def alignment_database_user_summary(alignment_result: dict[str, object]) -> dict[str, object]:
+    status = str(alignment_result.get("status", "unknown"))
+    ready = int(alignment_result.get("ready", 0) or 0)
+    total = int(alignment_result.get("total", 0) or 0)
+    deferred = int(alignment_result.get("deferred", 0) or 0)
+    return {
+        "completed": status == "ready",
+        "ready": ready,
+        "deferred": deferred,
+        "total": total,
+        "next_action": "继续" if status == "ready" else "运行安装/修复",
+    }
+
+
+def forcefield_user_summary(forcefield_result: dict[str, object]) -> dict[str, object]:
+    status = str(forcefield_result.get("status", "unknown"))
+    return {
+        "completed": status == "ready",
+        "ready": 1 if status == "ready" else 0,
+        "total": 1,
+        "next_action": "继续" if status == "ready" else "运行安装/修复",
+    }
+
+
 def runtime_user_summary(payload: dict[str, object]) -> dict[str, object]:
     binaries = payload.get("runtime_binaries")
     launch_environment = payload.get("launch_environment")
@@ -3192,6 +3584,8 @@ def install_user_summary(payload: dict[str, object]) -> dict[str, object]:
         "source_records": source_record_summary(payload.get("source_manifests", {}) if isinstance(payload.get("source_manifests"), dict) else {}),
         "tool_environment": tool_environment_user_summary(payload.get("tool_environment", {}) if isinstance(payload.get("tool_environment"), dict) else {}),
         "cuda_toolkit": payload.get("cuda_toolkit", {}),
+        "alignment_databases": alignment_database_user_summary(payload.get("alignment_databases", {}) if isinstance(payload.get("alignment_databases"), dict) else {}),
+        "forcefields": forcefield_user_summary(payload.get("forcefields", {}) if isinstance(payload.get("forcefields"), dict) else {}),
         "runtime": runtime_user_summary(payload),
     }
 
@@ -3202,6 +3596,8 @@ def installation_status(
     download_result: dict[str, object],
     external_sync_result: dict[str, object],
     tool_environment_result: dict[str, object],
+    alignment_database_result: dict[str, object],
+    forcefield_result: dict[str, object],
     source_manifest_result: dict[str, object],
     external_source_summary: dict[str, object],
     resource_result: dict[str, object],
@@ -3214,6 +3610,8 @@ def installation_status(
     )
     resource_status = str(resource_result.get("status", "unknown"))
     tool_status = str(tool_environment_result.get("status", "unknown"))
+    alignment_status = str(alignment_database_result.get("status", "unknown"))
+    forcefield_status = str(forcefield_result.get("status", "unknown"))
     source_manifest_status = str(source_manifest_result.get("status", "unknown"))
     missing = status_payload.get("missing_components", [])
     missing_count = len(missing) if isinstance(missing, list) else 0
@@ -3249,6 +3647,14 @@ def installation_status(
         status = "needs_repair"
         summary = "科学计算工具尚未准备完成。"
         next_action = "保持联网后重新运行安装/修复，或检查工具安装日志"
+    elif alignment_status != "ready":
+        status = "needs_repair"
+        summary = "本地序列和结构比对数据库尚未准备完成。"
+        next_action = "保持资源和工具可用后重新运行安装/修复"
+    elif forcefield_status != "ready":
+        status = "needs_repair"
+        summary = "OpenFF 小分子力场文件尚未准备完成。"
+        next_action = "保持联网后重新运行安装/修复"
     elif external_status == "needs_sync":
         status = "needs_repair"
         summary = "大型科学资源尚未闭合，科学仓库尚未准备完成。"
@@ -3467,7 +3873,39 @@ def main() -> int:
         total_steps=6,
         message="正在构建数据库索引",
     )
-    completed = run_command(command, env=command_env)
+    if existing_science_indexes_ready(science_store):
+        write_install_progress(
+            science_store,
+            status="running",
+            stage="构建索引",
+            current_resource="科学仓库索引",
+            completed_steps=5,
+            total_steps=6,
+            message="已复用现有数据库索引",
+        )
+        completed = subprocess.CompletedProcess(command, 0, "science_indexes_reused\n", "")
+    else:
+        completed = run_command(command, env=command_env)
+    write_install_progress(
+        science_store,
+        status="running",
+        stage="构建索引",
+        current_resource="序列和结构比对数据库",
+        completed_steps=5,
+        total_steps=6,
+        message="正在构建本地 MMseqs2 和 Foldseek 目标数据库",
+    )
+    alignment_database_result = build_persistent_alignment_databases(science_store, command_env, selected_wsl)
+    write_install_progress(
+        science_store,
+        status="running",
+        stage="构建索引",
+        current_resource="OpenFF 小分子力场",
+        completed_steps=5,
+        total_steps=6,
+        message="正在准备 OpenFF SMIRNOFF 力场文件",
+    )
+    forcefield_result = ensure_openff_forcefield_file(science_store)
     external_source_summary = source_sync_summary(
         source_sync_plan,
         science_store,
@@ -3480,6 +3918,8 @@ def main() -> int:
         download_result,
         external_sync_result,
         tool_environment_result,
+        alignment_database_result,
+        forcefield_result,
         source_manifest_result,
         external_source_summary,
         resource_result,
@@ -3492,6 +3932,8 @@ def main() -> int:
         "source_manifests": source_manifest_result,
         "resources": resource_result,
         "tool_environment": tool_environment_result,
+        "alignment_databases": alignment_database_result,
+        "forcefields": forcefield_result,
         "cuda_toolkit": cuda_toolkit_summary(),
         "runtime_binaries": {
             "gls_cli": cli_runtime_status,

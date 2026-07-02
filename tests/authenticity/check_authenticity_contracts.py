@@ -28,6 +28,10 @@ def main() -> int:
     science = read_rust_source_text("crates/gls-science/src/lib.rs")
     server = read("crates/gls-server/src/lib.rs")
     md_worker = read("python/genoligand_workers/md_summary_worker.py")
+    alignment_worker = read("python/genoligand_workers/alignment_worker.py")
+    worker_cpu_requirements = read("python/requirements-workers-cpu.txt")
+    worker_cuda_requirements = read("python/requirements-workers-cuda.txt")
+    worker_environment = read("python/environment-workers.yml")
 
     require("无输入、无数据库、无工具或无运行产物时" in architecture, "authenticity rule missing from architecture docs")
     require("candidate_count" in science, "science pipeline must write candidate count metadata")
@@ -42,6 +46,36 @@ def main() -> int:
     require("MolFromFASTA" in md_worker, "MD worker must build peptide molecules through RDKit peptide conversion")
     require("rdkit_peptide_conformer_ensemble" in md_worker, "peptide MD artifacts must identify the real conformer calculation method")
     require("no_receptor_contact_model" in md_worker, "peptide MD artifacts must mark missing receptor contact modeling")
+    require("openmmforcefields" in worker_cpu_requirements, "CPU worker environment must install OpenMM small-molecule force-field support")
+    require("openmmforcefields" in worker_cuda_requirements, "CUDA worker environment must install OpenMM small-molecule force-field support")
+    require("openmmforcefields" in worker_environment, "conda worker environment must install OpenMM small-molecule force-field support")
+    for dependency in ["xmltodict", "python-constraint", "lxml"]:
+        require(dependency in worker_cpu_requirements, f"CPU worker environment must install OpenFF runtime dependency: {dependency}")
+        require(dependency in worker_cuda_requirements, f"CUDA worker environment must install OpenFF runtime dependency: {dependency}")
+        require(dependency in worker_environment, f"conda worker environment must install OpenFF runtime dependency: {dependency}")
+    require("openff-interchange" in worker_cpu_requirements, "CPU worker environment must install OpenFF interchange")
+    require("openff-interchange" in worker_cuda_requirements, "CUDA worker environment must install OpenFF interchange")
+    require("openff-interchange" in worker_environment, "conda worker environment must install OpenFF interchange")
+    require("SMIRNOFFTemplateGenerator" in md_worker or "SystemGenerator" in md_worker, "complex MD must use OpenMM/OpenFF small-molecule parameterization")
+    require("ligand_with_vina_pose_coordinates" in md_worker, "complex MD must map Vina pose coordinates onto the RDKit ligand topology")
+    require("docking_ligand.pdbqt" in md_worker and "docking_pose.pdbqt" in md_worker, "complex MD must use Vina PDBQT coordinates for ligand placement")
+    require("Chem.RemoveHs" in md_worker and "Chem.AddHs" in md_worker, "complex MD must rebuild hydrogens after docking pose placement")
+    require("canonical_smiles" in science and "Chem.MolFromSmiles" in science, "BindingDB onsite matching must use canonical SMILES when RDKit is available")
+    require("temp_python_script_path" in science, "onsite Python scripts must run from a script file to avoid Windows cmd quoting loss")
+    require('command.push("-c"' not in science, "onsite Python scripts must not pass multiline code through python -c")
+    for forbidden in [
+        "MAX_RECEPTOR_ATOMS",
+        "receptor_heavy_atom_subset",
+        "coarse_restrained_complex_model",
+        "short_screening_md_protocol",
+        "CustomExternalForce",
+        "HarmonicBondForce",
+        "CustomCentroidBondForce",
+    ]:
+        require(forbidden not in md_worker, f"complex MD worker must not use nonstandard manual screening mechanics: {forbidden}")
+    require('"easy-search"' not in alignment_worker, "alignment worker must use persistent MMseqs2/Foldseek databases instead of per-run easy-search target indexing")
+    require("mmseqs_target_databases" in alignment_worker, "MMseqs2 worker must discover persistent target databases")
+    require("foldseek_target_database" in alignment_worker, "Foldseek worker must discover persistent target database")
     require("当前运行没有可展示的候选假设" in science, "report must preserve empty-result language")
     forbidden_report_claims = ["已确认靶点", "确认靶点", "已确认机制", "确认机制", "真实亲和力", "真实靶点"]
     for term in forbidden_report_claims:
@@ -76,6 +110,30 @@ def main() -> int:
         require(smiles == "", "protein_ligand field must not be treated as a small-molecule hint")
         sequence, input_id = md_summary_worker.read_peptide_sequence_input(protein_ligand_text)
         require((sequence, input_id) == ("CCN", "input_1"), "protein_ligand peptide text must remain peptide-capable")
+
+    weak = md_summary_worker.GpuTelemetry(
+        rows=[
+            {
+                "sample_label": "baseline_before_openmm_context",
+                "gpu_index": "0",
+                "utilization_gpu_percent": "0",
+                "memory_used_mb": "1000",
+                "current_pid_observed": "false",
+            },
+            {
+                "sample_label": "production_segment_1",
+                "gpu_index": "0",
+                "utilization_gpu_percent": "35",
+                "memory_used_mb": "1000",
+                "current_pid_observed": "false",
+            },
+        ],
+        available=True,
+    )
+    require(
+        not md_summary_worker.summarize_gpu_telemetry("CUDA", weak)["gpu_observed"],
+        "CUDA MD evidence must not accept unrelated utilization without process or memory evidence",
+    )
 
     print("authenticity_contracts\tPASS")
     return 0

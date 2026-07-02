@@ -8,8 +8,15 @@ dependencies:
   - rdkit
   - openbabel
   - openmm
+  - openmmforcefields
   - pdbfixer
   - openff-toolkit
+  - xmltodict
+  - python-constraint
+  - lxml
   - mdtraj
   - mdanalysis
   - jsonschema
+  - pip
+  - pip:
+      - git+https://github.com/openforcefield/openff-interchange.git

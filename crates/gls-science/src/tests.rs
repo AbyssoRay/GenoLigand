@@ -63,6 +63,59 @@ fn worker_python_candidates_prefer_installed_genoligand_runtime() {
 }
 
 #[test]
+fn script_python_candidates_prefer_configured_worker_python() {
+    let preferred =
+        r"C:\Users\tester\GenoLigand\runtime\python-worker-env\genoligand-wsl-python.cmd";
+
+    let candidates = script_python_command_candidates_from(Some(preferred.to_string()));
+
+    assert_eq!(candidates.first(), Some(&vec![preferred.to_string()]));
+    assert!(
+        candidates
+            .iter()
+            .any(|candidate| candidate == &vec!["python".to_string()])
+    );
+}
+
+#[test]
+fn script_python_candidates_use_installed_runtime_worker_without_env_override() {
+    let root = temp_root("script_python_runtime_worker");
+    let local = root.join("local_appdata");
+    let runtime = local
+        .join("GenoLigand")
+        .join("runtime")
+        .join("python-worker-env");
+    fs::create_dir_all(&runtime).expect("runtime dir");
+    let wrapper = runtime.join("genoligand-wsl-python.cmd");
+    write_text(&wrapper, "@echo off\n").expect("wrapper");
+
+    let candidates = script_python_command_candidates_from_env(None, Some(local.into_os_string()));
+
+    assert_eq!(
+        candidates.first(),
+        Some(&vec![wrapper.display().to_string()])
+    );
+    assert!(
+        candidates
+            .iter()
+            .any(|candidate| candidate == &vec!["python".to_string()])
+    );
+    fs::remove_dir_all(root).ok();
+}
+
+#[test]
+fn python_script_runner_uses_temp_script_file() {
+    let path = temp_python_script_path("bindingdb onsite query");
+
+    assert_eq!(path.extension().and_then(|ext| ext.to_str()), Some("py"));
+    assert!(
+        path.file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| name.contains("bindingdb_onsite_query"))
+    );
+}
+
+#[test]
 fn wsl_python_wrapper_uses_wsl_paths_for_worker_inputs() {
     if !cfg!(windows) {
         return;
@@ -633,7 +686,7 @@ fn known_matching_deduplicates_onsite_hits_and_downweights_token_noise() {
 
     assert!(matches.contains("CHEMBL_NOISE"));
     assert!(matches.contains(
-        "CHEMBL_NOISE\tToken-only noise target\tHomo sapiens\tknown_human_protein\t0.4500"
+        "CHEMBL_NOISE\tToken-only noise target\tHomo sapiens\tknown_human_protein\t0.2000"
     ));
     assert_eq!(matches.matches("\tP00918\t").count(), 1);
     assert!(matches.contains("Ki (nM)=12"));
@@ -857,6 +910,84 @@ fn md_summary_score_participates_in_ranking_and_report() {
     assert!(report.contains("md_stability_score"));
     assert!(report.contains("0.10"));
     assert!(source_map.contains("target_candidate_ranking.tsv\tknown_database_matches.tsv;metagenome_potential_matches.tsv;structure_interaction_matches.tsv;md_summary.tsv"));
+    fs::remove_dir_all(&root).expect("cleanup temp root");
+    assert!(!root.exists());
+}
+
+#[test]
+fn target_ranking_summarizes_long_bindingdb_evidence_for_display() {
+    let root = temp_root("bindingdb_evidence_summary");
+    let run = root.join("run");
+    let store = create_temporary_test_store(&root).expect("store");
+    let input = root.join("input.json");
+    let long_pdb_ids = "1AZM,1DMY,1JD0,1RJ5,1RJ6,1YDA,2CBA,2H4N";
+    write_text(
+        &input,
+        "{\"inputs\":[{\"field\":\"small_molecule\",\"value\":\"NS(=O)(=O)c1nnc(s1)NC(=O)C\"}],\"files\":[]}\n",
+    )
+    .expect("input");
+    write_text(
+        &run.join("known_database_matches.tsv"),
+        &format!(
+            "input_id\tsource\ttarget_id\ttarget_name\torganism\ttarget_class\tmatch_score\tmatched_features\tevidence\ninput_1\tBindingDB\tP00918\tCarbonic anhydrase 2\tHomo sapiens\tknown_human_protein\t1.0000\tligand_identity\tbindingdb_onsite_activity_row;Ki (nM)=0.012000;ligand_code=AZM;pdb_ids={long_pdb_ids};target_chain_pdb_ids=8ZWV,8C0Q,8C0P,7R15,7R14,7R13;pubchem_cid=1986\n"
+        ),
+    )
+    .expect("known matches");
+    let options = ScienceOptions {
+        workspace_root: root.clone(),
+        science_store: store,
+        input_manifest: input,
+        run_dir: run.clone(),
+    };
+
+    rank_targets(&options).expect("rank");
+
+    let source_matches = read_text(&run.join("known_database_matches.tsv")).expect("matches");
+    let ranking = read_text(&run.join("target_candidate_ranking.tsv")).expect("ranking");
+    let detail = read_text(&run.join("candidate_detail.json")).expect("detail");
+    assert!(source_matches.contains(long_pdb_ids));
+    assert!(ranking.contains("pdb_ids=1AZM,1DMY,1JD0,1RJ5,1RJ6(+3 more)"));
+    assert!(ranking.contains("target_chain_pdb_ids=8ZWV,8C0Q,8C0P,7R15,7R14(+1 more)"));
+    assert!(!ranking.contains("1AZM,1DMY,1JD0,1RJ5,1RJ6,1YDA,2CBA,2H4N"));
+    assert!(detail.contains("pdb_ids=1AZM,1DMY,1JD0,1RJ5,1RJ6(+3 more)"));
+    fs::remove_dir_all(&root).expect("cleanup temp root");
+    assert!(!root.exists());
+}
+
+#[test]
+fn report_limits_candidate_table_to_readable_top_results() {
+    let root = temp_root("report_candidate_limit");
+    let run = root.join("run");
+    let store = create_temporary_test_store(&root).expect("store");
+    let input = root.join("input.json");
+    write_text(
+        &input,
+        "{\"inputs\":[{\"field\":\"small_molecule\",\"value\":\"CCO\"}],\"files\":[]}\n",
+    )
+    .expect("input");
+    let mut ranking = String::from(
+        "rank\tcandidate_id\ttarget_id\ttarget_name\tcandidate_scope\torganism\tfinal_score\tknown_database_score\tmetagenome_score\tstructure_score\tdocking_score\tmd_score\tevidence_summary\tstatus\n",
+    );
+    for index in 1..=60 {
+        ranking.push_str(&format!(
+            "{index}\ttarget_T{index}\tT{index}\tTarget {index}\tknown_human_protein\tHomo sapiens\t0.1000\t0.2000\t0.0000\t0.0000\t0.0000\t0.0000\tChEMBL:activity\tcomputed_prediction\n"
+        ));
+    }
+    write_text(&run.join("target_candidate_ranking.tsv"), &ranking).expect("ranking");
+    let options = ScienceOptions {
+        workspace_root: root.clone(),
+        science_store: store,
+        input_manifest: input,
+        run_dir: run.clone(),
+    };
+
+    render_report(&options).expect("report");
+
+    let report = read_text(&run.join("research_report.md")).expect("report");
+    assert!(report.contains("共生成 60 个候选靶点"));
+    assert!(report.contains("Target 50"));
+    assert!(!report.contains("Target 51"));
+    assert!(!report.contains("target_candidate_ranking.tsv"));
     fs::remove_dir_all(&root).expect("cleanup temp root");
     assert!(!root.exists());
 }

@@ -7,6 +7,7 @@ use std::fs;
 use std::io::{BufRead, BufReader, Read};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
+use std::time::{SystemTime, UNIX_EPOCH};
 use zip::ZipArchive;
 
 mod input_conversion;
@@ -139,6 +140,8 @@ const DOCKING_WORKER_TASK: WorkerTask = WorkerTask {
     module: "genoligand_workers.docking_worker",
     stage: "docking_primitive",
 };
+
+const REPORT_CANDIDATE_LIMIT: usize = 50;
 
 #[derive(Clone, Debug)]
 struct ComputedFeatureInput {
@@ -2640,7 +2643,7 @@ fn match_known(options: &ScienceOptions) -> Result<String, String> {
 fn known_database_match_score(input: &ComputedFeatureInput, row: &StoreRow) -> f64 {
     let score = score_row(input, row);
     if input.input_kind == "small_molecule" && !row.evidence.contains("bindingdb_onsite") {
-        score.min(0.45)
+        score.min(0.20)
     } else {
         score
     }
@@ -2774,11 +2777,62 @@ def activity_score(value):
         score = min(score, 0.40)
     return score
 
-def query_matches(query, smiles, ligand_name):
+try:
+    from rdkit import Chem
+except Exception:
+    Chem = None
+
+def canonical_smiles(value):
+    text = clean(value)
+    if not text:
+        return ""
+    if text in canonical_cache:
+        return canonical_cache[text]
+    if Chem is None:
+        canonical_cache[text] = "".join(text.split()).lower()
+        return canonical_cache[text]
+    mol = Chem.MolFromSmiles(text)
+    if mol is None:
+        canonical_cache[text] = "".join(text.split()).lower()
+    else:
+        canonical_cache[text] = Chem.MolToSmiles(mol, isomericSmiles=False)
+    return canonical_cache[text]
+
+def atom_counts(smiles):
+    counts = {}
+    text = clean(smiles)
+    index = 0
+    while index < len(text):
+        ch = text[index]
+        symbol = ""
+        if ch == "[":
+            end = text.find("]", index + 1)
+            token = text[index + 1:end if end != -1 else len(text)]
+            letters = "".join(part for part in token if part.isalpha())
+            if letters:
+                symbol = letters[:2] if letters[:2] in {"Cl", "Br"} else letters[:1]
+            index = (end + 1) if end != -1 else len(text)
+        elif ch.isalpha():
+            two = text[index:index + 2]
+            symbol = two if two in {"Cl", "Br"} else ch
+            index += len(symbol)
+        else:
+            index += 1
+        if symbol:
+            symbol = symbol[0].upper() + symbol[1:].lower()
+            counts[symbol] = counts.get(symbol, 0) + 1
+    return tuple(sorted(counts.items()))
+
+canonical_cache = {}
+
+def query_matches(query_info, smiles, ligand_name):
+    _input_id, query, query_canonical, query_counts = query_info
     q = query.strip()
     q_lower = q.lower()
     compact = "".join(q.split()).lower()
     if compact and compact == "".join(smiles.split()).lower():
+        return True
+    if query_canonical and query_counts and atom_counts(smiles) == query_counts and query_canonical == canonical_smiles(smiles):
         return True
     if q_lower and q_lower in ligand_name.lower():
         return True
@@ -2789,7 +2843,12 @@ with open(query_path, "r", encoding="utf-8-sig", newline="") as handle:
     for row in csv.DictReader(handle, delimiter="\t"):
         query = decode(row.get("query", "")).strip()
         if query:
-            queries.append((clean(row.get("input_id", "input_1")) or "input_1", query))
+            queries.append((
+                clean(row.get("input_id", "input_1")) or "input_1",
+                query,
+                canonical_smiles(query),
+                atom_counts(query),
+            ))
 
 if not queries:
     raise SystemExit(0)
@@ -2806,8 +2865,9 @@ with zipfile.ZipFile(zip_path) as archive:
         for row in reader:
             smiles = first(row, ["Ligand SMILES", "SMILES"])
             ligand_name = first(row, ["BindingDB Ligand Name", "Ligand Name", "Compound Name"])
-            for input_id, query in queries:
-                if not query_matches(query, smiles, ligand_name):
+            for query_info in queries:
+                input_id = query_info[0]
+                if not query_matches(query_info, smiles, ligand_name):
                     continue
                 target_name = first(row, ["Target Name", "UniProt (SwissProt) Recommended Name of Target Chain 1"])
                 organism = first(row, ["Target Source Organism According to Curator or DataSource", "Organism"])
@@ -3671,6 +3731,18 @@ fn pdb_ids_from_text(value: &str) -> Vec<String> {
         }
     }
     ids.into_iter().collect()
+}
+
+fn pdb_ids_from_text_in_order(value: &str) -> Vec<String> {
+    let mut seen = BTreeSet::new();
+    let mut ids = Vec::new();
+    for token in value.split(|ch: char| !ch.is_ascii_alphanumeric()) {
+        let upper = token.trim().to_ascii_uppercase();
+        if is_pdb_id(&upper) && seen.insert(upper.clone()) {
+            ids.push(upper);
+        }
+    }
+    ids
 }
 
 fn write_selected_complex_candidate(
@@ -4642,7 +4714,7 @@ fn artifact_evidence_status(file: &str, path: &Path) -> Result<ArtifactEvidenceS
                 (
                     "available",
                     format!(
-                        "{rows} short dynamics screening rows from current run metrics; md_stability_score feeds md_score and final_score with weight {MD_SCORE_WEIGHT:.2}; restricted receptor model screening evidence"
+                        "{rows} OpenMM complex MD rows from current run metrics; md_stability_score feeds md_score and final_score with weight {MD_SCORE_WEIGHT:.2}; receptor-ligand force-field system evidence"
                     ),
                 )
             } else {
@@ -4660,7 +4732,7 @@ fn artifact_evidence_status(file: &str, path: &Path) -> Result<ArtifactEvidenceS
             if rows > 0 {
                 (
                     "available",
-                    format!("{rows} current-run MD metric artifact rows for screening summary"),
+                    format!("{rows} current-run MD metric artifact rows for complex summary"),
                 )
             } else {
                 ("not_generated", "no MD metric artifact rows".to_string())
@@ -4764,7 +4836,7 @@ fn render_report(options: &ScienceOptions) -> Result<String, String> {
     } else {
         text.push_str("| \u{6392}\u{5e8f} | \u{9776}\u{70b9} | \u{5019}\u{9009}\u{8303}\u{56f4} | \u{7269}\u{79cd} | \u{7efc}\u{5408}\u{5206}\u{6570} | \u{8bc1}\u{636e}\u{6458}\u{8981} |\n");
         text.push_str("| --- | --- | --- | --- | --- | --- |\n");
-        for (index, candidate) in candidates.iter().enumerate() {
+        for (index, candidate) in candidates.iter().take(REPORT_CANDIDATE_LIMIT).enumerate() {
             text.push_str(&format!(
                 "| {} | {} ({}) | {} | {} | {:.4} | {} |\n",
                 index + 1,
@@ -4774,6 +4846,13 @@ fn render_report(options: &ScienceOptions) -> Result<String, String> {
                 clean_cell(&candidate.organism),
                 candidate.final_score,
                 clean_cell(&candidate.evidence)
+            ));
+        }
+        if candidates.len() > REPORT_CANDIDATE_LIMIT {
+            text.push_str(&format!(
+                "\n\u{5171}\u{751f}\u{6210} {} \u{4e2a}\u{5019}\u{9009}\u{9776}\u{70b9}\u{ff1b}\u{62a5}\u{544a}\u{5c55}\u{793a}\u{524d} {} \u{4e2a}\u{ff0c}\u{5b8c}\u{6574}\u{6392}\u{540d}\u{53ef}\u{5728}\u{5bfc}\u{51fa}\u{7684}\u{5019}\u{9009}\u{6392}\u{5e8f}\u{8868}\u{4e2d}\u{67e5}\u{770b}\u{3002}\n",
+                candidates.len(),
+                REPORT_CANDIDATE_LIMIT
             ));
         }
         text.push_str(
@@ -5090,12 +5169,12 @@ fn write_artifact_source_map(options: &ScienceOptions) -> Result<(), String> {
         ),
         (
             "tool_outputs/mmseqs_alignment_matches.tsv",
-            "input_conversion_manifest.tsv;downloads/uniprot;downloads/metagenome;downloads/biolip2;MMseqs2 easy-search",
+            "input_conversion_manifest.tsv;indexes/mmseqs;MMseqs2 persistent database search",
             "metagenome_potential_matches.tsv;evidence_ledger.tsv",
         ),
         (
             "tool_outputs/mmseqs_alignment_status.tsv",
-            "MMseqs2 easy-search command execution",
+            "MMseqs2 persistent database search execution",
             "evidence_ledger.tsv",
         ),
         (
@@ -5120,12 +5199,12 @@ fn write_artifact_source_map(options: &ScienceOptions) -> Result<(), String> {
         ),
         (
             "tool_outputs/foldseek_structure_matches.tsv",
-            "structure_viewer coordinate artifact;downloads/rcsb/mmcif;Foldseek easy-search",
+            "structure_viewer coordinate artifact;indexes/foldseek;Foldseek persistent database search",
             "structure_interaction_matches.tsv;evidence_ledger.tsv",
         ),
         (
             "tool_outputs/foldseek_alignment_status.tsv",
-            "Foldseek easy-search command execution",
+            "Foldseek persistent database search execution",
             "evidence_ledger.tsv",
         ),
         (
@@ -6250,9 +6329,54 @@ fn merge_match_file(
             "structure_interaction" => entry.structure_score = entry.structure_score.max(score),
             _ => {}
         }
-        append_candidate_evidence(&mut entry.evidence, &format!("{}:{}", cols[1], cols[8]));
+        append_candidate_evidence(
+            &mut entry.evidence,
+            &candidate_evidence_summary(&cols[1], &cols[8]),
+        );
     }
     Ok(())
+}
+
+fn candidate_evidence_summary(source: &str, evidence: &str) -> String {
+    let mut parts = Vec::new();
+    for part in evidence
+        .split(';')
+        .map(str::trim)
+        .filter(|part| !part.is_empty())
+    {
+        let Some((key, value)) = part.split_once('=') else {
+            parts.push(part.to_string());
+            continue;
+        };
+        let key = key.trim();
+        let value = value.trim();
+        if key == "pdb_ids" || key == "target_chain_pdb_ids" {
+            let summarized = summarize_pdb_id_cell(value, 5);
+            if !summarized.is_empty() {
+                parts.push(format!("{key}={summarized}"));
+            }
+        } else if value.chars().count() <= 80 {
+            parts.push(format!("{key}={value}"));
+        }
+    }
+    let summary = if parts.is_empty() {
+        evidence.trim().chars().take(180).collect::<String>()
+    } else {
+        parts.join(";")
+    };
+    format!("{source}:{summary}")
+}
+
+fn summarize_pdb_id_cell(value: &str, max_ids: usize) -> String {
+    let ids = pdb_ids_from_text_in_order(value);
+    if ids.len() <= max_ids {
+        return ids.join(",");
+    }
+    format!(
+        "{}(+{} more)",
+        ids[..max_ids].join(","),
+        ids.len() - max_ids
+    )
 }
 
 fn append_candidate_evidence(evidence: &mut String, item: &str) {
@@ -6424,15 +6548,21 @@ fn decode_tsv_cell(value: &str) -> String {
 
 fn run_python_script(script: &str, args: &[String], context: &str) -> Result<String, String> {
     let mut errors = Vec::new();
+    let script_path = temp_python_script_path(context);
+    fs::write(&script_path, script)
+        .map_err(|err| format!("{context}_python_script_write_failed:{err}"))?;
     for candidate in script_python_command_candidates() {
         let mut command = candidate.clone();
-        command.push("-c".to_string());
-        command.push(script.to_string());
+        command.push(python_script_arg(
+            &candidate,
+            &script_path.display().to_string(),
+        ));
         for arg in args {
             command.push(python_script_arg(&candidate, arg));
         }
         match command_output(&command) {
             Ok(output) if output.status.success() => {
+                let _ = fs::remove_file(&script_path);
                 return Ok(decode_process_bytes(&output.stdout));
             }
             Ok(output) => errors.push(format!(
@@ -6446,9 +6576,23 @@ fn run_python_script(script: &str, args: &[String], context: &str) -> Result<Str
             Err(err) => errors.push(format!("{}:{err}", candidate.join(" "))),
         }
     }
+    let _ = fs::remove_file(&script_path);
     Err(format!(
         "{context}_python_failed:{}",
         clean_cell(&errors.join(" | "))
+    ))
+}
+
+fn temp_python_script_path(context: &str) -> PathBuf {
+    let millis = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_millis())
+        .unwrap_or_default();
+    env::temp_dir().join(format!(
+        "genoligand_{}_{}_{}.py",
+        safe_id(context),
+        std::process::id(),
+        millis
     ))
 }
 
@@ -6523,19 +6667,30 @@ fn safe_id(value: &str) -> String {
 }
 
 fn script_python_command_candidates() -> Vec<Vec<String>> {
-    let mut candidates = vec![
-        vec!["python".to_string()],
-        vec!["python3".to_string()],
-        vec!["py".to_string(), "-3".to_string()],
-    ];
-    if let Some(preferred) = std::env::var("GENOLIGAND_PYTHON")
-        .ok()
+    script_python_command_candidates_from_env(
+        std::env::var("GENOLIGAND_PYTHON").ok(),
+        env::var_os("LOCALAPPDATA"),
+    )
+}
+
+#[cfg(test)]
+fn script_python_command_candidates_from(preferred_python: Option<String>) -> Vec<Vec<String>> {
+    script_python_command_candidates_from_env(preferred_python, env::var_os("LOCALAPPDATA"))
+}
+
+fn script_python_command_candidates_from_env(
+    preferred_python: Option<String>,
+    local_appdata: Option<OsString>,
+) -> Vec<Vec<String>> {
+    let mut candidates = Vec::new();
+    if let Some(preferred) = preferred_python
         .filter(|value| !value.trim().is_empty())
         .map(|value| vec![value])
     {
         candidates.push(preferred);
     }
-    candidates
+    candidates.extend(python_worker_candidates_from_env(local_appdata));
+    dedup_command_vecs(candidates)
 }
 
 fn is_wsl_python_wrapper(candidate: &[String]) -> bool {
