@@ -76,6 +76,14 @@ def main() -> int:
         "run view must render backend stage readiness instead of fixed completed labels",
     )
     require(
+        "renderRunProgress()" in run_page and 'role="progressbar"' in run_page,
+        "run view must render a visible overall progress bar",
+    )
+    require(
+        "function runProgressPercent" in run_page and "stage.status" in run_page,
+        "run view must compute progress from backend stage statuses",
+    )
+    require(
         "stage.status === \"not_generated\"" in run_page,
         "run view must show not-generated stages for missing current-run artifacts",
     )

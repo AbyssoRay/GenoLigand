@@ -17,6 +17,7 @@
           <button class="button secondary" data-action="refresh-run">刷新</button>
           <button class="button ghost" data-action="to-results" ${canViewResults() ? "" : "disabled"}>查看结果</button>
         </div>
+        ${renderRunProgress()}
       </section>
       <section class="panel">
         <h2>流程阶段</h2>
@@ -86,6 +87,41 @@ function renderStage(stage, index) {
       </span>
       <span class="status-pill ${stageStatusClass(stage)}">${escapeHtml(statusLabel)}</span>
     </div>`;
+}
+
+function renderRunProgress() {
+  const stages = runStageRows();
+  const percent = runProgressPercent(stages);
+  const current = stages.find((stage) => stage.status === "running");
+  const done = stages.filter((stage) => ["ready", "not_generated"].includes(stage.status)).length;
+  const blocked = state.run?.state === "blocked" || state.run?.state === "failed";
+  const ready = state.run?.state === "completed";
+  const currentLabel = current?.label || (ready ? "运行完成" : state.run?.current_stage || "等待开始");
+  return `
+    <div class="progress-panel ${ready ? "ready" : blocked ? "blocked" : ""}">
+      <div class="progress-head">
+        <div>
+          <strong>${escapeHtml(currentLabel)}</strong>
+          <span>${escapeHtml(nextActionText())}</span>
+        </div>
+        <strong>${percent}%</strong>
+      </div>
+      <div class="progress-bar" role="progressbar" aria-valuemin="0" aria-valuemax="100" aria-valuenow="${percent}">
+        <span style="width: ${percent}%"></span>
+      </div>
+      <div class="progress-meta">
+        <span>${done} / ${stages.length} 阶段完成</span>
+        <span>${escapeHtml(state.run?.state_label || runStateLabel(state.run?.state || "not_started"))}</span>
+      </div>
+    </div>`;
+}
+
+function runProgressPercent(stages = runStageRows()) {
+  if (!stages.length) return 0;
+  if (state.run?.state === "completed") return 100;
+  const completed = stages.filter((stage) => ["ready", "not_generated"].includes(stage.status)).length;
+  const running = stages.some((stage) => stage.status === "running") ? 0.5 : 0;
+  return Math.max(0, Math.min(100, Math.round(((completed + running) / stages.length) * 100)));
 }
 
 function stageStatusClass(stage) {

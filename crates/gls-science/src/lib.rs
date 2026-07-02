@@ -2276,17 +2276,23 @@ fn run_pipeline(options: &ScienceOptions) -> Result<String, String> {
             options.run_dir.display()
         ));
     }
-    normalize_input(options)?;
-    compute_features(options)?;
-    match_known(options)?;
-    match_metagenome(options)?;
-    rank_targets(options)?;
-    evaluate_structure(options)?;
-    run_schema_bound_workers(options)?;
-    screen_dynamics(options)?;
-    rank_targets(options)?;
-    build_evidence(options)?;
-    render_report(options)?;
+    run_pipeline_stage(options, "input_normalize", || normalize_input(options))?;
+    run_pipeline_stage(options, "features_compute", || compute_features(options))?;
+    run_pipeline_stage(options, "database_match_known", || match_known(options))?;
+    run_pipeline_stage(options, "metagenome_match_potential", || {
+        match_metagenome(options)
+    })?;
+    run_pipeline_stage(options, "target_rank", || rank_targets(options))?;
+    run_pipeline_stage(options, "structure_evaluate", || {
+        evaluate_structure(options)
+    })?;
+    run_pipeline_stage(options, "dynamics_screen", || {
+        run_schema_bound_workers(options)?;
+        screen_dynamics(options)
+    })?;
+    run_pipeline_stage(options, "target_rank", || rank_targets(options))?;
+    run_pipeline_stage(options, "evidence_build", || build_evidence(options))?;
+    run_pipeline_stage(options, "report_render", || render_report(options))?;
     write_artifact_source_map(options)?;
     write_text(&options.run_dir.join("run_state.txt"), "completed\n")?;
     write_run_context(options, "completed", &[])?;
@@ -2294,6 +2300,21 @@ fn run_pipeline(options: &ScienceOptions) -> Result<String, String> {
         "pipeline_completed\trun_dir={}",
         options.run_dir.display()
     ))
+}
+
+fn run_pipeline_stage<F>(
+    options: &ScienceOptions,
+    stage: &str,
+    operation: F,
+) -> Result<String, String>
+where
+    F: FnOnce() -> Result<String, String>,
+{
+    write_text(
+        &options.run_dir.join("current_stage.txt"),
+        &(stage.to_string() + "\n"),
+    )?;
+    operation()
 }
 
 fn pipeline_blockers(options: &ScienceOptions) -> Result<Vec<String>, String> {
@@ -4425,9 +4446,10 @@ where
     if is_bindingdb_header(&headers) {
         return parse_bindingdb_rows(&headers, lines, label);
     }
+    let row_limit = canonical_index_row_limit(label);
     let mut rows = Vec::new();
     for line in lines {
-        if rows.len() >= MAX_SOURCE_INDEX_ROWS {
+        if rows.len() >= row_limit {
             break;
         }
         let line = line.map_err(|err| format!("{label}_read_failed:{err}"))?;
@@ -4449,6 +4471,14 @@ where
         });
     }
     Ok(rows)
+}
+
+fn canonical_index_row_limit(label: &str) -> usize {
+    if label.ends_with("_index") {
+        MAX_INDEX_ROWS
+    } else {
+        MAX_SOURCE_INDEX_ROWS
+    }
 }
 
 fn parse_chembl_sqlite_archive(path: &Path) -> Result<Vec<StoreRow>, String> {

@@ -717,6 +717,59 @@ fn structure_evaluate_writes_viewer_from_real_coordinate_file() {
 }
 
 #[test]
+fn structure_evaluate_reads_canonical_index_rows_beyond_source_sampling_limit() {
+    let root = temp_root("structure_index_full_scan");
+    let run = root.join("run");
+    let store = root.join("science_store");
+    let input = root.join("input.json");
+    ensure_dir(&store.join("indexes")).expect("indexes");
+    ensure_dir(&store.join("downloads/rcsb/mmcif/ik")).expect("coords");
+    write_text(&input, "{\"inputs\":[],\"files\":[]}\n").expect("input");
+    write_text(&run.join("input_normalized_manifest.tsv"), "input_id\n").expect("manifest");
+    write_text(
+        &run.join("feature_manifest.tsv"),
+        "input_id\tinput_kind\tfeature_family\tfeature_name\tfeature_value\tfeature_source\tfeature_token\ninput_1\tpeptide\tpeptide\tsequence_feature_token\tikv\tGenoLigand\tikv\n",
+    )
+    .expect("features");
+    let mut index = String::from(
+        "source\ttarget_id\ttarget_name\torganism\ttarget_class\tligand_tokens\tsequence_tokens\tstructure_tokens\tevidence\n",
+    );
+    for row in 0..MAX_SOURCE_INDEX_ROWS {
+        index.push_str(&format!(
+            "RCSB\t9{row:03}\tFiller structure {row}\tunknown\tstructure_record\t\tfiller{row}\tfiller pocket\trcsb_structure_file\n"
+        ));
+    }
+    index.push_str(
+        "RCSB\t1IKV\tRCSB structure 1IKV\tunknown\tstructure_record\t\t1ik ikv\t1ikv pocket\trcsb_structure_file\n",
+    );
+    write_text(&store.join("indexes/structure_targets.tsv"), &index).expect("structure index");
+    write_text(
+        &store.join("downloads/rcsb/mmcif/ik/1ikv.cif"),
+        "ATOM 1 N N . GLY A 1 1 ? 11.104 13.207 2.100 1.00 20.00 ? 1 GLY A N 1\nATOM 2 C CA . GLY A 1 1 ? 12.456 13.607 2.500 1.00 20.00 ? 1 GLY A CA 1\n",
+    )
+    .expect("coordinate cif");
+    let options = ScienceOptions {
+        workspace_root: root.clone(),
+        science_store: store,
+        input_manifest: input,
+        run_dir: run.clone(),
+    };
+
+    let out = run_science_command(ScienceCommand::StructureEvaluate, &options).expect("structure");
+    let matches = read_text(&run.join("structure_interaction_matches.tsv")).expect("matches");
+    let summary = read_text(&run.join("structure_patch_summary.tsv")).expect("summary");
+    let status = read_text(&run.join("structure_viewer_status.tsv")).expect("viewer status");
+
+    assert!(out.contains("structure_artifact=ready"));
+    assert!(out.contains("viewer_artifact=ready"));
+    assert!(matches.contains("1IKV"));
+    assert!(summary.contains("target_1IKV"));
+    assert!(status.contains("ready\t1IKV\t1IKV\tstructure_viewer.cif"));
+    fs::remove_dir_all(&root).expect("cleanup temp root");
+    assert!(!root.exists());
+}
+
+#[test]
 fn dynamics_screen_aggregates_real_metric_artifacts() {
     let root = temp_root("md_metric_artifacts");
     let run = root.join("run");

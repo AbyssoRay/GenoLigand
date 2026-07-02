@@ -1621,6 +1621,40 @@ fn user_run_detail_uses_stage_labels_not_internal_stage_keys() {
 }
 
 #[test]
+fn running_run_marks_completed_prior_stages_and_current_stage() {
+    let root = std::env::temp_dir().join(format!(
+        "genoligand-running-stage-progress-{}",
+        now_millis()
+    ));
+    let options = server_options(root.clone());
+    let run_dir = project_dir(&options, "project-1")
+        .join("runs")
+        .join("run-1");
+    fs::create_dir_all(&run_dir).expect("run dir");
+    fs::write(run_dir.join("run_state.txt"), "running\n").expect("state");
+    fs::write(run_dir.join("current_stage.txt"), "structure_evaluate\n").expect("stage");
+
+    let payload = user_run_json(&options, "run-1");
+    let stages = payload["stages"].as_array().expect("stages");
+    let by_id = |id: &str| {
+        stages
+            .iter()
+            .find(|stage| stage.get("id").and_then(Value::as_str) == Some(id))
+            .expect("stage id")
+    };
+
+    assert_eq!(payload["current_stage"], "结构与口袋评估");
+    assert_eq!(by_id("input")["status"], "ready");
+    assert_eq!(by_id("features")["status"], "ready");
+    assert_eq!(by_id("known")["status"], "ready");
+    assert_eq!(by_id("metagenome")["status"], "ready");
+    assert_eq!(by_id("structure")["status"], "running");
+    assert_eq!(by_id("md")["status"], "waiting");
+
+    fs::remove_dir_all(&root).ok();
+}
+
+#[test]
 fn completed_run_marks_missing_structure_and_md_stages_not_generated() {
     let root = std::env::temp_dir().join(format!("genoligand-user-run-stages-{}", now_millis()));
     let options = server_options(root.clone());

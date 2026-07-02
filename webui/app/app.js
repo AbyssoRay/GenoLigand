@@ -42,6 +42,11 @@ async function refreshAll() {
     if (state.run?.run_id) {
       state.run = await api(`/api/user/runs/${state.run.run_id}`);
       await loadRunData();
+      if (state.run?.state === "running") {
+        startRunProgressPolling();
+      } else {
+        stopRunProgressPolling();
+      }
     }
   } catch (error) {
     state.alert = `无法连接本机服务：${error.message}`;

@@ -892,7 +892,7 @@ fn start_run(options: &ServerOptions, project_id: &str) -> Value {
     let run_dir = project.join("runs").join(&run_id);
     let _ = fs::create_dir_all(&run_dir);
     let _ = write_text(&run_dir.join("run_state.txt"), "running\n");
-    let _ = write_text(&run_dir.join("current_stage.txt"), "pipeline_run\n");
+    let _ = write_text(&run_dir.join("current_stage.txt"), "input_normalize\n");
     let worker = worker_environment_status(options);
     if !worker
         .get("ready")
@@ -920,6 +920,51 @@ fn start_run(options: &ServerOptions, project_id: &str) -> Value {
     let command = gls_cli_command(options, &input, &run_dir);
     let command_text = command.join(" ");
     let _ = write_text(&run_dir.join("current_command.txt"), &command_text);
+    let _ = write_text(
+        &run_dir.join("run.log"),
+        &format!("command\t{command_text}\nstate\trunning\n"),
+    );
+    let _ = write_text(&project.join("latest_run_id.txt"), &run_id);
+    let background_options = options.clone();
+    let background_project = project.clone();
+    let background_run_dir = run_dir.clone();
+    let background_command = command.clone();
+    let background_command_text = command_text.clone();
+    match std::thread::Builder::new()
+        .name(format!("genoligand-run-{run_id}"))
+        .spawn(move || {
+            finish_run_command(
+                &background_options,
+                &background_project,
+                &background_run_dir,
+                &background_command,
+                &background_command_text,
+            );
+        }) {
+        Ok(_) => json!({"status":"running","run":run_json(options,&run_id)}),
+        Err(err) => {
+            let reason = format!("pipeline_thread_launch_failed:{err}");
+            let _ = write_text(&run_dir.join("run_state.txt"), "failed\n");
+            let _ = write_text(
+                &run_dir.join("failure_reason.txt"),
+                &(reason.clone() + "\n"),
+            );
+            let _ = write_text(
+                &run_dir.join("run.log"),
+                &format!("command\t{command_text}\nstate\tfailed\nstderr\n{reason}\n"),
+            );
+            json!({"status":"failed","run":run_json(options,&run_id)})
+        }
+    }
+}
+
+fn finish_run_command(
+    options: &ServerOptions,
+    project: &Path,
+    run_dir: &Path,
+    command: &[String],
+    command_text: &str,
+) {
     let output = Command::new(&command[0])
         .args(&command[1..])
         .current_dir(&options.workspace_root)
@@ -967,13 +1012,19 @@ fn start_run(options: &ServerOptions, project_id: &str) -> Value {
         &run_dir.join("run.log"),
         &format!("command\t{command_text}\nstate\t{state}\nstdout\n{stdout}\nstderr\n{stderr}\n"),
     );
-    let _ = write_text(&project.join("latest_run_id.txt"), &run_id);
-    let artifact_index = artifact_index(&run_dir);
+    let run_id = run_dir
+        .file_name()
+        .and_then(|value| value.to_str())
+        .unwrap_or_default();
+    let _ = write_text(
+        &project.join("latest_run_id.txt"),
+        &(run_id.to_string() + "\n"),
+    );
+    let artifact_index = artifact_index(run_dir);
     let _ = write_text(
         &run_dir.join("artifact_index.json"),
         &(artifact_index.to_string() + "\n"),
     );
-    json!({"status":state,"run":run_json(options,&run_id)})
 }
 
 fn start_user_run(options: &ServerOptions, project_id: &str) -> Value {
@@ -1180,10 +1231,22 @@ fn user_run_stages(run_dir: &Path, state: &str) -> Vec<Value> {
         ("evidence", "证据链与报告", "evidence_build"),
     ];
     let current = read_trimmed(&run_dir.join("current_stage.txt")).unwrap_or_default();
+    let current_index = specs
+        .iter()
+        .position(|(_, _, stage_key)| *stage_key == current);
     specs
         .iter()
-        .map(|(id, label, stage_key)| {
-            let (status, reason) = user_stage_status(run_dir, state, id, stage_key, &current);
+        .enumerate()
+        .map(|(index, (id, label, stage_key))| {
+            let (status, reason) = user_stage_status(
+                run_dir,
+                state,
+                id,
+                stage_key,
+                &current,
+                index,
+                current_index,
+            );
             json!({
                 "id": id,
                 "label": label,
@@ -1201,12 +1264,23 @@ fn user_stage_status<'a>(
     id: &str,
     stage_key: &str,
     current: &str,
+    stage_index: usize,
+    current_index: Option<usize>,
 ) -> (&'a str, String) {
     if state == "completed" {
         return completed_stage_status(run_dir, id);
     }
-    if state == "running" && current == stage_key {
-        return ("running", String::new());
+    if state == "running" {
+        if let Some(current_index) = current_index {
+            if stage_index < current_index {
+                return ("ready", String::new());
+            }
+            if current == stage_key {
+                return ("running", String::new());
+            }
+        } else if current == "pipeline_run" && stage_index == 0 {
+            return ("running", String::new());
+        }
     }
     if matches!(state, "failed" | "blocked" | "cancelled") {
         return ("blocked", String::new());

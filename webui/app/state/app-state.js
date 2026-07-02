@@ -26,6 +26,7 @@
 };
 
 let setupProgressTimer = null;
+let runProgressTimer = null;
 
 const page = document.querySelector("[data-page]");
 const alerts = document.querySelector("[data-alerts]");

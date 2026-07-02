@@ -81,6 +81,34 @@ async function refreshSetupProgress() {
   }
 }
 
+async function refreshRunProgress() {
+  if (!state.run?.run_id) return;
+  try {
+    state.run = await api(`/api/user/runs/${state.run.run_id}`);
+    await loadRunData();
+  } catch (error) {
+    state.alert = `无法刷新运行进度：${error.message}`;
+  }
+}
+
+function startRunProgressPolling() {
+  stopRunProgressPolling();
+  runProgressTimer = window.setInterval(async () => {
+    await refreshRunProgress();
+    if (state.run?.state !== "running") {
+      stopRunProgressPolling();
+    }
+    if (state.step === "run") render();
+  }, 1000);
+}
+
+function stopRunProgressPolling() {
+  if (runProgressTimer) {
+    window.clearInterval(runProgressTimer);
+    runProgressTimer = null;
+  }
+}
+
 function startSetupProgressPolling() {
   stopSetupProgressPolling();
   setupProgressTimer = window.setInterval(async () => {
@@ -156,10 +184,34 @@ async function startRun() {
     return;
   }
   state.alert = "";
-  const result = await api(`/api/user/projects/${state.project.project_id}/runs`, { method: "POST" });
-  state.run = result.run;
-  state.project = result.project || (await api(`/api/user/projects/${state.project.project_id}`));
-  await loadRunData();
+  setStep("run");
+  state.run = {
+    state: "running",
+    state_label: "启动中",
+    current_stage: "输入归一化",
+    stages: stageLabels.map((label, index) => ({
+      label,
+      status: index === 0 ? "running" : "waiting",
+      status_label: index === 0 ? "进行中" : "等待",
+      reason: "",
+    })),
+  };
+  state.runData = null;
+  render();
+  try {
+    const result = await api(`/api/user/projects/${state.project.project_id}/runs`, { method: "POST" });
+    state.run = result.run;
+    state.project = result.project || (await api(`/api/user/projects/${state.project.project_id}`));
+    await loadRunData();
+    if (state.run?.state === "running") {
+      startRunProgressPolling();
+    } else {
+      stopRunProgressPolling();
+    }
+  } catch (error) {
+    state.alert = `运行启动失败：${error.message}`;
+    stopRunProgressPolling();
+  }
   setStep("run");
 }
 
