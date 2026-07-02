@@ -535,6 +535,147 @@ fn database_matching_requires_computed_feature_tokens() {
 }
 
 #[test]
+fn known_matching_searches_bindingdb_zip_for_current_small_molecule() {
+    let root = temp_root("bindingdb_onsite_search");
+    let store = root.join("science_store");
+    let run = root.join("run");
+    let input = root.join("input.json");
+    write_text(
+        &store.join("indexes/known_targets.tsv"),
+        "source\ttarget_id\ttarget_name\torganism\ttarget_class\tligand_tokens\tsequence_tokens\tstructure_tokens\tevidence\n",
+    )
+    .expect("empty known index");
+    write_zip(
+        &store.join("downloads/bindingdb/bindingdb_all.tsv.zip"),
+        "BindingDB_All.tsv",
+        "Ligand SMILES\tBindingDB Ligand Name\tTarget Name\tTarget Source Organism According to Curator or DataSource\tKi (nM)\tPDB ID(s) for Ligand-Target Complex\tLigand HET ID in PDB\tUniProt (SwissProt) Primary ID of Target Chain 1\tBindingDB MonomerID\nCC(=O)Nc1nnc(s1)S(=O)(=O)N\tAcetazolamide, AZM\tCarbonic anhydrase 2\tHomo sapiens\t12\t3HS4,1AZM,2H4N\tAZM\tP00918\t10880\n",
+    )
+    .expect("bindingdb zip");
+    write_text(
+        &input,
+        "{\"inputs\":[{\"field\":\"small_molecule\",\"value\":\"CC(=O)Nc1nnc(s1)S(=O)(=O)N\"}],\"files\":[]}\n",
+    )
+    .expect("input");
+    let options = ScienceOptions {
+        workspace_root: root.clone(),
+        science_store: store,
+        input_manifest: input,
+        run_dir: run.clone(),
+    };
+
+    run_science_command(ScienceCommand::InputNormalize, &options).expect("normalize");
+    run_science_command(ScienceCommand::FeaturesCompute, &options).expect("features");
+    run_science_command(ScienceCommand::DatabaseMatchKnown, &options).expect("match known");
+    let matches = read_text(&run.join("known_database_matches.tsv")).expect("known matches");
+
+    assert!(matches.contains("BindingDB"));
+    assert!(matches.contains("P00918"));
+    assert!(matches.contains("Carbonic anhydrase 2"));
+    assert!(matches.contains("bindingdb_onsite_activity_row"));
+    assert!(matches.contains("ligand_code=AZM"));
+    assert!(matches.contains("pdb_ids=3HS4,1AZM,2H4N"));
+    fs::remove_dir_all(&root).expect("cleanup temp root");
+    assert!(!root.exists());
+}
+
+#[test]
+fn known_matching_deduplicates_onsite_hits_and_downweights_token_noise() {
+    let root = temp_root("bindingdb_dedupe_noise");
+    let store = root.join("science_store");
+    let run = root.join("run");
+    let input = root.join("input.json");
+    ensure_dir(&store.join("indexes")).expect("indexes");
+    write_text(
+        &store.join("indexes/known_targets.tsv"),
+        "source\ttarget_id\ttarget_name\torganism\ttarget_class\tligand_tokens\tsequence_tokens\tstructure_tokens\tevidence\nChEMBL\tCHEMBL_NOISE\tToken-only noise target\tHomo sapiens\tknown_human_protein\tgeneric\t\t\tchembl_activity_row\n",
+    )
+    .expect("known index");
+    write_zip(
+        &store.join("downloads/bindingdb/bindingdb_all.tsv.zip"),
+        "BindingDB_All.tsv",
+        "Ligand SMILES\tBindingDB Ligand Name\tTarget Name\tTarget Source Organism According to Curator or DataSource\tKi (nM)\tPDB ID(s) for Ligand-Target Complex\tLigand HET ID in PDB\tUniProt (SwissProt) Primary ID of Target Chain 1\tBindingDB MonomerID\nCC(=O)Nc1nnc(s1)S(=O)(=O)N\tAcetazolamide, AZM\tCarbonic anhydrase 2\tHomo sapiens\t900\t2H4N\tAZM\tP00918\t10880\nCC(=O)Nc1nnc(s1)S(=O)(=O)N\tAcetazolamide, AZM\tCarbonic anhydrase 2\tHomo sapiens\t12\t2H4N\tAZM\tP00918\t10880\n",
+    )
+    .expect("bindingdb zip");
+    write_text(
+        &run.join("input_normalized_manifest.tsv"),
+        "input_id\tinput_kind\tprimary_value\tfile_count\tfeature_tokens\tstatus\ninput_1\tsmall_molecule\tCC(=O)Nc1nnc(s1)S(=O)(=O)N\t0\tgeneric\tnormalized\n",
+    )
+    .expect("normalized");
+    write_text(
+        &run.join("feature_manifest.tsv"),
+        "input_id\tinput_kind\tfeature_family\tfeature_name\tfeature_value\tfeature_source\tfeature_token\ninput_1\tsmall_molecule\tsmall_molecule\tligand_fingerprint_token\tgeneric\tGenoLigand\tgeneric\n",
+    )
+    .expect("features");
+    write_text(&input, "{\"inputs\":[],\"files\":[]}\n").expect("input");
+    let options = ScienceOptions {
+        workspace_root: root.clone(),
+        science_store: store,
+        input_manifest: input,
+        run_dir: run.clone(),
+    };
+
+    run_science_command(ScienceCommand::DatabaseMatchKnown, &options).expect("match known");
+    let matches = read_text(&run.join("known_database_matches.tsv")).expect("known matches");
+    rank_targets(&options).expect("rank");
+    let ranking = read_text(&run.join("target_candidate_ranking.tsv")).expect("ranking");
+    let first_candidate = ranking.lines().nth(1).unwrap_or_default();
+
+    assert!(matches.contains("CHEMBL_NOISE"));
+    assert!(matches.contains(
+        "CHEMBL_NOISE\tToken-only noise target\tHomo sapiens\tknown_human_protein\t0.4500"
+    ));
+    assert_eq!(matches.matches("\tP00918\t").count(), 1);
+    assert!(matches.contains("Ki (nM)=12"));
+    assert!(first_candidate.contains("target_P00918"));
+    fs::remove_dir_all(&root).expect("cleanup temp root");
+    assert!(!root.exists());
+}
+
+#[test]
+fn structure_matching_uses_ligand_identity_from_known_search() {
+    let root = temp_root("structure_uses_known_ligand_identity");
+    let store = root.join("science_store");
+    let run = root.join("run");
+    let input = root.join("input.json");
+    ensure_dir(&store.join("indexes")).expect("indexes");
+    write_text(
+        &run.join("input_normalized_manifest.tsv"),
+        "input_id\tinput_kind\tprimary_value\tfile_count\tfeature_tokens\tstatus\ninput_1\tsmall_molecule\tCC(=O)Nc1nnc(s1)S(=O)(=O)N\t0\tcc\tnormalized\n",
+    )
+    .expect("normalized");
+    write_text(
+        &run.join("feature_manifest.tsv"),
+        "input_id\tinput_kind\tfeature_family\tfeature_name\tfeature_value\tfeature_source\tfeature_token\ninput_1\tsmall_molecule\tsmall_molecule\tligand_fingerprint_token\tcc\tGenoLigand\tcc\n",
+    )
+    .expect("features");
+    write_text(
+        &run.join("known_database_matches.tsv"),
+        "input_id\tsource\ttarget_id\ttarget_name\torganism\ttarget_class\tmatch_score\tmatched_features\tevidence\ninput_1\tBindingDB\tP00918\tCarbonic anhydrase 2\tHomo sapiens\tknown_human_protein\t1.0000\tligand_identity\tbindingdb_onsite_activity_row;ligand_code=AZM;pdb_ids=3HS4,1AZM,2H4N\n",
+    )
+    .expect("known matches");
+    write_text(
+        &store.join("indexes/structure_targets.tsv"),
+        "source\ttarget_id\ttarget_name\torganism\ttarget_class\tligand_tokens\tsequence_tokens\tstructure_tokens\tevidence\nRCSB\t2H4N\tH94N Carbonic anhydrase II complexed with acetazolamide\tHomo sapiens\tstructure_record\tazm\t2h4 h4n\tace taz azm car bon\tmolecule_coordinate_row\n",
+    )
+    .expect("structure index");
+    write_text(&input, "{\"inputs\":[],\"files\":[]}\n").expect("input");
+    let options = ScienceOptions {
+        workspace_root: root.clone(),
+        science_store: store,
+        input_manifest: input,
+        run_dir: run.clone(),
+    };
+
+    run_science_command(ScienceCommand::StructureEvaluate, &options).expect("structure");
+    let matches = read_text(&run.join("structure_interaction_matches.tsv")).expect("matches");
+
+    assert!(matches.contains("2H4N"));
+    assert!(matches.contains("azm"));
+    fs::remove_dir_all(&root).expect("cleanup temp root");
+    assert!(!root.exists());
+}
+
+#[test]
 fn webui_field_names_normalize_to_all_supported_input_types() {
     let root = temp_root("webui_fields");
     let input = root.join("input.json");
@@ -637,6 +778,16 @@ fn md_summary_score_participates_in_ranking_and_report() {
             "candidate_id\trmsd\trmsf\tligand_drift\thydrogen_bond_occupancy\tcontact_occupancy\tinteraction_persistence\tmd_risk_flags\tmd_score_decomposition\tmd_stability_score\ntarget_T1\t1.2\t0.4\t0.6\t0.72\t0.81\t0.77\tstable\tworker_md\t0.8\n",
         )
         .expect("md summary");
+    write_text(
+        &run.join("tool_outputs/complex_md_manifest.json"),
+        r#"{"candidate_id":"target_T1","method":"openmm_receptor_ligand_complex_dynamics","platform":"CUDA","receptor_coordinate":"structure_viewer.cif","ligand_coordinate":"tool_outputs/ligand_placement.tsv","trajectory":"tool_outputs/md_trajectory.tsv","metric_artifacts":["tool_outputs/md_summary.tsv"]}"#,
+    )
+    .expect("complex md manifest");
+    write_text(
+        &run.join("tool_outputs/md_run_manifest.json"),
+        r#"{"candidate_id":"target_T1","method":"openmm_receptor_ligand_complex_dynamics","platform":"CUDA","receptor_coordinate":"structure_viewer.cif","complex_manifest":"tool_outputs/complex_md_manifest.json","trajectory":"tool_outputs/md_trajectory.tsv"}"#,
+    )
+    .expect("md run manifest");
     let options = ScienceOptions {
         workspace_root: root.clone(),
         science_store: store,
@@ -655,7 +806,7 @@ fn md_summary_score_participates_in_ranking_and_report() {
     let report = read_text(&run.join("research_report.md")).expect("report");
     let source_map = read_text(&run.join("artifact_source_map.tsv")).expect("source map");
 
-    assert!(ranking.contains("0.6300\t1.0000\t0.0000\t0.0000\t0.0000\t0.8000"));
+    assert!(ranking.contains("0.5800\t1.0000\t0.0000\t0.0000\t0.0000\t0.8000"));
     assert!(ranking.contains("ChEMBL:chembl_activity_row;MD:md_summary_stability_score"));
     assert!(detail.contains("\"md\":0.8"));
     assert!(detail.contains("tool_outputs/md_run_manifest.json"));
@@ -669,6 +820,88 @@ fn md_summary_score_participates_in_ranking_and_report() {
     assert!(report.contains("md_stability_score"));
     assert!(report.contains("0.10"));
     assert!(source_map.contains("target_candidate_ranking.tsv\tknown_database_matches.tsv;metagenome_potential_matches.tsv;structure_interaction_matches.tsv;md_summary.tsv"));
+    fs::remove_dir_all(&root).expect("cleanup temp root");
+    assert!(!root.exists());
+}
+
+#[test]
+fn ranking_ignores_md_summary_without_complex_manifest() {
+    let root = temp_root("md_without_complex_manifest");
+    let run = root.join("run");
+    let store = create_temporary_test_store(&root).expect("store");
+    let input = root.join("input.json");
+    write_text(
+        &input,
+        "{\"inputs\":[{\"field\":\"peptide\",\"value\":\"IKVAV\"}],\"files\":[]}\n",
+    )
+    .expect("input");
+    write_text(
+        &run.join("known_database_matches.tsv"),
+        "input_id\tsource\ttarget_id\ttarget_name\torganism\ttarget_class\tmatch_score\tmatched_features\tevidence\ninput_1\tChEMBL\tT1\tTarget 1\tHomo sapiens\tenzyme\t1.0\tikvav\tchembl_activity_row\n",
+    )
+    .expect("known match");
+    write_text(
+        &run.join("md_summary.tsv"),
+        "candidate_id\trmsd\trmsf\tligand_drift\thydrogen_bond_occupancy\tcontact_occupancy\tinteraction_persistence\tmd_risk_flags\tmd_score_decomposition\tmd_stability_score\ntarget_T1\t1.2\t0.4\t0.6\t0.72\t0.81\t0.77\tno_receptor_contact_model;rdkit_peptide_conformer_ensemble\tworker_md\t0.8\n",
+    )
+    .expect("md summary");
+    write_text(
+        &run.join("tool_outputs/md_run_manifest.json"),
+        r#"{"candidate_id":"target_T1","method":"rdkit_peptide_conformer_ensemble","platform":"RDKit","receptor_coordinate":null,"complex_manifest":"","trajectory":"tool_outputs/md_trajectory.tsv"}"#,
+    )
+    .expect("md run manifest");
+    let options = ScienceOptions {
+        workspace_root: root.clone(),
+        science_store: store,
+        input_manifest: input,
+        run_dir: run.clone(),
+    };
+
+    rank_targets(&options).expect("rank");
+    let ranking = read_text(&run.join("target_candidate_ranking.tsv")).expect("ranking");
+
+    assert!(ranking.contains("0.5000\t1.0000\t0.0000\t0.0000\t0.0000\t0.0000"));
+    assert!(!ranking.contains("MD:md_summary_stability_score"));
+    fs::remove_dir_all(&root).expect("cleanup temp root");
+    assert!(!root.exists());
+}
+
+#[test]
+fn ranking_uses_completed_vina_docking_score() {
+    let root = temp_root("vina_docking_score");
+    let run = root.join("run");
+    let store = create_temporary_test_store(&root).expect("store");
+    let input = root.join("input.json");
+    write_text(
+        &input,
+        "{\"inputs\":[{\"field\":\"small_molecule\",\"value\":\"CCO\"}],\"files\":[]}\n",
+    )
+    .expect("input");
+    write_text(
+        &run.join("known_database_matches.tsv"),
+        "input_id\tsource\ttarget_id\ttarget_name\torganism\ttarget_class\tmatch_score\tmatched_features\tevidence\ninput_1\tChEMBL\tT1\tTarget 1\tHomo sapiens\tenzyme\t1.0\tcco\tchembl_activity_row\n",
+    )
+    .expect("known match");
+    write_text(
+        &run.join("docking_summary.tsv"),
+        "candidate_id\tdocking_status\tdocking_score\tdocking_engine\tnotes\ntarget_T1\tcompleted\t-7.2\tvina\tpose=tool_outputs/docking_pose_target_T1.pdbqt\n",
+    )
+    .expect("docking summary");
+    let options = ScienceOptions {
+        workspace_root: root.clone(),
+        science_store: store,
+        input_manifest: input,
+        run_dir: run.clone(),
+    };
+
+    rank_targets(&options).expect("rank");
+    let ranking = read_text(&run.join("target_candidate_ranking.tsv")).expect("ranking");
+    let score = read_text(&run.join("score_decomposition.tsv")).unwrap_or_default();
+
+    assert!(
+        ranking.contains("\t0.6000\t0.0000\tChEMBL:chembl_activity_row;Docking:vina_completed")
+    );
+    assert!(!score.contains("docking_score_contribution"));
     fs::remove_dir_all(&root).expect("cleanup temp root");
     assert!(!root.exists());
 }
@@ -712,6 +945,69 @@ fn structure_evaluate_writes_viewer_from_real_coordinate_file() {
     assert!(out.contains("viewer_artifact=ready"));
     assert!(viewer.contains("ATOM 1"));
     assert!(status.contains("ready\t10GS\t10GS\tstructure_viewer.cif"));
+    fs::remove_dir_all(&root).expect("cleanup temp root");
+    assert!(!root.exists());
+}
+
+#[test]
+fn structure_evaluate_prefers_bindingdb_pdb_candidate_over_token_noise() {
+    let root = temp_root("structure_bindingdb_candidate");
+    let run = root.join("run");
+    let store = root.join("science_store");
+    let input = root.join("input.json");
+    ensure_dir(&store.join("indexes")).expect("indexes");
+    ensure_dir(&store.join("downloads/rcsb/mmcif/12")).expect("noise coords");
+    ensure_dir(&store.join("downloads/rcsb/mmcif/h4")).expect("target coords");
+    ensure_dir(&run.join("tool_outputs")).expect("tool outputs");
+    write_text(&input, "{\"inputs\":[],\"files\":[]}\n").expect("input");
+    write_text(&run.join("input_normalized_manifest.tsv"), "input_id\n").expect("manifest");
+    write_text(
+        &run.join("feature_manifest.tsv"),
+        "input_id\tinput_kind\tfeature_family\tfeature_name\tfeature_value\tfeature_source\tfeature_token\ninput_1\tsmall_molecule\tligand\ttext\tazm\tuser\tazm\n",
+    )
+    .expect("features");
+    write_text(
+        &run.join("known_database_matches.tsv"),
+        "input_id\tsource\ttarget_id\ttarget_name\torganism\ttarget_class\tmatch_score\tmatched_features\tevidence\ninput_1\tBindingDB\tP00918\tCarbonic anhydrase 2\tHomo sapiens\tknown_human_protein\t1.0000\tligand_code=AZM;pdb_ids=2H4N\tbindingdb_onsite_activity_row;Ki (nM)=12;ligand_code=AZM;pdb_ids=2H4N\n",
+    )
+    .expect("known matches");
+    write_text(
+        &store.join("indexes/structure_targets.tsv"),
+        "source\ttarget_id\ttarget_name\torganism\ttarget_class\tligand_tokens\tsequence_tokens\tstructure_tokens\tevidence\nRCSB\t112M\tUnrelated myoglobin structure\tunknown\tstructure_record\tazm\t112m\t112m pocket\trcsb_structure_file\nRCSB\t2H4N\tCarbonic anhydrase II complexed with acetazolamide\tHomo sapiens\tstructure_record\tazm\t2h4 h4n\tcarbonic anhydrase ii azm\trcsb_structure_file\n",
+    )
+    .expect("structure index");
+    write_text(
+        &store.join("downloads/rcsb/mmcif/12/112m.cif"),
+        "_struct.title 'UNRELATED MYOGLOBIN COORDINATE'\nATOM 1 N N . GLY A 1 1 ? 1.0 1.0 1.0 1.00 20.00 ? 1 GLY A N 1\n",
+    )
+    .expect("noise coordinate");
+    write_text(
+        &store.join("downloads/rcsb/mmcif/h4/2h4n.cif"),
+        "_struct.title 'HUMAN CARBONIC ANHYDRASE II COMPLEXED WITH ACETAZOLAMIDE'\nATOM 1 N N . GLY A 1 1 ? 2.0 2.0 2.0 1.00 20.00 ? 1 GLY A N 1\n",
+    )
+    .expect("target coordinate");
+    write_text(
+        &run.join("tool_outputs/docking_summary.tsv"),
+        "candidate_id\tdocking_status\tdocking_score\tdocking_engine\tnotes\n",
+    )
+    .expect("skip worker");
+    let options = ScienceOptions {
+        workspace_root: root.clone(),
+        science_store: store,
+        input_manifest: input,
+        run_dir: run.clone(),
+    };
+
+    let out = run_science_command(ScienceCommand::StructureEvaluate, &options).expect("structure");
+    let status = read_text(&run.join("structure_viewer_status.tsv")).expect("viewer status");
+    let selected =
+        read_text(&run.join("complex_candidate_selection.tsv")).expect("candidate selection");
+    let summary = read_text(&run.join("structure_patch_summary.tsv")).expect("summary");
+
+    assert!(out.contains("viewer_artifact=ready"));
+    assert!(status.contains("ready\tP00918\t2H4N\tstructure_viewer.cif"));
+    assert!(selected.contains("target_P00918\tinput_1\tP00918\tCarbonic anhydrase 2"));
+    assert!(summary.contains("target_P00918\t1.0000"));
     fs::remove_dir_all(&root).expect("cleanup temp root");
     assert!(!root.exists());
 }
@@ -1187,6 +1483,34 @@ fn prepare_science_store_builds_structure_index_from_downloaded_sources() {
 }
 
 #[test]
+fn structure_index_reads_ligand_names_from_mmcif_coordinates() {
+    let root = temp_root("structure_mmcif_ligand_names");
+    let store = root.join("science_store");
+    write_gzip(
+        &store.join("downloads/rcsb/mmcif/h4/2h4n.cif.gz"),
+        "data_2H4N\n_struct.title 'H94N CARBONIC ANHYDRASE II COMPLEXED WITH ACETAZOLAMIDE'\nloop_\n_chem_comp.id\n_chem_comp.type\n_chem_comp.mon_nstd_flag\n_chem_comp.name\n_chem_comp.pdbx_synonyms\n_chem_comp.formula\n_chem_comp.formula_weight\nAZM non-polymer . 5-ACETAMIDO-1,3,4-THIADIAZOLE-2-SULFONAMIDE ACETAZOLAMIDE 'C4 H6 N4 O3 S2' 222.25\nATOM 1 N N . GLY A 1 1 ? 11.104 13.207 2.100 1.00 20.00 ? 1 GLY A N 1\n",
+    )
+    .expect("write mmcif");
+    let options = StoreOptions {
+        workspace_root: root.clone(),
+        science_store: store.clone(),
+    };
+
+    run_store_command(ScienceCommand::PrepareScienceStore, &options).expect("prepare store");
+    let structure =
+        read_text(&store.join("indexes/structure_targets.tsv")).expect("structure index");
+
+    assert!(structure.contains("2H4N"));
+    assert!(structure.contains("ace"));
+    assert!(structure.contains("taz"));
+    assert!(structure.contains("azm"));
+    assert!(structure.contains("car"));
+    assert!(structure.contains("bon"));
+    fs::remove_dir_all(&root).expect("cleanup temp root");
+    assert!(!root.exists());
+}
+
+#[test]
 fn prepare_science_store_keeps_canonical_target_rows_beyond_source_sampling_limit() {
     let root = temp_root("canonical_target_rows_beyond_sampling");
     let store = root.join("science_store");
@@ -1247,6 +1571,42 @@ fn chembl_sqlite_query_uses_index_limit_not_source_sampling_limit() {
 
     assert!(query.contains("LIMIT 30000"));
     assert!(!query.contains("LIMIT 5000"));
+}
+
+#[test]
+fn prepare_science_store_marks_row_limited_indexes_as_incomplete() {
+    let root = temp_root("row_limited_index_incomplete");
+    let store = root.join("science_store");
+    let mut targets = String::from(
+        "source\ttarget_id\ttarget_name\torganism\ttarget_class\tligand_tokens\tsequence_tokens\tstructure_tokens\tevidence\n",
+    );
+    for row in 0..=MAX_INDEX_ROWS {
+        targets.push_str(&format!(
+            "import\tLIMITED_{row}\tLimited target {row}\tunknown\tknown_protein\t\tseq{row}\t\timported_row\n"
+        ));
+    }
+    write_text(&store.join("imports/known_targets.tsv"), &targets).expect("known import");
+    let options = StoreOptions {
+        workspace_root: root.clone(),
+        science_store: store.clone(),
+    };
+
+    run_store_command(ScienceCommand::PrepareScienceStore, &options).expect("prepare store");
+    let manifest = read_text(&store.join("index_build_manifest.tsv")).expect("index manifest");
+    let status_text = read_text(&store.join("install_status.json")).expect("install status");
+    let status: Value = serde_json::from_str(&status_text).expect("status json");
+
+    assert!(manifest.contains("index_row_limit_reached"));
+    assert_eq!(status["status"], "needs_repair");
+    assert!(
+        status["missing_components"]
+            .as_array()
+            .expect("missing")
+            .iter()
+            .any(|item| item.as_str() == Some("index_limit:known_targets"))
+    );
+    fs::remove_dir_all(&root).expect("cleanup temp root");
+    assert!(!root.exists());
 }
 
 fn write_gzip(path: &Path, text: &str) -> Result<(), String> {

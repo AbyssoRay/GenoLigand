@@ -2320,6 +2320,7 @@ fn databases_json(options: &ServerOptions) -> Value {
         "indexes/metagenome_targets.tsv",
         "indexes/structure_targets.tsv",
         "indexes/tool_versions.tsv",
+        "index_build_manifest.tsv",
     ];
     let rows = required
         .iter()
@@ -2327,6 +2328,8 @@ fn databases_json(options: &ServerOptions) -> Value {
             let path = store.join(rel);
             let ready = if *rel == "indexes/tool_versions.tsv" {
                 tool_versions_ready(&path)
+            } else if *rel == "index_build_manifest.tsv" {
+                index_build_ready(&path)
             } else {
                 path.exists()
             };
@@ -2952,6 +2955,7 @@ fn preflight_store_ready(options: &ServerOptions) -> bool {
         && install_status_ready(&store.join("install_status.json"))
         && source_requirements_ready(&store.join("source_requirements.tsv"))
         && source_manifests_ready(&store.join("manifests"))
+        && index_build_ready(&store.join("index_build_manifest.tsv"))
 }
 
 fn install_status_ready(path: &Path) -> bool {
@@ -2967,6 +2971,20 @@ fn install_status_ready(path: &Path) -> bool {
                 .map(|status| status == "ready")
         })
         .unwrap_or(false)
+}
+
+fn index_build_ready(path: &Path) -> bool {
+    let Ok(text) = fs::read_to_string(path) else {
+        return false;
+    };
+    let mut saw_row = false;
+    for line in text.lines().skip(1).filter(|line| !line.trim().is_empty()) {
+        saw_row = true;
+        if line.contains("index_row_limit_reached") {
+            return false;
+        }
+    }
+    saw_row
 }
 
 fn source_requirements_ready(path: &Path) -> bool {
@@ -3148,6 +3166,12 @@ fn required_resource_rows(store: &Path) -> Vec<Value> {
             "来源与许可记录",
             "运行安装/修复以补齐来源、完整性和许可记录",
         ),
+        (
+            "index_build",
+            "index_build_manifest.tsv",
+            "索引完整性",
+            "运行安装/修复以构建完整搜索索引",
+        ),
     ];
     required
         .iter()
@@ -3158,6 +3182,7 @@ fn required_resource_rows(store: &Path) -> Vec<Value> {
                 "install_status" => install_status_ready(&path),
                 "source_requirements" => source_requirements_ready(&path),
                 "source_records" => source_manifests_ready(&store.join("manifests")),
+                "index_build" => index_build_ready(&path),
                 _ => path.exists(),
             };
             json!({

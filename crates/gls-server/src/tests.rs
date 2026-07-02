@@ -1256,11 +1256,12 @@ fn missing_resource_summary_is_user_facing() {
     let missing = missing_resource_rows(&rows);
     let text = serde_json::to_string(&missing).expect("missing json");
 
-    assert_eq!(missing.len(), 8);
+    assert_eq!(missing.len(), 9);
     assert!(text.contains("科学仓库"));
     assert!(text.contains("已知蛋白索引"));
     assert!(text.contains("宏基因组索引"));
     assert!(text.contains("结构索引"));
+    assert!(text.contains("索引完整性"));
     assert!(text.contains("计算工具"));
     assert!(text.contains("安装状态"));
     assert!(text.contains("科学资源状态"));
@@ -1628,6 +1629,62 @@ fn preflight_requires_closed_install_state_not_just_files() {
         .and_then(|row| row.get("ready").and_then(Value::as_bool))
         .unwrap_or(true);
     assert!(!science_store_ready);
+
+    fs::remove_dir_all(&root).ok();
+}
+
+#[test]
+fn preflight_rejects_row_limited_science_indexes() {
+    let root =
+        std::env::temp_dir().join(format!("genoligand-preflight-index-limit-{}", now_millis()));
+    let options = server_options(root.clone());
+    let store = root.join("science_store");
+    fs::create_dir_all(store.join("indexes")).expect("store indexes");
+    write_ready_source_records(&store);
+    write_ready_tool_versions(&store);
+    fs::write(
+        store.join("science_store_manifest.tsv"),
+        "item\tstatus\tpath\nknown_database_index\tready\tindexes/known_targets.tsv\nmetagenome_potential_index\tready\tindexes/metagenome_targets.tsv\nstructure_interaction_index\tready\tindexes/structure_targets.tsv\ntool_versions\tready\tindexes/tool_versions.tsv\n",
+    )
+    .expect("store manifest");
+    fs::write(
+        store.join("indexes/known_targets.tsv"),
+        "source\ttarget_id\ttarget_name\torganism\ttarget_class\tligand_tokens\tsequence_tokens\tstructure_tokens\tevidence\n",
+    )
+    .expect("known index");
+    fs::write(
+        store.join("indexes/metagenome_targets.tsv"),
+        "source\ttarget_id\ttarget_name\torganism\ttarget_class\tligand_tokens\tsequence_tokens\tstructure_tokens\tevidence\n",
+    )
+    .expect("metagenome index");
+    fs::write(
+        store.join("indexes/structure_targets.tsv"),
+        "source\ttarget_id\ttarget_name\torganism\ttarget_class\tligand_tokens\tsequence_tokens\tstructure_tokens\tevidence\n",
+    )
+    .expect("structure index");
+    fs::write(
+        store.join("install_status.json"),
+        r#"{"status":"ready","missing_components":[]}"#,
+    )
+    .expect("install status");
+    fs::write(
+        store.join("source_requirements.tsv"),
+        "source_id\tstatus\nchembl\tready\n",
+    )
+    .expect("source requirements");
+    fs::write(
+        store.join("index_build_manifest.tsv"),
+        "index\tinput_path\tstatus\trows\toutput_path\tnotes\nknown_targets\tdownloads/chembl/chembl_sqlite.tar.gz\tused\t30000\tindexes/known_targets.tsv\tchembl_sqlite_archive_rows;index_row_limit_reached\n",
+    )
+    .expect("index build manifest");
+
+    assert!(!preflight_store_ready(&options));
+    let resources = required_resource_rows(&store);
+    let index_build = resources
+        .iter()
+        .find(|row| row.get("id").and_then(Value::as_str) == Some("index_build"))
+        .expect("index build row");
+    assert_eq!(index_build["ready"], false);
 
     fs::remove_dir_all(&root).ok();
 }

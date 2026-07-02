@@ -22,10 +22,11 @@ const MAX_INDEX_ROWS: usize = 30_000;
 const MAX_SOURCE_INDEX_ROWS: usize = 5_000;
 const MAX_FASTA_INDEX_ROWS: usize = MAX_INDEX_ROWS;
 const MAX_SEQUENCE_TOKEN_CHARS: usize = 96;
-const KNOWN_SCORE_WEIGHT: f64 = 0.55;
-const METAGENOME_SCORE_WEIGHT: f64 = 0.35;
+const MAX_STRUCTURE_METADATA_CHARS: usize = 16_384;
+const KNOWN_SCORE_WEIGHT: f64 = 0.50;
+const METAGENOME_SCORE_WEIGHT: f64 = 0.25;
 const STRUCTURE_SCORE_WEIGHT: f64 = 0.10;
-const DOCKING_SCORE_WEIGHT: f64 = 0.0;
+const DOCKING_SCORE_WEIGHT: f64 = 0.05;
 const MD_SCORE_WEIGHT: f64 = 0.10;
 
 #[derive(Clone, Debug)]
@@ -147,9 +148,17 @@ const WORKER_TASKS: &[WorkerTask] = &[
     },
 ];
 
+const DOCKING_WORKER_TASK: WorkerTask = WorkerTask {
+    job_id: "autodock_vina_complex_docking",
+    worker: "docking",
+    module: "genoligand_workers.docking_worker",
+    stage: "docking_primitive",
+};
+
 #[derive(Clone, Debug)]
 struct ComputedFeatureInput {
     input_id: String,
+    input_kind: String,
     tokens: BTreeSet<String>,
 }
 
@@ -200,6 +209,31 @@ struct IndexMatch {
     target_class: String,
     match_score: f64,
     matched_features: String,
+    evidence: String,
+}
+
+#[derive(Clone, Debug)]
+struct KnownStructureHint {
+    input_id: String,
+    target_id: String,
+    target_name: String,
+    organism: String,
+    target_class: String,
+    match_score: f64,
+    evidence: String,
+    pdb_ids: Vec<String>,
+}
+
+#[derive(Clone, Debug)]
+struct SelectedComplexCandidate {
+    candidate_id: String,
+    input_id: String,
+    target_id: String,
+    target_name: String,
+    organism: String,
+    target_class: String,
+    source: String,
+    pdb_id: String,
     evidence: String,
 }
 
@@ -536,6 +570,7 @@ fn prepare_science_store(options: &StoreOptions) -> Result<String, String> {
     let mut repair_text = String::from("component\tstatus\taction\tdetail\n");
     let mut missing = Vec::new();
     let mut ready = 0usize;
+    missing.extend(index_build_limit_components(&index_build)?);
     for (item, is_ready, path, action) in rows {
         if is_ready {
             ready += 1;
@@ -624,6 +659,27 @@ struct IndexBuildSummary {
     known_rows: usize,
     metagenome_rows: usize,
     structure_rows: usize,
+}
+
+fn index_build_limit_components(path: &Path) -> Result<Vec<String>, String> {
+    let text = read_text(path)?;
+    let mut limited = Vec::new();
+    for line in text.lines().skip(1) {
+        if !line.contains("index_row_limit_reached") {
+            continue;
+        }
+        let cols = split_tsv(line);
+        let index = cols
+            .first()
+            .filter(|value| !value.is_empty())
+            .cloned()
+            .unwrap_or_else(|| "unknown".to_string());
+        let component = format!("index_limit:{index}");
+        if !limited.contains(&component) {
+            limited.push(component);
+        }
+    }
+    Ok(limited)
 }
 
 fn build_store_indexes(
@@ -1246,6 +1302,7 @@ fn structure_file_row(source: &str, path: &Path) -> StoreRow {
     let mut structure_tokens = tokenize(&structure_id);
     structure_tokens.extend(tokenize(file_name));
     structure_tokens.extend(tokenize(&path.display().to_string()));
+    structure_tokens.extend(structure_metadata_tokens(path));
     StoreRow {
         source: source.to_string(),
         target_id: safe_id(&structure_id),
@@ -1260,6 +1317,61 @@ fn structure_file_row(source: &str, path: &Path) -> StoreRow {
             source.to_ascii_lowercase().replace(' ', "_")
         ),
     }
+}
+
+fn structure_metadata_tokens(path: &Path) -> BTreeSet<String> {
+    read_structure_text_best_effort(path)
+        .map(|text| tokenize(&structure_metadata_text(&text)))
+        .unwrap_or_default()
+}
+
+fn read_structure_text_best_effort(path: &Path) -> Result<String, String> {
+    let name = lower_file_name(path);
+    if name.ends_with(".gz") {
+        return read_gzip_text(path).or_else(|_| read_text(path));
+    }
+    read_text(path)
+}
+
+fn structure_metadata_text(text: &str) -> String {
+    let mut out = String::new();
+    let mut capture_loop = false;
+    for line in text.lines() {
+        let trimmed = line.trim();
+        if trimmed.starts_with("_struct.title") || trimmed.starts_with("_citation.title") {
+            push_limited_metadata(&mut out, line);
+        }
+        if trimmed.starts_with("_chem_comp.") || trimmed.starts_with("_pdbx_entity_nonpoly.") {
+            capture_loop = true;
+            push_limited_metadata(&mut out, line);
+            continue;
+        }
+        if capture_loop {
+            if trimmed == "#" {
+                capture_loop = false;
+                continue;
+            }
+            push_limited_metadata(&mut out, line);
+        }
+        if out.len() >= MAX_STRUCTURE_METADATA_CHARS {
+            break;
+        }
+    }
+    out
+}
+
+fn push_limited_metadata(out: &mut String, line: &str) {
+    if out.len() >= MAX_STRUCTURE_METADATA_CHARS {
+        return;
+    }
+    let remaining = MAX_STRUCTURE_METADATA_CHARS - out.len();
+    for ch in line.chars() {
+        if out.len() + ch.len_utf8() > remaining {
+            break;
+        }
+        out.push(ch);
+    }
+    out.push('\n');
 }
 
 fn structure_id_from_file_name(file_name: &str) -> String {
@@ -2548,6 +2660,8 @@ fn compute_features(options: &ScienceOptions) -> Result<String, String> {
 
 fn match_known(options: &ScienceOptions) -> Result<String, String> {
     let inputs = read_computed_feature_inputs(&options.run_dir.join("feature_manifest.tsv"))?;
+    let normalized =
+        read_normalized_inputs(&options.run_dir.join("input_normalized_manifest.tsv"))?;
     let rows = read_store_rows(
         &options.science_store.join("indexes/known_targets.tsv"),
         "known_database_index",
@@ -2557,7 +2671,7 @@ fn match_known(options: &ScienceOptions) -> Result<String, String> {
     );
     for input in &inputs {
         for row in &rows {
-            let score = score_row(input, row);
+            let score = known_database_match_score(input, row);
             if score > 0.0 {
                 out.push_str(&format!(
                     "{}\t{}\t{}\t{}\t{}\t{}\t{score:.4}\t{}\t{}\n",
@@ -2573,11 +2687,203 @@ fn match_known(options: &ScienceOptions) -> Result<String, String> {
             }
         }
     }
+    append_bindingdb_onsite_matches(options, &normalized, &mut out)?;
     write_text(&options.run_dir.join("known_database_matches.tsv"), &out)?;
     Ok(format!(
         "known_database_matched\tout={}",
         options.run_dir.join("known_database_matches.tsv").display()
     ))
+}
+
+fn known_database_match_score(input: &ComputedFeatureInput, row: &StoreRow) -> f64 {
+    let score = score_row(input, row);
+    if input.input_kind == "small_molecule" && !row.evidence.contains("bindingdb_onsite") {
+        score.min(0.45)
+    } else {
+        score
+    }
+}
+
+fn append_bindingdb_onsite_matches(
+    options: &ScienceOptions,
+    inputs: &[NormalizedInput],
+    out: &mut String,
+) -> Result<(), String> {
+    let bindingdb = options
+        .science_store
+        .join("downloads/bindingdb/bindingdb_all.tsv.zip");
+    if !bindingdb.exists() {
+        return Ok(());
+    }
+    let small_molecules = inputs
+        .iter()
+        .filter(|input| input.kind == InputKind::SmallMolecule)
+        .collect::<Vec<_>>();
+    if small_molecules.is_empty() {
+        return Ok(());
+    }
+    ensure_dir(&options.run_dir)?;
+    let query_path = options.run_dir.join("bindingdb_onsite_queries.tsv");
+    let mut queries = String::from("input_id\tquery\n");
+    for input in small_molecules {
+        queries.push_str(&format!(
+            "{}\t{}\n",
+            clean_cell(&input.input_id),
+            encode_tsv_cell(&input.primary_value)
+        ));
+    }
+    write_text(&query_path, &queries)?;
+    let matches = run_python_script(
+        bindingdb_onsite_query_script(),
+        &[
+            bindingdb.display().to_string(),
+            query_path.display().to_string(),
+            "200".to_string(),
+        ],
+        "bindingdb_onsite_query",
+    )?;
+    for line in matches.lines().filter(|line| !line.trim().is_empty()) {
+        out.push_str(line);
+        out.push('\n');
+    }
+    Ok(())
+}
+
+fn bindingdb_onsite_query_script() -> &'static str {
+    r#"
+import csv
+import sys
+import zipfile
+
+zip_path, query_path, max_rows = sys.argv[1], sys.argv[2], int(sys.argv[3])
+
+def clean(value):
+    return str(value or "").replace("\t", " ").replace("\r", " ").replace("\n", " ").strip()
+
+def decode(value):
+    text = str(value or "")
+    out = []
+    index = 0
+    while index < len(text):
+        ch = text[index]
+        if ch != "\\" or index + 1 >= len(text):
+            out.append(ch)
+            index += 1
+            continue
+        nxt = text[index + 1]
+        if nxt == "t":
+            out.append("\t")
+        elif nxt == "n":
+            out.append("\n")
+        elif nxt == "r":
+            out.append("\r")
+        elif nxt == "\\":
+            out.append("\\")
+        else:
+            out.append(nxt)
+        index += 2
+    return "".join(out)
+
+def first(row, names):
+    for name in names:
+        value = clean(row.get(name, ""))
+        if value:
+            return value
+    return ""
+
+def target_class(organism):
+    low = organism.lower()
+    if "homo sapiens" in low or "human" in low:
+        return "known_human_protein"
+    return "known_protein"
+
+def numeric_activity(value):
+    text = clean(value).replace(",", "")
+    number = []
+    seen_digit = False
+    for ch in text:
+        if ch.isdigit() or ch == ".":
+            number.append(ch)
+            seen_digit = True
+        elif seen_digit:
+            break
+    try:
+        return float("".join(number)) if number else float("inf")
+    except ValueError:
+        return float("inf")
+
+def query_matches(query, smiles, ligand_name):
+    q = query.strip()
+    q_lower = q.lower()
+    compact = "".join(q.split()).lower()
+    if compact and compact == "".join(smiles.split()).lower():
+        return True
+    if q_lower and q_lower in ligand_name.lower():
+        return True
+    return False
+
+queries = []
+with open(query_path, "r", encoding="utf-8-sig", newline="") as handle:
+    for row in csv.DictReader(handle, delimiter="\t"):
+        query = decode(row.get("query", "")).strip()
+        if query:
+            queries.append((clean(row.get("input_id", "input_1")) or "input_1", query))
+
+if not queries:
+    raise SystemExit(0)
+
+with zipfile.ZipFile(zip_path) as archive:
+    members = [name for name in archive.namelist() if name.lower().endswith((".tsv", ".txt"))]
+    if not members:
+        raise SystemExit(0)
+    with archive.open(members[0]) as raw:
+        text = (line.decode("utf-8", "replace") for line in raw)
+        reader = csv.DictReader(text, delimiter="\t")
+        best = {}
+        writer = csv.writer(sys.stdout, delimiter="\t", lineterminator="\n")
+        for row in reader:
+            smiles = first(row, ["Ligand SMILES", "SMILES"])
+            ligand_name = first(row, ["BindingDB Ligand Name", "Ligand Name", "Compound Name"])
+            for input_id, query in queries:
+                if not query_matches(query, smiles, ligand_name):
+                    continue
+                target_name = first(row, ["Target Name", "UniProt (SwissProt) Recommended Name of Target Chain 1"])
+                organism = first(row, ["Target Source Organism According to Curator or DataSource", "Organism"])
+                target_id = first(row, [
+                    "UniProt (SwissProt) Primary ID of Target Chain 1",
+                    "UniProt (TrEMBL) Primary ID of Target Chain 1",
+                    "BindingDB MonomerID",
+                    "Target Name",
+                ])
+                if not target_name:
+                    target_name = target_id
+                if not target_id:
+                    continue
+                ligand_code = first(row, ["Ligand HET ID in PDB"])
+                pdb_ids = first(row, ["PDB ID(s) for Ligand-Target Complex", "PDB ID(s) of Target Chain 1"])
+                activity = first(row, ["Ki (nM)", "IC50 (nM)", "Kd (nM)", "EC50 (nM)"])
+                activity_type = next((name for name in ["Ki (nM)", "IC50 (nM)", "Kd (nM)", "EC50 (nM)"] if clean(row.get(name, ""))), "activity")
+                pubchem = first(row, ["PubChem CID"])
+                matched = f"ligand_name={ligand_name};ligand_smiles={smiles};ligand_code={ligand_code};pdb_ids={pdb_ids}"
+                evidence = f"bindingdb_onsite_activity_row;{activity_type}={activity};ligand_code={ligand_code};pdb_ids={pdb_ids};pubchem_cid={pubchem}"
+                out_row = [
+                    input_id,
+                    "BindingDB",
+                    target_id,
+                    target_name,
+                    organism or "unknown",
+                    target_class(organism),
+                    "1.0000",
+                    clean(matched),
+                    clean(evidence),
+                ]
+                key = (input_id, target_id)
+                rank = (numeric_activity(activity), target_name.lower(), organism.lower())
+                if key not in best or rank < best[key][0]:
+                    best[key] = (rank, out_row)
+        for _, out_row in sorted(best.values(), key=lambda item: item[0])[:max_rows]:
+            writer.writerow(out_row)
+"#
 }
 
 fn match_metagenome(options: &ScienceOptions) -> Result<String, String> {
@@ -2632,22 +2938,43 @@ fn evaluate_structure(options: &ScienceOptions) -> Result<String, String> {
         Vec::new()
     };
     let structure = options.run_dir.join("structure_patch_summary.tsv");
-    let docking = options.run_dir.join("docking_summary.tsv");
-    let structure_ready =
+    let mut structure_ready =
         if copy_tool_output_if_available(options, "structure_patch_summary.tsv", &structure)? {
             true
         } else {
             write_structure_summary_from_matches(&structure, &structure_matches)?;
             !structure_matches.is_empty()
         };
+    let viewer_ready = copy_structure_viewer_artifact_if_available(options)?
+        || write_structure_viewer_from_known_hints(options)?
+        || write_structure_viewer_from_matches(options, &structure_matches)?;
+    if append_selected_structure_match(
+        &options.run_dir.join("structure_interaction_matches.tsv"),
+        &options.run_dir.join("complex_candidate_selection.tsv"),
+    )? {
+        structure_ready = true;
+    }
+    if append_selected_structure_summary(
+        &structure,
+        &options.run_dir.join("complex_candidate_selection.tsv"),
+    )? {
+        structure_ready = true;
+    }
+    if viewer_ready
+        && !options
+            .run_dir
+            .join("tool_outputs/docking_summary.tsv")
+            .exists()
+    {
+        run_single_worker_task(options, &DOCKING_WORKER_TASK)?;
+    }
+    let docking = options.run_dir.join("docking_summary.tsv");
     let docking_ready = copy_tool_output_or_header(
         options,
         "docking_summary.tsv",
         "candidate_id\tdocking_status\tdocking_score\tdocking_engine\tnotes\n",
         &docking,
     )?;
-    let viewer_ready = copy_structure_viewer_artifact_if_available(options)?
-        || write_structure_viewer_from_matches(options, &structure_matches)?;
     Ok(format!(
         "structure_evaluated\tstructure_artifact={}\tdocking_artifact={}\tviewer_artifact={}",
         if structure_ready {
@@ -2738,6 +3065,23 @@ fn run_schema_bound_workers(options: &ScienceOptions) -> Result<String, String> 
         "schema_bound_workers_checked\tworker_count={}",
         WORKER_TASKS.len()
     ))
+}
+
+fn run_single_worker_task(options: &ScienceOptions, task: &WorkerTask) -> Result<(), String> {
+    let job_dir = options.run_dir.join("worker_jobs");
+    let result_dir = options.run_dir.join("worker_results");
+    ensure_dir(&job_dir)?;
+    ensure_dir(&result_dir)?;
+    let job_path = job_dir.join(format!("{}.json", task.job_id));
+    let result_path = result_dir.join(format!("{}.json", task.job_id));
+    let job = worker_job_value(options, task);
+    write_text(&job_path, &(job.to_string() + "\n"))?;
+    if let Err(err) = run_worker_task(options, task, &job_path, &result_path)
+        && !result_path.exists()
+    {
+        write_worker_failure_result(&result_path, task, &err)?;
+    }
+    Ok(())
 }
 
 fn worker_job_value(options: &ScienceOptions, task: &WorkerTask) -> Value {
@@ -2931,7 +3275,11 @@ fn validate_worker_result(value: &Value, task: &WorkerTask) -> bool {
 }
 
 fn match_structure_interactions(options: &ScienceOptions) -> Result<Vec<IndexMatch>, String> {
-    let inputs = read_computed_feature_inputs(&options.run_dir.join("feature_manifest.tsv"))?;
+    let mut inputs = read_computed_feature_inputs(&options.run_dir.join("feature_manifest.tsv"))?;
+    enrich_feature_inputs_from_known_matches(
+        &mut inputs,
+        &options.run_dir.join("known_database_matches.tsv"),
+    )?;
     let rows = read_store_rows(
         &options.science_store.join("indexes/structure_targets.tsv"),
         "structure_interaction_index",
@@ -2978,6 +3326,32 @@ fn match_structure_interactions(options: &ScienceOptions) -> Result<Vec<IndexMat
         &out,
     )?;
     Ok(matches)
+}
+
+fn enrich_feature_inputs_from_known_matches(
+    inputs: &mut [ComputedFeatureInput],
+    path: &Path,
+) -> Result<(), String> {
+    if !path.exists() {
+        return Ok(());
+    }
+    let mut by_input = inputs
+        .iter_mut()
+        .map(|input| (input.input_id.clone(), input))
+        .collect::<BTreeMap<_, _>>();
+    let text = read_text(path)?;
+    for line in text.lines().skip(1) {
+        let cols = split_tsv(line);
+        if cols.len() < 9 {
+            continue;
+        }
+        if let Some(input) = by_input.get_mut(&cols[0]) {
+            for token in tokenize(&format!("{} {} {}", cols[3], cols[7], cols[8])) {
+                input.tokens.insert(token);
+            }
+        }
+    }
+    Ok(())
 }
 
 fn write_structure_summary_from_matches(path: &Path, matches: &[IndexMatch]) -> Result<(), String> {
@@ -3039,6 +3413,56 @@ fn copy_structure_viewer_artifact_if_available(options: &ScienceOptions) -> Resu
     Ok(false)
 }
 
+fn write_structure_viewer_from_known_hints(options: &ScienceOptions) -> Result<bool, String> {
+    let hints = known_structure_hints(&options.run_dir.join("known_database_matches.tsv"))?;
+    let mut candidates = Vec::new();
+    for hint in hints {
+        for pdb_id in &hint.pdb_ids {
+            if let Some(path) = find_structure_coordinate_file(&options.science_store, pdb_id) {
+                let score = coordinate_hint_score(&path, &hint);
+                candidates.push((score, hint.clone(), pdb_id.clone(), path));
+            }
+        }
+    }
+    candidates.sort_by(|left, right| {
+        right
+            .0
+            .total_cmp(&left.0)
+            .then_with(|| right.1.match_score.total_cmp(&left.1.match_score))
+            .then_with(|| left.1.target_id.cmp(&right.1.target_id))
+            .then_with(|| left.2.cmp(&right.2))
+    });
+    for (_, hint, pdb_id, path) in candidates {
+        if let Some(artifact) = write_coordinate_viewer_artifact(&options.run_dir, &path) {
+            write_structure_viewer_status(
+                options,
+                "ready",
+                &hint.target_id,
+                &pdb_id,
+                &artifact,
+                &relative_display(&options.science_store, &path),
+                "coordinate artifact resolved from BindingDB ligand-target PDB evidence",
+            )?;
+            write_selected_complex_candidate(
+                options,
+                &SelectedComplexCandidate {
+                    candidate_id: format!("target_{}", safe_id(&hint.target_id)),
+                    input_id: hint.input_id,
+                    target_id: hint.target_id,
+                    target_name: hint.target_name,
+                    organism: hint.organism,
+                    target_class: hint.target_class,
+                    source: "BindingDB".to_string(),
+                    pdb_id,
+                    evidence: hint.evidence,
+                },
+            )?;
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
 fn write_structure_viewer_from_matches(
     options: &ScienceOptions,
     matches: &[IndexMatch],
@@ -3070,6 +3494,20 @@ fn write_structure_viewer_from_matches(
                     &relative_display(&options.science_store, &path),
                     "coordinate artifact resolved from local structure database",
                 )?;
+                write_selected_complex_candidate(
+                    options,
+                    &SelectedComplexCandidate {
+                        candidate_id: format!("target_{}", safe_id(&item.target_id)),
+                        input_id: item.input_id.clone(),
+                        target_id: item.target_id.clone(),
+                        target_name: item.target_name.clone(),
+                        organism: item.organism.clone(),
+                        target_class: item.target_class.clone(),
+                        source: item.source.clone(),
+                        pdb_id,
+                        evidence: item.evidence.clone(),
+                    },
+                )?;
                 return Ok(true);
             }
         }
@@ -3089,6 +3527,212 @@ fn write_structure_viewer_from_matches(
         reason,
     )?;
     Ok(false)
+}
+
+fn known_structure_hints(path: &Path) -> Result<Vec<KnownStructureHint>, String> {
+    if !path.exists() {
+        return Ok(Vec::new());
+    }
+    let text = read_text(path)?;
+    let mut by_target = BTreeMap::<String, KnownStructureHint>::new();
+    for line in text.lines().skip(1) {
+        let cols = split_tsv(line);
+        if cols.len() < 9 || !cols[8].contains("bindingdb_onsite_activity_row") {
+            continue;
+        }
+        let pdb_ids = pdb_ids_from_text(&format!("{} {}", cols[7], cols[8]));
+        if pdb_ids.is_empty() {
+            continue;
+        }
+        let hint = KnownStructureHint {
+            input_id: cols[0].clone(),
+            target_id: cols[2].clone(),
+            target_name: cols[3].clone(),
+            organism: cols[4].clone(),
+            target_class: cols[5].clone(),
+            match_score: cols[6].parse().unwrap_or(0.0),
+            evidence: cols[8].clone(),
+            pdb_ids,
+        };
+        let key = format!("{}\t{}", hint.input_id, hint.target_id);
+        match by_target.get(&key) {
+            Some(existing) if known_hint_rank(existing) >= known_hint_rank(&hint) => {}
+            _ => {
+                by_target.insert(key, hint);
+            }
+        }
+    }
+    Ok(by_target.into_values().collect())
+}
+
+fn known_hint_rank(hint: &KnownStructureHint) -> i64 {
+    let activity = activity_nm_from_evidence(&hint.evidence).unwrap_or(1_000_000.0);
+    let pdb_bonus = if hint.pdb_ids.is_empty() { 0 } else { 1000 };
+    let human_bonus = if hint.organism.eq_ignore_ascii_case("Homo sapiens") {
+        100
+    } else {
+        0
+    };
+    pdb_bonus + human_bonus + (1000.0 - activity.min(1000.0)).round() as i64
+}
+
+fn activity_nm_from_evidence(value: &str) -> Option<f64> {
+    for marker in ["Ki (nM)=", "IC50 (nM)=", "Kd (nM)=", "EC50 (nM)="] {
+        if let Some(index) = value.find(marker) {
+            let tail = &value[index + marker.len()..];
+            let number = tail
+                .chars()
+                .skip_while(|ch| matches!(ch, '<' | '>' | '=' | '~' | ' '))
+                .take_while(|ch| ch.is_ascii_digit() || *ch == '.')
+                .collect::<String>();
+            if let Ok(parsed) = number.parse::<f64>() {
+                return Some(parsed);
+            }
+        }
+    }
+    None
+}
+
+fn coordinate_hint_score(path: &Path, hint: &KnownStructureHint) -> f64 {
+    let mut score = hint.match_score;
+    if let Ok(text) = read_structure_text_best_effort(path) {
+        let metadata = structure_metadata_text(&text);
+        let metadata_tokens = tokens_with_numeric_aliases(&metadata);
+        let target_tokens =
+            tokens_with_numeric_aliases(&format!("{} {}", hint.target_name, hint.organism));
+        let matched = target_tokens
+            .intersection(&metadata_tokens)
+            .filter(|token| token.len() > 1)
+            .count();
+        score += matched as f64 * 0.25;
+    }
+    score
+}
+
+fn tokens_with_numeric_aliases(value: &str) -> BTreeSet<String> {
+    let mut tokens = tokenize(value);
+    for token in tokenize(value) {
+        if let Some(alias) = numeric_alias(&token) {
+            tokens.insert(alias.to_string());
+        }
+    }
+    tokens
+}
+
+fn numeric_alias(value: &str) -> Option<&'static str> {
+    match value {
+        "1" => Some("i"),
+        "2" => Some("ii"),
+        "3" => Some("iii"),
+        "4" => Some("iv"),
+        "5" => Some("v"),
+        "6" => Some("vi"),
+        "7" => Some("vii"),
+        "8" => Some("viii"),
+        "9" => Some("ix"),
+        "10" => Some("x"),
+        "11" => Some("xi"),
+        "12" => Some("xii"),
+        _ => None,
+    }
+}
+
+fn pdb_ids_from_text(value: &str) -> Vec<String> {
+    let mut ids = BTreeSet::new();
+    for token in value.split(|ch: char| !ch.is_ascii_alphanumeric()) {
+        let upper = token.trim().to_ascii_uppercase();
+        if is_pdb_id(&upper) {
+            ids.insert(upper);
+        }
+    }
+    ids.into_iter().collect()
+}
+
+fn write_selected_complex_candidate(
+    options: &ScienceOptions,
+    selected: &SelectedComplexCandidate,
+) -> Result<(), String> {
+    write_text(
+        &options.run_dir.join("complex_candidate_selection.tsv"),
+        &format!(
+            "candidate_id\tinput_id\ttarget_id\ttarget_name\torganism\ttarget_class\tsource\tpdb_id\tevidence\n{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\n",
+            clean_cell(&selected.candidate_id),
+            clean_cell(&selected.input_id),
+            clean_cell(&selected.target_id),
+            clean_cell(&selected.target_name),
+            clean_cell(&selected.organism),
+            clean_cell(&selected.target_class),
+            clean_cell(&selected.source),
+            clean_cell(&selected.pdb_id),
+            clean_cell(&selected.evidence)
+        ),
+    )
+}
+
+fn append_selected_structure_match(
+    match_path: &Path,
+    selected_path: &Path,
+) -> Result<bool, String> {
+    if !match_path.exists() || !selected_path.exists() {
+        return Ok(false);
+    }
+    let selected = read_text(selected_path)?;
+    let Some(line) = selected.lines().nth(1) else {
+        return Ok(false);
+    };
+    let cols = split_tsv(line);
+    if cols.len() < 9 {
+        return Ok(false);
+    }
+    let mut text = read_text(match_path)?;
+    if text.contains(&format!("\t{}\t", cols[2])) {
+        return Ok(false);
+    }
+    text.push_str(&format!(
+        "{}\t{}\t{}\t{}\t{}\t{}\t1.0000\t{}\t{}\n",
+        clean_cell(&cols[1]),
+        clean_cell(&cols[6]),
+        clean_cell(&cols[2]),
+        clean_cell(&cols[3]),
+        clean_cell(&cols[4]),
+        clean_cell(&cols[5]),
+        clean_cell(&format!("bindingdb_pdb_coordinate pdb_id={}", cols[7])),
+        clean_cell(&cols[8])
+    ));
+    write_text(match_path, &text)?;
+    Ok(true)
+}
+
+fn append_selected_structure_summary(
+    selection_path: &Path,
+    selected_path: &Path,
+) -> Result<bool, String> {
+    if !selection_path.exists() || !selected_path.exists() {
+        return Ok(false);
+    }
+    let selected = read_text(selected_path)?;
+    let Some(line) = selected.lines().nth(1) else {
+        return Ok(false);
+    };
+    let cols = split_tsv(line);
+    if cols.len() < 9 {
+        return Ok(false);
+    }
+    let mut text = read_text(selection_path)?;
+    if text.contains(&format!("{}\t", cols[0])) {
+        return Ok(false);
+    }
+    text.push_str(&format!(
+        "{}\t1.0000\t{}\t{}\t{}\t{}\t\t\t\t{}\n",
+        clean_cell(&cols[0]),
+        clean_cell(&format!("{} pdb_id={}", cols[6], cols[7])),
+        "bindingdb_pdb_coordinate",
+        clean_cell(&cols[5]),
+        clean_cell(&cols[8]),
+        clean_cell(&cols[8])
+    ));
+    write_text(selection_path, &text)?;
+    Ok(true)
 }
 
 fn write_structure_viewer_status(
@@ -3115,21 +3759,17 @@ fn write_structure_viewer_status(
 }
 
 fn structure_coordinate_ids(item: &IndexMatch) -> Vec<String> {
-    let mut ids = BTreeSet::new();
+    let mut text = String::new();
     for value in [
         item.target_id.as_str(),
         item.target_name.as_str(),
         item.matched_features.as_str(),
         item.evidence.as_str(),
     ] {
-        for token in value.split(|ch: char| !ch.is_ascii_alphanumeric()) {
-            let upper = token.trim().to_ascii_uppercase();
-            if is_pdb_id(&upper) {
-                ids.insert(upper);
-            }
-        }
+        text.push(' ');
+        text.push_str(value);
     }
-    ids.into_iter().collect()
+    pdb_ids_from_text(&text)
 }
 
 fn is_pdb_id(value: &str) -> bool {
@@ -3489,7 +4129,11 @@ fn rank_targets(options: &ScienceOptions) -> Result<String, String> {
         &mut by_target,
     )?;
     let mut candidates = by_target.into_values().collect::<Vec<_>>();
-    apply_md_scores(&mut candidates, &options.run_dir.join("md_summary.tsv"))?;
+    apply_docking_scores(
+        &mut candidates,
+        &options.run_dir.join("docking_summary.tsv"),
+    )?;
+    apply_md_scores(&mut candidates, options)?;
     for candidate in &mut candidates {
         candidate.final_score = (candidate.known_score * KNOWN_SCORE_WEIGHT
             + candidate.metagenome_score * METAGENOME_SCORE_WEIGHT
@@ -3528,18 +4172,121 @@ fn rank_targets(options: &ScienceOptions) -> Result<String, String> {
     ))
 }
 
-fn apply_md_scores(candidates: &mut [Candidate], path: &Path) -> Result<(), String> {
-    let md_scores = read_md_scores(path)?;
+fn apply_docking_scores(candidates: &mut [Candidate], path: &Path) -> Result<(), String> {
+    let docking_scores = read_docking_scores(path)?;
+    if docking_scores.is_empty() {
+        return Ok(());
+    }
+    for candidate in candidates {
+        if let Some(score) = docking_scores.get(&candidate.candidate_id) {
+            candidate.docking_score = *score;
+            append_evidence_once(&mut candidate.evidence, "Docking:vina_completed");
+        }
+    }
+    Ok(())
+}
+
+fn read_docking_scores(path: &Path) -> Result<BTreeMap<String, f64>, String> {
+    if !path.exists() {
+        return Ok(BTreeMap::new());
+    }
+    let text = read_text(path)?;
+    let mut lines = text.lines();
+    let Some(header) = lines.next() else {
+        return Ok(BTreeMap::new());
+    };
+    let headers = split_tsv(header);
+    let candidate_idx = find_header(&headers, &["candidate_id"]);
+    let status_idx = find_header(&headers, &["docking_status", "status"]);
+    let score_idx = find_header(&headers, &["docking_score", "affinity", "binding_affinity"]);
+    let engine_idx = find_header(&headers, &["docking_engine", "engine"]);
+    let mut scores = BTreeMap::new();
+    for line in lines {
+        let cols = split_tsv(line);
+        let candidate_id = cell(&cols, candidate_idx);
+        let status = cell(&cols, status_idx).to_ascii_lowercase();
+        let engine = cell(&cols, engine_idx).to_ascii_lowercase();
+        if candidate_id.is_empty() || status != "completed" || !engine.contains("vina") {
+            continue;
+        }
+        if let Some(score) = docking_score_from_affinity(&cell(&cols, score_idx)) {
+            scores.insert(candidate_id, score);
+        }
+    }
+    Ok(scores)
+}
+
+fn docking_score_from_affinity(value: &str) -> Option<f64> {
+    let raw = value.trim().parse::<f64>().ok()?;
+    if !raw.is_finite() {
+        return None;
+    }
+    if (0.0..=1.0).contains(&raw) {
+        Some(clamp_score(raw))
+    } else if raw < 0.0 {
+        Some(clamp_score((-raw) / 12.0))
+    } else {
+        None
+    }
+}
+
+fn apply_md_scores(candidates: &mut [Candidate], options: &ScienceOptions) -> Result<(), String> {
+    let complex_candidates = complex_md_candidate_ids(options)?;
+    if complex_candidates.is_empty() {
+        return Ok(());
+    }
+    let md_scores = read_md_scores(&options.run_dir.join("md_summary.tsv"))?;
     if md_scores.is_empty() {
         return Ok(());
     }
     for candidate in candidates {
+        if !complex_candidates.contains(&candidate.candidate_id) {
+            continue;
+        }
         if let Some(score) = md_scores.get(&candidate.candidate_id) {
             candidate.dynamics_score = *score;
             append_evidence_once(&mut candidate.evidence, "MD:md_summary_stability_score");
         }
     }
     Ok(())
+}
+
+fn complex_md_candidate_ids(options: &ScienceOptions) -> Result<BTreeSet<String>, String> {
+    let mut ids = BTreeSet::new();
+    for rel in [
+        "tool_outputs/complex_md_manifest.json",
+        "tool_outputs/md_run_manifest.json",
+    ] {
+        let path = options.run_dir.join(rel);
+        if !path.exists() {
+            continue;
+        }
+        let value = serde_json::from_str::<Value>(read_text(&path)?.trim_start_matches('\u{feff}'))
+            .map_err(|err| format!("md_manifest_parse_failed:{}:{err}", path.display()))?;
+        if !complex_md_manifest_value_ready(&value) {
+            continue;
+        }
+        if let Some(candidate_id) = value.get("candidate_id").and_then(Value::as_str)
+            && !candidate_id.trim().is_empty()
+        {
+            ids.insert(candidate_id.to_string());
+        }
+    }
+    Ok(ids)
+}
+
+fn complex_md_manifest_value_ready(value: &Value) -> bool {
+    value.get("method").and_then(Value::as_str) == Some("openmm_receptor_ligand_complex_dynamics")
+        && nonempty_json_string(value, "receptor_coordinate")
+        && nonempty_json_string(value, "ligand_coordinate")
+        && nonempty_json_string(value, "trajectory")
+}
+
+fn nonempty_json_string(value: &Value, key: &str) -> bool {
+    value
+        .get(key)
+        .and_then(Value::as_str)
+        .is_some_and(|text| !text.trim().is_empty())
 }
 
 fn read_md_scores(path: &Path) -> Result<BTreeMap<String, f64>, String> {
@@ -3643,6 +4390,7 @@ fn build_evidence(options: &ScienceOptions) -> Result<String, String> {
         "known_database_matches.tsv",
         "metagenome_potential_matches.tsv",
         "structure_interaction_matches.tsv",
+        "complex_candidate_selection.tsv",
         "worker_runtime_summary.tsv",
         "structure_patch_summary.tsv",
         "docking_summary.tsv",
@@ -3738,6 +4486,19 @@ fn artifact_evidence_status(file: &str, path: &Path) -> Result<ArtifactEvidenceS
                 (
                     "no_match",
                     "no structure interaction match rows".to_string(),
+                )
+            }
+        }
+        "complex_candidate_selection.tsv" => {
+            if rows > 0 {
+                (
+                    "available",
+                    format!("{rows} selected complex candidate rows"),
+                )
+            } else {
+                (
+                    "not_generated",
+                    "no selected complex candidate rows".to_string(),
                 )
             }
         }
@@ -4099,6 +4860,7 @@ fn write_candidate_detail(
                 "known_database_matches.tsv",
                 "metagenome_potential_matches.tsv",
                 "structure_interaction_matches.tsv",
+                "complex_candidate_selection.tsv",
                 "target_candidate_ranking.tsv",
                 "score_decomposition.tsv",
                 "evidence_ledger.tsv",
@@ -4193,7 +4955,12 @@ fn write_artifact_source_map(options: &ScienceOptions) -> Result<(), String> {
         (
             "structure_interaction_matches.tsv",
             "indexes/structure_targets.tsv;feature_manifest.tsv",
-            "target_candidate_ranking.tsv;structure_patch_summary.tsv",
+            "target_candidate_ranking.tsv;structure_patch_summary.tsv;complex_candidate_selection.tsv",
+        ),
+        (
+            "complex_candidate_selection.tsv",
+            "known_database_matches.tsv;structure_interaction_matches.tsv;local coordinate files",
+            "structure_viewer_status.tsv;docking_summary.tsv;md_summary.tsv;target_candidate_ranking.tsv",
         ),
         (
             "worker_runtime_summary.tsv",
@@ -4323,6 +5090,11 @@ fn write_score_decomposition(options: &ScienceOptions) -> Result<(), String> {
             ("metagenome_score", candidate.metagenome_score),
             ("structure_score", candidate.structure_score),
             ("docking_score", candidate.docking_score),
+            ("docking_score_weight", DOCKING_SCORE_WEIGHT),
+            (
+                "docking_score_contribution",
+                candidate.docking_score * DOCKING_SCORE_WEIGHT,
+            ),
             ("md_score", candidate.dynamics_score),
             ("md_score_weight", MD_SCORE_WEIGHT),
             (
@@ -4386,6 +5158,7 @@ fn read_computed_feature_inputs(path: &Path) -> Result<Vec<ComputedFeatureInput>
             .entry(cols[0].clone())
             .or_insert_with(|| ComputedFeatureInput {
                 input_id: cols[0].clone(),
+                input_kind: cols[1].clone(),
                 tokens: BTreeSet::new(),
             });
         if !token.is_empty() {
@@ -5298,12 +6071,19 @@ fn merge_match_file(
             "structure_interaction" => entry.structure_score = entry.structure_score.max(score),
             _ => {}
         }
-        if !entry.evidence.is_empty() {
-            entry.evidence.push(';');
-        }
-        entry.evidence.push_str(&format!("{}:{}", cols[1], cols[8]));
+        append_candidate_evidence(&mut entry.evidence, &format!("{}:{}", cols[1], cols[8]));
     }
     Ok(())
+}
+
+fn append_candidate_evidence(evidence: &mut String, item: &str) {
+    if evidence.contains(item) {
+        return;
+    }
+    if !evidence.is_empty() {
+        evidence.push(';');
+    }
+    evidence.push_str(item);
 }
 
 fn read_candidates(path: &Path) -> Result<Vec<Candidate>, String> {

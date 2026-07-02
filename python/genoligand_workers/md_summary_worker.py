@@ -357,6 +357,14 @@ def valid_element_symbol(symbol: str) -> bool:
 
 
 def top_candidate_id(run_dir: Path) -> str:
+    selected = run_dir / "complex_candidate_selection.tsv"
+    if selected.exists():
+        with selected.open("r", encoding="utf-8-sig", newline="") as handle:
+            reader = csv.DictReader(handle, delimiter="\t")
+            for row in reader:
+                value = str(row.get("candidate_id", "")).strip()
+                if value:
+                    return value
     path = run_dir / "target_candidate_ranking.tsv"
     if not path.exists():
         return ""

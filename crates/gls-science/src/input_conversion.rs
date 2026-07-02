@@ -384,9 +384,9 @@ fn looks_like_smiles_text(value: &str) -> bool {
                     index += 2;
                     continue;
                 }
-                return false;
             }
-            if valid_element_symbol(&symbol) {
+            let single = ch.to_string();
+            if valid_element_symbol(&single) {
                 saw_atom = true;
                 index += 1;
                 continue;
