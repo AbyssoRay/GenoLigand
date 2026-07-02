@@ -22,12 +22,12 @@ def main() -> int:
     required = [
         "state/app-state.js",
         "api/client.js",
+        "pages/project.js",
         "pages/input.js",
-        "pages/configure.js",
         "pages/check.js",
         "pages/run.js",
         "pages/results.js",
-        "pages/export.js",
+        "pages/report.js",
         "core/actions.js",
         "core/selectors.js",
         "components/common.js",
@@ -48,7 +48,13 @@ def main() -> int:
     )
     for rel in required[:12]:
         require(f'src="/{rel}"' in index, f"index.html does not load {rel}")
-    for step in ["configure", "check", "run", "results", "export"]:
+    for label in ["项目", "输入", "检查", "运行", "结果", "报告"]:
+        require(f">{label}</button>" in index, f"workflow navigation must use Chinese label: {label}")
+    require('data-step="configure"' not in index, "configure step must not be exposed in navigation")
+    require("pages/configure.js" not in index, "configure page script must not be loaded")
+    require('data-step="export"' not in index, "export step must be replaced by report")
+    require("pages/export.js" not in index, "export page script must be replaced by report page")
+    for step in ["input", "check", "run", "results", "report"]:
         require(
             f'data-step="{step}" class="step disabled" disabled' in index,
             f"initial step navigation must disable {step}",
@@ -70,9 +76,24 @@ def main() -> int:
     require('{ key: "md_support_label", label: "MD 支持" }' in common, "ranking must show MD support")
     require('{ key: "risk_note", label: "风险提示" }' in common, "ranking must show risk notes")
 
+    project_page = read(WEB / "pages/project.js")
+    input_page = read(WEB / "pages/input.js")
     run_page = read(WEB / "pages/run.js")
     check_page = read(WEB / "pages/check.js")
     actions = read(WEB / "core/actions.js")
+    selectors = read(WEB / "core/selectors.js")
+    require("function renderProject" in project_page, "project view must be the dedicated project manager")
+    require('data-action="new-project"' in project_page, "project view must expose new project action")
+    require("data-open-project" in project_page, "project view must open historical projects")
+    require("data-delete-project" in project_page, "project view must delete projects")
+    require("继续已有项目" not in input_page, "input view must not duplicate project history")
+    require("renderConfigure" not in actions + selectors + run_page, "configure view must be removed from active UI code")
+    require('"configure"' not in selectors, "workflow selectors must not allow configure step")
+    require('"report"' in selectors and '"export"' not in selectors, "workflow selectors must use report step")
+    report_page = read(WEB / "pages/report.js")
+    require("function renderReport" in report_page, "report view must replace the old export view")
+    require("报告材料" in report_page, "report view must use report wording")
+    require("当前运行还没有可下载报告材料" in report_page, "report view must keep empty downloads honest")
     require(
         "runStageRows().map(renderStage).join(\"\")" in run_page,
         "run view must render backend stage readiness instead of fixed completed labels",
@@ -89,7 +110,6 @@ def main() -> int:
         "stage.status === \"not_generated\"" in run_page,
         "run view must show not-generated stages for missing current-run artifacts",
     )
-    selectors = read(WEB / "core/selectors.js")
     require(
         'state.run?.state !== "running"' in selectors,
         "start-run control must be disabled while a run is already running",
@@ -102,6 +122,9 @@ def main() -> int:
         "if (!canStartRun())" in actions,
         "startRun action must reject duplicate start attempts before posting to the server",
     )
+    load_run_data = actions[actions.index("async function loadRunData()") :]
+    require("Promise.all([" not in load_run_data, "run data loading must avoid concurrent browser fetch bursts")
+    require("/candidate-detail" in load_run_data and "/md-summary" in load_run_data, "run data loading must still read all result endpoints")
     require(
         'class="stage-main"' in run_page and 'class="stage-reason"' in run_page,
         "run view must keep long stage reasons in the text column",
@@ -110,6 +133,8 @@ def main() -> int:
         "const completed = runState === \"completed\"" not in run_page,
         "run view must not mark every stage complete solely from run state",
     )
+    for removed in ["资源计划", "当前资源", "恢复建议", "可导出结果"]:
+        require(removed not in run_page, f"run view must not render {removed}")
     components = read(WEB / "styles/components.css")
     require(".stage-main" in components, "stage text column must have a stable width")
     require(".stage-reason" in components, "stage reasons must wrap as normal text")

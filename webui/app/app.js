@@ -61,12 +61,12 @@ function render() {
   updateStepNavigation();
   renderShellStatus();
   renderAlert();
+  if (state.step === "project") renderProject();
   if (state.step === "input") renderInput();
-  if (state.step === "configure") renderConfigure();
   if (state.step === "check") renderCheck();
   if (state.step === "run") renderRun();
   if (state.step === "results") renderResults();
-  if (state.step === "export") renderExport();
+  if (state.step === "report") renderReport();
 }
 
 function renderShellStatus() {

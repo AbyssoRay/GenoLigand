@@ -18,12 +18,12 @@
           </div>
         </div>
         <nav class="steps" aria-label="工作流程">
-          <button data-step="input" class="step active">Input</button>
-          <button data-step="configure" class="step disabled" disabled>Configure</button>
-          <button data-step="check" class="step disabled" disabled>Check</button>
-          <button data-step="run" class="step disabled" disabled>Run</button>
-          <button data-step="results" class="step disabled" disabled>Results</button>
-          <button data-step="export" class="step disabled" disabled>Export</button>
+          <button data-step="project" class="step active">项目</button>
+          <button data-step="input" class="step disabled" disabled>输入</button>
+          <button data-step="check" class="step disabled" disabled>检查</button>
+          <button data-step="run" class="step disabled" disabled>运行</button>
+          <button data-step="results" class="step disabled" disabled>结果</button>
+          <button data-step="report" class="step disabled" disabled>报告</button>
         </nav>
         <div class="side-status">
           <span data-health class="status-pill loading">连接中</span>
@@ -49,12 +49,12 @@
     </div>
     <script src="/state/app-state.js"></script>
     <script src="/api/client.js"></script>
+    <script src="/pages/project.js"></script>
     <script src="/pages/input.js"></script>
-    <script src="/pages/configure.js"></script>
     <script src="/pages/check.js"></script>
     <script src="/pages/run.js"></script>
     <script src="/pages/results.js"></script>
-    <script src="/pages/export.js"></script>
+    <script src="/pages/report.js"></script>
     <script src="/core/actions.js"></script>
     <script src="/core/selectors.js"></script>
     <script src="/components/common.js"></script>

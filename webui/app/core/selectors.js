@@ -280,9 +280,10 @@ function canViewResults() {
 }
 
 function canOpenStep(step) {
+  if (step === "project") return true;
   if (step === "input") return true;
-  if (step === "configure" || step === "check" || step === "run") return Boolean(state.project);
-  if (step === "results" || step === "export") return canViewResults();
+  if (step === "check" || step === "run") return Boolean(state.project);
+  if (step === "results" || step === "report") return canViewResults();
   return false;
 }
 
@@ -300,7 +301,7 @@ function nextActionText() {
   if (!state.preflight) return "执行预检查";
   if (!canStartRun()) return "处理预检查阻塞项";
   if (!state.run) return "开始运行";
-  if (state.run.state === "completed") return "查看结果或导出";
+  if (state.run.state === "completed") return "查看结果或报告";
   if (state.run.state === "blocked") return "查看阻塞原因";
   if (state.run.state === "failed") return "查看日志并修复";
   return "等待当前阶段完成";
@@ -313,92 +314,6 @@ function candidateCountText() {
   return "运行完成后计算";
 }
 
-function candidateForecastText() {
-  if (!state.project) return "保存输入后评估";
-  if (!state.preflight) return "预检查后评估";
-  if (!canStartRun()) return "资源补齐后评估";
-  return "由数据库命中和结构证据决定";
-}
-
-function runtimeClassText() {
-  if (!state.project) return "未评估";
-  const filled = usableInputs().length;
-  const structureReady = sourceReady("structure");
-  if (filled > 2 || structureReady) return "中到高";
-  return "低到中";
-}
-
-function gpuAdviceText() {
-  if (!sourceReady("structure")) return "结构和动力学工具未就绪时不启动相关计算";
-  return "可用于对接和短动力学筛选";
-}
-
-function cpuPathText() {
-  if (!state.project) return "等待输入";
-  return "输入整理、特征计算和数据库比对可先执行";
-}
-
-function storageNeedText() {
-  const available = state.setup?.database_ready === true;
-  if (available) return "科学仓库已由安装流程维护";
-  return "先运行安装/修复以准备数据库和索引";
-}
-
-function resourceStatusRows() {
-  const rows = [
-    ["研究输入", state.project ? "已保存" : "未保存"],
-    ["科学仓库", sourceReady("known") || sourceReady("metagenome") ? "已读取状态" : "需要准备"],
-    ["已知蛋白索引", sourceReady("known") ? "就绪" : "需要准备"],
-    ["宏基因组索引", sourceReady("metagenome") ? "就绪" : "需要准备"],
-    ["结构索引", sourceReady("structure_index") ? "就绪" : "需要准备"],
-    ["结构/动力学工具", sourceReady("tools") ? "就绪" : "需要准备"],
-  ];
-  return rows.map(([label, value]) => metricRow(label, value)).join("");
-}
-
-function blockedActionRows() {
-  return preflightGroups()
-    .flatMap((group) =>
-      group.rows
-        .filter((row) => !row.ready)
-        .map((row) => ({
-          group: group.title,
-          label: row.label,
-          next: row.next,
-        }))
-    );
-}
-
-function failureRecoveryRows() {
-  const rows = blockedActionRows();
-  if (!rows.length) {
-    return `<div class="empty">当前没有阻塞项。可以开始运行，或等待当前运行完成后查看结果。</div>`;
-  }
-  return table(
-    rows,
-    [
-      { key: "group", label: "分组" },
-      { key: "label", label: "项目" },
-      { key: "next", label: "下一步" },
-    ],
-  );
-}
-
 function candidateRows() {
   return state.runData?.candidates?.candidates || [];
-}
-
-function artifactRows() {
-  const items = state.run?.outputs?.items || state.runData?.artifacts?.items || [];
-  const available = items.filter((item) => item.exists);
-  if (!available.length) return `<div class="empty">当前运行还没有可导出材料。完成运行并生成输出后才会显示下载项。</div>`;
-  return `
-    <div class="table-wrap">
-      <table>
-        <thead><tr><th>输出材料</th><th>状态</th></tr></thead>
-        <tbody>
-          ${available.map((item) => `<tr><td>${friendlyArtifact(item.label || item.id)}</td><td><span class="status-pill ready">可下载</span></td></tr>`).join("")}
-        </tbody>
-      </table>
-    </div>`;
 }

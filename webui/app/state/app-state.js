@@ -1,5 +1,5 @@
 ﻿const state = {
-  step: "input",
+  step: "project",
   selectedInput: "small_molecule",
   projects: [],
   workspaceSummary: null,
@@ -74,12 +74,12 @@ const inputSpecs = [
 ];
 
 const stepMeta = {
+  project: ["项目", "新建研究项目，或进入已有项目继续运行和查看结果。"],
   input: ["输入研究对象", "填写任一种研究输入，空输入不会生成候选。"],
-  configure: ["配置搜索范围", "选择本次计算要覆盖的证据类型和输出。"],
   check: ["检查运行条件", "输入、数据库、运行环境、存储和导出条件都通过后再运行。"],
-  run: ["运行中心", "查看当前阶段、下一步动作、资源状态和日志。"],
+  run: ["运行中心", "查看当前阶段、下一步动作和日志。"],
   results: ["查看结果", "候选排序、详情、证据、结构和动力学结果只来自当前运行输出。"],
-  export: ["导出", "整理报告、候选表和证据摘要。"],
+  report: ["报告", "整理报告、候选表和证据摘要。"],
 };
 
 const stageLabels = [

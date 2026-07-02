@@ -705,12 +705,12 @@ fn web_user_assets() -> String {
         "app.js",
         "state/app-state.js",
         "api/client.js",
+        "pages/project.js",
         "pages/input.js",
-        "pages/configure.js",
         "pages/check.js",
         "pages/run.js",
         "pages/results.js",
-        "pages/export.js",
+        "pages/report.js",
         "core/actions.js",
         "core/selectors.js",
         "components/common.js",
@@ -761,27 +761,26 @@ fn first_launch_input_view_does_not_render_resource_status_panels() {
 
 #[test]
 fn run_monitor_export_list_only_renders_downloadable_artifacts() {
-    let app = web_asset_text("core/selectors.js");
-    let start = app.find("function artifactRows()").expect("artifactRows");
-    let artifact_rows = &app[start..];
+    let app = web_asset_text("pages/report.js");
+    let start = app.find("function renderReport()").expect("renderReport");
+    let report_view = &app[start..];
 
-    assert!(artifact_rows.contains("filter((item) => item.exists)"));
-    assert!(artifact_rows.contains("可下载"));
-    assert!(!artifact_rows.contains("未生成"));
+    assert!(report_view.contains("filter((item) => item.exists)"));
+    assert!(report_view.contains("可下载"));
+    assert!(!report_view.contains("未生成"));
 }
 
 #[test]
 fn export_view_only_renders_downloadable_artifacts() {
-    let app = web_asset_text("pages/export.js");
-    let selectors = web_asset_text("core/selectors.js");
-    let start = app.find("function renderExport()").expect("renderExport");
+    let app = web_asset_text("pages/report.js");
+    let start = app.find("function renderReport()").expect("renderReport");
     let export_view = &app[start..];
 
-    assert!(selectors.contains("available.map"));
-    assert!(export_view.contains("当前运行还没有可导出材料"));
-    assert!(selectors.contains("下载"));
+    assert!(export_view.contains("available.map"));
+    assert!(export_view.contains("当前运行还没有可下载报告材料"));
+    assert!(export_view.contains("下载"));
     assert!(!export_view.contains("当前运行未生成"));
-    assert!(!selectors.contains("不可用"));
+    assert!(!export_view.contains("不可用"));
 }
 
 #[test]
@@ -801,11 +800,13 @@ fn workflow_navigation_unlocks_results_only_after_completed_run() {
     let selectors = web_asset_text("core/selectors.js");
 
     assert!(selectors.contains("function canOpenStep(step)"));
-    assert!(selectors.contains("if (step === \"input\") return true"));
+    assert!(selectors.contains("if (step === \"project\") return true"));
     assert!(
         selectors
-            .contains("if (step === \"results\" || step === \"export\") return canViewResults();")
+            .contains("if (step === \"results\" || step === \"report\") return canViewResults();")
     );
+    assert!(!selectors.contains("\"configure\""));
+    assert!(!selectors.contains("\"export\""));
     assert!(selectors.contains("button.disabled = !enabled"));
     assert!(app.contains("if (!canOpenStep(step)) return;"));
 }
@@ -828,13 +829,16 @@ fn saving_input_clears_stale_run_state_in_webui() {
 #[test]
 fn webui_loads_existing_projects_without_seeding_workspace() {
     let app = web_asset_text("app.js");
+    let project = web_asset_text("pages/project.js");
     let input = web_asset_text("pages/input.js");
 
     assert!(app.contains("/api/user/workspace-summary"));
     assert!(app.contains("/api/user/projects"));
-    assert!(input.contains("继续已有项目"));
-    assert!(input.contains("data-open-project"));
-    assert!(input.contains("openExistingProject"));
+    assert!(project.contains("历史项目"));
+    assert!(project.contains("data-open-project"));
+    assert!(project.contains("data-delete-project"));
+    assert!(project.contains("createNewProject"));
+    assert!(!input.contains("继续已有项目"));
 }
 
 #[test]
@@ -888,6 +892,31 @@ fn user_project_creation_hides_internal_status_and_actions() {
     assert!(!text.contains("preflight"));
     assert!(!text.contains("export"));
 
+    fs::remove_dir_all(&root).ok();
+}
+
+#[test]
+fn user_project_delete_route_removes_project_directory() {
+    let root = std::env::temp_dir().join(format!("genoligand-user-delete-{}", now_millis()));
+    let options = server_options(root.clone());
+    let project = create_project_record(&options).expect("project");
+    let project_id = project["project_id"]
+        .as_str()
+        .expect("project id")
+        .to_string();
+    let project_path = project_dir(&options, &project_id);
+
+    let (status, _, body) = route(
+        "DELETE",
+        &format!("/api/user/projects/{project_id}"),
+        &options,
+        "",
+    );
+    let value: Value = serde_json::from_str(&body).expect("delete json");
+
+    assert_eq!(status, 200);
+    assert_eq!(value["status"], "deleted");
+    assert!(!project_path.exists());
     fs::remove_dir_all(&root).ok();
 }
 

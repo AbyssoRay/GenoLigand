@@ -41,8 +41,21 @@ async function saveInput() {
   state.run = null;
   state.runData = null;
   state.preflight = null;
-  setStep("configure");
+  await refreshProjects();
+  setStep("check");
   return true;
+}
+
+async function createNewProject() {
+  state.alert = "";
+  const created = await api("/api/user/projects", { method: "POST", body: "{}" });
+  state.project = created.project;
+  state.run = null;
+  state.runData = null;
+  state.preflight = null;
+  resetInputForm();
+  await refreshProjects();
+  setStep("input");
 }
 
 async function openExistingProject(projectId) {
@@ -57,7 +70,44 @@ async function openExistingProject(projectId) {
     setStep(state.run.state === "completed" ? "results" : "run");
     return;
   }
-  setStep("configure");
+  setStep("input");
+}
+
+async function deleteExistingProject(projectId) {
+  const project = (state.projects || []).find((item) => item.project_id === projectId) || state.project;
+  const name = project?.project_name || "当前项目";
+  if (!window.confirm(`删除“${name}”？项目运行输出也会删除。`)) return;
+  const deleted = await api(`/api/user/projects/${projectId}`, { method: "DELETE" });
+  if (deleted.status === "failed") {
+    state.alert = deleted.error || "项目删除失败。";
+    render();
+    return;
+  }
+  if (state.project?.project_id === projectId) {
+    state.project = null;
+    state.run = null;
+    state.runData = null;
+    state.preflight = null;
+    resetInputForm();
+  }
+  await refreshProjects();
+  setStep("project");
+}
+
+async function refreshProjects() {
+  const projectList = await api("/api/user/projects");
+  state.projects = projectList.projects || [];
+}
+
+function resetInputForm() {
+  state.form = {
+    project_name: "",
+    small_molecule: "",
+    peptide: "",
+    protein_ligand: "",
+    complex: "",
+    genome_or_metagenome: "",
+  };
 }
 
 async function runPreflight() {
@@ -226,15 +276,13 @@ async function loadRunData() {
     return;
   }
   const runId = state.run.run_id;
-  const [candidates, detail, evidence, genome, structure, md, logs, artifacts] = await Promise.all([
-    api(`/api/user/runs/${runId}/candidates`),
-    api(`/api/user/runs/${runId}/candidate-detail`),
-    api(`/api/user/runs/${runId}/evidence`),
-    api(`/api/user/runs/${runId}/genome-context`),
-    api(`/api/user/runs/${runId}/structure`),
-    api(`/api/user/runs/${runId}/md-summary`),
-    api(`/api/user/runs/${runId}/logs`),
-    api(`/api/user/runs/${runId}/artifacts`),
-  ]);
+  const candidates = await api(`/api/user/runs/${runId}/candidates`);
+  const detail = await api(`/api/user/runs/${runId}/candidate-detail`);
+  const evidence = await api(`/api/user/runs/${runId}/evidence`);
+  const genome = await api(`/api/user/runs/${runId}/genome-context`);
+  const structure = await api(`/api/user/runs/${runId}/structure`);
+  const md = await api(`/api/user/runs/${runId}/md-summary`);
+  const logs = await api(`/api/user/runs/${runId}/logs`);
+  const artifacts = await api(`/api/user/runs/${runId}/artifacts`);
   state.runData = { candidates, detail, evidence, genome, structure, md, logs, artifacts };
 }

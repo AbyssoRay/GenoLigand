@@ -185,12 +185,12 @@ fn web_asset_response(path: &str, _options: &ServerOptions) -> Option<(u16, &'st
         "styles.css" => include_str!("../../../webui/app/styles.css"),
         "state/app-state.js" => include_str!("../../../webui/app/state/app-state.js"),
         "api/client.js" => include_str!("../../../webui/app/api/client.js"),
+        "pages/project.js" => include_str!("../../../webui/app/pages/project.js"),
         "pages/input.js" => include_str!("../../../webui/app/pages/input.js"),
-        "pages/configure.js" => include_str!("../../../webui/app/pages/configure.js"),
         "pages/check.js" => include_str!("../../../webui/app/pages/check.js"),
         "pages/run.js" => include_str!("../../../webui/app/pages/run.js"),
         "pages/results.js" => include_str!("../../../webui/app/pages/results.js"),
-        "pages/export.js" => include_str!("../../../webui/app/pages/export.js"),
+        "pages/report.js" => include_str!("../../../webui/app/pages/report.js"),
         "core/actions.js" => include_str!("../../../webui/app/core/actions.js"),
         "core/selectors.js" => include_str!("../../../webui/app/core/selectors.js"),
         "components/common.js" => include_str!("../../../webui/app/components/common.js"),
@@ -273,6 +273,7 @@ fn route_user_project(
         ("POST", "inputs") => write_user_input_manifest(options, &project_id, request_body),
         ("GET", "preflight") | ("POST", "preflight") => user_preflight_json(options, &project_id),
         ("POST", "runs") => start_user_run(options, &project_id),
+        ("DELETE", "") => delete_project(options, &project_id),
         _ => json!({"message":"未找到工作台操作"}),
     };
     Some((200, "application/json; charset=utf-8", value.to_string()))

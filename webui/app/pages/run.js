@@ -8,7 +8,7 @@
         <div class="panel-header">
           <div>
             <h2>运行中心</h2>
-            <p>这里显示当前运行阶段、下一步动作、资源状态和日志。</p>
+            <p>这里显示当前运行阶段、下一步动作和日志。</p>
           </div>
           <span class="status-pill ${runStateClass(runState)}">${escapeHtml(runLabel)}</span>
         </div>
@@ -29,32 +29,6 @@
         ${metricRow("下一步", nextActionText())}
         ${metricRow("候选数量", candidateCountText())}
         ${metricRow("阻塞原因", state.run?.failure_summary || "无")}
-      </section>
-      <section class="panel">
-        <h2>资源计划</h2>
-        ${metricRow("候选量", candidateForecastText())}
-        ${metricRow("时间等级", runtimeClassText())}
-        ${metricRow("GPU 建议", gpuAdviceText())}
-        ${metricRow("CPU 路径", cpuPathText())}
-        ${metricRow("磁盘需求", storageNeedText())}
-      </section>
-      <section class="panel">
-        <h2>当前资源</h2>
-        ${resourceStatusRows()}
-      </section>
-      <section class="panel full">
-        <div class="panel-header">
-          <div>
-            <h2>恢复建议</h2>
-            <p>如果运行被阻塞，先处理这里列出的下一步，再重新检查。</p>
-          </div>
-          <span class="status-pill ${blockedActionRows().length ? "blocked" : "ready"}">${blockedActionRows().length ? "需要处理" : "无需处理"}</span>
-        </div>
-        ${failureRecoveryRows()}
-      </section>
-      <section class="panel full">
-        <h2>可导出结果</h2>
-        ${artifactRows()}
       </section>
       <section class="panel full">
         <details>

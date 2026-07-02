@@ -5,7 +5,6 @@
   const saveDisabled = inputsReadyToSave() ? "" : "disabled";
   page.innerHTML = `
     <div class="panel-grid">
-      ${existingProjectsSection()}
       <section class="panel full">
         <div class="panel-header">
           <div>
@@ -50,40 +49,10 @@
       </section>
       <section class="panel third">
         <h2>下一步</h2>
-        <p>${inputsReadyToSave() ? "保存后进入配置和检查。" : "先完成当前输入检查。"}</p>
+        <p>${inputsReadyToSave() ? "保存后进入检查。" : "先完成当前输入检查。"}</p>
       </section>
     </div>`;
   bindInputEvents();
-}
-
-function existingProjectsSection() {
-  const projects = state.projects || [];
-  if (state.project || !projects.length) return "";
-  return `
-      <section class="panel full">
-        <div class="panel-header">
-          <div>
-            <h2>继续已有项目</h2>
-            <p>选择一个已有研究项目继续运行或查看结果。</p>
-          </div>
-          <span class="status-pill ready">${projects.length} 个项目</span>
-        </div>
-        <div class="input-grid">
-          ${projects.map(renderExistingProjectCard).join("")}
-        </div>
-      </section>`;
-}
-
-function renderExistingProjectCard(project) {
-  const name = project.project_name || "未命名研究项目";
-  const stateLabel = project.project_state || "等待输入";
-  const hasRun = Boolean(project.latest_run_id);
-  return `
-    <button class="input-card" data-open-project="${escapeAttr(project.project_id || "")}">
-      <h3>${escapeHtml(name)}</h3>
-      <p>${hasRun ? "可继续上次运行" : "可继续编辑输入"}</p>
-      <span class="status-pill ${hasRun ? "ready" : "waiting"}">${escapeHtml(stateLabel)}</span>
-    </button>`;
 }
 
 function renderInputTypeCard(spec) {
@@ -106,9 +75,6 @@ function bindInputEvents() {
       state.selectedInput = button.dataset.selectInput;
       renderInput();
     });
-  });
-  page.querySelectorAll("[data-open-project]").forEach((button) => {
-    button.addEventListener("click", () => openExistingProject(button.dataset.openProject));
   });
   page.querySelectorAll("[data-form]").forEach((field) => {
     field.addEventListener("input", () => {
