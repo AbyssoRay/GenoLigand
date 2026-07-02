@@ -161,6 +161,37 @@ fn start_run_blocks_system_python_worker_environment() {
     fs::remove_dir_all(&root).ok();
 }
 
+#[test]
+fn start_run_reuses_existing_running_run() {
+    let root = std::env::temp_dir().join(format!("genoligand-running-run-{}", now_millis()));
+    let options = server_options(root.clone());
+    let project_id = "project-1";
+    let project = project_dir(&options, project_id);
+    let run_dir = project.join("runs").join("run-existing");
+    fs::create_dir_all(&run_dir).expect("run dir");
+    fs::write(
+        project.join("input_manifest.json"),
+        r#"{"inputs":[{"field":"small_molecule","value":"CCO"}],"files":[]}"#,
+    )
+    .expect("input");
+    fs::write(project.join("latest_run_id.txt"), "run-existing\n").expect("latest run");
+    fs::write(run_dir.join("run_state.txt"), "running\n").expect("state");
+    fs::write(run_dir.join("current_stage.txt"), "features_compute\n").expect("stage");
+
+    let response = start_run(&options, project_id);
+    let run_count = fs::read_dir(project.join("runs"))
+        .expect("runs")
+        .filter_map(Result::ok)
+        .filter(|entry| entry.path().is_dir())
+        .count();
+
+    assert_eq!(response["status"], "running");
+    assert_eq!(response["run"]["run_id"], "run-existing");
+    assert_eq!(response["run"]["state"], "running");
+    assert_eq!(run_count, 1);
+    fs::remove_dir_all(&root).ok();
+}
+
 fn write_ready_source_records(store: &Path) {
     let dir = store.join("manifests");
     fs::create_dir_all(&dir).expect("source records dir");

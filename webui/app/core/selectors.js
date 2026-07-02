@@ -268,7 +268,11 @@ function checkRow(byId, id, label, next) {
 
 function canStartRun() {
   const groups = preflightGroups();
-  return Boolean(state.project) && groups.every((group) => group.rows.every((row) => row.ready));
+  return (
+    Boolean(state.project) &&
+    state.run?.state !== "running" &&
+    groups.every((group) => group.rows.every((row) => row.ready))
+  );
 }
 
 function canViewResults() {

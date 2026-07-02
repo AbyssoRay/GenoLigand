@@ -71,6 +71,8 @@ def main() -> int:
     require('{ key: "risk_note", label: "风险提示" }' in common, "ranking must show risk notes")
 
     run_page = read(WEB / "pages/run.js")
+    check_page = read(WEB / "pages/check.js")
+    actions = read(WEB / "core/actions.js")
     require(
         "runStageRows().map(renderStage).join(\"\")" in run_page,
         "run view must render backend stage readiness instead of fixed completed labels",
@@ -86,6 +88,19 @@ def main() -> int:
     require(
         "stage.status === \"not_generated\"" in run_page,
         "run view must show not-generated stages for missing current-run artifacts",
+    )
+    selectors = read(WEB / "core/selectors.js")
+    require(
+        'state.run?.state !== "running"' in selectors,
+        "start-run control must be disabled while a run is already running",
+    )
+    require(
+        'data-action="start-run" ${canStartRun() ? "" : "disabled"}' in check_page,
+        "check view start-run button must share the central run-start predicate",
+    )
+    require(
+        "if (!canStartRun())" in actions,
+        "startRun action must reject duplicate start attempts before posting to the server",
     )
     require(
         'class="stage-main"' in run_page and 'class="stage-reason"' in run_page,

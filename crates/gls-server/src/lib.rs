@@ -888,6 +888,11 @@ fn windows_path_to_wsl(value: &str) -> Option<String> {
 
 fn start_run(options: &ServerOptions, project_id: &str) -> Value {
     let project = project_dir(options, project_id);
+    if let Some(run_id) = read_trimmed(&project.join("latest_run_id.txt"))
+        && run_state(&project.join("runs").join(&run_id)) == "running"
+    {
+        return json!({"status":"running","run":run_json(options,&run_id)});
+    }
     let run_id = format!("run-{}", now_millis());
     let run_dir = project.join("runs").join(&run_id);
     let _ = fs::create_dir_all(&run_dir);

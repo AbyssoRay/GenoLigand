@@ -1186,6 +1186,69 @@ fn prepare_science_store_builds_structure_index_from_downloaded_sources() {
     assert!(!root.exists());
 }
 
+#[test]
+fn prepare_science_store_keeps_canonical_target_rows_beyond_source_sampling_limit() {
+    let root = temp_root("canonical_target_rows_beyond_sampling");
+    let store = root.join("science_store");
+    let mut targets = String::from(
+        "source\ttarget_id\ttarget_name\torganism\ttarget_class\tligand_tokens\tsequence_tokens\tstructure_tokens\tevidence\n",
+    );
+    for row in 0..MAX_SOURCE_INDEX_ROWS {
+        targets.push_str(&format!(
+            "import\tFILLER_{row}\tFiller {row}\tunknown\tpotential_metagenome_sequence\t\tfiller{row}\t\timported_row\n"
+        ));
+    }
+    targets.push_str(
+        "import\tTAIL_TARGET\tTail target\tunknown\tpotential_metagenome_sequence\t\tikvav tailtoken\t\timported_row\n",
+    );
+    write_text(&store.join("imports/metagenome_targets.tsv"), &targets).expect("metagenome import");
+    let options = StoreOptions {
+        workspace_root: root.clone(),
+        science_store: store.clone(),
+    };
+
+    run_store_command(ScienceCommand::PrepareScienceStore, &options).expect("prepare store");
+    let metagenome =
+        read_text(&store.join("indexes/metagenome_targets.tsv")).expect("metagenome index");
+
+    assert!(metagenome.contains("TAIL_TARGET"));
+    fs::remove_dir_all(&root).expect("cleanup temp root");
+    assert!(!root.exists());
+}
+
+#[test]
+fn prepare_science_store_keeps_fasta_rows_beyond_source_sampling_limit() {
+    let root = temp_root("fasta_rows_beyond_sampling");
+    let store = root.join("science_store");
+    let mut fasta = String::new();
+    for row in 0..MAX_SOURCE_INDEX_ROWS {
+        fasta.push_str(&format!(">MGFILLER_{row}\nMSEQNNTEMT{row}\n"));
+    }
+    fasta.push_str(">MGTAIL target tail\nMSEQNNTEMTFQIQRIYTKDISFEAPNAPHVFQKDW\n");
+    write_text(&store.join("downloads/metagenome/mgnify/tail.fa"), &fasta)
+        .expect("metagenome fasta");
+    let options = StoreOptions {
+        workspace_root: root.clone(),
+        science_store: store.clone(),
+    };
+
+    run_store_command(ScienceCommand::PrepareScienceStore, &options).expect("prepare store");
+    let metagenome =
+        read_text(&store.join("indexes/metagenome_targets.tsv")).expect("metagenome index");
+
+    assert!(metagenome.contains("MGTAIL"));
+    fs::remove_dir_all(&root).expect("cleanup temp root");
+    assert!(!root.exists());
+}
+
+#[test]
+fn chembl_sqlite_query_uses_index_limit_not_source_sampling_limit() {
+    let query = chembl_sqlite_query_script();
+
+    assert!(query.contains("LIMIT 30000"));
+    assert!(!query.contains("LIMIT 5000"));
+}
+
 fn write_gzip(path: &Path, text: &str) -> Result<(), String> {
     use flate2::Compression;
     use flate2::write::GzEncoder;

@@ -20,7 +20,7 @@ const WORKER_SCHEMA_VERSION: &str = "genoligand_worker_current_v1";
 const WORKER_PIPELINE_MODE: &str = "genoligand_scientific_pipeline";
 const MAX_INDEX_ROWS: usize = 30_000;
 const MAX_SOURCE_INDEX_ROWS: usize = 5_000;
-const MAX_FASTA_INDEX_ROWS: usize = MAX_SOURCE_INDEX_ROWS;
+const MAX_FASTA_INDEX_ROWS: usize = MAX_INDEX_ROWS;
 const MAX_SEQUENCE_TOKEN_CHARS: usize = 96;
 const KNOWN_SCORE_WEIGHT: f64 = 0.55;
 const METAGENOME_SCORE_WEIGHT: f64 = 0.35;
@@ -791,9 +791,7 @@ fn append_canonical_rows(
         return Ok(());
     }
     let (mut parsed, notes) = read_source_rows(path, index_name)?;
-    let available = MAX_INDEX_ROWS
-        .saturating_sub(rows.len())
-        .min(MAX_SOURCE_INDEX_ROWS);
+    let available = MAX_INDEX_ROWS.saturating_sub(rows.len());
     let parsed_total = parsed.len();
     if parsed.len() > available {
         parsed.truncate(available);
@@ -823,9 +821,7 @@ fn append_built_rows(
     manifest: &mut String,
     notes: &str,
 ) {
-    let available = MAX_INDEX_ROWS
-        .saturating_sub(rows.len())
-        .min(MAX_SOURCE_INDEX_ROWS);
+    let available = MAX_INDEX_ROWS.saturating_sub(rows.len());
     let total = built_rows.len();
     let count = total.min(available);
     rows.extend(built_rows.into_iter().take(count));
@@ -4446,7 +4442,7 @@ where
     if is_bindingdb_header(&headers) {
         return parse_bindingdb_rows(&headers, lines, label);
     }
-    let row_limit = canonical_index_row_limit(label);
+    let row_limit = store_row_limit(label);
     let mut rows = Vec::new();
     for line in lines {
         if rows.len() >= row_limit {
@@ -4473,8 +4469,8 @@ where
     Ok(rows)
 }
 
-fn canonical_index_row_limit(label: &str) -> usize {
-    if label.ends_with("_index") {
+fn store_row_limit(label: &str) -> usize {
+    if label.ends_with("_index") || label.ends_with("_targets") {
         MAX_INDEX_ROWS
     } else {
         MAX_SOURCE_INDEX_ROWS
@@ -4591,7 +4587,7 @@ GROUP BY
     act.standard_relation,
     act.standard_value,
     act.standard_units
-LIMIT 5000
+LIMIT 30000
 """
 
 connection = sqlite3.connect(sys.argv[1])
@@ -4733,8 +4729,9 @@ where
     ];
 
     let mut rows = Vec::new();
+    let row_limit = store_row_limit(label);
     for line in lines {
-        if rows.len() >= MAX_SOURCE_INDEX_ROWS {
+        if rows.len() >= row_limit {
             break;
         }
         let line = line.map_err(|err| format!("{label}_read_failed:{err}"))?;

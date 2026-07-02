@@ -183,6 +183,11 @@ async function startRun() {
     setStep("check");
     return;
   }
+  if (!canStartRun()) {
+    state.alert = "当前运行正在进行中。";
+    setStep("run");
+    return;
+  }
   state.alert = "";
   setStep("run");
   state.run = {

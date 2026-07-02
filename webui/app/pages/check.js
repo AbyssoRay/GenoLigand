@@ -15,7 +15,7 @@
         </div>
         <div class="actions">
           <button class="button secondary" data-action="check-now" ${state.project ? "" : "disabled"}>重新检查</button>
-          <button class="button" data-action="start-run" ${allReady ? "" : "disabled"}>开始运行</button>
+          <button class="button" data-action="start-run" ${canStartRun() ? "" : "disabled"}>开始运行</button>
           <button class="button secondary" data-action="repair-store" ${setupReady ? "disabled" : ""}>运行安装/修复</button>
           <button class="button ghost" data-action="to-input">修改输入</button>
         </div>
