@@ -94,7 +94,7 @@ fn wsl_python_wrapper_uses_wsl_paths_for_worker_inputs() {
 fn valid_worker_fail_result_counts_as_executed_worker() {
     let root = temp_root("worker_fail_result");
     let path = root.join("worker_result.json");
-    let task = &WORKER_TASKS[0];
+    let task = &SCIENTIFIC_WORKER_TASKS[0];
     write_text(
         &path,
         &format!(
@@ -222,15 +222,19 @@ fn pipeline_uses_one_temporary_query_row_then_test_removes_it() {
     assert!(source_map.contains("tool_outputs/md_rmsd.tsv"));
     assert!(source_map.contains("tool_outputs/ligand_placement.tsv"));
     assert!(source_map.contains("tool_outputs/complex_md_manifest.json"));
-    assert!(source_map.contains("worker_runtime_summary.tsv"));
-    assert!(source_map.contains("Rust-generated worker job specs"));
+    assert!(source_map.contains("scientific_runtime_summary.tsv"));
+    assert!(source_map.contains("current run scientific worker jobs"));
+    assert!(!source_map.contains("worker_runtime_summary.tsv"));
+    assert!(!run.join("worker_jobs/openmm_smoke.json").exists());
+    assert!(!run.join("worker_results/openmm_smoke.json").exists());
     assert!(source_map.contains("docking_summary.tsv\t"));
     assert!(source_map.contains("md_summary.tsv\t"));
-    assert!(source_map.contains("docking_summary.tsv\tschema-bound docking output when present;otherwise no generated rows\tevidence_ledger.tsv\tno_rows"));
-    assert!(source_map.contains("md_summary.tsv\ttool_outputs/md_run_manifest.json;tool_outputs/md_summary.tsv;tool_outputs/md_rmsd.tsv;tool_outputs/md_rmsf.tsv;tool_outputs/md_ligand_drift.tsv;tool_outputs/md_contacts.tsv;tool_outputs/md_hbonds.tsv\ttarget_candidate_ranking.tsv;evidence_ledger.tsv\tno_rows"));
+    assert!(source_map.contains("docking_summary.tsv\tschema-bound docking output when present;otherwise no generated rows\ttool_outputs/docking_manifest.json;tool_outputs/docking_pose.sdf;evidence_ledger.tsv\tno_rows"));
+    assert!(source_map.contains("md_summary.tsv\ttool_outputs/docking_pose.sdf;tool_outputs/md_run_manifest.json;tool_outputs/md_protocol.tsv;tool_outputs/gpu_telemetry_status.tsv;tool_outputs/md_summary.tsv;tool_outputs/md_rmsd.tsv;tool_outputs/md_rmsf.tsv;tool_outputs/md_ligand_drift.tsv;tool_outputs/md_contacts.tsv;tool_outputs/md_hbonds.tsv\ttarget_candidate_ranking.tsv;evidence_ledger.tsv\tno_rows"));
     assert!(source_map.contains("tool_outputs/md_summary.tsv\tschema-bound MD summary worker output\tmd_summary.tsv\tnot_yet_written"));
     assert!(evidence.contains("structure_interaction_matches"));
-    assert!(evidence.contains("worker_runtime_summary"));
+    assert!(evidence.contains("scientific_runtime_summary"));
+    assert!(!evidence.contains("worker_runtime_summary"));
     assert!(evidence.contains("score_decomposition"));
     assert!(evidence.contains("docking_summary.tsv\tGenoLigand\tnot_generated\tno docking rows"));
     assert!(evidence.contains("md_summary.tsv\tGenoLigand\tnot_generated\tno dynamics rows"));
@@ -266,7 +270,7 @@ fn pipeline_uses_one_temporary_query_row_then_test_removes_it() {
 }
 
 #[test]
-fn pipeline_records_schema_bound_workers_without_delegating_scores() {
+fn pipeline_records_scientific_workers_without_smoke_artifacts() {
     let root = temp_root("schema_workers");
     let store = create_temporary_test_store(&root).expect("store");
     let input = root.join("input.json");
@@ -284,9 +288,9 @@ fn pipeline_records_schema_bound_workers_without_delegating_scores() {
     };
 
     run_science_command(ScienceCommand::PipelineRun, &options).expect("pipeline");
-    let summary = read_text(&run.join("worker_runtime_summary.tsv")).expect("worker summary");
+    let summary = read_text(&run.join("scientific_runtime_summary.tsv")).expect("worker summary");
     let rows = summary.lines().skip(1).collect::<Vec<_>>();
-    assert_eq!(rows.len(), WORKER_TASKS.len());
+    assert_eq!(rows.len(), SCIENTIFIC_WORKER_TASKS.len());
     for row in rows {
         assert!(
             row.contains("\ttrue\t"),
@@ -297,8 +301,10 @@ fn pipeline_records_schema_bound_workers_without_delegating_scores() {
             "worker escaped primitive-only boundary: {row}"
         );
     }
-    let job = read_text(&run.join("worker_jobs/openmm_smoke.json")).expect("worker job");
-    let result = read_text(&run.join("worker_results/openmm_smoke.json")).expect("worker result");
+    let job =
+        read_text(&run.join("worker_jobs/md_summary_ligand_dynamics.json")).expect("worker job");
+    let result = read_text(&run.join("worker_results/md_summary_ligand_dynamics.json"))
+        .expect("worker result");
     let score = read_text(&run.join("score_decomposition.tsv")).expect("score");
     let source_map = read_text(&run.join("artifact_source_map.tsv")).expect("source map");
 
@@ -306,7 +312,12 @@ fn pipeline_records_schema_bound_workers_without_delegating_scores() {
     assert!(result.contains("\"python_owns_final_score\":false"));
     assert!(result.contains("\"python_owns_report_semantics\":false"));
     assert!(result.contains("\"primitive_execution_only\":true"));
-    assert!(source_map.contains("worker_runtime_summary.tsv"));
+    assert!(source_map.contains("scientific_runtime_summary.tsv"));
+    assert!(!source_map.contains("worker_runtime_summary.tsv"));
+    assert!(!run.join("worker_jobs/openmm_smoke.json").exists());
+    assert!(!run.join("worker_results/openmm_smoke.json").exists());
+    assert!(!run.join("worker_jobs/openff_rdkit_smoke.json").exists());
+    assert!(!run.join("worker_results/openff_rdkit_smoke.json").exists());
     assert!(score.contains("\tGenoLigand\n"));
     assert!(!score.contains("Python"));
 
@@ -632,6 +643,17 @@ fn known_matching_deduplicates_onsite_hits_and_downweights_token_noise() {
 }
 
 #[test]
+fn bindingdb_complex_pdb_parser_ignores_target_chain_structures() {
+    let ids = bindingdb_complex_pdb_ids(
+        "ligand_code=AZM;pdb_ids=3HS4,2H4N;target_chain_pdb_ids=1YM3,2A5V",
+    );
+    assert_eq!(ids, vec!["2H4N".to_string(), "3HS4".to_string()]);
+
+    let chain_only = bindingdb_complex_pdb_ids("pdb_ids=;target_chain_pdb_ids=1YM3,2A5V");
+    assert!(chain_only.is_empty());
+}
+
+#[test]
 fn structure_matching_uses_ligand_identity_from_known_search() {
     let root = temp_root("structure_uses_known_ligand_identity");
     let store = root.join("science_store");
@@ -780,14 +802,29 @@ fn md_summary_score_participates_in_ranking_and_report() {
         .expect("md summary");
     write_text(
         &run.join("tool_outputs/complex_md_manifest.json"),
-        r#"{"candidate_id":"target_T1","method":"openmm_receptor_ligand_complex_dynamics","platform":"CUDA","receptor_coordinate":"structure_viewer.cif","ligand_coordinate":"tool_outputs/ligand_placement.tsv","trajectory":"tool_outputs/md_trajectory.tsv","metric_artifacts":["tool_outputs/md_summary.tsv"]}"#,
+        r#"{"candidate_id":"target_T1","method":"openmm_receptor_ligand_complex_dynamics","platform":"CUDA","receptor_coordinate":"structure_viewer.cif","ligand_coordinate":"tool_outputs/ligand_placement.tsv","trajectory":"tool_outputs/md_trajectory.tsv","protocol_artifact":"tool_outputs/md_protocol.tsv","gpu_telemetry_artifact":"tool_outputs/gpu_telemetry.tsv","gpu_telemetry_status_artifact":"tool_outputs/gpu_telemetry_status.tsv","gpu_observed":true,"metric_artifacts":["tool_outputs/md_summary.tsv"]}"#,
     )
     .expect("complex md manifest");
     write_text(
         &run.join("tool_outputs/md_run_manifest.json"),
-        r#"{"candidate_id":"target_T1","method":"openmm_receptor_ligand_complex_dynamics","platform":"CUDA","receptor_coordinate":"structure_viewer.cif","complex_manifest":"tool_outputs/complex_md_manifest.json","trajectory":"tool_outputs/md_trajectory.tsv"}"#,
+        r#"{"candidate_id":"target_T1","method":"openmm_receptor_ligand_complex_dynamics","platform":"CUDA","receptor_coordinate":"structure_viewer.cif","complex_manifest":"tool_outputs/complex_md_manifest.json","protocol_artifact":"tool_outputs/md_protocol.tsv","gpu_telemetry_artifact":"tool_outputs/gpu_telemetry.tsv","gpu_telemetry_status_artifact":"tool_outputs/gpu_telemetry_status.tsv","gpu_observed":true,"trajectory":"tool_outputs/md_trajectory.tsv"}"#,
     )
     .expect("md run manifest");
+    write_text(
+        &run.join("tool_outputs/md_protocol.tsv"),
+        "candidate_id\tinput_id\tstage\tparameter\tvalue\tunit\tsource\ntarget_T1\tinput_1\tproduction\ttotal_steps\t2000\tsteps\tOpenMM\n",
+    )
+    .expect("protocol");
+    write_text(
+        &run.join("tool_outputs/gpu_telemetry.tsv"),
+        "sample_label\ttimestamp\tgpu_index\tname\tutilization_gpu_percent\tmemory_used_mb\tmemory_total_mb\tpower_draw_w\tcurrent_pid_observed\tcompute_process_count\tcompute_process_memory_used_mb\tfailure_reason\nproduction\t2026/07/02 00:00:00\t0\tNVIDIA\t22.0\t512.0\t8192.0\t65.5\ttrue\t1\t512.0\t\n",
+    )
+    .expect("gpu telemetry");
+    write_text(
+        &run.join("tool_outputs/gpu_telemetry_status.tsv"),
+        "cuda_platform\tnvidia_smi_available\tgpu_observed\tmax_utilization_gpu_percent\tmax_memory_delta_mb\tprocess_observed\tsample_count\tfailure_reason\nCUDA\ttrue\ttrue\t22.0\t128.0\ttrue\t1\t\n",
+    )
+    .expect("gpu status");
     let options = ScienceOptions {
         workspace_root: root.clone(),
         science_store: store,
@@ -820,6 +857,95 @@ fn md_summary_score_participates_in_ranking_and_report() {
     assert!(report.contains("md_stability_score"));
     assert!(report.contains("0.10"));
     assert!(source_map.contains("target_candidate_ranking.tsv\tknown_database_matches.tsv;metagenome_potential_matches.tsv;structure_interaction_matches.tsv;md_summary.tsv"));
+    fs::remove_dir_all(&root).expect("cleanup temp root");
+    assert!(!root.exists());
+}
+
+#[test]
+fn cuda_complex_md_requires_gpu_observation_before_scoring() {
+    let root = temp_root("cuda_md_requires_gpu_observation");
+    let run = root.join("run");
+    let store = create_temporary_test_store(&root).expect("store");
+    let input = root.join("input.json");
+    write_text(
+        &input,
+        "{\"inputs\":[{\"field\":\"small_molecule\",\"value\":\"CCO\"}],\"files\":[]}\n",
+    )
+    .expect("input");
+    write_text(
+        &run.join("known_database_matches.tsv"),
+        "input_id\tsource\ttarget_id\ttarget_name\torganism\ttarget_class\tmatch_score\tmatched_features\tevidence\ninput_1\tChEMBL\tT1\tTarget 1\tHomo sapiens\tenzyme\t1.0\tcco\tchembl_activity_row\n",
+    )
+    .expect("known match");
+    write_text(
+        &run.join("md_summary.tsv"),
+        "candidate_id\trmsd\trmsf\tligand_drift\thydrogen_bond_occupancy\tcontact_occupancy\tinteraction_persistence\tmd_risk_flags\tmd_score_decomposition\tmd_stability_score\ntarget_T1\t1.2\t0.4\t0.6\t0.72\t0.81\t0.77\tcuda_unobserved\tworker_md\t0.8\n",
+    )
+    .expect("md summary");
+    write_text(
+        &run.join("tool_outputs/complex_md_manifest.json"),
+        r#"{"candidate_id":"target_T1","method":"openmm_receptor_ligand_complex_dynamics","platform":"CUDA","receptor_coordinate":"structure_viewer.cif","ligand_coordinate":"tool_outputs/ligand_placement.tsv","trajectory":"tool_outputs/md_trajectory.tsv","protocol_artifact":"tool_outputs/md_protocol.tsv","gpu_telemetry_status_artifact":"tool_outputs/gpu_telemetry_status.tsv","gpu_observed":false,"metric_artifacts":["tool_outputs/md_summary.tsv"]}"#,
+    )
+    .expect("complex md manifest");
+    let options = ScienceOptions {
+        workspace_root: root.clone(),
+        science_store: store,
+        input_manifest: input,
+        run_dir: run.clone(),
+    };
+
+    rank_targets(&options).expect("rank");
+
+    let ranking = read_text(&run.join("target_candidate_ranking.tsv")).expect("ranking");
+    assert!(ranking.contains("\t0.0000\tChEMBL:chembl_activity_row\t"));
+    assert!(!ranking.contains("MD:md_summary_stability_score"));
+    fs::remove_dir_all(&root).expect("cleanup temp root");
+    assert!(!root.exists());
+}
+
+#[test]
+fn md_protocol_and_gpu_telemetry_are_evidence_artifacts() {
+    let root = temp_root("md_protocol_gpu_evidence");
+    let run = root.join("run");
+    let store = create_temporary_test_store(&root).expect("store");
+    let input = root.join("input.json");
+    write_text(
+        &input,
+        "{\"inputs\":[{\"field\":\"small_molecule\",\"value\":\"CCO\"}],\"files\":[]}\n",
+    )
+    .expect("input");
+    write_text(
+        &run.join("tool_outputs/md_protocol.tsv"),
+        "candidate_id\tstage\tparameter\tvalue\ntarget_T1\tproduction\tsteps\t2000\n",
+    )
+    .expect("protocol");
+    write_text(
+        &run.join("tool_outputs/gpu_telemetry.tsv"),
+        "sample_label\tgpu_index\tname\tutilization_gpu_percent\tmemory_used_mb\tmemory_total_mb\tpower_draw_w\nproduction\t0\tNVIDIA\t22\t512\t8192\t65.5\n",
+    )
+    .expect("telemetry");
+    write_text(
+        &run.join("tool_outputs/gpu_telemetry_status.tsv"),
+        "cuda_platform\tnvidia_smi_available\tgpu_observed\tmax_utilization_gpu_percent\tmax_memory_delta_mb\tprocess_observed\tfailure_reason\nCUDA\ttrue\ttrue\t22\t128\ttrue\t\n",
+    )
+    .expect("telemetry status");
+    let options = ScienceOptions {
+        workspace_root: root.clone(),
+        science_store: store,
+        input_manifest: input,
+        run_dir: run.clone(),
+    };
+
+    build_evidence(&options).expect("evidence");
+
+    let source_map = read_text(&run.join("artifact_source_map.tsv")).expect("source map");
+    let evidence = read_text(&run.join("evidence_ledger.tsv")).expect("evidence");
+    assert!(source_map.contains("tool_outputs/md_protocol.tsv"));
+    assert!(source_map.contains("tool_outputs/gpu_telemetry.tsv"));
+    assert!(source_map.contains("tool_outputs/gpu_telemetry_status.tsv"));
+    assert!(evidence.contains("tool_outputs/md_protocol.tsv"));
+    assert!(evidence.contains("tool_outputs/gpu_telemetry.tsv"));
+    assert!(evidence.contains("tool_outputs/gpu_telemetry_status.tsv"));
     fs::remove_dir_all(&root).expect("cleanup temp root");
     assert!(!root.exists());
 }
@@ -1030,7 +1156,7 @@ fn structure_evaluate_reads_canonical_index_rows_beyond_source_sampling_limit() 
     let mut index = String::from(
         "source\ttarget_id\ttarget_name\torganism\ttarget_class\tligand_tokens\tsequence_tokens\tstructure_tokens\tevidence\n",
     );
-    for row in 0..MAX_SOURCE_INDEX_ROWS {
+    for row in 0..5_250usize {
         index.push_str(&format!(
             "RCSB\t9{row:03}\tFiller structure {row}\tunknown\tstructure_record\t\tfiller{row}\tfiller pocket\trcsb_structure_file\n"
         ));
@@ -1514,10 +1640,11 @@ fn structure_index_reads_ligand_names_from_mmcif_coordinates() {
 fn prepare_science_store_keeps_canonical_target_rows_beyond_source_sampling_limit() {
     let root = temp_root("canonical_target_rows_beyond_sampling");
     let store = root.join("science_store");
+    let filler_count = 5_250usize;
     let mut targets = String::from(
         "source\ttarget_id\ttarget_name\torganism\ttarget_class\tligand_tokens\tsequence_tokens\tstructure_tokens\tevidence\n",
     );
-    for row in 0..MAX_SOURCE_INDEX_ROWS {
+    for row in 0..filler_count {
         targets.push_str(&format!(
             "import\tFILLER_{row}\tFiller {row}\tunknown\tpotential_metagenome_sequence\t\tfiller{row}\t\timported_row\n"
         ));
@@ -1536,6 +1663,7 @@ fn prepare_science_store_keeps_canonical_target_rows_beyond_source_sampling_limi
         read_text(&store.join("indexes/metagenome_targets.tsv")).expect("metagenome index");
 
     assert!(metagenome.contains("TAIL_TARGET"));
+    assert_eq!(metagenome.lines().skip(1).count(), filler_count + 1);
     fs::remove_dir_all(&root).expect("cleanup temp root");
     assert!(!root.exists());
 }
@@ -1544,8 +1672,9 @@ fn prepare_science_store_keeps_canonical_target_rows_beyond_source_sampling_limi
 fn prepare_science_store_keeps_fasta_rows_beyond_source_sampling_limit() {
     let root = temp_root("fasta_rows_beyond_sampling");
     let store = root.join("science_store");
+    let filler_count = 5_250usize;
     let mut fasta = String::new();
-    for row in 0..MAX_SOURCE_INDEX_ROWS {
+    for row in 0..filler_count {
         fasta.push_str(&format!(">MGFILLER_{row}\nMSEQNNTEMT{row}\n"));
     }
     fasta.push_str(">MGTAIL target tail\nMSEQNNTEMTFQIQRIYTKDISFEAPNAPHVFQKDW\n");
@@ -1561,28 +1690,30 @@ fn prepare_science_store_keeps_fasta_rows_beyond_source_sampling_limit() {
         read_text(&store.join("indexes/metagenome_targets.tsv")).expect("metagenome index");
 
     assert!(metagenome.contains("MGTAIL"));
+    assert_eq!(metagenome.lines().skip(1).count(), filler_count + 1);
     fs::remove_dir_all(&root).expect("cleanup temp root");
     assert!(!root.exists());
 }
 
 #[test]
-fn chembl_sqlite_query_uses_index_limit_not_source_sampling_limit() {
+fn chembl_sqlite_query_has_no_artificial_index_limit() {
     let query = chembl_sqlite_query_script();
 
-    assert!(query.contains("LIMIT 30000"));
-    assert!(!query.contains("LIMIT 5000"));
+    assert!(!query.contains("LIMIT "));
+    assert!(!query.contains("LIMIT\n"));
 }
 
 #[test]
-fn prepare_science_store_marks_row_limited_indexes_as_incomplete() {
-    let root = temp_root("row_limited_index_incomplete");
+fn prepare_science_store_builds_full_index_without_row_limit_marker() {
+    let root = temp_root("full_index_without_limit_marker");
     let store = root.join("science_store");
+    let row_count = 30_250usize;
     let mut targets = String::from(
         "source\ttarget_id\ttarget_name\torganism\ttarget_class\tligand_tokens\tsequence_tokens\tstructure_tokens\tevidence\n",
     );
-    for row in 0..=MAX_INDEX_ROWS {
+    for row in 0..row_count {
         targets.push_str(&format!(
-            "import\tLIMITED_{row}\tLimited target {row}\tunknown\tknown_protein\t\tseq{row}\t\timported_row\n"
+            "import\tFULL_{row}\tFull target {row}\tunknown\tknown_protein\t\tseq{row}\t\timported_row\n"
         ));
     }
     write_text(&store.join("imports/known_targets.tsv"), &targets).expect("known import");
@@ -1593,17 +1724,20 @@ fn prepare_science_store_marks_row_limited_indexes_as_incomplete() {
 
     run_store_command(ScienceCommand::PrepareScienceStore, &options).expect("prepare store");
     let manifest = read_text(&store.join("index_build_manifest.tsv")).expect("index manifest");
+    let known = read_text(&store.join("indexes/known_targets.tsv")).expect("known index");
     let status_text = read_text(&store.join("install_status.json")).expect("install status");
     let status: Value = serde_json::from_str(&status_text).expect("status json");
 
-    assert!(manifest.contains("index_row_limit_reached"));
-    assert_eq!(status["status"], "needs_repair");
+    assert!(!manifest.contains("index_row_limit_reached"));
+    assert_eq!(known.lines().skip(1).count(), row_count);
     assert!(
-        status["missing_components"]
+        !status["missing_components"]
             .as_array()
             .expect("missing")
             .iter()
-            .any(|item| item.as_str() == Some("index_limit:known_targets"))
+            .any(|item| item
+                .as_str()
+                .is_some_and(|value| value.starts_with("index_limit:")))
     );
     fs::remove_dir_all(&root).expect("cleanup temp root");
     assert!(!root.exists());

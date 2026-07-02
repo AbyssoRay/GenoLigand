@@ -18,9 +18,6 @@ use input_conversion::{
 
 const WORKER_SCHEMA_VERSION: &str = "genoligand_worker_current_v1";
 const WORKER_PIPELINE_MODE: &str = "genoligand_scientific_pipeline";
-const MAX_INDEX_ROWS: usize = 30_000;
-const MAX_SOURCE_INDEX_ROWS: usize = 5_000;
-const MAX_FASTA_INDEX_ROWS: usize = MAX_INDEX_ROWS;
 const MAX_SEQUENCE_TOKEN_CHARS: usize = 96;
 const MAX_STRUCTURE_METADATA_CHARS: usize = 16_384;
 const KNOWN_SCORE_WEIGHT: f64 = 0.50;
@@ -115,38 +112,26 @@ struct WorkerTask {
     stage: &'static str,
 }
 
-const WORKER_TASKS: &[WorkerTask] = &[
-    WorkerTask {
-        job_id: "openff_rdkit_smoke",
-        worker: "openff_rdkit",
-        module: "genoligand_workers.openff_worker",
-        stage: "chemical_primitive",
-    },
-    WorkerTask {
-        job_id: "pdbfixer_smoke",
-        worker: "pdbfixer",
-        module: "genoligand_workers.pdbfixer_worker",
-        stage: "structure_preparation_primitive",
-    },
-    WorkerTask {
-        job_id: "openmm_smoke",
-        worker: "openmm",
-        module: "genoligand_workers.openmm_worker",
-        stage: "dynamics_primitive",
-    },
-    WorkerTask {
-        job_id: "trajectory_features_smoke",
-        worker: "trajectory_features",
-        module: "genoligand_workers.trajectory_worker",
-        stage: "trajectory_feature_primitive",
-    },
-    WorkerTask {
-        job_id: "md_summary_ligand_dynamics",
-        worker: "md_summary",
-        module: "genoligand_workers.md_summary_worker",
-        stage: "dynamics_summary_primitive",
-    },
-];
+const SCIENTIFIC_WORKER_TASKS: &[WorkerTask] = &[WorkerTask {
+    job_id: "md_summary_ligand_dynamics",
+    worker: "md_summary",
+    module: "genoligand_workers.md_summary_worker",
+    stage: "dynamics_summary_primitive",
+}];
+
+const SEQUENCE_ALIGNMENT_WORKER_TASK: WorkerTask = WorkerTask {
+    job_id: "mmseqs_onsite_sequence_alignment",
+    worker: "mmseqs_alignment",
+    module: "genoligand_workers.alignment_worker",
+    stage: "onsite_sequence_alignment",
+};
+
+const STRUCTURE_ALIGNMENT_WORKER_TASK: WorkerTask = WorkerTask {
+    job_id: "foldseek_onsite_structure_alignment",
+    worker: "foldseek_alignment",
+    module: "genoligand_workers.alignment_worker",
+    stage: "onsite_structure_alignment",
+};
 
 const DOCKING_WORKER_TASK: WorkerTask = WorkerTask {
     job_id: "autodock_vina_complex_docking",
@@ -570,7 +555,6 @@ fn prepare_science_store(options: &StoreOptions) -> Result<String, String> {
     let mut repair_text = String::from("component\tstatus\taction\tdetail\n");
     let mut missing = Vec::new();
     let mut ready = 0usize;
-    missing.extend(index_build_limit_components(&index_build)?);
     for (item, is_ready, path, action) in rows {
         if is_ready {
             ready += 1;
@@ -659,27 +643,6 @@ struct IndexBuildSummary {
     known_rows: usize,
     metagenome_rows: usize,
     structure_rows: usize,
-}
-
-fn index_build_limit_components(path: &Path) -> Result<Vec<String>, String> {
-    let text = read_text(path)?;
-    let mut limited = Vec::new();
-    for line in text.lines().skip(1) {
-        if !line.contains("index_row_limit_reached") {
-            continue;
-        }
-        let cols = split_tsv(line);
-        let index = cols
-            .first()
-            .filter(|value| !value.is_empty())
-            .cloned()
-            .unwrap_or_else(|| "unknown".to_string());
-        let component = format!("index_limit:{index}");
-        if !limited.contains(&component) {
-            limited.push(component);
-        }
-    }
-    Ok(limited)
 }
 
 fn build_store_indexes(
@@ -830,14 +793,6 @@ fn append_canonical_rows(
     rows: &mut Vec<StoreRow>,
     manifest: &mut String,
 ) -> Result<(), String> {
-    if rows.len() >= MAX_INDEX_ROWS {
-        manifest.push_str(&format!(
-            "{index_name}\t{}\tskipped\t0\t{}\tindex_row_limit_reached\n",
-            relative_display(root, path),
-            index_output_for(index_name)
-        ));
-        return Ok(());
-    }
     if !path.exists() {
         manifest.push_str(&format!(
             "{index_name}\t{}\tmissing\t0\t{}\tnot_present\n",
@@ -846,21 +801,11 @@ fn append_canonical_rows(
         ));
         return Ok(());
     }
-    let (mut parsed, notes) = read_source_rows(path, index_name)?;
-    let available = MAX_INDEX_ROWS.saturating_sub(rows.len());
-    let parsed_total = parsed.len();
-    if parsed.len() > available {
-        parsed.truncate(available);
-    }
+    let (parsed, notes) = read_source_rows(path, index_name)?;
     let count = parsed.len();
     rows.extend(parsed);
-    let note_suffix = if parsed_total > count {
-        ";index_row_limit_reached"
-    } else {
-        ""
-    };
     manifest.push_str(&format!(
-        "{index_name}\t{}\t{}\t{count}\t{}\t{notes}{note_suffix}\n",
+        "{index_name}\t{}\t{}\t{count}\t{}\t{notes}\n",
         relative_display(root, path),
         if count > 0 { "used" } else { "empty" },
         index_output_for(index_name)
@@ -877,19 +822,12 @@ fn append_built_rows(
     manifest: &mut String,
     notes: &str,
 ) {
-    let available = MAX_INDEX_ROWS.saturating_sub(rows.len());
     let total = built_rows.len();
-    let count = total.min(available);
-    rows.extend(built_rows.into_iter().take(count));
-    let note_suffix = if total > count {
-        ";index_row_limit_reached"
-    } else {
-        ""
-    };
+    rows.extend(built_rows);
     manifest.push_str(&format!(
-        "{index_name}\t{}\t{}\t{count}\t{}\t{notes}{note_suffix}\n",
+        "{index_name}\t{}\t{}\t{total}\t{}\t{notes}\n",
         relative_display(root, path),
-        if count > 0 { "used" } else { "empty" },
+        if total > 0 { "used" } else { "empty" },
         index_output_for(index_name)
     ));
 }
@@ -1286,7 +1224,7 @@ fn parse_fasta_line(
         );
         *header = rest.trim().to_string();
         sequence.clear();
-        rows.len() >= MAX_FASTA_INDEX_ROWS
+        false
     } else {
         sequence.push_str(line.trim());
         false
@@ -2386,6 +2324,10 @@ fn run_pipeline(options: &ScienceOptions) -> Result<String, String> {
     }
     run_pipeline_stage(options, "input_normalize", || normalize_input(options))?;
     run_pipeline_stage(options, "features_compute", || compute_features(options))?;
+    run_pipeline_stage(options, "onsite_sequence_alignment", || {
+        run_single_worker_task(options, &SEQUENCE_ALIGNMENT_WORKER_TASK)?;
+        Ok("onsite_sequence_alignment_checked".to_string())
+    })?;
     run_pipeline_stage(options, "database_match_known", || match_known(options))?;
     run_pipeline_stage(options, "metagenome_match_potential", || {
         match_metagenome(options)
@@ -2395,7 +2337,7 @@ fn run_pipeline(options: &ScienceOptions) -> Result<String, String> {
         evaluate_structure(options)
     })?;
     run_pipeline_stage(options, "dynamics_screen", || {
-        run_schema_bound_workers(options)?;
+        run_scientific_workers(options)?;
         screen_dynamics(options)
     })?;
     run_pipeline_stage(options, "target_rank", || rank_targets(options))?;
@@ -2812,6 +2754,26 @@ def numeric_activity(value):
     except ValueError:
         return float("inf")
 
+def activity_score(value):
+    numeric = numeric_activity(value)
+    if numeric == float("inf"):
+        return 0.65
+    if numeric <= 10:
+        score = 1.0
+    elif numeric <= 100:
+        score = 0.95
+    elif numeric <= 1000:
+        score = 0.85
+    elif numeric <= 10000:
+        score = 0.70
+    elif numeric <= 100000:
+        score = 0.55
+    else:
+        score = 0.40
+    if ">" in str(value):
+        score = min(score, 0.40)
+    return score
+
 def query_matches(query, smiles, ligand_name):
     q = query.strip()
     q_lower = q.lower()
@@ -2860,12 +2822,13 @@ with zipfile.ZipFile(zip_path) as archive:
                 if not target_id:
                     continue
                 ligand_code = first(row, ["Ligand HET ID in PDB"])
-                pdb_ids = first(row, ["PDB ID(s) for Ligand-Target Complex", "PDB ID(s) of Target Chain 1"])
+                ligand_complex_pdb_ids = first(row, ["PDB ID(s) for Ligand-Target Complex"])
+                target_chain_pdb_ids = first(row, ["PDB ID(s) of Target Chain 1"])
                 activity = first(row, ["Ki (nM)", "IC50 (nM)", "Kd (nM)", "EC50 (nM)"])
                 activity_type = next((name for name in ["Ki (nM)", "IC50 (nM)", "Kd (nM)", "EC50 (nM)"] if clean(row.get(name, ""))), "activity")
                 pubchem = first(row, ["PubChem CID"])
-                matched = f"ligand_name={ligand_name};ligand_smiles={smiles};ligand_code={ligand_code};pdb_ids={pdb_ids}"
-                evidence = f"bindingdb_onsite_activity_row;{activity_type}={activity};ligand_code={ligand_code};pdb_ids={pdb_ids};pubchem_cid={pubchem}"
+                matched = f"ligand_name={ligand_name};ligand_smiles={smiles};ligand_code={ligand_code};pdb_ids={ligand_complex_pdb_ids};target_chain_pdb_ids={target_chain_pdb_ids}"
+                evidence = f"bindingdb_onsite_activity_row;{activity_type}={activity};ligand_code={ligand_code};pdb_ids={ligand_complex_pdb_ids};target_chain_pdb_ids={target_chain_pdb_ids};pubchem_cid={pubchem}"
                 out_row = [
                     input_id,
                     "BindingDB",
@@ -2873,7 +2836,7 @@ with zipfile.ZipFile(zip_path) as archive:
                     target_name,
                     organism or "unknown",
                     target_class(organism),
-                    "1.0000",
+                    f"{activity_score(activity):.4f}",
                     clean(matched),
                     clean(evidence),
                 ]
@@ -2913,6 +2876,7 @@ fn match_metagenome(options: &ScienceOptions) -> Result<String, String> {
             }
         }
     }
+    append_tool_match_rows(options, "mmseqs_alignment_matches.tsv", &mut out)?;
     write_text(
         &options.run_dir.join("metagenome_potential_matches.tsv"),
         &out,
@@ -2948,6 +2912,15 @@ fn evaluate_structure(options: &ScienceOptions) -> Result<String, String> {
     let viewer_ready = copy_structure_viewer_artifact_if_available(options)?
         || write_structure_viewer_from_known_hints(options)?
         || write_structure_viewer_from_matches(options, &structure_matches)?;
+    run_single_worker_task(options, &STRUCTURE_ALIGNMENT_WORKER_TASK)?;
+    if append_tool_match_rows_to_file(
+        options,
+        &options.run_dir.join("structure_interaction_matches.tsv"),
+        "foldseek_structure_matches.tsv",
+    )? > 0
+    {
+        structure_ready = true;
+    }
     if append_selected_structure_match(
         &options.run_dir.join("structure_interaction_matches.tsv"),
         &options.run_dir.join("complex_candidate_selection.tsv"),
@@ -2994,7 +2967,44 @@ fn write_empty_structure_interaction_matches(options: &ScienceOptions) -> Result
     )
 }
 
-fn run_schema_bound_workers(options: &ScienceOptions) -> Result<String, String> {
+fn append_tool_match_rows(
+    options: &ScienceOptions,
+    tool_output_name: &str,
+    out: &mut String,
+) -> Result<usize, String> {
+    let path = options.run_dir.join("tool_outputs").join(tool_output_name);
+    if !path.exists() {
+        return Ok(0);
+    }
+    let text = read_text(&path)?;
+    let mut count = 0usize;
+    for line in text.lines().skip(1).filter(|line| !line.trim().is_empty()) {
+        if split_tsv(line).len() < 9 {
+            continue;
+        }
+        out.push_str(line);
+        out.push('\n');
+        count += 1;
+    }
+    Ok(count)
+}
+
+fn append_tool_match_rows_to_file(
+    options: &ScienceOptions,
+    target_path: &Path,
+    tool_output_name: &str,
+) -> Result<usize, String> {
+    let mut text = if target_path.exists() {
+        read_text(target_path)?
+    } else {
+        "input_id\tsource\ttarget_id\ttarget_name\torganism\ttarget_class\tmatch_score\tmatched_features\tevidence\n".to_string()
+    };
+    let count = append_tool_match_rows(options, tool_output_name, &mut text)?;
+    write_text(target_path, &text)?;
+    Ok(count)
+}
+
+fn run_scientific_workers(options: &ScienceOptions) -> Result<String, String> {
     let job_dir = options.run_dir.join("worker_jobs");
     let result_dir = options.run_dir.join("worker_results");
     ensure_dir(&job_dir)?;
@@ -3002,7 +3012,7 @@ fn run_schema_bound_workers(options: &ScienceOptions) -> Result<String, String> 
     let mut summary = String::from(
         "job_id\tworker\tstage\tjob_schema_valid\tlaunch_status\tresult_schema_valid\tresult_status\tengine_version\tprimitive_execution_only\tpython_owns_final_score\tpython_owns_report_semantics\n",
     );
-    for task in WORKER_TASKS {
+    for task in SCIENTIFIC_WORKER_TASKS {
         let job_path = job_dir.join(format!("{}.json", task.job_id));
         let result_path = result_dir.join(format!("{}.json", task.job_id));
         let job = worker_job_value(options, task);
@@ -3058,12 +3068,12 @@ fn run_schema_bound_workers(options: &ScienceOptions) -> Result<String, String> 
         ));
     }
     write_text(
-        &options.run_dir.join("worker_runtime_summary.tsv"),
+        &options.run_dir.join("scientific_runtime_summary.tsv"),
         &summary,
     )?;
     Ok(format!(
-        "schema_bound_workers_checked\tworker_count={}",
-        WORKER_TASKS.len()
+        "scientific_workers_checked\tworker_count={}",
+        SCIENTIFIC_WORKER_TASKS.len()
     ))
 }
 
@@ -3419,20 +3429,22 @@ fn write_structure_viewer_from_known_hints(options: &ScienceOptions) -> Result<b
     for hint in hints {
         for pdb_id in &hint.pdb_ids {
             if let Some(path) = find_structure_coordinate_file(&options.science_store, pdb_id) {
+                let rank = known_hint_rank(&hint);
                 let score = coordinate_hint_score(&path, &hint);
-                candidates.push((score, hint.clone(), pdb_id.clone(), path));
+                candidates.push((rank, score, hint.clone(), pdb_id.clone(), path));
             }
         }
     }
     candidates.sort_by(|left, right| {
         right
             .0
-            .total_cmp(&left.0)
-            .then_with(|| right.1.match_score.total_cmp(&left.1.match_score))
-            .then_with(|| left.1.target_id.cmp(&right.1.target_id))
-            .then_with(|| left.2.cmp(&right.2))
+            .cmp(&left.0)
+            .then_with(|| right.1.total_cmp(&left.1))
+            .then_with(|| right.2.match_score.total_cmp(&left.2.match_score))
+            .then_with(|| left.2.target_id.cmp(&right.2.target_id))
+            .then_with(|| left.3.cmp(&right.3))
     });
-    for (_, hint, pdb_id, path) in candidates {
+    for (_, _, hint, pdb_id, path) in candidates {
         if let Some(artifact) = write_coordinate_viewer_artifact(&options.run_dir, &path) {
             write_structure_viewer_status(
                 options,
@@ -3463,6 +3475,41 @@ fn write_structure_viewer_from_known_hints(options: &ScienceOptions) -> Result<b
     Ok(false)
 }
 
+fn known_structure_hints(path: &Path) -> Result<Vec<KnownStructureHint>, String> {
+    if !path.exists() {
+        return Ok(Vec::new());
+    }
+    let text = read_text(path)?;
+    let mut by_target = BTreeMap::<String, KnownStructureHint>::new();
+    for line in text.lines().skip(1) {
+        let cols = split_tsv(line);
+        if cols.len() < 9 || !cols[8].contains("bindingdb_onsite_activity_row") {
+            continue;
+        }
+        let pdb_ids = bindingdb_complex_pdb_ids(&format!("{};{}", cols[7], cols[8]));
+        if pdb_ids.is_empty() {
+            continue;
+        }
+        let hint = KnownStructureHint {
+            input_id: cols[0].clone(),
+            target_id: cols[2].clone(),
+            target_name: cols[3].clone(),
+            organism: cols[4].clone(),
+            target_class: cols[5].clone(),
+            match_score: cols[6].parse().unwrap_or(0.0),
+            evidence: cols[8].clone(),
+            pdb_ids,
+        };
+        let key = format!("{}\t{}", hint.input_id, hint.target_id);
+        match by_target.get(&key) {
+            Some(existing) if known_hint_rank(existing) >= known_hint_rank(&hint) => {}
+            _ => {
+                by_target.insert(key, hint);
+            }
+        }
+    }
+    Ok(by_target.into_values().collect())
+}
 fn write_structure_viewer_from_matches(
     options: &ScienceOptions,
     matches: &[IndexMatch],
@@ -3529,40 +3576,18 @@ fn write_structure_viewer_from_matches(
     Ok(false)
 }
 
-fn known_structure_hints(path: &Path) -> Result<Vec<KnownStructureHint>, String> {
-    if !path.exists() {
-        return Ok(Vec::new());
-    }
-    let text = read_text(path)?;
-    let mut by_target = BTreeMap::<String, KnownStructureHint>::new();
-    for line in text.lines().skip(1) {
-        let cols = split_tsv(line);
-        if cols.len() < 9 || !cols[8].contains("bindingdb_onsite_activity_row") {
+fn bindingdb_complex_pdb_ids(value: &str) -> Vec<String> {
+    let mut ids = BTreeSet::new();
+    for part in value.split(';') {
+        let Some((key, raw_value)) = part.split_once('=') else {
             continue;
-        }
-        let pdb_ids = pdb_ids_from_text(&format!("{} {}", cols[7], cols[8]));
-        if pdb_ids.is_empty() {
-            continue;
-        }
-        let hint = KnownStructureHint {
-            input_id: cols[0].clone(),
-            target_id: cols[2].clone(),
-            target_name: cols[3].clone(),
-            organism: cols[4].clone(),
-            target_class: cols[5].clone(),
-            match_score: cols[6].parse().unwrap_or(0.0),
-            evidence: cols[8].clone(),
-            pdb_ids,
         };
-        let key = format!("{}\t{}", hint.input_id, hint.target_id);
-        match by_target.get(&key) {
-            Some(existing) if known_hint_rank(existing) >= known_hint_rank(&hint) => {}
-            _ => {
-                by_target.insert(key, hint);
-            }
+        if key.trim() != "pdb_ids" {
+            continue;
         }
+        ids.extend(pdb_ids_from_text(raw_value));
     }
-    Ok(by_target.into_values().collect())
+    ids.into_iter().collect()
 }
 
 fn known_hint_rank(hint: &KnownStructureHint) -> i64 {
@@ -3583,7 +3608,7 @@ fn activity_nm_from_evidence(value: &str) -> Option<f64> {
             let number = tail
                 .chars()
                 .skip_while(|ch| matches!(ch, '<' | '>' | '=' | '~' | ' '))
-                .take_while(|ch| ch.is_ascii_digit() || *ch == '.')
+                .take_while(|ch| ch.is_ascii_digit() || matches!(*ch, '.' | 'e' | 'E' | '+' | '-'))
                 .collect::<String>();
             if let Ok(parsed) = number.parse::<f64>() {
                 return Some(parsed);
@@ -3759,6 +3784,9 @@ fn write_structure_viewer_status(
 }
 
 fn structure_coordinate_ids(item: &IndexMatch) -> Vec<String> {
+    if item.evidence.contains("bindingdb_onsite_activity_row") {
+        return bindingdb_complex_pdb_ids(&item.evidence);
+    }
     let mut text = String::new();
     for value in [
         item.target_id.as_str(),
@@ -4276,10 +4304,24 @@ fn complex_md_candidate_ids(options: &ScienceOptions) -> Result<BTreeSet<String>
 }
 
 fn complex_md_manifest_value_ready(value: &Value) -> bool {
-    value.get("method").and_then(Value::as_str) == Some("openmm_receptor_ligand_complex_dynamics")
-        && nonempty_json_string(value, "receptor_coordinate")
-        && nonempty_json_string(value, "ligand_coordinate")
-        && nonempty_json_string(value, "trajectory")
+    if value.get("method").and_then(Value::as_str)
+        != Some("openmm_receptor_ligand_complex_dynamics")
+        || !nonempty_json_string(value, "receptor_coordinate")
+        || !nonempty_json_string(value, "ligand_coordinate")
+        || !nonempty_json_string(value, "trajectory")
+        || !nonempty_json_string(value, "protocol_artifact")
+    {
+        return false;
+    }
+    if value.get("platform").and_then(Value::as_str) == Some("CUDA") {
+        return value
+            .get("gpu_observed")
+            .and_then(Value::as_bool)
+            .unwrap_or(false)
+            && nonempty_json_string(value, "gpu_telemetry_artifact")
+            && nonempty_json_string(value, "gpu_telemetry_status_artifact");
+    }
+    true
 }
 
 fn nonempty_json_string(value: &Value, key: &str) -> bool {
@@ -4387,13 +4429,19 @@ fn build_evidence(options: &ScienceOptions) -> Result<String, String> {
         "input_conversion_manifest.tsv",
         "input_normalized_manifest.tsv",
         "feature_manifest.tsv",
+        "tool_outputs/mmseqs_alignment_matches.tsv",
+        "tool_outputs/mmseqs_alignment_status.tsv",
         "known_database_matches.tsv",
         "metagenome_potential_matches.tsv",
         "structure_interaction_matches.tsv",
+        "tool_outputs/foldseek_structure_matches.tsv",
+        "tool_outputs/foldseek_alignment_status.tsv",
         "complex_candidate_selection.tsv",
-        "worker_runtime_summary.tsv",
+        "scientific_runtime_summary.tsv",
         "structure_patch_summary.tsv",
         "docking_summary.tsv",
+        "tool_outputs/docking_manifest.json",
+        "tool_outputs/docking_pose.sdf",
         "md_summary.tsv",
         "tool_outputs/md_summary.tsv",
         "tool_outputs/md_rmsd.tsv",
@@ -4401,6 +4449,9 @@ fn build_evidence(options: &ScienceOptions) -> Result<String, String> {
         "tool_outputs/md_ligand_drift.tsv",
         "tool_outputs/md_contacts.tsv",
         "tool_outputs/md_hbonds.tsv",
+        "tool_outputs/md_protocol.tsv",
+        "tool_outputs/gpu_telemetry.tsv",
+        "tool_outputs/gpu_telemetry_status.tsv",
         "tool_outputs/ligand_placement.tsv",
         "tool_outputs/md_trajectory.tsv",
         "tool_outputs/complex_md_manifest.json",
@@ -4462,6 +4513,26 @@ fn artifact_evidence_status(file: &str, path: &Path) -> Result<ArtifactEvidenceS
                 ("not_generated", "no computed feature rows".to_string())
             }
         }
+        "tool_outputs/mmseqs_alignment_matches.tsv" => {
+            if rows > 0 {
+                ("available", format!("{rows} MMseqs2 onsite alignment rows"))
+            } else {
+                ("no_match", "no MMseqs2 onsite alignment rows".to_string())
+            }
+        }
+        "tool_outputs/mmseqs_alignment_status.tsv" => {
+            if rows > 0 {
+                (
+                    "available",
+                    "MMseqs2 onsite alignment status recorded".to_string(),
+                )
+            } else {
+                (
+                    "not_generated",
+                    "no MMseqs2 alignment status row".to_string(),
+                )
+            }
+        }
         "known_database_matches.tsv" => {
             if rows > 0 {
                 ("available", format!("{rows} known database match rows"))
@@ -4489,6 +4560,32 @@ fn artifact_evidence_status(file: &str, path: &Path) -> Result<ArtifactEvidenceS
                 )
             }
         }
+        "tool_outputs/foldseek_structure_matches.tsv" => {
+            if rows > 0 {
+                (
+                    "available",
+                    format!("{rows} Foldseek onsite structure alignment rows"),
+                )
+            } else {
+                (
+                    "no_match",
+                    "no Foldseek onsite structure alignment rows".to_string(),
+                )
+            }
+        }
+        "tool_outputs/foldseek_alignment_status.tsv" => {
+            if rows > 0 {
+                (
+                    "available",
+                    "Foldseek onsite alignment status recorded".to_string(),
+                )
+            } else {
+                (
+                    "not_generated",
+                    "no Foldseek alignment status row".to_string(),
+                )
+            }
+        }
         "complex_candidate_selection.tsv" => {
             if rows > 0 {
                 (
@@ -4502,7 +4599,7 @@ fn artifact_evidence_status(file: &str, path: &Path) -> Result<ArtifactEvidenceS
                 )
             }
         }
-        "worker_runtime_summary.tsv" => {
+        "scientific_runtime_summary.tsv" => {
             if rows > 0 {
                 let text = read_text(path)?;
                 let pass_count = text
@@ -4512,10 +4609,10 @@ fn artifact_evidence_status(file: &str, path: &Path) -> Result<ArtifactEvidenceS
                     .count();
                 (
                     "available",
-                    format!("{rows} worker checks recorded; {pass_count} passed"),
+                    format!("{rows} scientific worker runs recorded; {pass_count} passed"),
                 )
             } else {
-                ("not_generated", "no worker runtime rows".to_string())
+                ("not_generated", "no scientific runtime rows".to_string())
             }
         }
         "structure_patch_summary.tsv" => {
@@ -4532,6 +4629,14 @@ fn artifact_evidence_status(file: &str, path: &Path) -> Result<ArtifactEvidenceS
                 ("not_generated", "no docking rows".to_string())
             }
         }
+        "tool_outputs/docking_manifest.json" => (
+            "available",
+            "AutoDock Vina docking manifest recorded".to_string(),
+        ),
+        "tool_outputs/docking_pose.sdf" => (
+            "available",
+            "AutoDock Vina docking pose SDF recorded".to_string(),
+        ),
         "md_summary.tsv" => {
             if rows > 0 {
                 (
@@ -4544,6 +4649,13 @@ fn artifact_evidence_status(file: &str, path: &Path) -> Result<ArtifactEvidenceS
                 ("not_generated", "no dynamics rows".to_string())
             }
         }
+        "tool_outputs/md_protocol.tsv" => {
+            if rows > 0 {
+                ("available", format!("{rows} MD protocol rows"))
+            } else {
+                ("not_generated", "no MD protocol rows".to_string())
+            }
+        }
         file if file.starts_with("tool_outputs/md_") && file.ends_with(".tsv") => {
             if rows > 0 {
                 (
@@ -4552,6 +4664,26 @@ fn artifact_evidence_status(file: &str, path: &Path) -> Result<ArtifactEvidenceS
                 )
             } else {
                 ("not_generated", "no MD metric artifact rows".to_string())
+            }
+        }
+        "tool_outputs/gpu_telemetry.tsv" => {
+            if rows > 0 {
+                ("available", format!("{rows} CUDA GPU telemetry samples"))
+            } else {
+                ("not_generated", "no CUDA GPU telemetry samples".to_string())
+            }
+        }
+        "tool_outputs/gpu_telemetry_status.tsv" => {
+            if rows > 0 {
+                (
+                    "available",
+                    "CUDA GPU observation status recorded for this run".to_string(),
+                )
+            } else {
+                (
+                    "not_generated",
+                    "no CUDA GPU observation status row".to_string(),
+                )
             }
         }
         "tool_outputs/ligand_placement.tsv" => {
@@ -4671,8 +4803,17 @@ fn report_md_score_summary(
         read_md_manifest_field(options, "platform").unwrap_or_else(|| "unknown".to_string());
     let trajectory = read_md_manifest_field(options, "trajectory")
         .unwrap_or_else(|| "tool_outputs/md_trajectory.tsv".to_string());
+    let protocol = read_md_manifest_field(options, "protocol_artifact")
+        .unwrap_or_else(|| "tool_outputs/md_protocol.tsv".to_string());
+    let telemetry = read_md_manifest_field(options, "gpu_telemetry_artifact")
+        .unwrap_or_else(|| "tool_outputs/gpu_telemetry.tsv".to_string());
+    let gpu_observed = if read_md_manifest_bool(options, "gpu_observed").unwrap_or(false) {
+        "\u{5df2}\u{89c2}\u{6d4b}"
+    } else {
+        "\u{672a}\u{89c2}\u{6d4b}"
+    };
     Ok(format!(
-        "## \u{52a8}\u{529b}\u{5b66}\u{8bc4}\u{5206}\n\n- \u{6765}\u{6e90}\u{ff1a}md_summary.tsv \u{4e2d}\u{7684} md_stability_score\u{ff0c}\u{7531} tool_outputs/md_rmsd.tsv\u{3001}tool_outputs/md_rmsf.tsv\u{3001}tool_outputs/md_ligand_drift.tsv\u{3001}tool_outputs/md_contacts.tsv \u{548c} tool_outputs/md_hbonds.tsv \u{7b49}\u{5f53}\u{524d}\u{8fd0}\u{884c}\u{8f68}\u{8ff9}\u{6307}\u{6807}\u{6c47}\u{603b}\u{5f97}\u{5230}\u{3002}\n- \u{7528}\u{9014}\u{ff1a}\u{5199}\u{5165} Candidate Ranking \u{7684} md_score\u{ff0c}\u{5e76}\u{4ee5} {MD_SCORE_WEIGHT:.2} \u{6743}\u{91cd}\u{53c2}\u{4e0e} final_score\u{ff1b}\u{672c}\u{8fd0}\u{884c} {ranked_md} \u{4e2a}\u{5019}\u{9009}\u{6709} MD \u{5206}\u{6570}\u{3002}\n- \u{4f7f}\u{7528}\u{8bf4}\u{660e}\u{ff1a}\u{5f53}\u{524d} MD \u{4f5c}\u{4e3a}\u{77ed}\u{7a0b}\u{7a33}\u{5b9a}\u{6027}\u{7b5b}\u{9009}\u{8bc1}\u{636e}\u{ff0c}\u{4f7f}\u{7528}\u{5f53}\u{524d}\u{8fd0}\u{884c}\u{7684}\u{914d}\u{4f53}\u{653e}\u{7f6e}\u{548c}\u{53d7}\u{9650} receptor \u{6a21}\u{578b}\u{ff1b}\u{9002}\u{5408}\u{5019}\u{9009}\u{4f18}\u{5148}\u{7ea7}\u{5224}\u{65ad}\u{ff0c}\u{5b8c}\u{6574}\u{751f}\u{4ea7}\u{7ea7} MD \u{548c}\u{5b9e}\u{9a8c}\u{7ed3}\u{679c}\u{7531}\u{540e}\u{7eed}\u{5b9e}\u{9a8c}\u{4e0e}\u{957f}\u{7a0b}\u{6a21}\u{62df}\u{8865}\u{5145}\u{3002}\n- OpenMM \u{5e73}\u{53f0}\u{ff1a}{platform}\u{ff1b}\u{8f68}\u{8ff9}\u{4ea7}\u{7269}\u{ff1a}{trajectory}\u{3002}\n\n"
+        "## \u{52a8}\u{529b}\u{5b66}\u{8bc4}\u{5206}\n\n- \u{6765}\u{6e90}\u{ff1a}md_summary.tsv \u{4e2d}\u{7684} md_stability_score\u{ff0c}\u{7531} tool_outputs/md_rmsd.tsv\u{3001}tool_outputs/md_rmsf.tsv\u{3001}tool_outputs/md_ligand_drift.tsv\u{3001}tool_outputs/md_contacts.tsv \u{548c} tool_outputs/md_hbonds.tsv \u{7b49}\u{5f53}\u{524d}\u{8fd0}\u{884c}\u{8f68}\u{8ff9}\u{6307}\u{6807}\u{6c47}\u{603b}\u{5f97}\u{5230}\u{3002}\n- \u{7528}\u{9014}\u{ff1a}\u{5199}\u{5165} Candidate Ranking \u{7684} md_score\u{ff0c}\u{5e76}\u{4ee5} {MD_SCORE_WEIGHT:.2} \u{6743}\u{91cd}\u{53c2}\u{4e0e} final_score\u{ff1b}\u{672c}\u{8fd0}\u{884c} {ranked_md} \u{4e2a}\u{5019}\u{9009}\u{6709} MD \u{5206}\u{6570}\u{3002}\n- \u{4f7f}\u{7528}\u{8bf4}\u{660e}\u{ff1a}\u{5f53}\u{524d} MD \u{4f5c}\u{4e3a}\u{77ed}\u{7a0b}\u{7a33}\u{5b9a}\u{6027}\u{7b5b}\u{9009}\u{8bc1}\u{636e}\u{ff0c}\u{4f7f}\u{7528}\u{5f53}\u{524d}\u{8fd0}\u{884c}\u{7684}\u{914d}\u{4f53}\u{653e}\u{7f6e}\u{548c}\u{53d7}\u{9650} receptor \u{6a21}\u{578b}\u{3002}\n- \u{8fd0}\u{884c}\u{8bb0}\u{5f55}\u{ff1a}OpenMM \u{5e73}\u{53f0} {platform}\u{ff0c}CUDA GPU {gpu_observed}\u{ff0c}\u{534f}\u{8bae}\u{4ea7}\u{7269} {protocol}\u{ff0c}\u{76d1}\u{6d4b}\u{4ea7}\u{7269} {telemetry}\u{ff0c}\u{8f68}\u{8ff9}\u{4ea7}\u{7269} {trajectory}\u{3002}\n\n"
     ))
 }
 
@@ -4686,6 +4827,13 @@ fn read_md_manifest_field(options: &ScienceOptions, field: &str) -> Option<Strin
                 .and_then(Value::as_str)
                 .map(ToOwned::to_owned)
         })
+}
+
+fn read_md_manifest_bool(options: &ScienceOptions, field: &str) -> Option<bool> {
+    read_text(&options.run_dir.join("tool_outputs/md_run_manifest.json"))
+        .ok()
+        .and_then(|text| serde_json::from_str::<Value>(text.trim_start_matches('\u{feff}')).ok())
+        .and_then(|value| value.get(field).and_then(Value::as_bool))
 }
 
 fn report_source_summary(options: &ScienceOptions, candidate_count: usize) -> String {
@@ -4871,6 +5019,9 @@ fn write_candidate_detail(
                     "tool_outputs/complex_md_manifest.json",
                     "tool_outputs/ligand_placement.tsv",
                     "tool_outputs/md_run_manifest.json",
+                    "tool_outputs/md_protocol.tsv",
+                    "tool_outputs/gpu_telemetry.tsv",
+                    "tool_outputs/gpu_telemetry_status.tsv",
                     "tool_outputs/md_trajectory.tsv",
                     "tool_outputs/md_rmsd.tsv",
                     "tool_outputs/md_rmsf.tsv",
@@ -4935,7 +5086,17 @@ fn write_artifact_source_map(options: &ScienceOptions) -> Result<(), String> {
         (
             "feature_manifest.tsv",
             "input_conversion_manifest.tsv;input_normalized_manifest.tsv",
-            "known_database_matches.tsv;metagenome_potential_matches.tsv",
+            "known_database_matches.tsv;metagenome_potential_matches.tsv;tool_outputs/mmseqs_alignment_matches.tsv",
+        ),
+        (
+            "tool_outputs/mmseqs_alignment_matches.tsv",
+            "input_conversion_manifest.tsv;downloads/uniprot;downloads/metagenome;downloads/biolip2;MMseqs2 easy-search",
+            "metagenome_potential_matches.tsv;evidence_ledger.tsv",
+        ),
+        (
+            "tool_outputs/mmseqs_alignment_status.tsv",
+            "MMseqs2 easy-search command execution",
+            "evidence_ledger.tsv",
         ),
         (
             "known_database_matches.tsv",
@@ -4954,8 +5115,18 @@ fn write_artifact_source_map(options: &ScienceOptions) -> Result<(), String> {
         ),
         (
             "structure_interaction_matches.tsv",
-            "indexes/structure_targets.tsv;feature_manifest.tsv",
+            "indexes/structure_targets.tsv;feature_manifest.tsv;tool_outputs/foldseek_structure_matches.tsv",
             "target_candidate_ranking.tsv;structure_patch_summary.tsv;complex_candidate_selection.tsv",
+        ),
+        (
+            "tool_outputs/foldseek_structure_matches.tsv",
+            "structure_viewer coordinate artifact;downloads/rcsb/mmcif;Foldseek easy-search",
+            "structure_interaction_matches.tsv;evidence_ledger.tsv",
+        ),
+        (
+            "tool_outputs/foldseek_alignment_status.tsv",
+            "Foldseek easy-search command execution",
+            "evidence_ledger.tsv",
         ),
         (
             "complex_candidate_selection.tsv",
@@ -4963,8 +5134,8 @@ fn write_artifact_source_map(options: &ScienceOptions) -> Result<(), String> {
             "structure_viewer_status.tsv;docking_summary.tsv;md_summary.tsv;target_candidate_ranking.tsv",
         ),
         (
-            "worker_runtime_summary.tsv",
-            "Rust-generated worker job specs;schema-bound primitive worker results",
+            "scientific_runtime_summary.tsv",
+            "current run scientific worker jobs and results",
             "evidence_ledger.tsv",
         ),
         (
@@ -4975,11 +5146,21 @@ fn write_artifact_source_map(options: &ScienceOptions) -> Result<(), String> {
         (
             "docking_summary.tsv",
             "schema-bound docking output when present;otherwise no generated rows",
-            "evidence_ledger.tsv",
+            "tool_outputs/docking_manifest.json;tool_outputs/docking_pose.sdf;evidence_ledger.tsv",
+        ),
+        (
+            "tool_outputs/docking_manifest.json",
+            "AutoDock Vina command, receptor coordinate, ligand structure and docking box",
+            "docking_summary.tsv;md_summary.tsv;evidence_ledger.tsv",
+        ),
+        (
+            "tool_outputs/docking_pose.sdf",
+            "AutoDock Vina pose converted from docking_pose.pdbqt by Open Babel",
+            "tool_outputs/ligand_placement.tsv;tool_outputs/complex_md_manifest.json;md_summary.tsv",
         ),
         (
             "md_summary.tsv",
-            "tool_outputs/md_run_manifest.json;tool_outputs/md_summary.tsv;tool_outputs/md_rmsd.tsv;tool_outputs/md_rmsf.tsv;tool_outputs/md_ligand_drift.tsv;tool_outputs/md_contacts.tsv;tool_outputs/md_hbonds.tsv",
+            "tool_outputs/docking_pose.sdf;tool_outputs/md_run_manifest.json;tool_outputs/md_protocol.tsv;tool_outputs/gpu_telemetry_status.tsv;tool_outputs/md_summary.tsv;tool_outputs/md_rmsd.tsv;tool_outputs/md_rmsf.tsv;tool_outputs/md_ligand_drift.tsv;tool_outputs/md_contacts.tsv;tool_outputs/md_hbonds.tsv",
             "target_candidate_ranking.tsv;evidence_ledger.tsv",
         ),
         (
@@ -5013,8 +5194,23 @@ fn write_artifact_source_map(options: &ScienceOptions) -> Result<(), String> {
             "md_summary.tsv",
         ),
         (
+            "tool_outputs/md_protocol.tsv",
+            "current run MD protocol: coordinates, platform, minimization, equilibration, production and output cadence",
+            "md_summary.tsv;tool_outputs/md_run_manifest.json;evidence_ledger.tsv",
+        ),
+        (
+            "tool_outputs/gpu_telemetry.tsv",
+            "nvidia-smi samples collected around OpenMM CUDA context, equilibration and production",
+            "tool_outputs/gpu_telemetry_status.tsv;tool_outputs/md_run_manifest.json;evidence_ledger.tsv",
+        ),
+        (
+            "tool_outputs/gpu_telemetry_status.tsv",
+            "CUDA platform observation status derived from nvidia-smi utilization, memory delta and process samples",
+            "md_summary.tsv;tool_outputs/complex_md_manifest.json;tool_outputs/md_run_manifest.json;evidence_ledger.tsv",
+        ),
+        (
             "tool_outputs/ligand_placement.tsv",
-            "current run ligand or peptide coordinates from worker calculation",
+            "AutoDock Vina pose SDF for small molecules or RDKit peptide conformer coordinates",
             "md_summary.tsv;tool_outputs/complex_md_manifest.json;tool_outputs/md_run_manifest.json",
         ),
         (
@@ -5024,7 +5220,7 @@ fn write_artifact_source_map(options: &ScienceOptions) -> Result<(), String> {
         ),
         (
             "tool_outputs/complex_md_manifest.json",
-            "current run receptor coordinate, ligand coordinate, OpenMM platform, trajectory and metric artifacts",
+            "current run receptor coordinate, AutoDock Vina ligand pose, OpenMM platform, trajectory and metric artifacts",
             "evidence_ledger.tsv;tool_outputs/md_run_manifest.json",
         ),
         (
@@ -5215,12 +5411,8 @@ where
     if is_bindingdb_header(&headers) {
         return parse_bindingdb_rows(&headers, lines, label);
     }
-    let row_limit = store_row_limit(label);
     let mut rows = Vec::new();
     for line in lines {
-        if rows.len() >= row_limit {
-            break;
-        }
         let line = line.map_err(|err| format!("{label}_read_failed:{err}"))?;
         let line = line.trim_start_matches('\u{feff}');
         let cols = split_tsv(line);
@@ -5240,14 +5432,6 @@ where
         });
     }
     Ok(rows)
-}
-
-fn store_row_limit(label: &str) -> usize {
-    if label.ends_with("_index") || label.ends_with("_targets") {
-        MAX_INDEX_ROWS
-    } else {
-        MAX_SOURCE_INDEX_ROWS
-    }
 }
 
 fn parse_chembl_sqlite_archive(path: &Path) -> Result<Vec<StoreRow>, String> {
@@ -5360,7 +5544,6 @@ GROUP BY
     act.standard_relation,
     act.standard_value,
     act.standard_units
-LIMIT 30000
 """
 
 connection = sqlite3.connect(sys.argv[1])
@@ -5502,11 +5685,7 @@ where
     ];
 
     let mut rows = Vec::new();
-    let row_limit = store_row_limit(label);
     for line in lines {
-        if rows.len() >= row_limit {
-            break;
-        }
         let line = line.map_err(|err| format!("{label}_read_failed:{err}"))?;
         let cols = split_tsv(line.trim_start_matches('\u{feff}'));
         let target_name = cell(&cols, target_name_idx);

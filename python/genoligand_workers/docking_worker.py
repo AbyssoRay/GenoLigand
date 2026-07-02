@@ -65,6 +65,7 @@ def run_docking_job(job: dict[str, Any]) -> str:
     ligand_sdf = tool_outputs / "docking_ligand.sdf"
     ligand_pdbqt = tool_outputs / "docking_ligand.pdbqt"
     pose_pdbqt = tool_outputs / "docking_pose.pdbqt"
+    pose_sdf = tool_outputs / "docking_pose.sdf"
     log_path = tool_outputs / "docking_vina.log"
 
     center = write_receptor_pdb(receptor_coordinate, receptor_pdb)
@@ -100,6 +101,7 @@ def run_docking_job(job: dict[str, Any]) -> str:
         "vina",
         log_path,
     )
+    run_checked([obabel, str(pose_pdbqt), "-O", str(pose_sdf)], "obabel_pose")
 
     affinity = parse_vina_affinity(log_path, pose_pdbqt)
     candidate_id = top_candidate_id(run_dir) or "target_docking"
@@ -112,7 +114,7 @@ def run_docking_job(job: dict[str, Any]) -> str:
                 "completed",
                 fmt(affinity),
                 "vina",
-                f"pose=tool_outputs/docking_pose.pdbqt;receptor={receptor_coordinate.name};box_center={fmt(center[0])},{fmt(center[1])},{fmt(center[2])};box_size={BOX_SIZE_ANGSTROM}",
+                f"pose=tool_outputs/docking_pose.pdbqt;pose_sdf=tool_outputs/docking_pose.sdf;receptor={receptor_coordinate.name};box_center={fmt(center[0])},{fmt(center[1])},{fmt(center[2])};box_size={BOX_SIZE_ANGSTROM}",
             ]
         ],
     )
@@ -129,6 +131,7 @@ def run_docking_job(job: dict[str, Any]) -> str:
                 "ligand_smiles": smiles,
                 "ligand_pdbqt": "tool_outputs/docking_ligand.pdbqt",
                 "pose": "tool_outputs/docking_pose.pdbqt",
+                "pose_sdf": "tool_outputs/docking_pose.sdf",
                 "log": "tool_outputs/docking_vina.log",
                 "affinity_kcal_mol": affinity,
                 "box_center": center,

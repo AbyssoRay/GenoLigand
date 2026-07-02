@@ -2238,14 +2238,26 @@ fn evidence_type_label(claim: &str, artifact: &str) -> &'static str {
         "metagenome_potential_matches.tsv" | "metagenome_potential_matches" => {
             "\u{5b8f}\u{57fa}\u{56e0}\u{7ec4}\u{6f5c}\u{5728}\u{5e8f}\u{5217}\u{6bd4}\u{5bf9}"
         }
+        "tool_outputs/mmseqs_alignment_matches.tsv" | "mmseqs_alignment_matches" => {
+            "\u{5e8f}\u{5217}\u{73b0}\u{573a}\u{6bd4}\u{5bf9}"
+        }
+        "tool_outputs/foldseek_structure_matches.tsv" | "foldseek_structure_matches" => {
+            "\u{7ed3}\u{6784}\u{73b0}\u{573a}\u{6bd4}\u{5bf9}"
+        }
         "structure_patch_summary.tsv" | "structure_patch_summary" => {
             "\u{7ed3}\u{6784}\u{4e0e}\u{53e3}\u{888b}"
         }
         "worker_runtime_summary.tsv" | "worker_runtime_summary" => {
             "\u{5de5}\u{5177}\u{9002}\u{914d}\u{5668}\u{68c0}\u{67e5}"
         }
+        "scientific_runtime_summary.tsv" | "scientific_runtime_summary" => {
+            "\u{79d1}\u{5b66}\u{8fd0}\u{884c}\u{6458}\u{8981}"
+        }
         "docking_summary.tsv" | "docking_summary" => "\u{5bf9}\u{63a5}\u{6458}\u{8981}",
         "md_summary.tsv" | "md_summary" => "\u{52a8}\u{529b}\u{5b66}\u{6458}\u{8981}",
+        "tool_outputs/md_protocol.tsv" | "md_protocol" => "MD \u{8fd0}\u{884c}\u{534f}\u{8bae}",
+        "tool_outputs/gpu_telemetry.tsv" | "gpu_telemetry" => "CUDA \u{76d1}\u{6d4b}",
+        "tool_outputs/gpu_telemetry_status.tsv" | "gpu_telemetry_status" => "CUDA \u{72b6}\u{6001}",
         "target_candidate_ranking.tsv" | "target_candidate_ranking" => {
             "\u{5019}\u{9009}\u{6392}\u{5e8f}"
         }
@@ -2264,11 +2276,24 @@ fn evidence_source_label(artifact: &str) -> &'static str {
         "metagenome_potential_matches.tsv" => {
             "\u{5b8f}\u{57fa}\u{56e0}\u{7ec4}\u{6f5c}\u{5728}\u{5e8f}\u{5217}\u{7d22}\u{5f15}"
         }
+        "tool_outputs/mmseqs_alignment_matches.tsv" => "MMseqs2 \u{73b0}\u{573a}\u{6bd4}\u{5bf9}",
+        "tool_outputs/foldseek_structure_matches.tsv" => {
+            "Foldseek \u{73b0}\u{573a}\u{7ed3}\u{6784}\u{6bd4}\u{5bf9}"
+        }
         "worker_runtime_summary.tsv" => {
             "\u{5f53}\u{524d}\u{8fd0}\u{884c}\u{7684}\u{5de5}\u{5177}\u{9002}\u{914d}\u{5668}"
         }
+        "scientific_runtime_summary.tsv" => {
+            "\u{5f53}\u{524d}\u{8fd0}\u{884c}\u{7684}\u{79d1}\u{5b66}\u{5de5}\u{5177}\u{8f93}\u{51fa}"
+        }
         "structure_patch_summary.tsv" | "docking_summary.tsv" | "md_summary.tsv" => {
             "\u{5f53}\u{524d}\u{8fd0}\u{884c}\u{7684}\u{5de5}\u{5177}\u{8f93}\u{51fa}"
+        }
+        "tool_outputs/md_protocol.tsv" => {
+            "\u{5f53}\u{524d} MD \u{7684}\u{534f}\u{8bae}\u{8bb0}\u{5f55}"
+        }
+        "tool_outputs/gpu_telemetry.tsv" | "tool_outputs/gpu_telemetry_status.tsv" => {
+            "\u{5f53}\u{524d} CUDA \u{8fd0}\u{884c}\u{76d1}\u{6d4b}"
         }
         "target_candidate_ranking.tsv" | "score_decomposition.tsv" | "candidate_detail.json" => {
             "\u{5f53}\u{524d}\u{8fd0}\u{884c}\u{7684}\u{5019}\u{9009}\u{7ed3}\u{679c}"
@@ -3635,7 +3660,8 @@ fn artifact_visible_for_user(id: &str, path: &Path, run_dir: &Path, completed: b
         "candidate_ranking" => {
             completed && rows_len(&run_dir.join("target_candidate_ranking.tsv")) > 0
         }
-        "evidence" | "structure_patch" | "md_summary" => completed && rows_len(path) > 0,
+        "evidence" | "structure_patch" | "md_summary" | "md_protocol" | "gpu_telemetry"
+        | "onsite_search" | "docking_summary" => completed && rows_len(path) > 0,
         "research_report" => {
             completed
                 && rows_len(&run_dir.join("target_candidate_ranking.tsv")) > 0
@@ -3648,6 +3674,16 @@ fn artifact_visible_for_user(id: &str, path: &Path, run_dir: &Path, completed: b
 fn artifact_specs() -> &'static [(&'static str, &'static str, &'static str)] {
     &[
         (
+            "onsite_search",
+            "\u{73b0}\u{573a}\u{641c}\u{7d22}\u{7ed3}\u{679c}",
+            "known_database_matches.tsv",
+        ),
+        (
+            "docking_summary",
+            "\u{5bf9}\u{63a5}\u{6458}\u{8981}",
+            "docking_summary.tsv",
+        ),
+        (
             "structure_patch",
             "\u{7ed3}\u{6784}\u{4e0e}\u{53e3}\u{888b}\u{6458}\u{8981}",
             "structure_patch_summary.tsv",
@@ -3656,6 +3692,16 @@ fn artifact_specs() -> &'static [(&'static str, &'static str, &'static str)] {
             "md_summary",
             "\u{52a8}\u{529b}\u{5b66}\u{6458}\u{8981}",
             "md_summary.tsv",
+        ),
+        (
+            "md_protocol",
+            "MD \u{8fd0}\u{884c}\u{534f}\u{8bae}",
+            "tool_outputs/md_protocol.tsv",
+        ),
+        (
+            "gpu_telemetry",
+            "CUDA \u{76d1}\u{6d4b}",
+            "tool_outputs/gpu_telemetry.tsv",
         ),
         (
             "candidate_ranking",

@@ -3,6 +3,8 @@ from __future__ import annotations
 import csv
 import json
 import math
+import os
+import subprocess
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -15,6 +17,10 @@ MAX_PEPTIDE_RESIDUES = 80
 PEPTIDE_CONFORMER_COUNT = 12
 SIMULATION_SEED = 20260629
 STANDARD_AMINO_ACIDS = set("ACDEFGHIKLMNPQRSTVWY")
+DEFAULT_EQUILIBRATION_STEPS = 1000
+DEFAULT_PRODUCTION_SEGMENTS = 20
+DEFAULT_PRODUCTION_STEPS_PER_SEGMENT = 250
+DEFAULT_MINIMIZATION_ITERATIONS = 200
 
 
 @dataclass
@@ -24,6 +30,13 @@ class ReceptorCoordinate:
     positions_angstrom: Any
     preparation: str
     risk_flags: list[str]
+
+
+@dataclass
+class GpuTelemetry:
+    rows: list[dict[str, str]]
+    available: bool = False
+    failure_reason: str = ""
 
 
 def main() -> int:
@@ -101,7 +114,6 @@ def run_md_summary_job(job: dict[str, Any]) -> str:
         write_md_not_ready(run_dir, "missing receptor coordinate artifact for complex MD", ["missing_receptor_coordinate"])
         return openmm_version_text(openmm, "not_ready", "missing_receptor_coordinate")
 
-    mol = prepare_ligand(smiles, Chem, AllChem)
     try:
         receptor = load_receptor_coordinate(receptor_path, unit)
     except Exception as exc:  # noqa: BLE001 - not-ready artifact is the contract for unusable coordinates
@@ -115,6 +127,15 @@ def run_md_summary_job(job: dict[str, Any]) -> str:
         write_md_not_ready(run_dir, "receptor coordinate file did not contain usable heavy atoms", ["receptor_coordinate_parse_failed"])
         return openmm_version_text(openmm, "not_ready", "receptor_coordinate_parse_failed")
 
+    mol = read_docking_pose_ligand(run_dir, Chem)
+    if mol is None:
+        write_md_not_ready(
+            run_dir,
+            "missing AutoDock Vina docking pose SDF for complex MD",
+            ["missing_docking_pose_sdf"],
+        )
+        return openmm_version_text(openmm, "not_ready", "missing_docking_pose_sdf")
+
     conformer = mol.GetConformer()
     initial_angstrom = np.array(
         [
@@ -127,9 +148,13 @@ def run_md_summary_job(job: dict[str, Any]) -> str:
         ],
         dtype=float,
     )
-    ligand_positions = place_ligand_near_receptor(initial_angstrom, receptor.positions_angstrom)
+    ligand_positions = initial_angstrom
     parameterization, parameter_flags = ligand_parameterization_status(mol)
     platform_name = select_openmm_platform(openmm)
+    platform = openmm.Platform.getPlatformByName(platform_name)
+    platform_properties = openmm_platform_properties(platform_name, platform)
+    gpu_telemetry = GpuTelemetry(rows=[])
+    sample_gpu_telemetry(gpu_telemetry, "baseline_before_openmm_context")
     system, role_ranges = build_complex_system(
         openmm,
         unit,
@@ -143,26 +168,68 @@ def run_md_summary_job(job: dict[str, Any]) -> str:
         0.001 * unit.picoseconds,
     )
     integrator.setRandomNumberSeed(SIMULATION_SEED)
-    platform = openmm.Platform.getPlatformByName(platform_name)
-    context = openmm.Context(system, integrator, platform)
+    if platform_properties:
+        context = openmm.Context(system, integrator, platform, platform_properties)
+    else:
+        context = openmm.Context(system, integrator, platform)
+    sample_gpu_telemetry(gpu_telemetry, "after_openmm_context")
     combined_positions = np.vstack([receptor.positions_angstrom, ligand_positions])
     positions_nm = [Vec3(*(coord / 10.0)) for coord in combined_positions]
     context.setPositions(unit.Quantity(positions_nm, unit.nanometer))
+    sample_gpu_telemetry(gpu_telemetry, "after_positions_set")
+    pre_minimization_energy = potential_energy_kj_mol(context, unit)
+    openmm.LocalEnergyMinimizer.minimize(
+        context,
+        tolerance=10 * unit.kilojoule_per_mole / unit.nanometer,
+        maxIterations=env_int("GENOLIGAND_MD_MINIMIZATION_ITERATIONS", DEFAULT_MINIMIZATION_ITERATIONS),
+    )
+    post_minimization_energy = potential_energy_kj_mol(context, unit)
+    sample_gpu_telemetry(gpu_telemetry, "after_minimization")
     context.setVelocitiesToTemperature(300 * unit.kelvin, SIMULATION_SEED)
+    equilibration_steps = env_int("GENOLIGAND_MD_EQUILIBRATION_STEPS", DEFAULT_EQUILIBRATION_STEPS)
+    production_segments = env_int("GENOLIGAND_MD_PRODUCTION_SEGMENTS", DEFAULT_PRODUCTION_SEGMENTS)
+    production_steps_per_segment = env_int(
+        "GENOLIGAND_MD_PRODUCTION_STEPS_PER_SEGMENT",
+        DEFAULT_PRODUCTION_STEPS_PER_SEGMENT,
+    )
+    if equilibration_steps > 0:
+        integrator.step(equilibration_steps)
+    sample_gpu_telemetry(gpu_telemetry, "after_equilibration")
 
     frames = [current_positions(context, unit)]
-    for _ in range(20):
-        integrator.step(20)
+    for segment in range(production_segments):
+        integrator.step(production_steps_per_segment)
         frames.append(current_positions(context, unit))
+        sample_gpu_telemetry(gpu_telemetry, f"production_segment_{segment + 1}")
+    sample_gpu_telemetry(gpu_telemetry, "after_production")
     del context
     del integrator
 
     candidate_id = top_candidate_id(run_dir) or input_id
+    gpu_status = summarize_gpu_telemetry(platform_name, gpu_telemetry)
+    protocol_rows = build_md_protocol_rows(
+        candidate_id,
+        input_id,
+        platform_name,
+        platform_properties,
+        receptor,
+        mol,
+        parameterization,
+        "autodock_vina_pose_sdf",
+        pre_minimization_energy,
+        post_minimization_energy,
+        equilibration_steps,
+        production_segments,
+        production_steps_per_segment,
+        len(frames),
+        gpu_status,
+    )
     risk_flags = [
         *receptor.risk_flags,
         *parameter_flags,
-        "ligand_placement_recorded_from_rdkit_conformer_centroid",
+        "ligand_placement_from_autodock_vina_pose",
         "coarse_restrained_complex_model",
+        "short_screening_md_protocol",
     ]
     metrics = summarize_complex_frames(mol, receptor, frames, role_ranges)
     write_md_artifacts(
@@ -179,10 +246,16 @@ def run_md_summary_job(job: dict[str, Any]) -> str:
         role_ranges,
         parameterization,
         risk_flags,
+        "autodock_vina_pose_sdf",
+        platform_properties,
+        protocol_rows,
+        gpu_telemetry,
+        gpu_status,
     )
     return (
         f"OpenMM {openmm.version.full_version}; platform={platform_name}; "
-        f"method=openmm_receptor_ligand_complex_dynamics; receptor={receptor.path.name}"
+        "method=openmm_receptor_ligand_complex_dynamics; "
+        f"gpu_observed={gpu_status['gpu_observed']}; receptor={receptor.path.name}"
     )
 
 
@@ -377,22 +450,14 @@ def top_candidate_id(run_dir: Path) -> str:
     return ""
 
 
-def prepare_ligand(smiles: str, Chem: Any, AllChem: Any) -> Any:
-    if smiles.strip().startswith("InChI=") and hasattr(Chem, "MolFromInchi"):
-        mol = Chem.MolFromInchi(smiles.strip())
-    else:
-        mol = Chem.MolFromSmiles(smiles)
-    if mol is None:
-        raise ValueError("small_molecule input is not a valid SMILES string")
-    mol = Chem.AddHs(mol)
-    embed = AllChem.ETKDGv3()
-    embed.randomSeed = SIMULATION_SEED
-    if AllChem.EmbedMolecule(mol, embed) != 0:
-        raise ValueError("RDKit conformer embedding failed")
-    if AllChem.MMFFHasAllMoleculeParams(mol):
-        AllChem.MMFFOptimizeMolecule(mol, maxIters=200)
-    else:
-        AllChem.UFFOptimizeMolecule(mol, maxIters=200)
+def read_docking_pose_ligand(run_dir: Path, Chem: Any) -> Any | None:
+    path = run_dir / "tool_outputs" / "docking_pose.sdf"
+    if not path.exists() or path.stat().st_size == 0:
+        return None
+    supplier = Chem.SDMolSupplier(str(path), removeHs=False)
+    mol = next((item for item in supplier if item is not None), None)
+    if mol is None or mol.GetNumConformers() == 0:
+        return None
     return mol
 
 
@@ -607,6 +672,41 @@ def select_openmm_platform(openmm: Any) -> str:
     return names[0]
 
 
+def openmm_platform_properties(platform_name: str, platform: Any) -> dict[str, str]:
+    if hasattr(platform, "getPropertyNames"):
+        property_names = set(platform.getPropertyNames())
+    else:
+        property_names = {
+            platform.getPropertyName(index)
+            for index in range(platform.getNumPropertyNames())
+        }
+    properties: dict[str, str] = {}
+    if platform_name == "CUDA":
+        precision = os.environ.get("GENOLIGAND_OPENMM_PRECISION", "mixed").strip() or "mixed"
+        if "Precision" in property_names:
+            properties["Precision"] = precision
+        elif "CudaPrecision" in property_names:
+            properties["CudaPrecision"] = precision
+        device_index = os.environ.get("GENOLIGAND_OPENMM_DEVICE_INDEX", "").strip()
+        if device_index:
+            if "DeviceIndex" in property_names:
+                properties["DeviceIndex"] = device_index
+            elif "CudaDeviceIndex" in property_names:
+                properties["CudaDeviceIndex"] = device_index
+    return properties
+
+
+def env_int(name: str, default: int) -> int:
+    raw = os.environ.get(name, "").strip()
+    if not raw:
+        return default
+    try:
+        value = int(raw)
+    except ValueError:
+        return default
+    return max(0, value)
+
+
 def build_complex_system(
     openmm: Any,
     unit: Any,
@@ -673,6 +773,198 @@ def current_positions(context: Any, unit: Any) -> Any:
     return context.getState(getPositions=True).getPositions(asNumpy=True).value_in_unit(
         unit.angstrom
     )
+
+
+def potential_energy_kj_mol(context: Any, unit: Any) -> float:
+    state = context.getState(getEnergy=True)
+    return float(state.getPotentialEnergy().value_in_unit(unit.kilojoule_per_mole))
+
+
+def sample_gpu_telemetry(telemetry: GpuTelemetry, label: str) -> None:
+    gpu_result = run_nvidia_smi(
+        [
+            "--query-gpu=timestamp,index,name,utilization.gpu,memory.used,memory.total,power.draw",
+            "--format=csv,noheader,nounits",
+        ]
+    )
+    process_result = run_nvidia_smi(
+        [
+            "--query-compute-apps=pid,process_name,used_memory",
+            "--format=csv,noheader,nounits",
+        ]
+    )
+    if gpu_result is None:
+        telemetry.failure_reason = append_reason(telemetry.failure_reason, "nvidia-smi unavailable")
+        return
+    telemetry.available = True
+    process_rows = parse_compute_process_rows(process_result or "")
+    current_pid = str(os.getpid())
+    current_process = any(row.get("pid") == current_pid for row in process_rows)
+    process_memory = sum(parse_float(row.get("used_memory_mb", "")) for row in process_rows)
+    compute_process_count = len(process_rows)
+    for row in parse_gpu_rows(gpu_result):
+        row.update(
+            {
+                "sample_label": label,
+                "current_pid_observed": bool_text(current_process),
+                "compute_process_count": str(compute_process_count),
+                "compute_process_memory_used_mb": fmt(process_memory),
+                "failure_reason": telemetry.failure_reason,
+            }
+        )
+        telemetry.rows.append(row)
+
+
+def run_nvidia_smi(args: list[str]) -> str | None:
+    try:
+        result = subprocess.run(
+            ["nvidia-smi", *args],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=8,
+            check=False,
+        )
+    except (FileNotFoundError, subprocess.SubprocessError):
+        return None
+    if result.returncode != 0:
+        return None
+    return result.stdout
+
+
+def parse_gpu_rows(text: str) -> list[dict[str, str]]:
+    rows: list[dict[str, str]] = []
+    reader = csv.reader(text.splitlines())
+    for cols in reader:
+        if len(cols) < 7:
+            continue
+        rows.append(
+            {
+                "timestamp": cols[0].strip(),
+                "gpu_index": cols[1].strip(),
+                "name": cols[2].strip(),
+                "utilization_gpu_percent": fmt(parse_float(cols[3])),
+                "memory_used_mb": fmt(parse_float(cols[4])),
+                "memory_total_mb": fmt(parse_float(cols[5])),
+                "power_draw_w": fmt(parse_float(cols[6])),
+            }
+        )
+    return rows
+
+
+def parse_compute_process_rows(text: str) -> list[dict[str, str]]:
+    rows: list[dict[str, str]] = []
+    reader = csv.reader(text.splitlines())
+    for cols in reader:
+        if len(cols) < 3:
+            continue
+        pid = cols[0].strip()
+        if not pid or pid.upper() in {"N/A", "[N/A]"}:
+            continue
+        rows.append(
+            {
+                "pid": pid,
+                "process_name": cols[1].strip(),
+                "used_memory_mb": fmt(parse_float(cols[2])),
+            }
+        )
+    return rows
+
+
+def summarize_gpu_telemetry(platform_name: str, telemetry: GpuTelemetry) -> dict[str, Any]:
+    baseline_by_gpu: dict[str, float] = {}
+    max_memory_delta = 0.0
+    max_utilization = 0.0
+    process_observed = False
+    for row in telemetry.rows:
+        gpu_index = row.get("gpu_index", "")
+        memory_used = parse_float(row.get("memory_used_mb", ""))
+        utilization = parse_float(row.get("utilization_gpu_percent", ""))
+        if row.get("sample_label") == "baseline_before_openmm_context":
+            baseline_by_gpu.setdefault(gpu_index, memory_used)
+        baseline = baseline_by_gpu.get(gpu_index, memory_used)
+        max_memory_delta = max(max_memory_delta, memory_used - baseline)
+        max_utilization = max(max_utilization, utilization)
+        process_observed = process_observed or row.get("current_pid_observed") == "true"
+    gpu_observed = platform_name == "CUDA" and telemetry.available and (
+        max_utilization > 0.0 or max_memory_delta >= 8.0 or process_observed
+    )
+    return {
+        "cuda_platform": platform_name,
+        "nvidia_smi_available": telemetry.available,
+        "gpu_observed": gpu_observed,
+        "max_utilization_gpu_percent": max_utilization,
+        "max_memory_delta_mb": max_memory_delta,
+        "process_observed": process_observed,
+        "sample_count": len(telemetry.rows),
+        "failure_reason": telemetry.failure_reason,
+    }
+
+
+def append_reason(existing: str, reason: str) -> str:
+    if not existing:
+        return reason
+    if reason in existing.split(";"):
+        return existing
+    return f"{existing};{reason}"
+
+
+def parse_float(value: str) -> float:
+    text = str(value).strip().replace("MiB", "").replace("W", "").replace("%", "").strip()
+    if not text or text.upper() in {"N/A", "[N/A]", "NOT SUPPORTED", "[NOT SUPPORTED]"}:
+        return 0.0
+    try:
+        return float(text)
+    except ValueError:
+        return 0.0
+
+
+def bool_text(value: bool) -> str:
+    return "true" if value else "false"
+
+
+def build_md_protocol_rows(
+    candidate_id: str,
+    input_id: str,
+    platform_name: str,
+    platform_properties: dict[str, str],
+    receptor: ReceptorCoordinate,
+    mol: Any,
+    parameterization: str,
+    placement_method: str,
+    pre_minimization_energy: float,
+    post_minimization_energy: float,
+    equilibration_steps: int,
+    production_segments: int,
+    production_steps_per_segment: int,
+    frame_count: int,
+    gpu_status: dict[str, Any],
+) -> list[list[str]]:
+    properties = ",".join(f"{key}={value}" for key, value in sorted(platform_properties.items()))
+    production_steps = production_segments * production_steps_per_segment
+    return [
+        [candidate_id, input_id, "input", "receptor_coordinate", str(receptor.path), "", "structure_viewer"],
+        [candidate_id, input_id, "input", "ligand_placement", placement_method, "", "docking_pose_sdf"],
+        [candidate_id, input_id, "input", "ligand_atom_count", str(mol.GetNumAtoms()), "atoms", "rdkit"],
+        [candidate_id, input_id, "input", "receptor_atom_count", str(len(receptor.atoms)), "atoms", "pdbfixer_or_coordinate_parser"],
+        [candidate_id, input_id, "parameterization", "ligand_parameterization", parameterization, "", "OpenFF/RDKit"],
+        [candidate_id, input_id, "platform", "openmm_platform", platform_name, "", "OpenMM"],
+        [candidate_id, input_id, "platform", "openmm_platform_properties", properties, "", "OpenMM"],
+        [candidate_id, input_id, "minimization", "max_iterations", str(env_int("GENOLIGAND_MD_MINIMIZATION_ITERATIONS", DEFAULT_MINIMIZATION_ITERATIONS)), "steps", "OpenMM"],
+        [candidate_id, input_id, "minimization", "pre_minimization_energy", fmt(pre_minimization_energy), "kJ/mol", "OpenMM"],
+        [candidate_id, input_id, "minimization", "post_minimization_energy", fmt(post_minimization_energy), "kJ/mol", "OpenMM"],
+        [candidate_id, input_id, "equilibration", "steps", str(equilibration_steps), "steps", "OpenMM"],
+        [candidate_id, input_id, "production", "segments", str(production_segments), "segments", "OpenMM"],
+        [candidate_id, input_id, "production", "steps_per_segment", str(production_steps_per_segment), "steps", "OpenMM"],
+        [candidate_id, input_id, "production", "total_steps", str(production_steps), "steps", "OpenMM"],
+        [candidate_id, input_id, "output", "frame_count", str(frame_count), "frames", "md_trajectory.tsv"],
+        [candidate_id, input_id, "cuda", "nvidia_smi_available", bool_text(bool(gpu_status["nvidia_smi_available"])), "", "nvidia-smi"],
+        [candidate_id, input_id, "cuda", "gpu_observed", bool_text(bool(gpu_status["gpu_observed"])), "", "nvidia-smi"],
+        [candidate_id, input_id, "cuda", "max_utilization_gpu_percent", fmt(float(gpu_status["max_utilization_gpu_percent"])), "%", "nvidia-smi"],
+        [candidate_id, input_id, "cuda", "max_memory_delta_mb", fmt(float(gpu_status["max_memory_delta_mb"])), "MB", "nvidia-smi"],
+        [candidate_id, input_id, "cuda", "process_observed", bool_text(bool(gpu_status["process_observed"])), "", "nvidia-smi"],
+    ]
 
 
 def summarize_complex_frames(
@@ -861,6 +1153,11 @@ def write_md_artifacts(
     role_ranges: dict[str, range],
     parameterization: str,
     risk_flags: list[str],
+    placement_method: str,
+    platform_properties: dict[str, str],
+    protocol_rows: list[list[str]],
+    gpu_telemetry: GpuTelemetry,
+    gpu_status: dict[str, Any],
 ) -> None:
     tool_outputs = run_dir / "tool_outputs"
     tool_outputs.mkdir(parents=True, exist_ok=True)
@@ -923,8 +1220,16 @@ def write_md_artifacts(
         input_id,
         mol,
         ligand_positions,
+        placement_method,
     )
     write_trajectory(tool_outputs / "md_trajectory.tsv", candidate_id, frames, mol, receptor, role_ranges)
+    write_tsv(
+        tool_outputs / "md_protocol.tsv",
+        ["candidate_id", "input_id", "stage", "parameter", "value", "unit", "source"],
+        protocol_rows,
+    )
+    write_gpu_telemetry(tool_outputs / "gpu_telemetry.tsv", gpu_telemetry)
+    write_gpu_telemetry_status(tool_outputs / "gpu_telemetry_status.tsv", gpu_status)
     write_complex_md_manifest(
         tool_outputs / "complex_md_manifest.json",
         candidate_id,
@@ -934,6 +1239,9 @@ def write_md_artifacts(
         parameterization,
         risk_flags,
         metric_artifacts,
+        placement_method,
+        platform_properties,
+        gpu_status,
     )
     with (tool_outputs / "md_run_manifest.json").open("w", encoding="utf-8") as handle:
         json.dump(
@@ -943,7 +1251,12 @@ def write_md_artifacts(
                 "input_smiles": smiles,
                 "method": "openmm_receptor_ligand_complex_dynamics",
                 "platform": platform_name,
-                "cuda_ready": platform_name == "CUDA",
+                "platform_properties": platform_properties,
+                "cuda_ready": platform_name == "CUDA" and bool(gpu_status["gpu_observed"]),
+                "gpu_observed": bool(gpu_status["gpu_observed"]),
+                "gpu_telemetry_artifact": "tool_outputs/gpu_telemetry.tsv",
+                "gpu_telemetry_status_artifact": "tool_outputs/gpu_telemetry_status.tsv",
+                "gpu_telemetry": gpu_status,
                 "receptor_coordinate": str(receptor.path),
                 "receptor_preparation": receptor.preparation,
                 "receptor_atom_count": len(receptor.atoms),
@@ -951,9 +1264,10 @@ def write_md_artifacts(
                 "ligand_coordinate": "tool_outputs/ligand_placement.tsv",
                 "ligand_coordinate_format": "tsv_angstrom",
                 "ligand_atom_count": mol.GetNumAtoms(),
-                "ligand_placement": "rdkit_conformer_translated_near_receptor_centroid",
+                "ligand_placement": placement_method,
                 "ligand_placement_manifest": "tool_outputs/ligand_placement.tsv",
                 "complex_manifest": "tool_outputs/complex_md_manifest.json",
+                "protocol_artifact": "tool_outputs/md_protocol.tsv",
                 "frame_count": len(frames),
                 "trajectory": "tool_outputs/md_trajectory.tsv",
                 "metric_artifacts": metric_artifacts,
@@ -1151,6 +1465,9 @@ def write_complex_md_manifest(
     parameterization: str,
     risk_flags: list[str],
     metric_artifacts: list[str],
+    placement_method: str,
+    platform_properties: dict[str, str],
+    gpu_status: dict[str, Any],
 ) -> None:
     with path.open("w", encoding="utf-8") as handle:
         json.dump(
@@ -1159,12 +1476,17 @@ def write_complex_md_manifest(
                 "input_id": input_id,
                 "method": "openmm_receptor_ligand_complex_dynamics",
                 "platform": platform_name,
-                "cuda_ready": platform_name == "CUDA",
+                "platform_properties": platform_properties,
+                "cuda_ready": platform_name == "CUDA" and bool(gpu_status["gpu_observed"]),
+                "gpu_observed": bool(gpu_status["gpu_observed"]),
+                "gpu_telemetry_artifact": "tool_outputs/gpu_telemetry.tsv",
+                "gpu_telemetry_status_artifact": "tool_outputs/gpu_telemetry_status.tsv",
                 "receptor_coordinate": str(receptor.path),
                 "receptor_preparation": receptor.preparation,
                 "ligand_coordinate": "tool_outputs/ligand_placement.tsv",
                 "ligand_parameterization": parameterization,
-                "ligand_placement": "rdkit_conformer_translated_near_receptor_centroid",
+                "ligand_placement": placement_method,
+                "protocol_artifact": "tool_outputs/md_protocol.tsv",
                 "trajectory": "tool_outputs/md_trajectory.tsv",
                 "metric_artifacts": metric_artifacts,
                 "risk_flags": risk_flags,
@@ -1221,6 +1543,53 @@ def write_trajectory(
                 ]
             )
     write_tsv(path, ["candidate_id", "frame", "atom_index", "role", "element", "residue", "x", "y", "z"], rows)
+
+
+def write_gpu_telemetry(path: Path, telemetry: GpuTelemetry) -> None:
+    header = [
+        "sample_label",
+        "timestamp",
+        "gpu_index",
+        "name",
+        "utilization_gpu_percent",
+        "memory_used_mb",
+        "memory_total_mb",
+        "power_draw_w",
+        "current_pid_observed",
+        "compute_process_count",
+        "compute_process_memory_used_mb",
+        "failure_reason",
+    ]
+    rows = [[row.get(column, "") for column in header] for row in telemetry.rows]
+    write_tsv(path, header, rows)
+
+
+def write_gpu_telemetry_status(path: Path, gpu_status: dict[str, Any]) -> None:
+    write_tsv(
+        path,
+        [
+            "cuda_platform",
+            "nvidia_smi_available",
+            "gpu_observed",
+            "max_utilization_gpu_percent",
+            "max_memory_delta_mb",
+            "process_observed",
+            "sample_count",
+            "failure_reason",
+        ],
+        [
+            [
+                str(gpu_status["cuda_platform"]),
+                bool_text(bool(gpu_status["nvidia_smi_available"])),
+                bool_text(bool(gpu_status["gpu_observed"])),
+                fmt(float(gpu_status["max_utilization_gpu_percent"])),
+                fmt(float(gpu_status["max_memory_delta_mb"])),
+                bool_text(bool(gpu_status["process_observed"])),
+                str(gpu_status["sample_count"]),
+                str(gpu_status["failure_reason"]),
+            ]
+        ],
+    )
 
 
 def write_tsv(path: Path, header: list[str], rows: list[list[str]]) -> None:
