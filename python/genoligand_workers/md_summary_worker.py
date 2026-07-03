@@ -5,7 +5,8 @@ import json
 import math
 import os
 import subprocess
-from dataclasses import dataclass
+import threading
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
@@ -16,10 +17,13 @@ MAX_PEPTIDE_RESIDUES = 80
 PEPTIDE_CONFORMER_COUNT = 12
 SIMULATION_SEED = 20260629
 STANDARD_AMINO_ACIDS = set("ACDEFGHIKLMNPQRSTVWY")
-DEFAULT_EQUILIBRATION_STEPS = 1000
-DEFAULT_PRODUCTION_SEGMENTS = 20
-DEFAULT_PRODUCTION_STEPS_PER_SEGMENT = 250
+DEFAULT_EQUILIBRATION_STEPS = 10000
+DEFAULT_PRODUCTION_SEGMENTS = 50
+DEFAULT_PRODUCTION_STEPS_PER_SEGMENT = 1000
 DEFAULT_MINIMIZATION_ITERATIONS = 200
+DEFAULT_TIMESTEP_PS = 0.002
+DEFAULT_GPU_TELEMETRY_POLL_SECONDS = 1.0
+GAS_CONSTANT_KJ_PER_MOL_K = 0.00831446261815324
 
 
 @dataclass
@@ -38,6 +42,7 @@ class GpuTelemetry:
     rows: list[dict[str, str]]
     available: bool = False
     failure_reason: str = ""
+    lock: Any = field(default_factory=threading.Lock, repr=False)
 
 
 def main() -> int:
@@ -166,10 +171,11 @@ def run_md_summary_job(job: dict[str, Any]) -> str:
         ligand_positions,
         science_store,
     )
+    timestep_ps = env_float("GENOLIGAND_MD_TIMESTEP_PS", DEFAULT_TIMESTEP_PS)
     integrator = openmm.LangevinMiddleIntegrator(
         300 * unit.kelvin,
         1 / unit.picosecond,
-        0.001 * unit.picoseconds,
+        timestep_ps * unit.picoseconds,
     )
     integrator.setRandomNumberSeed(SIMULATION_SEED)
     if platform_properties:
@@ -194,20 +200,63 @@ def run_md_summary_job(job: dict[str, Any]) -> str:
         "GENOLIGAND_MD_PRODUCTION_STEPS_PER_SEGMENT",
         DEFAULT_PRODUCTION_STEPS_PER_SEGMENT,
     )
+    telemetry_poll_seconds = env_float("GENOLIGAND_GPU_TELEMETRY_POLL_SECONDS", DEFAULT_GPU_TELEMETRY_POLL_SECONDS)
+    production_steps_total = production_segments * production_steps_per_segment
+    total_step = 0
+    candidate_id = top_candidate_id(run_dir) or input_id
     if equilibration_steps > 0:
-        integrator.step(equilibration_steps)
+        with GpuTelemetryMonitor(
+            gpu_telemetry,
+            enabled=platform_name == "CUDA",
+            label_prefix="equilibration_poll",
+            interval_seconds=telemetry_poll_seconds,
+        ):
+            integrator.step(equilibration_steps)
+        total_step += equilibration_steps
     sample_gpu_telemetry(gpu_telemetry, "after_equilibration")
 
-    frames = [current_positions(context, unit)]
-    for segment in range(production_segments):
-        integrator.step(production_steps_per_segment)
-        frames.append(current_positions(context, unit))
-        sample_gpu_telemetry(gpu_telemetry, f"production_segment_{segment + 1}")
+    frames: list[Any] = []
+    state_rows: list[list[str]] = []
+    frame, state_row = current_state_snapshot(
+        context,
+        unit,
+        candidate_id=candidate_id,
+        input_id=input_id,
+        frame_index=0,
+        step=total_step,
+        time_ps=total_step * timestep_ps,
+        particle_count=system.getNumParticles(),
+        stage="post_equilibration",
+    )
+    frames.append(frame)
+    state_rows.append(state_row)
+    with GpuTelemetryMonitor(
+        gpu_telemetry,
+        enabled=platform_name == "CUDA" and production_steps_total > 0,
+        label_prefix="production_poll",
+        interval_seconds=telemetry_poll_seconds,
+    ):
+        for segment in range(production_segments):
+            integrator.step(production_steps_per_segment)
+            total_step += production_steps_per_segment
+            frame, state_row = current_state_snapshot(
+                context,
+                unit,
+                candidate_id=candidate_id,
+                input_id=input_id,
+                frame_index=segment + 1,
+                step=total_step,
+                time_ps=total_step * timestep_ps,
+                particle_count=system.getNumParticles(),
+                stage=f"production_segment_{segment + 1}",
+            )
+            frames.append(frame)
+            state_rows.append(state_row)
+            sample_gpu_telemetry(gpu_telemetry, f"production_segment_{segment + 1}")
     sample_gpu_telemetry(gpu_telemetry, "after_production")
     del context
     del integrator
 
-    candidate_id = top_candidate_id(run_dir) or input_id
     gpu_status = summarize_gpu_telemetry(platform_name, gpu_telemetry)
     protocol_rows = build_md_protocol_rows(
         candidate_id,
@@ -223,7 +272,9 @@ def run_md_summary_job(job: dict[str, Any]) -> str:
         equilibration_steps,
         production_segments,
         production_steps_per_segment,
+        timestep_ps,
         len(frames),
+        len(state_rows),
         gpu_status,
         model_metadata,
     )
@@ -242,6 +293,7 @@ def run_md_summary_job(job: dict[str, Any]) -> str:
         platform_name,
         metrics,
         frames,
+        state_rows,
         mol,
         ligand_positions,
         receptor,
@@ -887,15 +939,84 @@ def openff_forcefield_source(science_store: Path) -> str:
     return "openff-2.2.1"
 
 
-def current_positions(context: Any, unit: Any) -> Any:
-    return context.getState(getPositions=True).getPositions(asNumpy=True).value_in_unit(
-        unit.angstrom
-    )
+def current_state_snapshot(
+    context: Any,
+    unit: Any,
+    candidate_id: str,
+    input_id: str,
+    frame_index: int,
+    step: int,
+    time_ps: float,
+    particle_count: int,
+    stage: str,
+) -> tuple[Any, list[str]]:
+    state = context.getState(getPositions=True, getEnergy=True)
+    positions = state.getPositions(asNumpy=True).value_in_unit(unit.angstrom)
+    potential = float(state.getPotentialEnergy().value_in_unit(unit.kilojoule_per_mole))
+    kinetic = float(state.getKineticEnergy().value_in_unit(unit.kilojoule_per_mole))
+    total = potential + kinetic
+    temperature = temperature_estimate_kelvin(kinetic, particle_count)
+    return positions, [
+        candidate_id,
+        input_id,
+        str(frame_index),
+        str(step),
+        fmt(time_ps),
+        stage,
+        fmt(potential),
+        fmt(kinetic),
+        fmt(total),
+        fmt(temperature),
+        "OpenMM Context state",
+    ]
+
+
+def temperature_estimate_kelvin(kinetic_energy_kj_mol: float, particle_count: int) -> float:
+    dof = max(1, 3 * int(particle_count) - 6)
+    return (2.0 * kinetic_energy_kj_mol) / (dof * GAS_CONSTANT_KJ_PER_MOL_K)
 
 
 def potential_energy_kj_mol(context: Any, unit: Any) -> float:
     state = context.getState(getEnergy=True)
     return float(state.getPotentialEnergy().value_in_unit(unit.kilojoule_per_mole))
+
+
+class GpuTelemetryMonitor:
+    def __init__(
+        self,
+        telemetry: GpuTelemetry,
+        enabled: bool,
+        label_prefix: str,
+        interval_seconds: float,
+    ) -> None:
+        self.telemetry = telemetry
+        self.enabled = enabled
+        self.label_prefix = label_prefix
+        self.interval_seconds = max(0.05, float(interval_seconds))
+        self.stop_event = threading.Event()
+        self.thread: threading.Thread | None = None
+        self.count = 0
+
+    def __enter__(self) -> GpuTelemetryMonitor:
+        if not self.enabled:
+            return self
+        self.thread = threading.Thread(target=self._run, name=f"genoligand-{self.label_prefix}", daemon=True)
+        self.thread.start()
+        return self
+
+    def __exit__(self, exc_type: Any, exc: Any, traceback: Any) -> None:
+        if not self.enabled:
+            return
+        self.stop_event.set()
+        if self.thread is not None:
+            self.thread.join(timeout=max(1.0, self.interval_seconds * 2.0))
+        sample_gpu_telemetry(self.telemetry, f"{self.label_prefix}_stop")
+
+    def _run(self) -> None:
+        sample_gpu_telemetry(self.telemetry, f"{self.label_prefix}_start")
+        while not self.stop_event.wait(self.interval_seconds):
+            self.count += 1
+            sample_gpu_telemetry(self.telemetry, f"{self.label_prefix}_{self.count}")
 
 
 def sample_gpu_telemetry(telemetry: GpuTelemetry, label: str) -> None:
@@ -912,25 +1033,29 @@ def sample_gpu_telemetry(telemetry: GpuTelemetry, label: str) -> None:
         ]
     )
     if gpu_result is None:
-        telemetry.failure_reason = append_reason(telemetry.failure_reason, "nvidia-smi unavailable")
+        with telemetry.lock:
+            telemetry.failure_reason = append_reason(telemetry.failure_reason, "nvidia-smi unavailable")
         return
-    telemetry.available = True
     process_rows = parse_compute_process_rows(process_result or "")
     current_pid = str(os.getpid())
     current_process = any(row.get("pid") == current_pid for row in process_rows)
     process_memory = sum(parse_float(row.get("used_memory_mb", "")) for row in process_rows)
     compute_process_count = len(process_rows)
-    for row in parse_gpu_rows(gpu_result):
-        row.update(
-            {
-                "sample_label": label,
-                "current_pid_observed": bool_text(current_process),
-                "compute_process_count": str(compute_process_count),
-                "compute_process_memory_used_mb": fmt(process_memory),
-                "failure_reason": telemetry.failure_reason,
-            }
-        )
-        telemetry.rows.append(row)
+    parsed_rows = parse_gpu_rows(gpu_result)
+    with telemetry.lock:
+        telemetry.available = True
+        failure_reason = telemetry.failure_reason
+        for row in parsed_rows:
+            row.update(
+                {
+                    "sample_label": label,
+                    "current_pid_observed": bool_text(current_process),
+                    "compute_process_count": str(compute_process_count),
+                    "compute_process_memory_used_mb": fmt(process_memory),
+                    "failure_reason": failure_reason,
+                }
+            )
+            telemetry.rows.append(row)
 
 
 def run_nvidia_smi(args: list[str]) -> str | None:
@@ -994,29 +1119,50 @@ def summarize_gpu_telemetry(platform_name: str, telemetry: GpuTelemetry) -> dict
     baseline_by_gpu: dict[str, float] = {}
     max_memory_delta = 0.0
     max_utilization = 0.0
+    production_max_memory_delta = 0.0
+    production_max_utilization = 0.0
     process_observed = False
-    for row in telemetry.rows:
+    production_sample_count = 0
+    with telemetry.lock:
+        rows = list(telemetry.rows)
+        available = telemetry.available
+        failure_reason = telemetry.failure_reason
+    for row in rows:
         gpu_index = row.get("gpu_index", "")
         memory_used = parse_float(row.get("memory_used_mb", ""))
         utilization = parse_float(row.get("utilization_gpu_percent", ""))
         if row.get("sample_label") == "baseline_before_openmm_context":
             baseline_by_gpu.setdefault(gpu_index, memory_used)
         baseline = baseline_by_gpu.get(gpu_index, memory_used)
-        max_memory_delta = max(max_memory_delta, memory_used - baseline)
+        memory_delta = memory_used - baseline
+        max_memory_delta = max(max_memory_delta, memory_delta)
         max_utilization = max(max_utilization, utilization)
         process_observed = process_observed or row.get("current_pid_observed") == "true"
-    gpu_observed = platform_name == "CUDA" and telemetry.available and (
-        process_observed or (max_memory_delta >= 8.0 and max_utilization > 0.0)
-    )
+        if row.get("sample_label", "").startswith("production_poll_"):
+            production_sample_count += 1
+            production_max_memory_delta = max(production_max_memory_delta, memory_delta)
+            production_max_utilization = max(production_max_utilization, utilization)
+    if process_observed and production_sample_count > 0:
+        observation_basis = "current_pid"
+    elif production_max_memory_delta >= 8.0 and production_max_utilization > 0.0:
+        observation_basis = "memory_delta_and_utilization"
+    else:
+        observation_basis = "not_observed"
+    gpu_observed = platform_name == "CUDA" and available and production_sample_count > 0 and observation_basis != "not_observed"
     return {
         "cuda_platform": platform_name,
-        "nvidia_smi_available": telemetry.available,
+        "nvidia_smi_available": available,
         "gpu_observed": gpu_observed,
         "max_utilization_gpu_percent": max_utilization,
         "max_memory_delta_mb": max_memory_delta,
+        "production_max_utilization_gpu_percent": production_max_utilization,
+        "production_max_memory_delta_mb": production_max_memory_delta,
         "process_observed": process_observed,
-        "sample_count": len(telemetry.rows),
-        "failure_reason": telemetry.failure_reason,
+        "sample_count": len(rows),
+        "production_sample_count": production_sample_count,
+        "monitoring_mode": "nvidia-smi_polling" if production_sample_count > 0 else "stage_samples",
+        "observation_basis": observation_basis,
+        "failure_reason": failure_reason,
     }
 
 
@@ -1056,12 +1202,16 @@ def build_md_protocol_rows(
     equilibration_steps: int,
     production_segments: int,
     production_steps_per_segment: int,
+    timestep_ps: float,
     frame_count: int,
+    state_row_count: int,
     gpu_status: dict[str, Any],
     model_metadata: dict[str, Any],
 ) -> list[list[str]]:
     properties = ",".join(f"{key}={value}" for key, value in sorted(platform_properties.items()))
     production_steps = production_segments * production_steps_per_segment
+    equilibration_time_ps = equilibration_steps * timestep_ps
+    production_time_ps = production_steps * timestep_ps
     return [
         [candidate_id, input_id, "input", "receptor_coordinate", str(receptor.path), "", "structure_viewer"],
         [candidate_id, input_id, "input", "ligand_placement", placement_method, "", "docking_pose_sdf"],
@@ -1076,18 +1226,27 @@ def build_md_protocol_rows(
         [candidate_id, input_id, "system", "nonbonded_method", str(model_metadata.get("nonbonded_method", "")), "", "OpenMM"],
         [candidate_id, input_id, "platform", "openmm_platform", platform_name, "", "OpenMM"],
         [candidate_id, input_id, "platform", "openmm_platform_properties", properties, "", "OpenMM"],
+        [candidate_id, input_id, "integrator", "integrator", "LangevinMiddleIntegrator", "", "OpenMM"],
+        [candidate_id, input_id, "integrator", "temperature", "300", "K", "OpenMM"],
+        [candidate_id, input_id, "integrator", "friction", "1", "1/ps", "OpenMM"],
+        [candidate_id, input_id, "integrator", "time_step", fmt(timestep_ps), "ps", "OpenMM"],
         [candidate_id, input_id, "minimization", "max_iterations", str(env_int("GENOLIGAND_MD_MINIMIZATION_ITERATIONS", DEFAULT_MINIMIZATION_ITERATIONS)), "steps", "OpenMM"],
         [candidate_id, input_id, "minimization", "pre_minimization_energy", fmt(pre_minimization_energy), "kJ/mol", "OpenMM"],
         [candidate_id, input_id, "minimization", "post_minimization_energy", fmt(post_minimization_energy), "kJ/mol", "OpenMM"],
         [candidate_id, input_id, "equilibration", "steps", str(equilibration_steps), "steps", "OpenMM"],
+        [candidate_id, input_id, "equilibration", "time", fmt(equilibration_time_ps), "ps", "OpenMM"],
         [candidate_id, input_id, "production", "segments", str(production_segments), "segments", "OpenMM"],
         [candidate_id, input_id, "production", "steps_per_segment", str(production_steps_per_segment), "steps", "OpenMM"],
         [candidate_id, input_id, "production", "total_steps", str(production_steps), "steps", "OpenMM"],
+        [candidate_id, input_id, "production", "total_time", fmt(production_time_ps), "ps", "OpenMM"],
         [candidate_id, input_id, "output", "frame_count", str(frame_count), "frames", "md_trajectory.tsv"],
+        [candidate_id, input_id, "output", "state_rows", str(state_row_count), "rows", "md_state.tsv"],
         [candidate_id, input_id, "cuda", "nvidia_smi_available", bool_text(bool(gpu_status["nvidia_smi_available"])), "", "nvidia-smi"],
         [candidate_id, input_id, "cuda", "gpu_observed", bool_text(bool(gpu_status["gpu_observed"])), "", "nvidia-smi"],
         [candidate_id, input_id, "cuda", "max_utilization_gpu_percent", fmt(float(gpu_status["max_utilization_gpu_percent"])), "%", "nvidia-smi"],
         [candidate_id, input_id, "cuda", "max_memory_delta_mb", fmt(float(gpu_status["max_memory_delta_mb"])), "MB", "nvidia-smi"],
+        [candidate_id, input_id, "cuda", "production_sample_count", str(gpu_status["production_sample_count"]), "samples", "nvidia-smi"],
+        [candidate_id, input_id, "cuda", "observation_basis", str(gpu_status["observation_basis"]), "", "nvidia-smi"],
         [candidate_id, input_id, "cuda", "process_observed", bool_text(bool(gpu_status["process_observed"])), "", "nvidia-smi"],
     ]
 
@@ -1272,6 +1431,7 @@ def write_md_artifacts(
     platform_name: str,
     metrics: dict[str, float],
     frames: list[Any],
+    state_rows: list[list[str]],
     mol: Any,
     ligand_positions: Any,
     receptor: ReceptorCoordinate,
@@ -1349,6 +1509,7 @@ def write_md_artifacts(
         placement_method,
     )
     write_trajectory(tool_outputs / "md_trajectory.tsv", candidate_id, frames, mol, receptor, role_ranges)
+    write_md_state(tool_outputs / "md_state.tsv", state_rows)
     write_tsv(
         tool_outputs / "md_protocol.tsv",
         ["candidate_id", "input_id", "stage", "parameter", "value", "unit", "source"],
@@ -1397,6 +1558,8 @@ def write_md_artifacts(
                 "complex_manifest": "tool_outputs/complex_md_manifest.json",
                 "protocol_artifact": "tool_outputs/md_protocol.tsv",
                 "frame_count": len(frames),
+                "state_artifact": "tool_outputs/md_state.tsv",
+                "state_row_count": len(state_rows),
                 "trajectory": "tool_outputs/md_trajectory.tsv",
                 "metric_artifacts": metric_artifacts,
                 "risk_flags": risk_flags,
@@ -1611,12 +1774,14 @@ def write_complex_md_manifest(
                 "gpu_observed": bool(gpu_status["gpu_observed"]),
                 "gpu_telemetry_artifact": "tool_outputs/gpu_telemetry.tsv",
                 "gpu_telemetry_status_artifact": "tool_outputs/gpu_telemetry_status.tsv",
+                "gpu_telemetry": gpu_status,
                 "receptor_coordinate": str(receptor.path),
                 "receptor_preparation": receptor.preparation,
                 "ligand_coordinate": "tool_outputs/ligand_placement.tsv",
                 "ligand_parameterization": parameterization,
                 "ligand_placement": placement_method,
                 "protocol_artifact": "tool_outputs/md_protocol.tsv",
+                "state_artifact": "tool_outputs/md_state.tsv",
                 "trajectory": "tool_outputs/md_trajectory.tsv",
                 "metric_artifacts": metric_artifacts,
                 "risk_flags": risk_flags,
@@ -1675,6 +1840,26 @@ def write_trajectory(
     write_tsv(path, ["candidate_id", "frame", "atom_index", "role", "element", "residue", "x", "y", "z"], rows)
 
 
+def write_md_state(path: Path, rows: list[list[str]]) -> None:
+    write_tsv(
+        path,
+        [
+            "candidate_id",
+            "input_id",
+            "frame",
+            "step",
+            "time_ps",
+            "stage",
+            "potential_energy_kj_mol",
+            "kinetic_energy_kj_mol",
+            "total_energy_kj_mol",
+            "temperature_estimate_K",
+            "source",
+        ],
+        rows,
+    )
+
+
 def write_gpu_telemetry(path: Path, telemetry: GpuTelemetry) -> None:
     header = [
         "sample_label",
@@ -1690,7 +1875,9 @@ def write_gpu_telemetry(path: Path, telemetry: GpuTelemetry) -> None:
         "compute_process_memory_used_mb",
         "failure_reason",
     ]
-    rows = [[row.get(column, "") for column in header] for row in telemetry.rows]
+    with telemetry.lock:
+        telemetry_rows = list(telemetry.rows)
+    rows = [[row.get(column, "") for column in header] for row in telemetry_rows]
     write_tsv(path, header, rows)
 
 
@@ -1705,6 +1892,11 @@ def write_gpu_telemetry_status(path: Path, gpu_status: dict[str, Any]) -> None:
             "max_memory_delta_mb",
             "process_observed",
             "sample_count",
+            "production_sample_count",
+            "production_max_utilization_gpu_percent",
+            "production_max_memory_delta_mb",
+            "monitoring_mode",
+            "observation_basis",
             "failure_reason",
         ],
         [
@@ -1716,6 +1908,11 @@ def write_gpu_telemetry_status(path: Path, gpu_status: dict[str, Any]) -> None:
                 fmt(float(gpu_status["max_memory_delta_mb"])),
                 bool_text(bool(gpu_status["process_observed"])),
                 str(gpu_status["sample_count"]),
+                str(gpu_status["production_sample_count"]),
+                fmt(float(gpu_status["production_max_utilization_gpu_percent"])),
+                fmt(float(gpu_status["production_max_memory_delta_mb"])),
+                str(gpu_status["monitoring_mode"]),
+                str(gpu_status["observation_basis"]),
                 str(gpu_status["failure_reason"]),
             ]
         ],

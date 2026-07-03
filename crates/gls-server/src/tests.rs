@@ -1945,7 +1945,7 @@ fn user_api_responses_do_not_expose_local_paths_or_commands() {
         candidates["candidates"][0]["risk_note"]
             .as_str()
             .unwrap_or_default()
-            .contains("短程受限 receptor 模型")
+            .contains("当前 run 的复合物 MD 证据已参与候选排序")
     );
 
     let responses = [
@@ -2076,18 +2076,54 @@ fn user_downloads_are_sanitized_exports() {
             "candidate_id\trmsd\trmsf\tligand_drift\thydrogen_bond_occupancy\tcontact_occupancy\tinteraction_persistence\tmd_risk_flags\tmd_score_decomposition\tmd_stability_score\nC1\t1.2\t0.4\t0.6\t0.72\t0.81\t0.77\tstable_internal\tscore_internal\t0.8\n",
         )
         .expect("md");
+    fs::create_dir_all(run_dir.join("tool_outputs")).expect("tool outputs");
+    fs::write(
+        run_dir.join("known_database_matches.tsv"),
+        "input_id\tsource\ttarget_id\ttarget_name\torganism\ttarget_class\tmatch_score\tmatched_features\tevidence\tdebug_path\nI1\tbindingdb_onsite\tP00918\tCA2\tHomo sapiens\tenzyme\t0.9\tacetazolamide\tassay\tD:/hidden\n",
+    )
+    .expect("known");
+    fs::write(
+        run_dir.join("docking_summary.tsv"),
+        "candidate_id\tdocking_status\tdocking_score\tdocking_engine\tnotes\tdebug_path\nC1\tcompleted\t-6.4\tvina\tpose ready\tD:/hidden\n",
+    )
+    .expect("docking");
+    fs::write(
+        run_dir.join("tool_outputs/md_protocol.tsv"),
+        "candidate_id\tinput_id\tstage\tparameter\tvalue\tunit\tsource\tdebug_path\nC1\tI1\tplatform\topenmm_platform\tCUDA\t\tOpenMM\tD:/hidden\n",
+    )
+    .expect("protocol");
+    fs::write(
+        run_dir.join("tool_outputs/md_state.tsv"),
+        "candidate_id\tinput_id\tframe\tstep\ttime_ps\tstage\tpotential_energy_kj_mol\tkinetic_energy_kj_mol\ttotal_energy_kj_mol\ttemperature_estimate_K\tsource\tdebug_path\nC1\tI1\t1\t1000\t2.0000\tproduction\t-1.0\t1.0\t0.0\t300.0\tOpenMM Context state\tD:/hidden\n",
+    )
+    .expect("state");
+    fs::write(
+        run_dir.join("tool_outputs/gpu_telemetry.tsv"),
+        "sample_label\ttimestamp\tgpu_index\tname\tutilization_gpu_percent\tmemory_used_mb\tmemory_total_mb\tpower_draw_w\tcurrent_pid_observed\tcompute_process_count\tcompute_process_memory_used_mb\tfailure_reason\tdebug_path\nproduction_poll_1\t2026-07-03\t0\tNVIDIA\t70\t2048\t8192\t80\ttrue\t1\t2048\t\tD:/hidden\n",
+    )
+    .expect("gpu");
 
     for artifact_id in [
         "candidate_ranking",
         "evidence",
         "structure_patch",
         "md_summary",
+        "onsite_search",
+        "docking_summary",
+        "md_protocol",
+        "md_state",
+        "gpu_telemetry",
     ] {
         let (status, content_type, body) =
             download_artifact_response(&options, "run-1", artifact_id);
         assert_eq!(status, 200);
         assert_eq!(content_type, "text/tab-separated-values; charset=utf-8");
-        assert!(body.contains("输出材料"));
+        if matches!(
+            artifact_id,
+            "candidate_ranking" | "evidence" | "structure_patch" | "md_summary"
+        ) {
+            assert!(body.contains("输出材料"));
+        }
         assert!(!body.contains("sha256"));
         assert!(!body.contains("debug_path"));
         assert!(!body.contains("D:/hidden"));
@@ -2238,14 +2274,38 @@ fn md_endpoint_builds_chart_rows_from_current_run_summaries() {
         "candidate_id\tcomponent\tscore\nC1\tstructure\t0.5\n",
     )
     .expect("score");
+    fs::create_dir_all(run_dir.join("tool_outputs")).expect("tool outputs");
+    fs::write(
+        run_dir.join("tool_outputs/md_protocol.tsv"),
+        "candidate_id\tinput_id\tstage\tparameter\tvalue\tunit\tsource\nC1\tI1\tplatform\topenmm_platform\tCUDA\t\tOpenMM\nC1\tI1\tintegrator\tintegrator\tLangevinMiddleIntegrator\t\tOpenMM\nC1\tI1\tintegrator\ttime_step\t0.0020\tps\tOpenMM\nC1\tI1\tequilibration\ttime\t20.0000\tps\tOpenMM\nC1\tI1\tproduction\ttotal_time\t100.0000\tps\tOpenMM\nC1\tI1\tproduction\ttotal_steps\t50000\tsteps\tOpenMM\nC1\tI1\toutput\tframe_count\t50\tframes\tmd_trajectory.tsv\n",
+    )
+    .expect("protocol");
+    fs::write(
+        run_dir.join("tool_outputs/md_state.tsv"),
+        "candidate_id\tinput_id\tframe\tstep\ttime_ps\tstage\tpotential_energy_kj_mol\tkinetic_energy_kj_mol\ttotal_energy_kj_mol\ttemperature_estimate_K\tsource\nC1\tI1\t0\t0\t0.0000\tminimized\t-1.0000\t0.0000\t-1.0000\t0.0000\tOpenMM Context state\nC1\tI1\t50\t60000\t120.0000\tproduction\t-2.0000\t1.0000\t-1.0000\t300.0000\tOpenMM Context state\n",
+    )
+    .expect("state");
+    fs::write(
+        run_dir.join("tool_outputs/gpu_telemetry_status.tsv"),
+        "cuda_platform\tnvidia_smi_available\tgpu_observed\tmax_utilization_gpu_percent\tmax_memory_delta_mb\tprocess_observed\tsample_count\tproduction_sample_count\tproduction_max_utilization_gpu_percent\tproduction_max_memory_delta_mb\tmonitoring_mode\tobservation_basis\tfailure_reason\nCUDA\ttrue\ttrue\t70.0000\t512.0000\ttrue\t4\t2\t70.0000\t512.0000\tnvidia-smi_polling\tcurrent_pid\t\n",
+    )
+    .expect("gpu status");
 
     let payload = md_endpoint_json(&options, "run-1");
     assert_eq!(payload["has_output"], true);
     assert_eq!(payload["readiness"]["ready"], true);
+    assert_eq!(payload["protocol"]["platform"], "CUDA");
+    assert_eq!(payload["state_trace"]["last_temperature_K"], "300.0000");
+    assert_eq!(payload["cuda_monitoring"]["ready"], true);
+    assert_eq!(
+        payload["cuda_monitoring"]["observation_basis"],
+        "current_pid"
+    );
     assert!(payload["charts"].as_array().unwrap().len() >= 5);
     let text = payload.to_string();
     assert!(text.contains("md_summary.tsv"));
     assert!(text.contains("score_decomposition.tsv"));
+    assert!(text.contains("gpu_telemetry_status.tsv"));
     assert!(!text.contains(&root.display().to_string()));
 
     fs::remove_dir_all(&root).ok();

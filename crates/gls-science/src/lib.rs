@@ -21,6 +21,7 @@ const WORKER_SCHEMA_VERSION: &str = "genoligand_worker_current_v1";
 const WORKER_PIPELINE_MODE: &str = "genoligand_scientific_pipeline";
 const MAX_SEQUENCE_TOKEN_CHARS: usize = 96;
 const MAX_STRUCTURE_METADATA_CHARS: usize = 16_384;
+const LARGE_METAGENOME_FASTA_TSV_MAX_BYTES: u64 = 1_000_000_000;
 const KNOWN_SCORE_WEIGHT: f64 = 0.50;
 const METAGENOME_SCORE_WEIGHT: f64 = 0.25;
 const STRUCTURE_SCORE_WEIGHT: f64 = 0.10;
@@ -741,6 +742,15 @@ fn build_store_indexes(
     }
     let metagenome_dir = options.science_store.join("downloads/metagenome");
     for path in discover_sequence_files(&metagenome_dir)? {
+        if large_metagenome_fasta_requires_alignment_database(&path) {
+            append_alignment_database_required(
+                "metagenome_targets",
+                &options.science_store,
+                &path,
+                &mut manifest,
+            );
+            continue;
+        }
         let rows = parse_fasta_targets(
             &path,
             "metagenome",
@@ -761,26 +771,20 @@ fn build_store_indexes(
 
     known_rows = dedupe_store_rows(known_rows);
     metagenome_rows = dedupe_store_rows(metagenome_rows);
-    if !known_rows.is_empty() {
-        write_store_rows(
-            &options.science_store.join("indexes/known_targets.tsv"),
-            &known_rows,
-        )?;
-    }
-    if !metagenome_rows.is_empty() {
-        write_store_rows(
-            &options.science_store.join("indexes/metagenome_targets.tsv"),
-            &metagenome_rows,
-        )?;
-    }
+    write_store_rows(
+        &options.science_store.join("indexes/known_targets.tsv"),
+        &known_rows,
+    )?;
+    write_store_rows(
+        &options.science_store.join("indexes/metagenome_targets.tsv"),
+        &metagenome_rows,
+    )?;
     let mut structure_rows = build_structure_index_rows(options, &mut manifest)?;
     structure_rows = dedupe_store_rows(structure_rows);
-    if !structure_rows.is_empty() {
-        write_store_rows(
-            &options.science_store.join("indexes/structure_targets.tsv"),
-            &structure_rows,
-        )?;
-    }
+    write_store_rows(
+        &options.science_store.join("indexes/structure_targets.tsv"),
+        &structure_rows,
+    )?;
     write_text(manifest_path, &manifest)?;
     Ok(IndexBuildSummary {
         known_rows: known_rows.len(),
@@ -833,6 +837,32 @@ fn append_built_rows(
         if total > 0 { "used" } else { "empty" },
         index_output_for(index_name)
     ));
+}
+
+fn append_alignment_database_required(
+    index_name: &str,
+    root: &Path,
+    path: &Path,
+    manifest: &mut String,
+) {
+    manifest.push_str(&format!(
+        "{index_name}\t{}\trequires_alignment_database\t0\t{}\tlarge_metagenome_source_uses_mmseqs_target_database\n",
+        relative_display(root, path),
+        index_output_for(index_name)
+    ));
+}
+
+fn large_metagenome_fasta_requires_alignment_database(path: &Path) -> bool {
+    metagenome_fasta_requires_alignment_database(path, LARGE_METAGENOME_FASTA_TSV_MAX_BYTES)
+}
+
+fn metagenome_fasta_requires_alignment_database(path: &Path, max_tsv_source_bytes: u64) -> bool {
+    if max_tsv_source_bytes == 0 {
+        return false;
+    }
+    fs::metadata(path)
+        .map(|metadata| metadata.len() > max_tsv_source_bytes)
+        .unwrap_or(false)
 }
 
 fn index_output_for(index_name: &str) -> &'static str {
@@ -2429,7 +2459,42 @@ fn pipeline_blockers(options: &ScienceOptions) -> Result<Vec<String>, String> {
             }
         }
     }
+    if alignment_database_manifest_required(&options.science_store)
+        && !alignment_database_manifest_ready(&options.science_store)?
+    {
+        blockers.push("alignment_database_needs_repair".to_string());
+    }
     Ok(blockers)
+}
+
+fn alignment_database_manifest_required(store: &Path) -> bool {
+    store
+        .join("indexes/mmseqs/mmseqs_target_databases.tsv")
+        .exists()
+        || store
+            .join("indexes/foldseek/foldseek_target_databases.tsv")
+            .exists()
+}
+
+fn alignment_database_manifest_ready(store: &Path) -> Result<bool, String> {
+    for rel in [
+        "indexes/mmseqs/mmseqs_target_databases.tsv",
+        "indexes/foldseek/foldseek_target_databases.tsv",
+    ] {
+        let path = store.join(rel);
+        if !path.exists() {
+            return Ok(false);
+        }
+        let rows = read_simple_tsv_rows(&path)?;
+        if rows.is_empty()
+            || rows
+                .iter()
+                .any(|row| row.get("status").map(String::as_str) != Some("ready"))
+        {
+            return Ok(false);
+        }
+    }
+    Ok(true)
 }
 
 fn unready_source_ids(path: &Path) -> Result<Vec<String>, String> {
@@ -2911,10 +2976,14 @@ with zipfile.ZipFile(zip_path) as archive:
 
 fn match_metagenome(options: &ScienceOptions) -> Result<String, String> {
     let inputs = read_computed_feature_inputs(&options.run_dir.join("feature_manifest.tsv"))?;
-    let rows = read_store_rows(
-        &options.science_store.join("indexes/metagenome_targets.tsv"),
-        "metagenome_potential_index",
-    )?;
+    let rows = if alignment_database_manifest_required(&options.science_store) {
+        Vec::new()
+    } else {
+        read_store_rows(
+            &options.science_store.join("indexes/metagenome_targets.tsv"),
+            "metagenome_potential_index",
+        )?
+    };
     let mut out = String::from(
         "input_id\tsource\ttarget_id\ttarget_name\torganism\ttarget_class\tmatch_score\tmatched_features\tevidence\n",
     );
@@ -4522,6 +4591,7 @@ fn build_evidence(options: &ScienceOptions) -> Result<String, String> {
         "tool_outputs/md_contacts.tsv",
         "tool_outputs/md_hbonds.tsv",
         "tool_outputs/md_protocol.tsv",
+        "tool_outputs/md_state.tsv",
         "tool_outputs/gpu_telemetry.tsv",
         "tool_outputs/gpu_telemetry_status.tsv",
         "tool_outputs/ligand_placement.tsv",
@@ -4728,6 +4798,13 @@ fn artifact_evidence_status(file: &str, path: &Path) -> Result<ArtifactEvidenceS
                 ("not_generated", "no MD protocol rows".to_string())
             }
         }
+        "tool_outputs/md_state.tsv" => {
+            if rows > 0 {
+                ("available", format!("{rows} OpenMM state rows"))
+            } else {
+                ("not_generated", "no OpenMM state rows".to_string())
+            }
+        }
         file if file.starts_with("tool_outputs/md_") && file.ends_with(".tsv") => {
             if rows > 0 {
                 (
@@ -4884,6 +4961,8 @@ fn report_md_score_summary(
         .unwrap_or_else(|| "tool_outputs/md_trajectory.tsv".to_string());
     let protocol = read_md_manifest_field(options, "protocol_artifact")
         .unwrap_or_else(|| "tool_outputs/md_protocol.tsv".to_string());
+    let state = read_md_manifest_field(options, "state_artifact")
+        .unwrap_or_else(|| "tool_outputs/md_state.tsv".to_string());
     let telemetry = read_md_manifest_field(options, "gpu_telemetry_artifact")
         .unwrap_or_else(|| "tool_outputs/gpu_telemetry.tsv".to_string());
     let gpu_observed = if read_md_manifest_bool(options, "gpu_observed").unwrap_or(false) {
@@ -4892,7 +4971,7 @@ fn report_md_score_summary(
         "\u{672a}\u{89c2}\u{6d4b}"
     };
     Ok(format!(
-        "## \u{52a8}\u{529b}\u{5b66}\u{8bc4}\u{5206}\n\n- \u{6765}\u{6e90}\u{ff1a}md_summary.tsv \u{4e2d}\u{7684} md_stability_score\u{ff0c}\u{7531} tool_outputs/md_rmsd.tsv\u{3001}tool_outputs/md_rmsf.tsv\u{3001}tool_outputs/md_ligand_drift.tsv\u{3001}tool_outputs/md_contacts.tsv \u{548c} tool_outputs/md_hbonds.tsv \u{7b49}\u{5f53}\u{524d}\u{8fd0}\u{884c}\u{8f68}\u{8ff9}\u{6307}\u{6807}\u{6c47}\u{603b}\u{5f97}\u{5230}\u{3002}\n- \u{7528}\u{9014}\u{ff1a}\u{5199}\u{5165} Candidate Ranking \u{7684} md_score\u{ff0c}\u{5e76}\u{4ee5} {MD_SCORE_WEIGHT:.2} \u{6743}\u{91cd}\u{53c2}\u{4e0e} final_score\u{ff1b}\u{672c}\u{8fd0}\u{884c} {ranked_md} \u{4e2a}\u{5019}\u{9009}\u{6709} MD \u{5206}\u{6570}\u{3002}\n- \u{4f7f}\u{7528}\u{8bf4}\u{660e}\u{ff1a}\u{5f53}\u{524d} MD \u{4f5c}\u{4e3a}\u{77ed}\u{7a0b}\u{7a33}\u{5b9a}\u{6027}\u{7b5b}\u{9009}\u{8bc1}\u{636e}\u{ff0c}\u{4f7f}\u{7528}\u{5f53}\u{524d}\u{8fd0}\u{884c}\u{7684}\u{914d}\u{4f53}\u{653e}\u{7f6e}\u{548c}\u{53d7}\u{9650} receptor \u{6a21}\u{578b}\u{3002}\n- \u{8fd0}\u{884c}\u{8bb0}\u{5f55}\u{ff1a}OpenMM \u{5e73}\u{53f0} {platform}\u{ff0c}CUDA GPU {gpu_observed}\u{ff0c}\u{534f}\u{8bae}\u{4ea7}\u{7269} {protocol}\u{ff0c}\u{76d1}\u{6d4b}\u{4ea7}\u{7269} {telemetry}\u{ff0c}\u{8f68}\u{8ff9}\u{4ea7}\u{7269} {trajectory}\u{3002}\n\n"
+        "## \u{52a8}\u{529b}\u{5b66}\u{8bc4}\u{5206}\n\n- \u{6765}\u{6e90}\u{ff1a}md_summary.tsv \u{4e2d}\u{7684} md_stability_score\u{ff0c}\u{7531} tool_outputs/md_rmsd.tsv\u{3001}tool_outputs/md_rmsf.tsv\u{3001}tool_outputs/md_ligand_drift.tsv\u{3001}tool_outputs/md_contacts.tsv \u{548c} tool_outputs/md_hbonds.tsv \u{7b49}\u{5f53}\u{524d}\u{8fd0}\u{884c}\u{8f68}\u{8ff9}\u{6307}\u{6807}\u{6c47}\u{603b}\u{5f97}\u{5230}\u{3002}\n- \u{7528}\u{9014}\u{ff1a}\u{5199}\u{5165} Candidate Ranking \u{7684} md_score\u{ff0c}\u{5e76}\u{4ee5} {MD_SCORE_WEIGHT:.2} \u{6743}\u{91cd}\u{53c2}\u{4e0e} final_score\u{ff1b}\u{672c}\u{8fd0}\u{884c} {ranked_md} \u{4e2a}\u{5019}\u{9009}\u{6709} MD \u{5206}\u{6570}\u{3002}\n- \u{4f7f}\u{7528}\u{8bf4}\u{660e}\u{ff1a}\u{5f53}\u{524d} MD \u{4f7f}\u{7528}\u{5f53}\u{524d} run \u{7684} receptor-ligand complex\u{3001}\u{914d}\u{4f53}\u{5bf9}\u{63a5}\u{4f4d}\u{59ff}\u{3001}OpenFF/RDKit \u{914d}\u{4f53}\u{53c2}\u{6570}\u{3001}OpenMM \u{86cb}\u{767d}\u{529b}\u{573a}\u{3001}\u{663e}\u{5f0f}\u{6eb6}\u{5242}\u{548c} PME\u{ff1b}\u{534f}\u{8bae}\u{3001}\u{72b6}\u{6001}\u{5e8f}\u{5217}\u{548c} CUDA \u{89c2}\u{6d4b}\u{8bc1}\u{636e}\u{7531}\u{5f53}\u{524d}\u{8fd0}\u{884c}\u{4ea7}\u{7269}\u{8bb0}\u{5f55}\u{3002}\n- \u{8fd0}\u{884c}\u{8bb0}\u{5f55}\u{ff1a}OpenMM \u{5e73}\u{53f0} {platform}\u{ff0c}CUDA GPU {gpu_observed}\u{ff0c}\u{534f}\u{8bae}\u{4ea7}\u{7269} {protocol}\u{ff0c}\u{72b6}\u{6001}\u{5e8f}\u{5217} {state}\u{ff0c}\u{76d1}\u{6d4b}\u{4ea7}\u{7269} {telemetry}\u{ff0c}\u{8f68}\u{8ff9}\u{4ea7}\u{7269} {trajectory}\u{3002}\n\n"
     ))
 }
 
@@ -5099,6 +5178,7 @@ fn write_candidate_detail(
                     "tool_outputs/ligand_placement.tsv",
                     "tool_outputs/md_run_manifest.json",
                     "tool_outputs/md_protocol.tsv",
+                    "tool_outputs/md_state.tsv",
                     "tool_outputs/gpu_telemetry.tsv",
                     "tool_outputs/gpu_telemetry_status.tsv",
                     "tool_outputs/md_trajectory.tsv",
@@ -5239,7 +5319,7 @@ fn write_artifact_source_map(options: &ScienceOptions) -> Result<(), String> {
         ),
         (
             "md_summary.tsv",
-            "tool_outputs/docking_pose.sdf;tool_outputs/md_run_manifest.json;tool_outputs/md_protocol.tsv;tool_outputs/gpu_telemetry_status.tsv;tool_outputs/md_summary.tsv;tool_outputs/md_rmsd.tsv;tool_outputs/md_rmsf.tsv;tool_outputs/md_ligand_drift.tsv;tool_outputs/md_contacts.tsv;tool_outputs/md_hbonds.tsv",
+            "tool_outputs/docking_pose.sdf;tool_outputs/md_run_manifest.json;tool_outputs/md_protocol.tsv;tool_outputs/md_state.tsv;tool_outputs/gpu_telemetry_status.tsv;tool_outputs/md_summary.tsv;tool_outputs/md_rmsd.tsv;tool_outputs/md_rmsf.tsv;tool_outputs/md_ligand_drift.tsv;tool_outputs/md_contacts.tsv;tool_outputs/md_hbonds.tsv",
             "target_candidate_ranking.tsv;evidence_ledger.tsv",
         ),
         (
@@ -5275,6 +5355,11 @@ fn write_artifact_source_map(options: &ScienceOptions) -> Result<(), String> {
         (
             "tool_outputs/md_protocol.tsv",
             "current run MD protocol: coordinates, platform, minimization, equilibration, production and output cadence",
+            "md_summary.tsv;tool_outputs/md_run_manifest.json;evidence_ledger.tsv",
+        ),
+        (
+            "tool_outputs/md_state.tsv",
+            "current run OpenMM state data: step, time, potential energy, kinetic energy and temperature estimate",
             "md_summary.tsv;tool_outputs/md_run_manifest.json;evidence_ledger.tsv",
         ),
         (

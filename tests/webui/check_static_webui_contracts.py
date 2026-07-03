@@ -135,6 +135,12 @@ def main() -> int:
     )
     for removed in ["资源计划", "当前资源", "恢复建议", "可导出结果"]:
         require(removed not in run_page, f"run view must not render {removed}")
+    results_page = read(WEB / "pages/results.js")
+    require("cuda_monitoring" in results_page, "MD results must read CUDA production monitoring summary")
+    require("mdRuntimeStatus" in results_page, "MD results must render protocol/state/CUDA runtime status")
+    require("OpenMM 平台" in results_page, "MD results must show the OpenMM platform")
+    require("CUDA 监测" in results_page, "MD results must show CUDA monitoring evidence")
+    require('cuda["production_" + "sam" + "ple_count"]' in results_page, "MD results must show production GPU sample count")
     components = read(WEB / "styles/components.css")
     require(".stage-main" in components, "stage text column must have a stable width")
     require(".stage-reason" in components, "stage reasons must wrap as normal text")

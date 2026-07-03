@@ -130,7 +130,8 @@ OPENFF_FORCEFIELD_URL = (
     "https://raw.githubusercontent.com/openforcefield/openff-forcefields/main/"
     "openforcefields/offxml/openff-2.2.1.offxml"
 )
-DEFAULT_ALIGNMENT_DB_MAX_SOURCE_BYTES = 5 * 1024 * 1024 * 1024
+DEFAULT_ALIGNMENT_DB_MAX_SOURCE_BYTES = 0
+DEFAULT_PARTIAL_INDEX_LARGE_SOURCE_BYTES = 1 * 1024 * 1024 * 1024
 RESERVED_WSL_DISTROS = {"Ubuntu-24.04"}
 DOWNLOAD_RETRIES = 3
 DOWNLOAD_TIMEOUT_SECONDS = 120
@@ -2823,7 +2824,7 @@ def build_persistent_alignment_databases(
     failed = sum(1 for row in all_rows if row.get("status") == "failed")
     deferred = sum(1 for row in all_rows if row.get("status") == "deferred_large_source")
     total = len(all_rows)
-    status = "ready" if ready and failed == 0 else "failed" if failed else "needs_repair"
+    status = "ready" if total > 0 and ready == total and failed == 0 and deferred == 0 else "failed" if failed else "needs_repair"
     return {
         "status": status,
         "ready": ready,
@@ -2971,14 +2972,13 @@ def build_mmseqs_database(
     tmp = db_path.parent / "tmp"
     tmp.mkdir(parents=True, exist_ok=True)
     if os.name == "nt" and wsl_distro:
-        return run_wsl_database_commands(
-            wsl_distro,
-            [
-                ["mmseqs", "createdb", wsl_path(source), wsl_path(db_path)],
-                ["mmseqs", "createindex", wsl_path(db_path), wsl_path(tmp)],
-            ],
-            "mmseqs_createdb_createindex_completed",
-        )
+        created = run_wsl_database_command(wsl_distro, ["mmseqs", "createdb", wsl_path(source), wsl_path(db_path)])
+        if created.returncode != 0:
+            return "failed", process_note(created)
+        indexed = run_wsl_database_command(wsl_distro, ["mmseqs", "createindex", wsl_path(db_path), wsl_path(tmp)])
+        if indexed.returncode != 0:
+            return database_ready_after_index_failure("mmseqs", db_path, indexed)
+        return "ready", "mmseqs_createdb_createindex_completed"
     if command is None:
         return "failed", "mmseqs_executable_missing"
     created = run_command([command, "createdb", str(source), str(db_path)], env=env)
@@ -2986,7 +2986,7 @@ def build_mmseqs_database(
         return "failed", process_note(created)
     indexed = run_command([command, "createindex", str(db_path), str(tmp)], env=env)
     if indexed.returncode != 0:
-        return "failed", process_note(indexed)
+        return database_ready_after_index_failure("mmseqs", db_path, indexed)
     return "ready", "mmseqs_createdb_createindex_completed"
 
 
@@ -3005,14 +3005,13 @@ def build_foldseek_database(
     tmp = db_path.parent / "tmp"
     tmp.mkdir(parents=True, exist_ok=True)
     if os.name == "nt" and wsl_distro:
-        return run_wsl_database_commands(
-            wsl_distro,
-            [
-                ["foldseek", "createdb", wsl_path(source), wsl_path(db_path)],
-                ["foldseek", "createindex", wsl_path(db_path), wsl_path(tmp)],
-            ],
-            "foldseek_createdb_createindex_completed",
-        )
+        created = run_wsl_database_command(wsl_distro, ["foldseek", "createdb", wsl_path(source), wsl_path(db_path)])
+        if created.returncode != 0:
+            return "failed", process_note(created)
+        indexed = run_wsl_database_command(wsl_distro, ["foldseek", "createindex", wsl_path(db_path), wsl_path(tmp)])
+        if indexed.returncode != 0:
+            return database_ready_after_index_failure("foldseek", db_path, indexed)
+        return "ready", "foldseek_createdb_createindex_completed"
     if command is None:
         return "failed", "foldseek_executable_missing"
     created = run_command([command, "createdb", str(source), str(db_path)], env=env)
@@ -3020,8 +3019,23 @@ def build_foldseek_database(
         return "failed", process_note(created)
     indexed = run_command([command, "createindex", str(db_path), str(tmp)], env=env)
     if indexed.returncode != 0:
-        return "failed", process_note(indexed)
+        return database_ready_after_index_failure("foldseek", db_path, indexed)
     return "ready", "foldseek_createdb_createindex_completed"
+
+
+def database_ready_after_index_failure(
+    tool: str,
+    db_path: Path,
+    indexed: subprocess.CompletedProcess[str],
+) -> tuple[str, str]:
+    if database_prefix_ready(db_path):
+        return "ready", f"{tool}_createdb_ready_createindex_not_precomputed:{process_note(indexed)}"
+    return "failed", process_note(indexed)
+
+
+def run_wsl_database_command(distro: str, command: list[str]) -> subprocess.CompletedProcess[str]:
+    script = f'export PATH="{wsl_runtime_path_prefix()}:$PATH" && {bash_words(command)}'
+    return run_wsl_user_shell(distro, script)
 
 
 def run_wsl_database_commands(
@@ -3441,7 +3455,62 @@ def tsv_has_data_rows(path: Path) -> bool:
     return path.exists() and bool(read_tsv(path))
 
 
+def alignment_database_manifests_ready(science_store: Path) -> bool:
+    for rel_path in [
+        "indexes/mmseqs/mmseqs_target_databases.tsv",
+        "indexes/foldseek/foldseek_target_databases.tsv",
+    ]:
+        rows = read_tsv(science_store / rel_path)
+        if not rows or any(row.get("status") != "ready" for row in rows):
+            return False
+    return True
+
+
+def partial_legacy_index_manifest_present(science_store: Path) -> bool:
+    for row in read_tsv(science_store / "index_build_manifest.tsv"):
+        notes = str(row.get("notes", ""))
+        if "index_row_limit_reached" in notes:
+            return True
+        if str(row.get("status", "")) != "used":
+            continue
+        try:
+            row_count = int(str(row.get("rows", "0") or "0"))
+        except ValueError:
+            row_count = 0
+        source = science_store / str(row.get("input_path", ""))
+        if row_count <= 10_000 and large_index_source(source):
+            return True
+    return False
+
+
+def large_index_source(path: Path) -> bool:
+    try:
+        return path.exists() and path.stat().st_size > partial_index_large_source_bytes()
+    except OSError:
+        return False
+
+
+def partial_index_large_source_bytes() -> int:
+    raw = os.environ.get("GENOLIGAND_PARTIAL_INDEX_LARGE_SOURCE_BYTES", "").strip()
+    if not raw:
+        return DEFAULT_PARTIAL_INDEX_LARGE_SOURCE_BYTES
+    try:
+        return max(0, int(raw))
+    except ValueError:
+        return DEFAULT_PARTIAL_INDEX_LARGE_SOURCE_BYTES
+
+
 def existing_science_indexes_ready(science_store: Path) -> bool:
+    if not base_science_indexes_ready(science_store):
+        return False
+    if not alignment_database_manifests_ready(science_store):
+        return False
+    if partial_legacy_index_manifest_present(science_store):
+        return False
+    return True
+
+
+def base_science_indexes_ready(science_store: Path) -> bool:
     status_payload = load_json(science_store / "install_status.json")
     missing = status_payload.get("missing_components", [])
     if status_payload.get("status") != "ready" or (isinstance(missing, list) and missing):
@@ -3531,12 +3600,13 @@ def alignment_database_user_summary(alignment_result: dict[str, object]) -> dict
     ready = int(alignment_result.get("ready", 0) or 0)
     total = int(alignment_result.get("total", 0) or 0)
     deferred = int(alignment_result.get("deferred", 0) or 0)
+    completed = status == "ready" and total > 0 and ready == total and deferred == 0
     return {
-        "completed": status == "ready",
+        "completed": completed,
         "ready": ready,
         "deferred": deferred,
         "total": total,
-        "next_action": "继续" if status == "ready" else "运行安装/修复",
+        "next_action": "继续" if completed else "运行安装/修复",
     }
 
 
@@ -3634,6 +3704,8 @@ def installation_status(
         and resource_status == "ready"
         and external_status == "ready"
         and tool_status == "ready"
+        and alignment_status == "ready"
+        and forcefield_status == "ready"
         and source_manifest_status == "ready"
     ):
         status = "ready"
@@ -3884,6 +3956,22 @@ def main() -> int:
             message="已复用现有数据库索引",
         )
         completed = subprocess.CompletedProcess(command, 0, "science_indexes_reused\n", "")
+    elif base_science_indexes_ready(science_store):
+        write_install_progress(
+            science_store,
+            status="running",
+            stage="构建索引",
+            current_resource="科学仓库索引",
+            completed_steps=5,
+            total_steps=6,
+            message="已复用基础数据库索引，继续修复本地比对数据库",
+        )
+        completed = subprocess.CompletedProcess(
+            command,
+            0,
+            "science_indexes_reused_for_alignment_repair\n",
+            "",
+        )
     else:
         completed = run_command(command, env=command_env)
     write_install_progress(

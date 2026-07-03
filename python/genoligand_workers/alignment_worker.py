@@ -159,6 +159,7 @@ def run_foldseek_alignment(run_dir: Path, science_store: Path) -> str:
         str(target),
         str(result_db),
         str(tmp),
+        "-a",
         "--threads",
         os.environ.get("GENOLIGAND_ALIGNMENT_THREADS", "1"),
     ]

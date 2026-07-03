@@ -1446,6 +1446,73 @@ fn download_artifact_response(
                 ("\u{8f93}\u{51fa}\u{6750}\u{6599}", "result_source"),
             ],
         ),
+        "onsite_search" => user_tsv_download(
+            read_tsv_rows(&run_dir.join("known_database_matches.tsv")),
+            &[
+                ("\u{8f93}\u{5165}\u{7f16}\u{53f7}", "input_id"),
+                ("\u{6765}\u{6e90}", "source"),
+                ("\u{76ee}\u{6807}\u{7f16}\u{53f7}", "target_id"),
+                ("\u{76ee}\u{6807}\u{540d}\u{79f0}", "target_name"),
+                ("\u{7269}\u{79cd}", "organism"),
+                ("\u{76ee}\u{6807}\u{7c7b}\u{578b}", "target_class"),
+                ("\u{5339}\u{914d}\u{5206}\u{6570}", "match_score"),
+                ("\u{5339}\u{914d}\u{7279}\u{5f81}", "matched_features"),
+                ("\u{8bc1}\u{636e}", "evidence"),
+            ],
+        ),
+        "docking_summary" => user_tsv_download(
+            read_tsv_rows(&run_dir.join("docking_summary.tsv")),
+            &[
+                ("\u{5019}\u{9009}\u{7f16}\u{53f7}", "candidate_id"),
+                ("\u{5bf9}\u{63a5}\u{72b6}\u{6001}", "docking_status"),
+                ("\u{5bf9}\u{63a5}\u{5206}\u{6570}", "docking_score"),
+                ("\u{5bf9}\u{63a5}\u{5f15}\u{64ce}", "docking_engine"),
+                ("\u{8bf4}\u{660e}", "notes"),
+            ],
+        ),
+        "md_protocol" => user_tsv_download(
+            read_tsv_rows(&run_dir.join("tool_outputs/md_protocol.tsv")),
+            &[
+                ("\u{5019}\u{9009}\u{7f16}\u{53f7}", "candidate_id"),
+                ("\u{8f93}\u{5165}\u{7f16}\u{53f7}", "input_id"),
+                ("\u{9636}\u{6bb5}", "stage"),
+                ("\u{53c2}\u{6570}", "parameter"),
+                ("\u{6570}\u{503c}", "value"),
+                ("\u{5355}\u{4f4d}", "unit"),
+                ("\u{6765}\u{6e90}", "source"),
+            ],
+        ),
+        "md_state" => user_tsv_download(
+            read_tsv_rows(&run_dir.join("tool_outputs/md_state.tsv")),
+            &[
+                ("\u{5019}\u{9009}\u{7f16}\u{53f7}", "candidate_id"),
+                ("\u{5e27}", "frame"),
+                ("\u{6b65}\u{6570}", "step"),
+                ("\u{65f6}\u{95f4} ps", "time_ps"),
+                ("\u{9636}\u{6bb5}", "stage"),
+                ("\u{52bf}\u{80fd} kJ/mol", "potential_energy_kj_mol"),
+                ("\u{603b}\u{80fd} kJ/mol", "total_energy_kj_mol"),
+                ("\u{6e29}\u{5ea6} K", "temperature_estimate_K"),
+                ("\u{6765}\u{6e90}", "source"),
+            ],
+        ),
+        "gpu_telemetry" => user_tsv_download(
+            read_tsv_rows(&run_dir.join("tool_outputs/gpu_telemetry.tsv")),
+            &[
+                ("\u{91c7}\u{6837}\u{9636}\u{6bb5}", "sample_label"),
+                ("\u{65f6}\u{95f4}", "timestamp"),
+                ("GPU", "gpu_index"),
+                ("\u{8bbe}\u{5907}", "name"),
+                ("\u{5229}\u{7528}\u{7387} %", "utilization_gpu_percent"),
+                ("\u{663e}\u{5b58} MB", "memory_used_mb"),
+                ("\u{5f53}\u{524d}\u{8fdb}\u{7a0b}", "current_pid_observed"),
+                (
+                    "\u{8ba1}\u{7b97}\u{8fdb}\u{7a0b}\u{6570}",
+                    "compute_process_count",
+                ),
+                ("\u{8bf4}\u{660e}", "failure_reason"),
+            ],
+        ),
         _ => json_response(404, json!({"error":"artifact_not_available"})),
     }
 }
@@ -1518,7 +1585,17 @@ fn structure_endpoint_json(options: &ServerOptions, run_id: &str) -> Value {
 
 fn md_endpoint_json(options: &ServerOptions, run_id: &str) -> Value {
     let Some(run_dir) = completed_run_dir(options, run_id) else {
-        return json!({"run_id":run_id,"md_rows":[],"row_count":0,"has_output":false,"charts":[],"readiness":{"ready":false,"reason":"等待运行完成后读取 MD 摘要输出","chart_ready":false}});
+        return json!({
+            "run_id":run_id,
+            "md_rows":[],
+            "row_count":0,
+            "has_output":false,
+            "charts":[],
+            "readiness":{"ready":false,"reason":"等待运行完成后读取 MD 摘要输出","chart_ready":false},
+            "protocol": md_protocol_payload(None),
+            "state_trace": md_state_payload(None),
+            "cuda_monitoring": md_cuda_monitoring_payload(None)
+        });
     };
     let rows = user_md_rows(&run_dir);
     let charts = md_chart_rows(&run_dir, &rows);
@@ -1529,7 +1606,10 @@ fn md_endpoint_json(options: &ServerOptions, run_id: &str) -> Value {
         "row_count": rows.len(),
         "has_output": !rows.is_empty(),
         "charts": charts,
-        "readiness": readiness
+        "readiness": readiness,
+        "protocol": md_protocol_payload(Some(&run_dir)),
+        "state_trace": md_state_payload(Some(&run_dir)),
+        "cuda_monitoring": md_cuda_monitoring_payload(Some(&run_dir))
     })
 }
 
@@ -1806,6 +1886,95 @@ fn md_readiness_payload(run_dir: &Path, rows: &[Value], charts: &[Value]) -> Val
     })
 }
 
+fn md_protocol_payload(run_dir: Option<&Path>) -> Value {
+    let Some(run_dir) = run_dir else {
+        return json!({"ready":false,"reason":"等待运行完成后读取 MD 运行协议"});
+    };
+    let rows = read_tsv_rows(&run_dir.join("tool_outputs/md_protocol.tsv"));
+    if rows.is_empty() {
+        return json!({"ready":false,"reason":"当前运行没有 MD 运行协议输出"});
+    }
+    json!({
+        "ready": true,
+        "platform": protocol_value(&rows, "platform", "openmm_platform"),
+        "integrator": protocol_value(&rows, "integrator", "integrator"),
+        "time_step": protocol_value_with_unit(&rows, "integrator", "time_step"),
+        "equilibration_time": protocol_value_with_unit(&rows, "equilibration", "time"),
+        "production_time": protocol_value_with_unit(&rows, "production", "total_time"),
+        "production_steps": protocol_value_with_unit(&rows, "production", "total_steps"),
+        "frame_count": protocol_value_with_unit(&rows, "output", "frame_count"),
+        "state_rows": protocol_value_with_unit(&rows, "output", "state_rows"),
+        "artifact": "tool_outputs/md_protocol.tsv"
+    })
+}
+
+fn md_state_payload(run_dir: Option<&Path>) -> Value {
+    let Some(run_dir) = run_dir else {
+        return json!({"ready":false,"reason":"等待运行完成后读取 MD 状态序列"});
+    };
+    let rows = read_tsv_rows(&run_dir.join("tool_outputs/md_state.tsv"));
+    let Some(last) = rows.last() else {
+        return json!({"ready":false,"reason":"当前运行没有 MD 状态序列输出"});
+    };
+    json!({
+        "ready": true,
+        "row_count": rows.len(),
+        "last_stage": row_text(last, "stage"),
+        "last_step": row_text(last, "step"),
+        "last_time_ps": row_text(last, "time_ps"),
+        "last_temperature_K": row_text(last, "temperature_estimate_K"),
+        "last_total_energy_kj_mol": row_text(last, "total_energy_kj_mol"),
+        "artifact": "tool_outputs/md_state.tsv"
+    })
+}
+
+fn md_cuda_monitoring_payload(run_dir: Option<&Path>) -> Value {
+    let Some(run_dir) = run_dir else {
+        return json!({"ready":false,"reason":"等待运行完成后读取 CUDA 监测输出"});
+    };
+    let rows = read_tsv_rows(&run_dir.join("tool_outputs/gpu_telemetry_status.tsv"));
+    let Some(row) = rows.first() else {
+        return json!({"ready":false,"reason":"当前运行没有 CUDA 监测状态输出"});
+    };
+    let platform = row_text(row, "cuda_platform");
+    let gpu_observed = row_text(row, "gpu_observed") == "true";
+    let nvidia_smi_available = row_text(row, "nvidia_smi_available") == "true";
+    json!({
+        "ready": platform == "CUDA" && gpu_observed,
+        "platform": platform,
+        "nvidia_smi_available": nvidia_smi_available,
+        "gpu_observed": gpu_observed,
+        "production_sample_count": row_text(row, "production_sample_count"),
+        "production_max_utilization_gpu_percent": row_text(row, "production_max_utilization_gpu_percent"),
+        "production_max_memory_delta_mb": row_text(row, "production_max_memory_delta_mb"),
+        "observation_basis": row_text(row, "observation_basis"),
+        "failure_reason": row_text(row, "failure_reason"),
+        "artifact": "tool_outputs/gpu_telemetry_status.tsv"
+    })
+}
+
+fn protocol_value(rows: &[Value], stage: &str, parameter: &str) -> String {
+    rows.iter()
+        .find(|row| row_text(row, "stage") == stage && row_text(row, "parameter") == parameter)
+        .map(|row| row_text(row, "value").to_string())
+        .unwrap_or_default()
+}
+
+fn protocol_value_with_unit(rows: &[Value], stage: &str, parameter: &str) -> String {
+    rows.iter()
+        .find(|row| row_text(row, "stage") == stage && row_text(row, "parameter") == parameter)
+        .map(|row| {
+            let value = row_text(row, "value");
+            let unit = row_text(row, "unit");
+            if unit.is_empty() {
+                value.to_string()
+            } else {
+                format!("{value} {unit}")
+            }
+        })
+        .unwrap_or_default()
+}
+
 fn read_status_reason(path: &Path, fallback: &str) -> String {
     let rows = read_tsv_rows(path);
     let reason = rows
@@ -1880,7 +2049,7 @@ fn candidate_risk_note(scope: &str, md_score: Option<f64>) -> String {
         parts.push("\u{975e}\u{4eba}\u{6e90}\u{5df2}\u{77e5}\u{86cb}\u{767d}\u{ff1b}\u{7ed3}\u{5408}\u{7814}\u{7a76}\u{5bf9}\u{8c61}\u{89e3}\u{8bfb}");
     }
     if matches!(md_score, Some(value) if value > 0.0) {
-        parts.push("\u{77ed}\u{7a0b}\u{53d7}\u{9650} receptor \u{6a21}\u{578b}\u{ff1b}\u{7528}\u{4e8e}\u{5019}\u{9009}\u{6392}\u{5e8f}");
+        parts.push("\u{5f53}\u{524d} run \u{7684}\u{590d}\u{5408}\u{7269} MD \u{8bc1}\u{636e}\u{5df2}\u{53c2}\u{4e0e}\u{5019}\u{9009}\u{6392}\u{5e8f}");
     } else {
         parts.push("MD \u{652f}\u{6301}\u{672a}\u{751f}\u{6210}\u{ff1b}\u{6309}\u{5176}\u{4ed6}\u{8bc1}\u{636e}\u{6392}\u{5e8f}");
     }
@@ -2256,6 +2425,7 @@ fn evidence_type_label(claim: &str, artifact: &str) -> &'static str {
         "docking_summary.tsv" | "docking_summary" => "\u{5bf9}\u{63a5}\u{6458}\u{8981}",
         "md_summary.tsv" | "md_summary" => "\u{52a8}\u{529b}\u{5b66}\u{6458}\u{8981}",
         "tool_outputs/md_protocol.tsv" | "md_protocol" => "MD \u{8fd0}\u{884c}\u{534f}\u{8bae}",
+        "tool_outputs/md_state.tsv" | "md_state" => "MD \u{72b6}\u{6001}\u{5e8f}\u{5217}",
         "tool_outputs/gpu_telemetry.tsv" | "gpu_telemetry" => "CUDA \u{76d1}\u{6d4b}",
         "tool_outputs/gpu_telemetry_status.tsv" | "gpu_telemetry_status" => "CUDA \u{72b6}\u{6001}",
         "target_candidate_ranking.tsv" | "target_candidate_ranking" => {
@@ -2291,6 +2461,9 @@ fn evidence_source_label(artifact: &str) -> &'static str {
         }
         "tool_outputs/md_protocol.tsv" => {
             "\u{5f53}\u{524d} MD \u{7684}\u{534f}\u{8bae}\u{8bb0}\u{5f55}"
+        }
+        "tool_outputs/md_state.tsv" => {
+            "\u{5f53}\u{524d} OpenMM MD \u{7684}\u{6b65}\u{6570}\u{3001}\u{80fd}\u{91cf}\u{548c}\u{6e29}\u{5ea6}\u{72b6}\u{6001}\u{5e8f}\u{5217}"
         }
         "tool_outputs/gpu_telemetry.tsv" | "tool_outputs/gpu_telemetry_status.tsv" => {
             "\u{5f53}\u{524d} CUDA \u{8fd0}\u{884c}\u{76d1}\u{6d4b}"
@@ -3697,6 +3870,11 @@ fn artifact_specs() -> &'static [(&'static str, &'static str, &'static str)] {
             "md_protocol",
             "MD \u{8fd0}\u{884c}\u{534f}\u{8bae}",
             "tool_outputs/md_protocol.tsv",
+        ),
+        (
+            "md_state",
+            "MD \u{72b6}\u{6001}\u{5e8f}\u{5217}",
+            "tool_outputs/md_state.tsv",
         ),
         (
             "gpu_telemetry",

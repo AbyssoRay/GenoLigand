@@ -47,8 +47,8 @@ def main() -> int:
     require("build_persistent_alignment_databases" in installer_text, "installer must build persistent MMseqs2/Foldseek target databases")
     require("mmseqs_target_databases.tsv" in installer_text, "installer must record persistent MMseqs2 database manifest")
     require("foldseek_target_databases.tsv" in installer_text, "installer must record persistent Foldseek database manifest")
-    require("deferred_large_source" in installer_text, "installer must record oversized alignment sources without blocking first launch")
-    require("GENOLIGAND_ALIGNMENT_DB_MAX_SOURCE_BYTES" in installer_text, "installer must allow explicit full alignment database indexing")
+    require("deferred_large_source" in installer_text, "installer must record explicitly deferred oversized alignment sources as needs_repair")
+    require("GENOLIGAND_ALIGNMENT_DB_MAX_SOURCE_BYTES" in installer_text, "installer must allow an explicit emergency alignment database size cap")
     require("ensure_openff_forcefield_file" in installer_text, "installer must install the OpenFF SMIRNOFF offxml force field file")
     require("openff-2.2.1.offxml" in installer_text, "installer must use a pinned OpenFF Sage force field file")
     require("getattr(xmltodict, '__version__', 'installed')" in installer_text, "xmltodict probe must not require a __version__ attribute")
@@ -59,20 +59,46 @@ def main() -> int:
         tmp_path = Path(tmp)
         source = tmp_path / "targets.fasta"
         source.write_text(">a\nAAAA\n", encoding="utf-8")
-        calls: list[tuple[str, list[list[str]], str]] = []
-        original_runner = installer.run_wsl_database_commands
+        calls: list[tuple[str, list[str]]] = []
+        original_runner = installer.run_wsl_database_command
         original_os_name = installer.os.name
-        installer.run_wsl_database_commands = lambda distro, commands, success_note: calls.append((distro, commands, success_note)) or ("ready", success_note)
+
+        def fake_wsl_database_command(distro, command):
+            calls.append((distro, command))
+            return installer.subprocess.CompletedProcess(command, 0, "", "")
+
+        installer.run_wsl_database_command = fake_wsl_database_command
         installer.os.name = "nt"
         try:
             status, note = installer.build_mmseqs_database(None, source, tmp_path / "mmseqs" / "target", {}, "GenoLigandPhase08")
             require(status == "ready" and note == "mmseqs_createdb_createindex_completed", "WSL MMseqs2 build must not require a Windows PATH executable")
             status, note = installer.build_foldseek_database(None, source, tmp_path / "foldseek" / "target", {}, "GenoLigandPhase08")
             require(status == "ready" and note == "foldseek_createdb_createindex_completed", "WSL Foldseek build must not require a Windows PATH executable")
-            require(len(calls) == 2 and all(call[0] == "GenoLigandPhase08" for call in calls), "WSL database builds must target the selected project distro")
+            require(len(calls) == 4 and all(call[0] == "GenoLigandPhase08" for call in calls), "WSL database builds must target the selected project distro")
         finally:
-            installer.run_wsl_database_commands = original_runner
+            installer.run_wsl_database_command = original_runner
             installer.os.name = original_os_name
+    with tempfile.TemporaryDirectory() as tmp:
+        tmp_path = Path(tmp)
+        source = tmp_path / "targets.fasta"
+        db_path = tmp_path / "mmseqs" / "target"
+        source.write_text(">a\nAAAA\n", encoding="utf-8")
+        original_run_command = installer.run_command
+
+        def fake_run_command(command, env=None):
+            if command[1] == "createdb":
+                db_path.parent.mkdir(parents=True, exist_ok=True)
+                db_path.with_suffix(".dbtype").write_text("0\n", encoding="utf-8")
+                return installer.subprocess.CompletedProcess(command, 0, "", "")
+            return installer.subprocess.CompletedProcess(command, 1, "", "Cannot fit databases into 12G. Please use a computer with more main memory.")
+
+        installer.run_command = fake_run_command
+        try:
+            status, note = installer.build_mmseqs_database("mmseqs", source, db_path, {}, None)
+            require(status == "ready", "created MMseqs2 target database must remain usable when precomputed index exceeds memory")
+            require("createdb_ready_createindex_not_precomputed" in note, "MMseqs2 manifest must record unindexed searchable database")
+        finally:
+            installer.run_command = original_run_command
     with tempfile.TemporaryDirectory() as tmp:
         tmp_path = Path(tmp)
         calls: list[list[str]] = []
@@ -112,7 +138,46 @@ def main() -> int:
             "indexes/tool_versions.tsv",
         ]:
             (store / rel).write_text("id\tstatus\nitem\tready\n", encoding="utf-8")
+        (store / "indexes/mmseqs").mkdir(parents=True)
+        (store / "indexes/foldseek").mkdir(parents=True)
+        (store / "indexes/mmseqs/mmseqs_target_databases.tsv").write_text(
+            "source_id\tsource_path\tdb_path\tstatus\tnotes\nmetagenome\tdownloads/metagenome/mgy.fa.gz\tindexes/mmseqs/metagenome/target\tready\talready_available\n",
+            encoding="utf-8",
+        )
+        (store / "indexes/foldseek/foldseek_target_databases.tsv").write_text(
+            "source_id\tsource_path\tdb_path\tstatus\tnotes\nrcsb_mmcif\tdownloads/rcsb/mmcif\tindexes/foldseek/rcsb_mmcif/target\tready\talready_available\n",
+            encoding="utf-8",
+        )
         require(installer.existing_science_indexes_ready(store), "ready installed indexes must be reused")
+        (store / "indexes/mmseqs/mmseqs_target_databases.tsv").write_text(
+            "source_id\tsource_path\tdb_path\tstatus\tnotes\nmetagenome\tdownloads/metagenome/mgy.fa.gz\tindexes/mmseqs/metagenome/target\tdeferred_large_source\tsource_exceeds_sync_index_threshold\n",
+            encoding="utf-8",
+        )
+        require(installer.base_science_indexes_ready(store), "base indexes should be reusable while repairing alignment databases")
+        require(not installer.existing_science_indexes_ready(store), "deferred persistent alignment databases must not be reused as ready")
+        (store / "indexes/mmseqs/mmseqs_target_databases.tsv").write_text(
+            "source_id\tsource_path\tdb_path\tstatus\tnotes\nmetagenome\tdownloads/metagenome/mgy.fa.gz\tindexes/mmseqs/metagenome/target\tready\talready_available\n",
+            encoding="utf-8",
+        )
+        (store / "downloads/metagenome").mkdir(parents=True)
+        (store / "downloads/metagenome/mgy.fa.gz").write_bytes(b"x" * 2048)
+        old_partial_limit = installer.os.environ.get("GENOLIGAND_PARTIAL_INDEX_LARGE_SOURCE_BYTES")
+        installer.os.environ["GENOLIGAND_PARTIAL_INDEX_LARGE_SOURCE_BYTES"] = "1024"
+        try:
+            (store / "index_build_manifest.tsv").write_text(
+                "index\tinput_path\tstatus\trows\toutput_path\tnotes\nmetagenome_targets\tdownloads/metagenome/mgy.fa.gz\tused\t5000\tindexes/metagenome_targets.tsv\tfasta_sequence_rows\n",
+                encoding="utf-8",
+            )
+            require(not installer.existing_science_indexes_ready(store), "partial legacy large-source slices must not be reused as ready")
+        finally:
+            if old_partial_limit is None:
+                installer.os.environ.pop("GENOLIGAND_PARTIAL_INDEX_LARGE_SOURCE_BYTES", None)
+            else:
+                installer.os.environ["GENOLIGAND_PARTIAL_INDEX_LARGE_SOURCE_BYTES"] = old_partial_limit
+        (store / "index_build_manifest.tsv").write_text(
+            "index\tinput_path\tstatus\trows\toutput_path\tnotes\nmetagenome_targets\tdownloads/metagenome/mgy.fa.gz\tused\t50000\tindexes/metagenome_targets.tsv\tfasta_sequence_rows\n",
+            encoding="utf-8",
+        )
         (store / "indexes/known_targets.tsv").write_text("id\tstatus\n", encoding="utf-8")
         require(not installer.existing_science_indexes_ready(store), "empty installed indexes must not be reused")
     with tempfile.TemporaryDirectory() as tmp:
@@ -152,10 +217,11 @@ def main() -> int:
         tmp_path = Path(tmp)
         source = tmp_path / "large.fasta.gz"
         source.write_bytes(b"x" * 2048)
+        require(not installer.alignment_source_deferred(source), "default installer must not defer large alignment sources")
         old_limit = installer.os.environ.get("GENOLIGAND_ALIGNMENT_DB_MAX_SOURCE_BYTES")
         installer.os.environ["GENOLIGAND_ALIGNMENT_DB_MAX_SOURCE_BYTES"] = "1024"
         try:
-            require(installer.alignment_source_deferred(source), "oversized alignment source must be deferred by the installer")
+            require(installer.alignment_source_deferred(source), "explicit emergency cap may defer oversized alignment sources")
         finally:
             if old_limit is None:
                 installer.os.environ.pop("GENOLIGAND_ALIGNMENT_DB_MAX_SOURCE_BYTES", None)
@@ -192,11 +258,12 @@ def main() -> int:
                 "environment": "D:/hidden/launch_environment.json",
             },
             "debug": {"stdout": "raw"},
-            "alignment_databases": {"status": "ready", "ready": 2, "deferred": 1, "total": 3},
+            "alignment_databases": {"status": "needs_repair", "ready": 2, "deferred": 1, "total": 3},
         }
     )
     text = str(summary)
     require(summary["alignment_databases"]["deferred"] == 1, "install summary must report deferred large alignment sources")
+    require(not summary["alignment_databases"]["completed"], "deferred alignment sources must keep install summary incomplete")
     for forbidden in [
         "source_file_manifest",
         "hash_manifest",

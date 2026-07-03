@@ -3,6 +3,7 @@ from __future__ import annotations
 import re
 import sys
 import tempfile
+import time
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -60,6 +61,10 @@ def main() -> int:
     require("ligand_with_vina_pose_coordinates" in md_worker, "complex MD must map Vina pose coordinates onto the RDKit ligand topology")
     require("docking_ligand.pdbqt" in md_worker and "docking_pose.pdbqt" in md_worker, "complex MD must use Vina PDBQT coordinates for ligand placement")
     require("Chem.RemoveHs" in md_worker and "Chem.AddHs" in md_worker, "complex MD must rebuild hydrogens after docking pose placement")
+    require("GpuTelemetryMonitor" in md_worker, "CUDA MD must poll nvidia-smi while OpenMM production steps are running")
+    require("production_poll_" in md_worker, "CUDA MD telemetry must label production-time GPU samples")
+    require("md_state.tsv" in md_worker, "OpenMM MD must write state data comparable to StateDataReporter output")
+    require("temperature_estimate_K" in md_worker, "OpenMM MD state artifact must include temperature evidence")
     require("canonical_smiles" in science and "Chem.MolFromSmiles" in science, "BindingDB onsite matching must use canonical SMILES when RDKit is available")
     require("temp_python_script_path" in science, "onsite Python scripts must run from a script file to avoid Windows cmd quoting loss")
     require('command.push("-c"' not in science, "onsite Python scripts must not pass multiline code through python -c")
@@ -76,10 +81,12 @@ def main() -> int:
     require('"easy-search"' not in alignment_worker, "alignment worker must use persistent MMseqs2/Foldseek databases instead of per-run easy-search target indexing")
     require("mmseqs_target_databases" in alignment_worker, "MMseqs2 worker must discover persistent target databases")
     require("foldseek_target_database" in alignment_worker, "Foldseek worker must discover persistent target database")
+    require('"-a"' in alignment_worker, "Foldseek search must request alignment backtrace for convertalis structure scores")
     require("当前运行没有可展示的候选假设" in science, "report must preserve empty-result language")
     forbidden_report_claims = ["已确认靶点", "确认靶点", "已确认机制", "确认机制", "真实亲和力", "真实靶点"]
     for term in forbidden_report_claims:
         require(term not in science and term not in server, f"confirmed biological claim is not allowed: {term}")
+    require("受限 receptor" not in science and "受限 receptor" not in server, "MD report/API must not describe current complex MD as an old restricted receptor model")
 
     from genoligand_workers import md_summary_worker
 
@@ -134,6 +141,76 @@ def main() -> int:
         not md_summary_worker.summarize_gpu_telemetry("CUDA", weak)["gpu_observed"],
         "CUDA MD evidence must not accept unrelated utilization without process or memory evidence",
     )
+    no_production = md_summary_worker.GpuTelemetry(
+        rows=[
+            {
+                "sample_label": "after_openmm_context",
+                "gpu_index": "0",
+                "utilization_gpu_percent": "5",
+                "memory_used_mb": "1200",
+                "current_pid_observed": "true",
+            },
+        ],
+        available=True,
+    )
+    require(
+        not md_summary_worker.summarize_gpu_telemetry("CUDA", no_production)["gpu_observed"],
+        "CUDA MD evidence must require production-time GPU samples",
+    )
+    strong = md_summary_worker.GpuTelemetry(
+        rows=[
+            {
+                "sample_label": "baseline_before_openmm_context",
+                "gpu_index": "0",
+                "utilization_gpu_percent": "0",
+                "memory_used_mb": "1000",
+                "current_pid_observed": "false",
+            },
+            {
+                "sample_label": "production_poll_1",
+                "gpu_index": "0",
+                "utilization_gpu_percent": "35",
+                "memory_used_mb": "1130",
+                "current_pid_observed": "false",
+            },
+        ],
+        available=True,
+    )
+    strong_status = md_summary_worker.summarize_gpu_telemetry("CUDA", strong)
+    require(strong_status["gpu_observed"], "CUDA MD evidence must accept production-time memory and utilization proof")
+    require(strong_status["production_sample_count"] == 1, "CUDA MD status must count production-time GPU samples")
+    require(strong_status["observation_basis"] == "memory_delta_and_utilization", "CUDA MD status must state the evidence basis")
+
+    original_sample = md_summary_worker.sample_gpu_telemetry
+    try:
+        monitored = md_summary_worker.GpuTelemetry(rows=[])
+
+        def fake_sample(telemetry, label):
+            telemetry.available = True
+            telemetry.rows.append(
+                {
+                    "sample_label": label,
+                    "gpu_index": "0",
+                    "utilization_gpu_percent": "18",
+                    "memory_used_mb": "1200",
+                    "current_pid_observed": "true",
+                }
+            )
+
+        md_summary_worker.sample_gpu_telemetry = fake_sample
+        with md_summary_worker.GpuTelemetryMonitor(
+            monitored,
+            enabled=True,
+            label_prefix="production_poll",
+            interval_seconds=0.01,
+        ):
+            time.sleep(0.03)
+        require(
+            any(row.get("sample_label", "").startswith("production_poll_") for row in monitored.rows),
+            "CUDA telemetry monitor must capture production polling samples",
+        )
+    finally:
+        md_summary_worker.sample_gpu_telemetry = original_sample
 
     print("authenticity_contracts\tPASS")
     return 0

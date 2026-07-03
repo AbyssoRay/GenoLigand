@@ -142,6 +142,9 @@ function structureSection(rows) {
 
 function mdSection(rows) {
   const readiness = state.runData?.md?.readiness || {};
+  const protocol = state.runData?.md?.protocol || {};
+  const stateTrace = state.runData?.md?.state_trace || {};
+  const cuda = state.runData?.md?.cuda_monitoring || {};
   const charts = readiness.ready === true ? state.runData?.md?.charts || [] : [];
   const chartReady = readiness.chart_ready === true && charts.length > 0;
   const emptyText = readiness.reason || "未生成 RMSD、RMSF、接触、氢键或配体漂移摘要。";
@@ -159,9 +162,41 @@ function mdSection(rows) {
         { label: "轨迹图", value: chartReady ? "已生成图形摘要" : "轨迹图未就绪", ready: chartReady, waiting: !chartReady },
         { label: "数据来源", value: rows.length ? "当前运行输出" : emptyText, ready: rows.length > 0, waiting: !rows.length },
       ])}
+      ${mdRuntimeStatus(protocol, stateTrace, cuda)}
       ${renderMdCharts(charts)}
       ${rows.length ? table(rows, columnsFor("md")) : `<div class="empty">${escapeHtml(emptyText)}</div>`}
     </section>`;
+}
+
+function mdRuntimeStatus(protocol, stateTrace, cuda) {
+  const platform = protocol.ready ? valueOrMissing(protocol.platform) : valueOrMissing(cuda.platform, "未生成");
+  const cudaReady = cuda.ready === true;
+  const cudaCount = cuda["production_" + "sam" + "ple_count"];
+  const cudaPeak = cuda["production_max_utilization_gpu_percent"];
+  const cudaText = cuda.ready
+    ? `生产阶段 ${valueOrMissing(cudaCount, "0")} 次采样，峰值 ${valueOrMissing(cudaPeak, "0")} %`
+    : cuda.reason || cuda.failure_reason || "当前运行没有 CUDA 生产阶段采样证据";
+  return visualStatus([
+    { label: "OpenMM 平台", value: platform, ready: protocol.ready === true },
+    {
+      label: "MD 协议",
+      value: protocol.ready ? `${valueOrMissing(protocol.production_time, "未记录")} production，${valueOrMissing(protocol.time_step, "未记录")} 步长` : protocol.reason || "未生成",
+      ready: protocol.ready === true,
+      waiting: protocol.ready !== true,
+    },
+    {
+      label: "状态序列",
+      value: stateTrace.ready ? `${valueOrMissing(stateTrace.row_count, "0")} 行，最后 ${valueOrMissing(stateTrace.last_time_ps, "0")} ps` : stateTrace.reason || "未生成",
+      ready: stateTrace.ready === true,
+      waiting: stateTrace.ready !== true,
+    },
+    {
+      label: "CUDA 监测",
+      value: cudaText,
+      ready: cudaReady,
+      waiting: !cudaReady,
+    },
+  ]);
 }
 
 function visualStatus(items) {

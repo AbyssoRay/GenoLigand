@@ -283,7 +283,7 @@ fn pipeline_uses_one_temporary_query_row_then_test_removes_it() {
     assert!(source_map.contains("docking_summary.tsv\t"));
     assert!(source_map.contains("md_summary.tsv\t"));
     assert!(source_map.contains("docking_summary.tsv\tschema-bound docking output when present;otherwise no generated rows\ttool_outputs/docking_manifest.json;tool_outputs/docking_pose.sdf;evidence_ledger.tsv\tno_rows"));
-    assert!(source_map.contains("md_summary.tsv\ttool_outputs/docking_pose.sdf;tool_outputs/md_run_manifest.json;tool_outputs/md_protocol.tsv;tool_outputs/gpu_telemetry_status.tsv;tool_outputs/md_summary.tsv;tool_outputs/md_rmsd.tsv;tool_outputs/md_rmsf.tsv;tool_outputs/md_ligand_drift.tsv;tool_outputs/md_contacts.tsv;tool_outputs/md_hbonds.tsv\ttarget_candidate_ranking.tsv;evidence_ledger.tsv\tno_rows"));
+    assert!(source_map.contains("md_summary.tsv\ttool_outputs/docking_pose.sdf;tool_outputs/md_run_manifest.json;tool_outputs/md_protocol.tsv;tool_outputs/md_state.tsv;tool_outputs/gpu_telemetry_status.tsv;tool_outputs/md_summary.tsv;tool_outputs/md_rmsd.tsv;tool_outputs/md_rmsf.tsv;tool_outputs/md_ligand_drift.tsv;tool_outputs/md_contacts.tsv;tool_outputs/md_hbonds.tsv\ttarget_candidate_ranking.tsv;evidence_ledger.tsv\tno_rows"));
     assert!(source_map.contains("tool_outputs/md_summary.tsv\tschema-bound MD summary worker output\tmd_summary.tsv\tnot_yet_written"));
     assert!(evidence.contains("structure_interaction_matches"));
     assert!(evidence.contains("scientific_runtime_summary"));
@@ -594,6 +594,47 @@ fn database_matching_requires_computed_feature_tokens() {
         read_text(&run.join("known_database_matches.tsv")).expect("known matches");
     assert!(!without_features.contains("CHEMBL_T1"));
 
+    fs::remove_dir_all(&root).expect("cleanup temp root");
+    assert!(!root.exists());
+}
+
+#[test]
+fn metagenome_matching_uses_mmseqs_output_when_persistent_database_is_configured() {
+    let root = temp_root("metagenome_requires_mmseqs_output");
+    let store = root.join("science_store");
+    let run = root.join("run");
+    let input = root.join("input.json");
+    write_text(
+        &store.join("indexes/metagenome_targets.tsv"),
+        "source\ttarget_id\ttarget_name\torganism\ttarget_class\tligand_tokens\tsequence_tokens\tstructure_tokens\tevidence\nmetagenome\tMG_FAKE\tTSV fallback row\tunknown\tpotential_metagenome_sequence\t\tikvav\t\tfasta_sequence_rows\n",
+    )
+    .expect("metagenome index");
+    ensure_dir(&store.join("indexes/mmseqs")).expect("mmseqs dir");
+    write_text(
+        &store.join("indexes/mmseqs/mmseqs_target_databases.tsv"),
+        "source_id\tsource_path\tdb_path\tstatus\tnotes\nmetagenome\tdownloads/metagenome/mgy.fa.gz\tindexes/mmseqs/metagenome/target\tready\talready_available\n",
+    )
+    .expect("mmseqs manifest");
+    write_text(
+        &input,
+        "{\"inputs\":[{\"field\":\"peptide\",\"value\":\"IKVAV\"}],\"files\":[]}\n",
+    )
+    .expect("input");
+    let options = ScienceOptions {
+        workspace_root: root.clone(),
+        science_store: store,
+        input_manifest: input,
+        run_dir: run.clone(),
+    };
+
+    run_science_command(ScienceCommand::InputNormalize, &options).expect("normalize");
+    run_science_command(ScienceCommand::FeaturesCompute, &options).expect("features");
+    run_science_command(ScienceCommand::MetagenomeMatchPotential, &options).expect("metagenome");
+    let matches =
+        read_text(&run.join("metagenome_potential_matches.tsv")).expect("metagenome matches");
+
+    assert!(!matches.contains("MG_FAKE"));
+    assert_eq!(matches.lines().count(), 1);
     fs::remove_dir_all(&root).expect("cleanup temp root");
     assert!(!root.exists());
 }
@@ -1464,6 +1505,76 @@ fn pipeline_blocks_when_store_lacks_install_closure() {
 }
 
 #[test]
+fn pipeline_blocks_when_alignment_database_manifest_is_deferred() {
+    let root = temp_root("deferred_alignment_manifest");
+    let store = root.join("science_store");
+    ensure_dir(&store.join("indexes/mmseqs")).expect("mmseqs dir");
+    ensure_dir(&store.join("indexes/foldseek")).expect("foldseek dir");
+    write_text(
+            &store.join("science_store_manifest.tsv"),
+            "item\tstatus\tpath\nwarehouse\tready\tindexes/known_targets.tsv\nmetagenome_index\tready\tindexes/metagenome_targets.tsv\nstructure_index\tready\tindexes/structure_targets.tsv\ntool_versions\tready\tindexes/tool_versions.tsv\n",
+        )
+        .expect("manifest");
+    write_text(
+        &store.join("indexes/tool_versions.tsv"),
+        &unit_test_tool_versions_text(),
+    )
+    .expect("tools");
+    for rel in [
+        "indexes/known_targets.tsv",
+        "indexes/metagenome_targets.tsv",
+        "indexes/structure_targets.tsv",
+    ] {
+        write_text(
+            &store.join(rel),
+            "source\ttarget_id\ttarget_name\torganism\ttarget_class\tligand_tokens\tsequence_tokens\tstructure_tokens\tevidence\n",
+        )
+        .expect("index");
+    }
+    write_text(
+        &store.join("install_status.json"),
+        r#"{"status":"ready","missing_components":[]}"#,
+    )
+    .expect("install status");
+    write_text(
+        &store.join("source_requirements.tsv"),
+        "source_id\tstatus\nchembl\tready\nmetagenome\tready\nstructure_interaction\tready\n",
+    )
+    .expect("sources");
+    write_text(
+        &store.join("indexes/mmseqs/mmseqs_target_databases.tsv"),
+        "source_id\tsource_path\tdb_path\tstatus\tnotes\nmetagenome\tdownloads/metagenome/mgy.fa.gz\tindexes/mmseqs/metagenome/target\tdeferred_large_source\tsource_exceeds_sync_index_threshold\n",
+    )
+    .expect("mmseqs manifest");
+    write_text(
+        &store.join("indexes/foldseek/foldseek_target_databases.tsv"),
+        "source_id\tsource_path\tdb_path\tstatus\tnotes\nrcsb_mmcif\tdownloads/rcsb/mmcif\tindexes/foldseek/rcsb_mmcif/target\tready\talready_available\n",
+    )
+    .expect("foldseek manifest");
+    let input = root.join("input.json");
+    let run = root.join("run");
+    write_text(
+        &input,
+        "{\"inputs\":[{\"field\":\"small_molecule\",\"value\":\"CCO\"}],\"files\":[]}\n",
+    )
+    .expect("input");
+    let options = ScienceOptions {
+        workspace_root: root.clone(),
+        science_store: store,
+        input_manifest: input,
+        run_dir: run.clone(),
+    };
+
+    let out = run_science_command(ScienceCommand::PipelineRun, &options).expect("blocked ok");
+    let failure = read_text(&run.join("failure_reason.txt")).expect("failure");
+
+    assert!(out.contains("pipeline_blocked"));
+    assert!(failure.contains("alignment_database_needs_repair"));
+    fs::remove_dir_all(&root).expect("cleanup temp root");
+    assert!(!root.exists());
+}
+
+#[test]
 fn prepare_science_store_builds_indexes_from_existing_source_files() {
     let root = temp_root("build_indexes");
     let store = root.join("science_store");
@@ -1539,6 +1650,19 @@ fn prepare_science_store_builds_metagenome_index_from_nested_mgnify_fasta() {
         read_text(&store.join("index_build_manifest.tsv")).expect("build manifest");
     assert!(metagenome.contains("MGYP000001"));
     assert!(build_manifest.contains("mgy_clusters.fa.gz"));
+    fs::remove_dir_all(&root).expect("cleanup temp root");
+    assert!(!root.exists());
+}
+
+#[test]
+fn large_metagenome_fasta_is_reserved_for_persistent_alignment_database() {
+    let root = temp_root("large_metagenome_alignment_db");
+    let path = root.join("downloads/metagenome/mgnify/mgy_clusters.fa.gz");
+    ensure_dir(path.parent().expect("parent")).expect("parent dir");
+    write_text(&path, ">MGY\nMSEQNNTEMTFQIQRIYTKDISFEAPNAPHVFQKDW\n").expect("fasta");
+
+    assert!(!metagenome_fasta_requires_alignment_database(&path, 10_000));
+    assert!(metagenome_fasta_requires_alignment_database(&path, 10));
     fs::remove_dir_all(&root).expect("cleanup temp root");
     assert!(!root.exists());
 }
