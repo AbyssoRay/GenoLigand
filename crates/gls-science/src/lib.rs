@@ -27,6 +27,25 @@ const METAGENOME_SCORE_WEIGHT: f64 = 0.25;
 const STRUCTURE_SCORE_WEIGHT: f64 = 0.10;
 const DOCKING_SCORE_WEIGHT: f64 = 0.05;
 const MD_SCORE_WEIGHT: f64 = 0.10;
+const AUTHENTICITY_FORBIDDEN_MARKERS: &[(&str, &str)] = &[
+    ("unit_test_fixture", "unit test fixture row"),
+    ("unit-test-fixture", "unit test fixture row"),
+    ("unit_test_store_fixture", "unit test fixture row"),
+    ("test_only", "test-only source row"),
+    ("test-only", "test-only source row"),
+    ("fixture", "fixture source row"),
+    ("smoke", "smoke output row"),
+    ("sample_output", "sample output row"),
+    ("sample_data", "sample data row"),
+    ("synthetic_placeholder", "synthetic placeholder row"),
+    ("placeholder_row", "synthetic placeholder row"),
+    ("static_fallback_candidate", "static fallback row"),
+    ("static_fallback", "static fallback row"),
+    ("static fallback", "static fallback row"),
+    ("demodb", "demo source row"),
+    ("demo_data", "demo source row"),
+    ("demo/sample", "demo source row"),
+];
 
 #[derive(Clone, Debug)]
 pub struct ScienceOptions {
@@ -2677,26 +2696,30 @@ fn match_known(options: &ScienceOptions) -> Result<String, String> {
         "known_database_index",
     )?;
     let mut out = String::from(
-        "input_id\tsource\ttarget_id\ttarget_name\torganism\ttarget_class\tmatch_score\tmatched_features\tevidence\n",
+        "input_id\tsource\ttarget_id\ttarget_name\torganism\ttarget_class\tmatch_score\tmatched_features\tevidence\tsource_row_provenance\tactivity_value\tligand_identity\tcurrent_run_query_id\n",
     );
     for input in &inputs {
         for row in &rows {
             let score = known_database_match_score(input, row);
             if score > 0.0 {
+                let matched = matched_tokens(input, row).join(" ");
                 out.push_str(&format!(
-                    "{}\t{}\t{}\t{}\t{}\t{}\t{score:.4}\t{}\t{}\n",
+                    "{}\t{}\t{}\t{}\t{}\t{}\t{score:.4}\t{}\t{}\t{}\t\t{}\tprojection_index_match\n",
                     input.input_id,
                     row.source,
                     row.target_id,
                     clean_cell(&row.target_name),
                     clean_cell(&row.organism),
                     row.target_class,
-                    matched_tokens(input, row).join(" "),
-                    clean_cell(&row.evidence)
+                    clean_cell(&matched),
+                    clean_cell(&row.evidence),
+                    clean_cell(&row.evidence),
+                    clean_cell(&matched)
                 ));
             }
         }
     }
+    append_chembl_onsite_matches(options, &normalized, &mut out)?;
     append_bindingdb_onsite_matches(options, &normalized, &mut out)?;
     write_text(&options.run_dir.join("known_database_matches.tsv"), &out)?;
     Ok(format!(
@@ -2712,6 +2735,251 @@ fn known_database_match_score(input: &ComputedFeatureInput, row: &StoreRow) -> f
     } else {
         score
     }
+}
+
+fn append_chembl_onsite_matches(
+    options: &ScienceOptions,
+    inputs: &[NormalizedInput],
+    out: &mut String,
+) -> Result<(), String> {
+    let small_molecules = inputs
+        .iter()
+        .filter(|input| input.kind == InputKind::SmallMolecule)
+        .collect::<Vec<_>>();
+    if small_molecules.is_empty() {
+        return Ok(());
+    }
+    let sources = discover_chembl_sqlite_sources(&options.science_store.join("downloads/chembl"))?;
+    if sources.is_empty() {
+        return Ok(());
+    }
+    ensure_dir(&options.run_dir)?;
+    let query_path = options.run_dir.join("chembl_onsite_queries.tsv");
+    let mut queries = String::from("input_id\tquery\n");
+    for input in small_molecules {
+        queries.push_str(&format!(
+            "{}\t{}\n",
+            clean_cell(&input.input_id),
+            encode_tsv_cell(&input.primary_value)
+        ));
+    }
+    write_text(&query_path, &queries)?;
+    for source in sources {
+        let matches = run_python_script(
+            chembl_onsite_query_script(),
+            &[
+                source.display().to_string(),
+                query_path.display().to_string(),
+                "200".to_string(),
+            ],
+            "chembl_onsite_query",
+        )?;
+        for line in matches.lines().filter(|line| !line.trim().is_empty()) {
+            out.push_str(line);
+            out.push('\n');
+        }
+    }
+    Ok(())
+}
+
+fn chembl_onsite_query_script() -> &'static str {
+    r#"
+import csv
+import os
+import sqlite3
+import sys
+import tarfile
+import tempfile
+
+source_path, query_path, max_rows = sys.argv[1], sys.argv[2], int(sys.argv[3])
+
+def clean(value):
+    return str(value or "").replace("\t", " ").replace("\r", " ").replace("\n", " ").strip()
+
+def decode(value):
+    text = str(value or "")
+    out = []
+    index = 0
+    while index < len(text):
+        ch = text[index]
+        if ch != "\\" or index + 1 >= len(text):
+            out.append(ch)
+            index += 1
+            continue
+        nxt = text[index + 1]
+        if nxt == "t":
+            out.append("\t")
+        elif nxt == "n":
+            out.append("\n")
+        elif nxt == "r":
+            out.append("\r")
+        elif nxt == "\\":
+            out.append("\\")
+        else:
+            out.append(nxt)
+        index += 2
+    return "".join(out)
+
+try:
+    from rdkit import Chem
+except Exception:
+    Chem = None
+
+canonical_cache = {}
+
+def canonical_smiles(value):
+    text = clean(value)
+    if not text:
+        return ""
+    if text in canonical_cache:
+        return canonical_cache[text]
+    if Chem is None:
+        canonical_cache[text] = "".join(text.split())
+        return canonical_cache[text]
+    mol = Chem.MolFromSmiles(text)
+    if mol is None:
+        canonical_cache[text] = "".join(text.split())
+    else:
+        canonical_cache[text] = Chem.MolToSmiles(mol, isomericSmiles=False)
+    return canonical_cache[text]
+
+def target_class(organism):
+    low = organism.lower()
+    if "homo sapiens" in low or "human" in low:
+        return "known_human_protein"
+    return "known_protein"
+
+def numeric_activity(value):
+    text = clean(value).replace(",", "")
+    try:
+        return float(text) if text else float("inf")
+    except ValueError:
+        return float("inf")
+
+def activity_score(value):
+    numeric = numeric_activity(value)
+    if numeric == float("inf"):
+        return 0.65
+    if numeric <= 10:
+        return 1.0
+    if numeric <= 100:
+        return 0.95
+    if numeric <= 1000:
+        return 0.85
+    if numeric <= 10000:
+        return 0.70
+    if numeric <= 100000:
+        return 0.55
+    return 0.40
+
+def format_activity_number(value):
+    text = clean(value)
+    try:
+        numeric = float(text)
+    except ValueError:
+        return text
+    if numeric.is_integer():
+        return str(int(numeric))
+    return text
+
+queries = []
+with open(query_path, "r", encoding="utf-8-sig", newline="") as handle:
+    for row in csv.DictReader(handle, delimiter="\t"):
+        query = decode(row.get("query", "")).strip()
+        canonical = canonical_smiles(query)
+        if query and canonical:
+            queries.append((clean(row.get("input_id", "input_1")) or "input_1", canonical))
+
+if not queries:
+    raise SystemExit(0)
+
+query_by_smiles = {}
+for input_id, canonical in queries:
+    query_by_smiles.setdefault(canonical, []).append(input_id)
+
+def sqlite_path_from_source(path):
+    lower = path.lower()
+    if not lower.endswith(".tar.gz"):
+        return path, None
+    tmp = tempfile.TemporaryDirectory(prefix="genoligand_chembl_onsite_")
+    with tarfile.open(path, "r:gz") as archive:
+        for member in archive.getmembers():
+            name = member.name.lower()
+            if member.isfile() and (name.endswith(".db") or name.endswith(".sqlite") or name.endswith(".sqlite3")):
+                extracted = archive.extractfile(member)
+                if extracted is None:
+                    continue
+                db_path = os.path.join(tmp.name, os.path.basename(member.name))
+                with open(db_path, "wb") as handle:
+                    handle.write(extracted.read())
+                return db_path, tmp
+    tmp.cleanup()
+    return "", None
+
+db_path, tmp_dir = sqlite_path_from_source(source_path)
+if not db_path:
+    raise SystemExit(0)
+
+placeholders = ",".join("?" for _ in query_by_smiles)
+sql = f"""
+SELECT
+    t.chembl_id AS target_id,
+    COALESCE(t.pref_name, t.chembl_id) AS target_name,
+    COALESCE(t.organism, '') AS organism,
+    COALESCE(cs.canonical_smiles, '') AS canonical_smiles,
+    COALESCE(md.pref_name, '') AS compound_name,
+    COALESCE(act.standard_type, '') AS standard_type,
+    COALESCE(act.standard_relation, '') AS standard_relation,
+    COALESCE(CAST(act.standard_value AS TEXT), '') AS standard_value,
+    COALESCE(act.standard_units, '') AS standard_units
+FROM activities act
+JOIN assays a ON act.assay_id = a.assay_id
+JOIN target_dictionary t ON a.tid = t.tid
+LEFT JOIN molecule_dictionary md ON act.molregno = md.molregno
+LEFT JOIN compound_structures cs ON act.molregno = cs.molregno
+WHERE act.standard_type IN ('Ki', 'Kd', 'IC50', 'EC50')
+  AND act.standard_value IS NOT NULL
+  AND (act.standard_units IS NULL OR act.standard_units = '' OR act.standard_units = 'nM')
+  AND cs.canonical_smiles IN ({placeholders})
+"""
+
+try:
+    connection = sqlite3.connect(db_path)
+    writer = csv.writer(sys.stdout, delimiter="\t", lineterminator="\n")
+    best = {}
+    for row in connection.execute(sql, list(query_by_smiles.keys())):
+        target_id, target_name, organism, smiles, compound_name, standard_type, relation, value, units = [clean(item) for item in row]
+        if not target_id or not smiles:
+            continue
+        activity = f"{standard_type}={format_activity_number(value)} {units}".strip()
+        matched = f"canonical_smiles={smiles};compound_name={compound_name}"
+        evidence = f"chembl_onsite_activity_row;{activity};relation={relation};compound_name={compound_name}"
+        for input_id in query_by_smiles.get(smiles, []):
+            out_row = [
+                input_id,
+                "ChEMBL",
+                target_id,
+                target_name or target_id,
+                organism or "unknown",
+                target_class(organism),
+                f"{activity_score(value):.4f}",
+                matched,
+                evidence,
+                "chembl_onsite_activity_row",
+                activity,
+                matched,
+                "current_run_onsite_query",
+            ]
+            key = (input_id, target_id)
+            rank = (numeric_activity(value), target_name.lower(), organism.lower())
+            if key not in best or rank < best[key][0]:
+                best[key] = (rank, out_row)
+    for _, out_row in sorted(best.values(), key=lambda item: item[0])[:max_rows]:
+        writer.writerow(out_row)
+finally:
+    if tmp_dir is not None:
+        tmp_dir.cleanup()
+"#
 }
 
 fn append_bindingdb_onsite_matches(
@@ -2953,7 +3221,9 @@ with zipfile.ZipFile(zip_path) as archive:
                 activity_type = next((name for name in ["Ki (nM)", "IC50 (nM)", "Kd (nM)", "EC50 (nM)"] if clean(row.get(name, ""))), "activity")
                 pubchem = first(row, ["PubChem CID"])
                 matched = f"ligand_name={ligand_name};ligand_smiles={smiles};ligand_code={ligand_code};pdb_ids={ligand_complex_pdb_ids};target_chain_pdb_ids={target_chain_pdb_ids}"
-                evidence = f"bindingdb_onsite_activity_row;{activity_type}={activity};ligand_code={ligand_code};pdb_ids={ligand_complex_pdb_ids};target_chain_pdb_ids={target_chain_pdb_ids};pubchem_cid={pubchem}"
+                activity_value = f"{activity_type}={activity}".strip()
+                ligand_identity = f"ligand_smiles={smiles};ligand_name={ligand_name};ligand_code={ligand_code}"
+                evidence = f"bindingdb_onsite_activity_row;{activity_value};ligand_code={ligand_code};pdb_ids={ligand_complex_pdb_ids};target_chain_pdb_ids={target_chain_pdb_ids};pubchem_cid={pubchem}"
                 out_row = [
                     input_id,
                     "BindingDB",
@@ -2964,6 +3234,10 @@ with zipfile.ZipFile(zip_path) as archive:
                     f"{activity_score(activity):.4f}",
                     clean(matched),
                     clean(evidence),
+                    "bindingdb_onsite_activity_row",
+                    clean(activity_value),
+                    clean(ligand_identity),
+                    "current_run_onsite_query",
                 ]
                 key = (input_id, target_id)
                 rank = (numeric_activity(activity), target_name.lower(), organism.lower())
@@ -2985,14 +3259,14 @@ fn match_metagenome(options: &ScienceOptions) -> Result<String, String> {
         )?
     };
     let mut out = String::from(
-        "input_id\tsource\ttarget_id\ttarget_name\torganism\ttarget_class\tmatch_score\tmatched_features\tevidence\n",
+        "input_id\tsource\ttarget_id\ttarget_name\torganism\ttarget_class\tmatch_score\tmatched_features\tevidence\tsource_database_id\tcurrent_run_query_id\n",
     );
     for input in &inputs {
         for row in &rows {
             let score = score_row(input, row);
             if score > 0.0 {
                 out.push_str(&format!(
-                    "{}\t{}\t{}\t{}\t{}\t{}\t{score:.4}\t{}\t{}\n",
+                    "{}\t{}\t{}\t{}\t{}\t{}\t{score:.4}\t{}\t{}\t{}\t{}\n",
                     input.input_id,
                     row.source,
                     row.target_id,
@@ -3000,7 +3274,9 @@ fn match_metagenome(options: &ScienceOptions) -> Result<String, String> {
                     clean_cell(&row.organism),
                     row.target_class,
                     matched_tokens(input, row).join(" "),
-                    clean_cell(&row.evidence)
+                    clean_cell(&row.evidence),
+                    clean_cell(&row.source),
+                    clean_cell(&input.input_id)
                 ));
             }
         }
@@ -3092,7 +3368,7 @@ fn evaluate_structure(options: &ScienceOptions) -> Result<String, String> {
 fn write_empty_structure_interaction_matches(options: &ScienceOptions) -> Result<(), String> {
     write_text(
         &options.run_dir.join("structure_interaction_matches.tsv"),
-        "input_id\tsource\ttarget_id\ttarget_name\torganism\ttarget_class\tmatch_score\tmatched_features\tevidence\n",
+        "input_id\tsource\ttarget_id\ttarget_name\torganism\ttarget_class\tmatch_score\tmatched_features\tevidence\tsource_database_id\tcurrent_run_query_id\n",
     )
 }
 
@@ -3106,16 +3382,62 @@ fn append_tool_match_rows(
         return Ok(0);
     }
     let text = read_text(&path)?;
+    let mut lines = text.lines();
+    let Some(header) = lines.next() else {
+        return Ok(0);
+    };
+    let headers = split_tsv(header);
+    let source_db_idx = find_header(
+        &headers,
+        &["source_database_id", "source_db", "database_id"],
+    );
+    let query_idx = find_header(&headers, &["current_run_query_id", "query_id"]);
     let mut count = 0usize;
-    for line in text.lines().skip(1).filter(|line| !line.trim().is_empty()) {
-        if split_tsv(line).len() < 9 {
+    for line in lines.filter(|line| !line.trim().is_empty()) {
+        let cols = split_tsv(line);
+        if cols.len() < 9 {
             continue;
         }
-        out.push_str(line);
-        out.push('\n');
+        let evidence = cols[8].clone();
+        let source_database_id = first_nonempty(&[
+            cell(&cols, source_db_idx),
+            evidence_field(&evidence, &["source_db", "source_id", "database_id"]),
+            cols[1].clone(),
+        ]);
+        let current_run_query_id = first_nonempty(&[
+            cell(&cols, query_idx),
+            evidence_field(&evidence, &["query_id", "current_run_query_id"]),
+            cols[0].clone(),
+        ]);
+        out.push_str(&format!(
+            "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\n",
+            clean_cell(&cols[0]),
+            clean_cell(&cols[1]),
+            clean_cell(&cols[2]),
+            clean_cell(&cols[3]),
+            clean_cell(&cols[4]),
+            clean_cell(&cols[5]),
+            clean_cell(&cols[6]),
+            clean_cell(&cols[7]),
+            clean_cell(&cols[8]),
+            clean_cell(&source_database_id),
+            clean_cell(&current_run_query_id)
+        ));
         count += 1;
     }
     Ok(count)
+}
+
+fn evidence_field(evidence: &str, keys: &[&str]) -> String {
+    for part in evidence.split(';').map(str::trim) {
+        let Some((key, value)) = part.split_once('=') else {
+            continue;
+        };
+        if keys.iter().any(|candidate| key.trim() == *candidate) {
+            return value.trim().to_string();
+        }
+    }
+    String::new()
 }
 
 fn append_tool_match_rows_to_file(
@@ -3126,7 +3448,7 @@ fn append_tool_match_rows_to_file(
     let mut text = if target_path.exists() {
         read_text(target_path)?
     } else {
-        "input_id\tsource\ttarget_id\ttarget_name\torganism\ttarget_class\tmatch_score\tmatched_features\tevidence\n".to_string()
+        "input_id\tsource\ttarget_id\ttarget_name\torganism\ttarget_class\tmatch_score\tmatched_features\tevidence\tsource_database_id\tcurrent_run_query_id\n".to_string()
     };
     let count = append_tool_match_rows(options, tool_output_name, &mut text)?;
     write_text(target_path, &text)?;
@@ -4280,7 +4602,102 @@ fn copy_tool_output_or_header(
     Ok(false)
 }
 
+struct AuthenticityViolation {
+    artifact: String,
+    line_number: usize,
+    marker: &'static str,
+    reason: &'static str,
+}
+
+fn ensure_final_artifacts_authentic(
+    options: &ScienceOptions,
+    artifacts: &[&str],
+) -> Result<(), String> {
+    let violations = final_artifact_authenticity_violations(options, artifacts)?;
+    write_authenticity_gate_report(options, &violations)?;
+    if violations.is_empty() {
+        return Ok(());
+    }
+    Err(format!(
+        "authenticity_gate_failed:forbidden_final_artifact_rows={}",
+        violations.len()
+    ))
+}
+
+fn final_artifact_authenticity_violations(
+    options: &ScienceOptions,
+    artifacts: &[&str],
+) -> Result<Vec<AuthenticityViolation>, String> {
+    let mut violations = Vec::new();
+    for artifact in artifacts {
+        let path = options.run_dir.join(artifact);
+        if !path.exists() || !path.is_file() {
+            continue;
+        }
+        let text = read_text(&path)?;
+        let skip_header = artifact.ends_with(".tsv");
+        for (index, line) in text.lines().enumerate() {
+            if skip_header && index == 0 {
+                continue;
+            }
+            if line.trim().is_empty() {
+                continue;
+            }
+            if let Some((marker, reason)) = authenticity_marker(line) {
+                violations.push(AuthenticityViolation {
+                    artifact: (*artifact).to_string(),
+                    line_number: index + 1,
+                    marker,
+                    reason,
+                });
+            }
+        }
+    }
+    Ok(violations)
+}
+
+fn authenticity_marker(line: &str) -> Option<(&'static str, &'static str)> {
+    let lower = line.to_ascii_lowercase();
+    AUTHENTICITY_FORBIDDEN_MARKERS
+        .iter()
+        .copied()
+        .find(|(marker, _)| lower.contains(marker))
+}
+
+fn write_authenticity_gate_report(
+    options: &ScienceOptions,
+    violations: &[AuthenticityViolation],
+) -> Result<(), String> {
+    let mut text = String::from("artifact\tstatus\tline_number\tmarker\treason\n");
+    if violations.is_empty() {
+        text.push_str("final_run_artifacts\tpassed\t0\t\tno_forbidden_fixture_sample_smoke_static_fallback_demo_markers\n");
+    } else {
+        for violation in violations {
+            text.push_str(&format!(
+                "{}\tblocked\t{}\t{}\t{}\n",
+                clean_cell(&violation.artifact),
+                violation.line_number,
+                clean_cell(violation.marker),
+                clean_cell(violation.reason)
+            ));
+        }
+    }
+    write_text(&options.run_dir.join("authenticity_gate.tsv"), &text)
+}
+
 fn rank_targets(options: &ScienceOptions) -> Result<String, String> {
+    ensure_final_artifacts_authentic(
+        options,
+        &[
+            "known_database_matches.tsv",
+            "metagenome_potential_matches.tsv",
+            "structure_interaction_matches.tsv",
+            "tool_outputs/mmseqs_alignment_matches.tsv",
+            "tool_outputs/foldseek_structure_matches.tsv",
+            "docking_summary.tsv",
+            "md_summary.tsv",
+        ],
+    )?;
     let mut by_target = BTreeMap::<String, Candidate>::new();
     merge_match_file(
         &options.run_dir.join("known_database_matches.tsv"),
@@ -4359,6 +4776,7 @@ fn read_docking_scores(path: &Path) -> Result<BTreeMap<String, f64>, String> {
     if !path.exists() {
         return Ok(BTreeMap::new());
     }
+    let run_dir = path.parent().unwrap_or_else(|| Path::new(""));
     let text = read_text(path)?;
     let mut lines = text.lines();
     let Some(header) = lines.next() else {
@@ -4369,6 +4787,7 @@ fn read_docking_scores(path: &Path) -> Result<BTreeMap<String, f64>, String> {
     let status_idx = find_header(&headers, &["docking_status", "status"]);
     let score_idx = find_header(&headers, &["docking_score", "affinity", "binding_affinity"]);
     let engine_idx = find_header(&headers, &["docking_engine", "engine"]);
+    let notes_idx = find_header(&headers, &["notes", "pose", "artifact"]);
     let mut scores = BTreeMap::new();
     for line in lines {
         let cols = split_tsv(line);
@@ -4378,11 +4797,33 @@ fn read_docking_scores(path: &Path) -> Result<BTreeMap<String, f64>, String> {
         if candidate_id.is_empty() || status != "completed" || !engine.contains("vina") {
             continue;
         }
+        if !docking_pose_artifact_ready(run_dir, &cell(&cols, notes_idx)) {
+            continue;
+        }
         if let Some(score) = docking_score_from_affinity(&cell(&cols, score_idx)) {
             scores.insert(candidate_id, score);
         }
     }
     Ok(scores)
+}
+
+fn docking_pose_artifact_ready(run_dir: &Path, notes: &str) -> bool {
+    for key in ["pose", "pose_sdf", "docking_pose", "docking_pose_sdf"] {
+        let value = evidence_field(notes, &[key]);
+        if value.is_empty() {
+            continue;
+        }
+        let path = Path::new(&value);
+        let artifact = if path.is_absolute() {
+            path.to_path_buf()
+        } else {
+            run_dir.join(path)
+        };
+        if artifact.exists() && artifact.is_file() {
+            return true;
+        }
+    }
+    false
 }
 
 fn docking_score_from_affinity(value: &str) -> Option<f64> {
@@ -4432,7 +4873,9 @@ fn complex_md_candidate_ids(options: &ScienceOptions) -> Result<BTreeSet<String>
         }
         let value = serde_json::from_str::<Value>(read_text(&path)?.trim_start_matches('\u{feff}'))
             .map_err(|err| format!("md_manifest_parse_failed:{}:{err}", path.display()))?;
-        if !complex_md_manifest_value_ready(&value) {
+        if !complex_md_manifest_value_ready(&value)
+            || !complex_md_manifest_artifacts_ready(options, &value)
+        {
             continue;
         }
         if let Some(candidate_id) = value.get("candidate_id").and_then(Value::as_str)
@@ -4451,6 +4894,7 @@ fn complex_md_manifest_value_ready(value: &Value) -> bool {
         || !nonempty_json_string(value, "ligand_coordinate")
         || !nonempty_json_string(value, "trajectory")
         || !nonempty_json_string(value, "protocol_artifact")
+        || !nonempty_json_string(value, "state_artifact")
     {
         return false;
     }
@@ -4463,6 +4907,53 @@ fn complex_md_manifest_value_ready(value: &Value) -> bool {
             && nonempty_json_string(value, "gpu_telemetry_status_artifact");
     }
     true
+}
+
+fn complex_md_manifest_artifacts_ready(options: &ScienceOptions, value: &Value) -> bool {
+    for field in [
+        "receptor_coordinate",
+        "ligand_coordinate",
+        "trajectory",
+        "protocol_artifact",
+        "state_artifact",
+    ] {
+        if !manifest_file_exists(options, value, field) {
+            return false;
+        }
+    }
+    if value.get("platform").and_then(Value::as_str) == Some("CUDA") {
+        return manifest_file_exists(options, value, "gpu_telemetry_artifact")
+            && manifest_file_exists(options, value, "gpu_telemetry_status_artifact");
+    }
+    true
+}
+
+fn manifest_file_exists(options: &ScienceOptions, value: &Value, field: &str) -> bool {
+    value
+        .get(field)
+        .and_then(Value::as_str)
+        .map(|raw| {
+            manifest_path_candidates(options, raw)
+                .iter()
+                .any(|artifact| artifact.exists() && artifact.is_file())
+        })
+        .unwrap_or(false)
+}
+
+fn manifest_path_candidates(options: &ScienceOptions, raw: &str) -> Vec<PathBuf> {
+    let trimmed = raw.trim();
+    let path = Path::new(trimmed);
+    let mut candidates = vec![if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        options.run_dir.join(path)
+    }];
+    if let Some(windows_path) = wsl_path_to_windows(trimmed)
+        && !candidates.contains(&windows_path)
+    {
+        candidates.push(windows_path);
+    }
+    candidates
 }
 
 fn nonempty_json_string(value: &Value, key: &str) -> bool {
@@ -4562,10 +5053,25 @@ fn append_evidence_once(evidence: &mut String, item: &str) {
 }
 
 fn build_evidence(options: &ScienceOptions) -> Result<String, String> {
+    ensure_final_artifacts_authentic(
+        options,
+        &[
+            "known_database_matches.tsv",
+            "metagenome_potential_matches.tsv",
+            "structure_interaction_matches.tsv",
+            "tool_outputs/mmseqs_alignment_matches.tsv",
+            "tool_outputs/foldseek_structure_matches.tsv",
+            "docking_summary.tsv",
+            "md_summary.tsv",
+            "target_candidate_ranking.tsv",
+            "candidate_detail.json",
+        ],
+    )?;
     write_score_decomposition(options)?;
     write_artifact_source_map(options)?;
     let files = [
         "run_context.json",
+        "authenticity_gate.tsv",
         "artifact_source_map.tsv",
         "input_conversion_manifest.tsv",
         "input_normalized_manifest.tsv",
@@ -4900,6 +5406,19 @@ fn rows_in_tsv(path: &Path) -> Result<usize, String> {
 }
 
 fn render_report(options: &ScienceOptions) -> Result<String, String> {
+    ensure_final_artifacts_authentic(
+        options,
+        &[
+            "target_candidate_ranking.tsv",
+            "candidate_detail.json",
+            "evidence_ledger.tsv",
+            "known_database_matches.tsv",
+            "metagenome_potential_matches.tsv",
+            "structure_interaction_matches.tsv",
+            "docking_summary.tsv",
+            "md_summary.tsv",
+        ],
+    )?;
     let candidates = read_candidates(&options.run_dir.join("target_candidate_ranking.tsv"))?;
     let mut text = String::from("# GenoLigand \u{79d1}\u{7814}\u{62a5}\u{544a}\n\n");
     text.push_str(
@@ -6804,6 +7323,19 @@ fn windows_path_to_wsl(value: &str) -> Option<String> {
     let drive = (bytes[0] as char).to_ascii_lowercase();
     let rest = value[3..].replace('\\', "/");
     Some(format!("/mnt/{drive}/{rest}"))
+}
+
+fn wsl_path_to_windows(value: &str) -> Option<PathBuf> {
+    let rest = value.strip_prefix("/mnt/")?;
+    let (drive, tail) = rest.split_once('/')?;
+    if drive.len() != 1 || !drive.as_bytes()[0].is_ascii_alphabetic() {
+        return None;
+    }
+    let drive = (drive.as_bytes()[0] as char).to_ascii_uppercase();
+    Some(PathBuf::from(format!(
+        "{drive}:\\{}",
+        tail.replace('/', "\\")
+    )))
 }
 
 fn relative_display(root: &Path, path: &Path) -> String {

@@ -26,6 +26,13 @@ def load_installer_module():
     return module
 
 
+def write_large_placeholder(path: Path, size: int) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("wb") as handle:
+        handle.seek(size)
+        handle.write(b"x")
+
+
 def main() -> int:
     ps1 = read("install.ps1")
     sh = read("install.sh")
@@ -180,6 +187,104 @@ def main() -> int:
         )
         (store / "indexes/known_targets.tsv").write_text("id\tstatus\n", encoding="utf-8")
         require(not installer.existing_science_indexes_ready(store), "empty installed indexes must not be reused")
+    with tempfile.TemporaryDirectory() as tmp:
+        tmp_path = Path(tmp)
+        store = tmp_path / "science_store"
+        (store / "indexes/mmseqs").mkdir(parents=True)
+        (store / "indexes/foldseek").mkdir(parents=True)
+        (store / "install_status.json").write_text('{"status":"ready","missing_components":[]}\n', encoding="utf-8")
+        (store / "source_requirements.tsv").write_text("source_id\tstatus\nknown_database\tready\n", encoding="utf-8")
+        for rel in [
+            "indexes/known_targets.tsv",
+            "indexes/metagenome_targets.tsv",
+            "indexes/structure_targets.tsv",
+            "indexes/tool_versions.tsv",
+        ]:
+            (store / rel).write_text("id\tstatus\nitem\tready\n", encoding="utf-8")
+        (store / "indexes/mmseqs/mmseqs_target_databases.tsv").write_text(
+            "source_id\tsource_path\tdb_path\tstatus\tnotes\nmetagenome\tdownloads/metagenome/mgnify/mgy_clusters.fa.gz\tindexes/mmseqs/metagenome/target\tready\talready_available\n",
+            encoding="utf-8",
+        )
+        (store / "indexes/foldseek/foldseek_target_databases.tsv").write_text(
+            "source_id\tsource_path\tdb_path\tstatus\tnotes\nrcsb_mmcif\tdownloads/rcsb/mmcif\tindexes/foldseek/rcsb_mmcif/target\tready\talready_available\n",
+            encoding="utf-8",
+        )
+        large_size = installer.DEFAULT_PARTIAL_INDEX_LARGE_SOURCE_BYTES + 1
+        write_large_placeholder(store / "downloads/bindingdb/bindingdb_all.tsv.zip", large_size)
+        write_large_placeholder(store / "downloads/chembl/chembl_sqlite.tar.gz", large_size)
+        write_large_placeholder(store / "downloads/metagenome/mgnify/mgy_clusters.fa.gz", large_size)
+        (store / "index_build_manifest.tsv").write_text(
+            "\n".join(
+                [
+                    "index\tinput_path\tstatus\trows\toutput_path\tnotes",
+                    "known_targets\tdownloads/bindingdb/bindingdb_all.tsv.zip\tused\t5000\tindexes/known_targets.tsv\tcanonical_or_source_table_rows",
+                    "known_targets\tdownloads/chembl/chembl_sqlite.tar.gz\tused\t5000\tindexes/known_targets.tsv\tchembl_sqlite_archive_rows",
+                    "metagenome_targets\tdownloads/metagenome/mgnify/mgy_clusters.fa.gz\tused\t5000\tindexes/metagenome_targets.tsv\tfasta_sequence_rows",
+                    "",
+                ]
+            ),
+            encoding="utf-8",
+        )
+        require(hasattr(installer, "science_index_readiness_rows"), "installer must expose explicit science index readiness classification")
+        readiness_rows = installer.science_index_readiness_rows(store)
+        statuses = {(row["input_path"], row["readiness_status"]) for row in readiness_rows}
+        require(
+            ("downloads/bindingdb/bindingdb_all.tsv.zip", "projection_only") in statuses,
+            "large BindingDB source with 5000-row TSV must be classified as projection_only",
+        )
+        require(
+            ("downloads/chembl/chembl_sqlite.tar.gz", "projection_only") in statuses,
+            "large ChEMBL sqlite archive with 5000-row TSV must be classified as projection_only",
+        )
+        require(
+            ("downloads/metagenome/mgnify/mgy_clusters.fa.gz", "projection_only") in statuses,
+            "large MGnify source with 5000-row TSV must be classified as projection_only",
+        )
+        require(not installer.existing_science_indexes_ready(store), "large-source projection TSVs must not make science indexes ready")
+        readiness_manifest = store / "index_readiness_manifest.tsv"
+        require(readiness_manifest.is_file(), "installer readiness check must persist explicit index readiness manifest")
+        readiness_text = readiness_manifest.read_text(encoding="utf-8")
+        require("projection_only" in readiness_text, "persisted index readiness manifest must expose projection_only state")
+    with tempfile.TemporaryDirectory() as tmp:
+        tmp_path = Path(tmp)
+        store = tmp_path / "science_store"
+        (store / "indexes/mmseqs").mkdir(parents=True)
+        (store / "indexes/foldseek").mkdir(parents=True)
+        (store / "install_status.json").write_text('{"status":"ready","missing_components":[]}\n', encoding="utf-8")
+        (store / "source_requirements.tsv").write_text("source_id\tstatus\nknown_database\tready\n", encoding="utf-8")
+        for rel in [
+            "indexes/known_targets.tsv",
+            "indexes/metagenome_targets.tsv",
+            "indexes/structure_targets.tsv",
+            "indexes/tool_versions.tsv",
+        ]:
+            (store / rel).write_text("id\tstatus\nitem\tready\n", encoding="utf-8")
+        (store / "indexes/mmseqs/mmseqs_target_databases.tsv").write_text(
+            "source_id\tsource_path\tdb_path\tstatus\tnotes\nmetagenome\tdownloads/metagenome/mgnify/mgy_clusters.fa.gz\tindexes/mmseqs/metagenome/target\tready\talready_available\n",
+            encoding="utf-8",
+        )
+        (store / "indexes/foldseek/foldseek_target_databases.tsv").write_text(
+            "source_id\tsource_path\tdb_path\tstatus\tnotes\nrcsb_mmcif\tdownloads/rcsb/mmcif\tindexes/foldseek/rcsb_mmcif/target\tready\talready_available\n",
+            encoding="utf-8",
+        )
+        write_large_placeholder(store / "downloads/bindingdb/bindingdb_all.tsv.zip", 590_000_000)
+        (store / "index_build_manifest.tsv").write_text(
+            "\n".join(
+                [
+                    "index\tinput_path\tstatus\trows\toutput_path\tnotes",
+                    "known_targets\tdownloads/bindingdb/bindingdb_all.tsv.zip\tused\t5000\tindexes/known_targets.tsv\tcanonical_or_source_table_rows",
+                    "",
+                ]
+            ),
+            encoding="utf-8",
+        )
+        readiness_rows = installer.science_index_readiness_rows(store)
+        statuses = {(row["input_path"], row["readiness_status"]) for row in readiness_rows}
+        require(
+            ("downloads/bindingdb/bindingdb_all.tsv.zip", "projection_only") in statuses,
+            "BindingDB 600 MB source with 5000-row TSV must be classified as projection_only",
+        )
+        require(not installer.existing_science_indexes_ready(store), "BindingDB 600 MB projection TSV must not make science indexes ready")
     with tempfile.TemporaryDirectory() as tmp:
         tmp_path = Path(tmp)
         source = tmp_path / "source" / ("gls-server.exe" if installer.os.name == "nt" else "gls-server")

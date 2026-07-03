@@ -1370,6 +1370,63 @@ fn artifact_download_is_limited_to_current_run_allowlist() {
 }
 
 #[test]
+fn candidate_ranking_download_returns_full_completed_table() {
+    let root = std::env::temp_dir().join(format!("genoligand-download-full-{}", now_millis()));
+    let options = server_options(root.clone());
+    let run_dir = projects_root(&options)
+        .join("project-1")
+        .join("runs")
+        .join("run-1");
+    fs::create_dir_all(&run_dir).expect("create run dir");
+    fs::write(run_dir.join("run_state.txt"), "completed\n").expect("state");
+    let mut ranking = String::from(
+        "rank\tcandidate_id\ttarget_id\ttarget_name\tcandidate_scope\torganism\tfinal_score\tknown_database_score\tmetagenome_score\tstructure_score\tdocking_score\tmd_score\tevidence_summary\tstatus\n",
+    );
+    for index in 1..=505 {
+        ranking.push_str(&format!(
+            "{index}\ttarget_T{index}\tT{index}\tTarget {index}\tknown_human_protein\tHomo sapiens\t0.1\t0.2\t0.0\t0.0\t0.0\t0.0\tcurrent evidence\tcomputed_prediction\n"
+        ));
+    }
+    fs::write(run_dir.join("target_candidate_ranking.tsv"), ranking).expect("ranking");
+
+    let (status, _, body) = download_artifact_response(&options, "run-1", "candidate_ranking");
+
+    assert_eq!(status, 200);
+    assert!(body.contains("target_T505"));
+    assert_eq!(body.lines().count(), 506);
+    fs::remove_dir_all(&root).ok();
+}
+
+#[test]
+fn artifact_download_is_blocked_when_authenticity_gate_reports_blocked_rows() {
+    let root = std::env::temp_dir().join(format!("genoligand-download-gated-{}", now_millis()));
+    let options = server_options(root.clone());
+    let run_dir = projects_root(&options)
+        .join("project-1")
+        .join("runs")
+        .join("run-1");
+    fs::create_dir_all(&run_dir).expect("create run dir");
+    fs::write(run_dir.join("run_state.txt"), "completed\n").expect("state");
+    fs::write(
+        run_dir.join("target_candidate_ranking.tsv"),
+        "rank\tcandidate_id\ttarget_id\ttarget_name\tcandidate_scope\torganism\tfinal_score\tknown_database_score\tmetagenome_score\tstructure_score\tdocking_score\tmd_score\tevidence_summary\tstatus\n1\ttarget_T1\tT1\tTarget 1\tknown_human_protein\tHomo sapiens\t0.1\t0.2\t0.0\t0.0\t0.0\t0.0\tstatic_fallback_candidate\tcomputed_prediction\n",
+    )
+    .expect("ranking");
+    fs::write(
+        run_dir.join("authenticity_gate.tsv"),
+        "artifact\tstatus\tline_number\tmarker\treason\ntarget_candidate_ranking.tsv\tblocked\t2\tstatic_fallback_candidate\tstatic fallback row\n",
+    )
+    .expect("gate");
+
+    let (status, _, body) = download_artifact_response(&options, "run-1", "candidate_ranking");
+
+    assert_eq!(status, 409);
+    assert!(body.contains("authenticity_gate_failed"));
+    assert!(!body.contains("static_fallback_candidate"));
+    fs::remove_dir_all(&root).ok();
+}
+
+#[test]
 fn blocked_run_trace_does_not_present_scientific_results() {
     let root = std::env::temp_dir().join(format!("genoligand-blocked-trace-{}", now_millis()));
     let options = server_options(root.clone());
@@ -2177,6 +2234,92 @@ fn candidate_detail_endpoint_uses_detail_artifact_without_internal_fields() {
     assert!(!text.contains("sha256"));
     assert!(!text.contains("D:/hidden"));
 
+    fs::remove_dir_all(&root).ok();
+}
+
+#[test]
+fn result_endpoints_expose_pagination_metadata_for_large_tables() {
+    let root = std::env::temp_dir().join(format!("genoligand-pagination-{}", now_millis()));
+    let options = server_options(root.clone());
+    let run_dir = projects_root(&options)
+        .join("project-1")
+        .join("runs")
+        .join("run-1");
+    fs::create_dir_all(&run_dir).expect("create run dir");
+    fs::write(run_dir.join("run_state.txt"), "completed\n").expect("state");
+    let mut ranking = String::from(
+        "rank\tcandidate_id\ttarget_id\ttarget_name\tcandidate_scope\torganism\tfinal_score\tknown_database_score\tmetagenome_score\tstructure_score\tdocking_score\tmd_score\tevidence_summary\tstatus\n",
+    );
+    for index in 1..=505 {
+        ranking.push_str(&format!(
+            "{index}\ttarget_T{index}\tT{index}\tTarget {index}\tknown_human_protein\tHomo sapiens\t0.1\t0.2\t0.0\t0.0\t0.0\t0.0\tcurrent evidence\tcomputed_prediction\n"
+        ));
+    }
+    fs::write(run_dir.join("target_candidate_ranking.tsv"), ranking).expect("ranking");
+
+    let payload = candidates_endpoint_json(&options, "run-1");
+
+    assert_eq!(payload["row_count"], 505);
+    assert_eq!(payload["candidates"].as_array().expect("rows").len(), 500);
+    assert_eq!(payload["pagination"]["total_rows"], 505);
+    assert_eq!(payload["pagination"]["returned_rows"], 500);
+    assert_eq!(payload["pagination"]["page"], 1);
+    assert_eq!(payload["pagination"]["page_size"], 500);
+    assert_eq!(payload["pagination"]["has_next_page"], true);
+    assert_eq!(payload["pagination"]["filters_active"], false);
+    fs::remove_dir_all(&root).ok();
+}
+
+#[test]
+fn result_routes_apply_page_and_filter_query_parameters() {
+    let root = std::env::temp_dir().join(format!("genoligand-pagination-query-{}", now_millis()));
+    let options = server_options(root.clone());
+    let run_dir = projects_root(&options)
+        .join("project-1")
+        .join("runs")
+        .join("run-1");
+    fs::create_dir_all(&run_dir).expect("create run dir");
+    fs::write(run_dir.join("run_state.txt"), "completed\n").expect("state");
+    let mut ranking = String::from(
+        "rank\tcandidate_id\ttarget_id\ttarget_name\tcandidate_scope\torganism\tfinal_score\tknown_database_score\tmetagenome_score\tstructure_score\tdocking_score\tmd_score\tevidence_summary\tstatus\n",
+    );
+    for index in 1..=505 {
+        ranking.push_str(&format!(
+            "{index}\ttarget_T{index}\tT{index}\tTarget {index}\tknown_human_protein\tHomo sapiens\t0.1\t0.2\t0.0\t0.0\t0.0\t0.0\tcurrent evidence\tcomputed_prediction\n"
+        ));
+    }
+    fs::write(run_dir.join("target_candidate_ranking.tsv"), ranking).expect("ranking");
+
+    let (status, _, body) = route(
+        "GET",
+        "/api/user/runs/run-1/candidates?page=2&page_size=200",
+        &options,
+        "",
+    );
+    assert_eq!(status, 200);
+    let payload: Value = serde_json::from_str(&body).expect("page payload");
+    assert_eq!(payload["row_count"], 505);
+    assert_eq!(payload["candidates"].as_array().expect("rows").len(), 200);
+    assert_eq!(payload["candidates"][0]["candidate_id"], "target_T201");
+    assert_eq!(payload["pagination"]["page"], 2);
+    assert_eq!(payload["pagination"]["page_size"], 200);
+    assert_eq!(payload["pagination"]["has_previous_page"], true);
+    assert_eq!(payload["pagination"]["has_next_page"], true);
+
+    let (status, _, body) = route(
+        "GET",
+        "/api/user/runs/run-1/candidates?filter=T505",
+        &options,
+        "",
+    );
+    assert_eq!(status, 200);
+    let payload: Value = serde_json::from_str(&body).expect("filter payload");
+    assert_eq!(payload["row_count"], 505);
+    assert_eq!(payload["candidates"].as_array().expect("rows").len(), 1);
+    assert_eq!(payload["candidates"][0]["candidate_id"], "target_T505");
+    assert_eq!(payload["pagination"]["filtered_rows"], 1);
+    assert_eq!(payload["pagination"]["filters_active"], true);
+    assert_eq!(payload["pagination"]["active_filters"][0], "T505");
     fs::remove_dir_all(&root).ok();
 }
 

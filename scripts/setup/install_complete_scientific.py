@@ -132,6 +132,7 @@ OPENFF_FORCEFIELD_URL = (
 )
 DEFAULT_ALIGNMENT_DB_MAX_SOURCE_BYTES = 0
 DEFAULT_PARTIAL_INDEX_LARGE_SOURCE_BYTES = 1 * 1024 * 1024 * 1024
+DEFAULT_BINDINGDB_PARTIAL_INDEX_LARGE_SOURCE_BYTES = 500 * 1024 * 1024
 RESERVED_WSL_DISTROS = {"Ubuntu-24.04"}
 DOWNLOAD_RETRIES = 3
 DOWNLOAD_TIMEOUT_SECONDS = 120
@@ -3466,38 +3467,93 @@ def alignment_database_manifests_ready(science_store: Path) -> bool:
     return True
 
 
-def partial_legacy_index_manifest_present(science_store: Path) -> bool:
+def science_index_readiness_rows(science_store: Path) -> list[dict[str, str]]:
+    rows: list[dict[str, str]] = []
     for row in read_tsv(science_store / "index_build_manifest.tsv"):
         notes = str(row.get("notes", ""))
-        if "index_row_limit_reached" in notes:
-            return True
-        if str(row.get("status", "")) != "used":
-            continue
+        input_path = str(row.get("input_path", ""))
+        output_path = str(row.get("output_path", ""))
+        source = science_store / input_path
         try:
             row_count = int(str(row.get("rows", "0") or "0"))
         except ValueError:
             row_count = 0
-        source = science_store / str(row.get("input_path", ""))
-        if row_count <= 10_000 and large_index_source(source):
-            return True
-    return False
+        source_scope = "full_searchable_source" if large_index_source(source) else "summary_source"
+        index_kind = "ui_projection_tsv" if output_path.endswith(".tsv") else "derived_index"
+        if str(row.get("status", "")) != "used":
+            readiness_status = "incomplete"
+            reason = "index_build_status_not_used"
+        elif "index_row_limit_reached" in notes:
+            readiness_status = "projection_only"
+            reason = "index_row_limit_reached"
+        elif row_count <= 10_000 and large_index_source(source):
+            readiness_status = "projection_only"
+            reason = "large_source_small_tsv_projection"
+        else:
+            readiness_status = "full_index"
+            reason = "current_index_rows_available"
+        rows.append(
+            {
+                "index": str(row.get("index", "")),
+                "input_path": input_path,
+                "output_path": output_path,
+                "rows": str(row_count),
+                "source_scope": source_scope,
+                "index_kind": index_kind,
+                "readiness_status": readiness_status,
+                "reason": reason,
+                "notes": notes,
+            }
+        )
+    return rows
+
+
+def write_science_index_readiness_manifest(science_store: Path, rows: list[dict[str, str]] | None = None) -> None:
+    write_simple_tsv(
+        science_store / "index_readiness_manifest.tsv",
+        [
+            "index",
+            "input_path",
+            "output_path",
+            "rows",
+            "source_scope",
+            "index_kind",
+            "readiness_status",
+            "reason",
+            "notes",
+        ],
+        rows if rows is not None else science_index_readiness_rows(science_store),
+    )
+
+
+def partial_legacy_index_manifest_present(science_store: Path) -> bool:
+    rows = science_index_readiness_rows(science_store)
+    write_science_index_readiness_manifest(science_store, rows)
+    return any(row.get("readiness_status") in {"projection_only", "incomplete"} for row in rows)
 
 
 def large_index_source(path: Path) -> bool:
     try:
-        return path.exists() and path.stat().st_size > partial_index_large_source_bytes()
+        return path.exists() and path.stat().st_size > partial_index_large_source_bytes(path)
     except OSError:
         return False
 
 
-def partial_index_large_source_bytes() -> int:
+def partial_index_large_source_bytes(path: Path | None = None) -> int:
     raw = os.environ.get("GENOLIGAND_PARTIAL_INDEX_LARGE_SOURCE_BYTES", "").strip()
     if not raw:
+        if path is not None and is_bindingdb_bulk_source(path):
+            return DEFAULT_BINDINGDB_PARTIAL_INDEX_LARGE_SOURCE_BYTES
         return DEFAULT_PARTIAL_INDEX_LARGE_SOURCE_BYTES
     try:
         return max(0, int(raw))
     except ValueError:
         return DEFAULT_PARTIAL_INDEX_LARGE_SOURCE_BYTES
+
+
+def is_bindingdb_bulk_source(path: Path) -> bool:
+    normalized = str(path).replace("\\", "/").lower()
+    return "/bindingdb/" in normalized and "bindingdb_all" in normalized
 
 
 def existing_science_indexes_ready(science_store: Path) -> bool:

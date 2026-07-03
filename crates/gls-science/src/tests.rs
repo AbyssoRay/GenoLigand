@@ -640,6 +640,89 @@ fn metagenome_matching_uses_mmseqs_output_when_persistent_database_is_configured
 }
 
 #[test]
+fn metagenome_matching_preserves_mmseqs_source_database_and_query_id() {
+    let root = temp_root("metagenome_mmseqs_identity");
+    let store = root.join("science_store");
+    let run = root.join("run");
+    let input = root.join("input.json");
+    ensure_dir(&store.join("indexes/mmseqs")).expect("mmseqs dir");
+    ensure_dir(&run.join("tool_outputs")).expect("tool outputs");
+    write_text(
+        &store.join("indexes/mmseqs/mmseqs_target_databases.tsv"),
+        "source_id\tsource_path\tdb_path\tstatus\tnotes\nmetagenome_mgy\tdownloads/metagenome/mgy.fa.gz\tindexes/mmseqs/metagenome_mgy/target\tready\talready_available\n",
+    )
+    .expect("mmseqs manifest");
+    write_text(
+        &run.join("feature_manifest.tsv"),
+        "input_id\tinput_kind\tfeature_family\tfeature_name\tfeature_value\tfeature_source\tfeature_token\ninput_1\tpeptide\tsequence\tmotif\tIKVAV\tGenoLigand\tikvav\n",
+    )
+    .expect("features");
+    write_text(
+        &run.join("tool_outputs/mmseqs_alignment_matches.tsv"),
+        "input_id\tsource\ttarget_id\ttarget_name\torganism\ttarget_class\tmatch_score\tmatched_features\tevidence\ninput_1\tMMseqs2\tMG_REAL\tMGnify hit\tunknown\tpotential_metagenome_sequence\t0.9100\tikvav\tmmseqs_alignment;source_db=metagenome_mgy;query_id=input_1\n",
+    )
+    .expect("mmseqs output");
+    write_text(&input, "{\"inputs\":[],\"files\":[]}\n").expect("input");
+    let options = ScienceOptions {
+        workspace_root: root.clone(),
+        science_store: store,
+        input_manifest: input,
+        run_dir: run.clone(),
+    };
+
+    run_science_command(ScienceCommand::MetagenomeMatchPotential, &options).expect("metagenome");
+    let matches =
+        read_text(&run.join("metagenome_potential_matches.tsv")).expect("metagenome matches");
+
+    assert!(
+        matches
+            .lines()
+            .next()
+            .unwrap_or_default()
+            .contains("source_database_id")
+    );
+    assert!(
+        matches
+            .lines()
+            .next()
+            .unwrap_or_default()
+            .contains("current_run_query_id")
+    );
+    assert!(matches.contains("MG_REAL"));
+    assert!(matches.contains("\tmetagenome_mgy\tinput_1"));
+    fs::remove_dir_all(&root).expect("cleanup temp root");
+    assert!(!root.exists());
+}
+
+#[test]
+fn foldseek_tool_rows_preserve_source_database_and_query_id() {
+    let root = temp_root("foldseek_identity");
+    let store = root.join("science_store");
+    let run = root.join("run");
+    ensure_dir(&run.join("tool_outputs")).expect("tool outputs");
+    write_text(
+        &run.join("tool_outputs/foldseek_structure_matches.tsv"),
+        "input_id\tsource\ttarget_id\ttarget_name\torganism\ttarget_class\tmatch_score\tmatched_features\tevidence\ninput_1\tFoldseek\t1ABC\tRCSB structure\tHomo sapiens\tknown_structure\t0.8700\tpocket\tfoldseek_alignment;source_db=rcsb_mmcif;query_id=input_1\n",
+    )
+    .expect("foldseek output");
+    let options = ScienceOptions {
+        workspace_root: root.clone(),
+        science_store: store,
+        input_manifest: root.join("input.json"),
+        run_dir: run.clone(),
+    };
+    let mut out = "input_id\tsource\ttarget_id\ttarget_name\torganism\ttarget_class\tmatch_score\tmatched_features\tevidence\tsource_database_id\tcurrent_run_query_id\n".to_string();
+
+    append_tool_match_rows(&options, "foldseek_structure_matches.tsv", &mut out)
+        .expect("append foldseek");
+
+    assert!(out.contains("1ABC"));
+    assert!(out.contains("\trcsb_mmcif\tinput_1"));
+    fs::remove_dir_all(&root).expect("cleanup temp root");
+    assert!(!root.exists());
+}
+
+#[test]
 fn known_matching_searches_bindingdb_zip_for_current_small_molecule() {
     let root = temp_root("bindingdb_onsite_search");
     let store = root.join("science_store");
@@ -672,13 +755,67 @@ fn known_matching_searches_bindingdb_zip_for_current_small_molecule() {
     run_science_command(ScienceCommand::FeaturesCompute, &options).expect("features");
     run_science_command(ScienceCommand::DatabaseMatchKnown, &options).expect("match known");
     let matches = read_text(&run.join("known_database_matches.tsv")).expect("known matches");
+    let header = matches.lines().next().unwrap_or_default();
 
+    assert!(header.contains("source_row_provenance"));
+    assert!(header.contains("activity_value"));
+    assert!(header.contains("ligand_identity"));
+    assert!(header.contains("current_run_query_id"));
     assert!(matches.contains("BindingDB"));
     assert!(matches.contains("P00918"));
     assert!(matches.contains("Carbonic anhydrase 2"));
     assert!(matches.contains("bindingdb_onsite_activity_row"));
+    assert!(matches.contains("Ki (nM)=12"));
+    assert!(matches.contains("ligand_smiles=CC(=O)Nc1nnc(s1)S(=O)(=O)N"));
     assert!(matches.contains("ligand_code=AZM"));
     assert!(matches.contains("pdb_ids=3HS4,1AZM,2H4N"));
+    fs::remove_dir_all(&root).expect("cleanup temp root");
+    assert!(!root.exists());
+}
+
+#[test]
+fn known_matching_searches_chembl_sqlite_archive_for_current_small_molecule() {
+    let root = temp_root("chembl_onsite_search");
+    let store = root.join("science_store");
+    let run = root.join("run");
+    let input = root.join("input.json");
+    write_text(
+        &store.join("indexes/known_targets.tsv"),
+        "source\ttarget_id\ttarget_name\torganism\ttarget_class\tligand_tokens\tsequence_tokens\tstructure_tokens\tevidence\n",
+    )
+    .expect("empty known index");
+    let source_sqlite = root.join("chembl_source.sqlite");
+    write_chembl_sqlite(&source_sqlite).expect("chembl sqlite");
+    write_tar_gzip_file(
+        &store.join("downloads/chembl/chembl_sqlite.tar.gz"),
+        "chembl_36/chembl_36_sqlite/chembl_36.db",
+        &source_sqlite,
+    )
+    .expect("chembl archive");
+    write_text(
+        &input,
+        "{\"inputs\":[{\"field\":\"small_molecule\",\"value\":\"CCO\"}],\"files\":[]}\n",
+    )
+    .expect("input");
+    let options = ScienceOptions {
+        workspace_root: root.clone(),
+        science_store: store,
+        input_manifest: input,
+        run_dir: run.clone(),
+    };
+
+    run_science_command(ScienceCommand::InputNormalize, &options).expect("normalize");
+    run_science_command(ScienceCommand::FeaturesCompute, &options).expect("features");
+    run_science_command(ScienceCommand::DatabaseMatchKnown, &options).expect("match known");
+    let matches = read_text(&run.join("known_database_matches.tsv")).expect("known matches");
+
+    assert!(matches.contains("ChEMBL"));
+    assert!(matches.contains("CHEMBL_T1"));
+    assert!(matches.contains("Cyclin-dependent kinase 2"));
+    assert!(matches.contains("chembl_onsite_activity_row"));
+    assert!(matches.contains("IC50=42 nM"));
+    assert!(matches.contains("canonical_smiles=CCO"));
+    assert!(matches.contains("current_run_onsite_query"));
     fs::remove_dir_all(&root).expect("cleanup temp root");
     assert!(!root.exists());
 }
@@ -896,19 +1033,35 @@ fn md_summary_score_participates_in_ranking_and_report() {
         .expect("md summary");
     write_text(
         &run.join("tool_outputs/complex_md_manifest.json"),
-        r#"{"candidate_id":"target_T1","method":"openmm_receptor_ligand_complex_dynamics","platform":"CUDA","receptor_coordinate":"structure_viewer.cif","ligand_coordinate":"tool_outputs/ligand_placement.tsv","trajectory":"tool_outputs/md_trajectory.tsv","protocol_artifact":"tool_outputs/md_protocol.tsv","gpu_telemetry_artifact":"tool_outputs/gpu_telemetry.tsv","gpu_telemetry_status_artifact":"tool_outputs/gpu_telemetry_status.tsv","gpu_observed":true,"metric_artifacts":["tool_outputs/md_summary.tsv"]}"#,
+        r#"{"candidate_id":"target_T1","method":"openmm_receptor_ligand_complex_dynamics","platform":"CUDA","receptor_coordinate":"structure_viewer.cif","ligand_coordinate":"tool_outputs/ligand_placement.tsv","trajectory":"tool_outputs/md_trajectory.tsv","protocol_artifact":"tool_outputs/md_protocol.tsv","state_artifact":"tool_outputs/md_state.tsv","gpu_telemetry_artifact":"tool_outputs/gpu_telemetry.tsv","gpu_telemetry_status_artifact":"tool_outputs/gpu_telemetry_status.tsv","gpu_observed":true,"metric_artifacts":["tool_outputs/md_summary.tsv"]}"#,
     )
     .expect("complex md manifest");
     write_text(
         &run.join("tool_outputs/md_run_manifest.json"),
-        r#"{"candidate_id":"target_T1","method":"openmm_receptor_ligand_complex_dynamics","platform":"CUDA","receptor_coordinate":"structure_viewer.cif","complex_manifest":"tool_outputs/complex_md_manifest.json","protocol_artifact":"tool_outputs/md_protocol.tsv","gpu_telemetry_artifact":"tool_outputs/gpu_telemetry.tsv","gpu_telemetry_status_artifact":"tool_outputs/gpu_telemetry_status.tsv","gpu_observed":true,"trajectory":"tool_outputs/md_trajectory.tsv"}"#,
+        r#"{"candidate_id":"target_T1","method":"openmm_receptor_ligand_complex_dynamics","platform":"CUDA","receptor_coordinate":"structure_viewer.cif","ligand_coordinate":"tool_outputs/ligand_placement.tsv","complex_manifest":"tool_outputs/complex_md_manifest.json","protocol_artifact":"tool_outputs/md_protocol.tsv","state_artifact":"tool_outputs/md_state.tsv","gpu_telemetry_artifact":"tool_outputs/gpu_telemetry.tsv","gpu_telemetry_status_artifact":"tool_outputs/gpu_telemetry_status.tsv","gpu_observed":true,"trajectory":"tool_outputs/md_trajectory.tsv"}"#,
     )
     .expect("md run manifest");
+    write_text(&run.join("structure_viewer.cif"), "data_target_T1\n").expect("receptor");
+    write_text(
+        &run.join("tool_outputs/ligand_placement.tsv"),
+        "candidate_id\tplacement_method\ntarget_T1\tdocking_pose_sdf\n",
+    )
+    .expect("ligand placement");
+    write_text(
+        &run.join("tool_outputs/md_trajectory.tsv"),
+        "candidate_id\ttime_ps\trmsd\ntarget_T1\t0\t0.0\n",
+    )
+    .expect("trajectory");
     write_text(
         &run.join("tool_outputs/md_protocol.tsv"),
         "candidate_id\tinput_id\tstage\tparameter\tvalue\tunit\tsource\ntarget_T1\tinput_1\tproduction\ttotal_steps\t2000\tsteps\tOpenMM\n",
     )
     .expect("protocol");
+    write_text(
+        &run.join("tool_outputs/md_state.tsv"),
+        "candidate_id\tstep\ttime_ps\tpotential_energy_kj_mol\ttemperature_estimate_K\ntarget_T1\t0\t0\t-10\t300\n",
+    )
+    .expect("state");
     write_text(
         &run.join("tool_outputs/gpu_telemetry.tsv"),
         "sample_label\ttimestamp\tgpu_index\tname\tutilization_gpu_percent\tmemory_used_mb\tmemory_total_mb\tpower_draw_w\tcurrent_pid_observed\tcompute_process_count\tcompute_process_memory_used_mb\tfailure_reason\nproduction\t2026/07/02 00:00:00\t0\tNVIDIA\t22.0\t512.0\t8192.0\t65.5\ttrue\t1\t512.0\t\n",
@@ -951,6 +1104,96 @@ fn md_summary_score_participates_in_ranking_and_report() {
     assert!(report.contains("md_stability_score"));
     assert!(report.contains("0.10"));
     assert!(source_map.contains("target_candidate_ranking.tsv\tknown_database_matches.tsv;metagenome_potential_matches.tsv;structure_interaction_matches.tsv;md_summary.tsv"));
+    fs::remove_dir_all(&root).expect("cleanup temp root");
+    assert!(!root.exists());
+}
+
+#[test]
+fn md_manifest_accepts_wsl_receptor_path_for_current_run_scoring() {
+    if !cfg!(windows) {
+        return;
+    }
+    let root = temp_root("md_wsl_manifest_path");
+    let run = root.join("run");
+    let store = create_temporary_test_store(&root).expect("store");
+    let input = root.join("input.json");
+    write_text(
+        &input,
+        "{\"inputs\":[{\"field\":\"small_molecule\",\"value\":\"CCO\"}],\"files\":[]}\n",
+    )
+    .expect("input");
+    write_text(
+        &run.join("known_database_matches.tsv"),
+        "input_id\tsource\ttarget_id\ttarget_name\torganism\ttarget_class\tmatch_score\tmatched_features\tevidence\ninput_1\tChEMBL\tT1\tTarget 1\tHomo sapiens\tenzyme\t1.0\tcco\tchembl_activity_row\n",
+    )
+    .expect("known match");
+    write_text(
+        &run.join("md_summary.tsv"),
+        "candidate_id\trmsd\trmsf\tligand_drift\thydrogen_bond_occupancy\tcontact_occupancy\tinteraction_persistence\tmd_risk_flags\tmd_score_decomposition\tmd_stability_score\ntarget_T1\t1.2\t0.4\t0.6\t0.72\t0.81\t0.77\tstable\tworker_md\t0.8\n",
+    )
+    .expect("md summary");
+    let receptor = run.join("structure_viewer.cif");
+    write_text(&receptor, "data_target_T1\n").expect("receptor");
+    let receptor_wsl =
+        windows_path_to_wsl(&receptor.display().to_string()).expect("receptor wsl path");
+    write_text(
+        &run.join("tool_outputs/complex_md_manifest.json"),
+        &format!(
+            r#"{{"candidate_id":"target_T1","method":"openmm_receptor_ligand_complex_dynamics","platform":"CUDA","receptor_coordinate":"{}","ligand_coordinate":"tool_outputs/ligand_placement.tsv","trajectory":"tool_outputs/md_trajectory.tsv","protocol_artifact":"tool_outputs/md_protocol.tsv","state_artifact":"tool_outputs/md_state.tsv","gpu_telemetry_artifact":"tool_outputs/gpu_telemetry.tsv","gpu_telemetry_status_artifact":"tool_outputs/gpu_telemetry_status.tsv","gpu_observed":true,"metric_artifacts":["tool_outputs/md_summary.tsv"]}}"#,
+            receptor_wsl
+        ),
+    )
+    .expect("complex md manifest");
+    write_text(
+        &run.join("tool_outputs/md_run_manifest.json"),
+        &format!(
+            r#"{{"candidate_id":"target_T1","method":"openmm_receptor_ligand_complex_dynamics","platform":"CUDA","receptor_coordinate":"{}","ligand_coordinate":"tool_outputs/ligand_placement.tsv","complex_manifest":"tool_outputs/complex_md_manifest.json","protocol_artifact":"tool_outputs/md_protocol.tsv","state_artifact":"tool_outputs/md_state.tsv","gpu_telemetry_artifact":"tool_outputs/gpu_telemetry.tsv","gpu_telemetry_status_artifact":"tool_outputs/gpu_telemetry_status.tsv","gpu_observed":true,"trajectory":"tool_outputs/md_trajectory.tsv"}}"#,
+            receptor_wsl
+        ),
+    )
+    .expect("md run manifest");
+    write_text(
+        &run.join("tool_outputs/ligand_placement.tsv"),
+        "candidate_id\tplacement_method\ntarget_T1\tdocking_pose_sdf\n",
+    )
+    .expect("ligand placement");
+    write_text(
+        &run.join("tool_outputs/md_trajectory.tsv"),
+        "candidate_id\ttime_ps\trmsd\ntarget_T1\t0\t0.0\n",
+    )
+    .expect("trajectory");
+    write_text(
+        &run.join("tool_outputs/md_protocol.tsv"),
+        "candidate_id\tinput_id\tstage\tparameter\tvalue\tunit\tsource\ntarget_T1\tinput_1\tproduction\ttotal_steps\t2000\tsteps\tOpenMM\n",
+    )
+    .expect("protocol");
+    write_text(
+        &run.join("tool_outputs/md_state.tsv"),
+        "candidate_id\tstep\ttime_ps\tpotential_energy_kj_mol\ttemperature_estimate_K\ntarget_T1\t0\t0\t-10\t300\n",
+    )
+    .expect("state");
+    write_text(
+        &run.join("tool_outputs/gpu_telemetry.tsv"),
+        "sample_label\ttimestamp\tgpu_index\tname\tutilization_gpu_percent\tmemory_used_mb\tmemory_total_mb\tpower_draw_w\tcurrent_pid_observed\tcompute_process_count\tcompute_process_memory_used_mb\tfailure_reason\nproduction\t2026/07/02 00:00:00\t0\tNVIDIA\t22.0\t512.0\t8192.0\t65.5\ttrue\t1\t512.0\t\n",
+    )
+    .expect("gpu telemetry");
+    write_text(
+        &run.join("tool_outputs/gpu_telemetry_status.tsv"),
+        "cuda_platform\tnvidia_smi_available\tgpu_observed\tmax_utilization_gpu_percent\tmax_memory_delta_mb\tprocess_observed\tsample_count\tfailure_reason\nCUDA\ttrue\ttrue\t22.0\t128.0\ttrue\t1\t\n",
+    )
+    .expect("gpu status");
+    let options = ScienceOptions {
+        workspace_root: root.clone(),
+        science_store: store,
+        input_manifest: input,
+        run_dir: run.clone(),
+    };
+
+    rank_targets(&options).expect("rank");
+
+    let ranking = read_text(&run.join("target_candidate_ranking.tsv")).expect("ranking");
+    assert!(ranking.contains("0.5800\t1.0000\t0.0000\t0.0000\t0.0000\t0.8000"));
+    assert!(ranking.contains("MD:md_summary_stability_score"));
     fs::remove_dir_all(&root).expect("cleanup temp root");
     assert!(!root.exists());
 }
@@ -1165,8 +1408,95 @@ fn ranking_ignores_md_summary_without_complex_manifest() {
 }
 
 #[test]
+fn ranking_ignores_md_summary_without_state_artifact() {
+    let root = temp_root("md_without_state_artifact");
+    let run = root.join("run");
+    let store = create_temporary_test_store(&root).expect("store");
+    let input = root.join("input.json");
+    write_text(
+        &input,
+        "{\"inputs\":[{\"field\":\"small_molecule\",\"value\":\"CCO\"}],\"files\":[]}\n",
+    )
+    .expect("input");
+    write_text(
+        &run.join("known_database_matches.tsv"),
+        "input_id\tsource\ttarget_id\ttarget_name\torganism\ttarget_class\tmatch_score\tmatched_features\tevidence\ninput_1\tChEMBL\tT1\tTarget 1\tHomo sapiens\tenzyme\t1.0\tcco\tchembl_activity_row\n",
+    )
+    .expect("known match");
+    write_text(
+        &run.join("md_summary.tsv"),
+        "candidate_id\trmsd\trmsf\tligand_drift\thydrogen_bond_occupancy\tcontact_occupancy\tinteraction_persistence\tmd_risk_flags\tmd_score_decomposition\tmd_stability_score\ntarget_T1\t1.2\t0.4\t0.6\t0.72\t0.81\t0.77\tmissing_state\tworker_md\t0.8\n",
+    )
+    .expect("md summary");
+    write_text(
+        &run.join("tool_outputs/complex_md_manifest.json"),
+        r#"{"candidate_id":"target_T1","method":"openmm_receptor_ligand_complex_dynamics","platform":"CPU","receptor_coordinate":"structure_viewer.cif","ligand_coordinate":"tool_outputs/ligand_placement.tsv","trajectory":"tool_outputs/md_trajectory.tsv","protocol_artifact":"tool_outputs/md_protocol.tsv","metric_artifacts":["tool_outputs/md_summary.tsv"]}"#,
+    )
+    .expect("complex md manifest");
+    let options = ScienceOptions {
+        workspace_root: root.clone(),
+        science_store: store,
+        input_manifest: input,
+        run_dir: run.clone(),
+    };
+
+    rank_targets(&options).expect("rank");
+    let ranking = read_text(&run.join("target_candidate_ranking.tsv")).expect("ranking");
+
+    assert!(ranking.contains("\t0.0000\tChEMBL:chembl_activity_row\t"));
+    assert!(!ranking.contains("MD:md_summary_stability_score"));
+    fs::remove_dir_all(&root).expect("cleanup temp root");
+    assert!(!root.exists());
+}
+
+#[test]
 fn ranking_uses_completed_vina_docking_score() {
     let root = temp_root("vina_docking_score");
+    let run = root.join("run");
+    let store = create_temporary_test_store(&root).expect("store");
+    let input = root.join("input.json");
+    write_text(
+        &input,
+        "{\"inputs\":[{\"field\":\"small_molecule\",\"value\":\"CCO\"}],\"files\":[]}\n",
+    )
+    .expect("input");
+    write_text(
+        &run.join("known_database_matches.tsv"),
+        "input_id\tsource\ttarget_id\ttarget_name\torganism\ttarget_class\tmatch_score\tmatched_features\tevidence\ninput_1\tChEMBL\tT1\tTarget 1\tHomo sapiens\tenzyme\t1.0\tcco\tchembl_activity_row\n",
+    )
+    .expect("known match");
+    write_text(
+        &run.join("docking_summary.tsv"),
+        "candidate_id\tdocking_status\tdocking_score\tdocking_engine\tnotes\ntarget_T1\tcompleted\t-7.2\tvina\tpose=tool_outputs/docking_pose_target_T1.pdbqt\n",
+    )
+    .expect("docking summary");
+    write_text(
+        &run.join("tool_outputs/docking_pose_target_T1.pdbqt"),
+        "REMARK Vina pose\n",
+    )
+    .expect("docking pose");
+    let options = ScienceOptions {
+        workspace_root: root.clone(),
+        science_store: store,
+        input_manifest: input,
+        run_dir: run.clone(),
+    };
+
+    rank_targets(&options).expect("rank");
+    let ranking = read_text(&run.join("target_candidate_ranking.tsv")).expect("ranking");
+    let score = read_text(&run.join("score_decomposition.tsv")).unwrap_or_default();
+
+    assert!(
+        ranking.contains("\t0.6000\t0.0000\tChEMBL:chembl_activity_row;Docking:vina_completed")
+    );
+    assert!(!score.contains("docking_score_contribution"));
+    fs::remove_dir_all(&root).expect("cleanup temp root");
+    assert!(!root.exists());
+}
+
+#[test]
+fn ranking_ignores_vina_docking_without_pose_artifact() {
+    let root = temp_root("vina_without_pose_artifact");
     let run = root.join("run");
     let store = create_temporary_test_store(&root).expect("store");
     let input = root.join("input.json");
@@ -1194,12 +1524,43 @@ fn ranking_uses_completed_vina_docking_score() {
 
     rank_targets(&options).expect("rank");
     let ranking = read_text(&run.join("target_candidate_ranking.tsv")).expect("ranking");
-    let score = read_text(&run.join("score_decomposition.tsv")).unwrap_or_default();
 
-    assert!(
-        ranking.contains("\t0.6000\t0.0000\tChEMBL:chembl_activity_row;Docking:vina_completed")
-    );
-    assert!(!score.contains("docking_score_contribution"));
+    assert!(ranking.contains("\t0.5000\t1.0000\t0.0000\t0.0000\t0.0000\t0.0000"));
+    assert!(!ranking.contains("Docking:vina_completed"));
+    fs::remove_dir_all(&root).expect("cleanup temp root");
+    assert!(!root.exists());
+}
+
+#[test]
+fn ranking_blocks_final_artifacts_with_static_fallback_rows() {
+    let root = temp_root("authenticity_static_fallback");
+    let run = root.join("run");
+    let store = create_temporary_test_store(&root).expect("store");
+    let input = root.join("input.json");
+    write_text(
+        &input,
+        "{\"inputs\":[{\"field\":\"small_molecule\",\"value\":\"CCO\"}],\"files\":[]}\n",
+    )
+    .expect("input");
+    write_text(
+        &run.join("known_database_matches.tsv"),
+        "input_id\tsource\ttarget_id\ttarget_name\torganism\ttarget_class\tmatch_score\tmatched_features\tevidence\ninput_1\tDemoDB\tT1\tTarget 1\tHomo sapiens\tenzyme\t1.0\tcco\tstatic_fallback_candidate;demo_data\n",
+    )
+    .expect("known match");
+    let options = ScienceOptions {
+        workspace_root: root.clone(),
+        science_store: store,
+        input_manifest: input,
+        run_dir: run.clone(),
+    };
+
+    let err = rank_targets(&options).expect_err("authenticity gate should block");
+
+    assert!(err.contains("authenticity_gate_failed"));
+    let gate = read_text(&run.join("authenticity_gate.tsv")).expect("gate report");
+    assert!(gate.contains("known_database_matches.tsv"));
+    assert!(gate.contains("static_fallback_candidate"));
+    assert!(!run.join("target_candidate_ranking.tsv").exists());
     fs::remove_dir_all(&root).expect("cleanup temp root");
     assert!(!root.exists());
 }

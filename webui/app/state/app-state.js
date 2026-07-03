@@ -14,6 +14,8 @@
   setupProgress: null,
   preflight: null,
   runData: null,
+  resultTab: "ranking",
+  resultQueries: {},
   form: {
     project_name: "",
     small_molecule: "",

@@ -1,39 +1,45 @@
 ﻿function renderResults() {
   page.className = "page";
-  const candidates = candidateRows();
-  const candidateDetails = state.runData?.detail?.candidate_details || [];
-  const evidence = state.runData?.evidence?.evidence || [];
-  const genome = state.runData?.genome?.genome_context || [];
-  const structure = state.runData?.structure?.structure_rows || [];
-  const md = state.runData?.md?.md_rows || [];
+  const activeTab = state.resultTab || "ranking";
   page.innerHTML = `
     ${resultTracePanel()}
     <div class="tabs">
-      <button class="tab active" data-result-tab="ranking">候选排序</button>
-      <button class="tab" data-result-tab="detail">候选详情</button>
-      <button class="tab" data-result-tab="evidence">证据链</button>
-      <button class="tab" data-result-tab="genome">基因组/ORF</button>
-      <button class="tab" data-result-tab="structure">结构/口袋</button>
-      <button class="tab" data-result-tab="md">动力学摘要</button>
+      ${["ranking", "detail", "evidence", "genome", "structure", "md"]
+        .map((tab) => `<button class="tab ${activeTab === tab ? "active" : ""}" data-result-tab="${tab}">${resultTabLabel(tab)}</button>`)
+        .join("")}
     </div>
     <div data-result-body>
-      ${resultSection("候选排序", candidates, "ranking")}
+      ${renderResultTab(activeTab)}
     </div>`;
   page.querySelectorAll("[data-result-tab]").forEach((button) => {
     button.addEventListener("click", () => {
-      page.querySelectorAll(".tab").forEach((tab) => tab.classList.remove("active"));
-      button.classList.add("active");
-      const tab = button.dataset.resultTab;
-      const body = page.querySelector("[data-result-body]");
-      if (tab === "ranking") body.innerHTML = resultSection("候选排序", candidates, "ranking");
-      if (tab === "detail") body.innerHTML = candidateDetailSection(candidateDetails);
-      if (tab === "evidence") body.innerHTML = resultSection("证据链", evidence, "evidence");
-      if (tab === "genome") body.innerHTML = resultSection("基因组/ORF", genome, "genome");
-      if (tab === "structure") body.innerHTML = structureSection(structure);
-      if (tab === "md") body.innerHTML = mdSection(md);
-      hydrateResultVisuals();
+      state.resultTab = button.dataset.resultTab;
+      renderResults();
     });
   });
+  hydrateResultPagination();
+  hydrateResultVisuals();
+}
+
+function resultTabLabel(tab) {
+  return {
+    ranking: "候选排序",
+    detail: "候选详情",
+    evidence: "证据链",
+    genome: "基因组/ORF",
+    structure: "结构/口袋",
+    md: "动力学摘要",
+  }[tab] || tab;
+}
+
+function renderResultTab(tab) {
+  if (tab === "ranking") return resultSection("候选排序", candidateRows(), "ranking", state.runData?.candidates?.pagination);
+  if (tab === "detail") return candidateDetailSection(state.runData?.detail?.candidate_details || [], state.runData?.detail?.pagination);
+  if (tab === "evidence") return resultSection("证据链", state.runData?.evidence?.evidence || [], "evidence", state.runData?.evidence?.pagination);
+  if (tab === "genome") return resultSection("基因组/ORF", state.runData?.genome?.genome_context || [], "genome", state.runData?.genome?.pagination);
+  if (tab === "structure") return structureSection(state.runData?.structure?.structure_rows || [], state.runData?.structure?.pagination);
+  if (tab === "md") return mdSection(state.runData?.md?.md_rows || [], state.runData?.md?.pagination);
+  return resultSection("候选排序", candidateRows(), "ranking", state.runData?.candidates?.pagination);
 }
 
 function resultTracePanel() {
@@ -66,7 +72,7 @@ function resultTracePanel() {
     </section>`;
 }
 
-function resultSection(title, rows, kind) {
+function resultSection(title, rows, kind, pagination) {
   const emptyText = {
     ranking: "当前没有候选。完成输入、检查和运行后才会显示候选排序。",
     evidence: "当前没有证据链输出。",
@@ -81,11 +87,13 @@ function resultSection(title, rows, kind) {
         </div>
         <span class="status-pill ${outputStatusClass(rows)}">${rows.length ? `${rows.length} 行` : "空"}</span>
       </div>
+      ${paginationSummary(pagination, rows)}
+      ${paginationControls(pagination, kind)}
       ${rows.length ? table(rows, columnsFor(kind)) : `<div class="empty">${emptyText}</div>`}
     </section>`;
 }
 
-function candidateDetailSection(rows) {
+function candidateDetailSection(rows, pagination) {
   if (!rows.length) {
     return `<section class="panel full"><h2>候选详情</h2><div class="empty">当前没有候选详情输出。完成运行并生成候选详情后才会显示。</div></section>`;
   }
@@ -115,11 +123,13 @@ function candidateDetailSection(rows) {
         </div>
         <span class="status-pill ready">${rows.length} 行</span>
       </div>
+      ${paginationSummary(pagination, rows)}
+      ${paginationControls(pagination, "detail")}
       ${table(rows, columnsFor("candidate_detail"))}
     </section>`;
 }
 
-function structureSection(rows) {
+function structureSection(rows, pagination) {
   const viewer = state.runData?.structure?.viewer;
   return `
     <section class="panel full">
@@ -135,12 +145,14 @@ function structureSection(rows) {
         { label: "三维查看器", value: viewer?.ready ? "已连接当前运行坐标" : "未就绪", ready: viewer?.ready === true, waiting: viewer?.ready !== true },
         { label: "数据来源", value: rows.length ? "当前运行输出" : "等待运行输出", ready: rows.length > 0 },
       ])}
+      ${paginationSummary(pagination, rows)}
+      ${paginationControls(pagination, "structure")}
       ${renderStructureViewer(viewer)}
       ${rows.length ? table(rows, columnsFor("structure")) : `<div class="empty">未生成结构查看数据或口袋摘要。</div>`}
     </section>`;
 }
 
-function mdSection(rows) {
+function mdSection(rows, pagination) {
   const readiness = state.runData?.md?.readiness || {};
   const protocol = state.runData?.md?.protocol || {};
   const stateTrace = state.runData?.md?.state_trace || {};
@@ -163,9 +175,109 @@ function mdSection(rows) {
         { label: "数据来源", value: rows.length ? "当前运行输出" : emptyText, ready: rows.length > 0, waiting: !rows.length },
       ])}
       ${mdRuntimeStatus(protocol, stateTrace, cuda)}
+      ${paginationSummary(pagination, rows)}
+      ${paginationControls(pagination, "md")}
       ${renderMdCharts(charts)}
       ${rows.length ? table(rows, columnsFor("md")) : `<div class="empty">${escapeHtml(emptyText)}</div>`}
     </section>`;
+}
+
+function paginationSummary(pagination, rows) {
+  const meta = pagination || {};
+  const total = Number.isFinite(meta.total_rows) ? meta.total_rows : rows.length;
+  const returned = Number.isFinite(meta.returned_rows) ? meta.returned_rows : rows.length;
+  const page = Number.isFinite(meta.page) ? meta.page : 1;
+  const pageSize = Number.isFinite(meta.page_size) ? meta.page_size : returned;
+  const filterText = meta.filters_active ? "过滤已启用" : "未启用过滤";
+  return `
+    <div class="pagination-summary">
+      <span>总数 ${escapeHtml(total)}</span>
+      <span>当前页 ${escapeHtml(page)}</span>
+      <span>本页 ${escapeHtml(returned)} / ${escapeHtml(pageSize)}</span>
+      <span>${filterText}</span>
+    </div>`;
+}
+
+function paginationControls(pagination, kind) {
+  const meta = pagination || {};
+  const page = Number.isFinite(meta.page) ? meta.page : 1;
+  const filter = resultFilterValue(kind, meta);
+  return `
+    <div class="pagination-controls">
+      <button class="button secondary" data-page-action="prev" data-result-kind="${kind}" data-page-target="${Math.max(1, page - 1)}" ${meta.has_previous_page ? "" : "disabled"}>上一页</button>
+      <button class="button secondary" data-page-action="next" data-result-kind="${kind}" data-page-target="${page + 1}" ${meta.has_next_page ? "" : "disabled"}>下一页</button>
+      <label class="pagination-filter">
+        <span>过滤</span>
+        <input data-result-filter="${kind}" value="${escapeAttr(filter)}" placeholder="目标、来源或状态" />
+      </label>
+      <button class="button secondary" data-filter-action="apply" data-result-kind="${kind}">应用</button>
+    </div>`;
+}
+
+function resultFilterValue(kind, pagination) {
+  const saved = state.resultQueries?.[kind]?.filter;
+  if (saved !== undefined) return saved;
+  return Array.isArray(pagination?.active_filters) ? pagination.active_filters[0] || "" : "";
+}
+
+function hydrateResultPagination() {
+  page.querySelectorAll("[data-page-action]").forEach((button) => {
+    button.addEventListener("click", async () => {
+      const kind = button.dataset.resultKind;
+      const targetPage = Number(button.dataset.pageTarget || 1);
+      const filter = page.querySelector(`[data-result-filter="${kind}"]`)?.value || "";
+      await loadResultPage(kind, targetPage, filter);
+    });
+  });
+  page.querySelectorAll("[data-filter-action='apply']").forEach((button) => {
+    button.addEventListener("click", async () => {
+      const kind = button.dataset.resultKind;
+      const filter = page.querySelector(`[data-result-filter="${kind}"]`)?.value || "";
+      await loadResultPage(kind, 1, filter);
+    });
+  });
+  page.querySelectorAll("[data-result-filter]").forEach((input) => {
+    input.addEventListener("keydown", async (event) => {
+      if (event.key !== "Enter") return;
+      await loadResultPage(input.dataset.resultFilter, 1, input.value || "");
+    });
+  });
+}
+
+async function loadResultPage(kind, pageNumber, filterText) {
+  if (!state.run?.run_id) return;
+  const config = resultEndpointConfig(kind);
+  if (!config) return;
+  const pageNumberSafe = Math.max(1, Number(pageNumber) || 1);
+  const currentPagination = state.runData?.[config.key]?.pagination || {};
+  const pageSize = Number.isFinite(currentPagination.page_size) ? currentPagination.page_size : 500;
+  const filter = String(filterText || "").trim();
+  const params = new URLSearchParams();
+  params.set("page", String(pageNumberSafe));
+  params.set("page_size", String(pageSize));
+  if (filter) params.set("filter", filter);
+  state.resultQueries = state.resultQueries || {};
+  state.resultQueries[kind] = { page: pageNumberSafe, filter };
+  state.resultTab = kind;
+  try {
+    state.runData = state.runData || {};
+    state.runData[config.key] = await api(`/api/user/runs/${state.run.run_id}/${config.endpoint}?${params.toString()}`);
+    render();
+  } catch (error) {
+    state.alert = `结果分页加载失败：${error.message}`;
+    render();
+  }
+}
+
+function resultEndpointConfig(kind) {
+  return {
+    ranking: { key: "candidates", endpoint: "candidates" },
+    detail: { key: "detail", endpoint: "candidate-detail" },
+    evidence: { key: "evidence", endpoint: "evidence" },
+    genome: { key: "genome", endpoint: "genome-context" },
+    structure: { key: "structure", endpoint: "structure" },
+    md: { key: "md", endpoint: "md-summary" },
+  }[kind];
 }
 
 function mdRuntimeStatus(protocol, stateTrace, cuda) {

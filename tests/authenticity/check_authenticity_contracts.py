@@ -68,6 +68,11 @@ def main() -> int:
     require("canonical_smiles" in science and "Chem.MolFromSmiles" in science, "BindingDB onsite matching must use canonical SMILES when RDKit is available")
     require("temp_python_script_path" in science, "onsite Python scripts must run from a script file to avoid Windows cmd quoting loss")
     require('command.push("-c"' not in science, "onsite Python scripts must not pass multiline code through python -c")
+    require("AUTHENTICITY_FORBIDDEN_MARKERS" in science, "science pipeline must define forbidden final artifact source markers")
+    require("ensure_final_artifacts_authentic" in science, "science pipeline must gate final artifact consumption")
+    require("authenticity_gate.tsv" in science, "science pipeline must write an authenticity gate report")
+    for forbidden_source in ["static_fallback_candidate", "demo_data", "smoke", "fixture"]:
+        require(forbidden_source in science, f"authenticity gate must block {forbidden_source}")
     for forbidden in [
         "MAX_RECEPTOR_ATOMS",
         "receptor_heavy_atom_subset",

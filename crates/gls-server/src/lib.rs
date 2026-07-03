@@ -13,6 +13,7 @@ use input_recognition::{input_recognition_summary, input_value_has_usable_user_i
 
 pub const PRODUCT_NAME: &str = "GenoLigand Local WebUI";
 pub const PRODUCT_VERSION: &str = env!("CARGO_PKG_VERSION");
+const RESULT_PAGE_SIZE: usize = 500;
 
 const REQUIRED_TOOL_IDS: &[&str] = &[
     "java",
@@ -93,7 +94,7 @@ fn handle_connection(mut stream: TcpStream, options: &ServerOptions) -> Result<(
         return Err("bad_request_line".to_string());
     }
     let method = parts[0];
-    let path = parts[1].split('?').next().unwrap_or(parts[1]);
+    let path = parts[1];
     let body_start = request
         .find("\r\n\r\n")
         .map(|index| index + 4)
@@ -109,6 +110,7 @@ fn route(
     options: &ServerOptions,
     request_body: &str,
 ) -> (u16, &'static str, String) {
+    let (path, query) = split_path_query(path);
     match (method, path) {
         ("GET", "/") | ("GET", "/index.html") => {
             return (
@@ -127,13 +129,13 @@ fn route(
     if let Some(response) = route_user_project(method, path, options, request_body) {
         return response;
     }
-    if let Some(response) = route_user_run(method, path, options) {
+    if let Some(response) = route_user_run(method, path, query, options) {
         return response;
     }
     if let Some(response) = route_project(method, path, options, request_body) {
         return response;
     }
-    if let Some(response) = route_run(method, path, options) {
+    if let Some(response) = route_run(method, path, query, options) {
         return response;
     }
     let value = match (method, path) {
@@ -173,6 +175,101 @@ fn route(
         }
     };
     (200, "application/json; charset=utf-8", value.to_string())
+}
+
+fn split_path_query(raw: &str) -> (&str, &str) {
+    raw.split_once('?').unwrap_or((raw, ""))
+}
+
+#[derive(Clone, Debug)]
+struct ResultQuery {
+    page: usize,
+    page_size: usize,
+    filter: String,
+}
+
+impl Default for ResultQuery {
+    fn default() -> Self {
+        Self {
+            page: 1,
+            page_size: RESULT_PAGE_SIZE,
+            filter: String::new(),
+        }
+    }
+}
+
+impl ResultQuery {
+    fn all() -> Self {
+        Self {
+            page: 1,
+            page_size: usize::MAX,
+            filter: String::new(),
+        }
+    }
+
+    fn parse(query: &str) -> Self {
+        let mut parsed = Self::default();
+        for pair in query.split('&').filter(|part| !part.is_empty()) {
+            let (key, value) = pair.split_once('=').unwrap_or((pair, ""));
+            let decoded = percent_decode(value);
+            match key {
+                "page" => {
+                    parsed.page = decoded
+                        .parse::<usize>()
+                        .ok()
+                        .filter(|value| *value > 0)
+                        .unwrap_or(1);
+                }
+                "page_size" => {
+                    parsed.page_size = decoded
+                        .parse::<usize>()
+                        .ok()
+                        .map(|value| value.clamp(1, 5000))
+                        .unwrap_or(RESULT_PAGE_SIZE);
+                }
+                "filter" => parsed.filter = decoded.trim().to_string(),
+                _ => {}
+            }
+        }
+        parsed
+    }
+
+    fn offset(&self) -> usize {
+        self.page.saturating_sub(1).saturating_mul(self.page_size)
+    }
+
+    fn filters_active(&self) -> bool {
+        !self.filter.trim().is_empty()
+    }
+}
+
+fn percent_decode(value: &str) -> String {
+    let bytes = value.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut index = 0;
+    while index < bytes.len() {
+        match bytes[index] {
+            b'+' => {
+                out.push(b' ');
+                index += 1;
+            }
+            b'%' if index + 2 < bytes.len() => {
+                let hex = &value[index + 1..index + 3];
+                if let Ok(decoded) = u8::from_str_radix(hex, 16) {
+                    out.push(decoded);
+                    index += 3;
+                } else {
+                    out.push(bytes[index]);
+                    index += 1;
+                }
+            }
+            byte => {
+                out.push(byte);
+                index += 1;
+            }
+        }
+    }
+    String::from_utf8_lossy(&out).to_string()
 }
 
 fn web_asset_response(path: &str, _options: &ServerOptions) -> Option<(u16, &'static str, String)> {
@@ -282,22 +379,30 @@ fn route_user_project(
 fn route_run(
     method: &str,
     path: &str,
+    query: &str,
     options: &ServerOptions,
 ) -> Option<(u16, &'static str, String)> {
     let rest = path.strip_prefix("/api/runs/")?;
     let mut parts = rest.split('/');
     let run_id = safe_id(parts.next().unwrap_or(""));
     let suffix = parts.collect::<Vec<_>>().join("/");
+    let result_query = ResultQuery::parse(query);
     let value = match (method, suffix.as_str()) {
         ("GET", "") => run_json(options, &run_id),
         ("GET", "logs") => logs_json(options, &run_id),
         ("GET", "artifacts") => artifacts_json(options, &run_id),
-        ("GET", "candidates") => candidates_endpoint_json(options, &run_id),
-        ("GET", "candidate-detail") => candidate_detail_json(options, &run_id),
-        ("GET", "evidence") => evidence_endpoint_json(options, &run_id),
-        ("GET", "genome-context") => genome_endpoint_json(options, &run_id),
-        ("GET", "structure") => structure_endpoint_json(options, &run_id),
-        ("GET", "md-summary") => md_endpoint_json(options, &run_id),
+        ("GET", "candidates") => {
+            candidates_endpoint_json_with_query(options, &run_id, &result_query)
+        }
+        ("GET", "candidate-detail") => {
+            candidate_detail_json_with_query(options, &run_id, &result_query)
+        }
+        ("GET", "evidence") => evidence_endpoint_json_with_query(options, &run_id, &result_query),
+        ("GET", "genome-context") => {
+            genome_endpoint_json_with_query(options, &run_id, &result_query)
+        }
+        ("GET", "structure") => structure_endpoint_json_with_query(options, &run_id, &result_query),
+        ("GET", "md-summary") => md_endpoint_json_with_query(options, &run_id, &result_query),
         ("POST", "cancel") => update_run_state(options, &run_id, "cancelled"),
         ("POST", "resume") => update_run_state(options, &run_id, "resumable"),
         _ => {
@@ -315,22 +420,30 @@ fn route_run(
 fn route_user_run(
     method: &str,
     path: &str,
+    query: &str,
     options: &ServerOptions,
 ) -> Option<(u16, &'static str, String)> {
     let rest = path.strip_prefix("/api/user/runs/")?;
     let mut parts = rest.split('/');
     let run_id = safe_id(parts.next().unwrap_or(""));
     let suffix = parts.collect::<Vec<_>>().join("/");
+    let result_query = ResultQuery::parse(query);
     let value = match (method, suffix.as_str()) {
         ("GET", "") => user_run_json(options, &run_id),
         ("GET", "logs") => logs_json(options, &run_id),
         ("GET", "artifacts") => artifacts_json(options, &run_id),
-        ("GET", "candidates") => candidates_endpoint_json(options, &run_id),
-        ("GET", "candidate-detail") => candidate_detail_json(options, &run_id),
-        ("GET", "evidence") => evidence_endpoint_json(options, &run_id),
-        ("GET", "genome-context") => genome_endpoint_json(options, &run_id),
-        ("GET", "structure") => structure_endpoint_json(options, &run_id),
-        ("GET", "md-summary") => md_endpoint_json(options, &run_id),
+        ("GET", "candidates") => {
+            candidates_endpoint_json_with_query(options, &run_id, &result_query)
+        }
+        ("GET", "candidate-detail") => {
+            candidate_detail_json_with_query(options, &run_id, &result_query)
+        }
+        ("GET", "evidence") => evidence_endpoint_json_with_query(options, &run_id, &result_query),
+        ("GET", "genome-context") => {
+            genome_endpoint_json_with_query(options, &run_id, &result_query)
+        }
+        ("GET", "structure") => structure_endpoint_json_with_query(options, &run_id, &result_query),
+        ("GET", "md-summary") => md_endpoint_json_with_query(options, &run_id, &result_query),
         _ => {
             if method == "GET"
                 && let Some(file) = suffix.strip_prefix("download/")
@@ -1360,6 +1473,9 @@ fn download_artifact_response(
     };
     let path = run_dir.join(artifact_file);
     let completed = run_state(&run_dir) == "completed";
+    if path.exists() && !authenticity_gate_allows_download(&run_dir) {
+        return json_response(409, json!({"error":"authenticity_gate_failed"}));
+    }
     if !artifact_visible_for_user(artifact_id, &path, &run_dir, completed) {
         return json_response(404, json!({"error":"artifact_not_available"}));
     }
@@ -1517,39 +1633,70 @@ fn download_artifact_response(
     }
 }
 
+#[cfg(test)]
 fn evidence_endpoint_json(options: &ServerOptions, run_id: &str) -> Value {
+    evidence_endpoint_json_with_query(options, run_id, &ResultQuery::default())
+}
+
+fn evidence_endpoint_json_with_query(
+    options: &ServerOptions,
+    run_id: &str,
+    query: &ResultQuery,
+) -> Value {
     let Some(run_dir) = completed_run_dir(options, run_id) else {
-        return json!({"run_id":run_id,"evidence":[],"row_count":0,"has_output":false});
+        return json!({"run_id":run_id,"evidence":[],"row_count":0,"has_output":false,"pagination":pagination_payload(query,0,0,0)});
     };
-    let rows = user_evidence_rows(&run_dir);
+    let paged = user_evidence_rows_paged(&run_dir, query);
+    let returned_rows = paged.rows.len();
     json!({
         "run_id": run_id,
-        "evidence": rows,
-        "row_count": rows.len(),
-        "has_output": !rows.is_empty()
+        "evidence": paged.rows,
+        "row_count": paged.total_rows,
+        "has_output": paged.total_rows > 0,
+        "pagination": pagination_payload(query,paged.total_rows,paged.filtered_rows,returned_rows)
     })
 }
 
+#[cfg(test)]
 fn candidates_endpoint_json(options: &ServerOptions, run_id: &str) -> Value {
+    candidates_endpoint_json_with_query(options, run_id, &ResultQuery::default())
+}
+
+fn candidates_endpoint_json_with_query(
+    options: &ServerOptions,
+    run_id: &str,
+    query: &ResultQuery,
+) -> Value {
     let Some(run_dir) = completed_run_dir(options, run_id) else {
-        return json!({"run_id":run_id,"candidates":[],"row_count":0,"has_output":false});
+        return json!({"run_id":run_id,"candidates":[],"row_count":0,"has_output":false,"pagination":pagination_payload(query,0,0,0)});
     };
-    let rows = user_candidate_rows(&run_dir);
+    let paged = user_candidate_rows_paged(&run_dir, query);
+    let returned_rows = paged.rows.len();
     json!({
         "run_id": run_id,
-        "candidates": rows,
-        "row_count": rows.len(),
-        "has_output": !rows.is_empty()
+        "candidates": paged.rows,
+        "row_count": paged.total_rows,
+        "has_output": paged.total_rows > 0,
+        "pagination": pagination_payload(query,paged.total_rows,paged.filtered_rows,returned_rows)
     })
 }
 
+#[cfg(test)]
 fn candidate_detail_json(options: &ServerOptions, run_id: &str) -> Value {
+    candidate_detail_json_with_query(options, run_id, &ResultQuery::default())
+}
+
+fn candidate_detail_json_with_query(
+    options: &ServerOptions,
+    run_id: &str,
+    query: &ResultQuery,
+) -> Value {
     let Some(run_dir) = completed_run_dir(options, run_id) else {
-        return json!({"run_id":run_id,"candidate_details":[],"candidate_count":0,"has_output":false});
+        return json!({"run_id":run_id,"candidate_details":[],"candidate_count":0,"has_output":false,"pagination":pagination_payload(query,0,0,0)});
     };
     let path = run_dir.join("candidate_detail.json");
     let value = read_json_or(&path, json!({}));
-    let rows = value
+    let all_rows = value
         .get("candidates")
         .and_then(Value::as_array)
         .map(|items| {
@@ -1559,37 +1706,70 @@ fn candidate_detail_json(options: &ServerOptions, run_id: &str) -> Value {
                 .collect::<Vec<_>>()
         })
         .unwrap_or_default();
-    let candidate_count = rows.len();
+    let candidate_count = all_rows.len();
+    let filtered_rows = all_rows
+        .into_iter()
+        .filter(|row| json_row_matches_filter(row, &query.filter))
+        .collect::<Vec<_>>();
+    let filtered_count = filtered_rows.len();
+    let rows = filtered_rows
+        .into_iter()
+        .skip(query.offset())
+        .take(query.page_size)
+        .collect::<Vec<_>>();
+    let returned_rows = rows.len();
     json!({
         "run_id": run_id,
         "candidate_details": rows,
         "candidate_count": candidate_count,
-        "has_output": candidate_count > 0
+        "has_output": candidate_count > 0,
+        "pagination": pagination_payload(query,candidate_count,filtered_count,returned_rows)
     })
 }
 
+#[cfg(test)]
 fn structure_endpoint_json(options: &ServerOptions, run_id: &str) -> Value {
+    structure_endpoint_json_with_query(options, run_id, &ResultQuery::default())
+}
+
+fn structure_endpoint_json_with_query(
+    options: &ServerOptions,
+    run_id: &str,
+    query: &ResultQuery,
+) -> Value {
     let Some(run_dir) = completed_run_dir(options, run_id) else {
-        return json!({"run_id":run_id,"structure_rows":[],"row_count":0,"has_output":false,"viewer":structure_viewer_unavailable("等待运行完成后读取结构坐标输出")});
+        return json!({"run_id":run_id,"structure_rows":[],"row_count":0,"has_output":false,"pagination":pagination_payload(query,0,0,0),"viewer":structure_viewer_unavailable("等待运行完成后读取结构坐标输出")});
     };
     let viewer = structure_viewer_payload(&run_dir);
-    let rows = user_structure_rows(&run_dir, &viewer);
+    let paged = user_structure_rows_paged(&run_dir, &viewer, query);
+    let returned_rows = paged.rows.len();
     json!({
         "run_id": run_id,
-        "structure_rows": rows,
-        "row_count": rows.len(),
-        "has_output": !rows.is_empty(),
+        "structure_rows": paged.rows,
+        "row_count": paged.total_rows,
+        "has_output": paged.total_rows > 0,
+        "pagination": pagination_payload(query,paged.total_rows,paged.filtered_rows,returned_rows),
         "viewer": viewer
     })
 }
 
+#[cfg(test)]
 fn md_endpoint_json(options: &ServerOptions, run_id: &str) -> Value {
+    md_endpoint_json_with_query(options, run_id, &ResultQuery::default())
+}
+
+fn md_endpoint_json_with_query(
+    options: &ServerOptions,
+    run_id: &str,
+    query: &ResultQuery,
+) -> Value {
     let Some(run_dir) = completed_run_dir(options, run_id) else {
         return json!({
             "run_id":run_id,
             "md_rows":[],
             "row_count":0,
             "has_output":false,
+            "pagination":pagination_payload(query,0,0,0),
             "charts":[],
             "readiness":{"ready":false,"reason":"等待运行完成后读取 MD 摘要输出","chart_ready":false},
             "protocol": md_protocol_payload(None),
@@ -1597,14 +1777,16 @@ fn md_endpoint_json(options: &ServerOptions, run_id: &str) -> Value {
             "cuda_monitoring": md_cuda_monitoring_payload(None)
         });
     };
-    let rows = user_md_rows(&run_dir);
-    let charts = md_chart_rows(&run_dir, &rows);
-    let readiness = md_readiness_payload(&run_dir, &rows, &charts);
+    let paged = user_md_rows_paged(&run_dir, query);
+    let charts = md_chart_rows(&run_dir, &paged.rows);
+    let readiness = md_readiness_payload(&run_dir, &paged.rows, &charts);
+    let returned_rows = paged.rows.len();
     json!({
         "run_id": run_id,
-        "md_rows": rows,
-        "row_count": rows.len(),
-        "has_output": !rows.is_empty(),
+        "md_rows": paged.rows,
+        "row_count": paged.total_rows,
+        "has_output": paged.total_rows > 0,
+        "pagination": pagination_payload(query,paged.total_rows,paged.filtered_rows,returned_rows),
         "charts": charts,
         "readiness": readiness,
         "protocol": md_protocol_payload(Some(&run_dir)),
@@ -1613,16 +1795,52 @@ fn md_endpoint_json(options: &ServerOptions, run_id: &str) -> Value {
     })
 }
 
+#[cfg(test)]
 fn genome_endpoint_json(options: &ServerOptions, run_id: &str) -> Value {
+    genome_endpoint_json_with_query(options, run_id, &ResultQuery::default())
+}
+
+fn genome_endpoint_json_with_query(
+    options: &ServerOptions,
+    run_id: &str,
+    query: &ResultQuery,
+) -> Value {
     let Some(run_dir) = completed_run_dir(options, run_id) else {
-        return json!({"run_id":run_id,"genome_context":[],"row_count":0,"has_output":false});
+        return json!({"run_id":run_id,"genome_context":[],"row_count":0,"has_output":false,"pagination":pagination_payload(query,0,0,0)});
     };
-    let rows = user_genome_rows(&run_dir);
+    let paged = user_genome_rows_paged(&run_dir, query);
+    let returned_rows = paged.rows.len();
     json!({
         "run_id": run_id,
-        "genome_context": rows,
-        "row_count": rows.len(),
-        "has_output": !rows.is_empty()
+        "genome_context": paged.rows,
+        "row_count": paged.total_rows,
+        "has_output": paged.total_rows > 0,
+        "pagination": pagination_payload(query,paged.total_rows,paged.filtered_rows,returned_rows)
+    })
+}
+
+fn pagination_payload(
+    query: &ResultQuery,
+    total_rows: usize,
+    filtered_rows: usize,
+    returned_rows: usize,
+) -> Value {
+    let offset = query.offset();
+    let active_filters = if query.filters_active() {
+        vec![query.filter.clone()]
+    } else {
+        Vec::new()
+    };
+    json!({
+        "page": query.page,
+        "page_size": query.page_size,
+        "total_rows": total_rows,
+        "filtered_rows": filtered_rows,
+        "returned_rows": returned_rows,
+        "has_next_page": offset.saturating_add(returned_rows) < filtered_rows,
+        "has_previous_page": query.page > 1 && filtered_rows > 0,
+        "filters_active": query.filters_active(),
+        "active_filters": active_filters
     })
 }
 
@@ -1635,6 +1853,22 @@ fn completed_run_dir(options: &ServerOptions, run_id: &str) -> Option<PathBuf> {
     }
 }
 
+struct PagedRows {
+    rows: Vec<Value>,
+    total_rows: usize,
+    filtered_rows: usize,
+}
+
+impl PagedRows {
+    fn map(self, f: impl Fn(Value) -> Value) -> Self {
+        Self {
+            rows: self.rows.into_iter().map(f).collect(),
+            total_rows: self.total_rows,
+            filtered_rows: self.filtered_rows,
+        }
+    }
+}
+
 fn user_candidate_rows(run_dir: &Path) -> Vec<Value> {
     read_tsv_rows(&run_dir.join("target_candidate_ranking.tsv"))
         .into_iter()
@@ -1642,11 +1876,20 @@ fn user_candidate_rows(run_dir: &Path) -> Vec<Value> {
         .collect()
 }
 
+fn user_candidate_rows_paged(run_dir: &Path, query: &ResultQuery) -> PagedRows {
+    read_tsv_rows_page(&run_dir.join("target_candidate_ranking.tsv"), query)
+        .map(|row| user_candidate_row(&row))
+}
+
 fn user_evidence_rows(run_dir: &Path) -> Vec<Value> {
     read_tsv_rows(&run_dir.join("evidence_ledger.tsv"))
         .into_iter()
         .map(user_evidence_row)
         .collect()
+}
+
+fn user_evidence_rows_paged(run_dir: &Path, query: &ResultQuery) -> PagedRows {
+    read_tsv_rows_page(&run_dir.join("evidence_ledger.tsv"), query).map(user_evidence_row)
 }
 
 fn user_structure_rows(run_dir: &Path, viewer: &Value) -> Vec<Value> {
@@ -1657,12 +1900,34 @@ fn user_structure_rows(run_dir: &Path, viewer: &Value) -> Vec<Value> {
         .collect()
 }
 
+fn user_structure_rows_paged(run_dir: &Path, viewer: &Value, query: &ResultQuery) -> PagedRows {
+    let targets = candidate_target_lookup(run_dir);
+    read_tsv_rows_page(&run_dir.join("structure_patch_summary.tsv"), query)
+        .map(|row| user_structure_row(&row, &targets, viewer))
+}
+
 fn user_md_rows(run_dir: &Path) -> Vec<Value> {
     let targets = candidate_target_lookup(run_dir);
     read_tsv_rows(&run_dir.join("md_summary.tsv"))
         .into_iter()
         .map(|row| user_md_row(&row, &targets))
         .collect()
+}
+
+fn user_md_rows_paged(run_dir: &Path, query: &ResultQuery) -> PagedRows {
+    let targets = candidate_target_lookup(run_dir);
+    read_tsv_rows_page(&run_dir.join("md_summary.tsv"), query)
+        .map(|row| user_md_row(&row, &targets))
+}
+
+fn user_genome_rows_paged(run_dir: &Path, query: &ResultQuery) -> PagedRows {
+    read_tsv_rows_page(&run_dir.join("metagenome_potential_matches.tsv"), query)
+        .map(|row| user_genome_row(&row))
+}
+
+fn json_row_matches_filter(row: &Value, filter: &str) -> bool {
+    let needle = filter.trim().to_ascii_lowercase();
+    needle.is_empty() || row.to_string().to_ascii_lowercase().contains(&needle)
 }
 
 fn structure_viewer_unavailable(reason: &str) -> Value {
@@ -2062,13 +2327,6 @@ fn format_metric_value(value: f64, unit: &str) -> String {
     } else {
         format!("{value:.3} {unit}")
     }
-}
-
-fn user_genome_rows(run_dir: &Path) -> Vec<Value> {
-    read_tsv_rows(&run_dir.join("metagenome_potential_matches.tsv"))
-        .into_iter()
-        .map(|row| user_genome_row(&row))
-        .collect()
 }
 
 fn user_candidate_row(row: &Value) -> Value {
@@ -3829,6 +4087,9 @@ fn artifact_visible_for_user(id: &str, path: &Path, run_dir: &Path, completed: b
     if !path.exists() {
         return false;
     }
+    if !authenticity_gate_allows_download(run_dir) {
+        return false;
+    }
     match id {
         "candidate_ranking" => {
             completed && rows_len(&run_dir.join("target_candidate_ranking.tsv")) > 0
@@ -3842,6 +4103,17 @@ fn artifact_visible_for_user(id: &str, path: &Path, run_dir: &Path, completed: b
         }
         _ => completed,
     }
+}
+
+fn authenticity_gate_allows_download(run_dir: &Path) -> bool {
+    let path = run_dir.join("authenticity_gate.tsv");
+    let Ok(text) = fs::read_to_string(path) else {
+        return true;
+    };
+    !text
+        .lines()
+        .skip(1)
+        .any(|line| line.split('\t').nth(1) == Some("blocked") || line.contains("\tblocked\t"))
 }
 
 fn artifact_specs() -> &'static [(&'static str, &'static str, &'static str)] {
@@ -3995,19 +4267,41 @@ fn stage_user_label(stage: &str) -> &'static str {
 }
 
 fn read_tsv_rows(path: &Path) -> Vec<Value> {
+    read_tsv_rows_page(path, &ResultQuery::all()).rows
+}
+
+fn read_tsv_rows_page(path: &Path, query: &ResultQuery) -> PagedRows {
     let Ok(text) = fs::read_to_string(path) else {
-        return Vec::new();
+        return PagedRows {
+            rows: Vec::new(),
+            total_rows: 0,
+            filtered_rows: 0,
+        };
     };
     let mut lines = text.lines().filter(|line| !line.trim().is_empty());
     let Some(header) = lines.next() else {
-        return Vec::new();
+        return PagedRows {
+            rows: Vec::new(),
+            total_rows: 0,
+            filtered_rows: 0,
+        };
     };
     let headers = header
         .split('\t')
         .map(|value| value.trim().to_string())
         .collect::<Vec<_>>();
-    lines
-        .take(500)
+    let data_lines = lines.collect::<Vec<_>>();
+    let total_rows = data_lines.len();
+    let filter = query.filter.trim().to_ascii_lowercase();
+    let filtered = data_lines
+        .into_iter()
+        .filter(|line| filter.is_empty() || line.to_ascii_lowercase().contains(&filter))
+        .collect::<Vec<_>>();
+    let filtered_rows = filtered.len();
+    let rows = filtered
+        .into_iter()
+        .skip(query.offset())
+        .take(query.page_size)
         .map(|line| {
             let cols = line.split('\t').collect::<Vec<_>>();
             let mut row = serde_json::Map::new();
@@ -4019,7 +4313,12 @@ fn read_tsv_rows(path: &Path) -> Vec<Value> {
             }
             Value::Object(row)
         })
-        .collect()
+        .collect();
+    PagedRows {
+        rows,
+        total_rows,
+        filtered_rows,
+    }
 }
 
 fn rows_len(path: &Path) -> usize {
