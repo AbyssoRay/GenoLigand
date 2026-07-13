@@ -3328,28 +3328,33 @@ def database_smoke_query(
     wsl_distro: str | None,
 ) -> bool:
     lookup = Path(f"{prefix}.lookup")
-    first_id = next((line.split("\t", 1)[0].strip() for line in lookup.read_text(encoding="utf-8", errors="replace").splitlines() if line.strip()), "")
-    if not first_id:
+    smoke_ids: list[str] = []
+    for line in lookup.read_text(encoding="utf-8", errors="replace").splitlines():
+        if line.strip():
+            smoke_ids.append(line.split("\t", 1)[0].strip())
+        if len(smoke_ids) == 64:
+            break
+    if not smoke_ids:
         return False
     smoke_root = prefix.parent / f".smoke-{tool}-{os.getpid()}-{time.time_ns()}"
     smoke_root.mkdir(parents=True, exist_ok=False)
     ids = smoke_root / "ids.tsv"
-    query = smoke_root / "query"
+    subset = smoke_root / "subset"
     result = smoke_root / "result"
     tmp = smoke_root / "tmp"
-    ids.write_text(f"{first_id}\n", encoding="utf-8")
+    ids.write_text("".join(f"{record_id}\n" for record_id in smoke_ids), encoding="utf-8")
     try:
         if os.name == "nt" and wsl_distro:
             commands = [
-                [tool, "createsubdb", wsl_path(ids), wsl_path(prefix), wsl_path(query)],
-                [tool, "search", wsl_path(query), wsl_path(prefix), wsl_path(result), wsl_path(tmp), "--threads", "1", "--max-seqs", "1"],
+                [tool, "createsubdb", wsl_path(ids), wsl_path(prefix), wsl_path(subset)],
+                [tool, "search", wsl_path(subset), wsl_path(subset), wsl_path(result), wsl_path(tmp), "--threads", "1", "--max-seqs", "1"],
             ]
             return all(run_wsl_database_command(wsl_distro, item).returncode == 0 for item in commands)
         if command is None:
             return False
         local_commands = [
-            [command, "createsubdb", str(ids), str(prefix), str(query)],
-            [command, "search", str(query), str(prefix), str(result), str(tmp), "--threads", "1", "--max-seqs", "1"],
+            [command, "createsubdb", str(ids), str(prefix), str(subset)],
+            [command, "search", str(subset), str(subset), str(result), str(tmp), "--threads", "1", "--max-seqs", "1"],
         ]
         return all(run_command(item, env=env).returncode == 0 for item in local_commands)
     except (OSError, UnicodeError):

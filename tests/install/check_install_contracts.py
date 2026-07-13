@@ -180,6 +180,11 @@ def check_database_readiness_contracts(installer) -> None:
         finally:
             installer.run_command = original_run_command
         require(any(command[1] == "search" for command in calls), "database readiness must execute a local smoke search")
+        smoke_search = next(command for command in calls if command[1] == "search")
+        require(
+            smoke_search[2] != str(db_path) and smoke_search[3] != str(db_path),
+            "database smoke search must use bounded query and target subsets instead of scanning the full database",
+        )
 
         def successful_smoke(command, env=None):
             calls.append(command)
