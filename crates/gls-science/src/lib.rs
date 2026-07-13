@@ -1117,17 +1117,14 @@ fn build_store_indexes(
 
     let known_count = known_rows.finish(&indexes_dir.join("known_targets.tsv"))?;
     let metagenome_count = metagenome_rows.finish(&indexes_dir.join("metagenome_targets.tsv"))?;
-    let mut structure_rows = build_structure_index_rows(options, &mut manifest)?;
-    structure_rows = dedupe_store_rows(structure_rows);
-    write_store_rows(
-        &options.science_store.join("indexes/structure_targets.tsv"),
-        &structure_rows,
-    )?;
+    let mut structure_rows = StoreRowSpool::create(&indexes_dir, "structure_targets_raw")?;
+    build_structure_index_rows(options, &mut manifest, &mut structure_rows)?;
+    let structure_count = structure_rows.finish(&indexes_dir.join("structure_targets.tsv"))?;
     write_text(manifest_path, &manifest)?;
     Ok(IndexBuildSummary {
         known_rows: known_count,
         metagenome_rows: metagenome_count,
-        structure_rows: structure_rows.len(),
+        structure_rows: structure_count,
     })
 }
 
@@ -1186,19 +1183,16 @@ fn append_fasta_source_rows(
     Ok(())
 }
 
-fn append_built_rows(
+fn append_built_row_count(
     index_name: &str,
     root: &Path,
     path: &Path,
-    built_rows: Vec<StoreRow>,
-    rows: &mut Vec<StoreRow>,
+    total: usize,
     manifest: &mut String,
     notes: &str,
 ) {
-    let total = built_rows.len();
-    rows.extend(built_rows);
     manifest.push_str(&format!(
-        "{index_name}\t{}\t{}\t{total}\t{}\t{notes}\n",
+        "{index_name}\t{}\t{}\t{total}\t{}\t{notes};complete_source_scan\n",
         relative_display(root, path),
         if total > 0 { "used" } else { "empty" },
         index_output_for(index_name)
@@ -1243,28 +1237,27 @@ fn index_output_for(index_name: &str) -> &'static str {
 fn build_structure_index_rows(
     options: &StoreOptions,
     manifest: &mut String,
-) -> Result<Vec<StoreRow>, String> {
-    let mut rows = Vec::new();
+    rows: &mut StoreRowSpool,
+) -> Result<(), String> {
     for path in discover_structure_files(&options.science_store.join("downloads/rcsb/mmcif"))? {
         let built = structure_file_row("RCSB", &path);
-        append_built_rows(
+        rows.append(std::slice::from_ref(&built))?;
+        append_built_row_count(
             "structure_targets",
             &options.science_store,
             &path,
-            vec![built],
-            &mut rows,
+            1,
             manifest,
             "rcsb_structure_file_rows",
         );
     }
     for path in discover_biolip_tables(&options.science_store.join("downloads/biolip2"))? {
-        let built = parse_biolip_structure_rows(&path)?;
-        append_built_rows(
+        let count = for_each_biolip_structure_row_batch(&path, |batch| rows.append(batch))?;
+        append_built_row_count(
             "structure_targets",
             &options.science_store,
             &path,
-            built,
-            &mut rows,
+            count,
             manifest,
             "biolip2_interaction_rows",
         );
@@ -1279,36 +1272,36 @@ fn build_structure_index_rows(
                 canonical.display()
             ));
         }
-        let built = read_store_rows(&canonical, "plinder_canonical_index")?;
-        if built.is_empty() {
+        let count = for_each_store_row_batch(&canonical, "plinder_canonical_index", |batch| {
+            rows.append(batch)
+        })?;
+        if count == 0 {
             return Err(format!(
                 "plinder_canonical_index_empty:{}",
                 canonical.display()
             ));
         }
-        append_built_rows(
+        append_built_row_count(
             "structure_targets",
             &options.science_store,
             &canonical,
-            built,
-            &mut rows,
+            count,
             manifest,
             "plinder_canonical_rows",
         );
     }
     for path in discover_moad_tables(&options.science_store.join("downloads/binding_moad"))? {
-        let built = parse_moad_structure_rows(&path)?;
-        append_built_rows(
+        let count = for_each_moad_structure_row_batch(&path, |batch| rows.append(batch))?;
+        append_built_row_count(
             "structure_targets",
             &options.science_store,
             &path,
-            built,
-            &mut rows,
+            count,
             manifest,
             "binding_moad_complex_rows",
         );
     }
-    Ok(rows)
+    Ok(())
 }
 
 fn discover_sequence_files(root: &Path) -> Result<Vec<PathBuf>, String> {
@@ -1384,6 +1377,7 @@ fn discover_biolip_tables(root: &Path) -> Result<Vec<PathBuf>, String> {
             || name == "biolip.txt.gz"
             || name == "biolip_nr.txt"
             || name == "biolip_nr.txt.gz"
+            || name.ends_with(".zip")
     })?;
     out.sort();
     Ok(out)
@@ -1409,7 +1403,13 @@ fn discover_moad_tables(root: &Path) -> Result<Vec<PathBuf>, String> {
     }
     discover_matching_files(root, &mut out, |path| {
         let name = lower_file_name(path);
-        name.ends_with(".csv") || name.ends_with(".tsv") || name.ends_with(".txt")
+        name.ends_with(".csv")
+            || name.ends_with(".tsv")
+            || name.ends_with(".txt")
+            || name.ends_with(".csv.gz")
+            || name.ends_with(".tsv.gz")
+            || name.ends_with(".txt.gz")
+            || name.ends_with(".zip")
     })?;
     out.sort();
     Ok(out)
@@ -1671,44 +1671,61 @@ fn structure_file_row(source: &str, path: &Path) -> StoreRow {
 }
 
 fn structure_metadata_tokens(path: &Path) -> BTreeSet<String> {
-    read_structure_text_best_effort(path)
-        .map(|text| tokenize(&structure_metadata_text(&text)))
+    read_structure_metadata_best_effort(path)
+        .map(|text| tokenize(&text))
         .unwrap_or_default()
 }
 
-fn read_structure_text_best_effort(path: &Path) -> Result<String, String> {
+fn read_structure_metadata_best_effort(path: &Path) -> Result<String, String> {
     let name = lower_file_name(path);
     if name.ends_with(".gz") {
-        return read_gzip_text(path).or_else(|_| read_text(path));
+        let compressed = (|| {
+            let file = fs::File::open(path)
+                .map_err(|err| format!("open_failed:{}:{err}", path.display()))?;
+            let mut reader = BufReader::new(GzDecoder::new(file));
+            read_structure_metadata(&mut reader)
+                .map_err(|err| format!("gzip_read_failed:{}:{err}", path.display()))
+        })();
+        return compressed.or_else(|_| {
+            let file = fs::File::open(path)
+                .map_err(|err| format!("open_failed:{}:{err}", path.display()))?;
+            let mut reader = BufReader::new(file);
+            read_structure_metadata(&mut reader)
+                .map_err(|err| format!("read_failed:{}:{err}", path.display()))
+        });
     }
-    read_text(path)
+    let file =
+        fs::File::open(path).map_err(|err| format!("open_failed:{}:{err}", path.display()))?;
+    let mut reader = BufReader::new(file);
+    read_structure_metadata(&mut reader)
+        .map_err(|err| format!("read_failed:{}:{err}", path.display()))
 }
 
-fn structure_metadata_text(text: &str) -> String {
+fn read_structure_metadata(reader: &mut dyn BufRead) -> Result<String, std::io::Error> {
     let mut out = String::new();
     let mut capture_loop = false;
-    for line in text.lines() {
+    let mut line = String::new();
+    while reader.read_line(&mut line)? != 0 {
         let trimmed = line.trim();
         if trimmed.starts_with("_struct.title") || trimmed.starts_with("_citation.title") {
-            push_limited_metadata(&mut out, line);
+            push_limited_metadata(&mut out, &line);
         }
         if trimmed.starts_with("_chem_comp.") || trimmed.starts_with("_pdbx_entity_nonpoly.") {
             capture_loop = true;
-            push_limited_metadata(&mut out, line);
-            continue;
-        }
-        if capture_loop {
+            push_limited_metadata(&mut out, &line);
+        } else if capture_loop {
             if trimmed == "#" {
                 capture_loop = false;
-                continue;
+            } else {
+                push_limited_metadata(&mut out, &line);
             }
-            push_limited_metadata(&mut out, line);
         }
         if out.len() >= MAX_STRUCTURE_METADATA_CHARS {
             break;
         }
+        line.clear();
     }
-    out
+    Ok(out)
 }
 
 fn push_limited_metadata(out: &mut String, line: &str) {
@@ -1722,7 +1739,9 @@ fn push_limited_metadata(out: &mut String, line: &str) {
         }
         out.push(ch);
     }
-    out.push('\n');
+    if out.len() < MAX_STRUCTURE_METADATA_CHARS {
+        out.push('\n');
+    }
 }
 
 fn structure_id_from_file_name(file_name: &str) -> String {
@@ -1750,69 +1769,113 @@ fn structure_id_from_file_name(file_name: &str) -> String {
     safe_id(&name.to_ascii_uppercase())
 }
 
-fn parse_biolip_structure_rows(path: &Path) -> Result<Vec<StoreRow>, String> {
-    let text = read_table_text(path)?;
-    let mut rows = Vec::new();
-    for line in text.lines() {
-        let line = line.trim_start_matches('\u{feff}').trim();
-        if line.is_empty() || line.starts_with('#') {
-            continue;
+fn for_each_biolip_structure_row_batch<F>(path: &Path, mut emit: F) -> Result<usize, String>
+where
+    F: FnMut(&[StoreRow]) -> Result<(), String>,
+{
+    let mut count = 0usize;
+    for_each_table_reader(path, |reader| {
+        let mut batch = Vec::with_capacity(SOURCE_ROW_BATCH_SIZE);
+        for line in reader.lines() {
+            let line = line.map_err(|err| format!("biolip2_read_failed:{err}"))?;
+            let line = line.trim_start_matches('\u{feff}').trim();
+            let Some(row) = biolip_structure_row(line) else {
+                continue;
+            };
+            batch.push(row);
+            if batch.len() >= SOURCE_ROW_BATCH_SIZE {
+                count += batch.len();
+                emit(&batch)?;
+                batch.clear();
+            }
         }
-        let cols = split_loose_columns(line);
-        if cols.is_empty() || cols[0].eq_ignore_ascii_case("pdb_id") {
-            continue;
+        if !batch.is_empty() {
+            count += batch.len();
+            emit(&batch)?;
         }
-        let pdb = cols.first().map(|value| value.trim()).unwrap_or_default();
-        if pdb.is_empty() {
-            continue;
-        }
-        let chain = cols.get(1).map(|value| value.trim()).unwrap_or_default();
-        let ligand = cols
-            .get(4)
-            .or_else(|| cols.get(3))
-            .map(|value| value.trim())
-            .unwrap_or_default();
-        let target_id = if chain.is_empty() {
-            safe_id(&pdb.to_ascii_uppercase())
-        } else {
-            safe_id(&format!("{}_{}", pdb.to_ascii_uppercase(), chain))
-        };
-        let mut structure_tokens = tokenize(line);
-        structure_tokens.extend(tokenize(pdb));
-        structure_tokens.extend(tokenize(chain));
-        rows.push(StoreRow {
-            source: "BioLiP2".to_string(),
-            target_id,
-            target_name: if chain.is_empty() {
-                format!("BioLiP2 interaction {}", pdb.to_ascii_uppercase())
-            } else {
-                format!(
-                    "BioLiP2 interaction {} chain {chain}",
-                    pdb.to_ascii_uppercase()
-                )
-            },
-            organism: "unknown".to_string(),
-            target_class: "structure_interaction_record".to_string(),
-            ligand_tokens: tokenize(ligand),
-            sequence_tokens: tokenize(&format!("{pdb} {chain}")),
-            structure_tokens: tokenize_limited(
-                &structure_tokens.into_iter().collect::<Vec<_>>().join(" "),
-                MAX_SEQUENCE_TOKEN_CHARS,
-            ),
-            evidence: "biolip2_interaction_row".to_string(),
-        });
-    }
-    Ok(rows)
+        Ok(())
+    })?;
+    Ok(count)
 }
 
-fn parse_moad_structure_rows(path: &Path) -> Result<Vec<StoreRow>, String> {
-    let text = read_table_text(path)?;
-    let mut lines = text
-        .lines()
-        .map(str::trim)
-        .filter(|line| !line.is_empty() && !line.starts_with('#'));
-    let Some(first_line) = lines.next() else {
-        return Ok(Vec::new());
+fn biolip_structure_row(line: &str) -> Option<StoreRow> {
+    if line.is_empty() || line.starts_with('#') {
+        return None;
+    }
+    let cols = split_loose_columns(line);
+    if cols.is_empty() || cols[0].eq_ignore_ascii_case("pdb_id") {
+        return None;
+    }
+    let pdb = cols.first().map(|value| value.trim()).unwrap_or_default();
+    if pdb.is_empty() {
+        return None;
+    }
+    let chain = cols.get(1).map(|value| value.trim()).unwrap_or_default();
+    let ligand = cols
+        .get(4)
+        .or_else(|| cols.get(3))
+        .map(|value| value.trim())
+        .unwrap_or_default();
+    let target_id = if chain.is_empty() {
+        safe_id(&pdb.to_ascii_uppercase())
+    } else {
+        safe_id(&format!("{}_{}", pdb.to_ascii_uppercase(), chain))
+    };
+    let mut structure_tokens = tokenize(line);
+    structure_tokens.extend(tokenize(pdb));
+    structure_tokens.extend(tokenize(chain));
+    Some(StoreRow {
+        source: "BioLiP2".to_string(),
+        target_id,
+        target_name: if chain.is_empty() {
+            format!("BioLiP2 interaction {}", pdb.to_ascii_uppercase())
+        } else {
+            format!(
+                "BioLiP2 interaction {} chain {chain}",
+                pdb.to_ascii_uppercase()
+            )
+        },
+        organism: "unknown".to_string(),
+        target_class: "structure_interaction_record".to_string(),
+        ligand_tokens: tokenize(ligand),
+        sequence_tokens: tokenize(&format!("{pdb} {chain}")),
+        structure_tokens: tokenize_limited(
+            &structure_tokens.into_iter().collect::<Vec<_>>().join(" "),
+            MAX_SEQUENCE_TOKEN_CHARS,
+        ),
+        evidence: "biolip2_interaction_row".to_string(),
+    })
+}
+
+fn for_each_moad_structure_row_batch<F>(path: &Path, mut emit: F) -> Result<usize, String>
+where
+    F: FnMut(&[StoreRow]) -> Result<(), String>,
+{
+    let mut count = 0usize;
+    for_each_table_reader(path, |reader| {
+        count += parse_moad_structure_reader_batched(reader, &mut emit)?;
+        Ok(())
+    })?;
+    Ok(count)
+}
+
+fn parse_moad_structure_reader_batched<F>(
+    reader: &mut dyn BufRead,
+    emit: &mut F,
+) -> Result<usize, String>
+where
+    F: FnMut(&[StoreRow]) -> Result<(), String>,
+{
+    let mut lines = reader.lines();
+    let first_line = loop {
+        let Some(line) = lines.next() else {
+            return Ok(0);
+        };
+        let line = line.map_err(|err| format!("binding_moad_read_failed:{err}"))?;
+        let line = line.trim_start_matches('\u{feff}').trim();
+        if !line.is_empty() && !line.starts_with('#') {
+            break line.to_string();
+        }
     };
     let delimiter = if first_line.contains('\t') {
         Some('\t')
@@ -1821,7 +1884,7 @@ fn parse_moad_structure_rows(path: &Path) -> Result<Vec<StoreRow>, String> {
     } else {
         None
     };
-    let first_cols = split_optional_delimited(first_line, delimiter);
+    let first_cols = split_optional_delimited(&first_line, delimiter);
     let first_is_header = first_cols.iter().any(|col| {
         let key = normalize_header(col);
         matches!(
@@ -1850,53 +1913,95 @@ fn parse_moad_structure_rows(path: &Path) -> Result<Vec<StoreRow>, String> {
             "units",
         ],
     );
-    let mut rows = Vec::new();
-    let mut row_lines = Vec::new();
-    if !first_is_header {
-        row_lines.push(first_line.to_string());
+    let mut batch = Vec::with_capacity(SOURCE_ROW_BATCH_SIZE);
+    let mut count = 0usize;
+    if !first_is_header
+        && let Some(row) = moad_structure_row(
+            &first_line,
+            delimiter,
+            false,
+            pdb_idx,
+            ligand_idx,
+            affinity_idx,
+        )
+    {
+        batch.push(row);
     }
-    row_lines.extend(lines.map(ToOwned::to_owned));
-    for line in row_lines {
-        let cols = split_optional_delimited(&line, delimiter);
-        let pdb = if first_is_header {
-            cell(&cols, pdb_idx)
-        } else {
-            cols.first()
-                .map(|value| value.trim().to_string())
-                .unwrap_or_default()
-        };
-        if pdb.is_empty() {
+    for line in lines {
+        let line = line.map_err(|err| format!("binding_moad_read_failed:{err}"))?;
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
             continue;
         }
-        let ligand = if first_is_header {
-            cell(&cols, ligand_idx)
-        } else {
-            cols.get(1)
-                .map(|value| value.trim().to_string())
-                .unwrap_or_default()
-        };
-        let affinity = if first_is_header {
-            cell(&cols, affinity_idx)
-        } else {
-            cols.get(2)
-                .map(|value| value.trim().to_string())
-                .unwrap_or_default()
-        };
-        let mut ligand_tokens = tokenize(&ligand);
-        ligand_tokens.extend(tokenize(&affinity));
-        rows.push(StoreRow {
-            source: "Binding MOAD".to_string(),
-            target_id: safe_id(&pdb.to_ascii_uppercase()),
-            target_name: format!("Binding MOAD complex {}", pdb.to_ascii_uppercase()),
-            organism: "unknown".to_string(),
-            target_class: "structure_interaction_record".to_string(),
-            ligand_tokens,
-            sequence_tokens: tokenize(&pdb),
-            structure_tokens: tokenize_limited(&line, MAX_SEQUENCE_TOKEN_CHARS),
-            evidence: "binding_moad_complex_row".to_string(),
-        });
+        if let Some(row) = moad_structure_row(
+            line,
+            delimiter,
+            first_is_header,
+            pdb_idx,
+            ligand_idx,
+            affinity_idx,
+        ) {
+            batch.push(row);
+        }
+        if batch.len() >= SOURCE_ROW_BATCH_SIZE {
+            count += batch.len();
+            emit(&batch)?;
+            batch.clear();
+        }
     }
-    Ok(rows)
+    if !batch.is_empty() {
+        count += batch.len();
+        emit(&batch)?;
+    }
+    Ok(count)
+}
+
+fn moad_structure_row(
+    line: &str,
+    delimiter: Option<char>,
+    has_header: bool,
+    pdb_idx: Option<usize>,
+    ligand_idx: Option<usize>,
+    affinity_idx: Option<usize>,
+) -> Option<StoreRow> {
+    let cols = split_optional_delimited(line, delimiter);
+    let pdb = if has_header {
+        cell(&cols, pdb_idx)
+    } else {
+        cols.first()
+            .map(|value| value.trim().to_string())
+            .unwrap_or_default()
+    };
+    if pdb.is_empty() {
+        return None;
+    }
+    let ligand = if has_header {
+        cell(&cols, ligand_idx)
+    } else {
+        cols.get(1)
+            .map(|value| value.trim().to_string())
+            .unwrap_or_default()
+    };
+    let affinity = if has_header {
+        cell(&cols, affinity_idx)
+    } else {
+        cols.get(2)
+            .map(|value| value.trim().to_string())
+            .unwrap_or_default()
+    };
+    let mut ligand_tokens = tokenize(&ligand);
+    ligand_tokens.extend(tokenize(&affinity));
+    Some(StoreRow {
+        source: "Binding MOAD".to_string(),
+        target_id: safe_id(&pdb.to_ascii_uppercase()),
+        target_name: format!("Binding MOAD complex {}", pdb.to_ascii_uppercase()),
+        organism: "unknown".to_string(),
+        target_class: "structure_interaction_record".to_string(),
+        ligand_tokens,
+        sequence_tokens: tokenize(&pdb),
+        structure_tokens: tokenize_limited(line, MAX_SEQUENCE_TOKEN_CHARS),
+        evidence: "binding_moad_complex_row".to_string(),
+    })
 }
 
 fn split_loose_columns(line: &str) -> Vec<String> {
@@ -1938,66 +2043,34 @@ fn split_csv_line(line: &str) -> Vec<String> {
     out
 }
 
-fn read_table_text(path: &Path) -> Result<String, String> {
-    let name = path
-        .file_name()
-        .and_then(|value| value.to_str())
-        .unwrap_or_default()
-        .to_ascii_lowercase();
-    if name.ends_with(".gz") {
-        read_gzip_text(path)
-    } else if name.ends_with(".zip") {
-        read_zip_text(path, matches_table_name)
-    } else {
-        read_text(path)
-    }
-}
-
 fn matches_table_name(name: &str) -> bool {
     name.ends_with(".tsv") || name.ends_with(".txt")
 }
 
-fn read_gzip_text(path: &Path) -> Result<String, String> {
-    let file =
-        fs::File::open(path).map_err(|err| format!("open_failed:{}:{err}", path.display()))?;
-    let mut decoder = GzDecoder::new(file);
-    let mut text = String::new();
-    decoder
-        .read_to_string(&mut text)
-        .map_err(|err| format!("gzip_read_failed:{}:{err}", path.display()))?;
-    Ok(text)
+fn matches_structure_table_name(name: &str) -> bool {
+    matches_table_name(name) || name.ends_with(".csv")
 }
 
-fn read_zip_text(path: &Path, accept: fn(&str) -> bool) -> Result<String, String> {
+fn for_each_table_reader<F>(path: &Path, mut visit: F) -> Result<usize, String>
+where
+    F: FnMut(&mut dyn BufRead) -> Result<(), String>,
+{
+    let name = lower_file_name(path);
+    if name.ends_with(".zip") {
+        return for_each_supported_zip_member(path, matches_structure_table_name, |_, reader| {
+            visit(reader)
+        });
+    }
     let file =
         fs::File::open(path).map_err(|err| format!("open_failed:{}:{err}", path.display()))?;
-    let mut archive =
-        ZipArchive::new(file).map_err(|err| format!("zip_open_failed:{}:{err}", path.display()))?;
-    let mut members = archive
-        .file_names()
-        .enumerate()
-        .filter_map(|(index, name)| {
-            let lower = name.to_ascii_lowercase();
-            (!name.ends_with('/') && accept(&lower)).then(|| (lower, name.to_string(), index))
-        })
-        .collect::<Vec<_>>();
-    members.sort();
-    if members.is_empty() {
-        return Err(format!("zip_no_supported_text_member:{}", path.display()));
+    if name.ends_with(".gz") {
+        let mut reader = BufReader::new(GzDecoder::new(file));
+        visit(&mut reader).map_err(|err| format!("gzip_read_failed:{}:{err}", path.display()))?;
+    } else {
+        let mut reader = BufReader::new(file);
+        visit(&mut reader).map_err(|err| format!("read_failed:{}:{err}", path.display()))?;
     }
-    let mut text = String::new();
-    for (_, _, index) in members {
-        let mut member = archive
-            .by_index(index)
-            .map_err(|err| format!("zip_member_failed:{}:{err}", path.display()))?;
-        member
-            .read_to_string(&mut text)
-            .map_err(|err| format!("zip_read_failed:{}:{err}", path.display()))?;
-        if !text.ends_with('\n') {
-            text.push('\n');
-        }
-    }
-    Ok(text)
+    Ok(1)
 }
 
 fn for_each_supported_zip_member<F>(
@@ -2099,46 +2172,6 @@ fn fasta_organism(header: &str) -> Option<String> {
         None
     } else {
         Some(organism)
-    }
-}
-
-fn dedupe_store_rows(rows: Vec<StoreRow>) -> Vec<StoreRow> {
-    let mut by_key = BTreeMap::new();
-    for row in rows {
-        by_key
-            .entry((row.source.clone(), row.target_id.clone()))
-            .and_modify(|existing: &mut StoreRow| merge_store_row(existing, &row))
-            .or_insert(row);
-    }
-    by_key.into_values().collect()
-}
-
-fn merge_store_row(existing: &mut StoreRow, row: &StoreRow) {
-    if existing.target_name == "unknown" && row.target_name != "unknown" {
-        existing.target_name = row.target_name.clone();
-    }
-    if existing.organism == "unknown" && row.organism != "unknown" {
-        existing.organism = row.organism.clone();
-    }
-    if existing.target_class != "known_human_protein" && row.target_class == "known_human_protein" {
-        existing.target_class = row.target_class.clone();
-    }
-    existing
-        .ligand_tokens
-        .extend(row.ligand_tokens.iter().cloned());
-    existing
-        .sequence_tokens
-        .extend(row.sequence_tokens.iter().cloned());
-    existing
-        .structure_tokens
-        .extend(row.structure_tokens.iter().cloned());
-    if !existing
-        .evidence
-        .split(';')
-        .any(|item| item == row.evidence)
-    {
-        existing.evidence.push(';');
-        existing.evidence.push_str(&row.evidence);
     }
 }
 
@@ -3346,10 +3379,6 @@ fn match_known(options: &ScienceOptions) -> Result<String, String> {
     let inputs = read_computed_feature_inputs(&options.run_dir.join("feature_manifest.tsv"))?;
     let normalized =
         read_normalized_inputs(&options.run_dir.join("input_normalized_manifest.tsv"))?;
-    let rows = read_store_rows(
-        &options.science_store.join("indexes/known_targets.tsv"),
-        "known_database_index",
-    )?;
     let output_path = options.run_dir.join("known_database_matches.tsv");
     if let Some(parent) = output_path.parent() {
         ensure_dir(parent)?;
@@ -3361,30 +3390,39 @@ fn match_known(options: &ScienceOptions) -> Result<String, String> {
         b"input_id\tsource\ttarget_id\ttarget_name\torganism\ttarget_class\tmatch_score\tmatched_features\tevidence\tsource_row_provenance\tactivity_value\tligand_identity\tcurrent_run_query_id\trecord_id\n",
     )
     .map_err(|err| format!("write_failed:{}:{err}", output_path.display()))?;
-    for input in &inputs {
-        for row in &rows {
-            let score = known_database_match_score(input, row);
-            if score > 0.0 {
-                let matched = matched_tokens(input, row).join(" ");
-                writeln!(
-                    out,
-                    "{}\t{}\t{}\t{}\t{}\t{}\t{score:.4}\t{}\t{}\t{}\t\t{}\tprojection_index_match\t{}",
-                    input.input_id,
-                    row.source,
-                    row.target_id,
-                    clean_cell(&row.target_name),
-                    clean_cell(&row.organism),
-                    row.target_class,
-                    clean_cell(&matched),
-                    clean_cell(&row.evidence),
-                    clean_cell(&row.evidence),
-                    clean_cell(&matched),
-                    clean_cell(&input.record_id),
-                )
-                .map_err(|err| format!("write_failed:{}:{err}", output_path.display()))?;
+    for_each_store_row_batch(
+        &options.science_store.join("indexes/known_targets.tsv"),
+        "known_database_index",
+        |rows| {
+            for input in &inputs {
+                for row in rows {
+                    let score = known_database_match_score(input, row);
+                    if score > 0.0 {
+                        let matched = matched_tokens(input, row).join(" ");
+                        writeln!(
+                            out,
+                            "{}\t{}\t{}\t{}\t{}\t{}\t{score:.4}\t{}\t{}\t{}\t\t{}\tprojection_index_match\t{}",
+                            input.input_id,
+                            row.source,
+                            row.target_id,
+                            clean_cell(&row.target_name),
+                            clean_cell(&row.organism),
+                            row.target_class,
+                            clean_cell(&matched),
+                            clean_cell(&row.evidence),
+                            clean_cell(&row.evidence),
+                            clean_cell(&matched),
+                            clean_cell(&input.record_id),
+                        )
+                        .map_err(|err| {
+                            format!("write_failed:{}:{err}", output_path.display())
+                        })?;
+                    }
+                }
             }
-        }
-    }
+            Ok(())
+        },
+    )?;
     append_chembl_onsite_matches(options, &normalized, &mut out)?;
     append_bindingdb_onsite_matches(options, &normalized, &mut out)?;
     let mut mmseqs = String::new();
@@ -5081,8 +5119,7 @@ fn activity_nm_from_evidence(value: &str) -> Option<f64> {
 
 fn coordinate_hint_score(path: &Path, hint: &KnownStructureHint) -> f64 {
     let mut score = hint.match_score;
-    if let Ok(text) = read_structure_text_best_effort(path) {
-        let metadata = structure_metadata_text(&text);
+    if let Ok(metadata) = read_structure_metadata_best_effort(path) {
         let metadata_tokens = tokens_with_numeric_aliases(&metadata);
         let target_tokens =
             tokens_with_numeric_aliases(&format!("{} {}", hint.target_name, hint.organism));
