@@ -12,7 +12,7 @@
 - GitHub 用于存储提交，不运行 GitHub Actions。
 - 保留 Rust、Python、JavaScript 和 Nextflow 技术栈。
 - 科学解析和轨迹计算使用成熟库：RDKit、PyArrow、MMseqs2、Foldseek、AutoDock Vina、MDTraj/MDAnalysis、OpenMM。
-- 每个阶段递增补丁版本、提交并推送 `codex/fix-audit-44`。
+- 每个阶段递增补丁版本、提交并推送 `main`，禁止新建其他分支。
 - 不以文字调整、状态改名或宽松 fallback 代替实际科学能力。
 - 运行所需工具从 GenoLigand 已安装 runtime/WSL 环境解析，不能以历史 `tool_versions.tsv` 代替实际探针。
 

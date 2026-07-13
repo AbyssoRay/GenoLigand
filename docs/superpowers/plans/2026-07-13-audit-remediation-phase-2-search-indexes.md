@@ -233,4 +233,4 @@ python tests/e2e/check_pipeline_contracts.py
 python tests/webui/check_static_webui_contracts.py
 ```
 
-Then run focused local MMseqs/Foldseek/PyArrow fixtures through the installed WSL worker environment, perform an independent read-only review, update the audit ledger, increment the patch version for each commit, and push `codex/fix-audit-44` with `[skip ci]`.
+Then run focused local MMseqs/Foldseek/PyArrow fixtures through the installed WSL worker environment, perform an independent read-only review, update the audit ledger, increment the patch version for each commit, and push `main` with `[skip ci]`. Do not create another branch.
