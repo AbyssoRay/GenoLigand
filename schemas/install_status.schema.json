@@ -3,14 +3,204 @@
   "$id": "https://genoligand.local/schemas/install_status.schema.json",
   "title": "GenoLigand Install Status",
   "type": "object",
-  "required": ["status", "progress_percent", "next_action"],
+  "required": [
+    "status",
+    "install_ready",
+    "summary",
+    "next_action",
+    "access_url",
+    "progress",
+    "downloads",
+    "external_sources",
+    "resources",
+    "source_records",
+    "tool_environment",
+    "cuda_toolkit",
+    "alignment_databases",
+    "forcefields",
+    "runtime"
+  ],
   "additionalProperties": false,
+  "$defs": {
+    "countSummary": {
+      "type": "object",
+      "required": ["completed", "ready", "total", "next_action"],
+      "additionalProperties": false,
+      "properties": {
+        "completed": { "type": "boolean" },
+        "ready": { "type": "integer", "minimum": 0 },
+        "total": { "type": "integer", "minimum": 0 },
+        "next_action": { "type": "string" }
+      }
+    },
+    "resourceItem": {
+      "type": "object",
+      "required": ["label", "status", "ready", "next_action"],
+      "additionalProperties": false,
+      "properties": {
+        "label": { "type": "string", "minLength": 1 },
+        "status": { "type": "string", "minLength": 1 },
+        "ready": { "type": "boolean" },
+        "next_action": { "type": "string" }
+      }
+    },
+    "recordSet": {
+      "type": "object",
+      "required": ["label", "ready", "total", "completed"],
+      "additionalProperties": false,
+      "properties": {
+        "label": { "type": "string", "minLength": 1 },
+        "ready": { "type": "integer", "minimum": 0 },
+        "total": { "type": "integer", "minimum": 0 },
+        "completed": { "type": "boolean" }
+      }
+    }
+  },
   "properties": {
-    "status": { "type": "string" },
-    "progress_percent": { "type": "number", "minimum": 0, "maximum": 100 },
+    "status": { "type": "string", "minLength": 1 },
+    "install_ready": { "type": "boolean" },
+    "summary": { "type": "string" },
     "next_action": { "type": "string" },
-    "science_store_path": { "type": ["string", "null"] },
-    "tool_status": { "type": "array", "items": { "type": "object", "additionalProperties": true } },
-    "database_status": { "type": "array", "items": { "type": "object", "additionalProperties": true } }
+    "access_url": { "type": "string" },
+    "progress": {
+      "type": "object",
+      "if": { "minProperties": 1 },
+      "then": {
+        "required": [
+          "status",
+          "stage",
+          "current_resource",
+          "completed_steps",
+          "total_steps",
+          "failed_steps",
+          "bytes_downloaded",
+          "bytes_total",
+          "percent",
+          "message",
+          "updated_at"
+        ]
+      },
+      "additionalProperties": false,
+      "properties": {
+        "status": { "type": "string", "minLength": 1 },
+        "stage": { "type": "string" },
+        "current_resource": { "type": "string" },
+        "completed_steps": { "type": "integer", "minimum": 0 },
+        "total_steps": { "type": "integer", "minimum": 0 },
+        "failed_steps": { "type": "integer", "minimum": 0 },
+        "bytes_downloaded": { "type": "integer", "minimum": 0 },
+        "bytes_total": {
+          "oneOf": [
+            { "type": "integer", "minimum": 0 },
+            { "const": "" }
+          ]
+        },
+        "percent": { "type": "integer", "minimum": 0, "maximum": 100 },
+        "message": { "type": "string" },
+        "updated_at": { "type": "integer", "minimum": 0 }
+      }
+    },
+    "downloads": {
+      "type": "object",
+      "if": { "minProperties": 1 },
+      "then": { "required": ["status", "ready", "failed", "message", "next_action"] },
+      "additionalProperties": false,
+      "properties": {
+        "status": { "type": "string", "minLength": 1 },
+        "ready": { "type": "integer", "minimum": 0 },
+        "failed": { "type": "integer", "minimum": 0 },
+        "message": { "type": "string" },
+        "next_action": { "type": "string" }
+      }
+    },
+    "external_sources": {
+      "type": "object",
+      "if": { "minProperties": 1 },
+      "then": {
+        "required": ["status", "ready", "total", "needs_action", "message", "next_action", "items"]
+      },
+      "additionalProperties": false,
+      "properties": {
+        "status": { "type": "string", "minLength": 1 },
+        "ready": { "type": "integer", "minimum": 0 },
+        "total": { "type": "integer", "minimum": 0 },
+        "needs_action": { "type": "integer", "minimum": 0 },
+        "message": { "type": "string" },
+        "next_action": { "type": "string" },
+        "items": { "type": "array", "items": { "$ref": "#/$defs/resourceItem" } }
+      }
+    },
+    "resources": {
+      "type": "object",
+      "if": { "minProperties": 1 },
+      "then": { "required": ["status", "ready", "total", "needs_action", "items"] },
+      "additionalProperties": false,
+      "properties": {
+        "status": { "type": "string", "minLength": 1 },
+        "ready": { "type": "integer", "minimum": 0 },
+        "total": { "type": "integer", "minimum": 0 },
+        "needs_action": { "type": "integer", "minimum": 0 },
+        "items": { "type": "array", "items": { "$ref": "#/$defs/resourceItem" } }
+      }
+    },
+    "source_records": {
+      "type": "object",
+      "required": [
+        "completed",
+        "ready",
+        "total",
+        "integrity_ready",
+        "license_ready",
+        "record_sets",
+        "next_action"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "completed": { "type": "boolean" },
+        "ready": { "type": "integer", "minimum": 0 },
+        "total": { "type": "integer", "minimum": 0 },
+        "integrity_ready": { "type": "integer", "minimum": 0 },
+        "license_ready": { "type": "integer", "minimum": 0 },
+        "record_sets": { "type": "array", "items": { "$ref": "#/$defs/recordSet" } },
+        "next_action": { "type": "string" }
+      }
+    },
+    "tool_environment": { "$ref": "#/$defs/countSummary" },
+    "cuda_toolkit": {
+      "type": "object",
+      "if": { "minProperties": 1 },
+      "then": { "required": ["status", "path", "nvcc", "notes"] },
+      "additionalProperties": false,
+      "properties": {
+        "status": { "type": "string", "minLength": 1 },
+        "path": { "type": "string" },
+        "nvcc": { "type": "string", "minLength": 1 },
+        "notes": { "type": "string" }
+      }
+    },
+    "alignment_databases": {
+      "type": "object",
+      "required": ["completed", "ready", "deferred", "total", "next_action"],
+      "additionalProperties": false,
+      "properties": {
+        "completed": { "type": "boolean" },
+        "ready": { "type": "integer", "minimum": 0 },
+        "deferred": { "type": "integer", "minimum": 0 },
+        "total": { "type": "integer", "minimum": 0 },
+        "next_action": { "type": "string" }
+      }
+    },
+    "forcefields": { "$ref": "#/$defs/countSummary" },
+    "runtime": {
+      "type": "object",
+      "required": ["gls_cli_ready", "gls_server_ready", "launcher", "next_action"],
+      "additionalProperties": false,
+      "properties": {
+        "gls_cli_ready": { "type": "boolean" },
+        "gls_server_ready": { "type": "boolean" },
+        "launcher": { "type": "string" },
+        "next_action": { "type": "string" }
+      }
+    }
   }
 }

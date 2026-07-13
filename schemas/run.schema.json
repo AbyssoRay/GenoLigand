@@ -3,17 +3,67 @@
   "$id": "https://genoligand.local/schemas/run.schema.json",
   "title": "GenoLigand Run",
   "type": "object",
-  "required": ["run_id", "project_id", "state", "input_manifest_id", "artifact_ids"],
+  "required": ["run_id", "state"],
   "additionalProperties": false,
   "properties": {
     "run_id": { "type": "string", "minLength": 1 },
-    "project_id": { "type": "string", "minLength": 1 },
-    "state": { "type": "string" },
+    "state": { "type": "string", "minLength": 1 },
+    "current_stage": { "type": "string" },
+    "failure_summary": { "type": "string" },
+    "trace": {
+      "type": "object",
+      "required": [
+        "project_label",
+        "run_label",
+        "input_status",
+        "database_status",
+        "output_status",
+        "output_count",
+        "candidate_status",
+        "candidate_count",
+        "evidence_status",
+        "evidence_count"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "project_label": { "type": "string" },
+        "run_label": { "type": "string" },
+        "input_status": { "type": "string" },
+        "database_status": { "type": "string" },
+        "output_status": { "type": "string" },
+        "output_count": { "type": "integer", "minimum": 0 },
+        "candidate_status": { "type": "string" },
+        "candidate_count": { "type": "integer", "minimum": 0 },
+        "evidence_status": { "type": "string" },
+        "evidence_count": { "type": "integer", "minimum": 0 }
+      }
+    },
+    "outputs": {
+      "type": "object",
+      "required": ["items"],
+      "additionalProperties": false,
+      "properties": {
+        "items": {
+          "type": "array",
+          "items": { "$ref": "artifact.schema.json" }
+        }
+      }
+    },
     "state_label": { "type": "string" },
-    "input_manifest_id": { "type": ["string", "null"] },
-    "database_manifest_id": { "type": ["string", "null"] },
-    "artifact_ids": { "type": "array", "items": { "type": "string" } },
-    "started_at": { "type": ["string", "null"] },
-    "finished_at": { "type": ["string", "null"] }
+    "stages": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["id", "label", "status", "status_label", "reason"],
+        "additionalProperties": false,
+        "properties": {
+          "id": { "type": "string", "minLength": 1 },
+          "label": { "type": "string", "minLength": 1 },
+          "status": { "type": "string", "minLength": 1 },
+          "status_label": { "type": "string", "minLength": 1 },
+          "reason": { "type": "string" }
+        }
+      }
+    }
   }
 }

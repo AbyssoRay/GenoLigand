@@ -1,18 +1,13 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://genoligand.local/schemas/artifact.schema.json",
-  "title": "GenoLigand Artifact",
+  "title": "GenoLigand Artifact Summary",
   "type": "object",
-  "required": ["artifact_id", "run_id", "kind", "path", "exists"],
+  "required": ["id", "label", "exists"],
   "additionalProperties": false,
   "properties": {
-    "artifact_id": { "type": "string", "minLength": 1 },
-    "run_id": { "type": "string", "minLength": 1 },
-    "kind": { "type": "string", "minLength": 1 },
-    "path": { "type": "string", "minLength": 1 },
-    "exists": { "type": "boolean" },
-    "bytes": { "type": ["integer", "null"], "minimum": 0 },
-    "sha256": { "type": ["string", "null"] },
-    "source": { "type": ["string", "null"] }
+    "id": { "type": "string", "minLength": 1 },
+    "label": { "type": "string", "minLength": 1 },
+    "exists": { "type": "boolean" }
   }
 }
