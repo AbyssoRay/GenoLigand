@@ -1165,6 +1165,38 @@ fn user_input_inspection_rejects_missing_structure_path() {
 }
 
 #[test]
+fn user_input_inspection_cleanup_failure_preserves_resolver_cause() {
+    let root = std::env::temp_dir().join(format!(
+        "genoligand-inspection-cleanup-cause-{}",
+        now_millis()
+    ));
+    let options = server_options(root.clone());
+
+    let response = inspect_user_input_json_with_cleanup(
+        &options,
+        r#"{"inputs":[{"field":"small_molecule","value":"Z:\\missing\\ghost.sdf"}],"files":[]}"#,
+        |_| Err("input_manifest_cleanup_failed:injected".to_string()),
+    );
+
+    assert_eq!(response["error"], "input_manifest_cleanup_failed");
+    assert_eq!(response["cause"]["error"], "input_file_not_found");
+    let errors = response["errors"].as_array().expect("errors");
+    assert!(errors.iter().any(|error| {
+        error
+            .as_str()
+            .unwrap_or_default()
+            .contains("input_manifest_cleanup_failed")
+    }));
+    assert!(errors.iter().any(|error| {
+        error
+            .as_str()
+            .unwrap_or_default()
+            .contains("input_file_not_found")
+    }));
+    fs::remove_dir_all(&root).ok();
+}
+
+#[test]
 fn user_input_inspection_rejects_malformed_json() {
     let root =
         std::env::temp_dir().join(format!("genoligand-malformed-inspection-{}", now_millis()));
@@ -1222,7 +1254,7 @@ fn user_input_inspection_parses_error_after_colon_record_id() {
     let options = server_options(root.clone());
     let fasta = root.join("invalid-peptide.fasta");
     fs::create_dir_all(&root).expect("root");
-    fs::write(&fasta, ">sample:chain\nZZ\n").expect("fasta");
+    fs::write(&fasta, ">sample\nACDEFG\n>sample:chain\nZZ\n").expect("fasta");
     let body = json!({
         "inputs": [{"field": "peptide", "value": fasta.display().to_string()}],
         "files": []
@@ -1232,7 +1264,7 @@ fn user_input_inspection_parses_error_after_colon_record_id() {
     let response = inspect_user_input_json(&options, &body);
 
     assert_eq!(response["usable"], false);
-    assert_eq!(response["inputs"][0]["record_id"], "sample:chain");
+    assert_eq!(response["inputs"][1]["record_id"], "sample:chain");
     assert_eq!(response["error"], "invalid_peptide_sequence");
     fs::remove_dir_all(&root).ok();
 }
@@ -1433,6 +1465,9 @@ fn input_validation_rejects_malformed_save_without_state_changes() {
     let options = server_options(root.clone());
     let project = project_dir(&options, "project-1");
     fs::create_dir_all(&project).expect("project");
+    let old_manifest = r#"{"inputs":[{"field":"peptide","value":"ACDEFG"}],"files":[]}"#;
+    fs::write(project.join("input_manifest.json"), old_manifest).expect("formal manifest");
+    fs::write(project.join("input_manifest.pending.json"), "stale pending").expect("pending");
     fs::write(project.join("project_name.txt"), "旧项目\n").expect("project name");
     fs::write(project.join("latest_run_id.txt"), "run-old\n").expect("latest run");
 
@@ -1440,7 +1475,10 @@ fn input_validation_rejects_malformed_save_without_state_changes() {
 
     assert_eq!(response["status"], "failed");
     assert_eq!(response["error"], "invalid_input_manifest_json");
-    assert!(!project.join("input_manifest.json").exists());
+    assert_eq!(
+        fs::read_to_string(project.join("input_manifest.json")).expect("formal manifest"),
+        old_manifest
+    );
     assert!(!project.join("input_manifest.pending.json").exists());
     assert_eq!(
         read_trimmed(&project.join("project_name.txt")).as_deref(),
@@ -1449,6 +1487,39 @@ fn input_validation_rejects_malformed_save_without_state_changes() {
     assert_eq!(
         read_trimmed(&project.join("latest_run_id.txt")).as_deref(),
         Some("run-old")
+    );
+    fs::remove_dir_all(&root).ok();
+}
+
+#[test]
+fn input_validation_malformed_save_reports_cleanup_failure_with_json_cause() {
+    let root = std::env::temp_dir().join(format!("genoligand-malformed-cleanup-{}", now_millis()));
+    let options = server_options(root.clone());
+    fs::create_dir_all(project_dir(&options, "project-1")).expect("project");
+
+    let response = write_input_manifest_with_operations(
+        &options,
+        "project-1",
+        r#"{"inputs":["#,
+        |_, _| panic!("malformed JSON must not promote"),
+        |_| Err("input_manifest_cleanup_failed:injected".to_string()),
+    );
+
+    assert_eq!(response["status"], "failed");
+    assert_eq!(response["error"], "input_manifest_cleanup_failed");
+    assert_eq!(
+        response["inspection"]["cause"]["error"],
+        "invalid_input_manifest_json"
+    );
+    assert!(
+        response["inspection"]["errors"]
+            .as_array()
+            .expect("errors")
+            .iter()
+            .any(|error| error
+                .as_str()
+                .unwrap_or_default()
+                .contains("invalid_input_manifest_json"))
     );
     fs::remove_dir_all(&root).ok();
 }
@@ -1488,9 +1559,18 @@ fn input_validation_has_no_server_owned_recognizer_module() {
     let module = ["input", "recognition"].join("_");
     let source_root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src");
     let lib_source = fs::read_to_string(source_root.join("lib.rs")).expect("server source");
+    let repo_root = source_root
+        .parent()
+        .and_then(Path::parent)
+        .and_then(Path::parent)
+        .expect("repository root");
+    let e2e_source = fs::read_to_string(repo_root.join("tests/e2e/check_pipeline_contracts.py"))
+        .expect("pipeline contract checker");
+    let removed_path = format!("src/{module}.rs");
 
     assert!(!source_root.join(format!("{module}.rs")).exists());
     assert!(!lib_source.contains(&format!("mod {module}")));
+    assert!(!e2e_source.replace('\\', "/").contains(&removed_path));
 }
 
 #[test]

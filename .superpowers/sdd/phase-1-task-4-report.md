@@ -50,3 +50,32 @@
 - `gls-server` adds the workspace path dependency `gls-science = { path = "../gls-science" }`.
 - No registry dependency was added. `atomic-file-install` is absent from manifests and `Cargo.lock`.
 - Final Cargo verification ran with `--offline`; the lockfile changes contain workspace version updates and the direct `gls-science` dependency edge.
+
+## Review follow-up (2026-07-13)
+
+### RED evidence
+
+| Command | Exit | Observed failure |
+| --- | ---: | --- |
+| `cargo test --offline -p gls-server user_input_inspection_parses_error_after_colon_record_id` | 101 | The shorter `input_1:sample:` prefix won and returned `chain` instead of `invalid_peptide_sequence`. |
+| `cargo test --offline -p gls-server input_validation_rejects_malformed_save_without_state_changes` | 101 | A stale `input_manifest.pending.json` survived malformed JSON parsing. |
+| `cargo test --offline -p gls-server input_validation_malformed_save_reports_cleanup_failure_with_json_cause` | 101 | Parsing returned `invalid_input_manifest_json` before attempting injected cleanup. |
+| `cargo test --offline -p gls-server user_input_inspection_cleanup_failure_preserves_resolver_cause` | 101 | The injectable inspection cleanup helper was absent. |
+| `cargo test --offline -p gls-server input_validation_has_no_server_owned_recognizer_module` | 101 | The E2E checker still referenced the deleted server recognizer source path. |
+
+### GREEN evidence
+
+| Command | Exit | Result |
+| --- | ---: | --- |
+| `cargo test --offline -p gls-server user_input_inspection_parses_error_after_colon_record_id` | 0 | Longest exact record prefix selected; 1 passed. |
+| `cargo test --offline -p gls-server input_validation_rejects_malformed_save_without_state_changes` | 0 | Stale pending file removed while formal manifest, project name, and run selection remained unchanged. |
+| `cargo test --offline -p gls-server input_validation_malformed_save_reports_cleanup_failure_with_json_cause` | 0 | Cleanup error became top-level and retained the invalid JSON cause. |
+| `cargo test --offline -p gls-server user_input_inspection_cleanup_failure_preserves_resolver_cause` | 0 | Cleanup error retained `input_file_not_found` in the structured cause and errors. |
+| `cargo test --offline -p gls-server user_input_inspection` | 0 | 9 passed. |
+| `cargo test --offline -p gls-server input_validation_has_no_server_owned_recognizer_module` | 0 | 1 passed; the checker no longer references the removed path. |
+| `python tests/e2e/check_pipeline_contracts.py` | 0 | `pipeline_contracts PASS`. |
+| `python -m py_compile tests/e2e/check_pipeline_contracts.py` | 0 | Compile check passed. |
+| `cargo fmt --all -- --check` | 1 then 0 | Rustfmt identified three assertion-layout differences; `cargo fmt --all` corrected them and the final check passed. |
+| `git diff --check` | 0 | Clean. |
+
+The review publishes workspace version `0.9.50` in `Cargo.toml` and all three workspace package entries in `Cargo.lock`. It adds no registry dependency. The continuation used the completed focused Rust results above and retained the full Task4 suite evidence in the preceding Final verification section.

@@ -637,6 +637,17 @@ fn read_input_manifest(options: &ServerOptions, project_id: &str) -> Value {
 }
 
 fn inspect_user_input_json(options: &ServerOptions, body: &str) -> Value {
+    inspect_user_input_json_with_cleanup(options, body, remove_pending_file)
+}
+
+fn inspect_user_input_json_with_cleanup<C>(
+    options: &ServerOptions,
+    body: &str,
+    mut cleanup: C,
+) -> Value
+where
+    C: FnMut(&Path) -> Result<(), String>,
+{
     let inspection_dir = options.artifact_dir.join("input-inspection");
     let sequence = INPUT_INSPECTION_SEQUENCE.fetch_add(1, Ordering::Relaxed);
     let pending = inspection_dir.join(format!(
@@ -645,18 +656,22 @@ fn inspect_user_input_json(options: &ServerOptions, body: &str) -> Value {
     ));
     if let Err(err) = write_text(&pending, body) {
         let failure = failed_inspection_json(err);
-        return match remove_pending_file(&pending) {
-            Ok(()) => failure,
-            Err(cleanup_err) => cleanup_failure_inspection(failure, cleanup_err),
-        };
+        return inspection_after_cleanup(failure, &pending, &mut cleanup);
     }
-    let result = inspect_manifest(options, &pending);
-    if let Err(err) = remove_pending_file(&pending) {
-        return failed_inspection_json(err);
-    }
-    match result {
+    let response = match inspect_manifest(options, &pending) {
         Ok(inspection) => inspection_json(&inspection),
         Err(err) => failed_inspection_json(err),
+    };
+    inspection_after_cleanup(response, &pending, &mut cleanup)
+}
+
+fn inspection_after_cleanup<C>(response: Value, pending: &Path, cleanup: &mut C) -> Value
+where
+    C: FnMut(&Path) -> Result<(), String>,
+{
+    match cleanup(pending) {
+        Ok(()) => response,
+        Err(err) => cleanup_failure_inspection(response, err),
     }
 }
 
@@ -696,12 +711,20 @@ fn inspection_error_code(inspection: &InputInspection) -> &str {
     let Some(error) = inspection.errors.first() else {
         return "input_not_usable";
     };
-    for input in &inspection.inputs {
-        let record_id = input.record_id.replace(['\t', '\r', '\n'], " ");
-        let prefix = format!("{}:{record_id}:", input.input_id);
-        if let Some(reason) = error.strip_prefix(&prefix) {
-            return resolver_error_code(reason);
-        }
+    let matched_reason = inspection
+        .inputs
+        .iter()
+        .filter_map(|input| {
+            let record_id = input.record_id.replace(['\t', '\r', '\n'], " ");
+            let prefix = format!("{}:{record_id}:", input.input_id);
+            error
+                .strip_prefix(&prefix)
+                .map(|reason| (prefix.len(), reason))
+        })
+        .max_by_key(|(prefix_len, _)| *prefix_len)
+        .map(|(_, reason)| reason);
+    if let Some(reason) = matched_reason {
+        return resolver_error_code(reason);
     }
     resolver_error_code(error)
 }
@@ -830,7 +853,13 @@ where
         Ok(value) => value,
         Err(err) => {
             let inspection = failed_inspection_json(format!("invalid_input_manifest_json:{err}"));
-            return failed_input_save(options, project_id, inspection);
+            return failed_save_after_cleanup(
+                options,
+                project_id,
+                &pending,
+                inspection,
+                &mut cleanup,
+            );
         }
     };
     if let Err(err) = write_text(&pending, body) {
