@@ -469,6 +469,104 @@ fn feature_compute_emits_type_specific_features_for_all_supported_inputs() {
     assert!(!root.exists());
 }
 
+#[test]
+fn identical_long_protein_uses_shared_database_and_query_tokens() {
+    let sequence = "MKTAYIAKQRQISFVKSHFSRQDILDLWQ".repeat(4);
+    let input_tokens = peptide_or_protein_features("protein_sequence", &sequence)
+        .into_iter()
+        .filter_map(|row| (!row.token.is_empty()).then_some(row.token))
+        .collect::<BTreeSet<_>>();
+    let input = ComputedFeatureInput {
+        input_id: "input_1".to_string(),
+        record_id: "record_1".to_string(),
+        input_kind: "protein_ligand".to_string(),
+        tokens: input_tokens,
+    };
+    let mut rows = Vec::new();
+    push_fasta_row(
+        "fixture",
+        "test",
+        "known_protein",
+        "long_protein_fixture",
+        "LONG_PROTEIN identical sequence",
+        &sequence,
+        &mut rows,
+    );
+
+    assert_eq!(rows.len(), 1);
+    assert_eq!(score_row(&input, &rows[0]), 1.0);
+    assert!(!matched_tokens(&input, &rows[0]).is_empty());
+}
+
+#[test]
+fn rna_and_reverse_complement_orfs_keep_strand_and_frame_identity() {
+    let rna = translate_orfs("AUGGCUUUUUAA");
+    assert!(
+        rna.iter()
+            .any(|orf| orf.peptide == "MAF" && orf.strand == '+' && orf.frame == 0)
+    );
+
+    let reverse = translate_orfs("TTAGGGTTTCAT");
+    assert!(
+        reverse
+            .iter()
+            .any(|orf| orf.peptide == "MKP" && orf.strand == '-' && orf.frame == 0)
+    );
+}
+
+#[test]
+fn multi_fasta_records_do_not_form_cross_record_orfs() {
+    let features = genome_or_metagenome_features(">alpha\nATGAAA\n>beta\nCCCTAA\n");
+    assert!(
+        features
+            .iter()
+            .any(|row| { row.name == "translated_orf_count" && row.value == "0" })
+    );
+    assert!(
+        !features
+            .iter()
+            .any(|row| { row.name == "translated_orf_feature_token" && row.token == "mkp" })
+    );
+}
+
+#[test]
+fn genome_orf_features_preserve_fasta_record_strand_and_frame_identity() {
+    let root = temp_root("genome_orf_record_identity");
+    let fasta = root.join("contigs.fasta");
+    write_text(&fasta, ">alpha\nATGCGTGTGTAA\n>beta\nTTAGGGTTTCAT\n").expect("fasta");
+    let input = root.join("input.json");
+    write_text(
+        &input,
+        &format!(
+            r#"{{"inputs":[{{"field":"genome_or_metagenome","value":{}}}],"files":[]}}"#,
+            serde_json::to_string(&fasta.display().to_string()).expect("path JSON")
+        ),
+    )
+    .expect("input");
+    let run = root.join("run");
+    let options = science_options(&root, &input, &run);
+
+    run_science_command(ScienceCommand::InputNormalize, &options).expect("normalize");
+    run_science_command(ScienceCommand::FeaturesCompute, &options).expect("features");
+    let features = read_text(&run.join("feature_manifest.tsv")).expect("feature manifest");
+
+    assert!(features.lines().any(|line| {
+        line.contains("\ttranslated_orf_identity\trecord=record_1;strand=+;frame=0;")
+            && line.ends_with("\talpha")
+    }));
+    assert!(features.lines().any(|line| {
+        line.contains("\ttranslated_orf_identity\trecord=record_1;strand=-;frame=0;")
+            && line.ends_with("\tbeta")
+    }));
+    assert!(features.lines().any(|line| {
+        line.contains("\ttranslated_orf_feature_token\tmrv\t") && line.ends_with("\talpha")
+    }));
+    assert!(features.lines().any(|line| {
+        line.contains("\ttranslated_orf_feature_token\tmkp\t") && line.ends_with("\tbeta")
+    }));
+    fs::remove_dir_all(root).expect("cleanup");
+}
+
 fn science_options(root: &Path, input: &Path, run: &Path) -> ScienceOptions {
     ScienceOptions {
         workspace_root: root.to_path_buf(),

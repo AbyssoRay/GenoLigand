@@ -1732,7 +1732,7 @@ fn push_fasta_row(
     }
     let (target_id, target_name) = fasta_id_and_name(header);
     let organism = fasta_organism(header).unwrap_or_else(|| default_organism.to_string());
-    let mut sequence_tokens = tokenize_limited(sequence, MAX_SEQUENCE_TOKEN_CHARS);
+    let mut sequence_tokens = protein_sequence_tokens(sequence);
     sequence_tokens.extend(tokenize(header));
     rows.push(StoreRow {
         source: source.to_string(),
@@ -6792,7 +6792,7 @@ fn chembl_store_row(row: ChEMBLActivityRow) -> StoreRow {
     let mut sequence_tokens = tokenize(&row.target_id);
     sequence_tokens.extend(tokenize(&row.target_name));
     sequence_tokens.extend(tokenize(&row.accessions));
-    sequence_tokens.extend(tokenize_limited(&row.sequences, MAX_SEQUENCE_TOKEN_CHARS));
+    sequence_tokens.extend(protein_sequence_tokens(&row.sequences));
     let organism = if row.organism.trim().is_empty() {
         "unknown".to_string()
     } else {
@@ -6934,7 +6934,7 @@ where
         for idx in activity_indexes.iter().flatten() {
             ligand_tokens.extend(tokenize(cell(&cols, Some(*idx)).as_str()));
         }
-        let mut sequence_tokens = tokenize_limited(&sequence, MAX_SEQUENCE_TOKEN_CHARS);
+        let mut sequence_tokens = protein_sequence_tokens(&sequence);
         sequence_tokens.extend(tokenize(&target_name));
         sequence_tokens.extend(tokenize(&uniprot));
         rows.push(StoreRow {
@@ -7176,7 +7176,7 @@ fn peptide_or_protein_features(family: &str, value: &str) -> Vec<FeatureRow> {
     rows.extend(token_feature_rows(
         family,
         "sequence_feature_token",
-        tokenize(&sequence),
+        protein_sequence_tokens(&sequence),
     ));
     rows
 }
@@ -7234,21 +7234,35 @@ fn complex_features(value: &str) -> Vec<FeatureRow> {
 }
 
 fn genome_or_metagenome_features(value: &str) -> Vec<FeatureRow> {
-    let sequence = compact_sequence(value);
-    let nucleotide_count = sequence
-        .chars()
-        .filter(|ch| matches!(ch.to_ascii_uppercase(), 'A' | 'C' | 'G' | 'T' | 'U' | 'N'))
-        .count();
-    let gc_count = sequence
-        .chars()
-        .filter(|ch| matches!(ch.to_ascii_uppercase(), 'G' | 'C'))
+    let records = nucleotide_records(value);
+    let nucleotide_count = records
+        .iter()
+        .map(|(_, sequence)| sequence.len())
+        .sum::<usize>();
+    let gc_count = records
+        .iter()
+        .flat_map(|(_, sequence)| sequence.chars())
+        .filter(|ch| matches!(ch, 'G' | 'C'))
         .count();
     let gc_fraction = if nucleotide_count > 0 {
         format!("{:.4}", gc_count as f64 / nucleotide_count as f64)
     } else {
         "0.0000".to_string()
     };
-    let translated_orfs = translate_orfs(&sequence);
+    let translated_orfs = records
+        .iter()
+        .flat_map(|(record_id, sequence)| {
+            translate_orfs(sequence)
+                .into_iter()
+                .map(|orf| (record_id.clone(), orf))
+        })
+        .collect::<Vec<_>>();
+    let start_marker_count = records
+        .iter()
+        .map(|(_, sequence)| {
+            sequence.matches("ATG").count() + reverse_complement(sequence).matches("ATG").count()
+        })
+        .sum::<usize>();
     let mut rows = vec![
         feature_row(
             "genome_or_metagenome",
@@ -7270,11 +7284,7 @@ fn genome_or_metagenome_features(value: &str) -> Vec<FeatureRow> {
         feature_row(
             "genome_or_metagenome",
             "orf_start_marker_count",
-            sequence
-                .to_ascii_uppercase()
-                .matches("ATG")
-                .count()
-                .to_string(),
+            start_marker_count.to_string(),
             "",
         ),
         feature_row(
@@ -7290,11 +7300,20 @@ fn genome_or_metagenome_features(value: &str) -> Vec<FeatureRow> {
             "",
         ),
     ];
-    for peptide in translated_orfs {
+    for (record_id, orf) in translated_orfs {
+        rows.push(feature_row(
+            "genome_or_metagenome",
+            "translated_orf_identity",
+            format!(
+                "record={record_id};strand={};frame={};start={}",
+                orf.strand, orf.frame, orf.start
+            ),
+            "",
+        ));
         rows.extend(token_feature_rows(
             "genome_or_metagenome",
             "translated_orf_feature_token",
-            tokenize(&peptide),
+            protein_sequence_tokens(&orf.peptide),
         ));
     }
     if rows
@@ -7306,7 +7325,10 @@ fn genome_or_metagenome_features(value: &str) -> Vec<FeatureRow> {
         rows.extend(token_feature_rows(
             "genome_or_metagenome",
             "sequence_feature_token",
-            tokenize(&sequence),
+            records
+                .iter()
+                .flat_map(|(_, sequence)| tokenize(sequence))
+                .collect(),
         ));
     }
     rows
@@ -7328,34 +7350,104 @@ fn token_feature_rows(family: &str, name: &str, tokens: BTreeSet<String>) -> Vec
         .collect()
 }
 
-fn translate_orfs(sequence: &str) -> Vec<String> {
-    let upper = sequence.to_ascii_uppercase();
-    let bases = upper.as_bytes();
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct TranslatedOrf {
+    peptide: String,
+    strand: char,
+    frame: usize,
+    start: usize,
+}
+
+fn translate_orfs(sequence: &str) -> Vec<TranslatedOrf> {
+    let forward = normalize_dna(sequence);
     let mut peptides = Vec::new();
-    for frame in 0..3 {
-        let mut pos = frame;
-        while pos + 3 <= bases.len() {
-            if &upper[pos..pos + 3] != "ATG" {
-                pos += 3;
-                continue;
-            }
-            let mut peptide = String::new();
-            let mut codon_pos = pos;
-            while codon_pos + 3 <= bases.len() {
-                let codon = &upper[codon_pos..codon_pos + 3];
-                if matches!(codon, "TAA" | "TAG" | "TGA") {
-                    break;
+    for (strand, strand_sequence) in [('+', forward.clone()), ('-', reverse_complement(&forward))] {
+        let bases = strand_sequence.as_bytes();
+        for frame in 0..3 {
+            let mut pos = frame;
+            while pos + 3 <= bases.len() {
+                if &strand_sequence[pos..pos + 3] != "ATG" {
+                    pos += 3;
+                    continue;
                 }
-                peptide.push(codon_to_amino_acid(codon));
-                codon_pos += 3;
+                let mut peptide = String::new();
+                let mut codon_pos = pos;
+                while codon_pos + 3 <= bases.len() {
+                    let codon = &strand_sequence[codon_pos..codon_pos + 3];
+                    if matches!(codon, "TAA" | "TAG" | "TGA") {
+                        break;
+                    }
+                    peptide.push(codon_to_amino_acid(codon));
+                    codon_pos += 3;
+                }
+                if peptide.len() >= 3 {
+                    peptides.push(TranslatedOrf {
+                        peptide,
+                        strand,
+                        frame,
+                        start: pos,
+                    });
+                }
+                pos += 3;
             }
-            if peptide.len() >= 3 {
-                peptides.push(peptide);
-            }
-            pos += 3;
         }
     }
     peptides
+}
+
+fn nucleotide_records(value: &str) -> Vec<(String, String)> {
+    let mut records = Vec::new();
+    let mut record_id = None::<String>;
+    let mut sequence = String::new();
+    for line in value.lines() {
+        if let Some(header) = line.strip_prefix('>') {
+            if let Some(previous_id) = record_id.replace(
+                header
+                    .split_whitespace()
+                    .next()
+                    .filter(|text| !text.is_empty())
+                    .unwrap_or("record")
+                    .to_string(),
+            ) {
+                records.push((previous_id, normalize_dna(&sequence)));
+                sequence.clear();
+            }
+        } else {
+            sequence.push_str(line);
+        }
+    }
+    if let Some(last_id) = record_id {
+        records.push((last_id, normalize_dna(&sequence)));
+    } else {
+        records.push(("record_1".to_string(), normalize_dna(value)));
+    }
+    records.retain(|(_, sequence)| !sequence.is_empty());
+    records
+}
+
+fn normalize_dna(value: &str) -> String {
+    value
+        .chars()
+        .filter_map(|ch| match ch.to_ascii_uppercase() {
+            'A' | 'C' | 'G' | 'T' | 'N' => Some(ch.to_ascii_uppercase()),
+            'U' => Some('T'),
+            _ => None,
+        })
+        .collect()
+}
+
+fn reverse_complement(sequence: &str) -> String {
+    sequence
+        .chars()
+        .rev()
+        .map(|base| match base {
+            'A' => 'T',
+            'C' => 'G',
+            'G' => 'C',
+            'T' => 'A',
+            _ => 'N',
+        })
+        .collect()
 }
 
 fn codon_to_amino_acid(codon: &str) -> char {
@@ -7632,6 +7724,10 @@ fn tokenize_limited(value: &str, max_chars: usize) -> BTreeSet<String> {
     tokens.insert(format!("len_{char_count}"));
     tokens.insert(format!("hash_{}", stable_hash(value)));
     tokens
+}
+
+fn protein_sequence_tokens(value: &str) -> BTreeSet<String> {
+    tokenize_limited(value, MAX_SEQUENCE_TOKEN_CHARS)
 }
 
 fn compact_sequence_tokens(value: &str) -> BTreeSet<String> {
