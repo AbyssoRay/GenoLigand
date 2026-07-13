@@ -25,6 +25,12 @@ DEFAULT_MINIMIZATION_ITERATIONS = 200
 DEFAULT_TIMESTEP_PS = 0.002
 DEFAULT_GPU_TELEMETRY_POLL_SECONDS = 1.0
 GAS_CONSTANT_KJ_PER_MOL_K = 0.00831446261815324
+MINIMUM_MD_PRODUCTION_SAMPLES = 10
+RMSD_SCORE_SCALE_ANGSTROM = 4.0
+LIGAND_DRIFT_SCORE_SCALE_ANGSTROM = 3.0
+CONTACT_CUTOFF_ANGSTROM = 4.5
+HBOND_DISTANCE_CUTOFF_NM = 0.25
+HBOND_ANGLE_CUTOFF_DEGREES = 120.0
 
 
 @dataclass
@@ -173,6 +179,25 @@ def run_md_summary_job(job: dict[str, Any]) -> WorkerExecution:
         )
         return md_execution("not_ready", reason, openmm_version_text(openmm, "not_ready", reason), True)
 
+    timestep_ps = env_float("GENOLIGAND_MD_TIMESTEP_PS", DEFAULT_TIMESTEP_PS)
+    equilibration_steps = env_int("GENOLIGAND_MD_EQUILIBRATION_STEPS", DEFAULT_EQUILIBRATION_STEPS)
+    production_segments = env_int("GENOLIGAND_MD_PRODUCTION_SEGMENTS", DEFAULT_PRODUCTION_SEGMENTS)
+    production_steps_per_segment = env_int(
+        "GENOLIGAND_MD_PRODUCTION_STEPS_PER_SEGMENT",
+        DEFAULT_PRODUCTION_STEPS_PER_SEGMENT,
+    )
+    telemetry_poll_seconds = env_float("GENOLIGAND_GPU_TELEMETRY_POLL_SECONDS", DEFAULT_GPU_TELEMETRY_POLL_SECONDS)
+    production_steps_total = production_segments * production_steps_per_segment
+    sampling_reason = md_sampling_rejection_reason(production_steps_total, production_segments + 1)
+    if sampling_reason:
+        write_md_not_ready(run_dir, sampling_reason, [sampling_reason])
+        return md_execution(
+            "not_ready",
+            sampling_reason,
+            openmm_version_text(openmm, "not_ready", sampling_reason),
+            True,
+        )
+
     conformer = mol.GetConformer()
     initial_angstrom = np.array(
         [
@@ -201,7 +226,6 @@ def run_md_summary_job(job: dict[str, Any]) -> WorkerExecution:
         ligand_positions,
         science_store,
     )
-    timestep_ps = env_float("GENOLIGAND_MD_TIMESTEP_PS", DEFAULT_TIMESTEP_PS)
     integrator = openmm.LangevinMiddleIntegrator(
         300 * unit.kelvin,
         1 / unit.picosecond,
@@ -224,14 +248,6 @@ def run_md_summary_job(job: dict[str, Any]) -> WorkerExecution:
     post_minimization_energy = potential_energy_kj_mol(context, unit)
     sample_gpu_telemetry(gpu_telemetry, "after_minimization")
     context.setVelocitiesToTemperature(300 * unit.kelvin, SIMULATION_SEED)
-    equilibration_steps = env_int("GENOLIGAND_MD_EQUILIBRATION_STEPS", DEFAULT_EQUILIBRATION_STEPS)
-    production_segments = env_int("GENOLIGAND_MD_PRODUCTION_SEGMENTS", DEFAULT_PRODUCTION_SEGMENTS)
-    production_steps_per_segment = env_int(
-        "GENOLIGAND_MD_PRODUCTION_STEPS_PER_SEGMENT",
-        DEFAULT_PRODUCTION_STEPS_PER_SEGMENT,
-    )
-    telemetry_poll_seconds = env_float("GENOLIGAND_GPU_TELEMETRY_POLL_SECONDS", DEFAULT_GPU_TELEMETRY_POLL_SECONDS)
-    production_steps_total = production_segments * production_steps_per_segment
     total_step = 0
     candidate_id = top_candidate_id(run_dir) or input_id
     if equilibration_steps > 0:
@@ -246,8 +262,9 @@ def run_md_summary_job(job: dict[str, Any]) -> WorkerExecution:
     sample_gpu_telemetry(gpu_telemetry, "after_equilibration")
 
     frames: list[Any] = []
+    box_vectors: list[Any | None] = []
     state_rows: list[list[str]] = []
-    frame, state_row = current_state_snapshot(
+    frame, state_row, periodic_box = current_state_snapshot(
         context,
         unit,
         candidate_id=candidate_id,
@@ -257,8 +274,10 @@ def run_md_summary_job(job: dict[str, Any]) -> WorkerExecution:
         time_ps=total_step * timestep_ps,
         particle_count=system.getNumParticles(),
         stage="post_equilibration",
+        periodic=model_metadata["nonbonded_method"] == "PME",
     )
     frames.append(frame)
+    box_vectors.append(periodic_box)
     state_rows.append(state_row)
     with GpuTelemetryMonitor(
         gpu_telemetry,
@@ -269,7 +288,7 @@ def run_md_summary_job(job: dict[str, Any]) -> WorkerExecution:
         for segment in range(production_segments):
             integrator.step(production_steps_per_segment)
             total_step += production_steps_per_segment
-            frame, state_row = current_state_snapshot(
+            frame, state_row, periodic_box = current_state_snapshot(
                 context,
                 unit,
                 candidate_id=candidate_id,
@@ -279,8 +298,10 @@ def run_md_summary_job(job: dict[str, Any]) -> WorkerExecution:
                 time_ps=total_step * timestep_ps,
                 particle_count=system.getNumParticles(),
                 stage=f"production_segment_{segment + 1}",
+                periodic=model_metadata["nonbonded_method"] == "PME",
             )
             frames.append(frame)
+            box_vectors.append(periodic_box)
             state_rows.append(state_row)
             sample_gpu_telemetry(gpu_telemetry, f"production_segment_{segment + 1}")
     sample_gpu_telemetry(gpu_telemetry, "after_production")
@@ -314,7 +335,14 @@ def run_md_summary_job(job: dict[str, Any]) -> WorkerExecution:
         "ligand_placement_from_autodock_vina_pose",
         "standard_openmm_forcefield_complex",
     ]
-    metrics = summarize_complex_frames(mol, receptor, frames, role_ranges)
+    metrics = summarize_complex_frames(
+        mol,
+        receptor,
+        frames,
+        role_ranges,
+        box_vectors=box_vectors,
+        production_steps_total=production_steps_total,
+    )
     write_md_artifacts(
         run_dir,
         candidate_id,
@@ -983,26 +1011,36 @@ def current_state_snapshot(
     time_ps: float,
     particle_count: int,
     stage: str,
-) -> tuple[Any, list[str]]:
-    state = context.getState(getPositions=True, getEnergy=True)
+    periodic: bool,
+) -> tuple[Any, list[str], Any | None]:
+    state = context.getState(getPositions=True, getEnergy=True, enforcePeriodicBox=periodic)
     positions = state.getPositions(asNumpy=True).value_in_unit(unit.angstrom)
+    periodic_box = (
+        state.getPeriodicBoxVectors(asNumpy=True).value_in_unit(unit.angstrom)
+        if periodic
+        else None
+    )
     potential = float(state.getPotentialEnergy().value_in_unit(unit.kilojoule_per_mole))
     kinetic = float(state.getKineticEnergy().value_in_unit(unit.kilojoule_per_mole))
     total = potential + kinetic
     temperature = temperature_estimate_kelvin(kinetic, particle_count)
-    return positions, [
-        candidate_id,
-        input_id,
-        str(frame_index),
-        str(step),
-        fmt(time_ps),
-        stage,
-        fmt(potential),
-        fmt(kinetic),
-        fmt(total),
-        fmt(temperature),
-        "OpenMM Context state",
-    ]
+    return (
+        positions,
+        [
+            candidate_id,
+            input_id,
+            str(frame_index),
+            str(step),
+            fmt(time_ps),
+            stage,
+            fmt(potential),
+            fmt(kinetic),
+            fmt(total),
+            fmt(temperature),
+            "OpenMM Context state",
+        ],
+        periodic_box,
+    )
 
 
 def temperature_estimate_kelvin(kinetic_energy_kj_mol: float, particle_count: int) -> float:
@@ -1290,8 +1328,18 @@ def summarize_complex_frames(
     receptor: ReceptorCoordinate,
     frames: list[Any],
     role_ranges: dict[str, range],
+    box_vectors: list[Any | None] | None = None,
+    production_steps_total: int | None = None,
 ) -> dict[str, float]:
+    import mdtraj
     import numpy as np
+
+    sampling_reason = md_sampling_rejection_reason(
+        1 if production_steps_total is None else production_steps_total,
+        len(frames),
+    )
+    if sampling_reason:
+        raise ValueError(sampling_reason)
 
     receptor_indices = list(role_ranges["receptor"])
     ligand_indices = list(role_ranges["ligand"])
@@ -1303,32 +1351,66 @@ def summarize_complex_frames(
         ligand_heavy_local = list(range(mol.GetNumAtoms()))
     if not receptor_heavy_local:
         receptor_heavy_local = list(range(len(receptor.atoms)))
-    receptor_heavy = [receptor_indices[index] for index in receptor_heavy_local]
-    ligand_heavy = [ligand_indices[index] for index in ligand_heavy_local]
 
-    receptor_frames = [np.asarray(frame, dtype=float)[receptor_heavy, :] for frame in frames]
-    ligand_frames = [np.asarray(frame, dtype=float)[ligand_heavy, :] for frame in frames]
-    receptor_reference = receptor_frames[0]
-    rmsd_values = [kabsch_rmsd(frame, receptor_reference) for frame in receptor_frames[1:]]
-    stack = np.stack([np.vstack([r_frame, l_frame]) for r_frame, l_frame in zip(receptor_frames, ligand_frames)], axis=0)
-    mean_by_atom = stack.mean(axis=0)
-    rmsf_by_atom = np.sqrt(((stack - mean_by_atom) ** 2).sum(axis=2).mean(axis=0))
-    centers = np.array([frame.mean(axis=0) for frame in ligand_frames])
-    drift_values = np.sqrt(((centers - centers[0]) ** 2).sum(axis=1))[1:]
+    topology = complex_mdtraj_topology(receptor, mol, mdtraj)
+    complex_frames = np.stack(
+        [
+            np.vstack(
+                [
+                    np.asarray(frame, dtype=float)[receptor_indices, :],
+                    np.asarray(frame, dtype=float)[ligand_indices, :],
+                ]
+            )
+            for frame in frames
+        ],
+        axis=0,
+    )
+    trajectory = mdtraj.Trajectory(complex_frames / 10.0, topology)
+    if box_vectors is not None and len(box_vectors) > 0 and all(box is not None for box in box_vectors):
+        periodic_boxes = np.asarray(box_vectors, dtype=float)
+        if periodic_boxes.shape != (len(frames), 3, 3):
+            raise ValueError("invalid_periodic_box_vectors")
+        trajectory.unitcell_vectors = periodic_boxes / 10.0
+        receptor_atoms = set(range(len(receptor_indices)))
+        anchor_molecules = [
+            molecule
+            for molecule in topology.find_molecules()
+            if molecule and all(atom.index in receptor_atoms for atom in molecule)
+        ]
+        if anchor_molecules:
+            trajectory = trajectory.image_molecules(anchor_molecules=anchor_molecules)
+
+    trajectory.superpose(
+        trajectory,
+        frame=0,
+        atom_indices=np.asarray(receptor_heavy_local, dtype=int),
+    )
+    aligned = np.asarray(trajectory.xyz, dtype=float) * 10.0
+    receptor_heavy = receptor_heavy_local
+    ligand_heavy = [len(receptor_indices) + index for index in ligand_heavy_local]
+    receptor_frames = aligned[1:, receptor_heavy, :]
+    ligand_frames = aligned[1:, ligand_heavy, :]
+    receptor_reference = aligned[0, receptor_heavy, :]
+    ligand_reference = aligned[0, ligand_heavy, :]
+
+    receptor_delta = receptor_frames - receptor_reference
+    rmsd_values = np.sqrt((receptor_delta**2).sum(axis=2).mean(axis=1))
+    mean_by_atom = receptor_frames.mean(axis=0)
+    rmsf_by_atom = np.sqrt(((receptor_frames - mean_by_atom) ** 2).sum(axis=2).mean(axis=0))
+    drift_values = np.sqrt(((ligand_frames.mean(axis=1) - ligand_reference.mean(axis=0)) ** 2).sum(axis=1))
     contact = receptor_ligand_contact_occupancy(receptor_frames, ligand_frames)
     hbond = receptor_ligand_hbond_occupancy(
-        receptor,
-        mol,
-        receptor_frames,
-        ligand_frames,
-        ligand_heavy_local,
-        receptor_heavy_local,
+        trajectory[1:],
+        range(len(receptor_indices)),
+        range(len(receptor_indices), len(receptor_indices) + len(ligand_indices)),
+        mdtraj,
+        np,
     )
-    rmsd = float(np.mean(rmsd_values)) if rmsd_values else 0.0
+    rmsd = float(np.mean(rmsd_values))
     rmsf = float(np.mean(rmsf_by_atom)) if len(rmsf_by_atom) else 0.0
-    drift = float(np.mean(drift_values)) if len(drift_values) else 0.0
+    drift = float(np.mean(drift_values))
     persistence = max(contact, hbond)
-    stability = max(0.0, min(1.0, 1.0 - (rmsd / 5.0 + drift / 5.0) / 2.0))
+    stability = md_stability_score(rmsd, drift, contact, hbond, persistence)
     return {
         "rmsd": rmsd,
         "rmsf": rmsf,
@@ -1338,6 +1420,64 @@ def summarize_complex_frames(
         "interaction_persistence": persistence,
         "md_stability_score": stability,
     }
+
+
+def complex_mdtraj_topology(receptor: ReceptorCoordinate, mol: Any, mdtraj: Any) -> Any:
+    topology = mdtraj.Topology.from_openmm(receptor.topology)
+    ligand_chain = topology.add_chain()
+    ligand_residue = topology.add_residue("LIG", ligand_chain)
+    ligand_atoms = []
+    for atom in mol.GetAtoms():
+        symbol = atom.GetSymbol()
+        ligand_atoms.append(
+            topology.add_atom(
+                f"{symbol}{atom.GetIdx() + 1}",
+                mdtraj.element.get_by_symbol(symbol),
+                ligand_residue,
+            )
+        )
+    for bond in mol.GetBonds():
+        topology.add_bond(
+            ligand_atoms[bond.GetBeginAtomIdx()],
+            ligand_atoms[bond.GetEndAtomIdx()],
+        )
+    return topology
+
+
+def md_sampling_rejection_reason(production_steps_total: int, frame_count: int) -> str:
+    if production_steps_total <= 0:
+        return "zero_production_steps"
+    if frame_count <= 1:
+        return "single_frame_trajectory"
+    if frame_count - 1 < MINIMUM_MD_PRODUCTION_SAMPLES:
+        return "insufficient_production_samples"
+    return ""
+
+
+def md_stability_score(
+    rmsd_angstrom: float,
+    ligand_drift_angstrom: float,
+    contact_occupancy: float,
+    hydrogen_bond_occupancy: float,
+    interaction_persistence: float,
+) -> float:
+    rmsd_component = clamp_unit(1.0 - float(rmsd_angstrom) / RMSD_SCORE_SCALE_ANGSTROM)
+    drift_component = clamp_unit(1.0 - float(ligand_drift_angstrom) / LIGAND_DRIFT_SCORE_SCALE_ANGSTROM)
+    score = (
+        rmsd_component * 0.30
+        + drift_component * 0.25
+        + clamp_unit(contact_occupancy) * 0.20
+        + clamp_unit(hydrogen_bond_occupancy) * 0.10
+        + clamp_unit(interaction_persistence) * 0.15
+    )
+    return clamp_unit(score)
+
+
+def clamp_unit(value: float) -> float:
+    value = float(value)
+    if not math.isfinite(value):
+        return 0.0
+    return max(0.0, min(1.0, value))
 
 
 def summarize_peptide_conformer_frames(mol: Any, frames: list[Any], np: Any) -> dict[str, float]:
@@ -1384,46 +1524,56 @@ def kabsch_rmsd(frame: Any, reference: Any) -> float:
 def receptor_ligand_contact_occupancy(receptor_frames: list[Any], ligand_frames: list[Any]) -> float:
     import numpy as np
 
-    occupied = 0
-    total = 0
+    if len(receptor_frames) != len(ligand_frames):
+        raise ValueError("receptor_ligand_frame_count_mismatch")
+    occupied_frames = 0
     for receptor_frame, ligand_frame in zip(receptor_frames, ligand_frames):
         distances = np.sqrt(((receptor_frame[:, None, :] - ligand_frame[None, :, :]) ** 2).sum(axis=2))
-        occupied += int((distances <= 4.5).sum())
-        total += int(distances.size)
-    return occupied / total if total else 0.0
+        occupied_frames += int(bool(np.any(distances <= CONTACT_CUTOFF_ANGSTROM)))
+    return occupied_frames / len(receptor_frames) if len(receptor_frames) else 0.0
 
 
 def receptor_ligand_hbond_occupancy(
-    receptor: ReceptorCoordinate,
-    mol: Any,
-    receptor_frames: list[Any],
-    ligand_frames: list[Any],
-    ligand_heavy_local: list[int],
-    receptor_heavy_local: list[int],
+    trajectory: Any,
+    receptor_indices: range,
+    ligand_indices: range,
+    mdtraj: Any,
+    np: Any,
 ) -> float:
-    import numpy as np
-
-    receptor_polar = [
-        out_index
-        for out_index, atom_index in enumerate(receptor_heavy_local)
-        if receptor.atoms[atom_index]["element"].upper() in {"N", "O", "S"}
-    ]
-    ligand_polar = [
-        out_index
-        for out_index, atom_index in enumerate(ligand_heavy_local)
-        if mol.GetAtomWithIdx(atom_index).GetAtomicNum() in {7, 8, 16}
-    ]
-    if not receptor_polar or not ligand_polar:
+    if trajectory.n_frames == 0:
         return 0.0
-    occupied = 0
-    total = 0
-    for receptor_frame, ligand_frame in zip(receptor_frames, ligand_frames):
-        distances = np.sqrt(
-            ((receptor_frame[receptor_polar, None, :] - ligand_frame[None, ligand_polar, :]) ** 2).sum(axis=2)
-        )
-        occupied += int((distances <= 3.5).sum())
-        total += int(distances.size)
-    return occupied / total if total else 0.0
+    triplets = mdtraj.baker_hubbard(
+        trajectory,
+        freq=0.0,
+        exclude_water=True,
+        periodic=False,
+        distance_cutoff=HBOND_DISTANCE_CUTOFF_NM,
+        angle_cutoff=HBOND_ANGLE_CUTOFF_DEGREES,
+    )
+    receptor_set = set(receptor_indices)
+    ligand_set = set(ligand_indices)
+    interface_triplets = [
+        tuple(int(index) for index in triplet)
+        for triplet in triplets
+        if (int(triplet[0]) in receptor_set and int(triplet[2]) in ligand_set)
+        or (int(triplet[0]) in ligand_set and int(triplet[2]) in receptor_set)
+    ]
+    if not interface_triplets:
+        return 0.0
+    distances = mdtraj.compute_distances(
+        trajectory,
+        np.asarray([(hydrogen, acceptor) for _, hydrogen, acceptor in interface_triplets], dtype=int),
+        periodic=False,
+    )
+    angles = mdtraj.compute_angles(
+        trajectory,
+        np.asarray(interface_triplets, dtype=int),
+        periodic=False,
+    )
+    present = (distances <= HBOND_DISTANCE_CUTOFF_NM) & (
+        angles >= np.deg2rad(HBOND_ANGLE_CUTOFF_DEGREES)
+    )
+    return float(np.any(present, axis=1).mean())
 
 
 def distance(left: Any, right: Any) -> float:
