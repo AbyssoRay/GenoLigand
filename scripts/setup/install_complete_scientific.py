@@ -1818,8 +1818,14 @@ def copy_or_download(
     destination: Path,
     expected_sha256: str | None,
     progress: ProgressCallback | None = None,
+    *,
+    observed_sha256: str | None = None,
+    observed_bytes: int | None = None,
 ) -> dict[str, object]:
     destination.parent.mkdir(parents=True, exist_ok=True)
+    observed_trusted = bool(observed_sha256) and observed_bytes is not None and observed_bytes > 0
+    trusted_sha256 = expected_sha256 or (observed_sha256 if observed_trusted else None)
+    trusted_bytes = observed_bytes if not expected_sha256 and observed_trusted else None
     if destination.exists() and destination.stat().st_size > 0:
         if progress:
             progress(
@@ -1829,7 +1835,8 @@ def copy_or_download(
                 "正在校验已下载资源",
             )
         actual_sha256 = sha256_file(destination)
-        if not expected_sha256 or actual_sha256.lower() == expected_sha256.lower():
+        bytes_match = trusted_bytes is None or destination.stat().st_size == trusted_bytes
+        if trusted_sha256 and bytes_match and actual_sha256.lower() == trusted_sha256.lower():
             if progress:
                 progress(
                     "completed",
@@ -1841,6 +1848,7 @@ def copy_or_download(
                 "status": "ready",
                 "bytes": destination.stat().st_size,
                 "sha256": actual_sha256,
+                "reused": True,
             }
         if progress:
             progress(
@@ -1865,65 +1873,29 @@ def copy_or_download(
         with source.open("rb") as source_handle, partial.open("wb") as target_handle:
             copy_with_progress(source_handle, target_handle, bytes_total=total, progress=progress)
     else:
-        last_error: Exception | None = None
-        for attempt in range(1, DOWNLOAD_RETRIES + 1):
-            existing = partial.stat().st_size if partial.exists() else 0
-            if progress:
-                progress("downloading", existing, None, f"正在下载数据库资源，第 {attempt} 次尝试")
-            request = urllib.request.Request(
-                url,
-                headers={"User-Agent": DOWNLOAD_USER_AGENT},
-            )
-            if existing:
-                request.add_header("Range", f"bytes={existing}-")
-            try:
-                with urlopen_with_compatible_tls(
-                    request,
-                    timeout=DOWNLOAD_TIMEOUT_SECONDS,
-                ) as response:
-                    status = getattr(response, "status", 200)
-                    mode = "ab" if existing and status == 206 else "wb"
-                    content_length = response.headers.get("Content-Length")
-                    response_bytes = int(content_length) if content_length and content_length.isdigit() else None
-                    if status == 206 and response_bytes is not None:
-                        total = existing + response_bytes
-                        start = existing
-                    else:
-                        total = response_bytes
-                        start = 0
-                    with partial.open(mode) as handle:
-                        copy_with_progress(
-                            response,
-                            handle,
-                            bytes_done=start,
-                            bytes_total=total,
-                            progress=progress,
-                        )
-                last_error = None
-                break
-            except urllib.error.HTTPError as err:
-                if existing and err.code == 416:
-                    last_error = None
-                    break
-                last_error = err
-            except (urllib.error.URLError, TimeoutError, OSError) as err:
-                last_error = err
-            if progress:
-                progress("retrying", partial.stat().st_size if partial.exists() else 0, None, "下载中断，准备重试")
-            if attempt < DOWNLOAD_RETRIES:
-                time.sleep(min(2 * attempt, 5))
-        if last_error is not None:
-            if not download_with_external_tool(url, partial, progress):
-                raise last_error
+        if partial.exists() and partial.stat().st_size > 0 and not trusted_sha256:
+            quarantine_partial(partial)
+        resumed = partial.exists() and partial.stat().st_size > 0
+        outcome = download_http_resource(url, partial, resumed, trusted_sha256, trusted_bytes, progress)
+        if outcome == "retry_full":
+            outcome = download_http_resource(url, partial, False, trusted_sha256, trusted_bytes, progress)
+        if outcome == "failed":
+            raise OSError(f"resource download failed: {url}")
     if progress:
         progress("verifying", partial.stat().st_size if partial.exists() else 0, partial.stat().st_size if partial.exists() else None, "正在校验资源")
-    actual_sha256 = sha256_file(partial)
-    if expected_sha256 and actual_sha256.lower() != expected_sha256.lower():
+    if not partial.is_file() or partial.stat().st_size <= 0:
         if progress:
-            progress("failed", partial.stat().st_size, partial.stat().st_size, "完整性校验失败")
+            progress("failed", 0, trusted_bytes, "下载资源为空")
+        return {"status": "empty_download", "bytes": 0, "sha256": ""}
+    actual_sha256 = sha256_file(partial)
+    bytes_match = trusted_bytes is None or partial.stat().st_size == trusted_bytes
+    if trusted_sha256 and (not bytes_match or actual_sha256.lower() != trusted_sha256.lower()):
+        quarantine_partial(partial)
+        if progress:
+            progress("failed", 0, trusted_bytes, "完整性校验失败")
         return {
             "status": "checksum_failed",
-            "bytes": partial.stat().st_size,
+            "bytes": 0,
             "sha256": actual_sha256,
         }
     partial.replace(destination)
@@ -1933,11 +1905,92 @@ def copy_or_download(
         "status": "ready",
         "bytes": destination.stat().st_size,
         "sha256": actual_sha256,
+        "reused": False,
     }
+
+
+def quarantine_partial(partial: Path) -> Path | None:
+    if not partial.exists():
+        return None
+    quarantine = Path(f"{partial}.quarantine-{time.time_ns()}")
+    partial.replace(quarantine)
+    return quarantine
+
+
+def download_http_resource(
+    url: str,
+    partial: Path,
+    resume: bool,
+    trusted_sha256: str | None,
+    trusted_bytes: int | None,
+    progress: ProgressCallback | None,
+) -> str:
+    last_error: Exception | None = None
+    for attempt in range(1, DOWNLOAD_RETRIES + 1):
+        existing = partial.stat().st_size if resume and partial.exists() else 0
+        if not resume and partial.exists():
+            partial.unlink()
+        if progress:
+            progress("downloading", existing, None, f"正在下载数据库资源，第 {attempt} 次尝试")
+        request = urllib.request.Request(url, headers={"User-Agent": DOWNLOAD_USER_AGENT})
+        if existing:
+            request.add_header("Range", f"bytes={existing}-")
+        try:
+            with urlopen_with_compatible_tls(request, timeout=DOWNLOAD_TIMEOUT_SECONDS) as response:
+                status = getattr(response, "status", 200)
+                mode = "ab" if existing and status == 206 else "wb"
+                content_length = response.headers.get("Content-Length")
+                response_bytes = int(content_length) if content_length and content_length.isdigit() else None
+                total = existing + response_bytes if status == 206 and response_bytes is not None else response_bytes
+                start = existing if status == 206 else 0
+                with partial.open(mode) as handle:
+                    copy_with_progress(
+                        response,
+                        handle,
+                        bytes_done=start,
+                        bytes_total=total,
+                        progress=progress,
+                    )
+            if resume and not download_matches(partial, trusted_sha256, trusted_bytes):
+                quarantine_partial(partial)
+                return "retry_full"
+            return "downloaded"
+        except urllib.error.HTTPError as err:
+            if existing and err.code == 416:
+                if download_matches(partial, trusted_sha256, trusted_bytes):
+                    return "downloaded"
+                quarantine_partial(partial)
+                return "retry_full"
+            last_error = err
+        except (urllib.error.URLError, TimeoutError, OSError) as err:
+            last_error = err
+        if progress:
+            progress("retrying", partial.stat().st_size if partial.exists() else 0, None, "下载中断，准备重试")
+        if attempt < DOWNLOAD_RETRIES:
+            time.sleep(min(2 * attempt, 5))
+    if last_error is not None and download_with_external_tool(url, partial, progress):
+        if not trusted_sha256 or download_matches(partial, trusted_sha256, trusted_bytes):
+            return "downloaded"
+        quarantine_partial(partial)
+        return "retry_full" if resume else "failed"
+    return "failed"
+
+
+def download_matches(path: Path, trusted_sha256: str | None, trusted_bytes: int | None) -> bool:
+    if not trusted_sha256 or not path.is_file() or path.stat().st_size <= 0:
+        return False
+    if trusted_bytes is not None and path.stat().st_size != trusted_bytes:
+        return False
+    return sha256_file(path).lower() == trusted_sha256.lower()
 
 
 def prepare_downloads(catalog: Path, science_store: Path) -> dict[str, object]:
     manifest = science_store / "download_execution_manifest.tsv"
+    previous_rows = {
+        (row.get("source_id", ""), row.get("url", ""), row.get("local_path", "")): row
+        for row in read_tsv(manifest)
+        if row.get("status") == "ready"
+    }
     rows: list[dict[str, str]] = []
     if catalog.exists():
         with catalog.open("r", encoding="utf-8-sig", newline="") as handle:
@@ -1965,6 +2018,11 @@ def prepare_downloads(catalog: Path, science_store: Path) -> dict[str, object]:
                 "status",
                 "bytes",
                 "sha256",
+                "expected_sha256",
+                "observed_bytes",
+                "observed_sha256",
+                "source_version",
+                "completed_at",
                 "notes",
             ],
         )
@@ -2005,6 +2063,15 @@ def prepare_downloads(catalog: Path, science_store: Path) -> dict[str, object]:
             url = row.get("url", "")
             local_path = row.get("local_path", "")
             expected = row.get("sha256", "") or None
+            source_version = row.get("release_or_date", "")
+            previous = previous_rows.get((source_id, url, local_path), {})
+            previous_version = previous.get("source_version", "")
+            observed_sha256 = previous.get("observed_sha256", "") or previous.get("sha256", "")
+            observed_bytes_text = previous.get("observed_bytes", "") or previous.get("bytes", "")
+            observed_bytes = int(observed_bytes_text) if observed_bytes_text.isdigit() else None
+            if expected or previous_version != source_version or not observed_sha256 or not observed_bytes:
+                observed_sha256 = ""
+                observed_bytes = None
             completed = ready + failed
             if not source_id or not url or not local_path:
                 failed += 1
@@ -2046,7 +2113,14 @@ def prepare_downloads(catalog: Path, science_store: Path) -> dict[str, object]:
                         message=message,
                     )
 
-                result = copy_or_download(url, destination, expected, progress_callback)
+                result = copy_or_download(
+                    url,
+                    destination,
+                    expected,
+                    progress_callback,
+                    observed_sha256=observed_sha256 or None,
+                    observed_bytes=observed_bytes,
+                )
                 if result["status"] == "ready":
                     ready += 1
                 else:
@@ -2071,7 +2145,12 @@ def prepare_downloads(catalog: Path, science_store: Path) -> dict[str, object]:
                         "status": str(result["status"]),
                         "bytes": str(result["bytes"]),
                         "sha256": str(result["sha256"]),
-                        "notes": "download_or_copy_completed",
+                        "expected_sha256": expected or "",
+                        "observed_bytes": str(result["bytes"]),
+                        "observed_sha256": str(result["sha256"]),
+                        "source_version": source_version,
+                        "completed_at": str(int(time.time())),
+                        "notes": "existing_observed_digest_matched" if result.get("reused") else "download_or_copy_completed",
                     }
                 )
             except Exception as err:  # noqa: BLE001 - report install diagnostics, do not hide failures
@@ -2556,6 +2635,76 @@ def rcsb_scope_has_missing_coordinates(science_store: Path, target: Path | None)
     return False
 
 
+def external_evidence_path(row: dict[str, str], target: Path | None, marker: Path | None) -> Path | None:
+    method = (row.get("sync_method") or "direct").strip().lower()
+    if method == "direct" and target is not None:
+        location = direct_source_location(row)
+        if location:
+            return external_destination(target, location)
+        return marker
+    return target if target and path_has_payload(target) else marker
+
+
+def external_plan_digest(row: dict[str, str]) -> str:
+    identity_fields = [
+        "source_id",
+        "source_class",
+        "sync_method",
+        "source_url",
+        "source_path",
+        "download_url",
+        "landing_url",
+        "target_rel_path",
+        "ready_marker",
+        "include_pattern",
+        "release_or_date",
+        "sha256",
+    ]
+    payload = json.dumps(
+        {key: row.get(key, "") for key in identity_fields},
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def external_evidence_digest(row: dict[str, str], evidence: Path) -> str:
+    method = (row.get("sync_method") or "direct").strip().lower()
+    if method == "direct" and evidence.is_file():
+        return sha256_file(evidence)
+    return directory_digest(evidence)
+
+
+def external_plan_row_ready(
+    row: dict[str, str],
+    target: Path | None,
+    marker: Path | None,
+    science_store: Path,
+    execution: dict[str, str],
+) -> bool:
+    if execution.get("status") != "ready" or execution.get("target_rel_path", "") != row.get("target_rel_path", ""):
+        return False
+    if execution.get("plan_digest", "") != external_plan_digest(row):
+        return False
+    if not marker or not path_has_payload(marker):
+        return False
+    if (row.get("sync_method") or "direct").strip().lower() == "rcsb_ligand_bound_scope":
+        if rcsb_scope_has_missing_coordinates(science_store, target):
+            return False
+    evidence = external_evidence_path(row, target, marker)
+    if not evidence or not path_has_payload(evidence):
+        return False
+    expected_sha256 = execution.get("sha256", "").strip()
+    expected_bytes = execution.get("bytes", "").strip()
+    return (
+        bool(expected_sha256)
+        and expected_bytes.isdigit()
+        and int(expected_bytes) == directory_size(evidence)
+        and expected_sha256.lower() == external_evidence_digest(row, evidence).lower()
+    )
+
+
 def sync_external_sources(
     plan: Path,
     science_store: Path,
@@ -2564,6 +2713,7 @@ def sync_external_sources(
 ) -> dict[str, object]:
     manifest = science_store / "external_sync_execution_manifest.tsv"
     rows = read_tsv(plan)
+    previous_rows = {row.get("source_id", ""): row for row in read_tsv(manifest)}
     manifest.parent.mkdir(parents=True, exist_ok=True)
     write_install_progress(
         science_store,
@@ -2585,6 +2735,7 @@ def sync_external_sources(
                 "status",
                 "bytes",
                 "sha256",
+                "plan_digest",
                 "notes",
             ],
         )
@@ -2629,10 +2780,12 @@ def sync_external_sources(
             target = science_store / target_rel if target_rel else None
             marker = science_store / ready_marker if ready_marker else target
             method = (row.get("sync_method") or "direct").strip().lower()
-            marker_ready = bool(marker and path_has_payload(marker))
-            if marker_ready and method == "rcsb_ligand_bound_scope":
-                marker_ready = not rcsb_scope_has_missing_coordinates(science_store, target)
+            previous = previous_rows.get(source_id, {})
+            marker_ready = external_plan_row_ready(row, target, marker, science_store, previous)
             if marker_ready:
+                evidence = external_evidence_path(row, target, marker)
+                evidence_bytes = directory_size(evidence) if evidence else 0
+                evidence_sha256 = external_evidence_digest(row, evidence) if evidence else ""
                 ready += 1
                 write_install_progress(
                     science_store,
@@ -2642,8 +2795,8 @@ def sync_external_sources(
                     completed_steps=ready + failed + needs_action,
                     total_steps=len(rows),
                     failed_steps=failed,
-                    bytes_downloaded=directory_size(marker),
-                    bytes_total=directory_size(marker),
+                    bytes_downloaded=evidence_bytes,
+                    bytes_total=evidence_bytes,
                     message="资源已可用",
                 )
                 writer.writerow(
@@ -2652,9 +2805,10 @@ def sync_external_sources(
                         "source_label": label,
                         "target_rel_path": target_rel,
                         "status": "ready",
-                        "bytes": str(directory_size(marker)),
-                        "sha256": "",
-                        "notes": "already_available",
+                        "bytes": str(evidence_bytes),
+                        "sha256": evidence_sha256,
+                        "plan_digest": external_plan_digest(row),
+                        "notes": "previous_success_digest_matched",
                     }
                 )
                 continue
@@ -2765,6 +2919,7 @@ def sync_external_sources(
                         "status": str(result["status"]),
                         "bytes": str(result["bytes"]),
                         "sha256": str(result["sha256"]),
+                        "plan_digest": external_plan_digest(row),
                         "notes": str(result["notes"]),
                     }
                 )
@@ -2877,25 +3032,54 @@ def ensure_openff_forcefield_file(science_store: Path) -> dict[str, object]:
 def build_mmseqs_target_databases(science_store: Path, env: dict[str, str] | None, wsl_distro: str | None) -> list[dict[str, str]]:
     index_root = science_store / "indexes" / "mmseqs"
     manifest = index_root / "mmseqs_target_databases.tsv"
+    previous_rows = {row.get("source_id", ""): row for row in read_tsv(manifest)}
     index_root.mkdir(parents=True, exist_ok=True)
     command = shutil.which("mmseqs", path=(env or os.environ).get("PATH"))
+    builder_version = database_builder_version("mmseqs", command, env, wsl_distro)
     rows: list[dict[str, str]] = []
     for label, source in sequence_database_sources(science_store):
         db_path = index_root / safe_file_stem(label) / "target"
+        source_summary = resource_payload_summary(source)
+        source_fields = alignment_source_manifest_fields(source_summary, builder_version)
+        force_rebuild = database_artifacts_present(db_path) and not alignment_source_manifest_matches(
+            previous_rows.get(label, {}), source_summary, builder_version
+        )
         if alignment_source_deferred(source):
             status, notes = "deferred_large_source", "source_exceeds_sync_index_threshold"
         else:
-            status, notes = build_mmseqs_database(command, source, db_path, env, wsl_distro)
+            status, notes = build_mmseqs_database(
+                command,
+                source,
+                db_path,
+                env,
+                wsl_distro,
+                force_rebuild=force_rebuild,
+            )
         rows.append(
             {
                 "source_id": label,
                 "source_path": relative_path(science_store, source),
+                **source_fields,
                 "db_path": relative_path(science_store, db_path),
                 "status": status,
                 "notes": notes,
             }
         )
-    write_simple_tsv(manifest, ["source_id", "source_path", "db_path", "status", "notes"], rows)
+    write_simple_tsv(
+        manifest,
+        [
+            "source_id",
+            "source_path",
+            "source_digest",
+            "source_files",
+            "source_bytes",
+            "builder_version",
+            "db_path",
+            "status",
+            "notes",
+        ],
+        rows,
+    )
     return rows
 
 
@@ -2922,21 +3106,50 @@ def alignment_db_max_source_bytes() -> int:
 def build_foldseek_target_database(science_store: Path, env: dict[str, str] | None, wsl_distro: str | None) -> list[dict[str, str]]:
     index_root = science_store / "indexes" / "foldseek"
     manifest = index_root / "foldseek_target_databases.tsv"
+    previous_rows = {row.get("source_id", ""): row for row in read_tsv(manifest)}
     index_root.mkdir(parents=True, exist_ok=True)
     command = shutil.which("foldseek", path=(env or os.environ).get("PATH"))
+    builder_version = database_builder_version("foldseek", command, env, wsl_distro)
     source = science_store / "downloads" / "rcsb" / "mmcif"
     db_path = index_root / "rcsb_mmcif" / "target"
-    status, notes = build_foldseek_database(command, source, db_path, env, wsl_distro)
+    source_summary = resource_payload_summary(source)
+    source_fields = alignment_source_manifest_fields(source_summary, builder_version)
+    force_rebuild = database_artifacts_present(db_path) and not alignment_source_manifest_matches(
+        previous_rows.get("rcsb_mmcif", {}), source_summary, builder_version
+    )
+    status, notes = build_foldseek_database(
+        command,
+        source,
+        db_path,
+        env,
+        wsl_distro,
+        force_rebuild=force_rebuild,
+    )
     rows = [
         {
             "source_id": "rcsb_mmcif",
             "source_path": relative_path(science_store, source),
+            **source_fields,
             "db_path": relative_path(science_store, db_path),
             "status": status,
             "notes": notes,
         }
     ]
-    write_simple_tsv(manifest, ["source_id", "source_path", "db_path", "status", "notes"], rows)
+    write_simple_tsv(
+        manifest,
+        [
+            "source_id",
+            "source_path",
+            "source_digest",
+            "source_files",
+            "source_bytes",
+            "builder_version",
+            "db_path",
+            "status",
+            "notes",
+        ],
+        rows,
+    )
     return rows
 
 
@@ -2964,11 +3177,19 @@ def build_mmseqs_database(
     db_path: Path,
     env: dict[str, str] | None,
     wsl_distro: str | None,
+    *,
+    force_rebuild: bool = False,
 ) -> tuple[str, str]:
     if not path_has_payload(source):
         return "failed", "source_missing"
-    if database_prefix_ready(db_path):
+    if command is None and not (os.name == "nt" and wsl_distro):
+        return "failed", "mmseqs_executable_missing"
+    if force_rebuild:
+        reset_database_directory(db_path)
+    if database_prefix_ready("mmseqs", db_path, command, env, wsl_distro):
         return "ready", "already_available"
+    if database_artifacts_present(db_path):
+        reset_database_directory(db_path)
     db_path.parent.mkdir(parents=True, exist_ok=True)
     tmp = db_path.parent / "tmp"
     tmp.mkdir(parents=True, exist_ok=True)
@@ -2978,8 +3199,8 @@ def build_mmseqs_database(
             return "failed", process_note(created)
         indexed = run_wsl_database_command(wsl_distro, ["mmseqs", "createindex", wsl_path(db_path), wsl_path(tmp)])
         if indexed.returncode != 0:
-            return database_ready_after_index_failure("mmseqs", db_path, indexed)
-        return "ready", "mmseqs_createdb_createindex_completed"
+            return database_ready_after_index_failure("mmseqs", db_path, indexed, command, env, wsl_distro)
+        return database_ready_after_build("mmseqs", db_path, command, env, wsl_distro, "mmseqs_createdb_createindex_completed")
     if command is None:
         return "failed", "mmseqs_executable_missing"
     created = run_command([command, "createdb", str(source), str(db_path)], env=env)
@@ -2987,8 +3208,8 @@ def build_mmseqs_database(
         return "failed", process_note(created)
     indexed = run_command([command, "createindex", str(db_path), str(tmp)], env=env)
     if indexed.returncode != 0:
-        return database_ready_after_index_failure("mmseqs", db_path, indexed)
-    return "ready", "mmseqs_createdb_createindex_completed"
+        return database_ready_after_index_failure("mmseqs", db_path, indexed, command, env, wsl_distro)
+    return database_ready_after_build("mmseqs", db_path, command, env, wsl_distro, "mmseqs_createdb_createindex_completed")
 
 
 def build_foldseek_database(
@@ -2997,11 +3218,19 @@ def build_foldseek_database(
     db_path: Path,
     env: dict[str, str] | None,
     wsl_distro: str | None,
+    *,
+    force_rebuild: bool = False,
 ) -> tuple[str, str]:
     if not path_has_payload(source):
         return "failed", "source_missing"
-    if database_prefix_ready(db_path):
+    if command is None and not (os.name == "nt" and wsl_distro):
+        return "failed", "foldseek_executable_missing"
+    if force_rebuild:
+        reset_database_directory(db_path)
+    if database_prefix_ready("foldseek", db_path, command, env, wsl_distro):
         return "ready", "already_available"
+    if database_artifacts_present(db_path):
+        reset_database_directory(db_path)
     db_path.parent.mkdir(parents=True, exist_ok=True)
     tmp = db_path.parent / "tmp"
     tmp.mkdir(parents=True, exist_ok=True)
@@ -3011,8 +3240,8 @@ def build_foldseek_database(
             return "failed", process_note(created)
         indexed = run_wsl_database_command(wsl_distro, ["foldseek", "createindex", wsl_path(db_path), wsl_path(tmp)])
         if indexed.returncode != 0:
-            return database_ready_after_index_failure("foldseek", db_path, indexed)
-        return "ready", "foldseek_createdb_createindex_completed"
+            return database_ready_after_index_failure("foldseek", db_path, indexed, command, env, wsl_distro)
+        return database_ready_after_build("foldseek", db_path, command, env, wsl_distro, "foldseek_createdb_createindex_completed")
     if command is None:
         return "failed", "foldseek_executable_missing"
     created = run_command([command, "createdb", str(source), str(db_path)], env=env)
@@ -3020,18 +3249,34 @@ def build_foldseek_database(
         return "failed", process_note(created)
     indexed = run_command([command, "createindex", str(db_path), str(tmp)], env=env)
     if indexed.returncode != 0:
-        return database_ready_after_index_failure("foldseek", db_path, indexed)
-    return "ready", "foldseek_createdb_createindex_completed"
+        return database_ready_after_index_failure("foldseek", db_path, indexed, command, env, wsl_distro)
+    return database_ready_after_build("foldseek", db_path, command, env, wsl_distro, "foldseek_createdb_createindex_completed")
 
 
 def database_ready_after_index_failure(
     tool: str,
     db_path: Path,
     indexed: subprocess.CompletedProcess[str],
+    command: str | None,
+    env: dict[str, str] | None,
+    wsl_distro: str | None,
 ) -> tuple[str, str]:
-    if database_prefix_ready(db_path):
+    if database_prefix_ready(tool, db_path, command, env, wsl_distro):
         return "ready", f"{tool}_createdb_ready_createindex_not_precomputed:{process_note(indexed)}"
     return "failed", process_note(indexed)
+
+
+def database_ready_after_build(
+    tool: str,
+    db_path: Path,
+    command: str | None,
+    env: dict[str, str] | None,
+    wsl_distro: str | None,
+    success_note: str,
+) -> tuple[str, str]:
+    if database_prefix_ready(tool, db_path, command, env, wsl_distro):
+        return "ready", success_note
+    return "failed", f"{tool}_database_smoke_failed"
 
 
 def run_wsl_database_command(distro: str, command: list[str]) -> subprocess.CompletedProcess[str]:
@@ -3062,8 +3307,100 @@ def wsl_path(path: Path) -> str:
     return text.replace("\\", "/")
 
 
-def database_prefix_ready(prefix: Path) -> bool:
-    return Path(str(prefix) + ".dbtype").exists() or prefix.with_suffix(".dbtype").exists()
+def database_prefix_ready(
+    tool: str,
+    prefix: Path,
+    command: str | None,
+    env: dict[str, str] | None,
+    wsl_distro: str | None,
+) -> bool:
+    companions = [prefix, Path(f"{prefix}.dbtype"), Path(f"{prefix}.index"), Path(f"{prefix}.lookup")]
+    if any(not path.is_file() or path.stat().st_size <= 0 for path in companions):
+        return False
+    return database_smoke_query(tool, prefix, command, env, wsl_distro)
+
+
+def database_smoke_query(
+    tool: str,
+    prefix: Path,
+    command: str | None,
+    env: dict[str, str] | None,
+    wsl_distro: str | None,
+) -> bool:
+    lookup = Path(f"{prefix}.lookup")
+    first_id = next((line.split("\t", 1)[0].strip() for line in lookup.read_text(encoding="utf-8", errors="replace").splitlines() if line.strip()), "")
+    if not first_id:
+        return False
+    smoke_root = prefix.parent / f".smoke-{tool}-{os.getpid()}-{time.time_ns()}"
+    smoke_root.mkdir(parents=True, exist_ok=False)
+    ids = smoke_root / "ids.tsv"
+    query = smoke_root / "query"
+    result = smoke_root / "result"
+    tmp = smoke_root / "tmp"
+    ids.write_text(f"{first_id}\n", encoding="utf-8")
+    try:
+        if os.name == "nt" and wsl_distro:
+            commands = [
+                [tool, "createsubdb", wsl_path(ids), wsl_path(prefix), wsl_path(query)],
+                [tool, "search", wsl_path(query), wsl_path(prefix), wsl_path(result), wsl_path(tmp), "--threads", "1", "--max-seqs", "1"],
+            ]
+            return all(run_wsl_database_command(wsl_distro, item).returncode == 0 for item in commands)
+        if command is None:
+            return False
+        local_commands = [
+            [command, "createsubdb", str(ids), str(prefix), str(query)],
+            [command, "search", str(query), str(prefix), str(result), str(tmp), "--threads", "1", "--max-seqs", "1"],
+        ]
+        return all(run_command(item, env=env).returncode == 0 for item in local_commands)
+    except (OSError, UnicodeError):
+        return False
+    finally:
+        shutil.rmtree(smoke_root, ignore_errors=True)
+
+
+def database_builder_version(
+    tool: str,
+    command: str | None,
+    env: dict[str, str] | None,
+    wsl_distro: str | None,
+) -> str:
+    if os.name == "nt" and wsl_distro:
+        completed = run_wsl_database_command(wsl_distro, [tool, "version"])
+    elif command is not None:
+        completed = run_command([command, "version"], env=env)
+    else:
+        return "missing"
+    text = f"{completed.stdout}{completed.stderr}".strip()
+    return next((line.strip() for line in text.splitlines() if line.strip()), "unknown") if completed.returncode == 0 else "unknown"
+
+
+def alignment_source_manifest_fields(source_summary: dict[str, object], builder_version: str) -> dict[str, str]:
+    return {
+        "source_digest": str(source_summary.get("sha256", "")),
+        "source_files": str(source_summary.get("file_count", 0)),
+        "source_bytes": str(source_summary.get("bytes", 0)),
+        "builder_version": builder_version,
+    }
+
+
+def alignment_source_manifest_matches(
+    row: dict[str, str],
+    source_summary: dict[str, object],
+    builder_version: str,
+) -> bool:
+    expected = alignment_source_manifest_fields(source_summary, builder_version)
+    return bool(row) and all(row.get(key, "") == value for key, value in expected.items())
+
+
+def database_artifacts_present(db_path: Path) -> bool:
+    return db_path.parent.is_dir() and any(
+        child.name == db_path.name or child.name.startswith(f"{db_path.name}.") for child in db_path.parent.iterdir()
+    )
+
+
+def reset_database_directory(db_path: Path) -> None:
+    if db_path.parent.exists():
+        shutil.rmtree(db_path.parent)
 
 
 def safe_file_stem(value: str) -> str:
@@ -3361,11 +3698,13 @@ def source_sync_summary(
     }
     items: list[dict[str, object]] = []
     for row in rows:
-        target_rel = row.get("ready_marker") or row.get("target_rel_path") or ""
+        target_rel = row.get("target_rel_path") or ""
+        marker_rel = row.get("ready_marker") or target_rel
         target = science_store / target_rel if target_rel else None
-        ready = bool(target and path_has_payload(target))
+        marker = science_store / marker_rel if marker_rel else target
         execution = execution_rows.get(row.get("source_id", ""))
         execution_status = execution.get("status", "") if execution else ""
+        ready = external_plan_row_ready(row, target, marker, science_store, execution or {})
         needs_bundle = execution_status == "requires_resource_bundle"
         items.append(
             {
@@ -3384,7 +3723,7 @@ def source_sync_summary(
     needs_action = total - ready_count
     failed = int(sync_result.get("failed", 0) or 0)
     return {
-        "status": "ready" if total and needs_action == 0 else "failed" if failed else "needs_sync",
+        "status": "failed" if failed else "ready" if total and needs_action == 0 else "needs_sync",
         "ready": ready_count,
         "total": total,
         "needs_action": needs_action,
@@ -3456,15 +3795,38 @@ def tsv_has_data_rows(path: Path) -> bool:
     return path.exists() and bool(read_tsv(path))
 
 
-def alignment_database_manifests_ready(science_store: Path) -> bool:
-    for rel_path in [
-        "indexes/mmseqs/mmseqs_target_databases.tsv",
-        "indexes/foldseek/foldseek_target_databases.tsv",
+def alignment_database_manifests_ready(
+    science_store: Path,
+    env: dict[str, str] | None = None,
+    wsl_distro: str | None = None,
+) -> bool:
+    for tool, rel_path in [
+        ("mmseqs", "indexes/mmseqs/mmseqs_target_databases.tsv"),
+        ("foldseek", "indexes/foldseek/foldseek_target_databases.tsv"),
     ]:
         rows = read_tsv(science_store / rel_path)
         if not rows or any(row.get("status") != "ready" for row in rows):
             return False
+        command = shutil.which(tool, path=(env or os.environ).get("PATH"))
+        builder_version = database_builder_version(tool, command, env, wsl_distro)
+        for row in rows:
+            source = resolve_manifest_path(science_store, row.get("source_path", ""))
+            db_path = resolve_manifest_path(science_store, row.get("db_path", ""))
+            if source is None or db_path is None:
+                return False
+            source_summary = resource_payload_summary(source)
+            if not alignment_source_manifest_matches(row, source_summary, builder_version):
+                return False
+            if not database_prefix_ready(tool, db_path, command, env, wsl_distro):
+                return False
     return True
+
+
+def resolve_manifest_path(science_store: Path, value: str) -> Path | None:
+    if not value.strip():
+        return None
+    path = Path(value)
+    return path if path.is_absolute() else science_store / path
 
 
 def science_index_readiness_rows(science_store: Path) -> list[dict[str, str]]:
@@ -3556,10 +3918,14 @@ def is_bindingdb_bulk_source(path: Path) -> bool:
     return "/bindingdb/" in normalized and "bindingdb_all" in normalized
 
 
-def existing_science_indexes_ready(science_store: Path) -> bool:
+def existing_science_indexes_ready(
+    science_store: Path,
+    env: dict[str, str] | None = None,
+    wsl_distro: str | None = None,
+) -> bool:
     if not base_science_indexes_ready(science_store):
         return False
-    if not alignment_database_manifests_ready(science_store):
+    if not alignment_database_manifests_ready(science_store, env, wsl_distro):
         return False
     if partial_legacy_index_manifest_present(science_store):
         return False
@@ -4001,7 +4367,7 @@ def main() -> int:
         total_steps=6,
         message="正在构建数据库索引",
     )
-    if existing_science_indexes_ready(science_store):
+    if existing_science_indexes_ready(science_store, command_env, selected_wsl):
         write_install_progress(
             science_store,
             status="running",
