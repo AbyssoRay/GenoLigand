@@ -1,20 +1,29 @@
 use super::{
-    InputKind, NormalizedInput, ScienceOptions, clean_cell, encode_tsv_cell, read_text, tokenize,
-    write_json_manifest, write_text,
+    InputKind, NormalizedInput, ScienceOptions, clean_cell, encode_tsv_cell, read_text,
+    run_python_script, tokenize, write_json_manifest, write_text,
 };
 use serde_json::Value;
-use std::path::Path;
+use sha2::{Digest, Sha256};
+use std::fs;
+use std::path::{Path, PathBuf};
+
+const INPUT_RESOLVER_SCRIPT: &str =
+    include_str!("../../../python/genoligand_workers/input_resolver.py");
 
 #[derive(Clone, Debug)]
 pub(super) struct ConvertedInput {
     pub(super) input_id: String,
+    pub(super) record_id: String,
     pub(super) original_field: String,
     pub(super) inferred_kind: String,
     pub(super) canonical_kind: Option<InputKind>,
     pub(super) canonical_value: String,
     pub(super) conversion_status: &'static str,
     pub(super) conversion_method: &'static str,
-    pub(super) format: &'static str,
+    pub(super) format: String,
+    pub(super) source_kind: &'static str,
+    pub(super) source_path: String,
+    pub(super) content_sha256: String,
     pub(super) reason: String,
     pub(super) artifact: String,
     pub(super) risk_flags: Vec<String>,
@@ -29,25 +38,48 @@ struct RawInput {
     file_count: usize,
 }
 
+#[derive(Clone, Debug)]
+struct ResolvedInputRecord {
+    input_id: String,
+    record_id: String,
+    original_field: String,
+    declared_value: String,
+    source_kind: &'static str,
+    source_path: String,
+    content_sha256: String,
+    format: String,
+    content: String,
+    file_count: usize,
+}
+
 struct ConversionDetails<'a> {
     kind: InputKind,
     canonical_value: String,
     inferred_kind: &'a str,
     method: &'static str,
-    format: &'static str,
+    format: &'a str,
     artifact: &'a str,
     risk_flag: &'a str,
 }
 
-pub(super) fn extract_inputs(path: &Path) -> Result<Vec<NormalizedInput>, String> {
+pub(super) fn extract_inputs(options: &ScienceOptions) -> Result<Vec<NormalizedInput>, String> {
     Ok(normalized_inputs_from_conversions(
-        &convert_inputs_from_manifest(path)?,
+        &convert_inputs_from_manifest(options)?,
     ))
 }
 
-pub(super) fn convert_inputs_from_manifest(path: &Path) -> Result<Vec<ConvertedInput>, String> {
-    let raw_inputs = extract_raw_inputs(path)?;
-    Ok(raw_inputs.iter().map(convert_raw_input).collect::<Vec<_>>())
+pub(super) fn convert_inputs_from_manifest(
+    options: &ScienceOptions,
+) -> Result<Vec<ConvertedInput>, String> {
+    let raw_inputs = extract_raw_inputs(&options.input_manifest)?;
+    let mut conversions = Vec::new();
+    for raw in &raw_inputs {
+        match resolve_raw_input(raw, options) {
+            Ok(records) => conversions.extend(records.iter().map(convert_resolved_input)),
+            Err(reason) => conversions.push(failed_resolution(raw, &reason)),
+        }
+    }
+    Ok(conversions)
 }
 
 fn extract_raw_inputs(path: &Path) -> Result<Vec<RawInput>, String> {
@@ -115,31 +147,50 @@ pub(super) fn normalized_inputs_from_conversions(
             let tokens = tokenize(&input.canonical_value);
             Some(NormalizedInput {
                 input_id: input.input_id.clone(),
+                record_id: input.record_id.clone(),
                 kind,
                 primary_value: input.canonical_value.clone(),
                 file_count: input.file_count,
                 tokens,
+                source_kind: input.source_kind,
+                source_path: input.source_path.clone(),
+                content_sha256: input.content_sha256.clone(),
             })
         })
         .collect()
 }
 
-fn convert_raw_input(raw: &RawInput) -> ConvertedInput {
-    let value = raw.value.trim();
-    if let Some((kind, method, format)) = classify_path_input(&raw.original_field, value) {
+fn convert_resolved_input(record: &ResolvedInputRecord) -> ConvertedInput {
+    if is_molecule_format(&record.format) {
         return converted_input(
-            raw,
+            record,
             ConversionDetails {
-                kind,
-                canonical_value: value.to_string(),
-                inferred_kind: kind.as_str(),
-                method,
-                format,
+                kind: InputKind::SmallMolecule,
+                canonical_value: record.content.clone(),
+                inferred_kind: "small_molecule",
+                method: "rdkit_structure_file",
+                format: &record.format,
                 artifact: "",
                 risk_flag: "",
             },
         );
     }
+    if is_coordinate_format(&record.format) {
+        let kind = coordinate_kind(&record.original_field);
+        return converted_input(
+            record,
+            ConversionDetails {
+                kind,
+                canonical_value: record.content.clone(),
+                inferred_kind: kind.as_str(),
+                method: "declared_structure_file",
+                format: &record.format,
+                artifact: "",
+                risk_flag: "",
+            },
+        );
+    }
+    let value = record.content.trim();
     let sequence = compact_sequence(value).to_ascii_uppercase();
     let sequence_format = if value.trim_start().starts_with('>') {
         "fasta"
@@ -147,12 +198,12 @@ fn convert_raw_input(raw: &RawInput) -> ConvertedInput {
         "plain_text"
     };
     if sequence.len() >= 8
-        && !raw.original_field.contains("peptide")
-        && !raw.original_field.contains("protein")
+        && !record.original_field.contains("peptide")
+        && !record.original_field.contains("protein")
         && sequence.chars().all(is_nucleotide_symbol)
     {
         return converted_input(
-            raw,
+            record,
             ConversionDetails {
                 kind: InputKind::GenomeOrMetagenome,
                 canonical_value: sequence,
@@ -164,9 +215,9 @@ fn convert_raw_input(raw: &RawInput) -> ConvertedInput {
             },
         );
     }
-    if raw.original_field.contains("small_molecule") && looks_like_smiles_text(value) {
+    if record.original_field.contains("small_molecule") && looks_like_smiles_text(value) {
         return converted_input(
-            raw,
+            record,
             ConversionDetails {
                 kind: InputKind::SmallMolecule,
                 canonical_value: value.to_string(),
@@ -185,7 +236,7 @@ fn convert_raw_input(raw: &RawInput) -> ConvertedInput {
             InputKind::Peptide
         };
         return converted_input(
-            raw,
+            record,
             ConversionDetails {
                 kind,
                 canonical_value: sequence,
@@ -199,7 +250,7 @@ fn convert_raw_input(raw: &RawInput) -> ConvertedInput {
     }
     if looks_like_inchi(value) {
         return converted_input(
-            raw,
+            record,
             ConversionDetails {
                 kind: InputKind::SmallMolecule,
                 canonical_value: value.to_string(),
@@ -213,7 +264,7 @@ fn convert_raw_input(raw: &RawInput) -> ConvertedInput {
     }
     if looks_like_smiles_text(value) {
         return converted_input(
-            raw,
+            record,
             ConversionDetails {
                 kind: InputKind::SmallMolecule,
                 canonical_value: value.to_string(),
@@ -225,9 +276,9 @@ fn convert_raw_input(raw: &RawInput) -> ConvertedInput {
             },
         );
     }
-    if raw.original_field.contains("complex") && count_alphanumeric(value) >= 5 {
+    if record.original_field.contains("complex") && count_alphanumeric(value) >= 5 {
         return converted_input(
-            raw,
+            record,
             ConversionDetails {
                 kind: InputKind::Complex,
                 canonical_value: value.to_string(),
@@ -239,19 +290,27 @@ fn convert_raw_input(raw: &RawInput) -> ConvertedInput {
             },
         );
     }
-    failed_conversion(raw, value)
+    failed_conversion(record)
 }
 
-fn converted_input(raw: &RawInput, details: ConversionDetails<'_>) -> ConvertedInput {
+fn converted_input(record: &ResolvedInputRecord, details: ConversionDetails<'_>) -> ConvertedInput {
     ConvertedInput {
-        input_id: raw.input_id.clone(),
-        original_field: raw.original_field.clone(),
+        input_id: record.input_id.clone(),
+        record_id: record.record_id.clone(),
+        original_field: record.original_field.clone(),
         inferred_kind: details.inferred_kind.to_string(),
         canonical_kind: Some(details.kind),
         canonical_value: details.canonical_value,
         conversion_status: "converted",
         conversion_method: details.method,
-        format: details.format,
+        format: if record.source_kind == "file" {
+            record.format.clone()
+        } else {
+            details.format.to_string()
+        },
+        source_kind: record.source_kind,
+        source_path: record.source_path.clone(),
+        content_sha256: record.content_sha256.clone(),
         reason: "recognized as calculable input".to_string(),
         artifact: details.artifact.to_string(),
         risk_flags: if details.risk_flag.is_empty() {
@@ -259,86 +318,360 @@ fn converted_input(raw: &RawInput, details: ConversionDetails<'_>) -> ConvertedI
         } else {
             vec![details.risk_flag.to_string()]
         },
-        file_count: raw.file_count,
+        file_count: record.file_count,
     }
 }
 
-fn failed_conversion(raw: &RawInput, value: &str) -> ConvertedInput {
-    let risk = if looks_like_cas_number(value) || raw.original_field.contains("cas") {
+fn failed_conversion(record: &ResolvedInputRecord) -> ConvertedInput {
+    let value = record.content.trim();
+    let risk = if looks_like_cas_number(value) || record.original_field.contains("cas") {
         "no_local_name_or_cas_mapping"
     } else {
         "unrecognized_free_text"
     };
     ConvertedInput {
-        input_id: raw.input_id.clone(),
-        original_field: raw.original_field.clone(),
+        input_id: record.input_id.clone(),
+        record_id: record.record_id.clone(),
+        original_field: record.original_field.clone(),
         inferred_kind: "unknown".to_string(),
         canonical_kind: None,
-        canonical_value: value.to_string(),
+        canonical_value: record.declared_value.clone(),
         conversion_status: "failed",
         conversion_method: "unrecognized_text",
-        format: "plain_text",
+        format: record.format.clone(),
+        source_kind: record.source_kind,
+        source_path: record.source_path.clone(),
+        content_sha256: record.content_sha256.clone(),
         reason: "无法转换为可计算结构或序列".to_string(),
         artifact: String::new(),
         risk_flags: vec![risk.to_string()],
+        file_count: record.file_count,
+    }
+}
+
+fn resolve_raw_input(
+    raw: &RawInput,
+    options: &ScienceOptions,
+) -> Result<Vec<ResolvedInputRecord>, String> {
+    let declared_value = raw.value.trim();
+    let Some(format) = recognized_file_format(declared_value) else {
+        return Ok(vec![ResolvedInputRecord {
+            input_id: raw.input_id.clone(),
+            record_id: "record_1".to_string(),
+            original_field: raw.original_field.clone(),
+            declared_value: declared_value.to_string(),
+            source_kind: "inline",
+            source_path: String::new(),
+            content_sha256: sha256_hex(declared_value.as_bytes()),
+            format: "plain_text".to_string(),
+            content: declared_value.to_string(),
+            file_count: raw.file_count,
+        }]);
+    };
+    let source_path = resolve_input_path(declared_value, options);
+    if !source_path.is_file() {
+        return Err(format!("input_file_not_found:{declared_value}"));
+    }
+    if matches!(format, "gff" | "gtf" | "vcf") {
+        return Err(format!(
+            "input_file_requires_reference_sequence:{declared_value}"
+        ));
+    }
+    let bytes = fs::read(&source_path)
+        .map_err(|err| format!("input_file_read_failed:{declared_value}:{err}"))?;
+    let content_sha256 = sha256_hex(&bytes);
+    if is_molecule_format(format) {
+        let content = resolve_molecule_file(&source_path, format, &content_sha256)?;
+        return Ok(vec![file_record(
+            raw,
+            "record_1".to_string(),
+            &source_path,
+            format,
+            &content_sha256,
+            content,
+        )]);
+    }
+    let text = String::from_utf8(bytes)
+        .map_err(|err| format!("input_file_not_utf8:{declared_value}:{err}"))?;
+    match format {
+        "fasta" | "fa" | "faa" | "fna" => {
+            resolve_fasta_records(raw, &source_path, format, &content_sha256, &text)
+        }
+        "fastq" | "fq" => resolve_fastq_records(raw, &source_path, format, &content_sha256, &text),
+        "gb" | "gbk" => {
+            let sequence = genbank_origin_sequence(&text)?;
+            Ok(vec![file_record(
+                raw,
+                "record_1".to_string(),
+                &source_path,
+                format,
+                &content_sha256,
+                sequence,
+            )])
+        }
+        "pdb" | "cif" | "mmcif" | "ent" => Ok(vec![file_record(
+            raw,
+            "record_1".to_string(),
+            &source_path,
+            format,
+            &content_sha256,
+            text,
+        )]),
+        _ => unreachable!("recognized file format must be handled"),
+    }
+}
+
+fn recognized_file_format(value: &str) -> Option<&'static str> {
+    let extension = Path::new(value.trim())
+        .extension()
+        .and_then(|ext| ext.to_str())?
+        .to_ascii_lowercase();
+    match extension.as_str() {
+        "fasta" => Some("fasta"),
+        "fa" => Some("fa"),
+        "faa" => Some("faa"),
+        "fna" => Some("fna"),
+        "fastq" => Some("fastq"),
+        "fq" => Some("fq"),
+        "gb" => Some("gb"),
+        "gbk" => Some("gbk"),
+        "sdf" => Some("sdf"),
+        "mol" => Some("mol"),
+        "mol2" => Some("mol2"),
+        "pdb" => Some("pdb"),
+        "cif" => Some("cif"),
+        "mmcif" => Some("mmcif"),
+        "ent" => Some("ent"),
+        "gff" => Some("gff"),
+        "gtf" => Some("gtf"),
+        "vcf" => Some("vcf"),
+        _ => None,
+    }
+}
+
+fn resolve_input_path(value: &str, options: &ScienceOptions) -> PathBuf {
+    let declared = PathBuf::from(value);
+    if declared.is_absolute() {
+        return declared;
+    }
+    if let Some(parent) = options.input_manifest.parent() {
+        let relative_to_manifest = parent.join(&declared);
+        if relative_to_manifest.is_file() {
+            return relative_to_manifest;
+        }
+    }
+    let relative_to_workspace = options.workspace_root.join(&declared);
+    if relative_to_workspace.is_file() {
+        return relative_to_workspace;
+    }
+    declared
+}
+
+fn file_record(
+    raw: &RawInput,
+    record_id: String,
+    source_path: &Path,
+    format: &str,
+    content_sha256: &str,
+    content: String,
+) -> ResolvedInputRecord {
+    ResolvedInputRecord {
+        input_id: raw.input_id.clone(),
+        record_id,
+        original_field: raw.original_field.clone(),
+        declared_value: raw.value.clone(),
+        source_kind: "file",
+        source_path: source_path.display().to_string(),
+        content_sha256: content_sha256.to_string(),
+        format: format.to_string(),
+        content,
         file_count: raw.file_count,
     }
 }
 
-fn classify_path_input(
-    field: &str,
-    value: &str,
-) -> Option<(InputKind, &'static str, &'static str)> {
-    let lower = value.trim().to_ascii_lowercase();
-    let extension = Path::new(lower.trim())
-        .extension()
-        .and_then(|ext| ext.to_str())
-        .unwrap_or("");
-    match extension {
-        "sdf" | "mol" | "mol2" => Some((
-            InputKind::SmallMolecule,
-            "declared_structure_file",
-            "file_path",
-        )),
-        "fasta" | "fa" | "faa" => {
-            if field.contains("genome") {
-                Some((
-                    InputKind::GenomeOrMetagenome,
-                    "declared_sequence_file",
-                    "file_path",
-                ))
-            } else {
-                Some((
-                    InputKind::ProteinLigand,
-                    "declared_sequence_file",
-                    "file_path",
-                ))
+fn resolve_fasta_records(
+    raw: &RawInput,
+    source_path: &Path,
+    format: &str,
+    content_sha256: &str,
+    text: &str,
+) -> Result<Vec<ResolvedInputRecord>, String> {
+    let mut records = Vec::new();
+    let mut record_id = None::<String>;
+    let mut sequence = String::new();
+    for line in text.lines() {
+        if let Some(header) = line.trim_start().strip_prefix('>') {
+            if let Some(previous_id) = record_id.replace(fasta_record_id(header, records.len() + 1))
+            {
+                if sequence.is_empty() {
+                    return Err("invalid_fasta_record:empty_sequence".to_string());
+                }
+                records.push(file_record(
+                    raw,
+                    previous_id,
+                    source_path,
+                    format,
+                    content_sha256,
+                    std::mem::take(&mut sequence),
+                ));
             }
+        } else if record_id.is_some() {
+            sequence.extend(line.chars().filter(|ch| !ch.is_whitespace() && *ch != '-'));
+        } else if !line.trim().is_empty() {
+            return Err("invalid_fasta_record:missing_header".to_string());
         }
-        "fna" | "fastq" | "fq" | "gb" | "gff" | "gtf" | "vcf" => Some((
-            InputKind::GenomeOrMetagenome,
-            "declared_sequence_file",
-            "file_path",
-        )),
-        "pdb" | "cif" | "mmcif" | "ent" => {
-            if field.contains("peptide") || field.contains("protein") {
-                Some((
-                    InputKind::ProteinLigand,
-                    "declared_structure_file",
-                    "file_path",
-                ))
-            } else if field.contains("small_molecule") || field.contains("ligand") {
-                Some((
-                    InputKind::SmallMolecule,
-                    "declared_structure_file",
-                    "file_path",
-                ))
-            } else {
-                Some((InputKind::Complex, "declared_structure_file", "file_path"))
-            }
-        }
-        _ => None,
     }
+    let Some(last_id) = record_id else {
+        return Err("invalid_fasta_record:missing_header".to_string());
+    };
+    if sequence.is_empty() {
+        return Err("invalid_fasta_record:empty_sequence".to_string());
+    }
+    records.push(file_record(
+        raw,
+        last_id,
+        source_path,
+        format,
+        content_sha256,
+        sequence,
+    ));
+    Ok(records)
+}
+
+fn fasta_record_id(header: &str, index: usize) -> String {
+    header
+        .split_whitespace()
+        .next()
+        .filter(|value| !value.is_empty())
+        .map(ToOwned::to_owned)
+        .unwrap_or_else(|| format!("record_{index}"))
+}
+
+fn resolve_fastq_records(
+    raw: &RawInput,
+    source_path: &Path,
+    format: &str,
+    content_sha256: &str,
+    text: &str,
+) -> Result<Vec<ResolvedInputRecord>, String> {
+    let lines = text.lines().collect::<Vec<_>>();
+    if lines.is_empty() || lines.len() % 4 != 0 {
+        return Err("invalid_fastq_record:line_count".to_string());
+    }
+    let mut records = Vec::new();
+    for chunk in lines.chunks_exact(4) {
+        let Some(header) = chunk[0].strip_prefix('@') else {
+            return Err("invalid_fastq_record:missing_header".to_string());
+        };
+        if !chunk[2].starts_with('+') {
+            return Err("invalid_fastq_record:missing_separator".to_string());
+        }
+        let sequence = chunk[1].trim();
+        let quality = chunk[3].trim();
+        if sequence.chars().count() != quality.chars().count() {
+            return Err("invalid_fastq_record:sequence_quality_length".to_string());
+        }
+        records.push(file_record(
+            raw,
+            fasta_record_id(header, records.len() + 1),
+            source_path,
+            format,
+            content_sha256,
+            sequence.to_string(),
+        ));
+    }
+    Ok(records)
+}
+
+fn genbank_origin_sequence(text: &str) -> Result<String, String> {
+    let mut in_origin = false;
+    let mut sequence = String::new();
+    for line in text.lines() {
+        if !in_origin {
+            if line.trim().eq_ignore_ascii_case("ORIGIN") {
+                in_origin = true;
+            }
+            continue;
+        }
+        if line.trim_start().starts_with("//") {
+            break;
+        }
+        sequence.extend(
+            line.chars()
+                .filter(|ch| !ch.is_ascii_digit() && !ch.is_whitespace()),
+        );
+    }
+    if !in_origin || sequence.is_empty() {
+        return Err("invalid_genbank_origin".to_string());
+    }
+    Ok(sequence.to_ascii_uppercase())
+}
+
+fn resolve_molecule_file(
+    path: &Path,
+    format: &str,
+    content_sha256: &str,
+) -> Result<String, String> {
+    let args = vec![
+        "--path".to_string(),
+        path.display().to_string(),
+        "--format".to_string(),
+        format.to_string(),
+    ];
+    let context = format!("input_resolver_{}", &content_sha256[..12]);
+    let output = run_python_script(INPUT_RESOLVER_SCRIPT, &args, &context)?;
+    let value = serde_json::from_str::<Value>(output.trim())
+        .map_err(|err| format!("input_resolver_invalid_json:{err}"))?;
+    value
+        .get("canonical_smiles")
+        .and_then(Value::as_str)
+        .filter(|smiles| !smiles.is_empty())
+        .map(ToOwned::to_owned)
+        .ok_or_else(|| "input_resolver_missing_canonical_smiles".to_string())
+}
+
+fn failed_resolution(raw: &RawInput, reason: &str) -> ConvertedInput {
+    let format = recognized_file_format(&raw.value).unwrap_or("file_path");
+    ConvertedInput {
+        input_id: raw.input_id.clone(),
+        record_id: "record_1".to_string(),
+        original_field: raw.original_field.clone(),
+        inferred_kind: "unknown".to_string(),
+        canonical_kind: None,
+        canonical_value: raw.value.clone(),
+        conversion_status: "failed",
+        conversion_method: "file_resolution",
+        format: format.to_string(),
+        source_kind: "file",
+        source_path: raw.value.clone(),
+        content_sha256: String::new(),
+        reason: reason.to_string(),
+        artifact: String::new(),
+        risk_flags: vec!["input_file_resolution_failed".to_string()],
+        file_count: raw.file_count,
+    }
+}
+
+fn is_molecule_format(format: &str) -> bool {
+    matches!(format, "sdf" | "mol" | "mol2")
+}
+
+fn is_coordinate_format(format: &str) -> bool {
+    matches!(format, "pdb" | "cif" | "mmcif" | "ent")
+}
+
+fn coordinate_kind(field: &str) -> InputKind {
+    if field.contains("peptide") || field.contains("protein") {
+        InputKind::ProteinLigand
+    } else if field.contains("small_molecule") || field.contains("ligand") {
+        InputKind::SmallMolecule
+    } else {
+        InputKind::Complex
+    }
+}
+
+fn sha256_hex(bytes: &[u8]) -> String {
+    format!("{:x}", Sha256::digest(bytes))
 }
 
 fn looks_like_inchi(value: &str) -> bool {
@@ -500,12 +833,13 @@ pub(super) fn write_input_conversion_manifest(
     conversions: &[ConvertedInput],
 ) -> Result<(), String> {
     let mut text = String::from(
-        "input_id\toriginal_field\tinferred_kind\tcanonical_kind\tcanonical_value\tconversion_status\tconversion_method\tformat\treason\tartifact\trisk_flags\n",
+        "input_id\trecord_id\toriginal_field\tinferred_kind\tcanonical_kind\tcanonical_value\tconversion_status\tconversion_method\tformat\tsource_kind\tsource_path\tcontent_sha256\treason\tartifact\trisk_flags\n",
     );
     for input in conversions {
         text.push_str(&format!(
-            "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\n",
+            "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\n",
             input.input_id,
+            clean_cell(&input.record_id),
             clean_cell(&input.original_field),
             clean_cell(&input.inferred_kind),
             input
@@ -516,6 +850,9 @@ pub(super) fn write_input_conversion_manifest(
             input.conversion_status,
             input.conversion_method,
             input.format,
+            input.source_kind,
+            clean_cell(&input.source_path),
+            input.content_sha256,
             clean_cell(&input.reason),
             clean_cell(&input.artifact),
             clean_cell(&input.risk_flags.join(";"))

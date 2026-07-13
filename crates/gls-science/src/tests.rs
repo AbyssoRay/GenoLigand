@@ -424,6 +424,380 @@ fn feature_compute_emits_type_specific_features_for_all_supported_inputs() {
     assert!(!root.exists());
 }
 
+fn science_options(root: &Path, input: &Path, run: &Path) -> ScienceOptions {
+    ScienceOptions {
+        workspace_root: root.to_path_buf(),
+        science_store: root.join("science_store"),
+        input_manifest: input.to_path_buf(),
+        run_dir: run.to_path_buf(),
+    }
+}
+
+fn conversion_rows(run: &Path) -> Vec<Vec<String>> {
+    read_text(&run.join("input_conversion_manifest.tsv"))
+        .expect("conversion manifest")
+        .lines()
+        .skip(1)
+        .map(split_tsv)
+        .collect()
+}
+
+#[test]
+fn input_conversion_manifest_records_inline_provenance() {
+    let root = temp_root("inline_provenance");
+    let input = root.join("input.json");
+    write_text(
+        &input,
+        r#"{"inputs":[{"field":"small_molecule","value":"CCO"}],"files":[]}"#,
+    )
+    .expect("input");
+    let run = root.join("run");
+    run_science_command(
+        ScienceCommand::InputNormalize,
+        &science_options(&root, &input, &run),
+    )
+    .expect("normalize");
+
+    let manifest = read_text(&run.join("input_conversion_manifest.tsv")).expect("manifest");
+    assert_eq!(
+        manifest.lines().next(),
+        Some(
+            "input_id\trecord_id\toriginal_field\tinferred_kind\tcanonical_kind\tcanonical_value\tconversion_status\tconversion_method\tformat\tsource_kind\tsource_path\tcontent_sha256\treason\tartifact\trisk_flags"
+        )
+    );
+    let rows = conversion_rows(&run);
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0][1], "record_1");
+    assert_eq!(rows[0][9], "inline");
+    assert_eq!(rows[0][10], "");
+    assert_eq!(rows[0][11].len(), 64);
+    assert!(rows[0][11].chars().all(|ch| ch.is_ascii_hexdigit()));
+    fs::remove_dir_all(root).expect("cleanup");
+}
+
+#[test]
+fn file_input_reads_fasta_records_and_hashes_content() {
+    let root = temp_root("fasta_content_resolution");
+    let fasta = root.join("queries.fasta");
+    write_text(&fasta, ">alpha\nMKTAYI\n>beta\nACDEFG\n").expect("fasta");
+    let input = root.join("input.json");
+    write_text(
+        &input,
+        &format!(
+            r#"{{"inputs":[{{"field":"protein_ligand","value":{}}}],"files":[]}}"#,
+            serde_json::to_string(&fasta.display().to_string()).expect("path JSON")
+        ),
+    )
+    .expect("input");
+    let run = root.join("run");
+    let options = science_options(&root, &input, &run);
+    run_science_command(ScienceCommand::InputNormalize, &options).expect("normalize");
+    let rows = conversion_rows(&run);
+    assert_eq!(rows.len(), 2);
+    assert_eq!(rows[0][0], "input_1");
+    assert_eq!(rows[0][1], "alpha");
+    assert_eq!(rows[0][5], "MKTAYI");
+    assert_eq!(rows[1][1], "beta");
+    assert_eq!(rows[1][5], "ACDEFG");
+    for row in rows {
+        assert_eq!(row[9], "file");
+        assert_eq!(row[10], fasta.display().to_string());
+        assert_eq!(
+            row[11],
+            "ed9366cb433cae217f90fcee728054b3b3f5300c52cdd3f5b3349f8b19601366"
+        );
+    }
+    fs::remove_dir_all(root).expect("cleanup");
+}
+
+#[test]
+fn sequence_file_formats_are_resolved_from_content() {
+    let root = temp_root("sequence_file_formats");
+    let cases = [
+        ("fa", ">alpha\nMKTAYI\n", "alpha", "MKTAYI"),
+        ("faa", ">alpha\nMKTAYI\n", "alpha", "MKTAYI"),
+        ("fna", ">contig\nATGCGTACGTAA\n", "contig", "ATGCGTACGTAA"),
+        (
+            "fastq",
+            "@read1\nATGCGTAA\n+\nFFFFFFFF\n",
+            "read1",
+            "ATGCGTAA",
+        ),
+        ("fq", "@read1\nATGCGTAA\n+\nFFFFFFFF\n", "read1", "ATGCGTAA"),
+        (
+            "gb",
+            "LOCUS       TEST\nORIGIN\n        1 atgcgtaa\n//\n",
+            "record_1",
+            "ATGCGTAA",
+        ),
+        (
+            "gbk",
+            "LOCUS       TEST\nORIGIN\n        1 atgcgtaa\n//\n",
+            "record_1",
+            "ATGCGTAA",
+        ),
+    ];
+    for (index, (extension, content, record_id, expected)) in cases.iter().enumerate() {
+        let source = root.join(format!("sequence_{index}.{extension}"));
+        write_text(&source, content).expect("source");
+        let input = root.join(format!("input_{index}.json"));
+        write_text(
+            &input,
+            &format!(
+                r#"{{"inputs":[{{"field":"genome_or_metagenome","value":{}}}],"files":[]}}"#,
+                serde_json::to_string(&source.display().to_string()).expect("path JSON")
+            ),
+        )
+        .expect("input");
+        let run = root.join(format!("run_{index}"));
+        run_science_command(
+            ScienceCommand::InputNormalize,
+            &science_options(&root, &input, &run),
+        )
+        .expect("normalize");
+        let rows = conversion_rows(&run);
+        assert_eq!(rows.len(), 1, "extension {extension}");
+        assert_eq!(rows[0][1], *record_id, "extension {extension}");
+        assert_eq!(rows[0][5], *expected, "extension {extension}");
+        assert_eq!(rows[0][8], *extension, "extension {extension}");
+        assert_eq!(rows[0][9], "file", "extension {extension}");
+        assert_eq!(rows[0][10], source.display().to_string());
+    }
+    fs::remove_dir_all(root).expect("cleanup");
+}
+
+#[test]
+fn malformed_fastq_is_a_failed_conversion() {
+    let root = temp_root("malformed_fastq");
+    let fastq = root.join("broken.fastq");
+    write_text(&fastq, "@read1\nATGCGTAA\nnot-plus\nFFFF\n").expect("fastq");
+    let input = root.join("input.json");
+    write_text(
+        &input,
+        &format!(
+            r#"{{"inputs":[{{"field":"genome_or_metagenome","value":{}}}],"files":[]}}"#,
+            serde_json::to_string(&fastq.display().to_string()).expect("path JSON")
+        ),
+    )
+    .expect("input");
+    let run = root.join("run");
+    let error = run_science_command(
+        ScienceCommand::InputNormalize,
+        &science_options(&root, &input, &run),
+    )
+    .expect_err("malformed FASTQ must fail normalization");
+    assert!(error.contains("invalid_fastq_record"));
+    fs::remove_dir_all(root).expect("cleanup");
+}
+
+#[test]
+fn persisted_file_path_is_resolved_with_provenance() {
+    let root = temp_root("persisted_file_resolution");
+    let fasta = root.join("uploaded.faa");
+    write_text(&fasta, ">persisted\nMKTAYI\n").expect("fasta");
+    let input = root.join("input.json");
+    write_text(
+        &input,
+        &format!(
+            r#"{{"inputs":[],"files":[{{"field":"protein_ligand","name":"client-name.faa","persisted_path":{}}}]}}"#,
+            serde_json::to_string(&fasta.display().to_string()).expect("path JSON")
+        ),
+    )
+    .expect("input");
+    let run = root.join("run");
+    run_science_command(
+        ScienceCommand::InputNormalize,
+        &science_options(&root, &input, &run),
+    )
+    .expect("normalize");
+    let rows = conversion_rows(&run);
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0][1], "persisted");
+    assert_eq!(rows[0][5], "MKTAYI");
+    assert_eq!(rows[0][10], fasta.display().to_string());
+    fs::remove_dir_all(root).expect("cleanup");
+}
+
+#[test]
+fn relative_file_path_prefers_manifest_directory_over_process_cwd() {
+    let root = temp_root("relative_file_resolution");
+    let manifest_dir = root.join("manifest");
+    let current_dir = std::env::current_dir().expect("current directory");
+    let relative = PathBuf::from("work").join(format!(
+        "input_resolution_shadow_{}_{}.faa",
+        std::process::id(),
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos()
+    ));
+    let process_shadow = current_dir.join(&relative);
+    let manifest_source = manifest_dir.join(&relative);
+    write_text(&process_shadow, ">process-cwd\nACDEFG\n").expect("process shadow");
+    write_text(&manifest_source, ">manifest-dir\nMKTAYI\n").expect("manifest source");
+    let input = manifest_dir.join("input.json");
+    write_text(
+        &input,
+        &format!(
+            r#"{{"inputs":[{{"field":"protein_ligand","value":{}}}],"files":[]}}"#,
+            serde_json::to_string(&relative.display().to_string()).expect("path JSON")
+        ),
+    )
+    .expect("input");
+    let run = root.join("run");
+    let outcome = run_science_command(
+        ScienceCommand::InputNormalize,
+        &science_options(&root, &input, &run),
+    )
+    .and_then(|_| read_text(&run.join("input_conversion_manifest.tsv")));
+
+    let work_dir = fs::canonicalize(current_dir.join("work")).expect("work directory");
+    let shadow_path = fs::canonicalize(&process_shadow).expect("shadow path");
+    assert!(shadow_path.starts_with(&work_dir));
+    fs::remove_file(&shadow_path).expect("cleanup process shadow");
+    fs::remove_dir_all(&root).expect("cleanup fixture");
+
+    let manifest = outcome.expect("normalize relative input");
+    assert!(manifest.contains("manifest-dir"));
+    assert!(manifest.contains("\tMKTAYI\tconverted\t"));
+    assert!(!manifest.contains("process-cwd"));
+    assert!(!manifest.contains("\tACDEFG\tconverted\t"));
+}
+
+#[test]
+fn nonexistent_declared_file_is_a_failed_conversion() {
+    let root = temp_root("missing_declared_file");
+    let input = root.join("input.json");
+    write_text(
+        &input,
+        r#"{"inputs":[{"field":"small_molecule","value":"Z:\\missing\\ghost.sdf"}],"files":[]}"#,
+    )
+    .expect("input");
+    let run = root.join("run");
+    let options = science_options(&root, &input, &run);
+    let error = run_science_command(ScienceCommand::InputNormalize, &options)
+        .expect_err("missing file must fail normalization");
+    assert!(error.contains("input_file_not_found"));
+    let rows = conversion_rows(&run);
+    assert_eq!(rows[0][6], "failed");
+    assert!(rows[0][12].contains("input_file_not_found"));
+    fs::remove_dir_all(root).expect("cleanup");
+}
+
+#[test]
+fn annotation_files_require_a_reference_sequence() {
+    let root = temp_root("annotation_reference_requirement");
+    for extension in ["gff", "gtf", "vcf"] {
+        let source = root.join(format!("annotations.{extension}"));
+        write_text(&source, "##fileformat=test\n").expect("annotation");
+        let input = root.join(format!("input_{extension}.json"));
+        write_text(
+            &input,
+            &format!(
+                r#"{{"inputs":[{{"field":"genome_or_metagenome","value":{}}}],"files":[]}}"#,
+                serde_json::to_string(&source.display().to_string()).expect("path JSON")
+            ),
+        )
+        .expect("input");
+        let run = root.join(format!("run_{extension}"));
+        let error = run_science_command(
+            ScienceCommand::InputNormalize,
+            &science_options(&root, &input, &run),
+        )
+        .expect_err("annotation without sequence must fail");
+        assert!(
+            error.contains("input_file_requires_reference_sequence"),
+            "extension {extension}: {error}"
+        );
+    }
+    fs::remove_dir_all(root).expect("cleanup");
+}
+
+#[test]
+fn coordinate_file_formats_preserve_content_and_provenance() {
+    let root = temp_root("coordinate_content_resolution");
+    for extension in ["pdb", "cif", "mmcif", "ent"] {
+        let content = format!("HEADER {extension} structure\nATOM 1 C\n");
+        let source = root.join(format!("complex.{extension}"));
+        write_text(&source, &content).expect("coordinates");
+        let input = root.join(format!("input_{extension}.json"));
+        write_text(
+            &input,
+            &format!(
+                r#"{{"inputs":[{{"field":"complex","value":{}}}],"files":[]}}"#,
+                serde_json::to_string(&source.display().to_string()).expect("path JSON")
+            ),
+        )
+        .expect("input");
+        let run = root.join(format!("run_{extension}"));
+        run_science_command(
+            ScienceCommand::InputNormalize,
+            &science_options(&root, &input, &run),
+        )
+        .expect("normalize");
+        let rows = conversion_rows(&run);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(decode_tsv_cell(&rows[0][5]), content);
+        assert_eq!(rows[0][8], extension);
+        assert_eq!(rows[0][9], "file");
+        assert_eq!(rows[0][10], source.display().to_string());
+        assert_eq!(rows[0][11].len(), 64);
+    }
+    fs::remove_dir_all(root).expect("cleanup");
+}
+
+fn ethanol_mol_block() -> &'static str {
+    "ethanol\n  GenoLigand\n\n  3  2  0  0  0  0  0  0  0  0999 V2000\n    0.0000    0.0000    0.0000 C   0  0  0  0  0  0  0  0  0  0  0  0\n    1.5000    0.0000    0.0000 C   0  0  0  0  0  0  0  0  0  0  0  0\n    2.8000    0.0000    0.0000 O   0  0  0  0  0  0  0  0  0  0  0  0\n  1  2  1  0  0  0  0\n  2  3  1  0  0  0  0\nM  END\n"
+}
+
+fn assert_molecule_file_resolves(extension: &str, content: &str) {
+    let root = temp_root(&format!("{extension}_content_resolution"));
+    let source = root.join(format!("ethanol.{extension}"));
+    write_text(&source, content).expect("molecule file");
+    let input = root.join("input.json");
+    write_text(
+        &input,
+        &format!(
+            r#"{{"inputs":[{{"field":"small_molecule","value":{}}}],"files":[]}}"#,
+            serde_json::to_string(&source.display().to_string()).expect("path JSON")
+        ),
+    )
+    .expect("input");
+    let run = root.join("run");
+    run_science_command(
+        ScienceCommand::InputNormalize,
+        &science_options(&root, &input, &run),
+    )
+    .expect("normalize");
+    let rows = conversion_rows(&run);
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0][5], "CCO");
+    assert_eq!(rows[0][6], "converted");
+    assert_eq!(rows[0][8], extension);
+    assert_eq!(rows[0][9], "file");
+    assert_eq!(rows[0][10], source.display().to_string());
+    assert!(!rows[0][5].contains(&source.display().to_string()));
+    fs::remove_dir_all(root).expect("cleanup");
+}
+
+#[test]
+fn sdf_file_is_resolved_to_canonical_smiles() {
+    assert_molecule_file_resolves("sdf", &format!("{}$$$$\n", ethanol_mol_block()));
+}
+
+#[test]
+fn mol_file_is_resolved_to_canonical_smiles() {
+    assert_molecule_file_resolves("mol", ethanol_mol_block());
+}
+
+#[test]
+fn mol2_file_is_resolved_to_canonical_smiles() {
+    assert_molecule_file_resolves(
+        "mol2",
+        "@<TRIPOS>MOLECULE\nethanol\n 3 2 0 0 0\nSMALL\nNO_CHARGES\n\n@<TRIPOS>ATOM\n      1 C1          0.0000    0.0000    0.0000 C.3       1 ETH         0.0000\n      2 C2          1.5000    0.0000    0.0000 C.3       1 ETH         0.0000\n      3 O1          2.8000    0.0000    0.0000 O.3       1 ETH         0.0000\n@<TRIPOS>BOND\n     1    1    2 1\n     2    2    3 1\n",
+    );
+}
+
 #[test]
 fn input_conversion_prefers_content_over_selected_field() {
     let root = temp_root("free_text_conversion");
@@ -449,7 +823,7 @@ fn input_conversion_prefers_content_over_selected_field() {
     let source_map = read_text(&run.join("artifact_source_map.tsv")).expect("source map");
 
     assert!(normalized.contains("input_1\tpeptide\tIKVAV"));
-    assert!(conversion.contains("input_1\tsmall_molecule\tpeptide\tpeptide\tIKVAV\tconverted\tstandard_amino_acid_sequence\tplain_text"));
+    assert!(conversion.contains("input_1\trecord_1\tsmall_molecule\tpeptide\tpeptide\tIKVAV\tconverted\tstandard_amino_acid_sequence\tplain_text"));
     assert!(source_map.contains("input_conversion_manifest.tsv"));
     fs::remove_dir_all(&root).expect("cleanup temp root");
     assert!(!root.exists());
@@ -460,7 +834,8 @@ fn input_conversion_rejects_malformed_manifest_json() {
     let root = temp_root("malformed_input_manifest");
     let input = root.join("input.json");
     write_text(&input, "{not-json").expect("input");
-    let error = extract_inputs(&input).expect_err("malformed JSON must fail");
+    let error = extract_inputs(&science_options(&root, &input, &root.join("run")))
+        .expect_err("malformed JSON must fail");
     assert!(error.starts_with("invalid_input_manifest_json:"));
     fs::remove_dir_all(root).expect("cleanup");
 }
@@ -496,10 +871,10 @@ fn input_conversion_classifies_sequence_and_structure_text() {
     assert!(normalized.contains("input_2\tsmall_molecule\tCC(=O)OC1=CC=CC=C1C(=O)O"));
     assert!(normalized.contains("input_3\tprotein_ligand\tMKTAYIAKQRQISFVKSHFSRQDILDLWQMKTAYIAKQRQISFVKSHFSRQDILDLWQMKTAYIAKQRQISFVKSHFSRQDILDLWQ"));
     assert!(conversion.contains(
-        "input_1\tpeptide\tpeptide\tpeptide\tIKVAV\tconverted\tstandard_amino_acid_sequence\tfasta"
+        "input_1\trecord_1\tpeptide\tpeptide\tpeptide\tIKVAV\tconverted\tstandard_amino_acid_sequence\tfasta"
     ));
-    assert!(conversion.contains("input_2\tsmall_molecule\tsmall_molecule\tsmall_molecule\tCC(=O)OC1=CC=CC=C1C(=O)O\tconverted\trdkit_smiles\tplain_text"));
-    assert!(conversion.contains("input_3\tprotein_ligand\tprotein_ligand\tprotein_ligand\tMKTAYIAKQRQISFVKSHFSRQDILDLWQMKTAYIAKQRQISFVKSHFSRQDILDLWQMKTAYIAKQRQISFVKSHFSRQDILDLWQ\tconverted\tstandard_amino_acid_sequence\tplain_text"));
+    assert!(conversion.contains("input_2\trecord_1\tsmall_molecule\tsmall_molecule\tsmall_molecule\tCC(=O)OC1=CC=CC=C1C(=O)O\tconverted\trdkit_smiles\tplain_text"));
+    assert!(conversion.contains("input_3\trecord_1\tprotein_ligand\tprotein_ligand\tprotein_ligand\tMKTAYIAKQRQISFVKSHFSRQDILDLWQMKTAYIAKQRQISFVKSHFSRQDILDLWQMKTAYIAKQRQISFVKSHFSRQDILDLWQ\tconverted\tstandard_amino_acid_sequence\tplain_text"));
     fs::remove_dir_all(&root).expect("cleanup temp root");
     assert!(!root.exists());
 }
@@ -528,7 +903,7 @@ fn input_conversion_recognizes_nucleotide_sequence_independent_of_field() {
         read_text(&run.join("input_conversion_manifest.tsv")).expect("conversion manifest");
 
     assert!(normalized.contains("input_1\tgenome_or_metagenome\tATGCGTACGTAA"));
-    assert!(conversion.contains("input_1\tsmall_molecule\tgenome_or_metagenome\tgenome_or_metagenome\tATGCGTACGTAA\tconverted\tnucleotide_sequence\tplain_text"));
+    assert!(conversion.contains("input_1\trecord_1\tsmall_molecule\tgenome_or_metagenome\tgenome_or_metagenome\tATGCGTACGTAA\tconverted\tnucleotide_sequence\tplain_text"));
     fs::remove_dir_all(&root).expect("cleanup temp root");
     assert!(!root.exists());
 }
@@ -558,7 +933,7 @@ fn input_conversion_uses_field_hint_for_ambiguous_short_smiles() {
 
     assert!(normalized.contains("input_1\tsmall_molecule\tCCN"));
     assert!(conversion.contains(
-            "input_1\tsmall_molecule\tsmall_molecule\tsmall_molecule\tCCN\tconverted\trdkit_smiles\tplain_text"
+            "input_1\trecord_1\tsmall_molecule\tsmall_molecule\tsmall_molecule\tCCN\tconverted\trdkit_smiles\tplain_text"
         ));
     fs::remove_dir_all(&root).expect("cleanup temp root");
     assert!(!root.exists());
@@ -954,7 +1329,8 @@ fn webui_field_names_normalize_to_all_supported_input_types() {
         )
         .expect("write input");
 
-    let inputs = extract_inputs(&input).expect("extract inputs");
+    let inputs =
+        extract_inputs(&science_options(&root, &input, &root.join("run"))).expect("extract inputs");
     let kinds = inputs
         .iter()
         .map(|input| input.kind.as_str())

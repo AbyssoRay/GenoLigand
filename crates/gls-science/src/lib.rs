@@ -119,10 +119,14 @@ impl InputKind {
 #[derive(Clone, Debug)]
 struct NormalizedInput {
     input_id: String,
+    record_id: String,
     kind: InputKind,
     primary_value: String,
     file_count: usize,
     tokens: BTreeSet<String>,
+    source_kind: &'static str,
+    source_path: String,
+    content_sha256: String,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -2423,7 +2427,7 @@ fn pipeline_blockers(options: &ScienceOptions) -> Result<Vec<String>, String> {
     let mut blockers = Vec::new();
     if !options.input_manifest.exists() {
         blockers.push("missing_input_manifest".to_string());
-    } else if extract_inputs(&options.input_manifest)?.is_empty() {
+    } else if extract_inputs(options)?.is_empty() {
         blockers.push("missing_input".to_string());
     }
     let manifest = options.science_store.join("science_store_manifest.tsv");
@@ -2578,30 +2582,39 @@ fn write_blocked_outputs(options: &ScienceOptions, blockers: &[String]) -> Resul
 
 fn normalize_input(options: &ScienceOptions) -> Result<String, String> {
     ensure_dir(&options.run_dir)?;
-    let conversions = convert_inputs_from_manifest(&options.input_manifest)?;
+    let conversions = convert_inputs_from_manifest(options)?;
     write_input_conversion_manifest(options, &conversions)?;
-    if conversions
+    if let Some(failed) = conversions
         .iter()
-        .any(|input| input.conversion_status == "failed")
+        .find(|input| input.conversion_status == "failed")
     {
         write_artifact_source_map(options)?;
-        return Err("input_conversion_failed".to_string());
+        return Err(format!(
+            "input_conversion_failed:{}:{}",
+            failed.input_id,
+            clean_cell(&failed.reason)
+        ));
     }
     let inputs = normalized_inputs_from_conversions(&conversions);
     if inputs.is_empty() {
         write_artifact_source_map(options)?;
         return Err("missing_input".to_string());
     }
-    let mut normalized =
-        String::from("input_id\tinput_kind\tprimary_value\tfile_count\tfeature_tokens\tstatus\n");
+    let mut normalized = String::from(
+        "input_id\tinput_kind\tprimary_value\tfile_count\tfeature_tokens\trecord_id\tsource_kind\tsource_path\tcontent_sha256\tstatus\n",
+    );
     for input in inputs {
         normalized.push_str(&format!(
-            "{}\t{}\t{}\t{}\t{}\tnormalized\n",
+            "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\tnormalized\n",
             input.input_id,
             input.kind.as_str(),
             encode_tsv_cell(&input.primary_value),
             input.file_count,
-            input.tokens.iter().cloned().collect::<Vec<_>>().join(" ")
+            input.tokens.iter().cloned().collect::<Vec<_>>().join(" "),
+            clean_cell(&input.record_id),
+            input.source_kind,
+            clean_cell(&input.source_path),
+            input.content_sha256,
         ));
     }
     write_text(
@@ -6009,10 +6022,21 @@ fn read_normalized_inputs(path: &Path) -> Result<Vec<NormalizedInput>, String> {
         };
         out.push(NormalizedInput {
             input_id: cols[0].clone(),
+            record_id: cols
+                .get(5)
+                .cloned()
+                .unwrap_or_else(|| "record_1".to_string()),
             kind,
             primary_value: decode_tsv_cell(&cols[2]),
             file_count: cols[3].parse().unwrap_or(0),
             tokens: cols[4].split_whitespace().map(ToOwned::to_owned).collect(),
+            source_kind: if cols.get(6).is_some_and(|value| value == "file") {
+                "file"
+            } else {
+                "inline"
+            },
+            source_path: cols.get(7).cloned().unwrap_or_default(),
+            content_sha256: cols.get(8).cloned().unwrap_or_default(),
         });
     }
     Ok(out)
