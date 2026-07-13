@@ -986,6 +986,49 @@ fn genome_field_accepts_nucleotide_or_protein_content_as_genome_family() {
 }
 
 #[test]
+fn genome_field_falls_back_to_amino_acids_for_short_nucleotide_alphabet_sequences() {
+    let root = temp_root("genome_short_nucleotide_alphabet");
+    let inline_input = root.join("inline.json");
+    write_text(
+        &inline_input,
+        r#"{"inputs":[{"field":"genome_or_metagenome","value":"ACGTAC"}],"files":[]}"#,
+    )
+    .expect("input");
+    let inline_rows = convert_inputs_from_manifest(&science_options(
+        &root,
+        &inline_input,
+        &root.join("run_inline"),
+    ))
+    .expect("convert inline");
+
+    assert_eq!(inline_rows.len(), 1);
+    assert_eq!(inline_rows[0].record_id, "record_1");
+    assert_eq!(
+        inline_rows[0].canonical_kind,
+        Some(InputKind::GenomeOrMetagenome)
+    );
+    assert_eq!(
+        inline_rows[0].conversion_method,
+        "standard_amino_acid_sequence"
+    );
+
+    let faa = root.join("ambiguous.faa");
+    write_text(&faa, ">ambiguous\nACGTAC\n").expect("faa");
+    let file_row = convert_declared_file(
+        &root,
+        "genome_short_nucleotide_faa",
+        "genome_or_metagenome",
+        &faa,
+    );
+    assert_eq!(file_row.record_id, "ambiguous");
+    assert_eq!(file_row.source_kind, "file");
+    assert_eq!(file_row.canonical_kind, Some(InputKind::GenomeOrMetagenome));
+    assert_eq!(file_row.conversion_method, "standard_amino_acid_sequence");
+
+    fs::remove_dir_all(root).expect("cleanup");
+}
+
+#[test]
 fn input_conversion_manifest_records_inline_provenance() {
     let root = temp_root("inline_provenance");
     let input = root.join("input.json");

@@ -103,3 +103,38 @@ The review tests were added before implementation and run individually against t
 | `cargo fmt --all -- --check` | PASS |
 | `cargo clippy --workspace --all-targets --all-features -- -D warnings` | PASS for all workspace targets and features at 0.9.47 |
 | `cargo test --workspace --all-features` | PASS, 173/173: CLI 3, science 99, server 71; doc-tests PASS |
+
+## Second review follow-up: ambiguous genome sequences
+
+### Baseline and scope
+
+- Review baseline HEAD: `7362de731e3f5f1f016a4068a5caeba6a41fcfed`
+- Version: `0.9.47` -> `0.9.48`
+- Scope: short sequences that belong to both the nucleotide alphabet and the standard amino-acid alphabet under `genome_or_metagenome`.
+- Python resolver status: `python/genoligand_workers/input_resolver.py` did not require a second-review change; local bytecode compilation passed.
+
+### RED evidence
+
+| Command | RED result |
+|---|---|
+| `cargo test -p gls-science genome_field_falls_back_to_amino_acids_for_short_nucleotide_alphabet_sequences` | Failed with exit code 101: inline `ACGTAC` produced no canonical kind instead of `GenomeOrMetagenome`; the nucleotide-alphabet branch returned failure before amino-acid fallback. |
+
+The regression test covers inline identity `record_1` and FASTA identity `ambiguous` from an `.faa` record. The existing `ACGTACGT` assertion continues to require `nucleotide_sequence` for a nucleotide-alphabet sequence with length at least eight.
+
+### Implementation
+
+- Applies nucleotide conversion when `len >= 8` and every symbol is nucleotide-compatible.
+- Continues to standard amino-acid conversion when the nucleotide success condition is not met.
+- Preserves `GenomeOrMetagenome` as the canonical family and `standard_amino_acid_sequence` as the method for inline and `.faa` `ACGTAC` records.
+
+### GREEN evidence
+
+| Command | Result |
+|---|---|
+| `cargo test -p gls-science genome_field_falls_back_to_amino_acids_for_short_nucleotide_alphabet_sequences` | PASS, 1/1 |
+| `cargo test -p gls-science` | PASS, 100/100; doc-tests PASS |
+| `cargo fmt --all -- --check` | PASS |
+| `cargo clippy --workspace --all-targets --all-features -- -D warnings` | PASS for all workspace targets and features at 0.9.48 |
+| `cargo test --workspace --all-features` | PASS, 174/174: CLI 3, science 100, server 71; doc-tests PASS |
+| `python -m py_compile python\genoligand_workers\input_resolver.py` | PASS |
+| `git diff --check` | PASS |

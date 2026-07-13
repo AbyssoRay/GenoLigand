@@ -437,25 +437,18 @@ fn convert_nucleotide_or_protein_sequence(record: &ResolvedInputRecord) -> Conve
         return failed_field_format(record, "genome_or_metagenome");
     }
     let sequence = compact_sequence(&record.content).to_ascii_uppercase();
-    if sequence.chars().all(is_nucleotide_symbol) {
-        if sequence.len() >= 8 {
-            return converted_input(
-                record,
-                ConversionDetails {
-                    kind: InputKind::GenomeOrMetagenome,
-                    canonical_value: sequence,
-                    inferred_kind: "genome_or_metagenome",
-                    method: "nucleotide_sequence",
-                    format: sequence_text_format(&record.content),
-                    artifact: "",
-                    risk_flag: "",
-                },
-            );
-        }
-        return failed_conversion_with_reason(
+    if sequence.len() >= 8 && sequence.chars().all(is_nucleotide_symbol) {
+        return converted_input(
             record,
-            "invalid_nucleotide_or_protein_sequence",
-            "invalid_declared_sequence",
+            ConversionDetails {
+                kind: InputKind::GenomeOrMetagenome,
+                canonical_value: sequence,
+                inferred_kind: "genome_or_metagenome",
+                method: "nucleotide_sequence",
+                format: sequence_text_format(&record.content),
+                artifact: "",
+                risk_flag: "",
+            },
         );
     }
     if sequence.len() >= 2 && sequence.chars().all(is_standard_amino_acid) {
