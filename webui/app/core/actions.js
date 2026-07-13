@@ -183,11 +183,19 @@ async function saveInput() {
     state.run = null;
     state.runData = null;
     state.preflight = null;
-    await refreshProjects();
+    let projectRefreshFailed = false;
+    try {
+      await refreshProjects();
+    } catch {
+      projectRefreshFailed = true;
+    }
     if (!inputSaveIsCurrent(saveGeneration, inspectionGeneration, projectId, inputPayload, inputPayloadKeyValue)) {
       return discardStaleInputSave(saveGeneration);
     }
     finishInputSave(saveGeneration);
+    if (projectRefreshFailed) {
+      state.alert = "输入已保存，项目列表暂未刷新。";
+    }
     setStep("check");
     return true;
   } catch (error) {

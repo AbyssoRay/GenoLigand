@@ -242,9 +242,14 @@ global.window = {
 const requests = [];
 const apiCalls = [];
 const saveRequests = [];
+const projectGetRequests = [];
+const projectListRequests = [];
 const visitedSteps = [];
 function render() {}
-function setStep(step) { visitedSteps.push(step); }
+function setStep(step) {
+  state.step = step;
+  visitedSteps.push(step);
+}
 function api(path, options = {}) {
   apiCalls.push({ path, options });
   if (path === "/api/user/inputs/inspect") {
@@ -257,6 +262,16 @@ function api(path, options = {}) {
       saveRequests.push({ path, options, resolve, reject });
     });
   }
+  if (path === "/api/user/projects" && !options.method) {
+    return new Promise((resolve, reject) => {
+      projectListRequests.push({ path, options, resolve, reject });
+    });
+  }
+  if (path.startsWith("/api/user/projects/") && path.split("/").length === 5 && !options.method) {
+    return new Promise((resolve, reject) => {
+      projectGetRequests.push({ path, options, resolve, reject });
+    });
+  }
   return Promise.resolve({ projects: [] });
 }
 function assert(condition, message) {
@@ -266,6 +281,32 @@ function clearScientificForm() {
   for (const spec of inputSpecs) state.form[spec.field] = "";
   state.form.project_name = "";
   invalidateInputInspection();
+}
+function prepareInspectedProject(projectId, projectName) {
+  state.form.project_name = projectName;
+  state.form.small_molecule = "CCO";
+  state.project = { project_id: projectId };
+  state.step = "input";
+  state.alert = "";
+  const payload = inputPayloadFromForm();
+  state.inputInspection = { usable: true, summary: projectName, errors: [], inputs: [] };
+  state.inputInspectionPayload = payload;
+  state.inputInspectionPayloadKey = inputPayloadKey(payload);
+  state.inputInspectionPending = false;
+  state.inputInspectionError = "";
+}
+function switchActiveProject(projectId) {
+  state.project = { project_id: projectId };
+  state.step = "input";
+  invalidateInputInspection();
+  state.alert = "";
+}
+function assertSwitchedProjectStable(result, label) {
+  assert(!result, `${label}: stale save must return false`);
+  assert(state.project.project_id === "project-b", `${label}: stale save must not replace project B`);
+  assert(state.alert === "", `${label}: stale save must not write an alert on project B`);
+  assert(state.step === "input", `${label}: stale save must not change project B step`);
+  assert(!state.inputSavePending, `${label}: stale save must not leave project B pending`);
 }
 
 (async () => {
@@ -333,26 +374,50 @@ function clearScientificForm() {
   assert(!staleSaveResult, "save response for changed form must be ignored");
   assert(!visitedSteps.includes("check"), "stale save response must not enter check step");
 
-  state.form.project_name = "Project A";
-  state.form.small_molecule = "CCO";
-  state.project = { project_id: "project-a" };
-  const projectAPayload = inputPayloadFromForm();
-  state.inputInspection = { usable: true, summary: "project A", errors: [], inputs: [] };
-  state.inputInspectionPayload = projectAPayload;
-  state.inputInspectionPayloadKey = inputPayloadKey(projectAPayload);
-  state.inputInspectionPending = false;
-  state.inputInspectionError = "";
-  const switchedProjectSave = saveInput();
+  prepareInspectedProject("project-a", "Project A post");
+  const staleAfterPostSave = saveInput();
   await Promise.resolve();
   assert(saveRequests.length === 2, "project A must start one save request");
-  state.project = { project_id: "project-b" };
-  invalidateInputInspection();
-  state.alert = "";
+  switchActiveProject("project-b");
   saveRequests[1].resolve({ ok: true, project: { project_id: "project-a" } });
-  const switchedProjectResult = await switchedProjectSave;
-  assert(!switchedProjectResult, "project A response must be ignored after switching to project B");
-  assert(state.project.project_id === "project-b", "stale response must not replace project B");
-  assert(state.alert === "", "stale project A response must not write an alert on project B");
+  assertSwitchedProjectStable(await staleAfterPostSave, "post checkpoint");
+
+  prepareInspectedProject("project-a", "Project A fetch");
+  const staleAfterFetchSave = saveInput();
+  await Promise.resolve();
+  assert(saveRequests.length === 3, "fallback project fetch scenario must start a save");
+  saveRequests[2].resolve({ ok: true });
+  await Promise.resolve();
+  assert(projectGetRequests.length === 1, "save without project payload must fetch the saved project");
+  switchActiveProject("project-b");
+  projectGetRequests[0].resolve({ project_id: "project-a" });
+  assertSwitchedProjectStable(await staleAfterFetchSave, "project fetch checkpoint");
+
+  prepareInspectedProject("project-a", "Project A refresh");
+  const staleAfterRefreshSave = saveInput();
+  await Promise.resolve();
+  assert(saveRequests.length === 4, "project refresh scenario must start a save");
+  saveRequests[3].resolve({ ok: true, project: { project_id: "project-a" } });
+  await Promise.resolve();
+  assert(projectListRequests.length === 1, "successful save must refresh the project list");
+  switchActiveProject("project-b");
+  projectListRequests[0].resolve({ projects: [{ project_id: "project-a" }] });
+  assertSwitchedProjectStable(await staleAfterRefreshSave, "project list checkpoint");
+
+  prepareInspectedProject("project-a", "Project A refresh failure");
+  const refreshFailureSave = saveInput();
+  await Promise.resolve();
+  assert(saveRequests.length === 5, "refresh failure scenario must start a save");
+  saveRequests[4].resolve({ ok: true, project: { project_id: "project-a" } });
+  await Promise.resolve();
+  assert(projectListRequests.length === 2, "persisted input must attempt one project-list refresh");
+  projectListRequests[1].reject(new Error("project list unavailable"));
+  const refreshFailureResult = await refreshFailureSave;
+  assert(refreshFailureResult, "project-list refresh failure must not turn a persisted input into a failed save");
+  assert(state.project.project_id === "project-a", "persisted project must remain active after refresh failure");
+  assert(state.step === "check", "persisted input must continue to the check step after refresh failure");
+  assert(!state.inputSavePending, "completed save must clear pending after refresh failure");
+  assert(!state.alert.includes("输入保存失败"), "refresh failure must not be reported as an input save failure");
 
   state.form.small_molecule = "changed-after-inspection";
   assert(!inputsReadyToSave(), "payload mismatch must disable save before debounce runs");
