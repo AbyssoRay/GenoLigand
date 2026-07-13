@@ -462,7 +462,7 @@ fn input_conversion_manifest_records_inline_provenance() {
     assert_eq!(
         manifest.lines().next(),
         Some(
-            "input_id\trecord_id\toriginal_field\tinferred_kind\tcanonical_kind\tcanonical_value\tconversion_status\tconversion_method\tformat\tsource_kind\tsource_path\tcontent_sha256\treason\tartifact\trisk_flags"
+            "input_id\trecord_id\toriginal_field\tinferred_kind\tcanonical_kind\tcanonical_value\tconversion_status\tconversion_method\tformat\tsource_kind\tsource_path\tcontent_sha256\treason\tartifact\trisk_flags\tstructure_atom_count\tstructure_chain_count\tstructure_residue_count"
         )
     );
     let rows = conversion_rows(&run);
@@ -508,6 +508,80 @@ fn file_input_reads_fasta_records_and_hashes_content() {
         );
     }
     fs::remove_dir_all(root).expect("cleanup");
+}
+
+#[test]
+fn duplicate_fasta_record_ids_fail_normalization() {
+    let root = temp_root("duplicate_fasta_record_ids");
+    let fasta = root.join("queries.fasta");
+    write_text(&fasta, ">duplicate\nMKTAYI\n>duplicate\nACDEFG\n").expect("fasta");
+    let input = root.join("input.json");
+    write_text(
+        &input,
+        &format!(
+            r#"{{"inputs":[{{"field":"protein_ligand","value":{}}}],"files":[]}}"#,
+            serde_json::to_string(&fasta.display().to_string()).expect("path JSON")
+        ),
+    )
+    .expect("input");
+    let run = root.join("run");
+    let error = run_science_command(
+        ScienceCommand::InputNormalize,
+        &science_options(&root, &input, &run),
+    )
+    .expect_err("duplicate FASTA record IDs must fail");
+    fs::remove_dir_all(root).expect("cleanup");
+    assert!(error.contains("duplicate_input_record_id"));
+}
+
+#[test]
+fn feature_manifest_preserves_multi_record_identity() {
+    let root = temp_root("feature_record_identity");
+    let store = root.join("science_store");
+    write_text(
+        &store.join("indexes/known_targets.tsv"),
+        "source\ttarget_id\ttarget_name\torganism\ttarget_class\tligand_tokens\tsequence_tokens\tstructure_tokens\tevidence\ntest\tT1\tRecord identity target\ttest\tprotein\t\tmkt acd\t\trecord_identity_fixture\n",
+    )
+    .expect("known targets");
+    let fasta = root.join("queries.fasta");
+    write_text(&fasta, ">alpha\nMKTAYI\n>beta\nACDEFG\n").expect("fasta");
+    let input = root.join("input.json");
+    write_text(
+        &input,
+        &format!(
+            r#"{{"inputs":[{{"field":"protein_ligand","value":{}}}],"files":[]}}"#,
+            serde_json::to_string(&fasta.display().to_string()).expect("path JSON")
+        ),
+    )
+    .expect("input");
+    let run = root.join("run");
+    let options = science_options(&root, &input, &run);
+    run_science_command(ScienceCommand::InputNormalize, &options).expect("normalize");
+    run_science_command(ScienceCommand::FeaturesCompute, &options).expect("features");
+    let features = read_text(&run.join("feature_manifest.tsv")).expect("feature manifest");
+    let computed = read_computed_feature_inputs(&run.join("feature_manifest.tsv"))
+        .expect("computed feature inputs");
+    run_science_command(ScienceCommand::DatabaseMatchKnown, &options).expect("known matching");
+    let matches = read_text(&run.join("known_database_matches.tsv")).expect("known matches");
+    fs::remove_dir_all(root).expect("cleanup");
+    assert!(
+        features
+            .lines()
+            .next()
+            .is_some_and(|line| line.ends_with("\trecord_id"))
+    );
+    assert!(features.lines().any(|line| line.ends_with("\talpha")));
+    assert!(features.lines().any(|line| line.ends_with("\tbeta")));
+    assert_eq!(computed.len(), 2);
+    assert_eq!(
+        computed
+            .iter()
+            .map(|input| input.record_id.as_str())
+            .collect::<BTreeSet<_>>(),
+        BTreeSet::from(["alpha", "beta"])
+    );
+    assert!(matches.lines().any(|line| line.ends_with("\talpha")));
+    assert!(matches.lines().any(|line| line.ends_with("\tbeta")));
 }
 
 #[test]
@@ -665,6 +739,46 @@ fn relative_file_path_prefers_manifest_directory_over_process_cwd() {
 }
 
 #[test]
+fn relative_file_path_never_falls_back_to_process_cwd() {
+    let root = temp_root("relative_file_no_cwd_fallback");
+    let manifest_dir = root.join("manifest");
+    let current_dir = std::env::current_dir().expect("current directory");
+    let relative = PathBuf::from("work").join(format!(
+        "input_resolution_cwd_only_{}_{}.faa",
+        std::process::id(),
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos()
+    ));
+    let process_shadow = current_dir.join(&relative);
+    write_text(&process_shadow, ">process-cwd\nACDEFG\n").expect("process shadow");
+    let input = manifest_dir.join("input.json");
+    write_text(
+        &input,
+        &format!(
+            r#"{{"inputs":[{{"field":"protein_ligand","value":{}}}],"files":[]}}"#,
+            serde_json::to_string(&relative.display().to_string()).expect("path JSON")
+        ),
+    )
+    .expect("input");
+    let run = root.join("run");
+    let outcome = run_science_command(
+        ScienceCommand::InputNormalize,
+        &science_options(&root, &input, &run),
+    );
+
+    let work_dir = fs::canonicalize(current_dir.join("work")).expect("work directory");
+    let shadow_path = fs::canonicalize(&process_shadow).expect("shadow path");
+    assert!(shadow_path.starts_with(&work_dir));
+    fs::remove_file(&shadow_path).expect("cleanup process shadow");
+    fs::remove_dir_all(&root).expect("cleanup fixture");
+
+    let error = outcome.expect_err("relative path must not resolve from process cwd");
+    assert!(error.contains("input_file_not_found"));
+}
+
+#[test]
 fn nonexistent_declared_file_is_a_failed_conversion() {
     let root = temp_root("missing_declared_file");
     let input = root.join("input.json");
@@ -680,6 +794,7 @@ fn nonexistent_declared_file_is_a_failed_conversion() {
     assert!(error.contains("input_file_not_found"));
     let rows = conversion_rows(&run);
     assert_eq!(rows[0][6], "failed");
+    assert_eq!(rows[0][5], "");
     assert!(rows[0][12].contains("input_file_not_found"));
     fs::remove_dir_all(root).expect("cleanup");
 }
@@ -717,7 +832,11 @@ fn annotation_files_require_a_reference_sequence() {
 fn coordinate_file_formats_preserve_content_and_provenance() {
     let root = temp_root("coordinate_content_resolution");
     for extension in ["pdb", "cif", "mmcif", "ent"] {
-        let content = format!("HEADER {extension} structure\nATOM 1 C\n");
+        let content = if matches!(extension, "pdb" | "ent") {
+            "ATOM      1  N   GLY A   1       0.000   0.000   0.000  1.00  0.00           N  \nATOM      2  CA  GLY A   1       1.458   0.000   0.000  1.00  0.00           C  \nTER       3      GLY A   1\nEND\n".to_string()
+        } else {
+            "data_test\n#\nloop_\n_atom_site.group_PDB\n_atom_site.id\n_atom_site.type_symbol\n_atom_site.label_atom_id\n_atom_site.label_alt_id\n_atom_site.label_comp_id\n_atom_site.label_asym_id\n_atom_site.label_entity_id\n_atom_site.label_seq_id\n_atom_site.pdbx_PDB_ins_code\n_atom_site.Cartn_x\n_atom_site.Cartn_y\n_atom_site.Cartn_z\n_atom_site.occupancy\n_atom_site.B_iso_or_equiv\n_atom_site.pdbx_formal_charge\n_atom_site.auth_seq_id\n_atom_site.auth_comp_id\n_atom_site.auth_asym_id\n_atom_site.auth_atom_id\n_atom_site.pdbx_PDB_model_num\nATOM 1 N N . GLY A 1 1 ? 0.000 0.000 0.000 1.00 0.00 ? 1 GLY A N 1\nATOM 2 C CA . GLY A 1 1 ? 1.458 0.000 0.000 1.00 0.00 ? 1 GLY A CA 1\n#\n".to_string()
+        };
         let source = root.join(format!("complex.{extension}"));
         write_text(&source, &content).expect("coordinates");
         let input = root.join(format!("input_{extension}.json"));
@@ -735,13 +854,55 @@ fn coordinate_file_formats_preserve_content_and_provenance() {
             &science_options(&root, &input, &run),
         )
         .expect("normalize");
+        run_science_command(
+            ScienceCommand::FeaturesCompute,
+            &science_options(&root, &input, &run),
+        )
+        .expect("features");
         let rows = conversion_rows(&run);
+        let features = read_text(&run.join("feature_manifest.tsv")).expect("feature manifest");
         assert_eq!(rows.len(), 1);
         assert_eq!(decode_tsv_cell(&rows[0][5]), content);
         assert_eq!(rows[0][8], extension);
         assert_eq!(rows[0][9], "file");
         assert_eq!(rows[0][10], source.display().to_string());
         assert_eq!(rows[0][11].len(), 64);
+        assert_eq!(rows[0][15], "2");
+        assert_eq!(rows[0][16], "1");
+        assert_eq!(rows[0][17], "1");
+        assert!(features.contains("structure\tparsed_structure\ttrue"));
+        assert!(features.contains("structure\tatom_count\t2"));
+        assert!(features.contains("structure\tchain_count\t1"));
+        assert!(features.contains("structure\tresidue_count\t1"));
+    }
+    fs::remove_dir_all(root).expect("cleanup");
+}
+
+#[test]
+fn coordinate_file_formats_reject_invalid_content() {
+    let root = temp_root("invalid_coordinate_content");
+    for extension in ["pdb", "cif", "mmcif", "ent"] {
+        let source = root.join(format!("invalid.{extension}"));
+        write_text(&source, "not a coordinate structure\n").expect("coordinates");
+        let input = root.join(format!("input_{extension}.json"));
+        write_text(
+            &input,
+            &format!(
+                r#"{{"inputs":[{{"field":"complex","value":{}}}],"files":[]}}"#,
+                serde_json::to_string(&source.display().to_string()).expect("path JSON")
+            ),
+        )
+        .expect("input");
+        let run = root.join(format!("run_{extension}"));
+        let error = run_science_command(
+            ScienceCommand::InputNormalize,
+            &science_options(&root, &input, &run),
+        )
+        .expect_err("invalid coordinate file must fail");
+        assert!(
+            error.contains("structure_parse_failed"),
+            "{extension}: {error}"
+        );
     }
     fs::remove_dir_all(root).expect("cleanup");
 }
@@ -796,6 +957,89 @@ fn mol2_file_is_resolved_to_canonical_smiles() {
         "mol2",
         "@<TRIPOS>MOLECULE\nethanol\n 3 2 0 0 0\nSMALL\nNO_CHARGES\n\n@<TRIPOS>ATOM\n      1 C1          0.0000    0.0000    0.0000 C.3       1 ETH         0.0000\n      2 C2          1.5000    0.0000    0.0000 C.3       1 ETH         0.0000\n      3 O1          2.8000    0.0000    0.0000 O.3       1 ETH         0.0000\n@<TRIPOS>BOND\n     1    1    2 1\n     2    2    3 1\n",
     );
+}
+
+#[test]
+fn multi_record_sdf_preserves_every_record() {
+    let root = temp_root("multi_record_sdf");
+    let sdf = root.join("two_records.sdf");
+    write_text(
+        &sdf,
+        &format!("{}$$$$\n{}$$$$\n", ethanol_mol_block(), ethanol_mol_block()),
+    )
+    .expect("sdf");
+    let input = root.join("input.json");
+    write_text(
+        &input,
+        &format!(
+            r#"{{"inputs":[{{"field":"small_molecule","value":{}}}],"files":[]}}"#,
+            serde_json::to_string(&sdf.display().to_string()).expect("path JSON")
+        ),
+    )
+    .expect("input");
+    let run = root.join("run");
+    run_science_command(
+        ScienceCommand::InputNormalize,
+        &science_options(&root, &input, &run),
+    )
+    .expect("normalize");
+    let rows = conversion_rows(&run);
+    fs::remove_dir_all(root).expect("cleanup");
+    assert_eq!(rows.len(), 2);
+    assert_eq!(rows[0][1], "record_1");
+    assert_eq!(rows[1][1], "record_2");
+    assert!(rows.iter().all(|row| row[5] == "CCO"));
+}
+
+#[test]
+fn sdf_with_an_invalid_record_fails_the_entire_input() {
+    let root = temp_root("invalid_record_sdf");
+    let sdf = root.join("partially_invalid.sdf");
+    write_text(
+        &sdf,
+        &format!("invalid molecule\n$$$$\n{}$$$$\n", ethanol_mol_block()),
+    )
+    .expect("sdf");
+    let input = root.join("input.json");
+    write_text(
+        &input,
+        &format!(
+            r#"{{"inputs":[{{"field":"small_molecule","value":{}}}],"files":[]}}"#,
+            serde_json::to_string(&sdf.display().to_string()).expect("path JSON")
+        ),
+    )
+    .expect("input");
+    let run = root.join("run");
+    let error = run_science_command(
+        ScienceCommand::InputNormalize,
+        &science_options(&root, &input, &run),
+    )
+    .expect_err("partially invalid SDF must fail");
+    fs::remove_dir_all(root).expect("cleanup");
+    assert!(
+        error.contains("rdkit_structure_parse_failed:record_1"),
+        "{error}"
+    );
+}
+
+#[test]
+fn normalized_manifest_requires_complete_provenance_schema() {
+    let root = temp_root("strict_normalized_schema");
+    let run = root.join("run");
+    write_text(
+        &run.join("input_normalized_manifest.tsv"),
+        "input_id\tinput_kind\tprimary_value\tfile_count\tfeature_tokens\tstatus\ninput_1\tpeptide\tMKTAYI\t0\tmkt\tnormalized\n",
+    )
+    .expect("legacy normalized manifest");
+    let input = root.join("input.json");
+    write_text(&input, "{\"inputs\":[],\"files\":[]}\n").expect("input");
+    let error = run_science_command(
+        ScienceCommand::FeaturesCompute,
+        &science_options(&root, &input, &run),
+    )
+    .expect_err("legacy normalized schema must fail");
+    fs::remove_dir_all(root).expect("cleanup");
+    assert!(error.contains("normalized_input_manifest_schema_mismatch"));
 }
 
 #[test]
@@ -969,8 +1213,8 @@ fn database_matching_requires_computed_feature_tokens() {
     assert!(with_features.contains("CHEMBL_T1"));
 
     write_text(
-            &run.join("feature_manifest.tsv"),
-            "input_id\tinput_kind\tfeature_family\tfeature_name\tfeature_value\tfeature_source\tfeature_token\ninput_1\tsmall_molecule\tinput\tinput_length\t3\tGenoLigand\t\n",
+        &run.join("feature_manifest.tsv"),
+        "input_id\tinput_kind\tfeature_family\tfeature_name\tfeature_value\tfeature_source\tfeature_token\trecord_id\ninput_1\tsmall_molecule\tinput\tinput_length\t3\tGenoLigand\t\trecord_1\n",
         )
         .expect("strip feature tokens");
     run_science_command(ScienceCommand::DatabaseMatchKnown, &options)
@@ -1039,7 +1283,7 @@ fn metagenome_matching_preserves_mmseqs_source_database_and_query_id() {
     .expect("mmseqs manifest");
     write_text(
         &run.join("feature_manifest.tsv"),
-        "input_id\tinput_kind\tfeature_family\tfeature_name\tfeature_value\tfeature_source\tfeature_token\ninput_1\tpeptide\tsequence\tmotif\tIKVAV\tGenoLigand\tikvav\n",
+        "input_id\tinput_kind\tfeature_family\tfeature_name\tfeature_value\tfeature_source\tfeature_token\trecord_id\ninput_1\tpeptide\tsequence\tmotif\tIKVAV\tGenoLigand\tikvav\trecord_1\n",
     )
     .expect("features");
     write_text(
@@ -1225,12 +1469,12 @@ fn known_matching_deduplicates_onsite_hits_and_downweights_token_noise() {
     .expect("bindingdb zip");
     write_text(
         &run.join("input_normalized_manifest.tsv"),
-        "input_id\tinput_kind\tprimary_value\tfile_count\tfeature_tokens\tstatus\ninput_1\tsmall_molecule\tCC(=O)Nc1nnc(s1)S(=O)(=O)N\t0\tgeneric\tnormalized\n",
+        "input_id\tinput_kind\tprimary_value\tfile_count\tfeature_tokens\trecord_id\tsource_kind\tsource_path\tcontent_sha256\tstatus\tstructure_atom_count\tstructure_chain_count\tstructure_residue_count\ninput_1\tsmall_molecule\tCC(=O)Nc1nnc(s1)S(=O)(=O)N\t0\tgeneric\trecord_1\tinline\t\taaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\tnormalized\t0\t0\t0\n",
     )
     .expect("normalized");
     write_text(
         &run.join("feature_manifest.tsv"),
-        "input_id\tinput_kind\tfeature_family\tfeature_name\tfeature_value\tfeature_source\tfeature_token\ninput_1\tsmall_molecule\tsmall_molecule\tligand_fingerprint_token\tgeneric\tGenoLigand\tgeneric\n",
+        "input_id\tinput_kind\tfeature_family\tfeature_name\tfeature_value\tfeature_source\tfeature_token\trecord_id\ninput_1\tsmall_molecule\tsmall_molecule\tligand_fingerprint_token\tgeneric\tGenoLigand\tgeneric\trecord_1\n",
     )
     .expect("features");
     write_text(&input, "{\"inputs\":[],\"files\":[]}\n").expect("input");
@@ -1278,12 +1522,12 @@ fn structure_matching_uses_ligand_identity_from_known_search() {
     ensure_dir(&store.join("indexes")).expect("indexes");
     write_text(
         &run.join("input_normalized_manifest.tsv"),
-        "input_id\tinput_kind\tprimary_value\tfile_count\tfeature_tokens\tstatus\ninput_1\tsmall_molecule\tCC(=O)Nc1nnc(s1)S(=O)(=O)N\t0\tcc\tnormalized\n",
+        "input_id\tinput_kind\tprimary_value\tfile_count\tfeature_tokens\trecord_id\tsource_kind\tsource_path\tcontent_sha256\tstatus\tstructure_atom_count\tstructure_chain_count\tstructure_residue_count\ninput_1\tsmall_molecule\tCC(=O)Nc1nnc(s1)S(=O)(=O)N\t0\tcc\trecord_1\tinline\t\taaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\tnormalized\t0\t0\t0\n",
     )
     .expect("normalized");
     write_text(
         &run.join("feature_manifest.tsv"),
-        "input_id\tinput_kind\tfeature_family\tfeature_name\tfeature_value\tfeature_source\tfeature_token\ninput_1\tsmall_molecule\tsmall_molecule\tligand_fingerprint_token\tcc\tGenoLigand\tcc\n",
+        "input_id\tinput_kind\tfeature_family\tfeature_name\tfeature_value\tfeature_source\tfeature_token\trecord_id\ninput_1\tsmall_molecule\tsmall_molecule\tligand_fingerprint_token\tcc\tGenoLigand\tcc\trecord_1\n",
     )
     .expect("features");
     write_text(
@@ -1960,10 +2204,14 @@ fn structure_evaluate_writes_viewer_from_real_coordinate_file() {
     ensure_dir(&store.join("indexes")).expect("indexes");
     ensure_dir(&store.join("downloads/rcsb/mmcif/0g")).expect("coords");
     write_text(&input, "{\"inputs\":[],\"files\":[]}\n").expect("input");
-    write_text(&run.join("input_normalized_manifest.tsv"), "input_id\n").expect("manifest");
+    write_text(
+        &run.join("input_normalized_manifest.tsv"),
+        &(NORMALIZED_INPUT_HEADER.to_string() + "\n"),
+    )
+    .expect("manifest");
     write_text(
             &run.join("feature_manifest.tsv"),
-            "input_id\tinput_kind\tfeature_family\tfeature_name\tfeature_value\tfeature_source\tfeature_token\ninput_1\tsmall_molecule\tligand\ttext\taspirin\tuser\taspirin\n",
+            "input_id\tinput_kind\tfeature_family\tfeature_name\tfeature_value\tfeature_source\tfeature_token\trecord_id\ninput_1\tsmall_molecule\tligand\ttext\taspirin\tuser\taspirin\trecord_1\n",
         )
         .expect("features");
     write_text(
@@ -2005,10 +2253,14 @@ fn structure_evaluate_prefers_bindingdb_pdb_candidate_over_token_noise() {
     ensure_dir(&store.join("downloads/rcsb/mmcif/h4")).expect("target coords");
     ensure_dir(&run.join("tool_outputs")).expect("tool outputs");
     write_text(&input, "{\"inputs\":[],\"files\":[]}\n").expect("input");
-    write_text(&run.join("input_normalized_manifest.tsv"), "input_id\n").expect("manifest");
+    write_text(
+        &run.join("input_normalized_manifest.tsv"),
+        &(NORMALIZED_INPUT_HEADER.to_string() + "\n"),
+    )
+    .expect("manifest");
     write_text(
         &run.join("feature_manifest.tsv"),
-        "input_id\tinput_kind\tfeature_family\tfeature_name\tfeature_value\tfeature_source\tfeature_token\ninput_1\tsmall_molecule\tligand\ttext\tazm\tuser\tazm\n",
+        "input_id\tinput_kind\tfeature_family\tfeature_name\tfeature_value\tfeature_source\tfeature_token\trecord_id\ninput_1\tsmall_molecule\tligand\ttext\tazm\tuser\tazm\trecord_1\n",
     )
     .expect("features");
     write_text(
@@ -2066,10 +2318,14 @@ fn structure_evaluate_reads_canonical_index_rows_beyond_source_sampling_limit() 
     ensure_dir(&store.join("indexes")).expect("indexes");
     ensure_dir(&store.join("downloads/rcsb/mmcif/ik")).expect("coords");
     write_text(&input, "{\"inputs\":[],\"files\":[]}\n").expect("input");
-    write_text(&run.join("input_normalized_manifest.tsv"), "input_id\n").expect("manifest");
+    write_text(
+        &run.join("input_normalized_manifest.tsv"),
+        &(NORMALIZED_INPUT_HEADER.to_string() + "\n"),
+    )
+    .expect("manifest");
     write_text(
         &run.join("feature_manifest.tsv"),
-        "input_id\tinput_kind\tfeature_family\tfeature_name\tfeature_value\tfeature_source\tfeature_token\ninput_1\tpeptide\tpeptide\tsequence_feature_token\tikv\tGenoLigand\tikv\n",
+        "input_id\tinput_kind\tfeature_family\tfeature_name\tfeature_value\tfeature_source\tfeature_token\trecord_id\ninput_1\tpeptide\tpeptide\tsequence_feature_token\tikv\tGenoLigand\tikv\trecord_1\n",
     )
     .expect("features");
     let mut index = String::from(

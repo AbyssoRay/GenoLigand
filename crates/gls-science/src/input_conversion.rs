@@ -4,6 +4,7 @@ use super::{
 };
 use serde_json::Value;
 use sha2::{Digest, Sha256};
+use std::collections::BTreeSet;
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -24,6 +25,9 @@ pub(super) struct ConvertedInput {
     pub(super) source_kind: &'static str,
     pub(super) source_path: String,
     pub(super) content_sha256: String,
+    pub(super) structure_atom_count: usize,
+    pub(super) structure_chain_count: usize,
+    pub(super) structure_residue_count: usize,
     pub(super) reason: String,
     pub(super) artifact: String,
     pub(super) risk_flags: Vec<String>,
@@ -43,13 +47,22 @@ struct ResolvedInputRecord {
     input_id: String,
     record_id: String,
     original_field: String,
-    declared_value: String,
     source_kind: &'static str,
     source_path: String,
     content_sha256: String,
     format: String,
     content: String,
+    structure_atom_count: usize,
+    structure_chain_count: usize,
+    structure_residue_count: usize,
     file_count: usize,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct CoordinateSummary {
+    atom_count: usize,
+    chain_count: usize,
+    residue_count: usize,
 }
 
 struct ConversionDetails<'a> {
@@ -155,6 +168,9 @@ pub(super) fn normalized_inputs_from_conversions(
                 source_kind: input.source_kind,
                 source_path: input.source_path.clone(),
                 content_sha256: input.content_sha256.clone(),
+                structure_atom_count: input.structure_atom_count,
+                structure_chain_count: input.structure_chain_count,
+                structure_residue_count: input.structure_residue_count,
             })
         })
         .collect()
@@ -311,6 +327,9 @@ fn converted_input(record: &ResolvedInputRecord, details: ConversionDetails<'_>)
         source_kind: record.source_kind,
         source_path: record.source_path.clone(),
         content_sha256: record.content_sha256.clone(),
+        structure_atom_count: record.structure_atom_count,
+        structure_chain_count: record.structure_chain_count,
+        structure_residue_count: record.structure_residue_count,
         reason: "recognized as calculable input".to_string(),
         artifact: details.artifact.to_string(),
         risk_flags: if details.risk_flag.is_empty() {
@@ -335,13 +354,16 @@ fn failed_conversion(record: &ResolvedInputRecord) -> ConvertedInput {
         original_field: record.original_field.clone(),
         inferred_kind: "unknown".to_string(),
         canonical_kind: None,
-        canonical_value: record.declared_value.clone(),
+        canonical_value: String::new(),
         conversion_status: "failed",
         conversion_method: "unrecognized_text",
         format: record.format.clone(),
         source_kind: record.source_kind,
         source_path: record.source_path.clone(),
         content_sha256: record.content_sha256.clone(),
+        structure_atom_count: record.structure_atom_count,
+        structure_chain_count: record.structure_chain_count,
+        structure_residue_count: record.structure_residue_count,
         reason: "无法转换为可计算结构或序列".to_string(),
         artifact: String::new(),
         risk_flags: vec![risk.to_string()],
@@ -359,12 +381,14 @@ fn resolve_raw_input(
             input_id: raw.input_id.clone(),
             record_id: "record_1".to_string(),
             original_field: raw.original_field.clone(),
-            declared_value: declared_value.to_string(),
             source_kind: "inline",
             source_path: String::new(),
             content_sha256: sha256_hex(declared_value.as_bytes()),
             format: "plain_text".to_string(),
             content: declared_value.to_string(),
+            structure_atom_count: 0,
+            structure_chain_count: 0,
+            structure_residue_count: 0,
             file_count: raw.file_count,
         }]);
     };
@@ -381,15 +405,20 @@ fn resolve_raw_input(
         .map_err(|err| format!("input_file_read_failed:{declared_value}:{err}"))?;
     let content_sha256 = sha256_hex(&bytes);
     if is_molecule_format(format) {
-        let content = resolve_molecule_file(&source_path, format, &content_sha256)?;
-        return Ok(vec![file_record(
-            raw,
-            "record_1".to_string(),
-            &source_path,
-            format,
-            &content_sha256,
-            content,
-        )]);
+        let records = resolve_molecule_file(&source_path, format, &content_sha256)?;
+        return Ok(records
+            .into_iter()
+            .map(|(record_id, content)| {
+                file_record(
+                    raw,
+                    record_id,
+                    &source_path,
+                    format,
+                    &content_sha256,
+                    content,
+                )
+            })
+            .collect());
     }
     let text = String::from_utf8(bytes)
         .map_err(|err| format!("input_file_not_utf8:{declared_value}:{err}"))?;
@@ -409,14 +438,21 @@ fn resolve_raw_input(
                 sequence,
             )])
         }
-        "pdb" | "cif" | "mmcif" | "ent" => Ok(vec![file_record(
-            raw,
-            "record_1".to_string(),
-            &source_path,
-            format,
-            &content_sha256,
-            text,
-        )]),
+        "pdb" | "cif" | "mmcif" | "ent" => {
+            let summary = resolve_coordinate_file(&source_path, format, &content_sha256)?;
+            let mut record = file_record(
+                raw,
+                "record_1".to_string(),
+                &source_path,
+                format,
+                &content_sha256,
+                text,
+            );
+            record.structure_atom_count = summary.atom_count;
+            record.structure_chain_count = summary.chain_count;
+            record.structure_residue_count = summary.residue_count;
+            Ok(vec![record])
+        }
         _ => unreachable!("recognized file format must be handled"),
     }
 }
@@ -464,7 +500,7 @@ fn resolve_input_path(value: &str, options: &ScienceOptions) -> PathBuf {
     if relative_to_workspace.is_file() {
         return relative_to_workspace;
     }
-    declared
+    relative_to_workspace
 }
 
 fn file_record(
@@ -479,12 +515,14 @@ fn file_record(
         input_id: raw.input_id.clone(),
         record_id,
         original_field: raw.original_field.clone(),
-        declared_value: raw.value.clone(),
         source_kind: "file",
         source_path: source_path.display().to_string(),
         content_sha256: content_sha256.to_string(),
         format: format.to_string(),
         content,
+        structure_atom_count: 0,
+        structure_chain_count: 0,
+        structure_residue_count: 0,
         file_count: raw.file_count,
     }
 }
@@ -497,12 +535,16 @@ fn resolve_fasta_records(
     text: &str,
 ) -> Result<Vec<ResolvedInputRecord>, String> {
     let mut records = Vec::new();
+    let mut seen_record_ids = BTreeSet::new();
     let mut record_id = None::<String>;
     let mut sequence = String::new();
     for line in text.lines() {
         if let Some(header) = line.trim_start().strip_prefix('>') {
-            if let Some(previous_id) = record_id.replace(fasta_record_id(header, records.len() + 1))
-            {
+            let next_id = fasta_record_id(header, records.len() + 1);
+            if !seen_record_ids.insert(next_id.clone()) {
+                return Err(format!("duplicate_input_record_id:{next_id}"));
+            }
+            if let Some(previous_id) = record_id.replace(next_id) {
                 if sequence.is_empty() {
                     return Err("invalid_fasta_record:empty_sequence".to_string());
                 }
@@ -559,6 +601,7 @@ fn resolve_fastq_records(
         return Err("invalid_fastq_record:line_count".to_string());
     }
     let mut records = Vec::new();
+    let mut seen_record_ids = BTreeSet::new();
     for chunk in lines.chunks_exact(4) {
         let Some(header) = chunk[0].strip_prefix('@') else {
             return Err("invalid_fastq_record:missing_header".to_string());
@@ -571,9 +614,13 @@ fn resolve_fastq_records(
         if sequence.chars().count() != quality.chars().count() {
             return Err("invalid_fastq_record:sequence_quality_length".to_string());
         }
+        let record_id = fasta_record_id(header, records.len() + 1);
+        if !seen_record_ids.insert(record_id.clone()) {
+            return Err(format!("duplicate_input_record_id:{record_id}"));
+        }
         records.push(file_record(
             raw,
-            fasta_record_id(header, records.len() + 1),
+            record_id,
             source_path,
             format,
             content_sha256,
@@ -611,7 +658,7 @@ fn resolve_molecule_file(
     path: &Path,
     format: &str,
     content_sha256: &str,
-) -> Result<String, String> {
+) -> Result<Vec<(String, String)>, String> {
     let args = vec![
         "--path".to_string(),
         path.display().to_string(),
@@ -622,12 +669,65 @@ fn resolve_molecule_file(
     let output = run_python_script(INPUT_RESOLVER_SCRIPT, &args, &context)?;
     let value = serde_json::from_str::<Value>(output.trim())
         .map_err(|err| format!("input_resolver_invalid_json:{err}"))?;
-    value
-        .get("canonical_smiles")
-        .and_then(Value::as_str)
-        .filter(|smiles| !smiles.is_empty())
-        .map(ToOwned::to_owned)
-        .ok_or_else(|| "input_resolver_missing_canonical_smiles".to_string())
+    let records = value
+        .get("records")
+        .and_then(Value::as_array)
+        .ok_or_else(|| "input_resolver_missing_records".to_string())?;
+    if records.is_empty() {
+        return Err("input_resolver_empty_records".to_string());
+    }
+    records
+        .iter()
+        .enumerate()
+        .map(|(index, record)| {
+            let record_id = record
+                .get("record_id")
+                .and_then(Value::as_str)
+                .filter(|value| !value.is_empty())
+                .map(ToOwned::to_owned)
+                .unwrap_or_else(|| format!("record_{}", index + 1));
+            let canonical_smiles = record
+                .get("canonical_smiles")
+                .and_then(Value::as_str)
+                .filter(|value| !value.is_empty())
+                .map(ToOwned::to_owned)
+                .ok_or_else(|| format!("input_resolver_missing_canonical_smiles:{record_id}"))?;
+            Ok((record_id, canonical_smiles))
+        })
+        .collect()
+}
+
+fn resolve_coordinate_file(
+    path: &Path,
+    format: &str,
+    content_sha256: &str,
+) -> Result<CoordinateSummary, String> {
+    let args = vec![
+        "--path".to_string(),
+        path.display().to_string(),
+        "--format".to_string(),
+        format.to_string(),
+    ];
+    let context = format!("input_resolver_{}", &content_sha256[..12]);
+    let output = run_python_script(INPUT_RESOLVER_SCRIPT, &args, &context)?;
+    let value = serde_json::from_str::<Value>(output.trim())
+        .map_err(|err| format!("input_resolver_invalid_json:{err}"))?;
+    let structure = value
+        .get("structure")
+        .ok_or_else(|| "input_resolver_missing_structure".to_string())?;
+    let parse_count = |name: &str| {
+        structure
+            .get(name)
+            .and_then(Value::as_u64)
+            .and_then(|value| usize::try_from(value).ok())
+            .filter(|value| *value > 0)
+            .ok_or_else(|| format!("input_resolver_invalid_structure_{name}"))
+    };
+    Ok(CoordinateSummary {
+        atom_count: parse_count("atom_count")?,
+        chain_count: parse_count("chain_count")?,
+        residue_count: parse_count("residue_count")?,
+    })
 }
 
 fn failed_resolution(raw: &RawInput, reason: &str) -> ConvertedInput {
@@ -638,13 +738,16 @@ fn failed_resolution(raw: &RawInput, reason: &str) -> ConvertedInput {
         original_field: raw.original_field.clone(),
         inferred_kind: "unknown".to_string(),
         canonical_kind: None,
-        canonical_value: raw.value.clone(),
+        canonical_value: String::new(),
         conversion_status: "failed",
         conversion_method: "file_resolution",
         format: format.to_string(),
         source_kind: "file",
         source_path: raw.value.clone(),
         content_sha256: String::new(),
+        structure_atom_count: 0,
+        structure_chain_count: 0,
+        structure_residue_count: 0,
         reason: reason.to_string(),
         artifact: String::new(),
         risk_flags: vec!["input_file_resolution_failed".to_string()],
@@ -833,11 +936,11 @@ pub(super) fn write_input_conversion_manifest(
     conversions: &[ConvertedInput],
 ) -> Result<(), String> {
     let mut text = String::from(
-        "input_id\trecord_id\toriginal_field\tinferred_kind\tcanonical_kind\tcanonical_value\tconversion_status\tconversion_method\tformat\tsource_kind\tsource_path\tcontent_sha256\treason\tartifact\trisk_flags\n",
+        "input_id\trecord_id\toriginal_field\tinferred_kind\tcanonical_kind\tcanonical_value\tconversion_status\tconversion_method\tformat\tsource_kind\tsource_path\tcontent_sha256\treason\tartifact\trisk_flags\tstructure_atom_count\tstructure_chain_count\tstructure_residue_count\n",
     );
     for input in conversions {
         text.push_str(&format!(
-            "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\n",
+            "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\n",
             input.input_id,
             clean_cell(&input.record_id),
             clean_cell(&input.original_field),
@@ -855,7 +958,10 @@ pub(super) fn write_input_conversion_manifest(
             input.content_sha256,
             clean_cell(&input.reason),
             clean_cell(&input.artifact),
-            clean_cell(&input.risk_flags.join(";"))
+            clean_cell(&input.risk_flags.join(";")),
+            input.structure_atom_count,
+            input.structure_chain_count,
+            input.structure_residue_count,
         ));
     }
     write_text(

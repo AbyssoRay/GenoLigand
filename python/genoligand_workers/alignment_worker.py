@@ -13,7 +13,7 @@ from genoligand_workers.worker_io import parse_worker_args, read_job, write_resu
 
 MATCH_HEADER = (
     "input_id\tsource\ttarget_id\ttarget_name\torganism\ttarget_class\tmatch_score\t"
-    "matched_features\tevidence\n"
+    "matched_features\tevidence\trecord_id\n"
 )
 
 
@@ -72,6 +72,10 @@ def run_mmseqs_alignment(run_dir: Path, science_store: Path) -> str:
 
     query = out_dir / "mmseqs_query.fasta"
     write_fasta(query, sequences)
+    query_identities = {
+        query_id: (input_id, record_id)
+        for query_id, input_id, record_id, _sequence in sequences
+    }
     query_db = out_dir / "mmseqs_query_db"
     raw_dir = out_dir / "mmseqs_raw"
     raw_dir.mkdir(parents=True, exist_ok=True)
@@ -113,7 +117,7 @@ def run_mmseqs_alignment(run_dir: Path, science_store: Path) -> str:
         if completed.returncode != 0:
             failures.append(f"{target.name}:{first_line(completed.stderr or completed.stdout)}")
             continue
-        rows.extend(mmseqs_rows(raw, target))
+        rows.extend(mmseqs_rows(raw, target, query_identities))
     write_text(matches_path, MATCH_HEADER + "".join(rows))
     if rows:
         write_status(status_path, "ready", f"mmseqs2 persistent database search completed against {len(targets)} target databases", len(rows))
@@ -214,11 +218,11 @@ def tool_outputs(run_dir: Path) -> Path:
     return run_dir / "tool_outputs"
 
 
-def read_sequence_inputs(run_dir: Path) -> list[tuple[str, str]]:
+def read_sequence_inputs(run_dir: Path) -> list[tuple[str, str, str, str]]:
     path = run_dir / "input_conversion_manifest.tsv"
     if not path.exists():
         return []
-    rows: list[tuple[str, str]] = []
+    rows: list[tuple[str, str, str, str]] = []
     with path.open("r", encoding="utf-8-sig", newline="") as handle:
         for row in csv.DictReader(handle, delimiter="\t"):
             if str(row.get("conversion_status", "")).strip() != "converted":
@@ -226,11 +230,27 @@ def read_sequence_inputs(run_dir: Path) -> list[tuple[str, str]]:
             kind = str(row.get("canonical_kind", "")).strip()
             if kind not in {"peptide", "protein_ligand", "genome_or_metagenome"}:
                 continue
+            input_format = str(row.get("format", "")).strip().lower()
+            if input_format not in {
+                "plain_text",
+                "fasta",
+                "fa",
+                "faa",
+                "fna",
+                "fastq",
+                "fq",
+                "gb",
+                "gbk",
+            }:
+                continue
             value = decode_tsv_cell(str(row.get("canonical_value", ""))).strip().upper()
             sequence = "".join(ch for ch in value if ch.isalpha())
             if len(sequence) < 2:
                 continue
-            rows.append((str(row.get("input_id", "input_1")).strip() or "input_1", sequence))
+            input_id = str(row.get("input_id", "input_1")).strip() or "input_1"
+            record_id = str(row.get("record_id", "record_1")).strip() or "record_1"
+            query_id = f"{safe_id(input_id)}__record__{safe_id(record_id)}"
+            rows.append((query_id, input_id, record_id, sequence))
     return rows
 
 
@@ -301,12 +321,19 @@ def dedupe_paths(paths: list[Path]) -> list[Path]:
     return out
 
 
-def write_fasta(path: Path, rows: list[tuple[str, str]]) -> None:
-    text = "".join(f">{safe_id(input_id)}\n{sequence}\n" for input_id, sequence in rows)
+def write_fasta(path: Path, rows: list[tuple[str, str, str, str]]) -> None:
+    text = "".join(
+        f">{query_id}\n{sequence}\n"
+        for query_id, _input_id, _record_id, sequence in rows
+    )
     write_text(path, text)
 
 
-def mmseqs_rows(path: Path, target_path: Path) -> list[str]:
+def mmseqs_rows(
+    path: Path,
+    target_path: Path,
+    query_identities: dict[str, tuple[str, str]],
+) -> list[str]:
     if not path.exists():
         return []
     rows: list[str] = []
@@ -316,16 +343,19 @@ def mmseqs_rows(path: Path, target_path: Path) -> list[str]:
             if len(cols) < 6:
                 continue
             query, target, pident, alnlen, evalue, bits = cols[:6]
+            input_id, record_id = query_identities.get(query, (query, "record_1"))
             score = alignment_score(pident, bits)
             target_id = safe_id(target.split()[0])
             evidence = (
                 f"mmseqs2_search;evalue={safe_note(evalue)};bits={safe_note(bits)};"
                 f"pident={safe_note(pident)};alnlen={safe_note(alnlen)};"
-                f"target_database={safe_note(target_path.name)}"
+                f"target_database={safe_note(target_path.name)};"
+                f"query_id={safe_note(query)};record_id={safe_note(record_id)}"
             )
             rows.append(
-                f"{safe_id(query)}\tMMseqs2\t{target_id}\t{clean_cell(target)}\tunknown\t"
-                f"onsite_sequence_alignment\t{score:.4f}\t{clean_cell(target)}\t{evidence}\n"
+                f"{clean_cell(input_id)}\tMMseqs2\t{target_id}\t{clean_cell(target)}\tunknown\t"
+                f"onsite_sequence_alignment\t{score:.4f}\t{clean_cell(target)}\t{evidence}\t"
+                f"{clean_cell(record_id)}\n"
             )
     return rows
 
@@ -348,7 +378,8 @@ def foldseek_rows(path: Path) -> list[str]:
             )
             rows.append(
                 f"{safe_id(query)}\tFoldseek\t{target_id}\t{clean_cell(target)}\tunknown\t"
-                f"onsite_structure_alignment\t{score:.4f}\t{clean_cell(target)}\t{evidence}\n"
+                f"onsite_structure_alignment\t{score:.4f}\t{clean_cell(target)}\t{evidence}\t"
+                "record_1\n"
             )
     return rows
 

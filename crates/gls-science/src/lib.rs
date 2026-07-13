@@ -127,7 +127,13 @@ struct NormalizedInput {
     source_kind: &'static str,
     source_path: String,
     content_sha256: String,
+    structure_atom_count: usize,
+    structure_chain_count: usize,
+    structure_residue_count: usize,
 }
+
+const NORMALIZED_INPUT_HEADER: &str = "input_id\tinput_kind\tprimary_value\tfile_count\tfeature_tokens\trecord_id\tsource_kind\tsource_path\tcontent_sha256\tstatus\tstructure_atom_count\tstructure_chain_count\tstructure_residue_count";
+const FEATURE_MANIFEST_HEADER: &str = "input_id\tinput_kind\tfeature_family\tfeature_name\tfeature_value\tfeature_source\tfeature_token\trecord_id";
 
 #[derive(Clone, Copy, Debug)]
 struct WorkerTask {
@@ -170,6 +176,7 @@ const REPORT_CANDIDATE_LIMIT: usize = 50;
 #[derive(Clone, Debug)]
 struct ComputedFeatureInput {
     input_id: String,
+    record_id: String,
     input_kind: String,
     tokens: BTreeSet<String>,
 }
@@ -214,6 +221,7 @@ struct Candidate {
 #[derive(Clone, Debug)]
 struct IndexMatch {
     input_id: String,
+    record_id: String,
     source: String,
     target_id: String,
     target_name: String,
@@ -2600,12 +2608,10 @@ fn normalize_input(options: &ScienceOptions) -> Result<String, String> {
         write_artifact_source_map(options)?;
         return Err("missing_input".to_string());
     }
-    let mut normalized = String::from(
-        "input_id\tinput_kind\tprimary_value\tfile_count\tfeature_tokens\trecord_id\tsource_kind\tsource_path\tcontent_sha256\tstatus\n",
-    );
+    let mut normalized = format!("{NORMALIZED_INPUT_HEADER}\n");
     for input in inputs {
         normalized.push_str(&format!(
-            "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\tnormalized\n",
+            "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\tnormalized\t{}\t{}\t{}\n",
             input.input_id,
             input.kind.as_str(),
             encode_tsv_cell(&input.primary_value),
@@ -2615,6 +2621,9 @@ fn normalize_input(options: &ScienceOptions) -> Result<String, String> {
             input.source_kind,
             clean_cell(&input.source_path),
             input.content_sha256,
+            input.structure_atom_count,
+            input.structure_chain_count,
+            input.structure_residue_count,
         ));
     }
     write_text(
@@ -2641,9 +2650,7 @@ fn compute_features(options: &ScienceOptions) -> Result<String, String> {
     if rows.is_empty() {
         return Err("normalized_input_missing_or_empty".to_string());
     }
-    let mut text = String::from(
-        "input_id\tinput_kind\tfeature_family\tfeature_name\tfeature_value\tfeature_source\tfeature_token\n",
-    );
+    let mut text = format!("{FEATURE_MANIFEST_HEADER}\n");
     for input in rows {
         let token_count = input.tokens.len();
         let length = input
@@ -2671,20 +2678,22 @@ fn compute_features(options: &ScienceOptions) -> Result<String, String> {
             ),
         ] {
             text.push_str(&format!(
-                "{}\t{}\t{family}\t{name}\t{value}\tGenoLigand\t\n",
+                "{}\t{}\t{family}\t{name}\t{value}\tGenoLigand\t\t{}\n",
                 input.input_id,
-                input.kind.as_str()
+                input.kind.as_str(),
+                clean_cell(&input.record_id),
             ));
         }
         for row in typed_feature_rows(&input) {
             text.push_str(&format!(
-                "{}\t{}\t{}\t{}\t{}\tGenoLigand\t{}\n",
+                "{}\t{}\t{}\t{}\t{}\tGenoLigand\t{}\t{}\n",
                 input.input_id,
                 input.kind.as_str(),
                 clean_cell(&row.family),
                 clean_cell(&row.name),
                 clean_cell(&row.value),
-                clean_cell(&row.token)
+                clean_cell(&row.token),
+                clean_cell(&input.record_id),
             ));
         }
     }
@@ -2709,7 +2718,7 @@ fn match_known(options: &ScienceOptions) -> Result<String, String> {
         "known_database_index",
     )?;
     let mut out = String::from(
-        "input_id\tsource\ttarget_id\ttarget_name\torganism\ttarget_class\tmatch_score\tmatched_features\tevidence\tsource_row_provenance\tactivity_value\tligand_identity\tcurrent_run_query_id\n",
+        "input_id\tsource\ttarget_id\ttarget_name\torganism\ttarget_class\tmatch_score\tmatched_features\tevidence\tsource_row_provenance\tactivity_value\tligand_identity\tcurrent_run_query_id\trecord_id\n",
     );
     for input in &inputs {
         for row in &rows {
@@ -2717,7 +2726,7 @@ fn match_known(options: &ScienceOptions) -> Result<String, String> {
             if score > 0.0 {
                 let matched = matched_tokens(input, row).join(" ");
                 out.push_str(&format!(
-                    "{}\t{}\t{}\t{}\t{}\t{}\t{score:.4}\t{}\t{}\t{}\t\t{}\tprojection_index_match\n",
+                    "{}\t{}\t{}\t{}\t{}\t{}\t{score:.4}\t{}\t{}\t{}\t\t{}\tprojection_index_match\t{}\n",
                     input.input_id,
                     row.source,
                     row.target_id,
@@ -2727,7 +2736,8 @@ fn match_known(options: &ScienceOptions) -> Result<String, String> {
                     clean_cell(&matched),
                     clean_cell(&row.evidence),
                     clean_cell(&row.evidence),
-                    clean_cell(&matched)
+                    clean_cell(&matched),
+                    clean_cell(&input.record_id),
                 ));
             }
         }
@@ -2768,11 +2778,12 @@ fn append_chembl_onsite_matches(
     }
     ensure_dir(&options.run_dir)?;
     let query_path = options.run_dir.join("chembl_onsite_queries.tsv");
-    let mut queries = String::from("input_id\tquery\n");
+    let mut queries = String::from("input_id\trecord_id\tquery\n");
     for input in small_molecules {
         queries.push_str(&format!(
-            "{}\t{}\n",
+            "{}\t{}\t{}\n",
             clean_cell(&input.input_id),
+            clean_cell(&input.record_id),
             encode_tsv_cell(&input.primary_value)
         ));
     }
@@ -2901,14 +2912,18 @@ with open(query_path, "r", encoding="utf-8-sig", newline="") as handle:
         query = decode(row.get("query", "")).strip()
         canonical = canonical_smiles(query)
         if query and canonical:
-            queries.append((clean(row.get("input_id", "input_1")) or "input_1", canonical))
+            queries.append((
+                clean(row.get("input_id", "input_1")) or "input_1",
+                clean(row.get("record_id", "record_1")) or "record_1",
+                canonical,
+            ))
 
 if not queries:
     raise SystemExit(0)
 
 query_by_smiles = {}
-for input_id, canonical in queries:
-    query_by_smiles.setdefault(canonical, []).append(input_id)
+for input_id, record_id, canonical in queries:
+    query_by_smiles.setdefault(canonical, []).append((input_id, record_id))
 
 def sqlite_path_from_source(path):
     lower = path.lower()
@@ -2967,7 +2982,7 @@ try:
         activity = f"{standard_type}={format_activity_number(value)} {units}".strip()
         matched = f"canonical_smiles={smiles};compound_name={compound_name}"
         evidence = f"chembl_onsite_activity_row;{activity};relation={relation};compound_name={compound_name}"
-        for input_id in query_by_smiles.get(smiles, []):
+        for input_id, record_id in query_by_smiles.get(smiles, []):
             out_row = [
                 input_id,
                 "ChEMBL",
@@ -2982,8 +2997,9 @@ try:
                 activity,
                 matched,
                 "current_run_onsite_query",
+                record_id,
             ]
-            key = (input_id, target_id)
+            key = (input_id, record_id, target_id)
             rank = (numeric_activity(value), target_name.lower(), organism.lower())
             if key not in best or rank < best[key][0]:
                 best[key] = (rank, out_row)
@@ -3015,11 +3031,12 @@ fn append_bindingdb_onsite_matches(
     }
     ensure_dir(&options.run_dir)?;
     let query_path = options.run_dir.join("bindingdb_onsite_queries.tsv");
-    let mut queries = String::from("input_id\tquery\n");
+    let mut queries = String::from("input_id\trecord_id\tquery\n");
     for input in small_molecules {
         queries.push_str(&format!(
-            "{}\t{}\n",
+            "{}\t{}\t{}\n",
             clean_cell(&input.input_id),
+            clean_cell(&input.record_id),
             encode_tsv_cell(&input.primary_value)
         ));
     }
@@ -3172,7 +3189,7 @@ def atom_counts(smiles):
 canonical_cache = {}
 
 def query_matches(query_info, smiles, ligand_name):
-    _input_id, query, query_canonical, query_counts = query_info
+    _input_id, _record_id, query, query_canonical, query_counts = query_info
     q = query.strip()
     q_lower = q.lower()
     compact = "".join(q.split()).lower()
@@ -3191,6 +3208,7 @@ with open(query_path, "r", encoding="utf-8-sig", newline="") as handle:
         if query:
             queries.append((
                 clean(row.get("input_id", "input_1")) or "input_1",
+                clean(row.get("record_id", "record_1")) or "record_1",
                 query,
                 canonical_smiles(query),
                 atom_counts(query),
@@ -3213,6 +3231,7 @@ with zipfile.ZipFile(zip_path) as archive:
             ligand_name = first(row, ["BindingDB Ligand Name", "Ligand Name", "Compound Name"])
             for query_info in queries:
                 input_id = query_info[0]
+                record_id = query_info[1]
                 if not query_matches(query_info, smiles, ligand_name):
                     continue
                 target_name = first(row, ["Target Name", "UniProt (SwissProt) Recommended Name of Target Chain 1"])
@@ -3251,8 +3270,9 @@ with zipfile.ZipFile(zip_path) as archive:
                     clean(activity_value),
                     clean(ligand_identity),
                     "current_run_onsite_query",
+                    record_id,
                 ]
-                key = (input_id, target_id)
+                key = (input_id, record_id, target_id)
                 rank = (numeric_activity(activity), target_name.lower(), organism.lower())
                 if key not in best or rank < best[key][0]:
                     best[key] = (rank, out_row)
@@ -3272,14 +3292,14 @@ fn match_metagenome(options: &ScienceOptions) -> Result<String, String> {
         )?
     };
     let mut out = String::from(
-        "input_id\tsource\ttarget_id\ttarget_name\torganism\ttarget_class\tmatch_score\tmatched_features\tevidence\tsource_database_id\tcurrent_run_query_id\n",
+        "input_id\tsource\ttarget_id\ttarget_name\torganism\ttarget_class\tmatch_score\tmatched_features\tevidence\tsource_database_id\tcurrent_run_query_id\trecord_id\n",
     );
     for input in &inputs {
         for row in &rows {
             let score = score_row(input, row);
             if score > 0.0 {
                 out.push_str(&format!(
-                    "{}\t{}\t{}\t{}\t{}\t{}\t{score:.4}\t{}\t{}\t{}\t{}\n",
+                    "{}\t{}\t{}\t{}\t{}\t{}\t{score:.4}\t{}\t{}\t{}\t{}\t{}\n",
                     input.input_id,
                     row.source,
                     row.target_id,
@@ -3289,7 +3309,8 @@ fn match_metagenome(options: &ScienceOptions) -> Result<String, String> {
                     matched_tokens(input, row).join(" "),
                     clean_cell(&row.evidence),
                     clean_cell(&row.source),
-                    clean_cell(&input.input_id)
+                    clean_cell(&input.input_id),
+                    clean_cell(&input.record_id),
                 ));
             }
         }
@@ -3381,7 +3402,7 @@ fn evaluate_structure(options: &ScienceOptions) -> Result<String, String> {
 fn write_empty_structure_interaction_matches(options: &ScienceOptions) -> Result<(), String> {
     write_text(
         &options.run_dir.join("structure_interaction_matches.tsv"),
-        "input_id\tsource\ttarget_id\ttarget_name\torganism\ttarget_class\tmatch_score\tmatched_features\tevidence\tsource_database_id\tcurrent_run_query_id\n",
+        "input_id\tsource\ttarget_id\ttarget_name\torganism\ttarget_class\tmatch_score\tmatched_features\tevidence\tsource_database_id\tcurrent_run_query_id\trecord_id\n",
     )
 }
 
@@ -3405,6 +3426,7 @@ fn append_tool_match_rows(
         &["source_database_id", "source_db", "database_id"],
     );
     let query_idx = find_header(&headers, &["current_run_query_id", "query_id"]);
+    let record_idx = find_header(&headers, &["record_id"]);
     let mut count = 0usize;
     for line in lines.filter(|line| !line.trim().is_empty()) {
         let cols = split_tsv(line);
@@ -3423,7 +3445,7 @@ fn append_tool_match_rows(
             cols[0].clone(),
         ]);
         out.push_str(&format!(
-            "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\n",
+            "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\n",
             clean_cell(&cols[0]),
             clean_cell(&cols[1]),
             clean_cell(&cols[2]),
@@ -3434,7 +3456,12 @@ fn append_tool_match_rows(
             clean_cell(&cols[7]),
             clean_cell(&cols[8]),
             clean_cell(&source_database_id),
-            clean_cell(&current_run_query_id)
+            clean_cell(&current_run_query_id),
+            clean_cell(&first_nonempty(&[
+                cell(&cols, record_idx),
+                evidence_field(&evidence, &["record_id"]),
+                "record_1".to_string(),
+            ])),
         ));
         count += 1;
     }
@@ -3461,7 +3488,7 @@ fn append_tool_match_rows_to_file(
     let mut text = if target_path.exists() {
         read_text(target_path)?
     } else {
-        "input_id\tsource\ttarget_id\ttarget_name\torganism\ttarget_class\tmatch_score\tmatched_features\tevidence\tsource_database_id\tcurrent_run_query_id\n".to_string()
+        "input_id\tsource\ttarget_id\ttarget_name\torganism\ttarget_class\tmatch_score\tmatched_features\tevidence\tsource_database_id\tcurrent_run_query_id\trecord_id\n".to_string()
     };
     let count = append_tool_match_rows(options, tool_output_name, &mut text)?;
     write_text(target_path, &text)?;
@@ -3760,7 +3787,7 @@ fn match_structure_interactions(options: &ScienceOptions) -> Result<Vec<IndexMat
     )?;
     let mut matches = Vec::new();
     let mut out = String::from(
-        "input_id\tsource\ttarget_id\ttarget_name\torganism\ttarget_class\tmatch_score\tmatched_features\tevidence\n",
+        "input_id\tsource\ttarget_id\ttarget_name\torganism\ttarget_class\tmatch_score\tmatched_features\tevidence\trecord_id\n",
     );
     for input in &inputs {
         for row in &rows {
@@ -3771,6 +3798,7 @@ fn match_structure_interactions(options: &ScienceOptions) -> Result<Vec<IndexMat
             let matched_features = matched_tokens(input, row).join(" ");
             let item = IndexMatch {
                 input_id: input.input_id.clone(),
+                record_id: input.record_id.clone(),
                 source: row.source.clone(),
                 target_id: row.target_id.clone(),
                 target_name: row.target_name.clone(),
@@ -3781,7 +3809,7 @@ fn match_structure_interactions(options: &ScienceOptions) -> Result<Vec<IndexMat
                 evidence: row.evidence.clone(),
             };
             out.push_str(&format!(
-                "{}\t{}\t{}\t{}\t{}\t{}\t{:.4}\t{}\t{}\n",
+                "{}\t{}\t{}\t{}\t{}\t{}\t{:.4}\t{}\t{}\t{}\n",
                 item.input_id,
                 clean_cell(&item.source),
                 clean_cell(&item.target_id),
@@ -3790,7 +3818,8 @@ fn match_structure_interactions(options: &ScienceOptions) -> Result<Vec<IndexMat
                 clean_cell(&item.target_class),
                 item.match_score,
                 clean_cell(&item.matched_features),
-                clean_cell(&item.evidence)
+                clean_cell(&item.evidence),
+                clean_cell(&item.record_id),
             ));
             matches.push(item);
         }
@@ -3811,15 +3840,22 @@ fn enrich_feature_inputs_from_known_matches(
     }
     let mut by_input = inputs
         .iter_mut()
-        .map(|input| (input.input_id.clone(), input))
+        .map(|input| ((input.input_id.clone(), input.record_id.clone()), input))
         .collect::<BTreeMap<_, _>>();
     let text = read_text(path)?;
-    for line in text.lines().skip(1) {
+    let mut lines = text.lines();
+    let headers = lines.next().map(split_tsv).unwrap_or_default();
+    let record_idx = find_header(&headers, &["record_id"]);
+    for line in lines {
         let cols = split_tsv(line);
         if cols.len() < 9 {
             continue;
         }
-        if let Some(input) = by_input.get_mut(&cols[0]) {
+        let key = (
+            cols[0].clone(),
+            first_nonempty(&[cell(&cols, record_idx), "record_1".to_string()]),
+        );
+        if let Some(input) = by_input.get_mut(&key) {
             for token in tokenize(&format!("{} {} {}", cols[3], cols[7], cols[8])) {
                 input.tokens.insert(token);
             }
@@ -6006,11 +6042,26 @@ fn write_score_decomposition(options: &ScienceOptions) -> Result<(), String> {
 
 fn read_normalized_inputs(path: &Path) -> Result<Vec<NormalizedInput>, String> {
     let text = read_text(path)?;
+    let mut lines = text.lines();
+    let header = lines
+        .next()
+        .map(|line| line.trim_start_matches('\u{feff}'))
+        .unwrap_or_default();
+    if header != NORMALIZED_INPUT_HEADER {
+        return Err("normalized_input_manifest_schema_mismatch:header".to_string());
+    }
     let mut out = Vec::new();
-    for line in text.lines().skip(1) {
-        let cols = split_tsv(line);
-        if cols.len() < 5 {
+    for (index, line) in lines.enumerate() {
+        if line.trim().is_empty() {
             continue;
+        }
+        let cols = split_tsv(line);
+        if cols.len() != 13 {
+            return Err(format!(
+                "normalized_input_manifest_schema_mismatch:line_{}:columns_{}",
+                index + 2,
+                cols.len()
+            ));
         }
         let kind = match cols[1].as_str() {
             "small_molecule" => InputKind::SmallMolecule,
@@ -6018,25 +6069,65 @@ fn read_normalized_inputs(path: &Path) -> Result<Vec<NormalizedInput>, String> {
             "protein_ligand" => InputKind::ProteinLigand,
             "complex" => InputKind::Complex,
             "genome_or_metagenome" => InputKind::GenomeOrMetagenome,
-            _ => continue,
+            _ => {
+                return Err(format!(
+                    "normalized_input_manifest_invalid_kind:line_{}:{}",
+                    index + 2,
+                    clean_cell(&cols[1])
+                ));
+            }
+        };
+        if cols[5].trim().is_empty() {
+            return Err(format!(
+                "normalized_input_manifest_missing_record_id:line_{}",
+                index + 2
+            ));
+        }
+        let source_kind = match cols[6].as_str() {
+            "file" => "file",
+            "inline" => "inline",
+            value => {
+                return Err(format!(
+                    "normalized_input_manifest_invalid_source_kind:line_{}:{}",
+                    index + 2,
+                    clean_cell(value)
+                ));
+            }
+        };
+        if cols[8].len() != 64 || !cols[8].chars().all(|ch| ch.is_ascii_hexdigit()) {
+            return Err(format!(
+                "normalized_input_manifest_invalid_sha256:line_{}",
+                index + 2
+            ));
+        }
+        if cols[9] != "normalized" {
+            return Err(format!(
+                "normalized_input_manifest_invalid_status:line_{}:{}",
+                index + 2,
+                clean_cell(&cols[9])
+            ));
+        }
+        let parse_usize = |column: usize, name: &str| {
+            cols[column].parse::<usize>().map_err(|_| {
+                format!(
+                    "normalized_input_manifest_invalid_{name}:line_{}",
+                    index + 2
+                )
+            })
         };
         out.push(NormalizedInput {
             input_id: cols[0].clone(),
-            record_id: cols
-                .get(5)
-                .cloned()
-                .unwrap_or_else(|| "record_1".to_string()),
+            record_id: cols[5].clone(),
             kind,
             primary_value: decode_tsv_cell(&cols[2]),
-            file_count: cols[3].parse().unwrap_or(0),
+            file_count: parse_usize(3, "file_count")?,
             tokens: cols[4].split_whitespace().map(ToOwned::to_owned).collect(),
-            source_kind: if cols.get(6).is_some_and(|value| value == "file") {
-                "file"
-            } else {
-                "inline"
-            },
-            source_path: cols.get(7).cloned().unwrap_or_default(),
-            content_sha256: cols.get(8).cloned().unwrap_or_default(),
+            source_kind,
+            source_path: cols[7].clone(),
+            content_sha256: cols[8].clone(),
+            structure_atom_count: parse_usize(10, "structure_atom_count")?,
+            structure_chain_count: parse_usize(11, "structure_chain_count")?,
+            structure_residue_count: parse_usize(12, "structure_residue_count")?,
         });
     }
     Ok(out)
@@ -6044,26 +6135,51 @@ fn read_normalized_inputs(path: &Path) -> Result<Vec<NormalizedInput>, String> {
 
 fn read_computed_feature_inputs(path: &Path) -> Result<Vec<ComputedFeatureInput>, String> {
     let text = read_text(path)?;
-    let mut by_input = BTreeMap::<String, ComputedFeatureInput>::new();
-    for line in text.lines().skip(1) {
-        let cols = split_tsv(line);
-        if cols.len() < 7 {
+    let mut lines = text.lines();
+    let header = lines
+        .next()
+        .map(|line| line.trim_start_matches('\u{feff}'))
+        .unwrap_or_default();
+    if header != FEATURE_MANIFEST_HEADER {
+        return Err("feature_manifest_schema_mismatch:header".to_string());
+    }
+    let mut by_input = BTreeMap::<(String, String), ComputedFeatureInput>::new();
+    for (index, line) in lines.enumerate() {
+        if line.trim().is_empty() {
             continue;
+        }
+        let cols = split_tsv(line);
+        if cols.len() != 8 {
+            return Err(format!(
+                "feature_manifest_schema_mismatch:line_{}:columns_{}",
+                index + 2,
+                cols.len()
+            ));
         }
         if !matches!(
             cols[1].as_str(),
             "small_molecule" | "peptide" | "protein_ligand" | "complex" | "genome_or_metagenome"
         ) {
-            continue;
+            return Err(format!(
+                "feature_manifest_invalid_kind:line_{}:{}",
+                index + 2,
+                clean_cell(&cols[1])
+            ));
+        }
+        if cols[7].trim().is_empty() {
+            return Err(format!(
+                "feature_manifest_missing_record_id:line_{}",
+                index + 2
+            ));
         }
         let token = cols[6].trim();
-        let entry = by_input
-            .entry(cols[0].clone())
-            .or_insert_with(|| ComputedFeatureInput {
-                input_id: cols[0].clone(),
-                input_kind: cols[1].clone(),
-                tokens: BTreeSet::new(),
-            });
+        let key = (cols[0].clone(), cols[7].clone());
+        let entry = by_input.entry(key).or_insert_with(|| ComputedFeatureInput {
+            input_id: cols[0].clone(),
+            record_id: cols[7].clone(),
+            input_kind: cols[1].clone(),
+            tokens: BTreeSet::new(),
+        });
         if !token.is_empty() {
             entry.tokens.insert(token.to_ascii_lowercase());
         }
@@ -6483,6 +6599,9 @@ fn first_nonempty(values: &[String]) -> String {
 }
 
 fn typed_feature_rows(input: &NormalizedInput) -> Vec<FeatureRow> {
+    if input.structure_atom_count > 0 {
+        return coordinate_structure_features(input);
+    }
     match input.kind {
         InputKind::SmallMolecule => small_molecule_features(&input.primary_value),
         InputKind::Peptide => peptide_or_protein_features("peptide", &input.primary_value),
@@ -6492,6 +6611,46 @@ fn typed_feature_rows(input: &NormalizedInput) -> Vec<FeatureRow> {
         InputKind::Complex => complex_features(&input.primary_value),
         InputKind::GenomeOrMetagenome => genome_or_metagenome_features(&input.primary_value),
     }
+}
+
+fn coordinate_structure_features(input: &NormalizedInput) -> Vec<FeatureRow> {
+    let extension = Path::new(&input.source_path)
+        .extension()
+        .and_then(|ext| ext.to_str())
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    vec![
+        feature_row("structure", "parsed_structure", "true".to_string(), ""),
+        feature_row(
+            "structure",
+            "structure_format",
+            if extension.is_empty() {
+                "unknown".to_string()
+            } else {
+                extension
+            },
+            "",
+        ),
+        feature_row(
+            "structure",
+            "atom_count",
+            input.structure_atom_count.to_string(),
+            "",
+        ),
+        feature_row(
+            "structure",
+            "chain_count",
+            input.structure_chain_count.to_string(),
+            "",
+        ),
+        feature_row(
+            "structure",
+            "residue_count",
+            input.structure_residue_count.to_string(),
+            "",
+        ),
+        feature_row("input", "file_or_inline", "file".to_string(), ""),
+    ]
 }
 
 fn small_molecule_features(value: &str) -> Vec<FeatureRow> {
