@@ -24,11 +24,18 @@
     complex: "",
     genome_or_metagenome: "",
   },
+  inputInspection: null,
+  inputInspectionPayload: null,
+  inputInspectionPayloadKey: "",
+  inputInspectionPending: false,
+  inputInspectionError: "",
+  inputInspectionGeneration: 0,
   alert: "",
 };
 
 let setupProgressTimer = null;
 let runProgressTimer = null;
+let inputInspectionTimer = null;
 
 const page = document.querySelector("[data-page]");
 const alerts = document.querySelector("[data-alerts]");

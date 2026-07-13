@@ -82,6 +82,46 @@ def main() -> int:
     check_page = read(WEB / "pages/check.js")
     actions = read(WEB / "core/actions.js")
     selectors = read(WEB / "core/selectors.js")
+    app_state = read(WEB / "state/app-state.js")
+    require(
+        "/api/user/inputs/inspect" in actions,
+        "WebUI must call server inspection",
+    )
+    require(
+        "looksLikeSmilesText" not in selectors,
+        "client SMILES heuristic must be removed",
+    )
+    require(
+        "looksLikeNucleotideSequence" not in selectors,
+        "client sequence heuristic must be removed",
+    )
+    require(
+        "inputInspection" in app_state,
+        "authoritative inspection state is required",
+    )
+    for removed_heuristic in [
+        "inputValueUsable",
+        "looksLikeConvertibleFreeText",
+        "looksLikePathWithExt",
+        "looksLikePeptideSequence",
+        "validElementSymbol",
+    ]:
+        require(
+            removed_heuristic not in selectors,
+            f"client scientific heuristic must be removed: {removed_heuristic}",
+        )
+    require(
+        actions.count("inputPayloadFromForm()") >= 3,
+        "inspection and save must share inputPayloadFromForm",
+    )
+    require(
+        "state.inputInspectionPayload" in actions,
+        "save must reuse the payload accepted by inspection",
+    )
+    require(
+        "inputInspectionGeneration" in actions + app_state,
+        "input inspection must reject stale asynchronous responses",
+    )
     require("function renderProject" in project_page, "project view must be the dedicated project manager")
     require('data-action="new-project"' in project_page, "project view must expose new project action")
     require("data-open-project" in project_page, "project view must open historical projects")
@@ -153,26 +193,123 @@ def main() -> int:
     require(".stage-main" in components, "stage text column must have a stable width")
     require(".stage-reason" in components, "stage reasons must wrap as normal text")
 
-    selector_probe = subprocess.run(
+    inspection_probe = subprocess.run(
         [
             "node",
             "-e",
-            read(WEB / "core/selectors.js")
-            + """
-const checks = {
-  invalidSmallMoleculeText: inputValueUsable("small_molecule", "lqtu0we9ur"),
-  invalidPeptide: inputValueUsable("peptide", "lqtu0we9ur"),
-  invalidProteinLigand: inputValueUsable("protein_ligand", "lqtu0we9ur"),
-  invalidGenome: inputValueUsable("genome_or_metagenome", "lqtu0we9ur"),
-  validSmallMoleculeSmiles: inputValueUsable("small_molecule", "CCO"),
-  validSmallMoleculePeptide: inputValueUsable("small_molecule", "IKVAV"),
-  validSmallMoleculeNucleotide: inputValueUsable("small_molecule", "ATGCGTACGTAA"),
-  validPeptide: inputValueUsable("peptide", "ACDEFG"),
-  validMultiFastaPeptide: inputValueUsable("peptide", ">pep1\\nIKVAV\\n>pep2\\nIKVAV"),
-  validProteinLigand: inputValueUsable("protein_ligand", ">protein\\nMSTNPKPQR"),
-  validGenome: inputValueUsable("genome_or_metagenome", ">orf1\\nATGCGTACGTAA")
+            """
+const timerCallbacks = new Map();
+let nextTimerId = 1;
+global.document = {
+  querySelector: () => ({ querySelectorAll: () => [] })
 };
-console.log(JSON.stringify(checks));
+global.window = {
+  setTimeout: (callback) => {
+    const id = nextTimerId++;
+    timerCallbacks.set(id, callback);
+    return id;
+  },
+  clearTimeout: (id) => timerCallbacks.delete(id),
+  setInterval,
+  clearInterval,
+  confirm: () => true
+};
+"""
+            + read(WEB / "state/app-state.js")
+            + read(WEB / "core/selectors.js")
+            + read(WEB / "core/actions.js")
+            + """
+const requests = [];
+const apiCalls = [];
+function render() {}
+function setStep() {}
+function api(path, options = {}) {
+  apiCalls.push({ path, options });
+  if (path !== "/api/user/inputs/inspect") {
+    return Promise.resolve({ projects: [] });
+  }
+  return new Promise((resolve, reject) => {
+    requests.push({ path, options, resolve, reject });
+  });
+}
+function assert(condition, message) {
+  if (!condition) throw new Error(message);
+}
+function clearScientificForm() {
+  for (const spec of inputSpecs) state.form[spec.field] = "";
+  state.form.project_name = "";
+  invalidateInputInspection();
+}
+
+(async () => {
+  clearScientificForm();
+  const emptySave = await saveInput();
+  assert(!emptySave, "empty form must not save");
+  assert(!apiCalls.some((call) => call.path === "/api/user/projects"), "empty form must not create a project");
+
+  state.form.project_name = "Race fixture";
+  state.form.small_molecule = "CCO";
+  const firstPayload = inputPayloadFromForm();
+  assert(firstPayload.files.length === 0, "payload must contain files: []");
+  assert(firstPayload.inputs[1].value === "CCO", "payload must include filled scientific input");
+
+  const oldSuccess = inspectInputs();
+  state.form.small_molecule = "CCCCCCCC";
+  const latestSuccess = inspectInputs();
+  assert(state.inputInspection === null, "new input must immediately invalidate old inspection");
+  assert(state.inputInspectionPending, "latest request must remain pending");
+  requests[1].resolve({ usable: true, summary: "latest", errors: [], inputs: [] });
+  await latestSuccess;
+  const acceptedPayload = state.inputInspectionPayload;
+  assert(acceptedPayload.inputs[1].value === "CCCCCCCC", "inspection must retain its exact payload");
+  assert(inputsReadyToSave(), "latest usable inspection must enable save");
+  requests[0].resolve({ usable: true, summary: "stale", errors: [], inputs: [] });
+  await oldSuccess;
+  assert(state.inputInspection.summary === "latest", "old success must not replace latest result");
+  assert(state.inputInspectionPayload === acceptedPayload, "old success must not replace accepted payload");
+
+  state.form.small_molecule = "first-failure";
+  const oldFailure = inspectInputs();
+  state.form.small_molecule = "latest-value";
+  const latestAfterFailure = inspectInputs();
+  requests[2].reject(new Error("stale failure"));
+  await oldFailure;
+  assert(state.inputInspectionPending, "old failure must not clear latest pending state");
+  assert(state.inputInspectionError === "", "old failure must not replace latest error state");
+  requests[3].resolve({ usable: true, summary: "latest after failure", errors: [], inputs: [] });
+  await latestAfterFailure;
+  assert(state.inputInspection.summary === "latest after failure", "latest result must survive old failure");
+
+  state.form.small_molecule = "changed-after-inspection";
+  assert(!inputsReadyToSave(), "payload mismatch must disable save before debounce runs");
+  const projectCallsBeforeStaleSave = apiCalls.filter((call) => call.path === "/api/user/projects").length;
+  const staleSave = await saveInput();
+  assert(!staleSave, "stale inspection must not save");
+  assert(
+    apiCalls.filter((call) => call.path === "/api/user/projects").length === projectCallsBeforeStaleSave,
+    "stale inspection must not create a project"
+  );
+  scheduleInputInspection();
+  assert(state.inputInspection === null, "form change must invalidate inspection immediately");
+  assert(state.inputInspectionPending, "non-empty form must be pending during debounce");
+
+  clearScientificForm();
+  const requestCount = requests.length;
+  scheduleInputInspection();
+  assert(!state.inputInspectionPending, "empty form must not remain pending");
+  assert(!inputsReadyToSave(), "empty form must not become saveable");
+  assert(requests.length === requestCount, "empty form must not inspect");
+
+  state.form.small_molecule = "unusable";
+  const unusable = inspectInputs();
+  requests[4].resolve({ usable: false, message: "rejected", errors: ["bad input"], inputs: [] });
+  await unusable;
+  assert(!inputsReadyToSave(), "unusable inspection must disable save");
+  console.log(JSON.stringify({ passed: true, requestCount: requests.length }));
+})().catch((error) => {
+  console.error(error.stack || error.message);
+  process.exitCode = 1;
+});
 """,
         ],
         cwd=ROOT,
@@ -181,21 +318,8 @@ console.log(JSON.stringify(checks));
         encoding="utf-8",
         check=True,
     )
-    selector_checks = json.loads(selector_probe.stdout)
-    require(not selector_checks["invalidSmallMoleculeText"], "small molecule input must reject random alphanumeric text")
-    require(not selector_checks["invalidPeptide"], "peptide input must reject random alphanumeric text")
-    require(
-        not selector_checks["invalidProteinLigand"],
-        "protein input must reject random alphanumeric text",
-    )
-    require(not selector_checks["invalidGenome"], "genome input must reject random alphanumeric text")
-    require(selector_checks["validSmallMoleculeSmiles"], "small molecule input must accept SMILES")
-    require(selector_checks["validSmallMoleculePeptide"], "small molecule input must accept peptide text for backend conversion")
-    require(selector_checks["validSmallMoleculeNucleotide"], "small molecule input must accept nucleotide text for backend conversion")
-    require(selector_checks["validPeptide"], "peptide input must accept amino-acid sequences")
-    require(selector_checks["validMultiFastaPeptide"], "peptide input must accept FASTA text with multiple headers")
-    require(selector_checks["validProteinLigand"], "protein input must accept FASTA amino-acid sequences")
-    require(selector_checks["validGenome"], "genome input must accept FASTA nucleotide sequences")
+    inspection_checks = json.loads(inspection_probe.stdout)
+    require(inspection_checks["passed"], "authoritative inspection probe must pass")
 
     mojibake_terms = [
         chr(0x9428),

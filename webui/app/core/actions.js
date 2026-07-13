@@ -4,19 +4,8 @@
   });
 }
 
-async function saveInput() {
-  collectForm();
-  if (!inputsReadyToSave()) {
-    state.alert = "请先填写至少一个可识别的研究输入，并处理所有已填写字段的提示。";
-    render();
-    return false;
-  }
-  state.alert = "";
-  if (!state.project) {
-    const created = await api("/api/user/projects", { method: "POST", body: "{}" });
-    state.project = created.project;
-  }
-  const inputPayload = {
+function inputPayloadFromForm() {
+  return {
     input_kind: "multi_input_workbench",
     inputs: [
       {
@@ -27,6 +16,123 @@ async function saveInput() {
     ],
     files: [],
   };
+}
+
+function inputPayloadKey(payload) {
+  return JSON.stringify(payload);
+}
+
+function clearInputInspectionTimer() {
+  if (inputInspectionTimer !== null) {
+    window.clearTimeout(inputInspectionTimer);
+    inputInspectionTimer = null;
+  }
+}
+
+function invalidateInputInspection() {
+  clearInputInspectionTimer();
+  state.inputInspectionGeneration += 1;
+  state.inputInspection = null;
+  state.inputInspectionPayload = null;
+  state.inputInspectionPayloadKey = "";
+  state.inputInspectionPending = false;
+  state.inputInspectionError = "";
+}
+
+function scheduleInputInspection() {
+  invalidateInputInspection();
+  if (!filledInputs().length) return;
+  const generation = state.inputInspectionGeneration;
+  state.inputInspectionPending = true;
+  inputInspectionTimer = window.setTimeout(() => {
+    inputInspectionTimer = null;
+    void inspectInputs(generation);
+  }, 300);
+}
+
+async function inspectInputs(generation = null) {
+  if (generation === null) {
+    invalidateInputInspection();
+    generation = state.inputInspectionGeneration;
+  }
+  const payload = inputPayloadFromForm();
+  const payloadKey = inputPayloadKey(payload);
+  if (!filledInputs().length) {
+    if (generation === state.inputInspectionGeneration) {
+      state.inputInspectionPending = false;
+      render();
+    }
+    return null;
+  }
+  if (generation !== state.inputInspectionGeneration) return null;
+  state.inputInspectionPending = true;
+  state.inputInspectionError = "";
+  render();
+  try {
+    const inspection = await api("/api/user/inputs/inspect", {
+      method: "POST",
+      body: JSON.stringify(payload),
+    });
+    if (
+      generation !== state.inputInspectionGeneration ||
+      payloadKey !== inputPayloadKey(inputPayloadFromForm())
+    ) {
+      return null;
+    }
+    state.inputInspection = inspection;
+    state.inputInspectionPayload = payload;
+    state.inputInspectionPayloadKey = payloadKey;
+    return inspection;
+  } catch (error) {
+    if (
+      generation !== state.inputInspectionGeneration ||
+      payloadKey !== inputPayloadKey(inputPayloadFromForm())
+    ) {
+      return null;
+    }
+    state.inputInspection = null;
+    state.inputInspectionPayload = null;
+    state.inputInspectionPayloadKey = "";
+    state.inputInspectionError = error.message || "输入检查失败";
+    return null;
+  } finally {
+    if (
+      generation === state.inputInspectionGeneration &&
+      payloadKey === inputPayloadKey(inputPayloadFromForm())
+    ) {
+      state.inputInspectionPending = false;
+      render();
+    }
+  }
+}
+
+async function saveInput() {
+  collectForm();
+  const currentPayload = inputPayloadFromForm();
+  if (
+    !inputsReadyToSave() ||
+    state.inputInspectionPayloadKey !== inputPayloadKey(currentPayload)
+  ) {
+    state.alert = "请先完成当前输入的服务端检查。";
+    render();
+    return false;
+  }
+  const inputPayload = state.inputInspectionPayload;
+  const inspectionGeneration = state.inputInspectionGeneration;
+  state.alert = "";
+  if (!state.project) {
+    const created = await api("/api/user/projects", { method: "POST", body: "{}" });
+    state.project = created.project;
+  }
+  if (
+    inspectionGeneration !== state.inputInspectionGeneration ||
+    state.inputInspectionPayload !== inputPayload ||
+    !inputsReadyToSave()
+  ) {
+    state.alert = "输入已变化，请等待最新检查完成后再保存。";
+    render();
+    return false;
+  }
   const saved = await api(`/api/user/projects/${state.project.project_id}/inputs`, {
     method: "POST",
     body: JSON.stringify(inputPayload),
@@ -48,6 +154,7 @@ async function saveInput() {
 
 async function createNewProject() {
   state.alert = "";
+  invalidateInputInspection();
   const created = await api("/api/user/projects", { method: "POST", body: "{}" });
   state.project = created.project;
   state.run = null;
@@ -60,6 +167,7 @@ async function createNewProject() {
 
 async function openExistingProject(projectId) {
   state.alert = "";
+  resetInputForm();
   state.project = await api(`/api/user/projects/${projectId}`);
   state.preflight = null;
   state.run = null;
@@ -77,6 +185,7 @@ async function deleteExistingProject(projectId) {
   const project = (state.projects || []).find((item) => item.project_id === projectId) || state.project;
   const name = project?.project_name || "当前项目";
   if (!window.confirm(`删除“${name}”？项目运行输出也会删除。`)) return;
+  if (state.project?.project_id === projectId) invalidateInputInspection();
   const deleted = await api(`/api/user/projects/${projectId}`, { method: "DELETE" });
   if (deleted.status === "failed") {
     state.alert = deleted.error || "项目删除失败。";
@@ -100,6 +209,7 @@ async function refreshProjects() {
 }
 
 function resetInputForm() {
+  invalidateInputInspection();
   state.form = {
     project_name: "",
     small_molecule: "",

@@ -8,7 +8,13 @@ function hasUsableInput() {
 
 function inputsReadyToSave() {
   const filled = filledInputs();
-  return filled.length > 0 && filled.every((item) => inputValueUsable(item.field, item.value));
+  return (
+    filled.length > 0 &&
+    !state.inputInspectionPending &&
+    !state.inputInspectionError &&
+    inputInspectionIsCurrent() &&
+    state.inputInspection?.usable === true
+  );
 }
 
 function filledInputs() {
@@ -22,16 +28,26 @@ function filledInputs() {
 }
 
 function usableInputs() {
-  return filledInputs().filter((item) => inputValueUsable(item.field, item.value));
+  return inputsReadyToSave() ? filledInputs() : [];
+}
+
+function inputInspectionIsCurrent() {
+  return (
+    Boolean(state.inputInspectionPayloadKey) &&
+    state.inputInspectionPayloadKey === inputPayloadKey(inputPayloadFromForm())
+  );
 }
 
 function inputStatusLabel() {
+  if (state.inputInspectionPending) return "检查中";
   if (inputsReadyToSave()) return "输入可保存";
-  if (hasAnyInput()) return "需要检查输入";
+  if (hasAnyInput() && (state.inputInspectionError || inputInspectionIsCurrent())) return "检查未通过";
+  if (hasAnyInput()) return "等待检查";
   return "等待输入";
 }
 
 function inputStatusClass() {
+  if (state.inputInspectionPending) return "waiting";
   if (inputsReadyToSave()) return "ready";
   if (hasAnyInput()) return "blocked";
   return "waiting";
@@ -52,138 +68,34 @@ function inputValidation(spec) {
   if (!value) {
     return { ready: false, value: "", message: spec.minimum };
   }
-  if (inputValueUsable(spec.field, value)) {
-    return { ready: true, value, message: "该输入可进入检查。" };
-  }
   return {
-    ready: false,
+    ready: inputsReadyToSave(),
     value,
-    message: "请填写可识别的序列、结构文件路径、分子表示或登记名称。",
+    message: inputInspectionMessage(),
   };
 }
 
-function inputValueUsable(field, value) {
-  const text = String(value || "").trim();
-  if (!text) return false;
-  if (looksLikeConvertibleFreeText(field, text)) return true;
-  if (field === "small_molecule") {
-    return false;
-  }
-  if (field === "peptide") {
-    return looksLikePathWithExt(text, ["fasta", "fa", "pdb", "cif", "mmcif"]) || looksLikePeptideSequence(text, 2);
-  }
-  if (field === "protein_ligand") {
-    return looksLikePathWithExt(text, ["fasta", "fa", "faa", "pdb", "cif", "mmcif"]) || looksLikePeptideSequence(text, 5);
-  }
-  if (field === "complex") {
-    return looksLikePathWithExt(text, ["pdb", "cif", "mmcif", "ent"]) || alnumCount(text) >= 5;
-  }
-  if (field === "genome_or_metagenome") {
-    return (
-      looksLikePathWithExt(text, ["fasta", "fa", "fna", "faa", "fastq", "fq", "gb", "gff", "gtf", "vcf"]) ||
-      looksLikeNucleotideSequence(text, 8)
-    );
-  }
-  return alnumCount(text) >= 2;
-}
-
-function looksLikeConvertibleFreeText(field, value) {
+function inputInspectionMessage() {
+  if (state.inputInspectionPending) return "检查中";
+  if (state.inputInspectionError) return state.inputInspectionError;
+  if (!inputInspectionIsCurrent()) return "等待检查";
+  if (state.inputInspection?.usable === true) return "服务端检查通过。";
   return (
-    looksLikePathWithExt(value, [
-      "sdf",
-      "mol2",
-      "mol",
-      "pdb",
-      "cif",
-      "mmcif",
-      "fasta",
-      "fa",
-      "faa",
-      "fna",
-      "fastq",
-      "fq",
-      "gb",
-      "gff",
-      "gtf",
-      "vcf",
-    ]) ||
-    looksLikePeptideSequence(value, 2) ||
-    looksLikeInchi(value) ||
-    looksLikeSmilesText(value) ||
-    looksLikeNucleotideSequence(value, 8)
+    state.inputInspection?.message ||
+    state.inputInspection?.errors?.[0] ||
+    state.inputInspection?.summary ||
+    "输入未通过检查。"
   );
 }
 
-function looksLikePathWithExt(value, extensions) {
-  const lower = value.toLowerCase();
-  return extensions.some((ext) => lower.endsWith(`.${ext}`) || lower.includes(`.${ext}\n`));
-}
-
-function sequenceBody(value) {
-  const body = value.trim().startsWith(">")
-    ? value
-        .split(/\r?\n/)
-        .filter((line) => !line.trimStart().startsWith(">"))
-        .join("")
-    : value;
-  return body.replace(/\s+/g, "");
-}
-
-function looksLikePeptideSequence(value, minLength) {
-  const body = sequenceBody(value);
-  return body.length >= minLength && /^[ACDEFGHIKLMNPQRSTVWY]+$/i.test(body);
-}
-
-function looksLikeNucleotideSequence(value, minLength) {
-  const body = sequenceBody(value);
-  return body.length >= minLength && /^[ACGTUNRYSWKMBDHV]+$/i.test(body);
-}
-
-function looksLikeInchi(value) {
-  return value.trim().startsWith("InChI=");
-}
-
-function looksLikeSmilesText(value) {
-  const text = value.trim();
-  if (!text || /\s/.test(text)) return false;
-  if (!/^[A-Za-z0-9[\]()=#@+\-\\/%.:]+$/.test(text)) return false;
-  let sawAtom = false;
-  for (let index = 0; index < text.length; ) {
-    const ch = text[index];
-    if (/[A-Z]/.test(ch)) {
-      const two = text.slice(index, index + 2);
-      if (/[a-z]/.test(text[index + 1] || "")) {
-        if (validElementSymbol(two)) {
-          sawAtom = true;
-          index += 2;
-          continue;
-        }
-        return false;
-      }
-      if (validElementSymbol(ch)) {
-        sawAtom = true;
-        index += 1;
-        continue;
-      }
-      return false;
-    }
-    if (/[bcnops]/.test(ch)) {
-      sawAtom = true;
-      index += 1;
-      continue;
-    }
-    if (/[a-z]/.test(ch)) return false;
-    index += 1;
+function inputCardStatus(filled) {
+  if (!filled) return { ready: false, label: "未填写" };
+  if (state.inputInspectionPending) return { ready: false, label: "检查中" };
+  if (inputsReadyToSave()) return { ready: true, label: "可用" };
+  if (state.inputInspectionError || inputInspectionIsCurrent()) {
+    return { ready: false, label: "未通过" };
   }
-  return sawAtom;
-}
-
-function validElementSymbol(symbol) {
-  return ["B", "C", "N", "O", "P", "S", "F", "I", "H", "Cl", "Br", "Na", "K", "Li", "Mg", "Ca", "Zn", "Fe"].includes(symbol);
-}
-
-function alnumCount(value) {
-  return Array.from(String(value || "")).filter((char) => /[\p{Letter}\p{Number}]/u.test(char)).length;
+  return { ready: false, label: "待检查" };
 }
 
 function sourceReady(key) {

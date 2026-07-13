@@ -59,12 +59,12 @@ function renderInputTypeCard(spec) {
   const selected = state.selectedInput === spec.kind;
   const value = state.form[spec.field].trim();
   const filled = value.length > 0;
-  const usable = inputValueUsable(spec.field, value);
+  const status = inputCardStatus(filled);
   return `
     <button class="input-card ${selected ? "selected" : ""}" data-select-input="${spec.kind}">
       <h3>${spec.title}</h3>
       <p>${spec.minimum}</p>
-      <span class="status-pill ${inputCardStatusClass(usable, filled)}" data-input-card-status="${spec.field}">${usable ? "可用" : filled ? "需检查" : "未填写"}</span>
+      <span class="status-pill ${inputCardStatusClass(status.ready, filled)}" data-input-card-status="${spec.field}">${status.label}</span>
     </button>`;
 }
 
@@ -79,6 +79,7 @@ function bindInputEvents() {
   page.querySelectorAll("[data-form]").forEach((field) => {
     field.addEventListener("input", () => {
       collectForm();
+      scheduleInputInspection();
       updateInputValidationUi();
     });
   });
@@ -93,6 +94,7 @@ function bindInputEvents() {
   page.querySelector("[data-action='clear-input']").addEventListener("click", () => {
     const active = inputSpecs.find((item) => item.kind === state.selectedInput);
     state.form[active.field] = "";
+    scheduleInputInspection();
     renderInput();
   });
 }
@@ -117,8 +119,8 @@ function updateInputValidationUi() {
     const statusNode = page.querySelector(`[data-input-card-status="${spec.field}"]`);
     if (!statusNode) return;
     const value = (state.form[spec.field] || "").trim();
-    const usable = inputValueUsable(spec.field, value);
-    statusNode.textContent = usable ? "可用" : value ? "需检查" : "未填写";
-    statusNode.className = `status-pill ${inputCardStatusClass(usable, Boolean(value))}`;
+    const cardStatus = inputCardStatus(Boolean(value));
+    statusNode.textContent = cardStatus.label;
+    statusNode.className = `status-pill ${inputCardStatusClass(cardStatus.ready, Boolean(value))}`;
   });
 }
