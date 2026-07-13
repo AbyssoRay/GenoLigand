@@ -2383,6 +2383,394 @@ fn known_matching_searches_chembl_sqlite_archive_for_current_small_molecule() {
 }
 
 #[test]
+fn chembl_onsite_preserves_exact_relation_and_has_no_shared_row_cap() {
+    let root = temp_root("chembl_relation_and_unbounded_targets");
+    let store = root.join("science_store");
+    let run = root.join("run");
+    let input = root.join("input.json");
+    write_text(
+        &store.join("indexes/known_targets.tsv"),
+        "source\ttarget_id\ttarget_name\torganism\ttarget_class\tligand_tokens\tsequence_tokens\tstructure_tokens\tevidence\n",
+    )
+    .expect("empty known index");
+    let source_sqlite = root.join("chembl_many.sqlite");
+    write_many_chembl_activities(&source_sqlite, 205).expect("many ChEMBL activities");
+    write_tar_gzip_file(
+        &store.join("downloads/chembl/chembl_sqlite.tar.gz"),
+        "chembl_many/chembl_many.db",
+        &source_sqlite,
+    )
+    .expect("chembl archive");
+    write_text(
+        &input,
+        "{\"inputs\":[{\"field\":\"small_molecule\",\"value\":\"CCO\"},{\"field\":\"small_molecule\",\"value\":\"CCN\"}],\"files\":[]}\n",
+    )
+    .expect("input");
+    let options = ScienceOptions {
+        workspace_root: root.clone(),
+        science_store: store,
+        input_manifest: input,
+        run_dir: run.clone(),
+    };
+
+    run_science_command(ScienceCommand::InputNormalize, &options).expect("normalize");
+    run_science_command(ScienceCommand::FeaturesCompute, &options).expect("features");
+    run_science_command(ScienceCommand::DatabaseMatchKnown, &options).expect("match known");
+    let matches = read_text(&run.join("known_database_matches.tsv")).expect("known matches");
+    let rows = matches
+        .lines()
+        .skip(1)
+        .map(split_tsv)
+        .filter(|cols| cols.get(1).is_some_and(|source| source == "ChEMBL"))
+        .collect::<Vec<_>>();
+
+    assert_eq!(
+        rows.iter()
+            .filter(|cols| cols[0] == "input_1" && cols[2].starts_with("CHEMBL_CCO_"))
+            .count(),
+        205
+    );
+    assert_eq!(
+        rows.iter()
+            .filter(|cols| cols[0] == "input_2" && cols[2].starts_with("CHEMBL_CCN_"))
+            .count(),
+        205
+    );
+    let exact = rows
+        .iter()
+        .find(|cols| cols[2] == "CHEMBL_RELATION_BEST")
+        .expect("relation best row");
+    assert_eq!(exact[6], "0.9500");
+    assert_eq!(exact[10], "IC50=100 nM");
+    assert!(exact[8].contains("relation=="));
+    let censored = rows
+        .iter()
+        .find(|cols| cols[2] == "CHEMBL_RELATION_CENSORED")
+        .expect("censored row");
+    assert_eq!(censored[6], "0.6500");
+    assert_eq!(censored[10], "Ki<10 nM");
+    assert!(censored[8].contains("relation=<"));
+
+    fs::remove_dir_all(&root).expect("cleanup temp root");
+}
+
+#[test]
+fn bindingdb_onsite_streams_all_zip_members_without_shared_row_cap() {
+    let root = temp_root("bindingdb_all_members_unbounded_targets");
+    let store = root.join("science_store");
+    let run = root.join("run");
+    let input = root.join("input.json");
+    write_text(
+        &store.join("indexes/known_targets.tsv"),
+        "source\ttarget_id\ttarget_name\torganism\ttarget_class\tligand_tokens\tsequence_tokens\tstructure_tokens\tevidence\n",
+    )
+    .expect("empty known index");
+    let header = "Ligand SMILES\tBindingDB Ligand Name\tTarget Name\tTarget Source Organism According to Curator or DataSource\tKi (nM)\tUniProt (SwissProt) Primary ID of Target Chain 1\tBindingDB MonomerID\n";
+    let mut first = header.to_string();
+    let mut second = header.to_string();
+    for index in 0..205 {
+        let target = if index % 2 == 0 {
+            &mut first
+        } else {
+            &mut second
+        };
+        target.push_str(&format!(
+            "CCO\tethanol\tCCO target {index}\tHomo sapiens\t{}\tP_CCO_{index}\tCCO_{index}\n",
+            index + 1
+        ));
+        target.push_str(&format!(
+            "CCN\tethylamine\tCCN target {index}\tHomo sapiens\t{}\tP_CCN_{index}\tCCN_{index}\n",
+            index + 1
+        ));
+    }
+    write_zip_members(
+        &store.join("downloads/bindingdb/bindingdb_all.tsv.zip"),
+        &[("z_part.tsv", &second), ("a_part.tsv", &first)],
+    )
+    .expect("bindingdb zip");
+    write_text(
+        &input,
+        "{\"inputs\":[{\"field\":\"small_molecule\",\"value\":\"CCO\"},{\"field\":\"small_molecule\",\"value\":\"CCN\"}],\"files\":[]}\n",
+    )
+    .expect("input");
+    let options = ScienceOptions {
+        workspace_root: root.clone(),
+        science_store: store,
+        input_manifest: input,
+        run_dir: run.clone(),
+    };
+
+    run_science_command(ScienceCommand::InputNormalize, &options).expect("normalize");
+    run_science_command(ScienceCommand::FeaturesCompute, &options).expect("features");
+    run_science_command(ScienceCommand::DatabaseMatchKnown, &options).expect("match known");
+    let matches = read_text(&run.join("known_database_matches.tsv")).expect("known matches");
+    let rows = matches
+        .lines()
+        .skip(1)
+        .map(split_tsv)
+        .filter(|cols| cols.get(1).is_some_and(|source| source == "BindingDB"))
+        .collect::<Vec<_>>();
+
+    assert_eq!(rows.iter().filter(|cols| cols[0] == "input_1").count(), 205);
+    assert_eq!(rows.iter().filter(|cols| cols[0] == "input_2").count(), 205);
+    assert!(rows.iter().any(|cols| cols[2] == "P_CCO_0"));
+    assert!(rows.iter().any(|cols| cols[2] == "P_CCO_204"));
+
+    fs::remove_dir_all(&root).expect("cleanup temp root");
+}
+
+#[test]
+fn archive_query_scripts_use_streaming_files_and_disk_backed_deduplication() {
+    let chembl = chembl_onsite_query_script();
+    let bindingdb = bindingdb_onsite_query_script();
+
+    assert!(chembl.contains("shutil.copyfileobj"));
+    assert!(!chembl.contains("extracted.read()"));
+    assert!(chembl.contains("result_path"));
+    assert!(chembl.contains("CREATE TABLE best"));
+    assert!(bindingdb.contains("for member_name in members"));
+    assert!(!bindingdb.contains("members[0]"));
+    assert!(!bindingdb.contains("best = {}"));
+    assert!(bindingdb.contains("CREATE TABLE best"));
+}
+
+#[test]
+fn onsite_aggregation_uses_input_namespace_target_key_across_records_and_sources() {
+    let root = temp_root("onsite_namespace_aggregation_key");
+    let query = root.join("queries.tsv");
+    write_text(
+        &query,
+        "input_id\trecord_id\tquery\ninput_1\trecord_b\tCCO\ninput_1\trecord_a\tCCO\n",
+    )
+    .expect("queries");
+    let chembl_a = root.join("chembl_a.sqlite");
+    let chembl_b = root.join("chembl_b.sqlite");
+    write_chembl_sqlite(&chembl_a).expect("chembl a");
+    fs::copy(&chembl_a, &chembl_b).expect("chembl b");
+    let chembl_result = root.join("chembl_results.tsv");
+    run_python_script(
+        chembl_onsite_query_script(),
+        &[
+            chembl_a.display().to_string(),
+            chembl_b.display().to_string(),
+            query.display().to_string(),
+            chembl_result.display().to_string(),
+        ],
+        "chembl_namespace_key",
+    )
+    .expect("chembl query");
+    let chembl_rows = read_text(&chembl_result).expect("chembl results");
+
+    let bindingdb = root.join("bindingdb.zip");
+    write_zip(
+        &bindingdb,
+        "bindingdb.tsv",
+        "Ligand SMILES\tBindingDB Ligand Name\tTarget Name\tTarget Source Organism According to Curator or DataSource\tKi (nM)\tUniProt (SwissProt) Primary ID of Target Chain 1\nCCO\tethanol\tTarget one\tHomo sapiens\t12\tP_ONE\n",
+    )
+    .expect("bindingdb zip");
+    let bindingdb_result = root.join("bindingdb_results.tsv");
+    run_python_script(
+        bindingdb_onsite_query_script(),
+        &[
+            bindingdb.display().to_string(),
+            query.display().to_string(),
+            bindingdb_result.display().to_string(),
+        ],
+        "bindingdb_namespace_key",
+    )
+    .expect("bindingdb query");
+    let bindingdb_rows = read_text(&bindingdb_result).expect("bindingdb results");
+
+    assert_eq!(chembl_rows.matches("\tCHEMBL_T1\t").count(), 1);
+    assert_eq!(bindingdb_rows.matches("\tP_ONE\t").count(), 1);
+    assert!(chembl_rows.contains("\trecord_a\n"));
+    assert!(bindingdb_rows.contains("\trecord_a\n"));
+    fs::remove_dir_all(&root).expect("cleanup temp root");
+}
+
+#[test]
+fn chembl_censored_relations_are_evidence_not_quantitative_scores() {
+    let root = temp_root("chembl_relation_filter");
+    let store = root.join("science_store");
+    let run = root.join("run");
+    let input = root.join("input.json");
+    write_text(
+        &store.join("indexes/known_targets.tsv"),
+        "source\ttarget_id\ttarget_name\torganism\ttarget_class\tligand_tokens\tsequence_tokens\tstructure_tokens\tevidence\n",
+    )
+    .expect("empty known index");
+    let sqlite = store.join("downloads/chembl/chembl.sqlite");
+    write_chembl_sqlite(&sqlite).expect("chembl sqlite");
+    add_chembl_activity_rows(
+        &sqlite,
+        &[
+            (
+                "CHEMBL_GT".to_string(),
+                "CCO".to_string(),
+                ">".to_string(),
+                10.0,
+            ),
+            (
+                "CHEMBL_LT".to_string(),
+                "CCO".to_string(),
+                "<".to_string(),
+                10.0,
+            ),
+        ],
+    )
+    .expect("censored activities");
+    write_text(
+        &input,
+        "{\"inputs\":[{\"field\":\"small_molecule\",\"value\":\"CCO\"}],\"files\":[]}\n",
+    )
+    .expect("input");
+    let options = ScienceOptions {
+        workspace_root: root.clone(),
+        science_store: store,
+        input_manifest: input,
+        run_dir: run.clone(),
+    };
+
+    run_science_command(ScienceCommand::InputNormalize, &options).expect("normalize");
+    run_science_command(ScienceCommand::FeaturesCompute, &options).expect("features");
+    run_science_command(ScienceCommand::DatabaseMatchKnown, &options).expect("match known");
+    let matches = read_text(&run.join("known_database_matches.tsv")).expect("known matches");
+    let chembl = matches
+        .lines()
+        .skip(1)
+        .map(split_tsv)
+        .filter(|cols| cols.get(1).is_some_and(|source| source == "ChEMBL"))
+        .map(|cols| (cols[2].clone(), (cols[6].clone(), cols[8].clone())))
+        .collect::<BTreeMap<_, _>>();
+
+    assert_eq!(chembl["CHEMBL_T1"].0, "0.9500");
+    for (target, relation) in [("CHEMBL_GT", ">"), ("CHEMBL_LT", "<")] {
+        assert_eq!(chembl[target].0, "0.6500");
+        assert!(chembl[target].1.contains(&format!("relation={relation}")));
+    }
+    fs::remove_dir_all(&root).expect("cleanup temp root");
+    assert!(!root.exists());
+}
+
+#[test]
+fn chembl_onsite_aggregation_keeps_more_than_200_targets_for_each_input() {
+    let root = temp_root("chembl_per_input_unbounded");
+    let store = root.join("science_store");
+    let run = root.join("run");
+    let input = root.join("input.json");
+    write_text(
+        &store.join("indexes/known_targets.tsv"),
+        "source\ttarget_id\ttarget_name\torganism\ttarget_class\tligand_tokens\tsequence_tokens\tstructure_tokens\tevidence\n",
+    )
+    .expect("empty known index");
+    let sqlite = store.join("downloads/chembl/chembl.sqlite");
+    write_chembl_sqlite(&sqlite).expect("chembl sqlite");
+    let mut activities = Vec::new();
+    for index in 0..205 {
+        activities.push((
+            format!("CHEMBL_CCO_{index:03}"),
+            "CCO".to_string(),
+            "=".to_string(),
+            20.0 + index as f64,
+        ));
+        activities.push((
+            format!("CHEMBL_CCN_{index:03}"),
+            "CCN".to_string(),
+            "=".to_string(),
+            20.0 + index as f64,
+        ));
+    }
+    add_chembl_activity_rows(&sqlite, &activities).expect("bulk chembl activities");
+    write_text(
+        &input,
+        "{\"inputs\":[{\"field\":\"small_molecule\",\"value\":\"CCO\"},{\"field\":\"small_molecule\",\"value\":\"CCN\"}],\"files\":[]}\n",
+    )
+    .expect("input");
+    let options = ScienceOptions {
+        workspace_root: root.clone(),
+        science_store: store,
+        input_manifest: input,
+        run_dir: run.clone(),
+    };
+
+    run_science_command(ScienceCommand::InputNormalize, &options).expect("normalize");
+    run_science_command(ScienceCommand::FeaturesCompute, &options).expect("features");
+    run_science_command(ScienceCommand::DatabaseMatchKnown, &options).expect("match known");
+    let matches = read_text(&run.join("known_database_matches.tsv")).expect("known matches");
+    let mut counts = BTreeMap::<String, usize>::new();
+    for cols in matches.lines().skip(1).map(split_tsv) {
+        if cols.get(1).is_some_and(|source| source == "ChEMBL") {
+            *counts.entry(cols[0].clone()).or_default() += 1;
+        }
+    }
+
+    assert_eq!(counts.len(), 2);
+    assert!(counts.values().all(|count| *count >= 205), "{counts:?}");
+    fs::remove_dir_all(&root).expect("cleanup temp root");
+    assert!(!root.exists());
+}
+
+#[test]
+fn bindingdb_onsite_aggregation_streams_all_members_without_a_200_target_cap() {
+    let root = temp_root("bindingdb_per_input_unbounded");
+    let store = root.join("science_store");
+    let run = root.join("run");
+    let input = root.join("input.json");
+    write_text(
+        &store.join("indexes/known_targets.tsv"),
+        "source\ttarget_id\ttarget_name\torganism\ttarget_class\tligand_tokens\tsequence_tokens\tstructure_tokens\tevidence\n",
+    )
+    .expect("empty known index");
+    let header = "Ligand SMILES\tBindingDB Ligand Name\tTarget Name\tTarget Source Organism According to Curator or DataSource\tKi (nM)\tUniProt (SwissProt) Primary ID of Target Chain 1\n";
+    let mut first = header.to_string();
+    let mut second = header.to_string();
+    for index in 0..205 {
+        let target = if index < 110 { &mut first } else { &mut second };
+        target.push_str(&format!(
+            "CCO\tethanol\tCCO target {index}\tHomo sapiens\t12\tP_CCO_{index:03}\n"
+        ));
+        target.push_str(&format!(
+            "CCN\tethylamine\tCCN target {index}\tHomo sapiens\t12\tP_CCN_{index:03}\n"
+        ));
+    }
+    write_zip_members(
+        &store.join("downloads/bindingdb/bindingdb_all.tsv.zip"),
+        &[
+            ("z_second.tsv", second.as_str()),
+            ("a_first.tsv", first.as_str()),
+        ],
+    )
+    .expect("bindingdb zip");
+    write_text(
+        &input,
+        "{\"inputs\":[{\"field\":\"small_molecule\",\"value\":\"CCO\"},{\"field\":\"small_molecule\",\"value\":\"CCN\"}],\"files\":[]}\n",
+    )
+    .expect("input");
+    let options = ScienceOptions {
+        workspace_root: root.clone(),
+        science_store: store,
+        input_manifest: input,
+        run_dir: run.clone(),
+    };
+
+    run_science_command(ScienceCommand::InputNormalize, &options).expect("normalize");
+    run_science_command(ScienceCommand::FeaturesCompute, &options).expect("features");
+    run_science_command(ScienceCommand::DatabaseMatchKnown, &options).expect("match known");
+    let matches = read_text(&run.join("known_database_matches.tsv")).expect("known matches");
+    let mut counts = BTreeMap::<String, usize>::new();
+    for cols in matches.lines().skip(1).map(split_tsv) {
+        if cols.get(1).is_some_and(|source| source == "BindingDB") {
+            *counts.entry(cols[0].clone()).or_default() += 1;
+        }
+    }
+
+    assert_eq!(counts.len(), 2);
+    assert!(counts.values().all(|count| *count == 205), "{counts:?}");
+    fs::remove_dir_all(&root).expect("cleanup temp root");
+    assert!(!root.exists());
+}
+
+#[test]
 fn known_matching_deduplicates_onsite_hits_and_downweights_token_noise() {
     let root = temp_root("bindingdb_dedupe_noise");
     let store = root.join("science_store");
@@ -3423,6 +3811,61 @@ fn pipeline_blocks_when_store_lacks_install_closure() {
 }
 
 #[test]
+fn shared_store_readiness_and_pipeline_reject_legacy_5000_row_projection() {
+    let root = temp_root("legacy_5000_projection");
+    let store = create_temporary_test_store(&root).expect("test store");
+    write_text(
+        &store.join("index_build_manifest.tsv"),
+        "index\tinput_path\tstatus\trows\toutput_path\tnotes\nknown_targets\tdownloads/bindingdb/bindingdb_all.tsv.zip\tused\t5000\tindexes/known_targets.tsv\tcanonical_or_source_table_rows\n",
+    )
+    .expect("legacy projection manifest");
+    let readiness = evaluate_science_store_readiness(&store).expect("readiness evaluation");
+
+    assert!(!readiness.ready);
+    assert!(
+        readiness
+            .blockers
+            .iter()
+            .any(|reason| reason.contains("legacy_5000_row_projection"))
+    );
+
+    let input = root.join("input.json");
+    let run = root.join("run");
+    write_text(
+        &input,
+        "{\"inputs\":[{\"field\":\"small_molecule\",\"value\":\"CCO\"}],\"files\":[]}\n",
+    )
+    .expect("input");
+    let options = ScienceOptions {
+        workspace_root: root.clone(),
+        science_store: store,
+        input_manifest: input,
+        run_dir: run.clone(),
+    };
+    let out = run_science_command(ScienceCommand::PipelineRun, &options).expect("blocked pipeline");
+    let failure = read_text(&run.join("failure_reason.txt")).expect("failure reasons");
+
+    assert!(out.contains("pipeline_blocked"));
+    assert!(failure.contains("legacy_5000_row_projection"));
+    fs::remove_dir_all(&root).expect("cleanup temp root");
+}
+
+#[test]
+fn shared_store_readiness_accepts_complete_5000_row_source_scan() {
+    let root = temp_root("complete_5000_source_scan");
+    write_text(
+        &root.join("index_build_manifest.tsv"),
+        "index\tinput_path\tstatus\trows\toutput_path\tnotes\nknown_targets\tdownloads/chembl/known_targets.tsv\tused\t5000\tindexes/known_targets.tsv\tcanonical_or_source_table_rows;complete_source_scan\n",
+    )
+    .expect("complete index manifest");
+
+    let readiness = evaluate_science_store_readiness(&root).expect("readiness evaluation");
+
+    assert!(readiness.ready, "{:?}", readiness.blockers);
+    fs::remove_dir_all(&root).expect("cleanup temp root");
+}
+
+#[test]
 fn pipeline_blocks_when_alignment_database_manifest_is_deferred() {
     let root = temp_root("deferred_alignment_manifest");
     let store = root.join("science_store");
@@ -3638,6 +4081,149 @@ fn prepare_science_store_builds_indexes_from_zip_members() {
 }
 
 #[test]
+fn prepare_science_store_reads_every_supported_zip_member() {
+    let root = temp_root("build_all_zip_members");
+    let store = root.join("science_store");
+    let header = "source\ttarget_id\ttarget_name\torganism\ttarget_class\tligand_tokens\tsequence_tokens\tstructure_tokens\tevidence\n";
+    let first = format!(
+        "{header}ChEMBL\tCHEMBL_ZIP_A\tAlpha target\tHomo sapiens\tknown_human_protein\talpha\talpha target\t\tzip_member_a\n"
+    );
+    let second = format!(
+        "{header}ChEMBL\tCHEMBL_ZIP_B\tBeta target\tHomo sapiens\tknown_human_protein\tbeta\tbeta target\t\tzip_member_b\n"
+    );
+    write_zip_members(
+        &store.join("downloads/chembl/known_targets.zip"),
+        &[("z_targets.tsv", &second), ("a_targets.tsv", &first)],
+    )
+    .expect("known zip");
+    write_zip_members(
+        &store.join("downloads/metagenome/orfs.zip"),
+        &[
+            ("z_sequences.faa", ">MG_Z\nMSEQNNTEMTFQIQRIYTKDISFEAP\n"),
+            ("a_sequences.faa", ">MG_A\nMKTAYIAKQRQISFVKSHFSRQDIL\n"),
+        ],
+    )
+    .expect("fasta zip");
+    let options = StoreOptions {
+        workspace_root: root.clone(),
+        science_store: store.clone(),
+    };
+
+    run_store_command(ScienceCommand::PrepareScienceStore, &options).expect("prepare store");
+    let known = read_text(&store.join("indexes/known_targets.tsv")).expect("known index");
+    let metagenome =
+        read_text(&store.join("indexes/metagenome_targets.tsv")).expect("metagenome index");
+
+    assert!(known.contains("CHEMBL_ZIP_A"));
+    assert!(known.contains("CHEMBL_ZIP_B"));
+    assert!(metagenome.contains("MG_A"));
+    assert!(metagenome.contains("MG_Z"));
+    fs::remove_dir_all(&root).expect("cleanup temp root");
+}
+
+#[test]
+fn prepare_science_store_visits_every_supported_zip_member_in_stable_name_order() {
+    let root = temp_root("build_multi_member_zip_indexes");
+    let store = root.join("science_store");
+    let header = "source\ttarget_id\ttarget_name\torganism\ttarget_class\tligand_tokens\tsequence_tokens\tstructure_tokens\tevidence\n";
+    let a_member = format!(
+        "{header}ChEMBL\tCHEMBL_A\tAlpha target\tHomo sapiens\tknown_human_protein\talpha\talpha\t\tzip_a\nChEMBL\tCHEMBL_SHARED\tFrom A member\tHomo sapiens\tknown_human_protein\talpha\talpha\t\tzip_a\n"
+    );
+    let z_member = format!(
+        "{header}ChEMBL\tCHEMBL_Z\tZeta target\tHomo sapiens\tknown_human_protein\tzeta\tzeta\t\tzip_z\nChEMBL\tCHEMBL_SHARED\tFrom Z member\tHomo sapiens\tknown_human_protein\tzeta\tzeta\t\tzip_z\n"
+    );
+    write_zip_members(
+        &store.join("downloads/chembl/known_targets.zip"),
+        &[
+            ("z/targets.tsv", z_member.as_str()),
+            ("ignored/readme.md", "ignored"),
+            ("a/targets.tsv", a_member.as_str()),
+        ],
+    )
+    .expect("known zip");
+    write_zip_members(
+        &store.join("downloads/metagenome/orfs.zip"),
+        &[
+            (
+                "z/orfs.faa",
+                ">MG_Z\nMTEYKLVVVGAGGVGKSALTIQLIQNHFVDEYDPTIEDSY\n",
+            ),
+            ("a/orfs.faa", ">MG_A\nMSTNPKPQRKTKRNTNRRPQDVKFPGG\n"),
+        ],
+    )
+    .expect("fasta zip");
+    let options = StoreOptions {
+        workspace_root: root.clone(),
+        science_store: store.clone(),
+    };
+
+    run_store_command(ScienceCommand::PrepareScienceStore, &options).expect("prepare store");
+    let known = read_text(&store.join("indexes/known_targets.tsv")).expect("known index");
+    let metagenome =
+        read_text(&store.join("indexes/metagenome_targets.tsv")).expect("metagenome index");
+
+    assert!(known.contains("CHEMBL_A"));
+    assert!(known.contains("CHEMBL_Z"));
+    assert!(known.contains("CHEMBL_SHARED\tFrom A member"));
+    assert!(!known.contains("CHEMBL_SHARED\tFrom Z member"));
+    assert!(metagenome.contains("MG_A"));
+    assert!(metagenome.contains("MG_Z"));
+    fs::remove_dir_all(&root).expect("cleanup temp root");
+    assert!(!root.exists());
+}
+
+#[test]
+fn tsv_and_fasta_archive_parsers_emit_bounded_row_batches() {
+    let root = temp_root("bounded_archive_batches");
+    let table_zip = root.join("targets.zip");
+    let fasta_zip = root.join("targets_fasta.zip");
+    let row_count = SOURCE_ROW_BATCH_SIZE * 2 + 17;
+    let mut table = String::from(
+        "source\ttarget_id\ttarget_name\torganism\ttarget_class\tligand_tokens\tsequence_tokens\tstructure_tokens\tevidence\n",
+    );
+    let mut fasta = String::new();
+    for index in 0..row_count {
+        table.push_str(&format!(
+            "source\tT_{index}\tTarget {index}\tunknown\tknown_protein\t\tseq{index}\t\trow\n"
+        ));
+        fasta.push_str(&format!(
+            ">F_{index}\nMSEQNNTEMTFQIQRIYTKDISFEAPNAPHVFQKDW\n"
+        ));
+    }
+    write_zip_members(&table_zip, &[("targets.tsv", table.as_str())]).expect("table zip");
+    write_zip_members(&fasta_zip, &[("targets.faa", fasta.as_str())]).expect("fasta zip");
+    let mut table_total = 0usize;
+    let mut table_max = 0usize;
+    for_each_store_row_batch(&table_zip, "bounded_table", |batch| {
+        table_total += batch.len();
+        table_max = table_max.max(batch.len());
+        Ok(())
+    })
+    .expect("stream table batches");
+    let mut fasta_total = 0usize;
+    let mut fasta_max = 0usize;
+    for_each_fasta_row_batch(
+        &fasta_zip,
+        "metagenome",
+        "unknown",
+        "potential_metagenome_sequence",
+        "sequence_record",
+        |batch| {
+            fasta_total += batch.len();
+            fasta_max = fasta_max.max(batch.len());
+            Ok(())
+        },
+    )
+    .expect("stream fasta batches");
+
+    assert_eq!(table_total, row_count);
+    assert_eq!(fasta_total, row_count);
+    assert!(table_max <= SOURCE_ROW_BATCH_SIZE);
+    assert!(fasta_max <= SOURCE_ROW_BATCH_SIZE);
+    fs::remove_dir_all(&root).expect("cleanup temp root");
+}
+
+#[test]
 fn prepare_science_store_builds_known_index_from_chembl_sqlite() {
     let root = temp_root("build_chembl_sqlite");
     let store = root.join("science_store");
@@ -3697,6 +4283,44 @@ fn prepare_science_store_builds_known_index_from_chembl_sqlite_archive() {
     assert!(known.contains("CHEMBL_T1"));
     assert!(build_manifest.contains("chembl_sqlite_archive_rows"));
     fs::remove_dir_all(&root).expect("cleanup temp root");
+    assert!(!root.exists());
+}
+
+#[test]
+fn chembl_archive_uses_unique_streamed_temporary_sqlite_and_one_source_query() {
+    let root = temp_root("chembl_archive_unique_temp");
+    let source_sqlite = root.join("chembl_source.sqlite");
+    let archive = root.join("chembl_sqlite.tar.gz");
+    write_chembl_sqlite(&source_sqlite).expect("chembl sqlite");
+    write_tar_gzip_file(
+        &archive,
+        "chembl_36/chembl_36_sqlite/chembl_36.db",
+        &source_sqlite,
+    )
+    .expect("chembl archive");
+    let legacy_temp = std::env::temp_dir().join(format!(
+        "genoligand_chembl_{}_{}_{}",
+        std::process::id(),
+        stable_hash(&archive.display().to_string()),
+        safe_id("chembl_36.db")
+    ));
+    write_text(&legacy_temp, "sentinel\n").expect("legacy sentinel");
+
+    let rows = parse_chembl_sqlite_archive(&archive).expect("parse archive");
+    let legacy_after = fs::read_to_string(&legacy_temp).ok();
+    let onsite_script = chembl_onsite_query_script();
+    let install_script = chembl_sqlite_query_script();
+
+    let _ = fs::remove_file(&legacy_temp);
+    fs::remove_dir_all(&root).expect("cleanup temp root");
+    assert!(!rows.is_empty());
+    assert_eq!(legacy_after.as_deref(), Some("sentinel\n"));
+    assert!(onsite_script.contains("shutil.copyfileobj"));
+    assert!(!onsite_script.contains("extracted.read()"));
+    assert_eq!(
+        install_script.matches("connection.execute(query)").count(),
+        1
+    );
     assert!(!root.exists());
 }
 
@@ -3783,6 +4407,42 @@ fn prepare_science_store_builds_structure_index_from_downloaded_sources() {
     assert!(manifest.contains("binding_moad_complex_rows"));
     assert!(manifest.contains("plinder_canonical_rows"));
     assert!(status.contains("\"structure\":"));
+    fs::remove_dir_all(&root).expect("cleanup temp root");
+    assert!(!root.exists());
+}
+
+#[test]
+fn prepare_science_store_streams_all_structure_table_zip_members() {
+    let root = temp_root("stream_structure_zip_members");
+    let store = root.join("science_store");
+    write_zip_members(
+        &store.join("downloads/biolip2/BioLiP.zip"),
+        &[
+            ("b/BioLiP_b.txt", "2BBB\tB\tB\t1\tFAD\tflavin\n"),
+            ("a/BioLiP_a.txt", "1AAA\tA\tA\t1\tATP\tadenosine\n"),
+        ],
+    )
+    .expect("write BioLiP archive");
+    write_zip_members(
+        &store.join("downloads/binding_moad/bindingmoad.zip"),
+        &[
+            ("z/moad_z.csv", "pdb,ligand,affinity\n4DDD,FAD,20 nM\n"),
+            ("a/moad_a.tsv", "pdb\tligand\taffinity\n3CCC\tATP\t10 nM\n"),
+        ],
+    )
+    .expect("write Binding MOAD archive");
+    let options = StoreOptions {
+        workspace_root: root.clone(),
+        science_store: store.clone(),
+    };
+
+    run_store_command(ScienceCommand::PrepareScienceStore, &options).expect("prepare store");
+    let structure =
+        read_text(&store.join("indexes/structure_targets.tsv")).expect("structure index");
+
+    for target in ["1AAA_A", "2BBB_B", "3CCC", "4DDD"] {
+        assert!(structure.contains(target), "missing {target}: {structure}");
+    }
     fs::remove_dir_all(&root).expect("cleanup temp root");
     assert!(!root.exists());
 }
@@ -3904,6 +4564,110 @@ fn chembl_sqlite_query_has_no_artificial_index_limit() {
 }
 
 #[test]
+fn candidate_identity_keeps_database_namespaces_separate() {
+    let root = temp_root("candidate_namespace_identity");
+    let known = root.join("known.tsv");
+    let metagenome = root.join("metagenome.tsv");
+    write_text(
+        &known,
+        "input_id\tsource\ttarget_id\ttarget_name\torganism\ttarget_class\tmatch_score\tmatched_features\tevidence\ninput_1\tChEMBL\tSHARED\tHuman target\tHomo sapiens (Human)\tknown_human_protein\t0.9\tligand\tchembl_activity_row\n",
+    )
+    .expect("known matches");
+    write_text(
+        &metagenome,
+        "input_id\tsource\ttarget_id\ttarget_name\torganism\ttarget_class\tmatch_score\tmatched_features\tevidence\ninput_1\tMMseqs2\tSHARED\tEnvironmental ORF\tuncultured bacterium\tmetagenome_potential_protein\t0.8\tsequence\tmmseqs_alignment;source_namespace=MGnify\n",
+    )
+    .expect("metagenome matches");
+
+    let mut candidates = BTreeMap::new();
+    merge_match_file(&known, "known_database", &mut candidates).expect("merge known");
+    merge_match_file(&metagenome, "metagenome_potential", &mut candidates)
+        .expect("merge metagenome");
+    let mut candidates = candidates.into_values().collect::<Vec<_>>();
+    assign_collision_free_candidate_ids(&mut candidates);
+
+    assert_eq!(candidates.len(), 2);
+    assert_eq!(
+        candidates
+            .iter()
+            .map(|candidate| candidate.candidate_id.as_str())
+            .collect::<BTreeSet<_>>()
+            .len(),
+        2
+    );
+    assert!(
+        candidates
+            .iter()
+            .any(|candidate| candidate.known_score > 0.0)
+    );
+    assert!(
+        candidates
+            .iter()
+            .any(|candidate| candidate.metagenome_score > 0.0)
+    );
+    fs::remove_dir_all(&root).expect("cleanup temp root");
+}
+
+#[test]
+fn candidate_ids_disambiguate_sanitized_target_collisions() {
+    let root = temp_root("candidate_sanitized_collision");
+    let matches = root.join("matches.tsv");
+    write_text(
+        &matches,
+        "input_id\tsource\ttarget_id\ttarget_name\torganism\ttarget_class\tmatch_score\tmatched_features\tevidence\ninput_1\tChEMBL\tA:B\tTarget colon\tHomo sapiens\tknown_human_protein\t0.9\tligand\tchembl_activity_row\ninput_1\tChEMBL\tA/B\tTarget slash\tHomo sapiens\tknown_human_protein\t0.8\tligand\tchembl_activity_row\n",
+    )
+    .expect("matches");
+
+    let mut candidates = BTreeMap::new();
+    merge_match_file(&matches, "known_database", &mut candidates).expect("merge matches");
+    let mut candidates = candidates.into_values().collect::<Vec<_>>();
+    assign_collision_free_candidate_ids(&mut candidates);
+    let ids = candidates
+        .iter()
+        .map(|candidate| candidate.candidate_id.clone())
+        .collect::<BTreeSet<_>>();
+
+    assert_eq!(ids.len(), 2);
+    assert!(
+        ids.iter()
+            .all(|candidate_id| candidate_id.starts_with("target_A_B_"))
+    );
+    fs::remove_dir_all(&root).expect("cleanup temp root");
+}
+
+#[test]
+fn candidate_metadata_prefers_informative_human_rows() {
+    let root = temp_root("candidate_metadata_quality");
+    let matches = root.join("matches.tsv");
+    write_text(
+        &matches,
+        "input_id\tsource\ttarget_id\ttarget_name\torganism\ttarget_class\tmatch_score\tmatched_features\tevidence\ninput_1\tChEMBL\tT1\tT1\tunknown\tknown_protein\t0.4\tligand\tprojected_index_row\ninput_2\tChEMBL\tT1\tCyclin-dependent kinase 2\tHomo sapiens (Human)\tknown_human_protein\t0.9\tligand\tchembl_onsite_activity_row\n",
+    )
+    .expect("matches");
+
+    let mut candidates = BTreeMap::new();
+    merge_match_file(&matches, "known_database", &mut candidates).expect("merge matches");
+    let candidate = candidates.into_values().next().expect("candidate");
+
+    assert_eq!(candidate.target_name, "Cyclin-dependent kinase 2");
+    assert_eq!(candidate.organism, "Homo sapiens (Human)");
+    assert_eq!(candidate.candidate_scope, "known_human_protein");
+    fs::remove_dir_all(&root).expect("cleanup temp root");
+}
+
+#[test]
+fn exact_small_molecule_scripts_preserve_stereochemistry_and_normalize_both_sides() {
+    let chembl = chembl_onsite_query_script();
+    let bindingdb = bindingdb_onsite_query_script();
+
+    assert!(chembl.contains("isomericSmiles=True"));
+    assert!(chembl.contains("create_function"));
+    assert!(!chembl.contains("cs.canonical_smiles IN"));
+    assert!(bindingdb.contains("isomericSmiles=True"));
+    assert!(!bindingdb.contains("isomericSmiles=False"));
+}
+
+#[test]
 fn prepare_science_store_builds_full_index_without_row_limit_marker() {
     let root = temp_root("full_index_without_limit_marker");
     let store = root.join("science_store");
@@ -3964,6 +4728,10 @@ fn write_gzip(path: &Path, text: &str) -> Result<(), String> {
 }
 
 fn write_zip(path: &Path, member_name: &str, text: &str) -> Result<(), String> {
+    write_zip_members(path, &[(member_name, text)])
+}
+
+fn write_zip_members(path: &Path, members: &[(&str, &str)]) -> Result<(), String> {
     use std::io::Write;
     use zip::CompressionMethod;
     use zip::write::FileOptions;
@@ -3976,12 +4744,14 @@ fn write_zip(path: &Path, member_name: &str, text: &str) -> Result<(), String> {
     let mut writer = zip::ZipWriter::new(file);
     let options: FileOptions<'_, ()> =
         FileOptions::default().compression_method(CompressionMethod::Deflated);
-    writer
-        .start_file(member_name, options)
-        .map_err(|err| format!("zip_start_failed:{}:{err}", path.display()))?;
-    writer
-        .write_all(text.as_bytes())
-        .map_err(|err| format!("zip_write_failed:{}:{err}", path.display()))?;
+    for (member_name, text) in members {
+        writer
+            .start_file(*member_name, options)
+            .map_err(|err| format!("zip_start_failed:{}:{err}", path.display()))?;
+        writer
+            .write_all(text.as_bytes())
+            .map_err(|err| format!("zip_write_failed:{}:{err}", path.display()))?;
+    }
     writer
         .finish()
         .map_err(|err| format!("zip_finish_failed:{}:{err}", path.display()))?;
@@ -4084,6 +4854,139 @@ connection.commit()
         "chembl_sqlite_fixture",
     )
     .map(|_| ())
+}
+
+fn write_many_chembl_activities(path: &Path, targets_per_input: usize) -> Result<(), String> {
+    if let Some(parent) = path.parent() {
+        ensure_dir(parent)?;
+    }
+    run_python_script(
+        r#"
+import pathlib
+import sqlite3
+import sys
+
+path = pathlib.Path(sys.argv[1])
+target_count = int(sys.argv[2])
+path.parent.mkdir(parents=True, exist_ok=True)
+connection = sqlite3.connect(path)
+connection.executescript("""
+CREATE TABLE target_dictionary (
+    tid INTEGER PRIMARY KEY,
+    chembl_id TEXT NOT NULL,
+    pref_name TEXT,
+    organism TEXT,
+    target_type TEXT
+);
+CREATE TABLE assays (assay_id INTEGER PRIMARY KEY, tid INTEGER NOT NULL);
+CREATE TABLE molecule_dictionary (molregno INTEGER PRIMARY KEY, pref_name TEXT);
+CREATE TABLE compound_structures (molregno INTEGER PRIMARY KEY, canonical_smiles TEXT);
+CREATE TABLE activities (
+    activity_id INTEGER PRIMARY KEY,
+    assay_id INTEGER NOT NULL,
+    molregno INTEGER NOT NULL,
+    standard_type TEXT,
+    standard_relation TEXT,
+    standard_value REAL,
+    standard_units TEXT
+);
+INSERT INTO molecule_dictionary VALUES (10, 'ethanol'), (11, 'ethylamine');
+INSERT INTO compound_structures VALUES (10, 'CCO'), (11, 'CCN');
+""")
+targets = []
+assays = []
+activities = []
+activity_id = 1
+for group, molregno in (("CCO", 10), ("CCN", 11)):
+    for index in range(target_count):
+        tid = len(targets) + 1
+        assay_id = tid
+        targets.append((tid, f"CHEMBL_{group}_{index}", f"{group} target {index}", "Homo sapiens", "SINGLE PROTEIN"))
+        assays.append((assay_id, tid))
+        activities.append((activity_id, assay_id, molregno, "Ki", "=", float(index + 1), "nM"))
+        activity_id += 1
+relation_best_tid = len(targets) + 1
+targets.append((relation_best_tid, "CHEMBL_RELATION_BEST", "Relation best target", "Homo sapiens", "SINGLE PROTEIN"))
+assays.append((relation_best_tid, relation_best_tid))
+activities.extend([
+    (activity_id, relation_best_tid, 10, "IC50", ">", 1.0, "nM"),
+    (activity_id + 1, relation_best_tid, 10, "IC50", "=", 100.0, "nM"),
+])
+activity_id += 2
+censored_tid = len(targets) + 1
+targets.append((censored_tid, "CHEMBL_RELATION_CENSORED", "Censored relation target", "Homo sapiens", "SINGLE PROTEIN"))
+assays.append((censored_tid, censored_tid))
+activities.append((activity_id, censored_tid, 10, "Ki", "<", 10.0, "nM"))
+connection.executemany("INSERT INTO target_dictionary VALUES (?, ?, ?, ?, ?)", targets)
+connection.executemany("INSERT INTO assays VALUES (?, ?)", assays)
+connection.executemany("INSERT INTO activities VALUES (?, ?, ?, ?, ?, ?, ?)", activities)
+connection.commit()
+"#,
+        &[path.display().to_string(), targets_per_input.to_string()],
+        "chembl_many_sqlite_fixture",
+    )
+    .map(|_| ())
+}
+
+fn add_chembl_activity_rows(
+    path: &Path,
+    rows: &[(String, String, String, f64)],
+) -> Result<(), String> {
+    let payload = rows
+        .iter()
+        .map(|(target_id, smiles, relation, value)| {
+            json!({
+                "target_id": target_id,
+                "smiles": smiles,
+                "relation": relation,
+                "value": value,
+            })
+        })
+        .collect::<Vec<_>>();
+    let payload_path = path.with_extension("activity_rows.json");
+    write_text(&payload_path, &Value::Array(payload).to_string())?;
+    let result = run_python_script(
+        r#"
+import json
+import sqlite3
+import sys
+
+connection = sqlite3.connect(sys.argv[1])
+with open(sys.argv[2], "r", encoding="utf-8") as handle:
+    rows = json.load(handle)
+for offset, row in enumerate(rows, start=10000):
+    tid = offset
+    assay_id = offset
+    molregno = offset
+    activity_id = offset
+    target_id = row["target_id"]
+    connection.execute(
+        "INSERT INTO target_dictionary VALUES (?, ?, ?, 'Homo sapiens', 'SINGLE PROTEIN')",
+        (tid, target_id, f"Target {target_id}"),
+    )
+    connection.execute("INSERT INTO assays VALUES (?, ?)", (assay_id, tid))
+    connection.execute(
+        "INSERT INTO molecule_dictionary VALUES (?, ?)",
+        (molregno, f"Compound {target_id}"),
+    )
+    connection.execute(
+        "INSERT INTO compound_structures VALUES (?, ?)",
+        (molregno, row["smiles"]),
+    )
+    connection.execute(
+        "INSERT INTO activities VALUES (?, ?, ?, 'IC50', ?, ?, 'nM')",
+        (activity_id, assay_id, molregno, row["relation"], row["value"]),
+    )
+connection.commit()
+"#,
+        &[
+            path.display().to_string(),
+            payload_path.display().to_string(),
+        ],
+        "chembl_activity_fixture",
+    );
+    let _ = fs::remove_file(payload_path);
+    result.map(|_| ())
 }
 
 fn temp_root(label: &str) -> PathBuf {

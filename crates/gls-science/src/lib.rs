@@ -1,10 +1,11 @@
 use flate2::read::GzDecoder;
 use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
 use std::env;
 use std::ffi::OsString;
 use std::fs;
-use std::io::{BufRead, BufReader, Read};
+use std::io::{BufRead, BufReader, BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -23,6 +24,7 @@ const WORKER_PIPELINE_MODE: &str = "genoligand_scientific_pipeline";
 const MAX_SEQUENCE_TOKEN_CHARS: usize = 96;
 const MAX_STRUCTURE_METADATA_CHARS: usize = 16_384;
 const LARGE_METAGENOME_FASTA_TSV_MAX_BYTES: u64 = 1_000_000_000;
+const SOURCE_ROW_BATCH_SIZE: usize = 512;
 const KNOWN_SCORE_WEIGHT: f64 = 0.50;
 const METAGENOME_SCORE_WEIGHT: f64 = 0.25;
 const STRUCTURE_SCORE_WEIGHT: f64 = 0.10;
@@ -55,6 +57,44 @@ pub struct ScienceOptions {
     pub science_store: PathBuf,
     pub input_manifest: PathBuf,
     pub run_dir: PathBuf,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ScienceStoreReadiness {
+    pub ready: bool,
+    pub blockers: Vec<String>,
+}
+
+impl ScienceStoreReadiness {
+    pub fn reasons(&self) -> &[String] {
+        &self.blockers
+    }
+}
+
+pub fn evaluate_science_store_readiness(
+    science_store: &Path,
+) -> Result<ScienceStoreReadiness, String> {
+    let mut blockers = Vec::new();
+    evaluate_index_build_manifest(
+        science_store,
+        &science_store.join("index_build_manifest.tsv"),
+        &mut blockers,
+    )?;
+    for name in [
+        "index_readiness_manifest.tsv",
+        "science_index_readiness.tsv",
+    ] {
+        let path = science_store.join(name);
+        if path.is_file() {
+            evaluate_persisted_index_readiness(&path, &mut blockers)?;
+        }
+    }
+    blockers.sort();
+    blockers.dedup();
+    Ok(ScienceStoreReadiness {
+        ready: blockers.is_empty(),
+        blockers,
+    })
 }
 
 #[derive(Clone, Debug)]
@@ -280,10 +320,12 @@ struct StoreRow {
 #[derive(Clone, Debug)]
 struct Candidate {
     candidate_id: String,
+    identity_namespace: String,
     target_id: String,
     target_name: String,
     candidate_scope: String,
     organism: String,
+    metadata_quality: u16,
     known_score: f64,
     metagenome_score: f64,
     structure_score: f64,
@@ -583,6 +625,10 @@ fn create_temporary_test_store(root: &Path) -> Result<PathBuf, String> {
             })
         ),
     )?;
+    write_text(
+        &store.join("index_build_manifest.tsv"),
+        "index\tinput_path\tstatus\trows\toutput_path\tnotes\nknown_targets\tunit_test/known_targets.tsv\tused\t1\tindexes/known_targets.tsv\tfull_test_index\nmetagenome_targets\tunit_test/metagenome_targets.tsv\tempty\t0\tindexes/metagenome_targets.tsv\tfull_test_index\nstructure_targets\tunit_test/structure_targets.tsv\tused\t1\tindexes/structure_targets.tsv\tfull_test_index\n",
+    )?;
     let mut sources = String::from(
         "source_id\tlabel\tcategory\tstatus\tlanding_url\taccess_method\tlicense_note\tlocal_path\tindex_target\trepair_action\n",
     );
@@ -755,6 +801,207 @@ struct IndexBuildSummary {
     structure_rows: usize,
 }
 
+struct StoreRowSpool {
+    path: PathBuf,
+    writer: Option<BufWriter<fs::File>>,
+    rows: usize,
+}
+
+impl StoreRowSpool {
+    fn create(root: &Path, label: &str) -> Result<Self, String> {
+        ensure_dir(root)?;
+        let path = temporary_data_path(root, label, "tsv");
+        let file = fs::File::create(&path)
+            .map_err(|err| format!("create_failed:{}:{err}", path.display()))?;
+        let mut writer = BufWriter::new(file);
+        writer
+            .write_all(store_row_header().as_bytes())
+            .map_err(|err| format!("write_failed:{}:{err}", path.display()))?;
+        Ok(Self {
+            path,
+            writer: Some(writer),
+            rows: 0,
+        })
+    }
+
+    fn append(&mut self, rows: &[StoreRow]) -> Result<(), String> {
+        let writer = self
+            .writer
+            .as_mut()
+            .ok_or_else(|| "store_row_spool_already_finished".to_string())?;
+        for row in rows {
+            write_store_row(writer, row)
+                .map_err(|err| format!("write_failed:{}:{err}", self.path.display()))?;
+        }
+        self.rows += rows.len();
+        Ok(())
+    }
+
+    fn finish(mut self, output: &Path) -> Result<usize, String> {
+        let mut writer = self
+            .writer
+            .take()
+            .ok_or_else(|| "store_row_spool_already_finished".to_string())?;
+        writer
+            .flush()
+            .map_err(|err| format!("write_failed:{}:{err}", self.path.display()))?;
+        let row_count = self.rows;
+        drop(writer);
+        if row_count == 0 {
+            return write_store_rows(output, &[]).map(|_| 0);
+        }
+        dedupe_store_row_spool(&self.path, output)
+    }
+}
+
+impl Drop for StoreRowSpool {
+    fn drop(&mut self) {
+        let _ = fs::remove_file(&self.path);
+    }
+}
+
+fn dedupe_store_row_spool(raw_path: &Path, output_path: &Path) -> Result<usize, String> {
+    let parent = output_path
+        .parent()
+        .ok_or_else(|| format!("index_output_parent_missing:{}", output_path.display()))?;
+    ensure_dir(parent)?;
+    let pending_path = temporary_data_path(parent, "deduped_store_rows", "tsv");
+    let database_path = temporary_data_path(parent, "store_row_dedupe", "sqlite");
+    let result = run_python_script(
+        store_row_dedupe_script(),
+        &[
+            raw_path.display().to_string(),
+            pending_path.display().to_string(),
+            database_path.display().to_string(),
+        ],
+        "store_row_dedupe",
+    );
+    let _ = fs::remove_file(&database_path);
+    let output = match result {
+        Ok(output) => output,
+        Err(err) => {
+            let _ = fs::remove_file(&pending_path);
+            return Err(err);
+        }
+    };
+    let Some(row_count) = output
+        .lines()
+        .find_map(|line| line.strip_prefix("rows="))
+        .and_then(|value| value.trim().parse::<usize>().ok())
+    else {
+        let _ = fs::remove_file(&pending_path);
+        return Err("store_row_dedupe_missing_row_count".to_string());
+    };
+    if output_path.exists()
+        && let Err(err) = fs::remove_file(output_path)
+    {
+        let _ = fs::remove_file(&pending_path);
+        return Err(format!("remove_failed:{}:{err}", output_path.display()));
+    }
+    if let Err(err) = fs::rename(&pending_path, output_path) {
+        let _ = fs::remove_file(&pending_path);
+        return Err(format!(
+            "rename_failed:{}:{}:{err}",
+            pending_path.display(),
+            output_path.display()
+        ));
+    }
+    Ok(row_count)
+}
+
+fn store_row_dedupe_script() -> &'static str {
+    r#"
+import csv
+import sqlite3
+import sys
+
+raw_path, output_path, database_path = sys.argv[1:4]
+
+def merge_tokens(left, right):
+    return " ".join(sorted(set(str(left or "").split()) | set(str(right or "").split())))
+
+def merge_evidence(left, right):
+    values = []
+    seen = set()
+    for value in (str(left or "") + ";" + str(right or "")).split(";"):
+        value = value.strip()
+        if value and value not in seen:
+            seen.add(value)
+            values.append(value)
+    return ";".join(values)
+
+connection = sqlite3.connect(database_path)
+try:
+    connection.execute("PRAGMA journal_mode=OFF")
+    connection.execute("PRAGMA synchronous=OFF")
+    connection.execute("PRAGMA temp_store=FILE")
+    connection.create_function("merge_tokens", 2, merge_tokens)
+    connection.create_function("merge_evidence", 2, merge_evidence)
+    connection.execute("""
+        CREATE TABLE rows (
+            source TEXT NOT NULL,
+            target_id TEXT NOT NULL,
+            target_name TEXT NOT NULL,
+            organism TEXT NOT NULL,
+            target_class TEXT NOT NULL,
+            ligand_tokens TEXT NOT NULL,
+            sequence_tokens TEXT NOT NULL,
+            structure_tokens TEXT NOT NULL,
+            evidence TEXT NOT NULL,
+            PRIMARY KEY (source, target_id)
+        )
+    """)
+    upsert = """
+        INSERT INTO rows VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(source, target_id) DO UPDATE SET
+            target_name=CASE WHEN rows.target_name = 'unknown' AND excluded.target_name != 'unknown' THEN excluded.target_name ELSE rows.target_name END,
+            organism=CASE WHEN rows.organism = 'unknown' AND excluded.organism != 'unknown' THEN excluded.organism ELSE rows.organism END,
+            target_class=CASE WHEN rows.target_class != 'known_human_protein' AND excluded.target_class = 'known_human_protein' THEN excluded.target_class ELSE rows.target_class END,
+            ligand_tokens=merge_tokens(rows.ligand_tokens, excluded.ligand_tokens),
+            sequence_tokens=merge_tokens(rows.sequence_tokens, excluded.sequence_tokens),
+            structure_tokens=merge_tokens(rows.structure_tokens, excluded.structure_tokens),
+            evidence=merge_evidence(rows.evidence, excluded.evidence)
+    """
+    batch = []
+    with open(raw_path, "r", encoding="utf-8-sig", newline="") as handle:
+        reader = csv.DictReader(handle, delimiter="\t")
+        for row in reader:
+            batch.append((
+                row.get("source", ""),
+                row.get("target_id", ""),
+                row.get("target_name", ""),
+                row.get("organism", ""),
+                row.get("target_class", ""),
+                row.get("ligand_tokens", ""),
+                row.get("sequence_tokens", ""),
+                row.get("structure_tokens", ""),
+                row.get("evidence", ""),
+            ))
+            if len(batch) >= 1000:
+                connection.executemany(upsert, batch)
+                connection.commit()
+                batch.clear()
+    if batch:
+        connection.executemany(upsert, batch)
+        connection.commit()
+    with open(output_path, "w", encoding="utf-8", newline="") as handle:
+        writer = csv.writer(handle, delimiter="\t", lineterminator="\n")
+        writer.writerow([
+            "source", "target_id", "target_name", "organism", "target_class",
+            "ligand_tokens", "sequence_tokens", "structure_tokens", "evidence",
+        ])
+        for row in connection.execute("""
+            SELECT source, target_id, target_name, organism, target_class,
+                   ligand_tokens, sequence_tokens, structure_tokens, evidence
+            FROM rows ORDER BY source, target_id
+        """):
+            writer.writerow(row)
+    print(f"rows={connection.execute('SELECT COUNT(*) FROM rows').fetchone()[0]}")
+finally:
+    connection.close()
+"#
+}
+
 fn build_store_indexes(
     options: &StoreOptions,
     manifest_path: &Path,
@@ -794,7 +1041,8 @@ fn build_store_indexes(
         "downloads/metagenome/metagenome_targets.zip",
     ];
     let mut manifest = String::from("index\tinput_path\tstatus\trows\toutput_path\tnotes\n");
-    let mut known_rows = Vec::new();
+    let indexes_dir = options.science_store.join("indexes");
+    let mut known_rows = StoreRowSpool::create(&indexes_dir, "known_targets_raw")?;
     for rel in known_sources {
         let path = options.science_store.join(rel);
         append_canonical_rows(
@@ -817,25 +1065,21 @@ fn build_store_indexes(
     }
     let uniprot_dir = options.science_store.join("downloads/uniprot");
     for path in discover_sequence_files(&uniprot_dir)? {
-        let rows = parse_fasta_targets(
+        append_fasta_source_rows(
+            "known_targets",
+            &options.science_store,
             &path,
             "UniProt",
             "Homo sapiens",
             "known_human_protein",
             "protein_sequence_record",
-        )?;
-        append_built_rows(
-            "known_targets",
-            &options.science_store,
-            &path,
-            rows,
             &mut known_rows,
             &mut manifest,
             "fasta_sequence_rows",
-        );
+        )?;
     }
 
-    let mut metagenome_rows = Vec::new();
+    let mut metagenome_rows = StoreRowSpool::create(&indexes_dir, "metagenome_targets_raw")?;
     for rel in metagenome_sources {
         let path = options.science_store.join(rel);
         append_canonical_rows(
@@ -857,34 +1101,22 @@ fn build_store_indexes(
             );
             continue;
         }
-        let rows = parse_fasta_targets(
+        append_fasta_source_rows(
+            "metagenome_targets",
+            &options.science_store,
             &path,
             "metagenome",
             "metagenome_or_custom_source",
             "potential_metagenome_sequence",
             "sequence_record",
-        )?;
-        append_built_rows(
-            "metagenome_targets",
-            &options.science_store,
-            &path,
-            rows,
             &mut metagenome_rows,
             &mut manifest,
             "fasta_sequence_rows",
-        );
+        )?;
     }
 
-    known_rows = dedupe_store_rows(known_rows);
-    metagenome_rows = dedupe_store_rows(metagenome_rows);
-    write_store_rows(
-        &options.science_store.join("indexes/known_targets.tsv"),
-        &known_rows,
-    )?;
-    write_store_rows(
-        &options.science_store.join("indexes/metagenome_targets.tsv"),
-        &metagenome_rows,
-    )?;
+    let known_count = known_rows.finish(&indexes_dir.join("known_targets.tsv"))?;
+    let metagenome_count = metagenome_rows.finish(&indexes_dir.join("metagenome_targets.tsv"))?;
     let mut structure_rows = build_structure_index_rows(options, &mut manifest)?;
     structure_rows = dedupe_store_rows(structure_rows);
     write_store_rows(
@@ -893,8 +1125,8 @@ fn build_store_indexes(
     )?;
     write_text(manifest_path, &manifest)?;
     Ok(IndexBuildSummary {
-        known_rows: known_rows.len(),
-        metagenome_rows: metagenome_rows.len(),
+        known_rows: known_count,
+        metagenome_rows: metagenome_count,
         structure_rows: structure_rows.len(),
     })
 }
@@ -903,7 +1135,7 @@ fn append_canonical_rows(
     index_name: &str,
     root: &Path,
     path: &Path,
-    rows: &mut Vec<StoreRow>,
+    rows: &mut StoreRowSpool,
     manifest: &mut String,
 ) -> Result<(), String> {
     if !path.exists() {
@@ -914,11 +1146,39 @@ fn append_canonical_rows(
         ));
         return Ok(());
     }
-    let (parsed, notes) = read_source_rows(path, index_name)?;
-    let count = parsed.len();
-    rows.extend(parsed);
+    let (count, notes) = for_each_source_row_batch(path, index_name, |batch| rows.append(batch))?;
     manifest.push_str(&format!(
-        "{index_name}\t{}\t{}\t{count}\t{}\t{notes}\n",
+        "{index_name}\t{}\t{}\t{count}\t{}\t{notes};complete_source_scan\n",
+        relative_display(root, path),
+        if count > 0 { "used" } else { "empty" },
+        index_output_for(index_name)
+    ));
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn append_fasta_source_rows(
+    index_name: &str,
+    root: &Path,
+    path: &Path,
+    source: &str,
+    default_organism: &str,
+    target_class: &str,
+    evidence: &str,
+    rows: &mut StoreRowSpool,
+    manifest: &mut String,
+    notes: &str,
+) -> Result<(), String> {
+    let count = for_each_fasta_row_batch(
+        path,
+        source,
+        default_organism,
+        target_class,
+        evidence,
+        |batch| rows.append(batch),
+    )?;
+    manifest.push_str(&format!(
+        "{index_name}\t{}\t{}\t{count}\t{}\t{notes};complete_source_scan\n",
         relative_display(root, path),
         if count > 0 { "used" } else { "empty" },
         index_output_for(index_name)
@@ -1234,96 +1494,72 @@ fn matches_sequence_name(name: &str) -> bool {
     )
 }
 
-fn parse_fasta_targets(
+fn for_each_fasta_row_batch<F>(
     path: &Path,
     source: &str,
     default_organism: &str,
     target_class: &str,
     evidence: &str,
-) -> Result<Vec<StoreRow>, String> {
-    let name = path
-        .file_name()
-        .and_then(|value| value.to_str())
-        .unwrap_or_default()
-        .to_ascii_lowercase();
+    mut emit: F,
+) -> Result<usize, String>
+where
+    F: FnMut(&[StoreRow]) -> Result<(), String>,
+{
+    let name = lower_file_name(path);
     if name.ends_with(".gz") {
         let file =
             fs::File::open(path).map_err(|err| format!("open_failed:{}:{err}", path.display()))?;
-        let decoder = GzDecoder::new(file);
-        return parse_fasta_reader(
-            BufReader::new(decoder),
+        let mut reader = BufReader::new(GzDecoder::new(file));
+        return parse_fasta_reader_batched(
+            &mut reader,
             source,
             default_organism,
             target_class,
             evidence,
+            &mut emit,
         )
         .map_err(|err| format!("gzip_read_failed:{}:{err}", path.display()));
     }
     if name.ends_with(".zip") {
-        let text = read_zip_text(path, matches_sequence_name)?;
-        return parse_fasta_lines(
-            text.lines(),
-            source,
-            default_organism,
-            target_class,
-            evidence,
-        );
+        let mut count = 0usize;
+        for_each_supported_zip_member(path, matches_sequence_name, |_, reader| {
+            count += parse_fasta_reader_batched(
+                reader,
+                source,
+                default_organism,
+                target_class,
+                evidence,
+                &mut emit,
+            )?;
+            Ok(())
+        })?;
+        return Ok(count);
     }
     let file =
         fs::File::open(path).map_err(|err| format!("open_failed:{}:{err}", path.display()))?;
-    parse_fasta_reader(
-        BufReader::new(file),
+    let mut reader = BufReader::new(file);
+    parse_fasta_reader_batched(
+        &mut reader,
         source,
         default_organism,
         target_class,
         evidence,
+        &mut emit,
     )
     .map_err(|err| format!("read_failed:{}:{err}", path.display()))
 }
 
-fn parse_fasta_reader<R: BufRead>(
-    reader: R,
+fn parse_fasta_reader_batched<R, F>(
+    reader: &mut R,
     source: &str,
     default_organism: &str,
     target_class: &str,
     evidence: &str,
-) -> Result<Vec<StoreRow>, std::io::Error> {
-    let context = FastaParseContext {
-        source,
-        default_organism,
-        target_class,
-        evidence,
-    };
-    let mut rows = Vec::new();
-    let mut header = String::new();
-    let mut sequence = String::new();
-    for line in reader.lines() {
-        let line = line?;
-        if parse_fasta_line(&line, &context, &mut header, &mut sequence, &mut rows) {
-            return Ok(rows);
-        }
-    }
-    push_fasta_row(
-        context.source,
-        context.default_organism,
-        context.target_class,
-        context.evidence,
-        &header,
-        &sequence,
-        &mut rows,
-    );
-    Ok(rows)
-}
-
-fn parse_fasta_lines<'a, I>(
-    lines: I,
-    source: &str,
-    default_organism: &str,
-    target_class: &str,
-    evidence: &str,
-) -> Result<Vec<StoreRow>, String>
+    emit: &mut F,
+) -> Result<usize, String>
 where
-    I: IntoIterator<Item = &'a str>,
+    R: BufRead + ?Sized,
+    F: FnMut(&[StoreRow]) -> Result<(), String>,
 {
     let context = FastaParseContext {
         source,
@@ -1331,13 +1567,14 @@ where
         target_class,
         evidence,
     };
-    let mut rows = Vec::new();
+    let mut rows = Vec::with_capacity(SOURCE_ROW_BATCH_SIZE);
+    let mut count = 0usize;
     let mut header = String::new();
     let mut sequence = String::new();
-    for line in lines {
-        if parse_fasta_line(line, &context, &mut header, &mut sequence, &mut rows) {
-            return Ok(rows);
-        }
+    for line in reader.lines() {
+        let line = line.map_err(|err| format!("fasta_read_failed:{err}"))?;
+        parse_fasta_line(&line, &context, &mut header, &mut sequence, &mut rows);
+        count += flush_full_store_row_batch(&mut rows, emit)?;
     }
     push_fasta_row(
         context.source,
@@ -1348,7 +1585,31 @@ where
         &sequence,
         &mut rows,
     );
-    Ok(rows)
+    count += flush_store_row_batch(&mut rows, emit)?;
+    Ok(count)
+}
+
+fn flush_full_store_row_batch<F>(rows: &mut Vec<StoreRow>, emit: &mut F) -> Result<usize, String>
+where
+    F: FnMut(&[StoreRow]) -> Result<(), String>,
+{
+    if rows.len() < SOURCE_ROW_BATCH_SIZE {
+        return Ok(0);
+    }
+    flush_store_row_batch(rows, emit)
+}
+
+fn flush_store_row_batch<F>(rows: &mut Vec<StoreRow>, emit: &mut F) -> Result<usize, String>
+where
+    F: FnMut(&[StoreRow]) -> Result<(), String>,
+{
+    if rows.is_empty() {
+        return Ok(0);
+    }
+    let count = rows.len();
+    emit(rows)?;
+    rows.clear();
+    Ok(count)
 }
 
 struct FastaParseContext<'a> {
@@ -1364,7 +1625,7 @@ fn parse_fasta_line(
     header: &mut String,
     sequence: &mut String,
     rows: &mut Vec<StoreRow>,
-) -> bool {
+) {
     let line = line.trim_start_matches('\u{feff}');
     if let Some(rest) = line.strip_prefix('>') {
         push_fasta_row(
@@ -1378,10 +1639,8 @@ fn parse_fasta_line(
         );
         *header = rest.trim().to_string();
         sequence.clear();
-        false
     } else {
         sequence.push_str(line.trim());
-        false
     }
 }
 
@@ -1714,23 +1973,67 @@ fn read_zip_text(path: &Path, accept: fn(&str) -> bool) -> Result<String, String
         fs::File::open(path).map_err(|err| format!("open_failed:{}:{err}", path.display()))?;
     let mut archive =
         ZipArchive::new(file).map_err(|err| format!("zip_open_failed:{}:{err}", path.display()))?;
-    for index in 0..archive.len() {
+    let mut members = archive
+        .file_names()
+        .enumerate()
+        .filter_map(|(index, name)| {
+            let lower = name.to_ascii_lowercase();
+            (!name.ends_with('/') && accept(&lower)).then(|| (lower, name.to_string(), index))
+        })
+        .collect::<Vec<_>>();
+    members.sort();
+    if members.is_empty() {
+        return Err(format!("zip_no_supported_text_member:{}", path.display()));
+    }
+    let mut text = String::new();
+    for (_, _, index) in members {
         let mut member = archive
             .by_index(index)
             .map_err(|err| format!("zip_member_failed:{}:{err}", path.display()))?;
-        if member.is_dir() {
-            continue;
-        }
-        let name = member.name().to_ascii_lowercase();
-        if accept(&name) {
-            let mut text = String::new();
-            member
-                .read_to_string(&mut text)
-                .map_err(|err| format!("zip_read_failed:{}:{err}", path.display()))?;
-            return Ok(text);
+        member
+            .read_to_string(&mut text)
+            .map_err(|err| format!("zip_read_failed:{}:{err}", path.display()))?;
+        if !text.ends_with('\n') {
+            text.push('\n');
         }
     }
-    Err(format!("zip_no_supported_text_member:{}", path.display()))
+    Ok(text)
+}
+
+fn for_each_supported_zip_member<F>(
+    path: &Path,
+    accept: fn(&str) -> bool,
+    mut visit: F,
+) -> Result<usize, String>
+where
+    F: FnMut(&str, &mut dyn BufRead) -> Result<(), String>,
+{
+    let file =
+        fs::File::open(path).map_err(|err| format!("open_failed:{}:{err}", path.display()))?;
+    let mut archive =
+        ZipArchive::new(file).map_err(|err| format!("zip_open_failed:{}:{err}", path.display()))?;
+    let mut members = archive
+        .file_names()
+        .enumerate()
+        .filter_map(|(index, name)| {
+            let lower = name.to_ascii_lowercase();
+            (!name.ends_with('/') && accept(&lower)).then(|| (lower, name.to_string(), index))
+        })
+        .collect::<Vec<_>>();
+    members.sort();
+    if members.is_empty() {
+        return Err(format!("zip_no_supported_text_member:{}", path.display()));
+    }
+    let count = members.len();
+    for (_, name, index) in members {
+        let member = archive
+            .by_index(index)
+            .map_err(|err| format!("zip_member_failed:{}:{err}", path.display()))?;
+        let mut reader = BufReader::new(member);
+        visit(&name, &mut reader)
+            .map_err(|err| format!("zip_read_failed:{}:{name}:{err}", path.display()))?;
+    }
+    Ok(count)
 }
 
 fn push_fasta_row(
@@ -1840,34 +2143,50 @@ fn merge_store_row(existing: &mut StoreRow, row: &StoreRow) {
 }
 
 fn write_store_rows(path: &Path, rows: &[StoreRow]) -> Result<(), String> {
-    let mut text = store_row_header();
-    for row in rows {
-        text.push_str(&format!(
-            "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\n",
-            clean_cell(&row.source),
-            clean_cell(&row.target_id),
-            clean_cell(&row.target_name),
-            clean_cell(&row.organism),
-            clean_cell(&row.target_class),
-            row.ligand_tokens
-                .iter()
-                .cloned()
-                .collect::<Vec<_>>()
-                .join(" "),
-            row.sequence_tokens
-                .iter()
-                .cloned()
-                .collect::<Vec<_>>()
-                .join(" "),
-            row.structure_tokens
-                .iter()
-                .cloned()
-                .collect::<Vec<_>>()
-                .join(" "),
-            clean_cell(&row.evidence)
-        ));
+    if let Some(parent) = path.parent() {
+        ensure_dir(parent)?;
     }
-    write_text(path, &text)
+    let file =
+        fs::File::create(path).map_err(|err| format!("create_failed:{}:{err}", path.display()))?;
+    let mut writer = BufWriter::new(file);
+    writer
+        .write_all(store_row_header().as_bytes())
+        .map_err(|err| format!("write_failed:{}:{err}", path.display()))?;
+    for row in rows {
+        write_store_row(&mut writer, row)
+            .map_err(|err| format!("write_failed:{}:{err}", path.display()))?;
+    }
+    writer
+        .flush()
+        .map_err(|err| format!("write_failed:{}:{err}", path.display()))
+}
+
+fn write_store_row<W: Write>(writer: &mut W, row: &StoreRow) -> std::io::Result<()> {
+    writeln!(
+        writer,
+        "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
+        clean_cell(&row.source),
+        clean_cell(&row.target_id),
+        clean_cell(&row.target_name),
+        clean_cell(&row.organism),
+        clean_cell(&row.target_class),
+        row.ligand_tokens
+            .iter()
+            .cloned()
+            .collect::<Vec<_>>()
+            .join(" "),
+        row.sequence_tokens
+            .iter()
+            .cloned()
+            .collect::<Vec<_>>()
+            .join(" "),
+        row.structure_tokens
+            .iter()
+            .cloned()
+            .collect::<Vec<_>>()
+            .join(" "),
+        clean_cell(&row.evidence)
+    )
 }
 
 fn store_row_header() -> String {
@@ -2521,6 +2840,223 @@ where
     operation()
 }
 
+fn evaluate_index_build_manifest(
+    science_store: &Path,
+    path: &Path,
+    blockers: &mut Vec<String>,
+) -> Result<(), String> {
+    if !path.is_file() {
+        blockers.push("missing_index_build_manifest".to_string());
+        return Ok(());
+    }
+    let file = fs::File::open(path)
+        .map_err(|err| format!("index_build_manifest_open_failed:{}:{err}", path.display()))?;
+    let mut lines = BufReader::new(file).lines();
+    let Some(header) = lines.next() else {
+        blockers.push("empty_index_build_manifest".to_string());
+        return Ok(());
+    };
+    let headers = split_tsv(
+        header
+            .map_err(|err| format!("index_build_manifest_read_failed:{err}"))?
+            .trim_start_matches('\u{feff}'),
+    );
+    let required = |name: &str| {
+        headers
+            .iter()
+            .position(|header| header == name)
+            .ok_or_else(|| format!("index_build_manifest_schema_missing:{name}"))
+    };
+    let index_idx = required("index")?;
+    let input_idx = required("input_path")?;
+    let status_idx = required("status")?;
+    let rows_idx = required("rows")?;
+    let output_idx = required("output_path")?;
+    let notes_idx = required("notes")?;
+    let required_columns = [
+        index_idx, input_idx, status_idx, rows_idx, output_idx, notes_idx,
+    ]
+    .into_iter()
+    .max()
+    .unwrap_or_default()
+        + 1;
+    let mut saw_row = false;
+    for (line_index, line) in lines.enumerate() {
+        let line = line.map_err(|err| format!("index_build_manifest_read_failed:{err}"))?;
+        if line.trim().is_empty() {
+            continue;
+        }
+        saw_row = true;
+        let cols = split_tsv(&line);
+        if cols.len() < required_columns {
+            blockers.push(format!(
+                "index_build_manifest_malformed_row:line_{}",
+                line_index + 2
+            ));
+            continue;
+        }
+        let index = cols[index_idx].trim();
+        let input_path = cols[input_idx].trim();
+        let status = cols[status_idx].trim();
+        let output_path = cols[output_idx].trim();
+        let notes = cols[notes_idx].trim();
+        if notes.contains("index_row_limit_reached") {
+            blockers.push(index_projection_blocker(
+                index,
+                input_path,
+                "index_row_limit_reached",
+            ));
+        }
+        if status != "used" {
+            continue;
+        }
+        let row_count = match cols[rows_idx].trim().parse::<u64>() {
+            Ok(value) => value,
+            Err(_) => {
+                blockers.push(index_projection_blocker(
+                    index,
+                    input_path,
+                    "invalid_row_count",
+                ));
+                continue;
+            }
+        };
+        if legacy_5000_row_projection(input_path, output_path, notes, row_count) {
+            blockers.push(index_projection_blocker(
+                index,
+                input_path,
+                "legacy_5000_row_projection",
+            ));
+        } else if row_count <= 10_000 && large_projection_source(science_store, input_path) {
+            blockers.push(index_projection_blocker(
+                index,
+                input_path,
+                "large_source_small_tsv_projection",
+            ));
+        }
+    }
+    if !saw_row {
+        blockers.push("empty_index_build_manifest".to_string());
+    }
+    Ok(())
+}
+
+fn evaluate_persisted_index_readiness(
+    path: &Path,
+    blockers: &mut Vec<String>,
+) -> Result<(), String> {
+    let file = fs::File::open(path).map_err(|err| {
+        format!(
+            "index_readiness_manifest_open_failed:{}:{err}",
+            path.display()
+        )
+    })?;
+    let mut lines = BufReader::new(file).lines();
+    let Some(header) = lines.next() else {
+        return Ok(());
+    };
+    let headers = split_tsv(
+        header
+            .map_err(|err| format!("index_readiness_manifest_read_failed:{err}"))?
+            .trim_start_matches('\u{feff}'),
+    );
+    let status_idx = headers
+        .iter()
+        .position(|header| header == "readiness_status")
+        .ok_or_else(|| "index_readiness_manifest_schema_missing:readiness_status".to_string())?;
+    let reason_idx = headers.iter().position(|header| header == "reason");
+    let index_idx = headers.iter().position(|header| header == "index");
+    let input_idx = headers.iter().position(|header| header == "input_path");
+    for line in lines {
+        let line = line.map_err(|err| format!("index_readiness_manifest_read_failed:{err}"))?;
+        if line.trim().is_empty() {
+            continue;
+        }
+        let cols = split_tsv(&line);
+        let status = cols.get(status_idx).map(String::as_str).unwrap_or_default();
+        if !matches!(status, "projection_only" | "incomplete") {
+            continue;
+        }
+        blockers.push(index_projection_blocker(
+            index_idx
+                .and_then(|idx| cols.get(idx))
+                .map(String::as_str)
+                .unwrap_or("unknown_index"),
+            input_idx
+                .and_then(|idx| cols.get(idx))
+                .map(String::as_str)
+                .unwrap_or("unknown_source"),
+            reason_idx
+                .and_then(|idx| cols.get(idx))
+                .map(String::as_str)
+                .filter(|reason| !reason.trim().is_empty())
+                .unwrap_or(status),
+        ));
+    }
+    Ok(())
+}
+
+fn index_projection_blocker(index: &str, input_path: &str, reason: &str) -> String {
+    format!(
+        "science_index_projection_incomplete:{}:{}:{}",
+        clean_cell(index),
+        clean_cell(input_path),
+        clean_cell(reason)
+    )
+}
+
+fn legacy_5000_row_projection(
+    input_path: &str,
+    output_path: &str,
+    notes: &str,
+    row_count: u64,
+) -> bool {
+    if row_count != 5_000 || !output_path.to_ascii_lowercase().ends_with(".tsv") {
+        return false;
+    }
+    let input = input_path.to_ascii_lowercase();
+    let notes = notes.to_ascii_lowercase();
+    if notes.split(';').any(|note| note == "complete_source_scan") {
+        return false;
+    }
+    ["bindingdb", "chembl", "uniprot", "metagenome", "mgnify"]
+        .iter()
+        .any(|marker| input.contains(marker))
+        || matches!(
+            notes.as_str(),
+            "canonical_or_source_table_rows"
+                | "chembl_sqlite_archive_rows"
+                | "chembl_sqlite_rows"
+                | "fasta_sequence_rows"
+        )
+}
+
+fn large_projection_source(science_store: &Path, input_path: &str) -> bool {
+    if input_path.trim().is_empty() {
+        return false;
+    }
+    let input = PathBuf::from(input_path);
+    let path = if input.is_absolute() {
+        input
+    } else {
+        science_store.join(input)
+    };
+    let threshold = env::var("GENOLIGAND_PARTIAL_INDEX_LARGE_SOURCE_BYTES")
+        .ok()
+        .and_then(|value| value.trim().parse::<u64>().ok())
+        .unwrap_or_else(|| {
+            if input_path.to_ascii_lowercase().contains("bindingdb") {
+                500 * 1024 * 1024
+            } else {
+                1024 * 1024 * 1024
+            }
+        });
+    threshold > 0
+        && fs::metadata(path)
+            .map(|metadata| metadata.len() > threshold)
+            .unwrap_or(false)
+}
+
 fn pipeline_blockers(options: &ScienceOptions) -> Result<Vec<String>, String> {
     let mut blockers = Vec::new();
     if !options.input_manifest.exists() {
@@ -2584,6 +3120,13 @@ fn pipeline_blockers(options: &ScienceOptions) -> Result<Vec<String>, String> {
         && !alignment_database_manifest_ready(&options.science_store)?
     {
         blockers.push("alignment_database_needs_repair".to_string());
+    }
+    match evaluate_science_store_readiness(&options.science_store) {
+        Ok(readiness) => blockers.extend(readiness.blockers),
+        Err(err) => blockers.push(format!(
+            "science_store_readiness_failed:{}",
+            clean_cell(&err)
+        )),
     }
     Ok(blockers)
 }
@@ -2807,16 +3350,25 @@ fn match_known(options: &ScienceOptions) -> Result<String, String> {
         &options.science_store.join("indexes/known_targets.tsv"),
         "known_database_index",
     )?;
-    let mut out = String::from(
-        "input_id\tsource\ttarget_id\ttarget_name\torganism\ttarget_class\tmatch_score\tmatched_features\tevidence\tsource_row_provenance\tactivity_value\tligand_identity\tcurrent_run_query_id\trecord_id\n",
-    );
+    let output_path = options.run_dir.join("known_database_matches.tsv");
+    if let Some(parent) = output_path.parent() {
+        ensure_dir(parent)?;
+    }
+    let file = fs::File::create(&output_path)
+        .map_err(|err| format!("create_failed:{}:{err}", output_path.display()))?;
+    let mut out = BufWriter::new(file);
+    out.write_all(
+        b"input_id\tsource\ttarget_id\ttarget_name\torganism\ttarget_class\tmatch_score\tmatched_features\tevidence\tsource_row_provenance\tactivity_value\tligand_identity\tcurrent_run_query_id\trecord_id\n",
+    )
+    .map_err(|err| format!("write_failed:{}:{err}", output_path.display()))?;
     for input in &inputs {
         for row in &rows {
             let score = known_database_match_score(input, row);
             if score > 0.0 {
                 let matched = matched_tokens(input, row).join(" ");
-                out.push_str(&format!(
-                    "{}\t{}\t{}\t{}\t{}\t{}\t{score:.4}\t{}\t{}\t{}\t\t{}\tprojection_index_match\t{}\n",
+                writeln!(
+                    out,
+                    "{}\t{}\t{}\t{}\t{}\t{}\t{score:.4}\t{}\t{}\t{}\t\t{}\tprojection_index_match\t{}",
                     input.input_id,
                     row.source,
                     row.target_id,
@@ -2828,14 +3380,18 @@ fn match_known(options: &ScienceOptions) -> Result<String, String> {
                     clean_cell(&row.evidence),
                     clean_cell(&matched),
                     clean_cell(&input.record_id),
-                ));
+                )
+                .map_err(|err| format!("write_failed:{}:{err}", output_path.display()))?;
             }
         }
     }
     append_chembl_onsite_matches(options, &normalized, &mut out)?;
     append_bindingdb_onsite_matches(options, &normalized, &mut out)?;
-    append_mmseqs_match_rows(options, "known", &mut out, true)?;
-    write_text(&options.run_dir.join("known_database_matches.tsv"), &out)?;
+    let mut mmseqs = String::new();
+    append_mmseqs_match_rows(options, "known", &mut mmseqs, true)?;
+    out.write_all(mmseqs.as_bytes())
+        .and_then(|_| out.flush())
+        .map_err(|err| format!("write_failed:{}:{err}", output_path.display()))?;
     Ok(format!(
         "known_database_matched\tout={}",
         options.run_dir.join("known_database_matches.tsv").display()
@@ -2851,10 +3407,10 @@ fn known_database_match_score(input: &ComputedFeatureInput, row: &StoreRow) -> f
     }
 }
 
-fn append_chembl_onsite_matches(
+fn append_chembl_onsite_matches<W: Write>(
     options: &ScienceOptions,
     inputs: &[NormalizedInput],
-    out: &mut String,
+    out: &mut W,
 ) -> Result<(), String> {
     let small_molecules = inputs
         .iter()
@@ -2879,34 +3435,34 @@ fn append_chembl_onsite_matches(
         ));
     }
     write_text(&query_path, &queries)?;
-    for source in sources {
-        let matches = run_python_script(
-            chembl_onsite_query_script(),
-            &[
-                source.display().to_string(),
-                query_path.display().to_string(),
-                "200".to_string(),
-            ],
-            "chembl_onsite_query",
-        )?;
-        for line in matches.lines().filter(|line| !line.trim().is_empty()) {
-            out.push_str(line);
-            out.push('\n');
-        }
+    let result_path = temporary_data_path(&options.run_dir, "chembl_onsite_matches", "tsv");
+    let mut args = sources
+        .iter()
+        .map(|source| source.display().to_string())
+        .collect::<Vec<_>>();
+    args.push(query_path.display().to_string());
+    args.push(result_path.display().to_string());
+    let result = run_python_script(chembl_onsite_query_script(), &args, "chembl_onsite_query");
+    if let Err(err) = result {
+        let _ = fs::remove_file(&result_path);
+        return Err(err);
     }
-    Ok(())
+    let copy_result = append_file_to_writer(&result_path, out, "chembl_onsite_results");
+    let _ = fs::remove_file(&result_path);
+    copy_result
 }
 
 fn chembl_onsite_query_script() -> &'static str {
     r#"
 import csv
 import os
+import shutil
 import sqlite3
 import sys
 import tarfile
 import tempfile
 
-source_path, query_path, max_rows = sys.argv[1], sys.argv[2], int(sys.argv[3])
+source_paths, query_path, result_path = sys.argv[1:-2], sys.argv[-2], sys.argv[-1]
 
 def clean(value):
     return str(value or "").replace("\t", " ").replace("\r", " ").replace("\n", " ").strip()
@@ -2937,8 +3493,8 @@ def decode(value):
 
 try:
     from rdkit import Chem
-except Exception:
-    Chem = None
+except Exception as exc:
+    raise RuntimeError("rdkit_required_for_exact_smiles_matching") from exc
 
 canonical_cache = {}
 
@@ -2948,14 +3504,11 @@ def canonical_smiles(value):
         return ""
     if text in canonical_cache:
         return canonical_cache[text]
-    if Chem is None:
-        canonical_cache[text] = "".join(text.split())
-        return canonical_cache[text]
     mol = Chem.MolFromSmiles(text)
     if mol is None:
-        canonical_cache[text] = "".join(text.split())
+        canonical_cache[text] = ""
     else:
-        canonical_cache[text] = Chem.MolToSmiles(mol, isomericSmiles=False)
+        canonical_cache[text] = Chem.MolToSmiles(mol, isomericSmiles=True)
     return canonical_cache[text]
 
 def target_class(organism):
@@ -2971,7 +3524,9 @@ def numeric_activity(value):
     except ValueError:
         return float("inf")
 
-def activity_score(value):
+def activity_score(value, relation):
+    if clean(relation) != "=":
+        return 0.65
     numeric = numeric_activity(value)
     if numeric == float("inf"):
         return 0.65
@@ -3010,34 +3565,31 @@ with open(query_path, "r", encoding="utf-8-sig", newline="") as handle:
             ))
 
 if not queries:
+    open(result_path, "w", encoding="utf-8").close()
     raise SystemExit(0)
 
 query_by_smiles = {}
 for input_id, record_id, canonical in queries:
     query_by_smiles.setdefault(canonical, []).append((input_id, record_id))
 
-def sqlite_path_from_source(path):
-    lower = path.lower()
-    if not lower.endswith(".tar.gz"):
-        return path, None
-    tmp = tempfile.TemporaryDirectory(prefix="genoligand_chembl_onsite_")
+def sqlite_paths_from_source(path, temp_root):
+    if not path.lower().endswith(".tar.gz"):
+        return [path]
+    paths = []
     with tarfile.open(path, "r:gz") as archive:
-        for member in archive.getmembers():
-            name = member.name.lower()
-            if member.isfile() and (name.endswith(".db") or name.endswith(".sqlite") or name.endswith(".sqlite3")):
-                extracted = archive.extractfile(member)
-                if extracted is None:
-                    continue
-                db_path = os.path.join(tmp.name, os.path.basename(member.name))
-                with open(db_path, "wb") as handle:
-                    handle.write(extracted.read())
-                return db_path, tmp
-    tmp.cleanup()
-    return "", None
-
-db_path, tmp_dir = sqlite_path_from_source(source_path)
-if not db_path:
-    raise SystemExit(0)
+        members = sorted(
+            (member for member in archive.getmembers() if member.isfile() and member.name.lower().endswith((".db", ".sqlite", ".sqlite3"))),
+            key=lambda member: member.name.lower(),
+        )
+        for index, member in enumerate(members):
+            extracted = archive.extractfile(member)
+            if extracted is None:
+                continue
+            db_path = os.path.join(temp_root, f"source_{index}_{os.path.basename(member.name)}")
+            with open(db_path, "wb") as handle:
+                shutil.copyfileobj(extracted, handle, length=1024 * 1024)
+            paths.append(db_path)
+    return paths
 
 placeholders = ",".join("?" for _ in query_by_smiles)
 sql = f"""
@@ -3059,53 +3611,101 @@ LEFT JOIN compound_structures cs ON act.molregno = cs.molregno
 WHERE act.standard_type IN ('Ki', 'Kd', 'IC50', 'EC50')
   AND act.standard_value IS NOT NULL
   AND (act.standard_units IS NULL OR act.standard_units = '' OR act.standard_units = 'nM')
-  AND cs.canonical_smiles IN ({placeholders})
+  AND genoligand_canonical_smiles(cs.canonical_smiles) IN ({placeholders})
 """
 
+tmp_dir = tempfile.TemporaryDirectory(prefix="genoligand_chembl_onsite_")
+best_connection = sqlite3.connect(os.path.join(tmp_dir.name, "best.sqlite"))
 try:
-    connection = sqlite3.connect(db_path)
-    writer = csv.writer(sys.stdout, delimiter="\t", lineterminator="\n")
-    best = {}
-    for row in connection.execute(sql, list(query_by_smiles.keys())):
-        target_id, target_name, organism, smiles, compound_name, standard_type, relation, value, units = [clean(item) for item in row]
-        if not target_id or not smiles:
-            continue
-        activity = f"{standard_type}={format_activity_number(value)} {units}".strip()
-        matched = f"canonical_smiles={smiles};compound_name={compound_name}"
-        evidence = f"chembl_onsite_activity_row;{activity};relation={relation};compound_name={compound_name}"
-        for input_id, record_id in query_by_smiles.get(smiles, []):
-            out_row = [
-                input_id,
-                "ChEMBL",
-                target_id,
-                target_name or target_id,
-                organism or "unknown",
-                target_class(organism),
-                f"{activity_score(value):.4f}",
-                matched,
-                evidence,
-                "chembl_onsite_activity_row",
-                activity,
-                matched,
-                "current_run_onsite_query",
-                record_id,
-            ]
-            key = (input_id, record_id, target_id)
-            rank = (numeric_activity(value), target_name.lower(), organism.lower())
-            if key not in best or rank < best[key][0]:
-                best[key] = (rank, out_row)
-    for _, out_row in sorted(best.values(), key=lambda item: item[0])[:max_rows]:
-        writer.writerow(out_row)
+    best_connection.execute("""
+        CREATE TABLE best (
+            input_id TEXT NOT NULL,
+            record_id TEXT NOT NULL,
+            target_id TEXT NOT NULL,
+            relation_rank INTEGER NOT NULL,
+            numeric_rank REAL NOT NULL,
+            tie_rank TEXT NOT NULL,
+            row_text TEXT NOT NULL,
+            PRIMARY KEY (input_id, target_id)
+        )
+    """)
+    upsert = """
+        INSERT INTO best VALUES (?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(input_id, target_id) DO UPDATE SET
+            record_id=excluded.record_id,
+            relation_rank=excluded.relation_rank,
+            numeric_rank=excluded.numeric_rank,
+            tie_rank=excluded.tie_rank,
+            row_text=excluded.row_text
+        WHERE excluded.relation_rank < best.relation_rank
+           OR (excluded.relation_rank = best.relation_rank AND excluded.numeric_rank < best.numeric_rank)
+           OR (excluded.relation_rank = best.relation_rank AND excluded.numeric_rank = best.numeric_rank AND excluded.tie_rank < best.tie_rank)
+    """
+    pending = 0
+    db_paths = []
+    for source_path in source_paths:
+        db_paths.extend(sqlite_paths_from_source(source_path, tmp_dir.name))
+    for db_path in db_paths:
+        connection = sqlite3.connect(db_path)
+        try:
+            connection.create_function("genoligand_canonical_smiles", 1, canonical_smiles, deterministic=True)
+            for row in connection.execute(sql, list(query_by_smiles.keys())):
+                target_id, target_name, organism, smiles, compound_name, standard_type, relation, value, units = [clean(item) for item in row]
+                canonical = canonical_smiles(smiles)
+                if not target_id or not canonical:
+                    continue
+                relation = clean(relation)
+                activity = f"{standard_type}{relation or '?'}{format_activity_number(value)} {units}".strip()
+                matched = f"canonical_smiles={canonical};source_smiles={smiles};compound_name={compound_name}"
+                evidence = f"chembl_onsite_activity_row;{activity};relation={relation};compound_name={compound_name}"
+                relation_rank = 0 if relation == "=" else 1
+                numeric_rank = numeric_activity(value) if relation_rank == 0 else 1e300
+                base_tie_rank = f"{target_name.lower()}\x1f{organism.lower()}\x1f{activity}"
+                for input_id, record_id in query_by_smiles.get(canonical, []):
+                    tie_rank = f"{base_tie_rank}\x1f{record_id}"
+                    out_row = [
+                        input_id,
+                        "ChEMBL",
+                        target_id,
+                        target_name or target_id,
+                        organism or "unknown",
+                        target_class(organism),
+                        f"{activity_score(value, relation):.4f}",
+                        matched,
+                        evidence,
+                        "chembl_onsite_activity_row",
+                        activity,
+                        matched,
+                        "current_run_onsite_query",
+                        record_id,
+                    ]
+                    best_connection.execute(
+                        upsert,
+                        (input_id, record_id, target_id, relation_rank, numeric_rank, tie_rank, "\t".join(out_row)),
+                    )
+                    pending += 1
+                    if pending >= 1000:
+                        best_connection.commit()
+                        pending = 0
+        finally:
+            connection.close()
+    best_connection.commit()
+    with open(result_path, "w", encoding="utf-8", newline="") as handle:
+        for (row_text,) in best_connection.execute(
+            "SELECT row_text FROM best ORDER BY input_id, record_id, relation_rank, numeric_rank, target_id, tie_rank"
+        ):
+            handle.write(row_text)
+            handle.write("\n")
 finally:
-    if tmp_dir is not None:
-        tmp_dir.cleanup()
+    best_connection.close()
+    tmp_dir.cleanup()
 "#
 }
 
-fn append_bindingdb_onsite_matches(
+fn append_bindingdb_onsite_matches<W: Write>(
     options: &ScienceOptions,
     inputs: &[NormalizedInput],
-    out: &mut String,
+    out: &mut W,
 ) -> Result<(), String> {
     let bindingdb = options
         .science_store
@@ -3132,29 +3732,35 @@ fn append_bindingdb_onsite_matches(
         ));
     }
     write_text(&query_path, &queries)?;
-    let matches = run_python_script(
+    let result_path = temporary_data_path(&options.run_dir, "bindingdb_onsite_matches", "tsv");
+    let result = run_python_script(
         bindingdb_onsite_query_script(),
         &[
             bindingdb.display().to_string(),
             query_path.display().to_string(),
-            "200".to_string(),
+            result_path.display().to_string(),
         ],
         "bindingdb_onsite_query",
-    )?;
-    for line in matches.lines().filter(|line| !line.trim().is_empty()) {
-        out.push_str(line);
-        out.push('\n');
+    );
+    if let Err(err) = result {
+        let _ = fs::remove_file(&result_path);
+        return Err(err);
     }
-    Ok(())
+    let copy_result = append_file_to_writer(&result_path, out, "bindingdb_onsite_results");
+    let _ = fs::remove_file(&result_path);
+    copy_result
 }
 
 fn bindingdb_onsite_query_script() -> &'static str {
     r#"
 import csv
+import os
+import sqlite3
 import sys
+import tempfile
 import zipfile
 
-zip_path, query_path, max_rows = sys.argv[1], sys.argv[2], int(sys.argv[3])
+zip_path, query_path, result_path = sys.argv[1], sys.argv[2], sys.argv[3]
 
 def clean(value):
     return str(value or "").replace("\t", " ").replace("\r", " ").replace("\n", " ").strip()
@@ -3211,7 +3817,16 @@ def numeric_activity(value):
     except ValueError:
         return float("inf")
 
+def activity_relation(value):
+    text = clean(value).lstrip()
+    for relation in ("<=", ">=", "<", ">", "~"):
+        if text.startswith(relation):
+            return relation
+    return "="
+
 def activity_score(value):
+    if activity_relation(value) != "=":
+        return 0.65
     numeric = numeric_activity(value)
     if numeric == float("inf"):
         return 0.65
@@ -3227,14 +3842,12 @@ def activity_score(value):
         score = 0.55
     else:
         score = 0.40
-    if ">" in str(value):
-        score = min(score, 0.40)
     return score
 
 try:
     from rdkit import Chem
-except Exception:
-    Chem = None
+except Exception as exc:
+    raise RuntimeError("rdkit_required_for_exact_smiles_matching") from exc
 
 def canonical_smiles(value):
     text = clean(value)
@@ -3242,51 +3855,23 @@ def canonical_smiles(value):
         return ""
     if text in canonical_cache:
         return canonical_cache[text]
-    if Chem is None:
-        canonical_cache[text] = "".join(text.split()).lower()
-        return canonical_cache[text]
     mol = Chem.MolFromSmiles(text)
     if mol is None:
-        canonical_cache[text] = "".join(text.split()).lower()
+        canonical_cache[text] = ""
     else:
-        canonical_cache[text] = Chem.MolToSmiles(mol, isomericSmiles=False)
+        canonical_cache[text] = Chem.MolToSmiles(mol, isomericSmiles=True)
     return canonical_cache[text]
-
-def atom_counts(smiles):
-    counts = {}
-    text = clean(smiles)
-    index = 0
-    while index < len(text):
-        ch = text[index]
-        symbol = ""
-        if ch == "[":
-            end = text.find("]", index + 1)
-            token = text[index + 1:end if end != -1 else len(text)]
-            letters = "".join(part for part in token if part.isalpha())
-            if letters:
-                symbol = letters[:2] if letters[:2] in {"Cl", "Br"} else letters[:1]
-            index = (end + 1) if end != -1 else len(text)
-        elif ch.isalpha():
-            two = text[index:index + 2]
-            symbol = two if two in {"Cl", "Br"} else ch
-            index += len(symbol)
-        else:
-            index += 1
-        if symbol:
-            symbol = symbol[0].upper() + symbol[1:].lower()
-            counts[symbol] = counts.get(symbol, 0) + 1
-    return tuple(sorted(counts.items()))
 
 canonical_cache = {}
 
 def query_matches(query_info, smiles, ligand_name):
-    _input_id, _record_id, query, query_canonical, query_counts = query_info
+    _input_id, _record_id, query, query_canonical = query_info
     q = query.strip()
     q_lower = q.lower()
     compact = "".join(q.split()).lower()
+    if query_canonical:
+        return query_canonical == canonical_smiles(smiles)
     if compact and compact == "".join(smiles.split()).lower():
-        return True
-    if query_canonical and query_counts and atom_counts(smiles) == query_counts and query_canonical == canonical_smiles(smiles):
         return True
     if q_lower and q_lower in ligand_name.lower():
         return True
@@ -3302,73 +3887,120 @@ with open(query_path, "r", encoding="utf-8-sig", newline="") as handle:
                 clean(row.get("record_id", "record_1")) or "record_1",
                 query,
                 canonical_smiles(query),
-                atom_counts(query),
             ))
 
 if not queries:
+    open(result_path, "w", encoding="utf-8").close()
     raise SystemExit(0)
 
-with zipfile.ZipFile(zip_path) as archive:
-    members = [name for name in archive.namelist() if name.lower().endswith((".tsv", ".txt"))]
-    if not members:
-        raise SystemExit(0)
-    with archive.open(members[0]) as raw:
-        text = (line.decode("utf-8", "replace") for line in raw)
-        reader = csv.DictReader(text, delimiter="\t")
-        best = {}
-        writer = csv.writer(sys.stdout, delimiter="\t", lineterminator="\n")
-        for row in reader:
-            smiles = first(row, ["Ligand SMILES", "SMILES"])
-            ligand_name = first(row, ["BindingDB Ligand Name", "Ligand Name", "Compound Name"])
-            for query_info in queries:
-                input_id = query_info[0]
-                record_id = query_info[1]
-                if not query_matches(query_info, smiles, ligand_name):
-                    continue
-                target_name = first(row, ["Target Name", "UniProt (SwissProt) Recommended Name of Target Chain 1"])
-                organism = first(row, ["Target Source Organism According to Curator or DataSource", "Organism"])
-                target_id = first(row, [
-                    "UniProt (SwissProt) Primary ID of Target Chain 1",
-                    "UniProt (TrEMBL) Primary ID of Target Chain 1",
-                    "BindingDB MonomerID",
-                    "Target Name",
-                ])
-                if not target_name:
-                    target_name = target_id
-                if not target_id:
-                    continue
-                ligand_code = first(row, ["Ligand HET ID in PDB"])
-                ligand_complex_pdb_ids = first(row, ["PDB ID(s) for Ligand-Target Complex"])
-                target_chain_pdb_ids = first(row, ["PDB ID(s) of Target Chain 1"])
-                activity = first(row, ["Ki (nM)", "IC50 (nM)", "Kd (nM)", "EC50 (nM)"])
-                activity_type = next((name for name in ["Ki (nM)", "IC50 (nM)", "Kd (nM)", "EC50 (nM)"] if clean(row.get(name, ""))), "activity")
-                pubchem = first(row, ["PubChem CID"])
-                matched = f"ligand_name={ligand_name};ligand_smiles={smiles};ligand_code={ligand_code};pdb_ids={ligand_complex_pdb_ids};target_chain_pdb_ids={target_chain_pdb_ids}"
-                activity_value = f"{activity_type}={activity}".strip()
-                ligand_identity = f"ligand_smiles={smiles};ligand_name={ligand_name};ligand_code={ligand_code}"
-                evidence = f"bindingdb_onsite_activity_row;{activity_value};ligand_code={ligand_code};pdb_ids={ligand_complex_pdb_ids};target_chain_pdb_ids={target_chain_pdb_ids};pubchem_cid={pubchem}"
-                out_row = [
-                    input_id,
-                    "BindingDB",
-                    target_id,
-                    target_name,
-                    organism or "unknown",
-                    target_class(organism),
-                    f"{activity_score(activity):.4f}",
-                    clean(matched),
-                    clean(evidence),
-                    "bindingdb_onsite_activity_row",
-                    clean(activity_value),
-                    clean(ligand_identity),
-                    "current_run_onsite_query",
-                    record_id,
-                ]
-                key = (input_id, record_id, target_id)
-                rank = (numeric_activity(activity), target_name.lower(), organism.lower())
-                if key not in best or rank < best[key][0]:
-                    best[key] = (rank, out_row)
-        for _, out_row in sorted(best.values(), key=lambda item: item[0])[:max_rows]:
-            writer.writerow(out_row)
+tmp_dir = tempfile.TemporaryDirectory(prefix="genoligand_bindingdb_onsite_")
+best_connection = sqlite3.connect(os.path.join(tmp_dir.name, "best.sqlite"))
+try:
+    best_connection.execute("""
+        CREATE TABLE best (
+            input_id TEXT NOT NULL,
+            record_id TEXT NOT NULL,
+            target_id TEXT NOT NULL,
+            relation_rank INTEGER NOT NULL,
+            numeric_rank REAL NOT NULL,
+            tie_rank TEXT NOT NULL,
+            row_text TEXT NOT NULL,
+            PRIMARY KEY (input_id, target_id)
+        )
+    """)
+    upsert = """
+        INSERT INTO best VALUES (?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(input_id, target_id) DO UPDATE SET
+            record_id=excluded.record_id,
+            relation_rank=excluded.relation_rank,
+            numeric_rank=excluded.numeric_rank,
+            tie_rank=excluded.tie_rank,
+            row_text=excluded.row_text
+        WHERE excluded.relation_rank < best.relation_rank
+           OR (excluded.relation_rank = best.relation_rank AND excluded.numeric_rank < best.numeric_rank)
+           OR (excluded.relation_rank = best.relation_rank AND excluded.numeric_rank = best.numeric_rank AND excluded.tie_rank < best.tie_rank)
+    """
+    pending = 0
+    with zipfile.ZipFile(zip_path) as archive:
+        members = sorted(
+            (name for name in archive.namelist() if name.lower().endswith((".tsv", ".txt"))),
+            key=str.lower,
+        )
+        if not members:
+            open(result_path, "w", encoding="utf-8").close()
+            raise SystemExit(0)
+        for member_name in members:
+            with archive.open(member_name) as raw:
+                text = (line.decode("utf-8", "replace") for line in raw)
+                reader = csv.DictReader(text, delimiter="\t")
+                for row in reader:
+                    smiles = first(row, ["Ligand SMILES", "SMILES"])
+                    ligand_name = first(row, ["BindingDB Ligand Name", "Ligand Name", "Compound Name"])
+                    for query_info in queries:
+                        input_id = query_info[0]
+                        record_id = query_info[1]
+                        if not query_matches(query_info, smiles, ligand_name):
+                            continue
+                        target_name = first(row, ["Target Name", "UniProt (SwissProt) Recommended Name of Target Chain 1"])
+                        organism = first(row, ["Target Source Organism According to Curator or DataSource", "Organism"])
+                        target_id = first(row, [
+                            "UniProt (SwissProt) Primary ID of Target Chain 1",
+                            "UniProt (TrEMBL) Primary ID of Target Chain 1",
+                            "BindingDB MonomerID",
+                            "Target Name",
+                        ])
+                        if not target_name:
+                            target_name = target_id
+                        if not target_id:
+                            continue
+                        ligand_code = first(row, ["Ligand HET ID in PDB"])
+                        ligand_complex_pdb_ids = first(row, ["PDB ID(s) for Ligand-Target Complex"])
+                        target_chain_pdb_ids = first(row, ["PDB ID(s) of Target Chain 1"])
+                        activity = first(row, ["Ki (nM)", "IC50 (nM)", "Kd (nM)", "EC50 (nM)"])
+                        activity_type = next((name for name in ["Ki (nM)", "IC50 (nM)", "Kd (nM)", "EC50 (nM)"] if clean(row.get(name, ""))), "activity")
+                        pubchem = first(row, ["PubChem CID"])
+                        matched = f"ligand_name={ligand_name};ligand_smiles={smiles};ligand_code={ligand_code};pdb_ids={ligand_complex_pdb_ids};target_chain_pdb_ids={target_chain_pdb_ids}"
+                        activity_value = f"{activity_type}={activity}".strip()
+                        ligand_identity = f"ligand_smiles={smiles};ligand_name={ligand_name};ligand_code={ligand_code}"
+                        evidence = f"bindingdb_onsite_activity_row;{activity_value};ligand_code={ligand_code};pdb_ids={ligand_complex_pdb_ids};target_chain_pdb_ids={target_chain_pdb_ids};pubchem_cid={pubchem}"
+                        relation = activity_relation(activity)
+                        relation_rank = 0 if relation == "=" else 1
+                        numeric_rank = numeric_activity(activity) if relation_rank == 0 else 1e300
+                        tie_rank = f"{target_name.lower()}\x1f{organism.lower()}\x1f{activity_value}\x1f{record_id}"
+                        out_row = [
+                            input_id,
+                            "BindingDB",
+                            target_id,
+                            target_name,
+                            organism or "unknown",
+                            target_class(organism),
+                            f"{activity_score(activity):.4f}",
+                            clean(matched),
+                            clean(evidence),
+                            "bindingdb_onsite_activity_row",
+                            clean(activity_value),
+                            clean(ligand_identity),
+                            "current_run_onsite_query",
+                            record_id,
+                        ]
+                        best_connection.execute(
+                            upsert,
+                            (input_id, record_id, target_id, relation_rank, numeric_rank, tie_rank, "\t".join(out_row)),
+                        )
+                        pending += 1
+                        if pending >= 1000:
+                            best_connection.commit()
+                            pending = 0
+    best_connection.commit()
+    with open(result_path, "w", encoding="utf-8", newline="") as handle:
+        for (row_text,) in best_connection.execute(
+            "SELECT row_text FROM best ORDER BY input_id, record_id, relation_rank, numeric_rank, target_id, tie_rank"
+        ):
+            handle.write(row_text)
+            handle.write("\n")
+finally:
+    best_connection.close()
+    tmp_dir.cleanup()
 "#
 }
 
@@ -5093,6 +5725,7 @@ fn rank_targets(options: &ScienceOptions) -> Result<String, String> {
         &mut by_target,
     )?;
     let mut candidates = by_target.into_values().collect::<Vec<_>>();
+    assign_collision_free_candidate_ids(&mut candidates);
     apply_docking_scores(
         &mut candidates,
         &options.run_dir.join("docking_summary.tsv"),
@@ -6719,54 +7352,87 @@ fn read_computed_feature_inputs(path: &Path) -> Result<Vec<ComputedFeatureInput>
     Ok(by_input.into_values().collect())
 }
 
-fn read_source_rows(path: &Path, label: &str) -> Result<(Vec<StoreRow>, &'static str), String> {
+fn for_each_source_row_batch<F>(
+    path: &Path,
+    label: &str,
+    emit: F,
+) -> Result<(usize, &'static str), String>
+where
+    F: FnMut(&[StoreRow]) -> Result<(), String>,
+{
     let name = path
         .file_name()
         .and_then(|value| value.to_str())
         .unwrap_or_default()
         .to_ascii_lowercase();
     if is_sqlite_name(&name) {
-        return parse_chembl_sqlite(path).map(|rows| (rows, "chembl_sqlite_rows"));
+        return for_each_chembl_sqlite_row_batch(path, emit)
+            .map(|count| (count, "chembl_sqlite_rows"));
     }
     if name.ends_with(".tar.gz") && name.contains("chembl") {
-        return parse_chembl_sqlite_archive(path).map(|rows| (rows, "chembl_sqlite_archive_rows"));
+        return for_each_chembl_sqlite_archive_row_batch(path, emit)
+            .map(|count| (count, "chembl_sqlite_archive_rows"));
     }
-    read_store_rows(path, label).map(|rows| (rows, "canonical_or_source_table_rows"))
+    for_each_store_row_batch(path, label, emit)
+        .map(|count| (count, "canonical_or_source_table_rows"))
 }
 
 fn read_store_rows(path: &Path, label: &str) -> Result<Vec<StoreRow>, String> {
+    let mut rows = Vec::new();
+    for_each_store_row_batch(path, label, |batch| {
+        rows.extend_from_slice(batch);
+        Ok(())
+    })?;
+    Ok(rows)
+}
+
+fn for_each_store_row_batch<F>(path: &Path, label: &str, mut emit: F) -> Result<usize, String>
+where
+    F: FnMut(&[StoreRow]) -> Result<(), String>,
+{
     let name = lower_file_name(path);
     if name.ends_with(".zip") {
-        let text = read_zip_text(path, matches_table_name)
-            .map_err(|err| format!("{label}_missing:{err}"))?;
-        return parse_store_rows_from_lines(text.lines().map(|line| Ok(line.to_string())), label);
+        let mut count = 0usize;
+        for_each_supported_zip_member(path, matches_table_name, |_, reader| {
+            count += parse_store_rows_from_lines_batched(reader.lines(), label, &mut emit)?;
+            Ok(())
+        })
+        .map_err(|err| format!("{label}_missing:{err}"))?;
+        return Ok(count);
     }
     if name.ends_with(".gz") {
         let file = fs::File::open(path)
             .map_err(|err| format!("{label}_missing:{}:{err}", path.display()))?;
-        let decoder = GzDecoder::new(file);
-        return parse_store_rows_from_lines(BufReader::new(decoder).lines(), label)
+        let mut reader = BufReader::new(GzDecoder::new(file));
+        return parse_store_rows_from_lines_batched(reader.by_ref().lines(), label, &mut emit)
             .map_err(|err| format!("{label}_missing:{err}"));
     }
     let file =
         fs::File::open(path).map_err(|err| format!("{label}_missing:{}:{err}", path.display()))?;
-    parse_store_rows_from_lines(BufReader::new(file).lines(), label)
+    let mut reader = BufReader::new(file);
+    parse_store_rows_from_lines_batched(reader.by_ref().lines(), label, &mut emit)
         .map_err(|err| format!("{label}_missing:{err}"))
 }
 
-fn parse_store_rows_from_lines<I>(mut lines: I, label: &str) -> Result<Vec<StoreRow>, String>
+fn parse_store_rows_from_lines_batched<I, F>(
+    mut lines: I,
+    label: &str,
+    emit: &mut F,
+) -> Result<usize, String>
 where
     I: Iterator<Item = Result<String, std::io::Error>>,
+    F: FnMut(&[StoreRow]) -> Result<(), String>,
 {
     let Some(header_line) = lines.next() else {
-        return Ok(Vec::new());
+        return Ok(0);
     };
     let header_line = header_line.map_err(|err| format!("{label}_read_failed:{err}"))?;
     let headers = split_tsv(header_line.trim_start_matches('\u{feff}'));
     if is_bindingdb_header(&headers) {
-        return parse_bindingdb_rows(&headers, lines, label);
+        return parse_bindingdb_rows_batched(&headers, lines, label, emit);
     }
-    let mut rows = Vec::new();
+    let mut rows = Vec::with_capacity(SOURCE_ROW_BATCH_SIZE);
+    let mut count = 0usize;
     for line in lines {
         let line = line.map_err(|err| format!("{label}_read_failed:{err}"))?;
         let line = line.trim_start_matches('\u{feff}');
@@ -6785,11 +7451,16 @@ where
             structure_tokens: cols[7].split_whitespace().map(ToOwned::to_owned).collect(),
             evidence: cols[8].clone(),
         });
+        count += flush_full_store_row_batch(&mut rows, emit)?;
     }
-    Ok(rows)
+    count += flush_store_row_batch(&mut rows, emit)?;
+    Ok(count)
 }
 
-fn parse_chembl_sqlite_archive(path: &Path) -> Result<Vec<StoreRow>, String> {
+fn for_each_chembl_sqlite_archive_row_batch<F>(path: &Path, mut emit: F) -> Result<usize, String>
+where
+    F: FnMut(&[StoreRow]) -> Result<(), String>,
+{
     let file =
         fs::File::open(path).map_err(|err| format!("open_failed:{}:{err}", path.display()))?;
     let decoder = GzDecoder::new(file);
@@ -6797,6 +7468,7 @@ fn parse_chembl_sqlite_archive(path: &Path) -> Result<Vec<StoreRow>, String> {
     let entries = archive
         .entries()
         .map_err(|err| format!("tar_entries_failed:{}:{err}", path.display()))?;
+    let mut extracted = Vec::new();
     for entry in entries {
         let mut entry =
             entry.map_err(|err| format!("tar_entry_failed:{}:{err}", path.display()))?;
@@ -6808,53 +7480,92 @@ fn parse_chembl_sqlite_archive(path: &Path) -> Result<Vec<StoreRow>, String> {
             .and_then(|value| value.to_str())
             .unwrap_or_default()
             .to_ascii_lowercase();
+        let member_sort_name = member_path.to_string_lossy().to_ascii_lowercase();
         if !is_sqlite_name(&member_name) {
             continue;
         }
-        let tmp_path = std::env::temp_dir().join(format!(
-            "genoligand_chembl_{}_{}_{}",
-            std::process::id(),
-            stable_hash(&path.display().to_string()),
-            safe_id(&member_name)
-        ));
+        let tmp_path = unique_temp_file_path("chembl_sqlite", ".sqlite");
         entry
             .unpack(&tmp_path)
             .map_err(|err| format!("tar_unpack_failed:{}:{err}", path.display()))?;
-        let result = parse_chembl_sqlite(&tmp_path);
-        let _ = fs::remove_file(&tmp_path);
-        return result;
+        extracted.push((member_sort_name, tmp_path));
     }
-    Err(format!("chembl_sqlite_member_missing:{}", path.display()))
+    if extracted.is_empty() {
+        return Err(format!("chembl_sqlite_member_missing:{}", path.display()));
+    }
+    extracted.sort_by(|left, right| left.0.cmp(&right.0));
+    let result = (|| {
+        let mut count = 0usize;
+        for (_, tmp_path) in &extracted {
+            count += for_each_chembl_sqlite_row_batch(tmp_path, &mut emit)?;
+        }
+        Ok(count)
+    })();
+    for (_, tmp_path) in extracted {
+        let _ = fs::remove_file(tmp_path);
+    }
+    result
 }
 
-fn parse_chembl_sqlite(path: &Path) -> Result<Vec<StoreRow>, String> {
+#[cfg(test)]
+fn parse_chembl_sqlite_archive(path: &Path) -> Result<Vec<StoreRow>, String> {
     let mut rows = Vec::new();
-    let output = run_python_script(
-        chembl_sqlite_query_script(),
-        &[path.display().to_string()],
-        "chembl_sqlite_query",
-    )?;
-    for line in output.lines() {
-        let cols = split_tsv(line);
-        if cols.len() < 12 {
-            continue;
-        }
-        rows.push(chembl_store_row(ChEMBLActivityRow {
-            target_id: cols[0].clone(),
-            target_name: cols[1].clone(),
-            organism: cols[2].clone(),
-            target_type: cols[3].clone(),
-            canonical_smiles: cols[4].clone(),
-            compound_name: cols[5].clone(),
-            standard_type: cols[6].clone(),
-            standard_relation: cols[7].clone(),
-            standard_value: cols[8].clone(),
-            standard_units: cols[9].clone(),
-            accessions: cols[10].clone(),
-            sequences: cols[11].clone(),
-        }));
-    }
+    for_each_chembl_sqlite_archive_row_batch(path, |batch| {
+        rows.extend_from_slice(batch);
+        Ok(())
+    })?;
     Ok(rows)
+}
+
+fn for_each_chembl_sqlite_row_batch<F>(path: &Path, mut emit: F) -> Result<usize, String>
+where
+    F: FnMut(&[StoreRow]) -> Result<(), String>,
+{
+    let output_path = unique_temp_file_path("chembl_sqlite_rows", ".tsv");
+    let result = run_python_script(
+        chembl_sqlite_query_script(),
+        &[
+            path.display().to_string(),
+            output_path.display().to_string(),
+        ],
+        "chembl_sqlite_query",
+    );
+    if let Err(err) = result {
+        let _ = fs::remove_file(&output_path);
+        return Err(err);
+    }
+    let parse_result = (|| {
+        let file = fs::File::open(&output_path)
+            .map_err(|err| format!("chembl_sqlite_rows_open_failed:{err}"))?;
+        let mut rows = Vec::with_capacity(SOURCE_ROW_BATCH_SIZE);
+        let mut count = 0usize;
+        for line in BufReader::new(file).lines() {
+            let line = line.map_err(|err| format!("chembl_sqlite_rows_read_failed:{err}"))?;
+            let cols = split_tsv(&line);
+            if cols.len() < 12 {
+                continue;
+            }
+            rows.push(chembl_store_row(ChEMBLActivityRow {
+                target_id: cols[0].clone(),
+                target_name: cols[1].clone(),
+                organism: cols[2].clone(),
+                target_type: cols[3].clone(),
+                canonical_smiles: cols[4].clone(),
+                compound_name: cols[5].clone(),
+                standard_type: cols[6].clone(),
+                standard_relation: cols[7].clone(),
+                standard_value: cols[8].clone(),
+                standard_units: cols[9].clone(),
+                accessions: cols[10].clone(),
+                sequences: cols[11].clone(),
+            }));
+            count += flush_full_store_row_batch(&mut rows, &mut emit)?;
+        }
+        count += flush_store_row_batch(&mut rows, &mut emit)?;
+        Ok(count)
+    })();
+    let _ = fs::remove_file(&output_path);
+    parse_result
 }
 
 fn chembl_sqlite_query_script() -> &'static str {
@@ -6902,9 +7613,11 @@ GROUP BY
 """
 
 connection = sqlite3.connect(sys.argv[1])
-writer = csv.writer(sys.stdout, delimiter="\t", lineterminator="\n")
-for row in connection.execute(query):
-    writer.writerow(["" if value is None else value for value in row])
+with open(sys.argv[2], "w", encoding="utf-8", newline="") as handle:
+    writer = csv.writer(handle, delimiter="\t", lineterminator="\n")
+    for row in connection.execute(query):
+        writer.writerow(["" if value is None else value for value in row])
+connection.close()
 "#
 }
 
@@ -6974,13 +7687,15 @@ fn is_bindingdb_header(headers: &[String]) -> bool {
         && find_header(headers, &["Target Name", "Target", "BindingDB Target Name"]).is_some()
 }
 
-fn parse_bindingdb_rows<I>(
+fn parse_bindingdb_rows_batched<I, F>(
     headers: &[String],
     lines: I,
     label: &str,
-) -> Result<Vec<StoreRow>, String>
+    emit: &mut F,
+) -> Result<usize, String>
 where
     I: Iterator<Item = Result<String, std::io::Error>>,
+    F: FnMut(&[StoreRow]) -> Result<(), String>,
 {
     let target_name_idx = find_header(headers, &["Target Name", "Target", "BindingDB Target Name"]);
     let sequence_idx = find_header(
@@ -7039,7 +7754,8 @@ where
         find_header(headers, &["EC50 (nM)", "EC50"]),
     ];
 
-    let mut rows = Vec::new();
+    let mut rows = Vec::with_capacity(SOURCE_ROW_BATCH_SIZE);
+    let mut count = 0usize;
     for line in lines {
         let line = line.map_err(|err| format!("{label}_read_failed:{err}"))?;
         let cols = split_tsv(line.trim_start_matches('\u{feff}'));
@@ -7094,8 +7810,10 @@ where
             structure_tokens: tokenize(&cell(&cols, pdb_idx)),
             evidence: "bindingdb_activity_row".to_string(),
         });
+        count += flush_full_store_row_batch(&mut rows, emit)?;
     }
-    Ok(rows)
+    count += flush_store_row_batch(&mut rows, emit)?;
+    Ok(count)
 }
 
 fn find_header(headers: &[String], candidates: &[&str]) -> Option<usize> {
@@ -7689,13 +8407,115 @@ fn matched_tokens(input: &ComputedFeatureInput, row: &StoreRow) -> Vec<String> {
 
 fn initial_candidate_scope(scope: &str, organism: &str) -> String {
     match scope {
-        "known_database" if organism.eq_ignore_ascii_case("Homo sapiens") => {
-            "known_human_protein".to_string()
-        }
+        "known_database" if is_human_organism(organism) => "known_human_protein".to_string(),
         "known_database" => "known_nonhuman_protein".to_string(),
         "metagenome_potential" => "metagenome_potential_protein".to_string(),
         "structure_interaction" => "structure_interaction".to_string(),
         _ => "computed_candidate".to_string(),
+    }
+}
+
+fn is_human_organism(organism: &str) -> bool {
+    let lower = organism.to_ascii_lowercase();
+    if lower.contains("homo sapiens") {
+        return true;
+    }
+    lower
+        .split(|ch: char| !ch.is_ascii_alphanumeric())
+        .any(|token| token == "human")
+}
+
+fn candidate_evidence_field(evidence: &str, key: &str) -> Option<String> {
+    evidence
+        .split(';')
+        .filter_map(|part| part.split_once('='))
+        .find_map(|(candidate, value)| {
+            (candidate.trim().eq_ignore_ascii_case(key) && !value.trim().is_empty())
+                .then(|| value.trim().to_string())
+        })
+}
+
+fn match_namespace(
+    source: &str,
+    evidence: &str,
+    cols: &[String],
+    source_database_idx: Option<usize>,
+) -> String {
+    let source_database = cell(cols, source_database_idx);
+    if !source_database.is_empty() {
+        return source_database;
+    }
+    candidate_evidence_field(evidence, "source_namespace")
+        .or_else(|| candidate_evidence_field(evidence, "source_database_id"))
+        .or_else(|| candidate_evidence_field(evidence, "source_db"))
+        .unwrap_or_else(|| source.trim().to_string())
+}
+
+fn candidate_metadata_quality(
+    target_id: &str,
+    target_name: &str,
+    organism: &str,
+    target_class: &str,
+    evidence: &str,
+) -> u16 {
+    let mut quality = 0u16;
+    let name = target_name.trim();
+    if !name.is_empty() && !name.eq_ignore_ascii_case(target_id) && name != "unknown" {
+        quality += 20;
+    }
+    let organism = organism.trim();
+    if is_human_organism(organism) {
+        quality += 30;
+    } else if !organism.is_empty() && !organism.eq_ignore_ascii_case("unknown") {
+        quality += 10;
+    }
+    if target_class.eq_ignore_ascii_case("known_human_protein") {
+        quality += 20;
+    } else if !target_class.trim().is_empty() && !target_class.eq_ignore_ascii_case("unknown") {
+        quality += 5;
+    }
+    let evidence = evidence.to_ascii_lowercase();
+    if evidence.contains("onsite_activity_row") || evidence.contains("alignment") {
+        quality += 15;
+    } else if evidence.contains("activity_row") || evidence.contains("structure") {
+        quality += 8;
+    }
+    quality
+}
+
+fn candidate_identity_suffix(namespace: &str, target_id: &str) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(namespace.as_bytes());
+    hasher.update([0]);
+    hasher.update(target_id.as_bytes());
+    hasher
+        .finalize()
+        .iter()
+        .take(6)
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
+}
+
+fn assign_collision_free_candidate_ids(candidates: &mut [Candidate]) {
+    let mut base_counts = BTreeMap::<String, usize>::new();
+    for candidate in candidates.iter() {
+        *base_counts
+            .entry(format!("target_{}", safe_id(&candidate.target_id)))
+            .or_default() += 1;
+    }
+    for candidate in candidates {
+        let sanitized = safe_id(&candidate.target_id);
+        let base = format!("target_{sanitized}");
+        let changed_by_sanitization = sanitized != candidate.target_id;
+        candidate.candidate_id =
+            if changed_by_sanitization || base_counts.get(&base).copied().unwrap_or_default() > 1 {
+                format!(
+                    "{base}_{}",
+                    candidate_identity_suffix(&candidate.identity_namespace, &candidate.target_id)
+                )
+            } else {
+                base
+            };
     }
 }
 
@@ -7708,19 +8528,37 @@ fn merge_match_file(
         return Ok(());
     }
     let text = read_text(path)?;
-    for line in text.lines().skip(1) {
+    let mut lines = text.lines();
+    let headers = split_tsv(lines.next().unwrap_or_default());
+    let source_database_idx = find_header(&headers, &["source_database_id"]);
+    for line in lines {
         let cols = split_tsv(line);
         if cols.len() < 9 {
             continue;
         }
         let target_id = cols[2].clone();
+        if target_id.trim().is_empty() {
+            continue;
+        }
+        let source = cols[1].clone();
+        let evidence = cols[8].clone();
+        let namespace = match_namespace(&source, &evidence, &cols, source_database_idx);
+        let identity_key = format!(
+            "{}\u{1f}{}",
+            namespace.trim().to_ascii_lowercase(),
+            target_id
+        );
         let score = cols[6].parse::<f64>().unwrap_or(0.0);
-        let entry = by_target.entry(target_id.clone()).or_insert(Candidate {
+        let metadata_quality =
+            candidate_metadata_quality(&target_id, &cols[3], &cols[4], &cols[5], &evidence);
+        let entry = by_target.entry(identity_key).or_insert(Candidate {
             candidate_id: format!("target_{}", safe_id(&target_id)),
+            identity_namespace: namespace,
             target_id,
             target_name: cols[3].clone(),
             candidate_scope: initial_candidate_scope(scope, &cols[4]),
             organism: cols[4].clone(),
+            metadata_quality,
             known_score: 0.0,
             metagenome_score: 0.0,
             structure_score: 0.0,
@@ -7729,6 +8567,15 @@ fn merge_match_file(
             final_score: 0.0,
             evidence: String::new(),
         });
+        if metadata_quality > entry.metadata_quality
+            || (metadata_quality == entry.metadata_quality
+                && (&cols[3], &cols[4]) < (&entry.target_name, &entry.organism))
+        {
+            entry.target_name = cols[3].clone();
+            entry.organism = cols[4].clone();
+            entry.candidate_scope = initial_candidate_scope(scope, &cols[4]);
+            entry.metadata_quality = metadata_quality;
+        }
         match scope {
             "known_database" => entry.known_score = entry.known_score.max(score),
             "metagenome_potential" => {
@@ -7742,7 +8589,7 @@ fn merge_match_file(
         }
         append_candidate_evidence(
             &mut entry.evidence,
-            &candidate_evidence_summary(&cols[1], &cols[8]),
+            &candidate_evidence_summary(&source, &evidence),
         );
     }
     Ok(())
@@ -7813,10 +8660,12 @@ fn read_candidates(path: &Path) -> Result<Vec<Candidate>, String> {
         }
         out.push(Candidate {
             candidate_id: cols[1].clone(),
+            identity_namespace: String::new(),
             target_id: cols[2].clone(),
             target_name: cols[3].clone(),
             candidate_scope: cols[4].clone(),
             organism: cols[5].clone(),
+            metadata_quality: 0,
             final_score: cols[6].parse().unwrap_or(0.0),
             known_score: cols[7].parse().unwrap_or(0.0),
             metagenome_score: cols[8].parse().unwrap_or(0.0),
@@ -7999,18 +8848,51 @@ fn run_python_script(script: &str, args: &[String], context: &str) -> Result<Str
 }
 
 fn temp_python_script_path(context: &str) -> PathBuf {
+    unique_temp_file_path(context, ".py")
+}
+
+fn unique_temp_file_path(context: &str, suffix: &str) -> PathBuf {
     let millis = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|duration| duration.as_millis())
         .unwrap_or_default();
     let sequence = PYTHON_SCRIPT_SEQUENCE.fetch_add(1, Ordering::Relaxed);
     env::temp_dir().join(format!(
-        "genoligand_{}_{}_{}_{}.py",
+        "genoligand_{}_{}_{}_{}{}",
         safe_id(context),
         std::process::id(),
         millis,
-        sequence
+        sequence,
+        suffix
     ))
+}
+
+fn temporary_data_path(root: &Path, label: &str, extension: &str) -> PathBuf {
+    let millis = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_millis())
+        .unwrap_or_default();
+    let sequence = PYTHON_SCRIPT_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+    root.join(format!(
+        ".{}_{}_{}_{}.{}",
+        safe_id(label),
+        std::process::id(),
+        millis,
+        sequence,
+        safe_id(extension)
+    ))
+}
+
+fn append_file_to_writer<W: Write>(
+    path: &Path,
+    writer: &mut W,
+    context: &str,
+) -> Result<(), String> {
+    let mut file = fs::File::open(path)
+        .map_err(|err| format!("{context}_open_failed:{}:{err}", path.display()))?;
+    std::io::copy(&mut file, writer)
+        .map(|_| ())
+        .map_err(|err| format!("{context}_copy_failed:{}:{err}", path.display()))
 }
 
 fn preferred_python_command() -> Vec<String> {
