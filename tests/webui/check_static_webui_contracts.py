@@ -333,6 +333,27 @@ function clearScientificForm() {
   assert(!staleSaveResult, "save response for changed form must be ignored");
   assert(!visitedSteps.includes("check"), "stale save response must not enter check step");
 
+  state.form.project_name = "Project A";
+  state.form.small_molecule = "CCO";
+  state.project = { project_id: "project-a" };
+  const projectAPayload = inputPayloadFromForm();
+  state.inputInspection = { usable: true, summary: "project A", errors: [], inputs: [] };
+  state.inputInspectionPayload = projectAPayload;
+  state.inputInspectionPayloadKey = inputPayloadKey(projectAPayload);
+  state.inputInspectionPending = false;
+  state.inputInspectionError = "";
+  const switchedProjectSave = saveInput();
+  await Promise.resolve();
+  assert(saveRequests.length === 2, "project A must start one save request");
+  state.project = { project_id: "project-b" };
+  invalidateInputInspection();
+  state.alert = "";
+  saveRequests[1].resolve({ ok: true, project: { project_id: "project-a" } });
+  const switchedProjectResult = await switchedProjectSave;
+  assert(!switchedProjectResult, "project A response must be ignored after switching to project B");
+  assert(state.project.project_id === "project-b", "stale response must not replace project B");
+  assert(state.alert === "", "stale project A response must not write an alert on project B");
+
   state.form.small_molecule = "changed-after-inspection";
   assert(!inputsReadyToSave(), "payload mismatch must disable save before debounce runs");
   const projectCallsBeforeStaleSave = apiCalls.filter((call) => call.path === "/api/user/projects").length;

@@ -58,6 +58,13 @@ function finishInputSave(saveGeneration) {
   }
 }
 
+function discardStaleInputSave(saveGeneration) {
+  const currentSave = saveGeneration === state.inputSaveGeneration;
+  finishInputSave(saveGeneration);
+  if (currentSave) render();
+  return false;
+}
+
 function scheduleInputInspection() {
   invalidateInputInspection();
   if (!filledInputs().length) return;
@@ -156,10 +163,7 @@ async function saveInput() {
       body: JSON.stringify(inputPayload),
     });
     if (!inputSaveIsCurrent(saveGeneration, inspectionGeneration, projectId, inputPayload, inputPayloadKeyValue)) {
-      finishInputSave(saveGeneration);
-      state.alert = "保存期间输入或项目已变化，请检查当前输入后再继续。";
-      render();
-      return false;
+      return discardStaleInputSave(saveGeneration);
     }
     if (saved.ok !== true) {
       finishInputSave(saveGeneration);
@@ -173,10 +177,7 @@ async function saveInput() {
       savedProject = await api(`/api/user/projects/${projectId}`);
     }
     if (!inputSaveIsCurrent(saveGeneration, inspectionGeneration, projectId, inputPayload, inputPayloadKeyValue)) {
-      finishInputSave(saveGeneration);
-      state.alert = "保存期间输入或项目已变化，请检查当前输入后再继续。";
-      render();
-      return false;
+      return discardStaleInputSave(saveGeneration);
     }
     state.project = savedProject;
     state.run = null;
@@ -184,10 +185,7 @@ async function saveInput() {
     state.preflight = null;
     await refreshProjects();
     if (!inputSaveIsCurrent(saveGeneration, inspectionGeneration, projectId, inputPayload, inputPayloadKeyValue)) {
-      finishInputSave(saveGeneration);
-      state.alert = "保存完成后当前输入已变化，请重新检查。";
-      render();
-      return false;
+      return discardStaleInputSave(saveGeneration);
     }
     finishInputSave(saveGeneration);
     setStep("check");
