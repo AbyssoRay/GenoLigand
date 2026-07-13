@@ -1,3 +1,4 @@
+use super::input_conversion::ConvertedInput;
 use super::*;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -461,6 +462,217 @@ fn conversion_rows(run: &Path) -> Vec<Vec<String>> {
         .collect()
 }
 
+fn normalize_fixture_inputs(
+    entries: &[(&str, &str)],
+    identifiers: &[(&str, &str, &str)],
+) -> Vec<ConvertedInput> {
+    static FIXTURE_ID: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+    let fixture_id = FIXTURE_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let root = temp_root(&format!("input_identifier_fixture_{fixture_id}"));
+    let store = root.join("science_store");
+    let mut lookup =
+        String::from("identifier_type\tidentifier\tcanonical_smiles\tdisplay_name\tsource\n");
+    for (kind, identifier, smiles) in identifiers {
+        lookup.push_str(&format!(
+            "{kind}\t{identifier}\t{smiles}\t{identifier}\ttest\n"
+        ));
+    }
+    write_text(&store.join("indexes/compound_identifiers.tsv"), &lookup).expect("lookup");
+    let input = root.join("input.json");
+    let rows = entries
+        .iter()
+        .map(|(field, value)| serde_json::json!({"field": field, "value": value}))
+        .collect::<Vec<_>>();
+    write_text(
+        &input,
+        &(serde_json::json!({"inputs": rows, "files": []}).to_string() + "\n"),
+    )
+    .expect("input");
+    let options = ScienceOptions {
+        workspace_root: root.clone(),
+        science_store: store,
+        input_manifest: input,
+        run_dir: root.join("run"),
+    };
+    let converted = convert_inputs_from_manifest(&options).expect("convert");
+    fs::remove_dir_all(root).expect("cleanup");
+    converted
+}
+
+#[test]
+fn explicit_small_molecule_field_prevents_sequence_reclassification() {
+    let rows = normalize_fixture_inputs(
+        &[
+            ("small_molecule", "CCCCCCCC"),
+            ("small_molecule", "caffeine"),
+        ],
+        &[("name", "caffeine", "Cn1c(=O)c2c(ncn2C)n(C)c1=O")],
+    );
+
+    assert_eq!(
+        rows[0].canonical_kind,
+        Some(InputKind::SmallMolecule),
+        "{:#?}",
+        rows[0]
+    );
+    assert_eq!(rows[0].canonical_value, "CCCCCCCC");
+    assert_eq!(rows[0].conversion_method, "rdkit_smiles");
+    assert_eq!(
+        rows[1].canonical_kind,
+        Some(InputKind::SmallMolecule),
+        "{:#?}",
+        rows[1]
+    );
+    assert_eq!(rows[1].canonical_value, "Cn1c(=O)c2c(ncn2C)n(C)c1=O");
+    assert_eq!(rows[1].conversion_method, "local_identifier_lookup");
+}
+
+#[test]
+fn inline_smiles_and_inchi_are_canonicalized_by_rdkit() {
+    let rows =
+        normalize_fixture_inputs(&[("smiles", "C(C)O"), ("inchi", "InChI=1S/CH4/h1H4")], &[]);
+
+    assert_eq!(
+        rows[0].canonical_kind,
+        Some(InputKind::SmallMolecule),
+        "{:#?}",
+        rows[0]
+    );
+    assert_eq!(rows[0].canonical_value, "CCO");
+    assert_eq!(rows[0].conversion_method, "rdkit_smiles");
+    assert_eq!(rows[1].canonical_kind, Some(InputKind::SmallMolecule));
+    assert_eq!(rows[1].canonical_value, "C");
+    assert_eq!(rows[1].conversion_method, "rdkit_inchi");
+}
+
+#[test]
+fn compound_identifier_lookup_validates_cas_and_canonicalizes_mapped_smiles() {
+    let rows = normalize_fixture_inputs(
+        &[("cas", "59-66-5"), ("small_molecule", "CAFÉ   MOLECULE")],
+        &[
+            ("cas", "59-66-5", "C(C)O"),
+            ("name", "Café Molecule", "C(C)O"),
+        ],
+    );
+
+    for row in &rows {
+        assert_eq!(row.canonical_kind, Some(InputKind::SmallMolecule));
+        assert_eq!(row.canonical_value, "CCO");
+        assert_eq!(row.conversion_method, "local_identifier_lookup");
+    }
+}
+
+#[test]
+fn compound_identifier_lookup_rejects_invalid_cas_and_unknown_name() {
+    let rows = normalize_fixture_inputs(
+        &[
+            ("cas", "59-66-4"),
+            ("small_molecule", "unknown compound name"),
+        ],
+        &[("cas", "59-66-5", "CCO")],
+    );
+
+    assert_eq!(rows[0].conversion_status, "failed");
+    assert!(rows[0].reason.contains("invalid_cas_check_digit"));
+    assert_eq!(rows[1].conversion_status, "failed");
+    assert!(rows[1].reason.contains("unknown_compound_identifier"));
+}
+
+#[test]
+fn declared_sequence_and_complex_fields_determine_scientific_family() {
+    let rows = normalize_fixture_inputs(
+        &[
+            ("peptide", "ACGTAC"),
+            ("protein_ligand", "ACGTAC"),
+            ("genome_or_metagenome", "ACGTACGT"),
+            ("complex", "protein A with ligand B"),
+        ],
+        &[],
+    );
+
+    assert_eq!(rows[0].canonical_kind, Some(InputKind::Peptide));
+    assert_eq!(rows[1].canonical_kind, Some(InputKind::ProteinLigand));
+    assert_eq!(rows[2].canonical_kind, Some(InputKind::GenomeOrMetagenome));
+    assert_eq!(rows[3].canonical_kind, Some(InputKind::Complex));
+}
+
+#[test]
+fn compound_identifier_lookup_rejects_invalid_mapped_smiles() {
+    let rows = normalize_fixture_inputs(
+        &[("small_molecule", "broken mapping")],
+        &[("name", "broken mapping", "not-a-smiles")],
+    );
+
+    assert_eq!(rows[0].conversion_status, "failed");
+    assert!(rows[0].reason.contains("invalid_mapped_smiles"));
+}
+
+#[test]
+fn input_inspection_reports_every_record_identity_and_failure() {
+    let root = temp_root("input_inspection_failures");
+    let input = root.join("input.json");
+    write_text(
+        &input,
+        &(serde_json::json!({
+            "inputs": [
+                {"field": "project_name", "value": "inspection fixture"},
+                {"field": "smiles", "value": "C(C)O"},
+                {"field": "cas", "value": "59-66-4"}
+            ],
+            "files": []
+        })
+        .to_string()
+            + "\n"),
+    )
+    .expect("input");
+
+    let inspection = inspect_input_manifest(&science_options(&root, &input, &root.join("run")))
+        .expect("inspect");
+    fs::remove_dir_all(root).expect("cleanup");
+
+    assert!(!inspection.usable);
+    assert_eq!(inspection.inputs.len(), 2);
+    assert_eq!(inspection.inputs[0].input_id, "input_1");
+    assert_eq!(inspection.inputs[0].record_id, "record_1");
+    assert_eq!(inspection.inputs[0].canonical_kind, "small_molecule");
+    assert_eq!(inspection.inputs[0].conversion_method, "rdkit_smiles");
+    assert_eq!(inspection.inputs[1].input_id, "input_2");
+    assert_eq!(inspection.inputs[1].record_id, "record_1");
+    assert_eq!(inspection.inputs[1].canonical_kind, "unknown");
+    assert_eq!(inspection.errors.len(), 1);
+    assert!(inspection.errors[0].contains("input_2:record_1:invalid_cas_check_digit"));
+    assert!(inspection.summary.contains("1 of 2 input records failed"));
+}
+
+#[test]
+fn input_inspection_is_usable_only_when_all_non_project_records_convert() {
+    let root = temp_root("input_inspection_usable");
+    let input = root.join("input.json");
+    write_text(
+        &input,
+        &(serde_json::json!({
+            "inputs": [
+                {"field": "project_name", "value": "inspection fixture"},
+                {"field": "small_molecule", "value": "CCO"},
+                {"field": "peptide", "value": "IKVAV"}
+            ],
+            "files": []
+        })
+        .to_string()
+            + "\n"),
+    )
+    .expect("input");
+
+    let inspection = inspect_input_manifest(&science_options(&root, &input, &root.join("run")))
+        .expect("inspect");
+    fs::remove_dir_all(root).expect("cleanup");
+
+    assert!(inspection.usable);
+    assert!(inspection.errors.is_empty());
+    assert_eq!(inspection.inputs.len(), 2);
+    assert!(inspection.summary.contains("2 input records ready"));
+}
+
 #[test]
 fn input_conversion_manifest_records_inline_provenance() {
     let root = temp_root("inline_provenance");
@@ -607,37 +819,64 @@ fn feature_manifest_preserves_multi_record_identity() {
 fn sequence_file_formats_are_resolved_from_content() {
     let root = temp_root("sequence_file_formats");
     let cases = [
-        ("fa", ">alpha\nMKTAYI\n", "alpha", "MKTAYI"),
-        ("faa", ">alpha\nMKTAYI\n", "alpha", "MKTAYI"),
-        ("fna", ">contig\nATGCGTACGTAA\n", "contig", "ATGCGTACGTAA"),
+        (
+            "fa",
+            "protein_ligand",
+            ">alpha\nMKTAYI\n",
+            "alpha",
+            "MKTAYI",
+        ),
+        (
+            "faa",
+            "protein_ligand",
+            ">alpha\nMKTAYI\n",
+            "alpha",
+            "MKTAYI",
+        ),
+        (
+            "fna",
+            "genome_or_metagenome",
+            ">contig\nATGCGTACGTAA\n",
+            "contig",
+            "ATGCGTACGTAA",
+        ),
         (
             "fastq",
+            "genome_or_metagenome",
             "@read1\nATGCGTAA\n+\nFFFFFFFF\n",
             "read1",
             "ATGCGTAA",
         ),
-        ("fq", "@read1\nATGCGTAA\n+\nFFFFFFFF\n", "read1", "ATGCGTAA"),
+        (
+            "fq",
+            "genome_or_metagenome",
+            "@read1\nATGCGTAA\n+\nFFFFFFFF\n",
+            "read1",
+            "ATGCGTAA",
+        ),
         (
             "gb",
+            "genome_or_metagenome",
             "LOCUS       TEST\nORIGIN\n        1 atgcgtaa\n//\n",
             "record_1",
             "ATGCGTAA",
         ),
         (
             "gbk",
+            "genome_or_metagenome",
             "LOCUS       TEST\nORIGIN\n        1 atgcgtaa\n//\n",
             "record_1",
             "ATGCGTAA",
         ),
     ];
-    for (index, (extension, content, record_id, expected)) in cases.iter().enumerate() {
+    for (index, (extension, field, content, record_id, expected)) in cases.iter().enumerate() {
         let source = root.join(format!("sequence_{index}.{extension}"));
         write_text(&source, content).expect("source");
         let input = root.join(format!("input_{index}.json"));
         write_text(
             &input,
             &format!(
-                r#"{{"inputs":[{{"field":"genome_or_metagenome","value":{}}}],"files":[]}}"#,
+                r#"{{"inputs":[{{"field":"{field}","value":{}}}],"files":[]}}"#,
                 serde_json::to_string(&source.display().to_string()).expect("path JSON")
             ),
         )
@@ -1188,13 +1427,13 @@ fn feature_manifest_rejects_empty_identity_and_kind_conflicts() {
 }
 
 #[test]
-fn input_conversion_prefers_content_over_selected_field() {
+fn input_conversion_prefers_declared_field_over_sequence_like_content() {
     let root = temp_root("free_text_conversion");
     let input = root.join("input.json");
     let run = root.join("run");
     write_text(
         &input,
-        r#"{"inputs":[{"field":"small_molecule","value":"ikv AV"}],"files":[]}"#,
+        r#"{"inputs":[{"field":"small_molecule","value":"CCCCCCCC"}],"files":[]}"#,
     )
     .expect("write input");
     let options = ScienceOptions {
@@ -1211,8 +1450,8 @@ fn input_conversion_prefers_content_over_selected_field() {
         read_text(&run.join("input_conversion_manifest.tsv")).expect("conversion manifest");
     let source_map = read_text(&run.join("artifact_source_map.tsv")).expect("source map");
 
-    assert!(normalized.contains("input_1\tpeptide\tIKVAV"));
-    assert!(conversion.contains("input_1\trecord_1\tsmall_molecule\tpeptide\tpeptide\tIKVAV\tconverted\tstandard_amino_acid_sequence\tplain_text"));
+    assert!(normalized.contains("input_1\tsmall_molecule\tCCCCCCCC"));
+    assert!(conversion.contains("input_1\trecord_1\tsmall_molecule\tsmall_molecule\tsmall_molecule\tCCCCCCCC\tconverted\trdkit_smiles\tplain_text"));
     assert!(source_map.contains("input_conversion_manifest.tsv"));
     fs::remove_dir_all(&root).expect("cleanup temp root");
     assert!(!root.exists());
@@ -1257,19 +1496,19 @@ fn input_conversion_classifies_sequence_and_structure_text() {
         read_text(&run.join("input_conversion_manifest.tsv")).expect("conversion manifest");
 
     assert!(normalized.contains("input_1\tpeptide\tIKVAV"));
-    assert!(normalized.contains("input_2\tsmall_molecule\tCC(=O)OC1=CC=CC=C1C(=O)O"));
+    assert!(normalized.contains("input_2\tsmall_molecule\tCC(=O)Oc1ccccc1C(=O)O"));
     assert!(normalized.contains("input_3\tprotein_ligand\tMKTAYIAKQRQISFVKSHFSRQDILDLWQMKTAYIAKQRQISFVKSHFSRQDILDLWQMKTAYIAKQRQISFVKSHFSRQDILDLWQ"));
     assert!(conversion.contains(
         "input_1\trecord_1\tpeptide\tpeptide\tpeptide\tIKVAV\tconverted\tstandard_amino_acid_sequence\tfasta"
     ));
-    assert!(conversion.contains("input_2\trecord_1\tsmall_molecule\tsmall_molecule\tsmall_molecule\tCC(=O)OC1=CC=CC=C1C(=O)O\tconverted\trdkit_smiles\tplain_text"));
+    assert!(conversion.contains("input_2\trecord_1\tsmall_molecule\tsmall_molecule\tsmall_molecule\tCC(=O)Oc1ccccc1C(=O)O\tconverted\trdkit_smiles\tplain_text"));
     assert!(conversion.contains("input_3\trecord_1\tprotein_ligand\tprotein_ligand\tprotein_ligand\tMKTAYIAKQRQISFVKSHFSRQDILDLWQMKTAYIAKQRQISFVKSHFSRQDILDLWQMKTAYIAKQRQISFVKSHFSRQDILDLWQ\tconverted\tstandard_amino_acid_sequence\tplain_text"));
     fs::remove_dir_all(&root).expect("cleanup temp root");
     assert!(!root.exists());
 }
 
 #[test]
-fn input_conversion_recognizes_nucleotide_sequence_independent_of_field() {
+fn input_conversion_does_not_reclassify_declared_small_molecule_as_nucleotide() {
     let root = temp_root("input_conversion_nucleotide");
     let input = root.join("input.json");
     let run = root.join("run");
@@ -1285,14 +1524,14 @@ fn input_conversion_recognizes_nucleotide_sequence_independent_of_field() {
         run_dir: run.clone(),
     };
 
-    run_science_command(ScienceCommand::InputNormalize, &options).expect("normalize");
-    let normalized =
-        read_text(&run.join("input_normalized_manifest.tsv")).expect("normalized manifest");
+    let error = run_science_command(ScienceCommand::InputNormalize, &options)
+        .expect_err("invalid declared small molecule must fail");
     let conversion =
         read_text(&run.join("input_conversion_manifest.tsv")).expect("conversion manifest");
 
-    assert!(normalized.contains("input_1\tgenome_or_metagenome\tATGCGTACGTAA"));
-    assert!(conversion.contains("input_1\trecord_1\tsmall_molecule\tgenome_or_metagenome\tgenome_or_metagenome\tATGCGTACGTAA\tconverted\tnucleotide_sequence\tplain_text"));
+    assert!(error.contains("unknown_compound_identifier"), "{error}");
+    assert!(conversion.contains("input_1\trecord_1\tsmall_molecule\tunknown\tunknown\t\tfailed"));
+    assert!(!conversion.contains("genome_or_metagenome"));
     fs::remove_dir_all(&root).expect("cleanup temp root");
     assert!(!root.exists());
 }

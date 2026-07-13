@@ -6,6 +6,7 @@ use serde_json::Value;
 use sha2::{Digest, Sha256};
 use std::collections::BTreeSet;
 use std::fs;
+use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
 
 const INPUT_RESOLVER_SCRIPT: &str =
@@ -89,7 +90,11 @@ pub(super) fn convert_inputs_from_manifest(
     let mut conversions = Vec::new();
     for raw in &raw_inputs {
         match resolve_raw_input(raw, options) {
-            Ok(records) => conversions.extend(records.iter().map(convert_resolved_input)),
+            Ok(records) => conversions.extend(
+                records
+                    .iter()
+                    .map(|record| convert_resolved_input(record, options)),
+            ),
             Err(reason) => conversions.push(failed_resolution(raw, &reason)),
         }
     }
@@ -177,7 +182,10 @@ pub(super) fn normalized_inputs_from_conversions(
         .collect()
 }
 
-fn convert_resolved_input(record: &ResolvedInputRecord) -> ConvertedInput {
+fn convert_resolved_input(
+    record: &ResolvedInputRecord,
+    options: &ScienceOptions,
+) -> ConvertedInput {
     if is_molecule_format(&record.format) {
         return converted_input(
             record,
@@ -207,44 +215,199 @@ fn convert_resolved_input(record: &ResolvedInputRecord) -> ConvertedInput {
             },
         );
     }
+    match normalized_field(&record.original_field) {
+        "small_molecule" | "smiles" | "inchi" | "cas" => convert_small_molecule(record, options),
+        "peptide" => convert_amino_acid_sequence(record, InputKind::Peptide),
+        "protein_ligand" => convert_amino_acid_sequence(record, InputKind::ProteinLigand),
+        "genome_or_metagenome" => convert_nucleotide_sequence(record),
+        "complex" => convert_complex(record),
+        _ => infer_untyped_record(record, options),
+    }
+}
+
+fn normalized_field(field: &str) -> &'static str {
+    match field.split_whitespace().next().unwrap_or("") {
+        "small_molecule" | "small-molecule" | "molecule" | "ligand" => "small_molecule",
+        "smiles" => "smiles",
+        "inchi" => "inchi",
+        "cas" => "cas",
+        "peptide" => "peptide",
+        "protein_ligand" | "protein" => "protein_ligand",
+        "genome_or_metagenome" | "genome" | "metagenome" | "nucleotide" => "genome_or_metagenome",
+        "complex" => "complex",
+        _ => "untyped",
+    }
+}
+
+fn convert_small_molecule(
+    record: &ResolvedInputRecord,
+    options: &ScienceOptions,
+) -> ConvertedInput {
     let value = record.content.trim();
-    let sequence = compact_sequence(value).to_ascii_uppercase();
-    let sequence_format = if value.trim_start().starts_with('>') {
-        "fasta"
-    } else {
-        "plain_text"
-    };
-    if sequence.len() >= 8
-        && !record.original_field.contains("peptide")
-        && !record.original_field.contains("protein")
-        && sequence.chars().all(is_nucleotide_symbol)
+    let field = normalized_field(&record.original_field);
+    if field == "inchi" || looks_like_inchi(value) {
+        return match canonicalize_molecular_text(value, "inchi") {
+            Ok(canonical_value) => converted_molecular_text(record, canonical_value, "rdkit_inchi"),
+            Err(error) => failed_conversion_with_reason(
+                record,
+                &format!("invalid_inchi:{error}"),
+                "molecular_structure_parse_failed",
+            ),
+        };
+    }
+    if field == "smiles" {
+        return match canonicalize_molecular_text(value, "smiles") {
+            Ok(canonical_value) => {
+                converted_molecular_text(record, canonical_value, "rdkit_smiles")
+            }
+            Err(error) => failed_conversion_with_reason(
+                record,
+                &format!("invalid_smiles:{error}"),
+                "molecular_structure_parse_failed",
+            ),
+        };
+    }
+    if field != "cas"
+        && let Ok(canonical_value) = canonicalize_molecular_text(value, "smiles")
     {
-        return converted_input(
+        return converted_molecular_text(record, canonical_value, "rdkit_smiles");
+    }
+
+    let (identifier_type, identifier) = if field == "cas" || looks_like_cas_number(value) {
+        match normalize_cas_identifier(value) {
+            Ok(identifier) => ("cas", identifier),
+            Err(reason) => {
+                return failed_conversion_with_reason(record, reason, "invalid_cas_identifier");
+            }
+        }
+    } else {
+        ("name", normalize_compound_name(value))
+    };
+    let mapped_smiles = match lookup_compound_identifier(options, identifier_type, &identifier) {
+        Ok(Some(smiles)) => smiles,
+        Ok(None) => {
+            return failed_conversion_with_reason(
+                record,
+                "unknown_compound_identifier",
+                "no_local_name_or_cas_mapping",
+            );
+        }
+        Err(reason) => {
+            return failed_conversion_with_reason(
+                record,
+                &reason,
+                "compound_identifier_index_invalid",
+            );
+        }
+    };
+    match canonicalize_molecular_text(&mapped_smiles, "smiles") {
+        Ok(canonical_value) => {
+            converted_molecular_text(record, canonical_value, "local_identifier_lookup")
+        }
+        Err(error) => failed_conversion_with_reason(
             record,
-            ConversionDetails {
-                kind: InputKind::GenomeOrMetagenome,
-                canonical_value: sequence,
-                inferred_kind: "genome_or_metagenome",
-                method: "nucleotide_sequence",
-                format: sequence_format,
-                artifact: "",
-                risk_flag: "",
+            &format!("invalid_mapped_smiles:{error}"),
+            "molecular_structure_parse_failed",
+        ),
+    }
+}
+
+fn converted_molecular_text(
+    record: &ResolvedInputRecord,
+    canonical_value: String,
+    method: &'static str,
+) -> ConvertedInput {
+    converted_input(
+        record,
+        ConversionDetails {
+            kind: InputKind::SmallMolecule,
+            canonical_value,
+            inferred_kind: "small_molecule",
+            method,
+            format: "plain_text",
+            artifact: "",
+            risk_flag: "",
+        },
+    )
+}
+
+fn convert_amino_acid_sequence(record: &ResolvedInputRecord, kind: InputKind) -> ConvertedInput {
+    let sequence = compact_sequence(&record.content).to_ascii_uppercase();
+    if sequence.len() < 2 || !sequence.chars().all(is_standard_amino_acid) {
+        return failed_conversion_with_reason(
+            record,
+            if kind == InputKind::Peptide {
+                "invalid_peptide_sequence"
+            } else {
+                "invalid_protein_sequence"
             },
+            "invalid_declared_sequence",
         );
     }
-    if record.original_field.contains("small_molecule") && looks_like_smiles_text(value) {
-        return converted_input(
+    converted_input(
+        record,
+        ConversionDetails {
+            kind,
+            canonical_value: sequence,
+            inferred_kind: kind.as_str(),
+            method: "standard_amino_acid_sequence",
+            format: sequence_text_format(&record.content),
+            artifact: "",
+            risk_flag: "",
+        },
+    )
+}
+
+fn convert_nucleotide_sequence(record: &ResolvedInputRecord) -> ConvertedInput {
+    let sequence = compact_sequence(&record.content).to_ascii_uppercase();
+    if sequence.len() < 8 || !sequence.chars().all(is_nucleotide_symbol) {
+        return failed_conversion_with_reason(
             record,
-            ConversionDetails {
-                kind: InputKind::SmallMolecule,
-                canonical_value: value.to_string(),
-                inferred_kind: "small_molecule",
-                method: "rdkit_smiles",
-                format: "plain_text",
-                artifact: "",
-                risk_flag: "",
-            },
+            "invalid_nucleotide_sequence",
+            "invalid_declared_sequence",
         );
+    }
+    converted_input(
+        record,
+        ConversionDetails {
+            kind: InputKind::GenomeOrMetagenome,
+            canonical_value: sequence,
+            inferred_kind: "genome_or_metagenome",
+            method: "nucleotide_sequence",
+            format: sequence_text_format(&record.content),
+            artifact: "",
+            risk_flag: "",
+        },
+    )
+}
+
+fn convert_complex(record: &ResolvedInputRecord) -> ConvertedInput {
+    let value = record.content.trim();
+    if count_alphanumeric(value) < 5 {
+        return failed_conversion_with_reason(
+            record,
+            "invalid_complex_description",
+            "requires_structure_or_complex_context",
+        );
+    }
+    converted_input(
+        record,
+        ConversionDetails {
+            kind: InputKind::Complex,
+            canonical_value: value.to_string(),
+            inferred_kind: "complex",
+            method: "complex_description",
+            format: "plain_text",
+            artifact: "",
+            risk_flag: "requires_structure_or_complex_context",
+        },
+    )
+}
+
+fn infer_untyped_record(record: &ResolvedInputRecord, options: &ScienceOptions) -> ConvertedInput {
+    let sequence = compact_sequence(&record.content).to_ascii_uppercase();
+    if sequence.len() >= 8 && sequence.chars().all(is_nucleotide_symbol) {
+        return convert_nucleotide_sequence(record);
     }
     if sequence.len() >= 2 && sequence.chars().all(is_standard_amino_acid) {
         let kind = if sequence.len() > 80 {
@@ -252,62 +415,17 @@ fn convert_resolved_input(record: &ResolvedInputRecord) -> ConvertedInput {
         } else {
             InputKind::Peptide
         };
-        return converted_input(
-            record,
-            ConversionDetails {
-                kind,
-                canonical_value: sequence,
-                inferred_kind: kind.as_str(),
-                method: "standard_amino_acid_sequence",
-                format: sequence_format,
-                artifact: "",
-                risk_flag: "",
-            },
-        );
+        return convert_amino_acid_sequence(record, kind);
     }
-    if looks_like_inchi(value) {
-        return converted_input(
-            record,
-            ConversionDetails {
-                kind: InputKind::SmallMolecule,
-                canonical_value: value.to_string(),
-                inferred_kind: "small_molecule",
-                method: "inchi_text",
-                format: "plain_text",
-                artifact: "",
-                risk_flag: "",
-            },
-        );
+    convert_small_molecule(record, options)
+}
+
+fn sequence_text_format(value: &str) -> &'static str {
+    if value.trim_start().starts_with('>') {
+        "fasta"
+    } else {
+        "plain_text"
     }
-    if looks_like_smiles_text(value) {
-        return converted_input(
-            record,
-            ConversionDetails {
-                kind: InputKind::SmallMolecule,
-                canonical_value: value.to_string(),
-                inferred_kind: "small_molecule",
-                method: "rdkit_smiles",
-                format: "plain_text",
-                artifact: "",
-                risk_flag: "",
-            },
-        );
-    }
-    if record.original_field.contains("complex") && count_alphanumeric(value) >= 5 {
-        return converted_input(
-            record,
-            ConversionDetails {
-                kind: InputKind::Complex,
-                canonical_value: value.to_string(),
-                inferred_kind: "complex",
-                method: "complex_description",
-                format: "plain_text",
-                artifact: "",
-                risk_flag: "requires_structure_or_complex_context",
-            },
-        );
-    }
-    failed_conversion(record)
 }
 
 fn converted_input(record: &ResolvedInputRecord, details: ConversionDetails<'_>) -> ConvertedInput {
@@ -342,13 +460,11 @@ fn converted_input(record: &ResolvedInputRecord, details: ConversionDetails<'_>)
     }
 }
 
-fn failed_conversion(record: &ResolvedInputRecord) -> ConvertedInput {
-    let value = record.content.trim();
-    let risk = if looks_like_cas_number(value) || record.original_field.contains("cas") {
-        "no_local_name_or_cas_mapping"
-    } else {
-        "unrecognized_free_text"
-    };
+fn failed_conversion_with_reason(
+    record: &ResolvedInputRecord,
+    reason: &str,
+    risk: &str,
+) -> ConvertedInput {
     ConvertedInput {
         input_id: record.input_id.clone(),
         record_id: record.record_id.clone(),
@@ -357,7 +473,7 @@ fn failed_conversion(record: &ResolvedInputRecord) -> ConvertedInput {
         canonical_kind: None,
         canonical_value: String::new(),
         conversion_status: "failed",
-        conversion_method: "unrecognized_text",
+        conversion_method: "input_validation",
         format: record.format.clone(),
         source_kind: record.source_kind,
         source_path: record.source_path.clone(),
@@ -365,9 +481,13 @@ fn failed_conversion(record: &ResolvedInputRecord) -> ConvertedInput {
         structure_atom_count: record.structure_atom_count,
         structure_chain_count: record.structure_chain_count,
         structure_residue_count: record.structure_residue_count,
-        reason: "无法转换为可计算结构或序列".to_string(),
+        reason: reason.to_string(),
         artifact: String::new(),
-        risk_flags: vec![risk.to_string()],
+        risk_flags: if risk.is_empty() {
+            Vec::new()
+        } else {
+            vec![risk.to_string()]
+        },
         file_count: record.file_count,
     }
 }
@@ -698,6 +818,89 @@ fn resolve_molecule_file(
         .collect()
 }
 
+fn canonicalize_molecular_text(value: &str, format: &str) -> Result<String, String> {
+    let args = vec![
+        "--text-hex".to_string(),
+        value
+            .as_bytes()
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect(),
+        "--format".to_string(),
+        format.to_string(),
+    ];
+    let digest = sha256_hex(value.as_bytes());
+    let context = format!("input_resolver_{}", &digest[..12]);
+    let output = run_python_script(INPUT_RESOLVER_SCRIPT, &args, &context)?;
+    let value = serde_json::from_str::<Value>(output.trim())
+        .map_err(|err| format!("input_resolver_invalid_json:{err}"))?;
+    let records = value
+        .get("records")
+        .and_then(Value::as_array)
+        .ok_or_else(|| "input_resolver_missing_records".to_string())?;
+    if records.len() != 1 {
+        return Err("input_resolver_invalid_inline_record_count".to_string());
+    }
+    records[0]
+        .get("canonical_smiles")
+        .and_then(Value::as_str)
+        .filter(|value| !value.is_empty())
+        .map(ToOwned::to_owned)
+        .ok_or_else(|| "input_resolver_missing_canonical_smiles:record_1".to_string())
+}
+
+fn lookup_compound_identifier(
+    options: &ScienceOptions,
+    identifier_type: &str,
+    identifier: &str,
+) -> Result<Option<String>, String> {
+    let path = options
+        .science_store
+        .join("indexes/compound_identifiers.tsv");
+    if !path.is_file() {
+        return Ok(None);
+    }
+    let file = fs::File::open(&path)
+        .map_err(|err| format!("compound_identifier_index_read_failed:{err}"))?;
+    let mut lines = BufReader::new(file).lines();
+    let header = lines
+        .next()
+        .transpose()
+        .map_err(|err| format!("compound_identifier_index_read_failed:{err}"))?
+        .unwrap_or_default();
+    if header.trim_start_matches('\u{feff}')
+        != "identifier_type\tidentifier\tcanonical_smiles\tdisplay_name\tsource"
+    {
+        return Err("compound_identifier_index_schema_mismatch".to_string());
+    }
+    for (index, line) in lines.enumerate() {
+        let line = line.map_err(|err| format!("compound_identifier_index_read_failed:{err}"))?;
+        if line.trim().is_empty() {
+            continue;
+        }
+        let columns = line.split('\t').collect::<Vec<_>>();
+        if columns.len() != 5 {
+            return Err(format!(
+                "compound_identifier_index_invalid_row:{}",
+                index + 2
+            ));
+        }
+        if !columns[0].eq_ignore_ascii_case(identifier_type) {
+            continue;
+        }
+        let row_identifier = match identifier_type {
+            "cas" => normalize_cas_identifier(columns[1])
+                .map_err(|reason| format!("compound_identifier_index_{reason}:{}", index + 2))?,
+            "name" => normalize_compound_name(columns[1]),
+            _ => continue,
+        };
+        if row_identifier == identifier {
+            return Ok(Some(columns[2].to_string()));
+        }
+    }
+    Ok(None)
+}
+
 fn resolve_coordinate_file(
     path: &Path,
     format: &str,
@@ -793,77 +996,36 @@ fn looks_like_cas_number(value: &str) -> bool {
         && parts[2].chars().all(|ch| ch.is_ascii_digit())
 }
 
-fn looks_like_smiles_text(value: &str) -> bool {
-    let text = value.trim();
-    if text.is_empty() || text.chars().any(char::is_whitespace) {
-        return false;
+fn normalize_cas_identifier(value: &str) -> Result<String, &'static str> {
+    let normalized = value.trim();
+    if !looks_like_cas_number(normalized) {
+        return Err("invalid_cas_format");
     }
-    if !text.chars().all(|ch| {
-        ch.is_ascii_alphanumeric()
-            || matches!(
-                ch,
-                '[' | ']' | '(' | ')' | '=' | '#' | '@' | '+' | '-' | '\\' | '/' | '%' | '.' | ':'
-            )
-    }) {
-        return false;
+    let digits = normalized
+        .bytes()
+        .filter(u8::is_ascii_digit)
+        .map(|byte| usize::from(byte - b'0'))
+        .collect::<Vec<_>>();
+    let check_digit = *digits.last().ok_or("invalid_cas_format")?;
+    let expected = digits[..digits.len() - 1]
+        .iter()
+        .rev()
+        .enumerate()
+        .map(|(index, digit)| (index + 1) * digit)
+        .sum::<usize>()
+        % 10;
+    if check_digit != expected {
+        return Err("invalid_cas_check_digit");
     }
-    let mut saw_atom = false;
-    let chars = text.chars().collect::<Vec<_>>();
-    let mut index = 0usize;
-    while index < chars.len() {
-        let ch = chars[index];
-        if ch.is_ascii_uppercase() {
-            let mut symbol = ch.to_string();
-            if index + 1 < chars.len() && chars[index + 1].is_ascii_lowercase() {
-                symbol.push(chars[index + 1]);
-                if valid_element_symbol(&symbol) {
-                    saw_atom = true;
-                    index += 2;
-                    continue;
-                }
-            }
-            let single = ch.to_string();
-            if valid_element_symbol(&single) {
-                saw_atom = true;
-                index += 1;
-                continue;
-            }
-            return false;
-        }
-        if matches!(ch, 'b' | 'c' | 'n' | 'o' | 'p' | 's') {
-            saw_atom = true;
-            index += 1;
-            continue;
-        }
-        if ch.is_ascii_lowercase() {
-            return false;
-        }
-        index += 1;
-    }
-    saw_atom
+    Ok(normalized.to_string())
 }
 
-fn valid_element_symbol(symbol: &str) -> bool {
-    matches!(
-        symbol,
-        "B" | "C"
-            | "N"
-            | "O"
-            | "P"
-            | "S"
-            | "F"
-            | "I"
-            | "H"
-            | "Cl"
-            | "Br"
-            | "Na"
-            | "K"
-            | "Li"
-            | "Mg"
-            | "Ca"
-            | "Zn"
-            | "Fe"
-    )
+fn normalize_compound_name(value: &str) -> String {
+    value
+        .to_lowercase()
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 fn is_nucleotide_symbol(ch: char) -> bool {

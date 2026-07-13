@@ -54,6 +54,18 @@ def molecule_records_from_path(path: Path, fmt: str) -> list[dict[str, object]]:
     raise ValueError(f"unsupported_molecule_format:{fmt}")
 
 
+def molecule_record_from_text(text: str, fmt: str) -> dict[str, object]:
+    if fmt == "smiles":
+        mol = Chem.MolFromSmiles(text)
+    elif fmt == "inchi":
+        mol = Chem.MolFromInchi(text)
+    else:
+        raise ValueError(f"unsupported_molecule_text_format:{fmt}")
+    if mol is None:
+        raise ValueError(f"rdkit_{fmt}_parse_failed")
+    return canonical_molecule_record(mol, 1)
+
+
 def structure_summary_from_path(path: Path, fmt: str) -> dict[str, int]:
     from openmm.app import PDBFile, PDBxFile
 
@@ -75,14 +87,20 @@ def structure_summary_from_path(path: Path, fmt: str) -> dict[str, int]:
 
 def main() -> int:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--path", required=True)
+    source = parser.add_mutually_exclusive_group(required=True)
+    source.add_argument("--path")
+    source.add_argument("--text-hex")
     parser.add_argument("--format", required=True)
     args = parser.parse_args()
-    path = Path(args.path)
     fmt = args.format.lower()
-    if fmt in {"sdf", "mol", "mol2"}:
+    if args.text_hex is not None:
+        text = bytes.fromhex(args.text_hex).decode("utf-8")
+        result = {"records": [molecule_record_from_text(text, fmt)]}
+    elif fmt in {"sdf", "mol", "mol2"}:
+        path = Path(args.path)
         result = {"records": molecule_records_from_path(path, fmt)}
     elif fmt in {"pdb", "cif", "mmcif", "ent"}:
+        path = Path(args.path)
         result = {"structure": structure_summary_from_path(path, fmt)}
     else:
         raise ValueError(f"unsupported_input_format:{fmt}")

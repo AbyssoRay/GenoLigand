@@ -56,6 +56,65 @@ pub struct ScienceOptions {
 }
 
 #[derive(Clone, Debug)]
+pub struct InputInspectionRow {
+    pub input_id: String,
+    pub record_id: String,
+    pub canonical_kind: String,
+    pub conversion_method: String,
+}
+
+#[derive(Clone, Debug)]
+pub struct InputInspection {
+    pub usable: bool,
+    pub summary: String,
+    pub errors: Vec<String>,
+    pub inputs: Vec<InputInspectionRow>,
+}
+
+pub fn inspect_input_manifest(options: &ScienceOptions) -> Result<InputInspection, String> {
+    let conversions = convert_inputs_from_manifest(options)?;
+    let errors = conversions
+        .iter()
+        .filter(|input| input.conversion_status == "failed")
+        .map(|input| {
+            format!(
+                "{}:{}:{}",
+                input.input_id,
+                clean_cell(&input.record_id),
+                clean_cell(&input.reason)
+            )
+        })
+        .collect::<Vec<_>>();
+    let inputs = conversions
+        .iter()
+        .map(|input| InputInspectionRow {
+            input_id: input.input_id.clone(),
+            record_id: input.record_id.clone(),
+            canonical_kind: input
+                .canonical_kind
+                .map(InputKind::as_str)
+                .unwrap_or("unknown")
+                .to_string(),
+            conversion_method: input.conversion_method.to_string(),
+        })
+        .collect::<Vec<_>>();
+    let usable = !inputs.is_empty() && errors.is_empty();
+    let summary = if inputs.is_empty() {
+        "no non-project input records".to_string()
+    } else if errors.is_empty() {
+        format!("{} input records ready", inputs.len())
+    } else {
+        format!("{} of {} input records failed", errors.len(), inputs.len())
+    };
+    Ok(InputInspection {
+        usable,
+        summary,
+        errors,
+        inputs,
+    })
+}
+
+#[derive(Clone, Debug)]
 pub struct StoreOptions {
     pub workspace_root: PathBuf,
     pub science_store: PathBuf,
