@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import math
+import os
 import platform
 import sys
 from datetime import datetime, timezone
@@ -114,7 +116,7 @@ def cmd_embed(args) -> None:
         candidate_id = row["candidate_id"]
         record = record_by_id[candidate_id]
         vector = row["vector"]
-        vector_path = vectors_dir / f"{safe_id(candidate_id)}.mean.npy"
+        vector_path = (vectors_dir / embedding_filename(candidate_id)).resolve()
         write_npy_float32(vector_path, vector)
         mean_abs, l2_norm = vector_stats(vector)
         manifest_rows.append(
@@ -169,9 +171,15 @@ def cmd_summarize(args) -> None:
 
 
 def cmd_validate(args) -> None:
-    rows = read_tsv(args.manifest)
+    validate_manifest(args.manifest)
+
+
+def validate_manifest(manifest: str | Path) -> None:
+    manifest_path = Path(manifest).resolve()
+    rows = read_tsv(manifest_path)
     if not rows:
         raise SystemExit("manifest_has_no_rows")
+    embedding_references: dict[str, str] = {}
     for row in rows:
         candidate_id = row.get("candidate_id", "")
         for required in ["model_id", "backend", "device_resolved", "embedding_dim", "plm_status"]:
@@ -180,10 +188,29 @@ def cmd_validate(args) -> None:
         if row["plm_status"] == "success":
             if not row.get("embedding_sha256"):
                 raise SystemExit(f"manifest_missing_embedding_sha256:{candidate_id}")
+            if not row.get("embedding_file"):
+                raise SystemExit(f"manifest_missing_embedding_file:{candidate_id}")
+            vector_path = Path(row["embedding_file"])
+            if not vector_path.is_absolute():
+                vector_path = manifest_path.parent / vector_path
+            vector_path = vector_path.resolve()
+            reference = os.path.normcase(str(vector_path))
+            previous_candidate = embedding_references.get(reference)
+            if previous_candidate is not None:
+                raise SystemExit(
+                    f"manifest_embedding_reference_collision:{candidate_id}:{previous_candidate}"
+                )
+            embedding_references[reference] = candidate_id
+            try:
+                actual_sha256 = sha256_file(vector_path)
+            except OSError as exc:
+                raise SystemExit(f"manifest_embedding_unreadable:{candidate_id}:{exc}") from exc
+            if actual_sha256.lower() != row["embedding_sha256"].strip().lower():
+                raise SystemExit(f"manifest_embedding_sha256_mismatch:{candidate_id}")
             dim = int(row["embedding_dim"])
             if dim <= 0:
                 raise SystemExit(f"manifest_bad_embedding_dim:{candidate_id}")
-            vector = read_npy_float32(row["embedding_file"])
+            vector = read_npy_float32(vector_path)
             if len(vector) != dim:
                 raise SystemExit(f"manifest_vector_dim_mismatch:{candidate_id}")
             if not all_finite(vector):
@@ -197,6 +224,12 @@ def cmd_validate(args) -> None:
 
 def safe_id(value: str) -> str:
     return "".join(ch if ch.isalnum() or ch in "._-" else "_" for ch in value)
+
+
+def embedding_filename(candidate_id: str) -> str:
+    readable_id = safe_id(candidate_id)[:80] or "candidate"
+    content_digest = hashlib.sha256(candidate_id.encode("utf-8")).hexdigest()
+    return f"{readable_id}.{content_digest}.mean.npy"
 
 
 def now_utc() -> str:
