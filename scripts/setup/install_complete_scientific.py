@@ -139,6 +139,8 @@ DOWNLOAD_TIMEOUT_SECONDS = 120
 DOWNLOAD_USER_AGENT = "GenoLigand-science-store-installer/0.9"
 RCSB_DOWNLOAD_WORKERS = 20
 ProgressCallback = Callable[[str, int, int | None, str], None]
+ResourceSignature = tuple[str, int, int, int, int, int, str]
+ResourceSummaryCache = dict[str, tuple[tuple[ResourceSignature, ...], dict[str, object]]]
 
 
 def urlopen_with_compatible_tls(request: urllib.request.Request, timeout: int):
@@ -1823,9 +1825,24 @@ def copy_or_download(
     observed_bytes: int | None = None,
 ) -> dict[str, object]:
     destination.parent.mkdir(parents=True, exist_ok=True)
+    partial = destination.with_suffix(destination.suffix + ".part")
+    cleanup_partial_quarantines(partial)
+    local_source: Path | None = None
+    declared_local_source: Path | None = None
+    if url.startswith("file://"):
+        declared_local_source = Path(urllib.request.url2pathname(url[7:]))
+        if declared_local_source.is_file():
+            local_source = declared_local_source
+    else:
+        candidate = Path(url)
+        if candidate.is_file():
+            local_source = candidate
     observed_trusted = bool(observed_sha256) and observed_bytes is not None and observed_bytes > 0
     trusted_sha256 = expected_sha256 or (observed_sha256 if observed_trusted else None)
     trusted_bytes = observed_bytes if not expected_sha256 and observed_trusted else None
+    if expected_sha256 is None and local_source is not None:
+        trusted_sha256 = sha256_file(local_source)
+        trusted_bytes = local_source.stat().st_size
     if destination.exists() and destination.stat().st_size > 0:
         if progress:
             progress(
@@ -1857,17 +1874,11 @@ def copy_or_download(
                 destination.stat().st_size,
                 "已下载资源校验不一致，正在重新下载",
             )
-    partial = destination.with_suffix(destination.suffix + ".part")
-    if url.startswith("file://"):
-        source = Path(urllib.request.url2pathname(url[7:]))
+    if declared_local_source is not None and local_source is None:
+        raise FileNotFoundError(f"local resource source is missing: {declared_local_source}")
+    if local_source is not None:
+        source = local_source
         total = source.stat().st_size if source.exists() else None
-        if progress:
-            progress("copying", 0, total, "正在复制本地资源")
-        with source.open("rb") as source_handle, partial.open("wb") as target_handle:
-            copy_with_progress(source_handle, target_handle, bytes_total=total, progress=progress)
-    elif Path(url).exists():
-        source = Path(url)
-        total = source.stat().st_size
         if progress:
             progress("copying", 0, total, "正在复制本地资源")
         with source.open("rb") as source_handle, partial.open("wb") as target_handle:
@@ -1912,9 +1923,15 @@ def copy_or_download(
 def quarantine_partial(partial: Path) -> Path | None:
     if not partial.exists():
         return None
-    quarantine = Path(f"{partial}.quarantine-{time.time_ns()}")
-    partial.replace(quarantine)
-    return quarantine
+    partial.unlink()
+    cleanup_partial_quarantines(partial)
+    return None
+
+
+def cleanup_partial_quarantines(partial: Path) -> None:
+    for quarantine in partial.parent.glob(f"{partial.name}.quarantine-*"):
+        if quarantine.is_file():
+            quarantine.unlink()
 
 
 def download_http_resource(
@@ -2262,7 +2279,9 @@ def sync_html_links(
         if progress:
             progress("downloading", index - 1, len(links), f"正在同步资源 {index}/{len(links)}")
         try:
-            copy_or_download(link, destination, row.get("sha256", "") or None, progress)
+            result = copy_or_download(link, destination, row.get("sha256", "") or None, progress)
+            if result.get("status") != "ready":
+                failures.append(f"{link}:status={result.get('status', 'unknown')}")
         except Exception as err:  # noqa: BLE001 - report per-source install failure
             failures.append(f"{link}:{err}")
     if failures:
@@ -2328,8 +2347,11 @@ def sync_html_tree(row: dict[str, str], target: Path) -> dict[str, object]:
                 continue
             destination = current_target / name
             try:
-                copy_or_download(absolute, destination, row.get("sha256", "") or None)
-                downloaded += 1
+                result = copy_or_download(absolute, destination, row.get("sha256", "") or None)
+                if result.get("status") == "ready":
+                    downloaded += 1
+                else:
+                    failures.append(f"{absolute}:status={result.get('status', 'unknown')}")
             except Exception as err:  # noqa: BLE001 - report per-file failure
                 failures.append(f"{absolute}:{err}")
     if failures:
@@ -2388,8 +2410,11 @@ def sync_gcs_prefix(
             if progress:
                 progress("downloading", downloaded, None, f"正在同步对象 {rel_name}")
             try:
-                copy_or_download(media_url, destination, None, progress)
-                downloaded += 1
+                result = copy_or_download(media_url, destination, None, progress)
+                if result.get("status") == "ready":
+                    downloaded += 1
+                else:
+                    failures.append(f"{name}:status={result.get('status', 'unknown')}")
             except Exception as err:  # noqa: BLE001 - report per-source install failure
                 failures.append(f"{name}:{err}")
         page_token = payload.get("nextPageToken", "")
@@ -2452,8 +2477,10 @@ def sync_rcsb_ligand_bound_scope(
             return upper, True, "already_available"
         url = template.replace("{pdb_id}", upper).replace("{pdb_id_lower}", upper.lower())
         try:
-            copy_or_download(url, destination, None)
-            return upper, True, "downloaded"
+            result = copy_or_download(url, destination, None)
+            if result.get("status") == "ready":
+                return upper, True, "downloaded"
+            return upper, False, f"status={result.get('status', 'unknown')}"
         except Exception as err:  # noqa: BLE001 - keep per-entry provenance in install manifest
             return upper, False, str(err)
 
@@ -2657,6 +2684,9 @@ def external_plan_digest(row: dict[str, str]) -> str:
         "target_rel_path",
         "ready_marker",
         "include_pattern",
+        "max_depth",
+        "gcs_bucket",
+        "gcs_prefix",
         "release_or_date",
         "sha256",
     ]
@@ -2972,9 +3002,10 @@ def build_persistent_alignment_databases(
     science_store: Path,
     env: dict[str, str] | None = None,
     wsl_distro: str | None = None,
+    summary_cache: ResourceSummaryCache | None = None,
 ) -> dict[str, object]:
-    mmseqs_rows = build_mmseqs_target_databases(science_store, env, wsl_distro)
-    foldseek_rows = build_foldseek_target_database(science_store, env, wsl_distro)
+    mmseqs_rows = build_mmseqs_target_databases(science_store, env, wsl_distro, summary_cache)
+    foldseek_rows = build_foldseek_target_database(science_store, env, wsl_distro, summary_cache)
     all_rows = [*mmseqs_rows, *foldseek_rows]
     ready = sum(1 for row in all_rows if row.get("status") == "ready")
     failed = sum(1 for row in all_rows if row.get("status") == "failed")
@@ -3029,7 +3060,12 @@ def ensure_openff_forcefield_file(science_store: Path) -> dict[str, object]:
     }
 
 
-def build_mmseqs_target_databases(science_store: Path, env: dict[str, str] | None, wsl_distro: str | None) -> list[dict[str, str]]:
+def build_mmseqs_target_databases(
+    science_store: Path,
+    env: dict[str, str] | None,
+    wsl_distro: str | None,
+    summary_cache: ResourceSummaryCache | None = None,
+) -> list[dict[str, str]]:
     index_root = science_store / "indexes" / "mmseqs"
     manifest = index_root / "mmseqs_target_databases.tsv"
     previous_rows = {row.get("source_id", ""): row for row in read_tsv(manifest)}
@@ -3039,7 +3075,7 @@ def build_mmseqs_target_databases(science_store: Path, env: dict[str, str] | Non
     rows: list[dict[str, str]] = []
     for label, source in sequence_database_sources(science_store):
         db_path = index_root / safe_file_stem(label) / "target"
-        source_summary = resource_payload_summary(source)
+        source_summary = resource_payload_summary(source, cache=summary_cache)
         source_fields = alignment_source_manifest_fields(source_summary, builder_version)
         force_rebuild = database_artifacts_present(db_path) and not alignment_source_manifest_matches(
             previous_rows.get(label, {}), source_summary, builder_version
@@ -3103,7 +3139,12 @@ def alignment_db_max_source_bytes() -> int:
         return DEFAULT_ALIGNMENT_DB_MAX_SOURCE_BYTES
 
 
-def build_foldseek_target_database(science_store: Path, env: dict[str, str] | None, wsl_distro: str | None) -> list[dict[str, str]]:
+def build_foldseek_target_database(
+    science_store: Path,
+    env: dict[str, str] | None,
+    wsl_distro: str | None,
+    summary_cache: ResourceSummaryCache | None = None,
+) -> list[dict[str, str]]:
     index_root = science_store / "indexes" / "foldseek"
     manifest = index_root / "foldseek_target_databases.tsv"
     previous_rows = {row.get("source_id", ""): row for row in read_tsv(manifest)}
@@ -3112,7 +3153,7 @@ def build_foldseek_target_database(science_store: Path, env: dict[str, str] | No
     builder_version = database_builder_version("foldseek", command, env, wsl_distro)
     source = science_store / "downloads" / "rcsb" / "mmcif"
     db_path = index_root / "rcsb_mmcif" / "target"
-    source_summary = resource_payload_summary(source)
+    source_summary = resource_payload_summary(source, cache=summary_cache)
     source_fields = alignment_source_manifest_fields(source_summary, builder_version)
     force_rebuild = database_artifacts_present(db_path) and not alignment_source_manifest_matches(
         previous_rows.get("rcsb_mmcif", {}), source_summary, builder_version
@@ -3184,12 +3225,11 @@ def build_mmseqs_database(
         return "failed", "source_missing"
     if command is None and not (os.name == "nt" and wsl_distro):
         return "failed", "mmseqs_executable_missing"
-    if force_rebuild:
-        reset_database_directory(db_path)
-    if database_prefix_ready("mmseqs", db_path, command, env, wsl_distro):
+    artifacts_present = database_artifacts_present(db_path)
+    if artifacts_present and not force_rebuild and database_prefix_ready("mmseqs", db_path, command, env, wsl_distro):
         return "ready", "already_available"
-    if database_artifacts_present(db_path):
-        reset_database_directory(db_path)
+    if artifacts_present:
+        return rebuild_mmseqs_database(command, source, db_path, env, wsl_distro)
     db_path.parent.mkdir(parents=True, exist_ok=True)
     tmp = db_path.parent / "tmp"
     tmp.mkdir(parents=True, exist_ok=True)
@@ -3225,12 +3265,11 @@ def build_foldseek_database(
         return "failed", "source_missing"
     if command is None and not (os.name == "nt" and wsl_distro):
         return "failed", "foldseek_executable_missing"
-    if force_rebuild:
-        reset_database_directory(db_path)
-    if database_prefix_ready("foldseek", db_path, command, env, wsl_distro):
+    artifacts_present = database_artifacts_present(db_path)
+    if artifacts_present and not force_rebuild and database_prefix_ready("foldseek", db_path, command, env, wsl_distro):
         return "ready", "already_available"
-    if database_artifacts_present(db_path):
-        reset_database_directory(db_path)
+    if artifacts_present:
+        return rebuild_foldseek_database(command, source, db_path, env, wsl_distro)
     db_path.parent.mkdir(parents=True, exist_ok=True)
     tmp = db_path.parent / "tmp"
     tmp.mkdir(parents=True, exist_ok=True)
@@ -3251,6 +3290,82 @@ def build_foldseek_database(
     if indexed.returncode != 0:
         return database_ready_after_index_failure("foldseek", db_path, indexed, command, env, wsl_distro)
     return database_ready_after_build("foldseek", db_path, command, env, wsl_distro, "foldseek_createdb_createindex_completed")
+
+
+def rebuild_mmseqs_database(
+    command: str | None,
+    source: Path,
+    db_path: Path,
+    env: dict[str, str] | None,
+    wsl_distro: str | None,
+) -> tuple[str, str]:
+    staged_db = staged_database_path(db_path)
+    try:
+        status, notes = build_mmseqs_database(command, source, staged_db, env, wsl_distro)
+        if status != "ready":
+            return "failed", f"rebuild_failed_previous_preserved:{notes}"
+        cleanup_complete = publish_database_directory(staged_db, db_path)
+        cleanup_note = "" if cleanup_complete else ";previous_backup_cleanup_pending"
+        return "ready", f"atomic_rebuild_completed:{notes}{cleanup_note}"
+    except Exception as err:  # noqa: BLE001 - preserve the current database and report repair failure
+        return "failed", f"rebuild_failed_previous_preserved:{exception_note(err)}"
+    finally:
+        if staged_db.parent.exists():
+            shutil.rmtree(staged_db.parent)
+
+
+def rebuild_foldseek_database(
+    command: str | None,
+    source: Path,
+    db_path: Path,
+    env: dict[str, str] | None,
+    wsl_distro: str | None,
+) -> tuple[str, str]:
+    staged_db = staged_database_path(db_path)
+    try:
+        status, notes = build_foldseek_database(command, source, staged_db, env, wsl_distro)
+        if status != "ready":
+            return "failed", f"rebuild_failed_previous_preserved:{notes}"
+        cleanup_complete = publish_database_directory(staged_db, db_path)
+        cleanup_note = "" if cleanup_complete else ";previous_backup_cleanup_pending"
+        return "ready", f"atomic_rebuild_completed:{notes}{cleanup_note}"
+    except Exception as err:  # noqa: BLE001 - preserve the current database and report repair failure
+        return "failed", f"rebuild_failed_previous_preserved:{exception_note(err)}"
+    finally:
+        if staged_db.parent.exists():
+            shutil.rmtree(staged_db.parent)
+
+
+def staged_database_path(db_path: Path) -> Path:
+    parent = db_path.parent
+    staged_parent = parent.with_name(f".{parent.name}.rebuild-{os.getpid()}-{time.time_ns()}")
+    return staged_parent / db_path.name
+
+
+def publish_database_directory(staged_db: Path, db_path: Path) -> bool:
+    staged_parent = staged_db.parent
+    live_parent = db_path.parent
+    backup = live_parent.with_name(f".{live_parent.name}.previous-{os.getpid()}-{time.time_ns()}")
+    if backup.exists():
+        shutil.rmtree(backup)
+    if live_parent.exists():
+        live_parent.replace(backup)
+    try:
+        staged_parent.replace(live_parent)
+    except Exception:
+        if backup.exists() and not live_parent.exists():
+            backup.replace(live_parent)
+        raise
+    if backup.exists():
+        try:
+            shutil.rmtree(backup)
+        except OSError:
+            return False
+    return True
+
+
+def exception_note(err: Exception) -> str:
+    return str(err).replace("\t", " ").replace("\r", " ").replace("\n", " ")[:240] or type(err).__name__
 
 
 def database_ready_after_index_failure(
@@ -3317,7 +3432,18 @@ def database_prefix_ready(
     companions = [prefix, Path(f"{prefix}.dbtype"), Path(f"{prefix}.index"), Path(f"{prefix}.lookup")]
     if any(not path.is_file() or path.stat().st_size <= 0 for path in companions):
         return False
-    return database_smoke_query(tool, prefix, command, env, wsl_distro)
+    if Path(f"{prefix}.dbtype").stat().st_size != 4:
+        return False
+    index_companions = {Path(f"{prefix}.idx"), Path(f"{prefix}.idx.dbtype"), Path(f"{prefix}.idx.index")}
+    index_artifacts = {path for path in prefix.parent.glob(f"{prefix.name}.idx*") if path.is_file()}
+    if index_artifacts and index_artifacts != index_companions:
+        return False
+    index_present = bool(index_artifacts)
+    if index_present and any(path.stat().st_size <= 0 for path in index_companions):
+        return False
+    if index_present and Path(f"{prefix}.idx.dbtype").stat().st_size != 4:
+        return False
+    return database_smoke_query(tool, prefix, command, env, wsl_distro, validate_index=index_present)
 
 
 def database_smoke_query(
@@ -3326,41 +3452,161 @@ def database_smoke_query(
     command: str | None,
     env: dict[str, str] | None,
     wsl_distro: str | None,
+    *,
+    validate_index: bool = False,
 ) -> bool:
-    lookup = Path(f"{prefix}.lookup")
-    smoke_ids: list[str] = []
-    for line in lookup.read_text(encoding="utf-8", errors="replace").splitlines():
-        if line.strip():
-            smoke_ids.append(line.split("\t", 1)[0].strip())
-        if len(smoke_ids) == 64:
-            break
-    if not smoke_ids:
-        return False
     smoke_root = prefix.parent / f".smoke-{tool}-{os.getpid()}-{time.time_ns()}"
     smoke_root.mkdir(parents=True, exist_ok=False)
-    ids = smoke_root / "ids.tsv"
     subset = smoke_root / "subset"
     result = smoke_root / "result"
     tmp = smoke_root / "tmp"
-    ids.write_text("".join(f"{record_id}\n" for record_id in smoke_ids), encoding="utf-8")
     try:
+        if not copy_database_subset(prefix, subset):
+            return False
         if os.name == "nt" and wsl_distro:
             commands = [
-                [tool, "createsubdb", wsl_path(ids), wsl_path(prefix), wsl_path(subset)],
                 [tool, "search", wsl_path(subset), wsl_path(subset), wsl_path(result), wsl_path(tmp), "--threads", "1", "--max-seqs", "1"],
             ]
+            if validate_index:
+                commands.append(
+                    [tool, "view", f"{wsl_path(prefix)}.idx", "--id-list", "0", "--idx-entry-type", "0"]
+                )
             return all(run_wsl_database_command(wsl_distro, item).returncode == 0 for item in commands)
         if command is None:
             return False
         local_commands = [
-            [command, "createsubdb", str(ids), str(prefix), str(subset)],
             [command, "search", str(subset), str(subset), str(result), str(tmp), "--threads", "1", "--max-seqs", "1"],
         ]
+        if validate_index:
+            local_commands.append(
+                [command, "view", f"{prefix}.idx", "--id-list", "0", "--idx-entry-type", "0"]
+            )
         return all(run_command(item, env=env).returncode == 0 for item in local_commands)
     except (OSError, UnicodeError):
         return False
     finally:
         shutil.rmtree(smoke_root, ignore_errors=True)
+
+
+def copy_database_subset(prefix: Path, subset: Path) -> bool:
+    max_records = 64
+    max_index_lines = 4096
+    max_bytes = 128 * 1024 * 1024
+    try:
+        base_entries = database_index_entries(Path(f"{prefix}.index"), None, max_records, max_index_lines)
+        if not base_entries:
+            return False
+        ordered_keys = [entry[0] for entry in base_entries]
+        selected_keys = set(ordered_keys)
+        lookup_rows = database_lookup_rows(Path(f"{prefix}.lookup"), ordered_keys, max_index_lines)
+        if not lookup_rows:
+            return False
+        copied_bytes = copy_database_component(prefix, subset, base_entries, max_bytes)
+        for suffix in ("_h", "_ss", "_ss_h", "_ca"):
+            source_component = Path(f"{prefix}{suffix}")
+            if not source_component.exists() or source_component.stat().st_size == 0:
+                continue
+            entries = database_index_entries(
+                Path(f"{source_component}.index"), selected_keys, max_records, max_index_lines
+            )
+            if not entries or {entry[0] for entry in entries} != selected_keys:
+                return False
+            copied_bytes += copy_database_component(
+                source_component,
+                Path(f"{subset}{suffix}"),
+                entries,
+                max_bytes - copied_bytes,
+            )
+        Path(f"{subset}.lookup").write_text("".join(lookup_rows), encoding="utf-8")
+        return copied_bytes <= max_bytes
+    except (OSError, UnicodeError, ValueError):
+        return False
+
+
+def database_index_entries(
+    index_path: Path,
+    selected_keys: set[str] | None,
+    max_records: int,
+    max_lines: int,
+) -> list[tuple[str, int, int]]:
+    entries: list[tuple[str, int, int]] = []
+    wanted = set(selected_keys) if selected_keys is not None else None
+    with index_path.open("r", encoding="ascii", errors="strict") as handle:
+        for _ in range(max_lines):
+            line = handle.readline(4096)
+            if not line:
+                break
+            if len(line) == 4096 and not line.endswith("\n"):
+                raise ValueError("database index line exceeds smoke limit")
+            fields = line.rstrip("\r\n").split("\t")
+            if len(fields) < 3:
+                raise ValueError("database index row is incomplete")
+            key, offset_text, length_text = fields[:3]
+            if wanted is not None and key not in wanted:
+                continue
+            offset = int(offset_text)
+            length = int(length_text)
+            if offset < 0 or length <= 0:
+                raise ValueError("database index row has invalid bounds")
+            entries.append((key, offset, length))
+            if wanted is None and len(entries) >= max_records:
+                break
+            if wanted is not None:
+                wanted.discard(key)
+                if not wanted:
+                    break
+    return entries
+
+
+def database_lookup_rows(lookup_path: Path, ordered_keys: list[str], max_lines: int) -> list[str]:
+    wanted = set(ordered_keys)
+    rows: dict[str, str] = {}
+    with lookup_path.open("r", encoding="utf-8", errors="strict") as handle:
+        for _ in range(max_lines):
+            line = handle.readline(4096)
+            if not line:
+                break
+            if len(line) == 4096 and not line.endswith("\n"):
+                raise ValueError("database lookup line exceeds smoke limit")
+            fields = line.rstrip("\r\n").split("\t")
+            if len(fields) < 3:
+                raise ValueError("database lookup row is incomplete")
+            key = fields[0]
+            if key in wanted:
+                rows[key] = line if line.endswith("\n") else f"{line}\n"
+                wanted.discard(key)
+                if not wanted:
+                    break
+    return [rows[key] for key in ordered_keys] if not wanted else []
+
+
+def copy_database_component(
+    source: Path,
+    destination: Path,
+    entries: list[tuple[str, int, int]],
+    max_bytes: int,
+) -> int:
+    dbtype = Path(f"{source}.dbtype")
+    if not dbtype.is_file() or dbtype.stat().st_size != 4:
+        raise ValueError("database component type is invalid")
+    total_bytes = sum(length for _key, _offset, length in entries)
+    if total_bytes <= 0 or total_bytes > max_bytes:
+        raise ValueError("database smoke subset exceeds byte limit")
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    new_offset = 0
+    index_rows: list[str] = []
+    with source.open("rb") as source_handle, destination.open("wb") as destination_handle:
+        for key, offset, length in entries:
+            source_handle.seek(offset)
+            payload = source_handle.read(length)
+            if len(payload) != length:
+                raise ValueError("database component record is truncated")
+            destination_handle.write(payload)
+            index_rows.append(f"{key}\t{new_offset}\t{length}\n")
+            new_offset += length
+    shutil.copyfile(dbtype, Path(f"{destination}.dbtype"))
+    Path(f"{destination}.index").write_text("".join(index_rows), encoding="ascii")
+    return total_bytes
 
 
 def database_builder_version(
@@ -3401,11 +3647,6 @@ def database_artifacts_present(db_path: Path) -> bool:
     return db_path.parent.is_dir() and any(
         child.name == db_path.name or child.name.startswith(f"{db_path.name}.") for child in db_path.parent.iterdir()
     )
-
-
-def reset_database_directory(db_path: Path) -> None:
-    if db_path.parent.exists():
-        shutil.rmtree(db_path.parent)
 
 
 def safe_file_stem(value: str) -> str:
@@ -3477,9 +3718,55 @@ def file_count(path: Path) -> int:
     return sum(1 for child in path.rglob("*") if child.is_file())
 
 
+def file_change_token(path: Path, stat: os.stat_result) -> str:
+    if os.name != "nt":
+        return f"ctime:{stat.st_ctime_ns}"
+    try:
+        import ctypes
+        import msvcrt
+
+        device_io_control = ctypes.windll.kernel32.DeviceIoControl
+        device_io_control.argtypes = [
+            ctypes.c_void_p,
+            ctypes.c_uint32,
+            ctypes.c_void_p,
+            ctypes.c_uint32,
+            ctypes.c_void_p,
+            ctypes.c_uint32,
+            ctypes.POINTER(ctypes.c_uint32),
+            ctypes.c_void_p,
+        ]
+        device_io_control.restype = ctypes.c_int
+        output = ctypes.create_string_buffer(1024)
+        returned = ctypes.c_uint32()
+        with path.open("rb") as handle:
+            succeeded = device_io_control(
+                ctypes.c_void_p(msvcrt.get_osfhandle(handle.fileno())),
+                0x000900EB,  # FSCTL_READ_FILE_USN_DATA
+                None,
+                0,
+                output,
+                len(output),
+                ctypes.byref(returned),
+                None,
+            )
+        if not succeeded or returned.value < 32:
+            return ""
+        major_version = int.from_bytes(output.raw[4:6], "little")
+        usn_offset = 24 if major_version == 2 else 40 if major_version in {3, 4} else -1
+        if usn_offset < 0 or returned.value < usn_offset + 8:
+            return ""
+        usn = int.from_bytes(output.raw[usn_offset : usn_offset + 8], "little", signed=True)
+        return f"usn:{major_version}:{usn}"
+    except (AttributeError, OSError, ValueError):
+        return ""
+
+
 def resource_payload_summary(
     path: Path,
     progress: Callable[[int, int | None, str], None] | None = None,
+    *,
+    cache: ResourceSummaryCache | None = None,
 ) -> dict[str, object]:
     if path.is_file():
         files = [path]
@@ -3489,16 +3776,36 @@ def resource_payload_summary(
         root = path
     else:
         return {"file_count": 0, "bytes": 0, "sha256": ""}
-    total_bytes = sum(child.stat().st_size for child in files)
+    signature_rows: list[ResourceSignature] = []
+    for child in files:
+        stat = child.stat()
+        signature_rows.append(
+            (
+                child.name if path.is_file() else child.relative_to(root).as_posix(),
+                stat.st_size,
+                stat.st_mtime_ns,
+                stat.st_ctime_ns,
+                stat.st_dev,
+                stat.st_ino,
+                file_change_token(child, stat),
+            )
+        )
+    signature = tuple(signature_rows)
+    cacheable = all(entry[6] for entry in signature)
+    cache_key = str(path.resolve())
+    cached = cache.get(cache_key) if cache is not None else None
+    if cacheable and cached is not None and cached[0] == signature:
+        return dict(cached[1])
+    total_bytes = sum(entry[1] for entry in signature)
     if not files or total_bytes <= 0:
         return {"file_count": 0, "bytes": 0, "sha256": ""}
     digest = hashlib.sha256()
     bytes_done = 0
     if progress:
         progress(0, total_bytes, "正在记录来源文件")
-    for child in files:
-        rel = child.name if path.is_file() else child.relative_to(root).as_posix()
-        size = child.stat().st_size
+    for child, entry in zip(files, signature, strict=True):
+        rel = entry[0]
+        size = entry[1]
         digest.update(rel.encode("utf-8"))
         digest.update(str(size).encode("ascii"))
 
@@ -3510,7 +3817,12 @@ def resource_payload_summary(
         bytes_done += size
         if progress:
             progress(bytes_done, total_bytes, f"已记录 {rel}")
-    return {"file_count": len(files), "bytes": total_bytes, "sha256": digest.hexdigest()}
+    summary: dict[str, object] = {"file_count": len(files), "bytes": total_bytes, "sha256": digest.hexdigest()}
+    if cache is not None and cacheable:
+        cache[cache_key] = (signature, dict(summary))
+    elif cache is not None:
+        cache.pop(cache_key, None)
+    return summary
 
 
 def write_science_resource_manifests(
@@ -3518,6 +3830,7 @@ def write_science_resource_manifests(
     source_sync_plan: Path,
     science_store: Path,
     progress: Callable[[str, int, int | None, str], None] | None = None,
+    summary_cache: ResourceSummaryCache | None = None,
 ) -> dict[str, object]:
     manifest_dir = science_store / "manifests"
     manifest_dir.mkdir(parents=True, exist_ok=True)
@@ -3602,7 +3915,7 @@ def write_science_resource_manifests(
                 if progress:
                     progress(source_id, bytes_done, bytes_total, f"{message} ({index}/{total_sources})")
 
-            summary = resource_payload_summary(local_path, source_progress)
+            summary = resource_payload_summary(local_path, source_progress, cache=summary_cache)
             file_count_value = int(summary["file_count"])
             bytes_count = int(summary["bytes"])
             digest = str(summary["sha256"])
@@ -3804,6 +4117,7 @@ def alignment_database_manifests_ready(
     science_store: Path,
     env: dict[str, str] | None = None,
     wsl_distro: str | None = None,
+    summary_cache: ResourceSummaryCache | None = None,
 ) -> bool:
     for tool, rel_path in [
         ("mmseqs", "indexes/mmseqs/mmseqs_target_databases.tsv"),
@@ -3819,7 +4133,7 @@ def alignment_database_manifests_ready(
             db_path = resolve_manifest_path(science_store, row.get("db_path", ""))
             if source is None or db_path is None:
                 return False
-            source_summary = resource_payload_summary(source)
+            source_summary = resource_payload_summary(source, cache=summary_cache)
             if not alignment_source_manifest_matches(row, source_summary, builder_version):
                 return False
             if not database_prefix_ready(tool, db_path, command, env, wsl_distro):
@@ -3927,10 +4241,11 @@ def existing_science_indexes_ready(
     science_store: Path,
     env: dict[str, str] | None = None,
     wsl_distro: str | None = None,
+    summary_cache: ResourceSummaryCache | None = None,
 ) -> bool:
     if not base_science_indexes_ready(science_store):
         return False
-    if not alignment_database_manifests_ready(science_store, env, wsl_distro):
+    if not alignment_database_manifests_ready(science_store, env, wsl_distro, summary_cache):
         return False
     if partial_legacy_index_manifest_present(science_store):
         return False
@@ -4142,6 +4457,10 @@ def installation_status(
         status = "needs_repair"
         summary = "本次未执行科学资源下载，科学仓库不能标记为完成。"
         next_action = "保持联网后重新运行安装/修复"
+    elif download_status != "ready":
+        status = "needs_repair"
+        summary = "科学资源下载状态尚未闭合。"
+        next_action = "重新运行安装/修复并完成资源校验"
     elif tool_status != "ready":
         status = "needs_repair"
         summary = "科学计算工具尚未准备完成。"
@@ -4162,11 +4481,19 @@ def installation_status(
         status = "needs_repair"
         summary = "部分大型科学资源同步失败，科学仓库尚未准备完成。"
         next_action = "检查资源包、网络和磁盘空间后重新运行安装/修复"
+    elif external_status != "ready":
+        status = "needs_repair"
+        summary = "大型科学资源同步状态尚未闭合。"
+        next_action = "补齐同步清单和资源后重新运行安装/修复"
     elif source_manifest_status != "ready":
         status = "needs_repair"
         summary = "科学资源来源、完整性或许可证记录尚未闭合。"
         next_action = "补齐资源文件、来源记录和许可证记录后重新运行安装/修复"
-    elif store_status == "ready":
+    elif resource_status != "ready":
+        status = "needs_repair"
+        summary = "科学资源索引仍有缺项。"
+        next_action = "补齐科学资源后重新运行安装/修复"
+    elif store_status == "ready" and missing_count == 0:
         status = "ready"
         summary = "科学仓库已就绪。"
         next_action = "打开 WebUI 并输入研究对象"
@@ -4293,11 +4620,13 @@ def main() -> int:
             message=message,
         )
 
+    resource_summary_cache: ResourceSummaryCache = {}
     source_manifest_result = write_science_resource_manifests(
         source_catalog,
         source_sync_plan,
         science_store,
         source_manifest_progress,
+        resource_summary_cache,
     )
     write_install_progress(
         science_store,
@@ -4372,7 +4701,7 @@ def main() -> int:
         total_steps=6,
         message="正在构建数据库索引",
     )
-    if existing_science_indexes_ready(science_store, command_env, selected_wsl):
+    if existing_science_indexes_ready(science_store, command_env, selected_wsl, resource_summary_cache):
         write_install_progress(
             science_store,
             status="running",
@@ -4410,7 +4739,12 @@ def main() -> int:
         total_steps=6,
         message="正在构建本地 MMseqs2 和 Foldseek 目标数据库",
     )
-    alignment_database_result = build_persistent_alignment_databases(science_store, command_env, selected_wsl)
+    alignment_database_result = build_persistent_alignment_databases(
+        science_store,
+        command_env,
+        selected_wsl,
+        resource_summary_cache,
+    )
     write_install_progress(
         science_store,
         status="running",

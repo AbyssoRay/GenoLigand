@@ -3,6 +3,8 @@ from __future__ import annotations
 import hashlib
 import http.server
 import importlib.util
+import inspect
+import os
 import sys
 import tempfile
 import threading
@@ -37,12 +39,20 @@ def write_large_placeholder(path: Path, size: int) -> None:
         handle.write(b"x")
 
 
-def write_database_fixture(prefix: Path, *, empty_dbtype: bool = False) -> None:
+def write_database_index_fixture(prefix: Path) -> None:
+    Path(f"{prefix}.idx").write_bytes(b"precomputed-index")
+    Path(f"{prefix}.idx.dbtype").write_bytes(b"\x00\x00\x00\x00")
+    Path(f"{prefix}.idx.index").write_text("0\t0\t17\n", encoding="utf-8")
+
+
+def write_database_fixture(prefix: Path, *, empty_dbtype: bool = False, with_index: bool = True) -> None:
     prefix.parent.mkdir(parents=True, exist_ok=True)
     prefix.write_bytes(b"database-payload")
     Path(f"{prefix}.dbtype").write_bytes(b"" if empty_dbtype else b"\x00\x00\x00\x00")
     Path(f"{prefix}.index").write_text("0\t0\t16\n", encoding="utf-8")
     Path(f"{prefix}.lookup").write_text("0\tsmoke\t0\n", encoding="utf-8")
+    if with_index:
+        write_database_index_fixture(prefix)
 
 
 def write_ready_alignment_manifests(
@@ -180,14 +190,43 @@ def check_database_readiness_contracts(installer) -> None:
         finally:
             installer.run_command = original_run_command
         require(any(command[1] == "search" for command in calls), "database readiness must execute a local smoke search")
+        require(
+            all(command[1] != "createsubdb" for command in calls),
+            "database smoke must not invoke createsubdb because it scans oversized lookup/index metadata",
+        )
         smoke_search = next(command for command in calls if command[1] == "search")
         require(
             smoke_search[2] != str(db_path) and smoke_search[3] != str(db_path),
             "database smoke search must use bounded query and target subsets instead of scanning the full database",
         )
+        smoke_source = inspect.getsource(installer.database_smoke_query)
+        require(
+            "copy_database_subset" in smoke_source and "lookup.read_text" not in smoke_source,
+            "database smoke must build its bounded subset from streamed index offsets",
+        )
 
         def successful_smoke(command, env=None):
             calls.append(command)
+            if command[1] == "search":
+                query = Path(command[2])
+                target = Path(command[3])
+                valid = all(
+                    path.is_file() and path.stat().st_size > 0
+                    for path in [query, Path(f"{query}.dbtype"), Path(f"{query}.index"), target]
+                )
+                return installer.subprocess.CompletedProcess(command, 0 if valid else 1, "", "")
+            if command[1] == "view":
+                index = Path(command[2])
+                dbtype = Path(f"{index}.dbtype")
+                valid = (
+                    index.is_file()
+                    and index.stat().st_size > 0
+                    and dbtype.is_file()
+                    and dbtype.read_bytes() == b"\x00\x00\x00\x00"
+                    and Path(f"{index}.index").is_file()
+                    and Path(f"{index}.index").stat().st_size > 0
+                )
+                return installer.subprocess.CompletedProcess(command, 0 if valid else 1, "", "")
             return installer.subprocess.CompletedProcess(command, 0, "", "")
 
         installer.run_command = successful_smoke
@@ -195,6 +234,47 @@ def check_database_readiness_contracts(installer) -> None:
             require(
                 installer.database_prefix_ready("foldseek", db_path, "foldseek", {}, None),
                 "complete database with a successful local smoke query must be ready",
+            )
+        finally:
+            installer.run_command = original_run_command
+        index_view = next(command for command in calls if command[1] == "view")
+        require(index_view[2] == f"{db_path}.idx", "database readiness must inspect the original precomputed index")
+
+        index_dbtype = Path(f"{db_path}.idx.dbtype")
+        index_dbtype.write_bytes(b"\xff\xff\xff\xff")
+        installer.run_command = successful_smoke
+        try:
+            require(
+                not installer.database_prefix_ready("mmseqs", db_path, "mmseqs", {}, None),
+                "database with a corrupt original precomputed index must not be ready",
+            )
+        finally:
+            installer.run_command = original_run_command
+        index_dbtype.write_bytes(b"\x00\x00\x00\x00")
+
+        lookup = Path(f"{db_path}.lookup")
+        lookup_text = lookup.read_text(encoding="utf-8")
+        lookup.write_text("garbage\n", encoding="utf-8")
+        installer.run_command = successful_smoke
+        try:
+            require(
+                not installer.database_prefix_ready("mmseqs", db_path, "mmseqs", {}, None),
+                "database with malformed lookup metadata must not be ready",
+            )
+        finally:
+            installer.run_command = original_run_command
+        lookup.write_text(lookup_text, encoding="utf-8")
+
+        Path(f"{db_path}.idx").unlink()
+        Path(f"{db_path}.idx.dbtype").unlink()
+        Path(f"{db_path}.idx.index").unlink()
+        Path(f"{db_path}.idx.0").write_bytes(b"partial-index")
+        Path(f"{db_path}.idx.index.0").write_bytes(b"")
+        installer.run_command = successful_smoke
+        try:
+            require(
+                not installer.database_prefix_ready("mmseqs", db_path, "mmseqs", {}, None),
+                "partial segmented precomputed indexes must not be treated as an unindexed ready database",
             )
         finally:
             installer.run_command = original_run_command
@@ -206,7 +286,9 @@ def check_database_readiness_contracts(installer) -> None:
         def repair_database(command, env=None):
             repair_calls.append(command)
             if command[1] == "createdb":
-                write_database_fixture(db_path)
+                write_database_fixture(Path(command[3]), with_index=False)
+            elif command[1] == "createindex":
+                write_database_index_fixture(Path(command[2]))
             return installer.subprocess.CompletedProcess(command, 0, "", "")
 
         installer.run_command = repair_database
@@ -261,6 +343,12 @@ def check_external_sync_closure(installer) -> None:
             ),
             "a changed required plan must invalidate the previous successful marker",
         )
+        for field, value in [("max_depth", "9"), ("gcs_bucket", "other-bucket"), ("gcs_prefix", "other-prefix")]:
+            changed = {**plan_rows[0], field: value}
+            require(
+                installer.external_plan_digest(changed) != installer.external_plan_digest(plan_rows[0]),
+                f"external plan digest must include {field}",
+            )
         payload = {
             "status": "ready",
             "downloads": {"status": "ready"},
@@ -272,6 +360,68 @@ def check_external_sync_closure(installer) -> None:
             "forcefields": {"status": "ready"},
         }
         require(not installer.install_ready(payload), "partial external sync must keep install readiness false")
+
+
+def check_external_download_result_closure(installer) -> None:
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        original_extract = installer.extract_html_links
+        original_hrefs = installer.list_html_hrefs
+        original_copy = installer.copy_or_download
+        original_urlopen = installer.urlopen_with_compatible_tls
+        original_scope = installer.ligand_bound_pdb_scope
+
+        class JsonResponse:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, _exc_type, _exc, _traceback):
+                return False
+
+            def read(self) -> bytes:
+                return b'{"items":[{"name":"prefix/new.dat","mediaLink":"https://fixture/new.dat"}]}'
+
+        installer.extract_html_links = lambda _url, _pattern: ["https://fixture/new.dat"]
+        installer.list_html_hrefs = lambda _url: ["new.dat"]
+        installer.copy_or_download = lambda *_args, **_kwargs: {
+            "status": "checksum_failed",
+            "bytes": 0,
+            "sha256": "bad",
+        }
+        installer.urlopen_with_compatible_tls = lambda *_args, **_kwargs: JsonResponse()
+        installer.ligand_bound_pdb_scope = lambda _store: {"1ABC"}
+        try:
+            html_links_target = root / "html-links"
+            html_tree_target = root / "html-tree"
+            gcs_target = root / "gcs"
+            for target in (html_links_target, html_tree_target, gcs_target):
+                target.mkdir()
+                (target / "old.dat").write_bytes(b"old")
+            html_links = installer.sync_html_links(
+                {"source_url": "https://fixture/", "include_pattern": ".*"}, html_links_target
+            )
+            html_tree = installer.sync_html_tree(
+                {"source_url": "https://fixture/", "include_pattern": ".*"}, html_tree_target
+            )
+            gcs = installer.sync_gcs_prefix(
+                {"gcs_bucket": "fixture", "gcs_prefix": "prefix", "include_pattern": ".*"}, gcs_target
+            )
+            rcsb_target = root / "rcsb"
+            rcsb_target.mkdir()
+            (rcsb_target / "old.cif.gz").write_bytes(b"old")
+            rcsb = installer.sync_rcsb_ligand_bound_scope(
+                {"source_url": "https://fixture/{pdb_id}.cif.gz"}, rcsb_target, root
+            )
+        finally:
+            installer.extract_html_links = original_extract
+            installer.list_html_hrefs = original_hrefs
+            installer.copy_or_download = original_copy
+            installer.urlopen_with_compatible_tls = original_urlopen
+            installer.ligand_bound_pdb_scope = original_scope
+        require(html_links["status"] == "failed", "html-links sync must fail when a required download returns non-ready")
+        require(html_tree["status"] == "failed", "html-tree sync must fail when a required download returns non-ready")
+        require(gcs["status"] == "failed", "GCS sync must fail when a required download returns non-ready")
+        require(rcsb["status"] == "failed", "RCSB scope sync must fail when a required download returns non-ready")
 
 
 def check_alignment_source_digest_rebuild(installer, tool: str) -> None:
@@ -310,7 +460,9 @@ def check_alignment_source_digest_rebuild(installer, tool: str) -> None:
         def fake_run_command(command, env=None):
             calls.append(command)
             if command[1] == "createdb":
-                write_database_fixture(db_path)
+                write_database_fixture(Path(command[3]), with_index=False)
+            elif command[1] == "createindex":
+                write_database_index_fixture(Path(command[2]))
             stdout = "test-builder-1\n" if command[1] == "version" else ""
             return installer.subprocess.CompletedProcess(command, 0, stdout, "")
 
@@ -333,6 +485,318 @@ def check_alignment_source_digest_rebuild(installer, tool: str) -> None:
         require(int(manifest_rows[0]["source_files"]) == current_summary["file_count"], f"{tool} manifest must record source file count")
         require(int(manifest_rows[0]["source_bytes"]) == current_summary["bytes"], f"{tool} manifest must record source bytes")
         require(manifest_rows[0]["builder_version"] == "test-builder-1", f"{tool} manifest must record builder version")
+
+
+def check_alignment_rebuild_failure_preserves_previous(installer, tool: str) -> None:
+    with tempfile.TemporaryDirectory() as tmp:
+        store = Path(tmp) / "science_store"
+        if tool == "mmseqs":
+            source = store / "downloads/metagenome/source.fasta"
+            source.parent.mkdir(parents=True)
+            source.write_text(">old\nAAAA\n", encoding="utf-8")
+            manifest = store / "indexes/mmseqs/mmseqs_target_databases.tsv"
+            db_path = store / "indexes/mmseqs/metagenome_source/target"
+            source_id = "metagenome_source"
+        else:
+            source = store / "downloads/rcsb/mmcif"
+            source.mkdir(parents=True)
+            (source / "1abc.cif").write_text("old structure\n", encoding="utf-8")
+            manifest = store / "indexes/foldseek/foldseek_target_databases.tsv"
+            db_path = store / "indexes/foldseek/rcsb_mmcif/target"
+            source_id = "rcsb_mmcif"
+        write_database_fixture(db_path)
+        old_database = db_path.read_bytes()
+        old_summary = installer.resource_payload_summary(source)
+        manifest.parent.mkdir(parents=True, exist_ok=True)
+        manifest.write_text(
+            "source_id\tsource_path\tsource_digest\tsource_files\tsource_bytes\tbuilder_version\tdb_path\tstatus\tnotes\n"
+            f"{source_id}\t{installer.relative_path(store, source)}\t{old_summary['sha256']}\t{old_summary['file_count']}\t{old_summary['bytes']}\ttest-builder-1\t{installer.relative_path(store, db_path)}\tready\talready_available\n",
+            encoding="utf-8",
+        )
+        if source.is_file():
+            source.write_text(">new\nCCCC\n", encoding="utf-8")
+        else:
+            (source / "1abc.cif").write_text("new structure\n", encoding="utf-8")
+        original_run_command = installer.run_command
+        original_which = installer.shutil.which
+
+        def failing_rebuild(command, env=None):
+            if command[1] == "version":
+                return installer.subprocess.CompletedProcess(command, 0, "test-builder-1\n", "")
+            if command[1] == "createdb":
+                raise OSError("fixture rebuild failed")
+            return installer.subprocess.CompletedProcess(command, 0, "", "")
+
+        installer.run_command = failing_rebuild
+        installer.shutil.which = lambda _name, path=None: tool
+        try:
+            rows = (
+                installer.build_mmseqs_target_databases(store, {}, None)
+                if tool == "mmseqs"
+                else installer.build_foldseek_target_database(store, {}, None)
+            )
+        finally:
+            installer.run_command = original_run_command
+            installer.shutil.which = original_which
+        require(db_path.read_bytes() == old_database, f"{tool} failed rebuild must preserve the previous database")
+        require(rows[0]["status"] == "failed", f"{tool} failed rebuild must return a failed row")
+        require(installer.read_tsv(manifest)[0]["status"] == "failed", f"{tool} manifest must not remain ready after rebuild failure")
+
+
+def check_corrupt_database_rebuild_preserves_previous(installer, tool: str) -> None:
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        source = root / "source.dat"
+        source.write_text(">target\nMKTAYIAKQRQISFVKSHFSRQ\n" if tool == "mmseqs" else "structure", encoding="utf-8")
+        db_path = root / tool / "target"
+        write_database_fixture(db_path, empty_dbtype=True)
+        old_database = db_path.read_bytes()
+        original_run_command = installer.run_command
+
+        def failing_rebuild(command, env=None):
+            if command[1] == "createdb":
+                raise OSError("fixture corrupt rebuild failed")
+            return installer.subprocess.CompletedProcess(command, 0, "", "")
+
+        installer.run_command = failing_rebuild
+        try:
+            status, _note = (
+                installer.build_mmseqs_database(tool, source, db_path, {}, None)
+                if tool == "mmseqs"
+                else installer.build_foldseek_database(tool, source, db_path, {}, None)
+            )
+        finally:
+            installer.run_command = original_run_command
+        require(status == "failed", f"{tool} corrupt rebuild failure must be reported")
+        require(db_path.read_bytes() == old_database, f"{tool} corrupt rebuild failure must preserve existing database files")
+
+
+def check_atomic_publish_cleanup_status(installer) -> None:
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        live_db = root / "database" / "target"
+        staged_db = root / ".database.rebuild-fixture" / "target"
+        write_database_fixture(live_db)
+        write_database_fixture(staged_db)
+        staged_db.write_bytes(b"new-database")
+        original_rmtree = installer.shutil.rmtree
+
+        def fail_backup_cleanup(path, *args, **kwargs):
+            if ".previous-" in Path(path).name:
+                raise OSError("fixture backup cleanup failed")
+            return original_rmtree(path, *args, **kwargs)
+
+        installer.shutil.rmtree = fail_backup_cleanup
+        try:
+            cleanup_complete = installer.publish_database_directory(staged_db, live_db)
+        finally:
+            installer.shutil.rmtree = original_rmtree
+        require(live_db.read_bytes() == b"new-database", "atomic publish must leave the new database live")
+        require(cleanup_complete is False, "backup cleanup failure must be reported separately from publish success")
+        for child in root.iterdir():
+            if ".previous-" in child.name:
+                original_rmtree(child)
+
+
+def check_resource_summary_cache(installer) -> None:
+    with tempfile.TemporaryDirectory() as tmp:
+        source = Path(tmp) / "large-source.dat"
+        source.write_bytes(b"first-content")
+        cache = {}
+        calls = 0
+        original_hash = installer.sha256_file_with_progress
+
+        def counted_hash(path, progress=None):
+            nonlocal calls
+            calls += 1
+            return original_hash(path, progress)
+
+        installer.sha256_file_with_progress = counted_hash
+        try:
+            source_token = installer.file_change_token(source, source.stat())
+            first = installer.resource_payload_summary(source, cache=cache)
+            second = installer.resource_payload_summary(source, cache=cache)
+            expected_calls = 1 if source_token else 2
+            require(first == second and calls == expected_calls, "source summary reuse must follow change-token availability")
+            original_stat = source.stat()
+            source.write_bytes(b"other-content")
+            os.utime(source, ns=(original_stat.st_atime_ns, original_stat.st_mtime_ns))
+            changed_token = installer.file_change_token(source, source.stat())
+            if source_token:
+                require(changed_token and changed_token != source_token, "source change token must detect restored-mtime writes")
+            changed = installer.resource_payload_summary(source, cache=cache)
+        finally:
+            installer.sha256_file_with_progress = original_hash
+        expected_calls += 1
+        require(
+            changed["sha256"] != first["sha256"] and calls == expected_calls,
+            "source summary cache must invalidate after source changes",
+        )
+
+        directory = Path(tmp) / "source-directory"
+        directory.mkdir()
+        files = [directory / f"source-{index}.dat" for index in range(5)]
+        for index, path in enumerate(files):
+            path.write_bytes(f"content-{index}".encode("ascii"))
+        installer.sha256_file_with_progress = counted_hash
+        try:
+            directory_start_calls = calls
+            directory_tokens = [installer.file_change_token(path, path.stat()) for path in files]
+            directory_cacheable = all(directory_tokens)
+            first_directory = installer.resource_payload_summary(directory, cache=cache)
+            second_directory = installer.resource_payload_summary(directory, cache=cache)
+            expected_directory_calls = directory_start_calls + (5 if directory_cacheable else 10)
+            require(
+                first_directory == second_directory and calls == expected_directory_calls,
+                "directory summary reuse must follow change-token availability",
+            )
+            original_stat = files[1].stat()
+            files[1].write_bytes(b"changed-1")
+            os.utime(files[1], ns=(original_stat.st_atime_ns, original_stat.st_mtime_ns))
+            changed_directory_token = installer.file_change_token(files[1], files[1].stat())
+            if directory_cacheable:
+                require(
+                    changed_directory_token and changed_directory_token != directory_tokens[1],
+                    "directory change token must detect writes to every source position",
+                )
+            changed_directory = installer.resource_payload_summary(directory, cache=cache)
+        finally:
+            installer.sha256_file_with_progress = original_hash
+        expected_directory_calls += 5
+        require(
+            changed_directory["sha256"] != first_directory["sha256"] and calls == expected_directory_calls,
+            "directory cache must invalidate when any same-size source changes with restored mtime",
+        )
+
+        uncacheable = Path(tmp) / "uncacheable-source.dat"
+        uncacheable.write_bytes(b"uncacheable")
+        uncacheable_start_calls = calls
+        original_change_token = installer.file_change_token
+        installer.file_change_token = lambda _path, _stat: ""
+        installer.sha256_file_with_progress = counted_hash
+        try:
+            first_uncacheable = installer.resource_payload_summary(uncacheable, cache=cache)
+            second_uncacheable = installer.resource_payload_summary(uncacheable, cache=cache)
+        finally:
+            installer.sha256_file_with_progress = original_hash
+            installer.file_change_token = original_change_token
+        require(first_uncacheable == second_uncacheable, "uncacheable source summaries must remain deterministic")
+        require(calls == uncacheable_start_calls + 2, "missing change tokens must disable digest cache reuse")
+        require(str(uncacheable.resolve()) not in cache, "uncacheable source summaries must not remain in the digest cache")
+
+
+def check_database_subset_io_bounds(installer) -> None:
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        prefix = root / "source" / "target"
+        subset = root / "subset" / "target"
+        prefix.parent.mkdir(parents=True)
+        prefix.write_bytes(b"A" * 64)
+        Path(f"{prefix}.dbtype").write_bytes(b"\x00\x00\x00\x00")
+        index_rows = [f"{key}\t{key}\t1\n" for key in range(64)]
+        index_rows.append("malformed-tail\n")
+        Path(f"{prefix}.index").write_text("".join(index_rows), encoding="ascii")
+        lookup_rows = [f"padding_{key}\tentry_{key}\t0\n" for key in range(4032)]
+        lookup_rows.extend(f"{key}\tentry_{key}\t0\n" for key in range(64))
+        lookup_rows.append("malformed-tail\n")
+        Path(f"{prefix}.lookup").write_text("".join(lookup_rows), encoding="ascii")
+        header = Path(f"{prefix}_h")
+        header.write_bytes(b"H" * 64)
+        Path(f"{header}.dbtype").write_bytes(b"\x00\x00\x00\x00")
+        header_index_rows = [f"padding_{key}\t0\t1\n" for key in range(4032)]
+        header_index_rows.extend(f"{key}\t{key}\t1\n" for key in range(64))
+        header_index_rows.append("malformed-tail\n")
+        Path(f"{header}.index").write_text("".join(header_index_rows), encoding="ascii")
+
+        reads: dict[str, dict[str, int]] = {}
+        original_path_open = installer.Path.open
+
+        class BoundedTextReader:
+            def __init__(self, handle, key):
+                self.handle = handle
+                self.key = key
+                reads[key] = {"lines": 0, "bytes": 0}
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, exc_type, exc_value, traceback):
+                return self.handle.__exit__(exc_type, exc_value, traceback)
+
+            def readline(self, size=-1):
+                require(size == 4096, "database metadata reads must use the 4096-byte line bound")
+                value = self.handle.readline(size)
+                reads[self.key]["lines"] += 1
+                reads[self.key]["bytes"] += len(value.encode("utf-8"))
+                require(reads[self.key]["lines"] <= 4096, "database metadata reads must stop at 4096 lines")
+                require(reads[self.key]["bytes"] <= 4096 * 4096, "database metadata reads must remain byte-bounded")
+                return value
+
+            def read(self, *args, **kwargs):
+                raise AssertionError("database metadata must not be read into memory in one operation")
+
+            def __getattr__(self, name):
+                return getattr(self.handle, name)
+
+        def monitored_path_open(path, *args, **kwargs):
+            handle = original_path_open(path, *args, **kwargs)
+            mode = args[0] if args else kwargs.get("mode", "r")
+            key = str(path)
+            if "r" in mode and "b" not in mode and (key.endswith(".index") or key.endswith(".lookup")):
+                return BoundedTextReader(handle, key)
+            return handle
+
+        installer.Path.open = monitored_path_open
+        try:
+            copied = installer.copy_database_subset(prefix, subset)
+        finally:
+            installer.Path.open = original_path_open
+        require(copied, "bounded database subset must copy valid records at the metadata scan limit")
+        require(subset.stat().st_size == 64, "bounded database subset must not copy source data beyond selected records")
+        require(len(Path(f"{subset}.index").read_text(encoding="ascii").splitlines()) == 64, "bounded subset must contain exactly 64 index rows")
+        require(reads[str(Path(f"{prefix}.lookup"))]["lines"] == 4096, "lookup scan must stop after its bounded line budget")
+        require(reads[str(Path(f"{header}.index"))]["lines"] == 4096, "companion index scan must stop after its bounded line budget")
+
+        oversized = root / "oversized" / "target"
+        oversized.parent.mkdir()
+        oversized.write_bytes(b"A")
+        Path(f"{oversized}.dbtype").write_bytes(b"\x00\x00\x00\x00")
+        Path(f"{oversized}.index").write_text(f"0\t0\t{128 * 1024 * 1024 + 1}\n", encoding="ascii")
+        Path(f"{oversized}.lookup").write_text("0\tentry_0\t0\n", encoding="ascii")
+        oversized_payload_reads = 0
+
+        class RejectPayloadRead:
+            def __init__(self, handle):
+                self.handle = handle
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, exc_type, exc_value, traceback):
+                return self.handle.__exit__(exc_type, exc_value, traceback)
+
+            def read(self, *args, **kwargs):
+                nonlocal oversized_payload_reads
+                oversized_payload_reads += 1
+                raise AssertionError("oversized database payload must be rejected before reading")
+
+            def __getattr__(self, name):
+                return getattr(self.handle, name)
+
+        def reject_oversized_payload_open(path, *args, **kwargs):
+            handle = original_path_open(path, *args, **kwargs)
+            mode = args[0] if args else kwargs.get("mode", "r")
+            return RejectPayloadRead(handle) if Path(path) == oversized and mode == "rb" else handle
+
+        installer.Path.open = reject_oversized_payload_open
+        try:
+            oversized_copied = installer.copy_database_subset(oversized, root / "oversized-subset" / "target")
+        finally:
+            installer.Path.open = original_path_open
+        require(
+            not oversized_copied and oversized_payload_reads == 0,
+            "database subset must reject payloads larger than 128 MiB before reading them",
+        )
 
 
 def check_download_integrity_contracts(installer) -> None:
@@ -364,6 +828,10 @@ def check_download_integrity_contracts(installer) -> None:
         require(int(manifest_row["observed_bytes"]) == source.stat().st_size, "successful no-SHA download must pin observed bytes")
         require(manifest_row["source_version"] == "fixture-v2", "download manifest must retain the source version")
         require(int(manifest_row["completed_at"]) > 0, "successful download must record completion time")
+        source.write_bytes(b"changed-observed-content")
+        refreshed = installer.prepare_downloads(catalog, store)
+        require(refreshed["status"] == "ready", "changed local no-SHA source must be refreshed")
+        require(destination.read_bytes() == source.read_bytes(), "observed reuse must compare the current local source content")
         expected_content = source.read_bytes()
         source.unlink()
         reused = installer.prepare_downloads(catalog, store)
@@ -384,6 +852,22 @@ def check_download_integrity_contracts(installer) -> None:
         installer.copy_or_download(str(source), destination, None, observed_sha256=old_digest)
         require(destination.read_bytes() == source.read_bytes(), "observed digest without observed bytes must not authorize reuse")
 
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        source = root / "source.bin"
+        destination = root / "destination.bin"
+        source.write_bytes(b"file-uri-content")
+        first = installer.copy_or_download(source.as_uri(), destination, None)
+        source.unlink()
+        reused = installer.copy_or_download(
+            source.as_uri(),
+            destination,
+            None,
+            observed_sha256=str(first["sha256"]),
+            observed_bytes=int(first["bytes"]),
+        )
+        require(reused["status"] == "ready" and reused.get("reused") is True, "missing file URI source must allow verified observed reuse")
+
     content = b"complete-http-payload"
     digest = hashlib.sha256(content).hexdigest()
     for ranged_response in ("416", "bad_206"):
@@ -403,7 +887,29 @@ def check_download_integrity_contracts(installer) -> None:
             require(destination.read_bytes() == content, f"HTTP {ranged_response} recovery must publish fully verified content")
             require(requests[0].startswith("bytes="), f"HTTP {ranged_response} fixture must first exercise resume")
             require(requests[-1] == "", f"HTTP {ranged_response} recovery must retry once without Range")
-            require(list(root.glob("resource.bin.part.quarantine-*")), "invalid partial must be isolated before full retry")
+            require(not list(root.glob("resource.bin.part.quarantine-*")), "successful full retry must remove quarantined partial data")
+            require(not partial.exists(), "successful full retry must not retain a partial file")
+
+
+def check_installation_status_rejects_unknown_external_state(installer) -> None:
+    with tempfile.TemporaryDirectory() as tmp:
+        store = Path(tmp)
+        (store / "install_status.json").write_text('{"status":"ready","missing_components":[]}', encoding="utf-8")
+        completed = installer.subprocess.CompletedProcess(["fixture"], 0, "", "")
+        ready = {"status": "ready"}
+        result = installer.installation_status(
+            store,
+            completed,
+            ready,
+            {"status": "not_configured"},
+            ready,
+            ready,
+            ready,
+            ready,
+            {"status": "not_configured"},
+            ready,
+        )
+        require(result["status"] == "needs_repair", "unknown or unconfigured external state must not summarize as ready")
 
 
 def main() -> int:
@@ -437,9 +943,18 @@ def main() -> int:
     installer = load_installer_module()
     check_database_readiness_contracts(installer)
     check_external_sync_closure(installer)
+    check_external_download_result_closure(installer)
     check_alignment_source_digest_rebuild(installer, "mmseqs")
     check_alignment_source_digest_rebuild(installer, "foldseek")
+    check_alignment_rebuild_failure_preserves_previous(installer, "mmseqs")
+    check_alignment_rebuild_failure_preserves_previous(installer, "foldseek")
+    check_corrupt_database_rebuild_preserves_previous(installer, "mmseqs")
+    check_corrupt_database_rebuild_preserves_previous(installer, "foldseek")
+    check_atomic_publish_cleanup_status(installer)
+    check_resource_summary_cache(installer)
+    check_database_subset_io_bounds(installer)
     check_download_integrity_contracts(installer)
+    check_installation_status_rejects_unknown_external_state(installer)
     with tempfile.TemporaryDirectory() as tmp:
         tmp_path = Path(tmp)
         source = tmp_path / "targets.fasta"
@@ -451,7 +966,9 @@ def main() -> int:
         def fake_wsl_database_command(distro, command):
             calls.append((distro, command))
             if command[1] == "createdb":
-                write_database_fixture(tmp_path / command[0] / "target")
+                write_database_fixture(tmp_path / command[0] / "target", with_index=False)
+            elif command[1] == "createindex":
+                write_database_index_fixture(tmp_path / command[0] / "target")
             return installer.subprocess.CompletedProcess(command, 0, "", "")
 
         installer.run_wsl_database_command = fake_wsl_database_command
@@ -461,7 +978,7 @@ def main() -> int:
             require(status == "ready" and note == "mmseqs_createdb_createindex_completed", "WSL MMseqs2 build must not require a Windows PATH executable")
             status, note = installer.build_foldseek_database(None, source, tmp_path / "foldseek" / "target", {}, "GenoLigandPhase08")
             require(status == "ready" and note == "foldseek_createdb_createindex_completed", "WSL Foldseek build must not require a Windows PATH executable")
-            require(len(calls) == 8 and all(call[0] == "GenoLigandPhase08" for call in calls), "WSL database builds and smoke queries must target the selected project distro")
+            require(len(calls) == 8 and all(call[0] == "GenoLigandPhase08" for call in calls), "WSL database builds and bounded index checks must target the selected project distro")
         finally:
             installer.run_wsl_database_command = original_runner
             installer.os.name = original_os_name
@@ -474,7 +991,7 @@ def main() -> int:
 
         def fake_run_command(command, env=None):
             if command[1] == "createdb":
-                write_database_fixture(db_path)
+                write_database_fixture(db_path, with_index=False)
                 return installer.subprocess.CompletedProcess(command, 0, "", "")
             if command[1] == "createindex":
                 return installer.subprocess.CompletedProcess(command, 1, "", "Cannot fit databases into 12G. Please use a computer with more main memory.")
