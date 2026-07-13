@@ -433,6 +433,25 @@ fn science_options(root: &Path, input: &Path, run: &Path) -> ScienceOptions {
     }
 }
 
+fn normalize_and_compute_fixture(
+    options: &ScienceOptions,
+    field: &str,
+    value: &str,
+) -> Result<(), String> {
+    write_text(
+        &options.input_manifest,
+        &(serde_json::json!({
+            "inputs": [{"field": field, "value": value}],
+            "files": []
+        })
+        .to_string()
+            + "\n"),
+    )?;
+    run_science_command(ScienceCommand::InputNormalize, options)?;
+    run_science_command(ScienceCommand::FeaturesCompute, options)?;
+    Ok(())
+}
+
 fn conversion_rows(run: &Path) -> Vec<Vec<String>> {
     read_text(&run.join("input_conversion_manifest.tsv"))
         .expect("conversion manifest")
@@ -1043,6 +1062,104 @@ fn normalized_manifest_requires_complete_provenance_schema() {
 }
 
 #[test]
+fn normalized_manifest_rejects_incomplete_or_mismatched_provenance() {
+    let root = temp_root("normalized_provenance_validation");
+    let input = root.join("input.json");
+    let run = root.join("run");
+    write_text(
+        &input,
+        r#"{"inputs":[{"field":"small_molecule","value":"CCO"}],"files":[]}"#,
+    )
+    .expect("input");
+    let options = science_options(&root, &input, &run);
+    run_science_command(ScienceCommand::InputNormalize, &options).expect("normalize");
+
+    let path = run.join("input_normalized_manifest.tsv");
+    let text = read_text(&path).expect("normalized manifest");
+    let mut lines = text.lines();
+    let header = lines.next().expect("header");
+    let mut cols = split_tsv(lines.next().expect("row"));
+    cols[6] = "file".to_string();
+    cols[7].clear();
+    write_text(&path, &format!("{header}\n{}\n", cols.join("\t"))).expect("mutate source");
+    let error = run_science_command(ScienceCommand::FeaturesCompute, &options)
+        .expect_err("file provenance without source path must fail");
+    assert!(
+        error.contains("normalized_input_manifest_missing_source_path"),
+        "{error}"
+    );
+
+    run_science_command(ScienceCommand::InputNormalize, &options).expect("renormalize");
+    let text = read_text(&path).expect("normalized manifest");
+    let mut lines = text.lines();
+    let header = lines.next().expect("header");
+    let mut cols = split_tsv(lines.next().expect("row"));
+    cols[8] = "a".repeat(64);
+    write_text(&path, &format!("{header}\n{}\n", cols.join("\t"))).expect("mutate hash");
+    let error = run_science_command(ScienceCommand::FeaturesCompute, &options)
+        .expect_err("normalized provenance must match conversion manifest");
+    fs::remove_dir_all(root).expect("cleanup");
+    assert!(
+        error.contains("normalized_input_manifest_provenance_mismatch"),
+        "{error}"
+    );
+}
+
+#[test]
+fn feature_manifest_rejects_empty_identity_and_kind_conflicts() {
+    let root = temp_root("feature_identity_validation");
+    let input = root.join("input.json");
+    let run = root.join("run");
+    write_text(
+        &input,
+        r#"{"inputs":[{"field":"small_molecule","value":"CCO"}],"files":[]}"#,
+    )
+    .expect("input");
+    let options = science_options(&root, &input, &run);
+    run_science_command(ScienceCommand::InputNormalize, &options).expect("normalize");
+    run_science_command(ScienceCommand::FeaturesCompute, &options).expect("features");
+
+    let path = run.join("feature_manifest.tsv");
+    let text = read_text(&path).expect("feature manifest");
+    let mut lines = text.lines();
+    let header = lines.next().expect("header");
+    let original_rows = lines.map(ToOwned::to_owned).collect::<Vec<_>>();
+    let mut empty_source = split_tsv(&original_rows[0]);
+    empty_source[5].clear();
+    write_text(&path, &format!("{header}\n{}\n", empty_source.join("\t")))
+        .expect("empty feature source");
+    let error = run_science_command(ScienceCommand::DatabaseMatchKnown, &options)
+        .expect_err("empty feature source must fail");
+    assert!(
+        error.contains("feature_manifest_missing_feature_source"),
+        "{error}"
+    );
+
+    let mut empty_identity = split_tsv(&original_rows[0]);
+    empty_identity[0].clear();
+    write_text(&path, &format!("{header}\n{}\n", empty_identity.join("\t")))
+        .expect("empty identity");
+    let error = run_science_command(ScienceCommand::DatabaseMatchKnown, &options)
+        .expect_err("empty feature identity must fail");
+    assert!(
+        error.contains("feature_manifest_missing_input_id"),
+        "{error}"
+    );
+
+    let mut conflict = split_tsv(&original_rows[0]);
+    conflict[1] = "peptide".to_string();
+    write_text(
+        &path,
+        &format!("{header}\n{}\n{}\n", original_rows[0], conflict.join("\t")),
+    )
+    .expect("kind conflict");
+    let error = run_science_command(ScienceCommand::DatabaseMatchKnown, &options)
+        .expect_err("feature kind conflict must fail");
+    fs::remove_dir_all(root).expect("cleanup");
+    assert!(error.contains("feature_manifest_kind_conflict"), "{error}");
+}
+
+#[test]
 fn input_conversion_prefers_content_over_selected_field() {
     let root = temp_root("free_text_conversion");
     let input = root.join("input.json");
@@ -1282,16 +1399,10 @@ fn metagenome_matching_preserves_mmseqs_source_database_and_query_id() {
     )
     .expect("mmseqs manifest");
     write_text(
-        &run.join("feature_manifest.tsv"),
-        "input_id\tinput_kind\tfeature_family\tfeature_name\tfeature_value\tfeature_source\tfeature_token\trecord_id\ninput_1\tpeptide\tsequence\tmotif\tIKVAV\tGenoLigand\tikvav\trecord_1\n",
-    )
-    .expect("features");
-    write_text(
         &run.join("tool_outputs/mmseqs_alignment_matches.tsv"),
         "input_id\tsource\ttarget_id\ttarget_name\torganism\ttarget_class\tmatch_score\tmatched_features\tevidence\ninput_1\tMMseqs2\tMG_REAL\tMGnify hit\tunknown\tpotential_metagenome_sequence\t0.9100\tikvav\tmmseqs_alignment;source_db=metagenome_mgy;query_id=input_1\n",
     )
     .expect("mmseqs output");
-    write_text(&input, "{\"inputs\":[],\"files\":[]}\n").expect("input");
     let options = ScienceOptions {
         workspace_root: root.clone(),
         science_store: store,
@@ -1299,6 +1410,7 @@ fn metagenome_matching_preserves_mmseqs_source_database_and_query_id() {
         run_dir: run.clone(),
     };
 
+    normalize_and_compute_fixture(&options, "peptide", "IKVAV").expect("upstream manifests");
     run_science_command(ScienceCommand::MetagenomeMatchPotential, &options).expect("metagenome");
     let matches =
         read_text(&run.join("metagenome_potential_matches.tsv")).expect("metagenome matches");
@@ -1467,17 +1579,6 @@ fn known_matching_deduplicates_onsite_hits_and_downweights_token_noise() {
         "Ligand SMILES\tBindingDB Ligand Name\tTarget Name\tTarget Source Organism According to Curator or DataSource\tKi (nM)\tPDB ID(s) for Ligand-Target Complex\tLigand HET ID in PDB\tUniProt (SwissProt) Primary ID of Target Chain 1\tBindingDB MonomerID\nCC(=O)Nc1nnc(s1)S(=O)(=O)N\tAcetazolamide, AZM\tCarbonic anhydrase 2\tHomo sapiens\t900\t2H4N\tAZM\tP00918\t10880\nCC(=O)Nc1nnc(s1)S(=O)(=O)N\tAcetazolamide, AZM\tCarbonic anhydrase 2\tHomo sapiens\t12\t2H4N\tAZM\tP00918\t10880\n",
     )
     .expect("bindingdb zip");
-    write_text(
-        &run.join("input_normalized_manifest.tsv"),
-        "input_id\tinput_kind\tprimary_value\tfile_count\tfeature_tokens\trecord_id\tsource_kind\tsource_path\tcontent_sha256\tstatus\tstructure_atom_count\tstructure_chain_count\tstructure_residue_count\ninput_1\tsmall_molecule\tCC(=O)Nc1nnc(s1)S(=O)(=O)N\t0\tgeneric\trecord_1\tinline\t\taaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\tnormalized\t0\t0\t0\n",
-    )
-    .expect("normalized");
-    write_text(
-        &run.join("feature_manifest.tsv"),
-        "input_id\tinput_kind\tfeature_family\tfeature_name\tfeature_value\tfeature_source\tfeature_token\trecord_id\ninput_1\tsmall_molecule\tsmall_molecule\tligand_fingerprint_token\tgeneric\tGenoLigand\tgeneric\trecord_1\n",
-    )
-    .expect("features");
-    write_text(&input, "{\"inputs\":[],\"files\":[]}\n").expect("input");
     let options = ScienceOptions {
         workspace_root: root.clone(),
         science_store: store,
@@ -1485,6 +1586,13 @@ fn known_matching_deduplicates_onsite_hits_and_downweights_token_noise() {
         run_dir: run.clone(),
     };
 
+    normalize_and_compute_fixture(&options, "small_molecule", "CC(=O)Nc1nnc(s1)S(=O)(=O)N")
+        .expect("upstream manifests");
+    write_text(
+        &run.join("feature_manifest.tsv"),
+        "input_id\tinput_kind\tfeature_family\tfeature_name\tfeature_value\tfeature_source\tfeature_token\trecord_id\ninput_1\tsmall_molecule\tsmall_molecule\tligand_fingerprint_token\tgeneric\tGenoLigand\tgeneric\trecord_1\n",
+    )
+    .expect("features");
     run_science_command(ScienceCommand::DatabaseMatchKnown, &options).expect("match known");
     let matches = read_text(&run.join("known_database_matches.tsv")).expect("known matches");
     rank_targets(&options).expect("rank");
@@ -1521,16 +1629,6 @@ fn structure_matching_uses_ligand_identity_from_known_search() {
     let input = root.join("input.json");
     ensure_dir(&store.join("indexes")).expect("indexes");
     write_text(
-        &run.join("input_normalized_manifest.tsv"),
-        "input_id\tinput_kind\tprimary_value\tfile_count\tfeature_tokens\trecord_id\tsource_kind\tsource_path\tcontent_sha256\tstatus\tstructure_atom_count\tstructure_chain_count\tstructure_residue_count\ninput_1\tsmall_molecule\tCC(=O)Nc1nnc(s1)S(=O)(=O)N\t0\tcc\trecord_1\tinline\t\taaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\tnormalized\t0\t0\t0\n",
-    )
-    .expect("normalized");
-    write_text(
-        &run.join("feature_manifest.tsv"),
-        "input_id\tinput_kind\tfeature_family\tfeature_name\tfeature_value\tfeature_source\tfeature_token\trecord_id\ninput_1\tsmall_molecule\tsmall_molecule\tligand_fingerprint_token\tcc\tGenoLigand\tcc\trecord_1\n",
-    )
-    .expect("features");
-    write_text(
         &run.join("known_database_matches.tsv"),
         "input_id\tsource\ttarget_id\ttarget_name\torganism\ttarget_class\tmatch_score\tmatched_features\tevidence\ninput_1\tBindingDB\tP00918\tCarbonic anhydrase 2\tHomo sapiens\tknown_human_protein\t1.0000\tligand_identity\tbindingdb_onsite_activity_row;ligand_code=AZM;pdb_ids=3HS4,1AZM,2H4N\n",
     )
@@ -1540,7 +1638,6 @@ fn structure_matching_uses_ligand_identity_from_known_search() {
         "source\ttarget_id\ttarget_name\torganism\ttarget_class\tligand_tokens\tsequence_tokens\tstructure_tokens\tevidence\nRCSB\t2H4N\tH94N Carbonic anhydrase II complexed with acetazolamide\tHomo sapiens\tstructure_record\tazm\t2h4 h4n\tace taz azm car bon\tmolecule_coordinate_row\n",
     )
     .expect("structure index");
-    write_text(&input, "{\"inputs\":[],\"files\":[]}\n").expect("input");
     let options = ScienceOptions {
         workspace_root: root.clone(),
         science_store: store,
@@ -1548,6 +1645,13 @@ fn structure_matching_uses_ligand_identity_from_known_search() {
         run_dir: run.clone(),
     };
 
+    normalize_and_compute_fixture(&options, "small_molecule", "CC(=O)Nc1nnc(s1)S(=O)(=O)N")
+        .expect("upstream manifests");
+    write_text(
+        &run.join("feature_manifest.tsv"),
+        "input_id\tinput_kind\tfeature_family\tfeature_name\tfeature_value\tfeature_source\tfeature_token\trecord_id\ninput_1\tsmall_molecule\tsmall_molecule\tligand_fingerprint_token\tcc\tGenoLigand\tcc\trecord_1\n",
+    )
+    .expect("features");
     run_science_command(ScienceCommand::StructureEvaluate, &options).expect("structure");
     let matches = read_text(&run.join("structure_interaction_matches.tsv")).expect("matches");
 
@@ -2203,17 +2307,6 @@ fn structure_evaluate_writes_viewer_from_real_coordinate_file() {
     let input = root.join("input.json");
     ensure_dir(&store.join("indexes")).expect("indexes");
     ensure_dir(&store.join("downloads/rcsb/mmcif/0g")).expect("coords");
-    write_text(&input, "{\"inputs\":[],\"files\":[]}\n").expect("input");
-    write_text(
-        &run.join("input_normalized_manifest.tsv"),
-        &(NORMALIZED_INPUT_HEADER.to_string() + "\n"),
-    )
-    .expect("manifest");
-    write_text(
-            &run.join("feature_manifest.tsv"),
-            "input_id\tinput_kind\tfeature_family\tfeature_name\tfeature_value\tfeature_source\tfeature_token\trecord_id\ninput_1\tsmall_molecule\tligand\ttext\taspirin\tuser\taspirin\trecord_1\n",
-        )
-        .expect("features");
     write_text(
             &store.join("indexes/structure_targets.tsv"),
             "source\ttarget_id\ttarget_name\torganism\ttarget_class\tligand_tokens\tsequence_tokens\tstructure_tokens\tevidence\nRCSB\t10GS\tRCSB structure 10GS\tunknown\tstructure_record\taspirin\t10gs\t10gs pocket\trcsb_structure_file\n",
@@ -2231,6 +2324,12 @@ fn structure_evaluate_writes_viewer_from_real_coordinate_file() {
         run_dir: run.clone(),
     };
 
+    normalize_and_compute_fixture(&options, "small_molecule", "CCO").expect("upstream manifests");
+    write_text(
+        &run.join("feature_manifest.tsv"),
+        "input_id\tinput_kind\tfeature_family\tfeature_name\tfeature_value\tfeature_source\tfeature_token\trecord_id\ninput_1\tsmall_molecule\tligand\ttext\taspirin\tuser\taspirin\trecord_1\n",
+    )
+    .expect("features");
     let out = run_science_command(ScienceCommand::StructureEvaluate, &options).expect("structure");
     let viewer = read_text(&run.join("structure_viewer.cif")).expect("viewer cif");
     let status = read_text(&run.join("structure_viewer_status.tsv")).expect("viewer status");
@@ -2252,17 +2351,6 @@ fn structure_evaluate_prefers_bindingdb_pdb_candidate_over_token_noise() {
     ensure_dir(&store.join("downloads/rcsb/mmcif/12")).expect("noise coords");
     ensure_dir(&store.join("downloads/rcsb/mmcif/h4")).expect("target coords");
     ensure_dir(&run.join("tool_outputs")).expect("tool outputs");
-    write_text(&input, "{\"inputs\":[],\"files\":[]}\n").expect("input");
-    write_text(
-        &run.join("input_normalized_manifest.tsv"),
-        &(NORMALIZED_INPUT_HEADER.to_string() + "\n"),
-    )
-    .expect("manifest");
-    write_text(
-        &run.join("feature_manifest.tsv"),
-        "input_id\tinput_kind\tfeature_family\tfeature_name\tfeature_value\tfeature_source\tfeature_token\trecord_id\ninput_1\tsmall_molecule\tligand\ttext\tazm\tuser\tazm\trecord_1\n",
-    )
-    .expect("features");
     write_text(
         &run.join("known_database_matches.tsv"),
         "input_id\tsource\ttarget_id\ttarget_name\torganism\ttarget_class\tmatch_score\tmatched_features\tevidence\ninput_1\tBindingDB\tP00918\tCarbonic anhydrase 2\tHomo sapiens\tknown_human_protein\t1.0000\tligand_code=AZM;pdb_ids=2H4N\tbindingdb_onsite_activity_row;Ki (nM)=12;ligand_code=AZM;pdb_ids=2H4N\n",
@@ -2295,6 +2383,12 @@ fn structure_evaluate_prefers_bindingdb_pdb_candidate_over_token_noise() {
         run_dir: run.clone(),
     };
 
+    normalize_and_compute_fixture(&options, "small_molecule", "CCN").expect("upstream manifests");
+    write_text(
+        &run.join("feature_manifest.tsv"),
+        "input_id\tinput_kind\tfeature_family\tfeature_name\tfeature_value\tfeature_source\tfeature_token\trecord_id\ninput_1\tsmall_molecule\tligand\ttext\tazm\tuser\tazm\trecord_1\n",
+    )
+    .expect("features");
     let out = run_science_command(ScienceCommand::StructureEvaluate, &options).expect("structure");
     let status = read_text(&run.join("structure_viewer_status.tsv")).expect("viewer status");
     let selected =
@@ -2317,17 +2411,6 @@ fn structure_evaluate_reads_canonical_index_rows_beyond_source_sampling_limit() 
     let input = root.join("input.json");
     ensure_dir(&store.join("indexes")).expect("indexes");
     ensure_dir(&store.join("downloads/rcsb/mmcif/ik")).expect("coords");
-    write_text(&input, "{\"inputs\":[],\"files\":[]}\n").expect("input");
-    write_text(
-        &run.join("input_normalized_manifest.tsv"),
-        &(NORMALIZED_INPUT_HEADER.to_string() + "\n"),
-    )
-    .expect("manifest");
-    write_text(
-        &run.join("feature_manifest.tsv"),
-        "input_id\tinput_kind\tfeature_family\tfeature_name\tfeature_value\tfeature_source\tfeature_token\trecord_id\ninput_1\tpeptide\tpeptide\tsequence_feature_token\tikv\tGenoLigand\tikv\trecord_1\n",
-    )
-    .expect("features");
     let mut index = String::from(
         "source\ttarget_id\ttarget_name\torganism\ttarget_class\tligand_tokens\tsequence_tokens\tstructure_tokens\tevidence\n",
     );
@@ -2352,6 +2435,12 @@ fn structure_evaluate_reads_canonical_index_rows_beyond_source_sampling_limit() 
         run_dir: run.clone(),
     };
 
+    normalize_and_compute_fixture(&options, "peptide", "IKVAV").expect("upstream manifests");
+    write_text(
+        &run.join("feature_manifest.tsv"),
+        "input_id\tinput_kind\tfeature_family\tfeature_name\tfeature_value\tfeature_source\tfeature_token\trecord_id\ninput_1\tpeptide\tpeptide\tsequence_feature_token\tikv\tGenoLigand\tikv\trecord_1\n",
+    )
+    .expect("features");
     let out = run_science_command(ScienceCommand::StructureEvaluate, &options).expect("structure");
     let matches = read_text(&run.join("structure_interaction_matches.tsv")).expect("matches");
     let summary = read_text(&run.join("structure_patch_summary.tsv")).expect("summary");

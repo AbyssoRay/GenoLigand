@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import csv
+import hashlib
 import json
 import os
 import shutil
@@ -223,6 +224,7 @@ def read_sequence_inputs(run_dir: Path) -> list[tuple[str, str, str, str]]:
     if not path.exists():
         return []
     rows: list[tuple[str, str, str, str]] = []
+    query_identities: dict[str, tuple[str, str]] = {}
     with path.open("r", encoding="utf-8-sig", newline="") as handle:
         for row in csv.DictReader(handle, delimiter="\t"):
             if str(row.get("conversion_status", "")).strip() != "converted":
@@ -249,9 +251,20 @@ def read_sequence_inputs(run_dir: Path) -> list[tuple[str, str, str, str]]:
                 continue
             input_id = str(row.get("input_id", "input_1")).strip() or "input_1"
             record_id = str(row.get("record_id", "record_1")).strip() or "record_1"
-            query_id = f"{safe_id(input_id)}__record__{safe_id(record_id)}"
+            query_id = sequence_query_id(input_id, record_id)
+            identity = (input_id, record_id)
+            if query_id in query_identities and query_identities[query_id] != identity:
+                raise ValueError(f"sequence_query_identity_collision:{query_id}")
+            query_identities[query_id] = identity
             rows.append((query_id, input_id, record_id, sequence))
     return rows
+
+
+def sequence_query_id(input_id: str, record_id: str) -> str:
+    payload = json.dumps(
+        [input_id, record_id], ensure_ascii=False, separators=(",", ":")
+    ).encode("utf-8")
+    return f"query_{hashlib.sha256(payload).hexdigest()}"
 
 
 def mmseqs_target_databases(science_store: Path) -> list[Path]:

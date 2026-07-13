@@ -13,8 +13,8 @@ use zip::ZipArchive;
 mod input_conversion;
 
 use input_conversion::{
-    convert_inputs_from_manifest, extract_inputs, normalized_inputs_from_conversions,
-    write_input_conversion_manifest,
+    INPUT_CONVERSION_HEADER, convert_inputs_from_manifest, extract_inputs,
+    normalized_inputs_from_conversions, write_input_conversion_manifest,
 };
 
 const WORKER_SCHEMA_VERSION: &str = "genoligand_worker_current_v1";
@@ -179,6 +179,14 @@ struct ComputedFeatureInput {
     record_id: String,
     input_kind: String,
     tokens: BTreeSet<String>,
+}
+
+#[derive(Clone, Debug)]
+struct ConversionProvenance {
+    canonical_kind: String,
+    source_kind: String,
+    source_path: String,
+    content_sha256: String,
 }
 
 #[derive(Clone, Debug)]
@@ -6040,6 +6048,106 @@ fn write_score_decomposition(options: &ScienceOptions) -> Result<(), String> {
     write_text(&options.run_dir.join("score_decomposition.tsv"), &text)
 }
 
+fn read_conversion_provenance(
+    normalized_path: &Path,
+) -> Result<BTreeMap<(String, String), ConversionProvenance>, String> {
+    let parent = normalized_path
+        .parent()
+        .ok_or_else(|| "normalized_input_manifest_missing_parent".to_string())?;
+    let path = parent.join("input_conversion_manifest.tsv");
+    if !path.is_file() {
+        return Err(format!(
+            "normalized_input_manifest_missing_conversion_provenance:{}",
+            path.display()
+        ));
+    }
+    let text = read_text(&path)?;
+    let mut lines = text.lines();
+    let header = lines
+        .next()
+        .map(|line| line.trim_start_matches('\u{feff}'))
+        .unwrap_or_default();
+    if header != INPUT_CONVERSION_HEADER {
+        return Err("input_conversion_manifest_schema_mismatch:header".to_string());
+    }
+    let mut by_identity = BTreeMap::new();
+    for (index, line) in lines.enumerate() {
+        if line.trim().is_empty() {
+            continue;
+        }
+        let cols = split_tsv(line);
+        if cols.len() != 18 {
+            return Err(format!(
+                "input_conversion_manifest_schema_mismatch:line_{}:columns_{}",
+                index + 2,
+                cols.len()
+            ));
+        }
+        if cols[6] != "converted" {
+            continue;
+        }
+        if cols[0].trim().is_empty() || cols[1].trim().is_empty() {
+            return Err(format!(
+                "input_conversion_manifest_missing_identity:line_{}",
+                index + 2
+            ));
+        }
+        if !matches!(
+            cols[4].as_str(),
+            "small_molecule" | "peptide" | "protein_ligand" | "complex" | "genome_or_metagenome"
+        ) {
+            return Err(format!(
+                "input_conversion_manifest_invalid_kind:line_{}:{}",
+                index + 2,
+                clean_cell(&cols[4])
+            ));
+        }
+        match cols[9].as_str() {
+            "file" if cols[10].trim().is_empty() => {
+                return Err(format!(
+                    "input_conversion_manifest_missing_source_path:line_{}",
+                    index + 2
+                ));
+            }
+            "inline" if !cols[10].trim().is_empty() => {
+                return Err(format!(
+                    "input_conversion_manifest_unexpected_source_path:line_{}",
+                    index + 2
+                ));
+            }
+            "file" | "inline" => {}
+            value => {
+                return Err(format!(
+                    "input_conversion_manifest_invalid_source_kind:line_{}:{}",
+                    index + 2,
+                    clean_cell(value)
+                ));
+            }
+        }
+        if cols[11].len() != 64 || !cols[11].chars().all(|ch| ch.is_ascii_hexdigit()) {
+            return Err(format!(
+                "input_conversion_manifest_invalid_sha256:line_{}",
+                index + 2
+            ));
+        }
+        let key = (cols[0].clone(), cols[1].clone());
+        let provenance = ConversionProvenance {
+            canonical_kind: cols[4].clone(),
+            source_kind: cols[9].clone(),
+            source_path: cols[10].clone(),
+            content_sha256: cols[11].clone(),
+        };
+        if by_identity.insert(key.clone(), provenance).is_some() {
+            return Err(format!(
+                "input_conversion_manifest_duplicate_identity:{}:{}",
+                clean_cell(&key.0),
+                clean_cell(&key.1)
+            ));
+        }
+    }
+    Ok(by_identity)
+}
+
 fn read_normalized_inputs(path: &Path) -> Result<Vec<NormalizedInput>, String> {
     let text = read_text(path)?;
     let mut lines = text.lines();
@@ -6051,6 +6159,7 @@ fn read_normalized_inputs(path: &Path) -> Result<Vec<NormalizedInput>, String> {
         return Err("normalized_input_manifest_schema_mismatch:header".to_string());
     }
     let mut out = Vec::new();
+    let mut conversion_provenance = None;
     for (index, line) in lines.enumerate() {
         if line.trim().is_empty() {
             continue;
@@ -6077,6 +6186,12 @@ fn read_normalized_inputs(path: &Path) -> Result<Vec<NormalizedInput>, String> {
                 ));
             }
         };
+        if cols[0].trim().is_empty() {
+            return Err(format!(
+                "normalized_input_manifest_missing_input_id:line_{}",
+                index + 2
+            ));
+        }
         if cols[5].trim().is_empty() {
             return Err(format!(
                 "normalized_input_manifest_missing_record_id:line_{}",
@@ -6084,6 +6199,18 @@ fn read_normalized_inputs(path: &Path) -> Result<Vec<NormalizedInput>, String> {
             ));
         }
         let source_kind = match cols[6].as_str() {
+            "file" if cols[7].trim().is_empty() => {
+                return Err(format!(
+                    "normalized_input_manifest_missing_source_path:line_{}",
+                    index + 2
+                ));
+            }
+            "inline" if !cols[7].trim().is_empty() => {
+                return Err(format!(
+                    "normalized_input_manifest_unexpected_source_path:line_{}",
+                    index + 2
+                ));
+            }
             "file" => "file",
             "inline" => "inline",
             value => {
@@ -6115,6 +6242,31 @@ fn read_normalized_inputs(path: &Path) -> Result<Vec<NormalizedInput>, String> {
                 )
             })
         };
+        if conversion_provenance.is_none() {
+            conversion_provenance = Some(read_conversion_provenance(path)?);
+        }
+        let key = (cols[0].clone(), cols[5].clone());
+        let expected = conversion_provenance
+            .as_ref()
+            .and_then(|rows| rows.get(&key))
+            .ok_or_else(|| {
+                format!(
+                    "normalized_input_manifest_missing_provenance:{}:{}",
+                    clean_cell(&key.0),
+                    clean_cell(&key.1)
+                )
+            })?;
+        if expected.canonical_kind != cols[1]
+            || expected.source_kind != cols[6]
+            || expected.source_path != cols[7]
+            || expected.content_sha256 != cols[8]
+        {
+            return Err(format!(
+                "normalized_input_manifest_provenance_mismatch:{}:{}",
+                clean_cell(&key.0),
+                clean_cell(&key.1)
+            ));
+        }
         out.push(NormalizedInput {
             input_id: cols[0].clone(),
             record_id: cols[5].clone(),
@@ -6143,6 +6295,21 @@ fn read_computed_feature_inputs(path: &Path) -> Result<Vec<ComputedFeatureInput>
     if header != FEATURE_MANIFEST_HEADER {
         return Err("feature_manifest_schema_mismatch:header".to_string());
     }
+    let normalized = read_normalized_inputs(&path.with_file_name("input_normalized_manifest.tsv"))?;
+    let mut normalized_kinds = BTreeMap::<(String, String), String>::new();
+    for input in normalized {
+        let key = (input.input_id.clone(), input.record_id.clone());
+        if normalized_kinds
+            .insert(key.clone(), input.kind.as_str().to_string())
+            .is_some()
+        {
+            return Err(format!(
+                "normalized_input_manifest_duplicate_identity:{}:{}",
+                clean_cell(&key.0),
+                clean_cell(&key.1)
+            ));
+        }
+    }
     let mut by_input = BTreeMap::<(String, String), ComputedFeatureInput>::new();
     for (index, line) in lines.enumerate() {
         if line.trim().is_empty() {
@@ -6166,6 +6333,18 @@ fn read_computed_feature_inputs(path: &Path) -> Result<Vec<ComputedFeatureInput>
                 clean_cell(&cols[1])
             ));
         }
+        if cols[0].trim().is_empty() {
+            return Err(format!(
+                "feature_manifest_missing_input_id:line_{}",
+                index + 2
+            ));
+        }
+        if cols[5].trim().is_empty() {
+            return Err(format!(
+                "feature_manifest_missing_feature_source:line_{}",
+                index + 2
+            ));
+        }
         if cols[7].trim().is_empty() {
             return Err(format!(
                 "feature_manifest_missing_record_id:line_{}",
@@ -6174,6 +6353,30 @@ fn read_computed_feature_inputs(path: &Path) -> Result<Vec<ComputedFeatureInput>
         }
         let token = cols[6].trim();
         let key = (cols[0].clone(), cols[7].clone());
+        if by_input
+            .get(&key)
+            .is_some_and(|input| input.input_kind != cols[1])
+        {
+            return Err(format!(
+                "feature_manifest_kind_conflict:{}:{}",
+                clean_cell(&key.0),
+                clean_cell(&key.1)
+            ));
+        }
+        let expected_kind = normalized_kinds.get(&key).ok_or_else(|| {
+            format!(
+                "feature_manifest_missing_normalized_identity:{}:{}",
+                clean_cell(&key.0),
+                clean_cell(&key.1)
+            )
+        })?;
+        if expected_kind != &cols[1] {
+            return Err(format!(
+                "feature_manifest_normalized_kind_mismatch:{}:{}",
+                clean_cell(&key.0),
+                clean_cell(&key.1)
+            ));
+        }
         let entry = by_input.entry(key).or_insert_with(|| ComputedFeatureInput {
             input_id: cols[0].clone(),
             record_id: cols[7].clone(),

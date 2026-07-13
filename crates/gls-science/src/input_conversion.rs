@@ -10,6 +10,7 @@ use std::path::{Path, PathBuf};
 
 const INPUT_RESOLVER_SCRIPT: &str =
     include_str!("../../../python/genoligand_workers/input_resolver.py");
+pub(super) const INPUT_CONVERSION_HEADER: &str = "input_id\trecord_id\toriginal_field\tinferred_kind\tcanonical_kind\tcanonical_value\tconversion_status\tconversion_method\tformat\tsource_kind\tsource_path\tcontent_sha256\treason\tartifact\trisk_flags\tstructure_atom_count\tstructure_chain_count\tstructure_residue_count";
 
 #[derive(Clone, Debug)]
 pub(super) struct ConvertedInput {
@@ -935,9 +936,7 @@ pub(super) fn write_input_conversion_manifest(
     options: &ScienceOptions,
     conversions: &[ConvertedInput],
 ) -> Result<(), String> {
-    let mut text = String::from(
-        "input_id\trecord_id\toriginal_field\tinferred_kind\tcanonical_kind\tcanonical_value\tconversion_status\tconversion_method\tformat\tsource_kind\tsource_path\tcontent_sha256\treason\tartifact\trisk_flags\tstructure_atom_count\tstructure_chain_count\tstructure_residue_count\n",
-    );
+    let mut text = format!("{INPUT_CONVERSION_HEADER}\n");
     for input in conversions {
         text.push_str(&format!(
             "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\n",
