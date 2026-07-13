@@ -8,6 +8,8 @@ from pathlib import Path
 from unittest.mock import patch
 
 from genoligand_workers.alignment_worker import (
+    SequenceInput,
+    TargetDatabase,
     mmseqs_rows,
     read_sequence_inputs,
     run_foldseek_alignment,
@@ -34,6 +36,17 @@ class AlignmentRecordIdentityTests(unittest.TestCase):
             encoding="utf-8",
         )
         return query_id
+
+    @staticmethod
+    def append_genome_sequence(run_dir: Path) -> None:
+        path = run_dir / "input_conversion_manifest.tsv"
+        with path.open("a", encoding="utf-8") as handle:
+            handle.write(
+                "input_2\tcontig_1\tgenome_or_metagenome\tgenome_or_metagenome\tgenome_or_metagenome\t"
+                "ATGCGTGTGTAA\tconverted\tstandard_nucleotide_sequence\tfasta\tinline\t\t"
+                + "b" * 64
+                + "\trecognized\t\t\n"
+            )
 
     def test_multi_record_queries_keep_input_and_record_identity(self) -> None:
         with tempfile.TemporaryDirectory(prefix="genoligand_alignment_identity_") as tmp:
@@ -68,23 +81,30 @@ class AlignmentRecordIdentityTests(unittest.TestCase):
             root = Path(tmp)
             raw = root / "matches.m8"
             raw.write_text(
-                "input_1__record__alpha\ttarget_a\t80\t6\t1e-8\t60\n"
-                "input_1__record__beta\ttarget_b\t75\t6\t1e-7\t55\n",
+                "input_1__record__alpha\ttarget_a\t80\t6\t1.0\t1.0\t1e-8\t60\t1\t6\t1\t6\t6M\n"
+                "input_1__record__beta\ttarget_b\t75\t6\t1.0\t1.0\t1e-7\t55\t1\t6\t1\t6\t6M\n",
                 encoding="utf-8",
             )
             rows = mmseqs_rows(
                 raw,
-                root / "known_targets",
+                TargetDatabase(
+                    "uniprot_test", "UniProt", "known", "a" * 64, "mmseqs-test", root / "known_targets"
+                ),
                 {
-                    "input_1__record__alpha": ("input_1", "alpha"),
-                    "input_1__record__beta": ("input_1", "beta"),
+                    "input_1__record__alpha": SequenceInput(
+                        "input_1__record__alpha", "input_1", "alpha", "protein_ligand", "MKTAYI"
+                    ),
+                    "input_1__record__beta": SequenceInput(
+                        "input_1__record__beta", "input_1", "beta", "protein_ligand", "ACDEFG"
+                    ),
                 },
+                "MMseqs2-test",
             )
 
             self.assertEqual(len(rows), 2)
-            self.assertTrue(rows[0].startswith("input_1\tMMseqs2\t"))
-            self.assertTrue(rows[0].endswith("\talpha\n"))
-            self.assertTrue(rows[1].endswith("\tbeta\n"))
+            self.assertTrue(rows[0].startswith("input_1\tUniProt\t"))
+            self.assertIn("\talpha\tprotein_ligand\t6\t1.0\t1.0\t6M\n", rows[0])
+            self.assertIn("\tbeta\tprotein_ligand\t6\t1.0\t1.0\t6M\n", rows[1])
             self.assertIn("query_id=input_1__record__alpha", rows[0])
 
     def test_coordinate_content_is_not_converted_to_a_sequence_query(self) -> None:
@@ -165,23 +185,26 @@ class AlignmentRecordIdentityTests(unittest.TestCase):
             manifest = store / "indexes/mmseqs/mmseqs_target_databases.tsv"
             manifest.parent.mkdir(parents=True)
             manifest.write_text(
-                "source_id\tdb_path\tstatus\n"
-                "known_db\tindexes/mmseqs/known/target\tready\n"
-                "broken_db\tindexes/mmseqs/broken/target\tready\n",
+                "source_id\tsource_namespace\tsource_class\tsource_digest\tbuilder_version\tdb_path\tstatus\n"
+                f"known_db\tUniProt\tknown\t{'a' * 64}\tmmseqs-test\tindexes/mmseqs/known/target\tready\n"
+                f"broken_db\tBioLiP2\tknown\t{'b' * 64}\tmmseqs-test\tindexes/mmseqs/broken/target\tready\n",
                 encoding="utf-8",
             )
             for database_id in ("known", "broken"):
                 prefix = store / f"indexes/mmseqs/{database_id}/target"
                 prefix.parent.mkdir(parents=True)
+                prefix.write_bytes(b"database")
                 Path(f"{prefix}.dbtype").write_bytes(b"\x00\x00\x00\x00")
 
             def fake_run(command, capture_output=True, text=True, timeout=None):
                 operation = command[1]
+                if operation == "version":
+                    return subprocess.CompletedProcess(command, 0, "MMseqs2-test\n", "")
                 if operation == "search" and "broken" in command[3]:
                     return subprocess.CompletedProcess(command, 1, "", "fixture search failed")
                 if operation == "convertalis":
                     Path(command[5]).write_text(
-                        f"{query_id}\ttarget_a\t80\t6\t1e-8\t60\n",
+                        f"{query_id}\ttarget_a\t80\t6\t1.0\t1.0\t1e-8\t60\t1\t6\t1\t6\t6M\n",
                         encoding="utf-8",
                     )
                 return subprocess.CompletedProcess(command, 0, "", "")
@@ -200,6 +223,173 @@ class AlignmentRecordIdentityTests(unittest.TestCase):
             self.assertTrue(outcomes["broken_db"].required)
             matches = (run_dir / "tool_outputs/mmseqs_alignment_matches.tsv").read_text(encoding="utf-8")
             self.assertIn("target_a", matches)
+
+    def test_mmseqs_builds_typed_query_databases_and_requires_alignment_backtrace(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="genoligand_mmseqs_typed_") as tmp:
+            root = Path(tmp)
+            run_dir = root / "run"
+            store = root / "store"
+            protein_query_id = self.write_sequence_manifest(run_dir)
+            self.append_genome_sequence(run_dir)
+            manifest = store / "indexes/mmseqs/mmseqs_target_databases.tsv"
+            manifest.parent.mkdir(parents=True)
+            manifest.write_text(
+                "source_id\tsource_namespace\tsource_class\tsource_digest\tbuilder_version\tdb_path\tstatus\n"
+                f"uniprot_human\tUniProt\tknown\t{'a' * 64}\tmmseqs-test\tindexes/mmseqs/uniprot/target\tready\n",
+                encoding="utf-8",
+            )
+            target = store / "indexes/mmseqs/uniprot/target"
+            target.parent.mkdir(parents=True)
+            target.write_bytes(b"database")
+            Path(f"{target}.dbtype").write_bytes(b"\x00\x00\x00\x00")
+            commands: list[list[str]] = []
+
+            def fake_run(command, capture_output=True, text=True, timeout=None):
+                commands.append(command)
+                if command[1] == "version":
+                    return subprocess.CompletedProcess(command, 0, "MMseqs2-test\n", "")
+                if command[1] == "convertalis":
+                    query_id = protein_query_id
+                    query_fasta = Path(command[2]).name
+                    if "nucleotide" in query_fasta:
+                        query_id = next(
+                            line[1:]
+                            for line in (run_dir / "tool_outputs/mmseqs_query_nucleotide.fasta")
+                            .read_text(encoding="utf-8")
+                            .splitlines()
+                            if line.startswith(">")
+                        )
+                    if "translated_protein" in query_fasta:
+                        query_id = next(
+                            line[1:]
+                            for line in (run_dir / "tool_outputs/mmseqs_query_translated_protein.fasta")
+                            .read_text(encoding="utf-8")
+                            .splitlines()
+                            if line.startswith(">")
+                        )
+                    Path(command[5]).write_text(
+                        f"{query_id}\ttarget_a\t80\t6\t1.0\t1.0\t1e-8\t60\t1\t6\t1\t6\t6M\n",
+                        encoding="utf-8",
+                    )
+                return subprocess.CompletedProcess(command, 0, "", "")
+
+            with patch("genoligand_workers.alignment_worker.shutil.which", return_value="mmseqs"), patch(
+                "genoligand_workers.alignment_worker.subprocess.run", side_effect=fake_run
+            ):
+                execution = run_mmseqs_alignment(run_dir, store)
+
+            self.assertEqual(execution.status, "completed")
+            createdb = [command for command in commands if command[1] == "createdb"]
+            self.assertEqual(len(createdb), 3)
+            created_types = {Path(command[3]).name: command[command.index("--dbtype") + 1] for command in createdb}
+            self.assertEqual(created_types["mmseqs_query_protein_db"], "1")
+            self.assertEqual(created_types["mmseqs_query_nucleotide_db"], "2")
+            self.assertEqual(created_types["mmseqs_query_translated_protein_db"], "1")
+            searches = [command for command in commands if command[1] == "search"]
+            self.assertEqual(len(searches), 3)
+            self.assertTrue(all("-a" in command for command in searches))
+            search_types = {Path(command[2]).name: command[command.index("--search-type") + 1] for command in searches}
+            self.assertEqual(search_types["mmseqs_query_protein_db"], "1")
+            self.assertEqual(search_types["mmseqs_query_nucleotide_db"], "2")
+            self.assertEqual(search_types["mmseqs_query_translated_protein_db"], "1")
+            output = (run_dir / "tool_outputs/mmseqs_alignment_matches.tsv").read_text(encoding="utf-8")
+            self.assertIn("source_database_id\tsource_namespace\tsource_class", output.splitlines()[0])
+            self.assertIn("\tuniprot_human\tUniProt\tknown\t", output)
+            self.assertIn(f"\t{'a' * 64}\tmmseqs-test\tMMseqs2-test\t", output)
+
+    def test_mmseqs_rejects_rows_without_real_alignment_backtrace(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="genoligand_mmseqs_backtrace_") as tmp:
+            root = Path(tmp)
+            raw = root / "matches.m8"
+            raw.write_text("query_1\ttarget_a\t80\t6\t1e-8\t60\n", encoding="utf-8")
+            with self.assertRaisesRegex(ValueError, "alignment_backtrace"):
+                mmseqs_rows(
+                    raw,
+                    TargetDatabase(
+                        "uniprot_test",
+                        "UniProt",
+                        "known",
+                        "a" * 64,
+                        "mmseqs-test",
+                        root / "known_targets",
+                    ),
+                    {
+                        "query_1": SequenceInput(
+                            "query_1", "input_1", "record_1", "protein_ligand", "MKTAYI"
+                        )
+                    },
+                    "MMseqs2-test",
+                )
+
+    def test_mmseqs_rejects_ready_target_without_explicit_provenance(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="genoligand_mmseqs_provenance_") as tmp:
+            root = Path(tmp)
+            run_dir = root / "run"
+            store = root / "store"
+            self.write_sequence_manifest(run_dir)
+            manifest = store / "indexes/mmseqs/mmseqs_target_databases.tsv"
+            manifest.parent.mkdir(parents=True)
+            manifest.write_text(
+                "source_id\tdb_path\tstatus\n"
+                "uniprot_human\tindexes/mmseqs/uniprot/target\tready\n",
+                encoding="utf-8",
+            )
+            target = store / "indexes/mmseqs/uniprot/target"
+            target.parent.mkdir(parents=True)
+            target.write_bytes(b"database")
+            Path(f"{target}.dbtype").write_bytes(b"\x00\x00\x00\x00")
+
+            with self.assertRaisesRegex(ValueError, "target_provenance_missing"):
+                run_mmseqs_alignment(run_dir, store)
+
+    def test_mmseqs_ready_target_with_missing_database_fails_instead_of_being_skipped(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="genoligand_mmseqs_missing_ready_db_") as tmp:
+            root = Path(tmp)
+            run_dir = root / "run"
+            store = root / "store"
+            self.write_sequence_manifest(run_dir)
+            manifest = store / "indexes/mmseqs/mmseqs_target_databases.tsv"
+            manifest.parent.mkdir(parents=True)
+            manifest.write_text(
+                "source_id\tsource_namespace\tsource_class\tsource_digest\tbuilder_version\tdb_path\tstatus\n"
+                f"uniprot_human\tUniProt\tknown\t{'a' * 64}\tmmseqs-test\tindexes/mmseqs/missing/target\tready\n",
+                encoding="utf-8",
+            )
+
+            with self.assertRaisesRegex(ValueError, "target_database_not_ready:uniprot_human"):
+                run_mmseqs_alignment(run_dir, store)
+
+    def test_mmseqs_accepts_reverse_coordinates_and_penalizes_low_coverage(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="genoligand_mmseqs_reverse_coverage_") as tmp:
+            root = Path(tmp)
+            raw = root / "matches.m8"
+            raw.write_text(
+                "query_high\ttarget_a\t80\t60\t1.0\t1.0\t1e-8\t60\t60\t1\t1\t60\t60M\n"
+                "query_low\ttarget_b\t80\t6\t0.1\t0.1\t1e-8\t60\t6\t1\t1\t6\t6M\n",
+                encoding="utf-8",
+            )
+            target = TargetDatabase(
+                "uniprot_test",
+                "UniProt",
+                "known",
+                "a" * 64,
+                "mmseqs-test",
+                root / "known_targets",
+            )
+            identities = {
+                "query_high": SequenceInput(
+                    "query_high", "input_1", "record_1", "nucleotide", "ATGCGT"
+                ),
+                "query_low": SequenceInput(
+                    "query_low", "input_1", "record_1", "nucleotide", "ATGCGT"
+                ),
+            }
+
+            rows = mmseqs_rows(raw, target, identities, "MMseqs2-test")
+
+            high_score = float(rows[0].split("\t")[6])
+            low_score = float(rows[1].split("\t")[6])
+            self.assertGreater(high_score, low_score)
 
     def test_md_outcomes_distinguish_no_input_from_missing_receptor(self) -> None:
         with tempfile.TemporaryDirectory(prefix="genoligand_md_outcome_") as tmp:

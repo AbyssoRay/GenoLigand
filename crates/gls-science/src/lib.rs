@@ -1009,16 +1009,31 @@ fn build_structure_index_rows(
             "biolip2_interaction_rows",
         );
     }
-    for path in discover_plinder_tables(&options.science_store.join("downloads/plinder"))? {
-        let built = structure_file_row("PLINDER", &path);
+    let plinder_sources =
+        discover_plinder_tables(&options.science_store.join("downloads/plinder"))?;
+    if !plinder_sources.is_empty() {
+        let canonical = options.science_store.join("indexes/plinder_targets.tsv");
+        if !canonical.is_file() {
+            return Err(format!(
+                "plinder_canonical_index_missing:{}",
+                canonical.display()
+            ));
+        }
+        let built = read_store_rows(&canonical, "plinder_canonical_index")?;
+        if built.is_empty() {
+            return Err(format!(
+                "plinder_canonical_index_empty:{}",
+                canonical.display()
+            ));
+        }
         append_built_rows(
             "structure_targets",
             &options.science_store,
-            &path,
-            vec![built],
+            &canonical,
+            built,
             &mut rows,
             manifest,
-            "plinder_annotation_rows",
+            "plinder_canonical_rows",
         );
     }
     for path in discover_moad_tables(&options.science_store.join("downloads/binding_moad"))? {
@@ -2819,6 +2834,7 @@ fn match_known(options: &ScienceOptions) -> Result<String, String> {
     }
     append_chembl_onsite_matches(options, &normalized, &mut out)?;
     append_bindingdb_onsite_matches(options, &normalized, &mut out)?;
+    append_mmseqs_match_rows(options, "known", &mut out, true)?;
     write_text(&options.run_dir.join("known_database_matches.tsv"), &out)?;
     Ok(format!(
         "known_database_matched\tout={}",
@@ -3390,7 +3406,7 @@ fn match_metagenome(options: &ScienceOptions) -> Result<String, String> {
             }
         }
     }
-    append_tool_match_rows(options, "mmseqs_alignment_matches.tsv", &mut out)?;
+    append_mmseqs_match_rows(options, "metagenome", &mut out, false)?;
     write_text(
         &options.run_dir.join("metagenome_potential_matches.tsv"),
         &out,
@@ -3538,6 +3554,132 @@ fn append_tool_match_rows(
                 "record_1".to_string(),
             ])),
         ));
+        count += 1;
+    }
+    Ok(count)
+}
+
+fn append_mmseqs_match_rows(
+    options: &ScienceOptions,
+    expected_source_class: &str,
+    out: &mut String,
+    known_output: bool,
+) -> Result<usize, String> {
+    let path = options
+        .run_dir
+        .join("tool_outputs/mmseqs_alignment_matches.tsv");
+    if !path.exists() {
+        return Ok(0);
+    }
+    let text = read_text(&path)?;
+    let mut lines = text.lines();
+    let Some(header) = lines.next() else {
+        return Err("mmseqs_provenance_header_missing".to_string());
+    };
+    let headers = split_tsv(header);
+    let required_header = |name: &str| {
+        find_header(&headers, &[name])
+            .ok_or_else(|| format!("mmseqs_provenance_header_missing:{name}"))
+    };
+    let source_db_idx = required_header("source_database_id")?;
+    let namespace_idx = required_header("source_namespace")?;
+    let source_class_idx = required_header("source_class")?;
+    let source_digest_idx = required_header("source_digest")?;
+    let builder_version_idx = required_header("builder_version")?;
+    let mmseqs_version_idx = required_header("mmseqs_version")?;
+    let query_idx = required_header("current_run_query_id")?;
+    let record_idx = required_header("record_id")?;
+    let mut count = 0usize;
+    for (line_index, line) in lines.enumerate() {
+        if line.trim().is_empty() {
+            continue;
+        }
+        let cols = split_tsv(line);
+        if cols.len() < 9 {
+            return Err(format!("mmseqs_result_row_invalid:line={}", line_index + 2));
+        }
+        let source_database_id = cell(&cols, Some(source_db_idx));
+        let source_namespace = cell(&cols, Some(namespace_idx));
+        let source_class = cell(&cols, Some(source_class_idx)).to_ascii_lowercase();
+        let source_digest = cell(&cols, Some(source_digest_idx));
+        let builder_version = cell(&cols, Some(builder_version_idx));
+        let mmseqs_version = cell(&cols, Some(mmseqs_version_idx));
+        let current_run_query_id = cell(&cols, Some(query_idx));
+        let record_id = cell(&cols, Some(record_idx));
+        if source_database_id.is_empty()
+            || source_namespace.is_empty()
+            || source_digest.is_empty()
+            || builder_version.is_empty()
+            || mmseqs_version.is_empty()
+            || current_run_query_id.is_empty()
+            || record_id.is_empty()
+        {
+            return Err(format!("mmseqs_provenance_missing:line={}", line_index + 2));
+        }
+        if !matches!(source_class.as_str(), "known" | "metagenome") {
+            return Err(format!(
+                "mmseqs_source_class_invalid:line={}:class={}",
+                line_index + 2,
+                clean_cell(&source_class)
+            ));
+        }
+        if source_class != expected_source_class {
+            continue;
+        }
+        let target_class = if source_class == "known" {
+            "known_protein"
+        } else {
+            "potential_metagenome_sequence"
+        };
+        let evidence = format!(
+            "{};source_digest={};builder_version={};mmseqs_version={}",
+            clean_cell(&cols[8]),
+            clean_cell(&source_digest),
+            clean_cell(&builder_version),
+            clean_cell(&mmseqs_version)
+        );
+        if known_output {
+            let provenance = format!(
+                "mmseqs_database={};source_namespace={};source_class={};source_digest={};builder_version={};mmseqs_version={}",
+                clean_cell(&source_database_id),
+                clean_cell(&source_namespace),
+                source_class,
+                clean_cell(&source_digest),
+                clean_cell(&builder_version),
+                clean_cell(&mmseqs_version)
+            );
+            out.push_str(&format!(
+                "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t\t\t{}\t{}\n",
+                clean_cell(&cols[0]),
+                clean_cell(&source_namespace),
+                clean_cell(&cols[2]),
+                clean_cell(&cols[3]),
+                clean_cell(&cols[4]),
+                target_class,
+                clean_cell(&cols[6]),
+                clean_cell(&cols[7]),
+                evidence,
+                provenance,
+                clean_cell(&current_run_query_id),
+                clean_cell(&record_id),
+            ));
+        } else {
+            out.push_str(&format!(
+                "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\n",
+                clean_cell(&cols[0]),
+                clean_cell(&source_namespace),
+                clean_cell(&cols[2]),
+                clean_cell(&cols[3]),
+                clean_cell(&cols[4]),
+                target_class,
+                clean_cell(&cols[6]),
+                clean_cell(&cols[7]),
+                evidence,
+                clean_cell(&source_database_id),
+                clean_cell(&current_run_query_id),
+                clean_cell(&record_id),
+            ));
+        }
         count += 1;
     }
     Ok(count)

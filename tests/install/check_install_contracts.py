@@ -4,6 +4,7 @@ import hashlib
 import http.server
 import importlib.util
 import inspect
+import json
 import os
 import sys
 import tempfile
@@ -485,6 +486,45 @@ def check_alignment_source_digest_rebuild(installer, tool: str) -> None:
         require(int(manifest_rows[0]["source_files"]) == current_summary["file_count"], f"{tool} manifest must record source file count")
         require(int(manifest_rows[0]["source_bytes"]) == current_summary["bytes"], f"{tool} manifest must record source bytes")
         require(manifest_rows[0]["builder_version"] == "test-builder-1", f"{tool} manifest must record builder version")
+        if tool == "mmseqs":
+            require(manifest_rows[0]["source_namespace"] == "MGnify", "MMseqs manifest must record source namespace")
+            require(manifest_rows[0]["source_class"] == "metagenome", "MMseqs manifest must record source class")
+
+
+def check_plinder_canonical_digest_gate(installer) -> None:
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        source = root / "annotation_table.parquet"
+        canonical = root / "plinder_targets.tsv"
+        manifest = root / "plinder_targets.manifest.json"
+        source.write_bytes(b"PAR1fixturePAR1")
+        canonical.write_text("source\ttarget_id\nPLINDER\tSYSTEM_1\n", encoding="utf-8")
+        manifest.write_text(
+            json.dumps(
+                {
+                    "status": "ready",
+                    "source": {
+                        "sha256": installer.sha256_file(source),
+                        "size_bytes": source.stat().st_size,
+                    },
+                    "canonical": {
+                        "row_count": 1,
+                        "sha256": installer.sha256_file(canonical),
+                        "size_bytes": canonical.stat().st_size,
+                    },
+                }
+            ),
+            encoding="utf-8",
+        )
+        require(
+            installer.plinder_canonical_index_ready(source, canonical, manifest),
+            "matching PLINDER source and canonical digests must be reusable",
+        )
+        source.write_bytes(b"PAR1changedPAR1")
+        require(
+            not installer.plinder_canonical_index_ready(source, canonical, manifest),
+            "changed PLINDER source digest must invalidate the canonical index",
+        )
 
 
 def check_alignment_rebuild_failure_preserves_previous(installer, tool: str) -> None:
@@ -946,6 +986,7 @@ def main() -> int:
     check_external_download_result_closure(installer)
     check_alignment_source_digest_rebuild(installer, "mmseqs")
     check_alignment_source_digest_rebuild(installer, "foldseek")
+    check_plinder_canonical_digest_gate(installer)
     check_alignment_rebuild_failure_preserves_previous(installer, "mmseqs")
     check_alignment_rebuild_failure_preserves_previous(installer, "foldseek")
     check_corrupt_database_rebuild_preserves_previous(installer, "mmseqs")

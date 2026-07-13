@@ -1,6 +1,7 @@
 # GenoLigand schema-bound scientific worker runtime, CPU profile.
 numpy
 pandas
+pyarrow==24.0.0
 rdkit
 openbabel-wheel
 openmm

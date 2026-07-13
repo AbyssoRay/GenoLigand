@@ -3,20 +3,52 @@ from __future__ import annotations
 import csv
 import hashlib
 import json
+import math
 import os
 import shutil
 import subprocess
 from pathlib import Path
-from typing import Any
+from typing import Any, NamedTuple
 
 from genoligand_workers.common import WorkerExecution, WorkerOutcome
 from genoligand_workers.worker_io import parse_worker_args, read_job, write_result
 
 
-MATCH_HEADER = (
+FOLDSEEK_MATCH_HEADER = (
     "input_id\tsource\ttarget_id\ttarget_name\torganism\ttarget_class\tmatch_score\t"
     "matched_features\tevidence\trecord_id\n"
 )
+
+MMSEQS_MATCH_HEADER = (
+    "input_id\tsource\ttarget_id\ttarget_name\torganism\ttarget_class\tmatch_score\t"
+    "matched_features\tevidence\tsource_database_id\tsource_namespace\tsource_class\t"
+    "source_digest\tbuilder_version\tmmseqs_version\tcurrent_run_query_id\trecord_id\t"
+    "query_kind\talignment_length\tquery_coverage\ttarget_coverage\talignment_cigar\n"
+)
+
+
+class SequenceInput(NamedTuple):
+    query_id: str
+    input_id: str
+    record_id: str
+    canonical_kind: str
+    sequence: str
+
+
+class QueryBatch(NamedTuple):
+    name: str
+    dbtype: str
+    search_type: str
+    records: list[SequenceInput]
+
+
+class TargetDatabase(NamedTuple):
+    database_id: str
+    namespace: str
+    source_class: str
+    source_digest: str
+    builder_version: str
+    path: Path
 
 
 def main() -> int:
@@ -67,7 +99,7 @@ def run_mmseqs_alignment(run_dir: Path, science_store: Path) -> WorkerExecution:
     out_dir.mkdir(parents=True, exist_ok=True)
     matches_path = out_dir / "mmseqs_alignment_matches.tsv"
     status_path = out_dir / "mmseqs_alignment_status.tsv"
-    write_text(matches_path, MATCH_HEADER)
+    write_text(matches_path, MMSEQS_MATCH_HEADER)
 
     sequences = read_sequence_inputs(run_dir)
     if not sequences:
@@ -99,64 +131,94 @@ def run_mmseqs_alignment(run_dir: Path, science_store: Path) -> WorkerExecution:
             "not_ready",
             reason,
             "MMseqs2 executable missing",
-            tuple(WorkerOutcome("not_ready", reason, True, database_id, 0) for database_id, _target in targets),
+            tuple(
+                WorkerOutcome("not_ready", reason, True, target.database_id, 0)
+                for target in targets
+            ),
         )
 
-    query = out_dir / "mmseqs_query.fasta"
-    write_fasta(query, sequences)
-    query_identities = {
-        query_id: (input_id, record_id)
-        for query_id, input_id, record_id, _sequence in sequences
-    }
-    query_db = out_dir / "mmseqs_query_db"
+    mmseqs_version = executable_version(mmseqs, timeout=30)
+    batches = sequence_query_batches(sequences)
+    query_databases: list[tuple[QueryBatch, Path]] = []
     raw_dir = out_dir / "mmseqs_raw"
     raw_dir.mkdir(parents=True, exist_ok=True)
     tmp_root = out_dir / "mmseqs_tmp"
     tmp_root.mkdir(parents=True, exist_ok=True)
     timeout = int(os.environ.get("GENOLIGAND_ALIGNMENT_TIMEOUT_SECONDS", "900"))
-    run_command([mmseqs, "createdb", str(query), str(query_db)], timeout, "mmseqs_createdb")
+    for batch in batches:
+        query = out_dir / f"mmseqs_query_{batch.name}.fasta"
+        query_db = out_dir / f"mmseqs_query_{batch.name}_db"
+        write_fasta(query, batch.records)
+        run_command(
+            [mmseqs, "createdb", str(query), str(query_db), "--dbtype", batch.dbtype],
+            timeout,
+            f"mmseqs_createdb_{batch.name}",
+        )
+        query_databases.append((batch, query_db))
+
     rows: list[str] = []
     outcomes: list[WorkerOutcome] = []
-    for index, (database_id, target) in enumerate(targets, start=1):
-        raw = raw_dir / f"target_{index}.m8"
-        tmp = tmp_root / f"target_{index}"
-        result_db = raw_dir / f"target_{index}_result"
-        command = [
-            mmseqs,
-            "search",
-            str(query_db),
-            str(target),
-            str(result_db),
-            str(tmp),
-            "--threads",
-            os.environ.get("GENOLIGAND_ALIGNMENT_THREADS", "1"),
-        ]
-        completed = subprocess.run(command, capture_output=True, text=True, timeout=timeout)
-        if completed.returncode != 0:
-            reason = safe_note(first_line(completed.stderr or completed.stdout)) or "mmseqs_search_failed"
-            outcomes.append(WorkerOutcome("failed", reason, True, database_id, 0))
-            continue
-        command = [
-            mmseqs,
-            "convertalis",
-            str(query_db),
-            str(target),
-            str(result_db),
-            str(raw),
-            "--format-output",
-            "query,target,pident,alnlen,evalue,bits",
-        ]
-        completed = subprocess.run(command, capture_output=True, text=True, timeout=timeout)
-        if completed.returncode != 0:
-            reason = safe_note(first_line(completed.stderr or completed.stdout)) or "mmseqs_convertalis_failed"
-            outcomes.append(WorkerOutcome("failed", reason, True, database_id, 0))
-            continue
-        target_rows = mmseqs_rows(raw, target, query_identities)
+    for target_index, target in enumerate(targets, start=1):
+        target_rows: list[str] = []
+        failure_reason = ""
+        for batch, query_db in query_databases:
+            stem = f"target_{target_index}_{batch.name}"
+            raw = raw_dir / f"{stem}.m8"
+            tmp = tmp_root / stem
+            result_db = raw_dir / f"{stem}_result"
+            command = [
+                mmseqs,
+                "search",
+                str(query_db),
+                str(target.path),
+                str(result_db),
+                str(tmp),
+                "-a",
+                "--search-type",
+                batch.search_type,
+                "--threads",
+                os.environ.get("GENOLIGAND_ALIGNMENT_THREADS", "1"),
+            ]
+            completed = subprocess.run(command, capture_output=True, text=True, timeout=timeout)
+            if completed.returncode != 0:
+                failure_reason = (
+                    safe_note(first_line(completed.stderr or completed.stdout))
+                    or f"mmseqs_search_failed_{batch.name}"
+                )
+                break
+            command = [
+                mmseqs,
+                "convertalis",
+                str(query_db),
+                str(target.path),
+                str(result_db),
+                str(raw),
+                "--format-output",
+                "query,target,pident,alnlen,qcov,tcov,evalue,bits,qstart,qend,tstart,tend,cigar",
+            ]
+            completed = subprocess.run(command, capture_output=True, text=True, timeout=timeout)
+            if completed.returncode != 0:
+                failure_reason = (
+                    safe_note(first_line(completed.stderr or completed.stdout))
+                    or f"mmseqs_convertalis_failed_{batch.name}"
+                )
+                break
+            identities = {record.query_id: record for record in batch.records}
+            target_rows.extend(mmseqs_rows(raw, target, identities, mmseqs_version))
         rows.extend(target_rows)
-        outcomes.append(WorkerOutcome("completed", "search_completed", True, database_id, len(target_rows)))
-    write_text(matches_path, MATCH_HEADER + "".join(rows))
+        if failure_reason:
+            outcomes.append(
+                WorkerOutcome("failed", failure_reason, True, target.database_id, len(target_rows))
+            )
+        else:
+            outcomes.append(
+                WorkerOutcome(
+                    "completed", "search_completed", True, target.database_id, len(target_rows)
+                )
+            )
+    write_text(matches_path, MMSEQS_MATCH_HEADER + "".join(rows))
     failures = [outcome for outcome in outcomes if outcome.status == "failed"]
-    version = f"MMseqs2 search; targets={len(targets)}; matches={len(rows)}"
+    version = f"{mmseqs_version}; targets={len(targets)}; matches={len(rows)}"
     if failures:
         reason = ";".join(f"{outcome.database_id}:{outcome.reason}" for outcome in failures[:4])
         write_status(status_path, "failed", reason, len(rows))
@@ -171,7 +233,7 @@ def run_foldseek_alignment(run_dir: Path, science_store: Path) -> WorkerExecutio
     out_dir.mkdir(parents=True, exist_ok=True)
     matches_path = out_dir / "foldseek_structure_matches.tsv"
     status_path = out_dir / "foldseek_alignment_status.tsv"
-    write_text(matches_path, MATCH_HEADER)
+    write_text(matches_path, FOLDSEEK_MATCH_HEADER)
 
     query = structure_query(run_dir)
     if query is None:
@@ -255,7 +317,7 @@ def run_foldseek_alignment(run_dir: Path, science_store: Path) -> WorkerExecutio
             (WorkerOutcome("failed", reason, True, database_id, 0),),
         )
     rows = foldseek_rows(raw)
-    write_text(matches_path, MATCH_HEADER + "".join(rows))
+    write_text(matches_path, FOLDSEEK_MATCH_HEADER + "".join(rows))
     reason = "search_completed" if rows else "search_completed_no_hits"
     write_status(status_path, "completed", reason, len(rows))
     return WorkerExecution(
@@ -284,16 +346,30 @@ def run_command(command: list[str], timeout: int, label: str) -> None:
         raise ValueError(f"{label}_failed:{detail}")
 
 
+def executable_version(command: str, timeout: int) -> str:
+    completed = subprocess.run([command, "version"], capture_output=True, text=True, timeout=timeout)
+    if completed.returncode != 0:
+        detail = first_line(completed.stderr or completed.stdout)
+        raise ValueError(f"mmseqs_version_failed:{detail}")
+    version = next(
+        (line.strip() for line in (completed.stdout or completed.stderr).splitlines() if line.strip()),
+        "",
+    )
+    if not version:
+        raise ValueError("mmseqs_version_missing")
+    return safe_note(version)
+
+
 def tool_outputs(run_dir: Path) -> Path:
     return run_dir / "tool_outputs"
 
 
-def read_sequence_inputs(run_dir: Path) -> list[tuple[str, str, str, str]]:
+def read_sequence_inputs(run_dir: Path) -> list[SequenceInput]:
     path = run_dir / "input_conversion_manifest.tsv"
     if not path.exists():
         return []
-    rows: list[tuple[str, str, str, str]] = []
-    query_identities: dict[str, tuple[str, str]] = {}
+    rows: list[SequenceInput] = []
+    query_identities: dict[str, tuple[str, str, str]] = {}
     with path.open("r", encoding="utf-8-sig", newline="") as handle:
         for row in csv.DictReader(handle, delimiter="\t"):
             if str(row.get("conversion_status", "")).strip() != "converted":
@@ -321,41 +397,144 @@ def read_sequence_inputs(run_dir: Path) -> list[tuple[str, str, str, str]]:
             input_id = str(row.get("input_id", "input_1")).strip() or "input_1"
             record_id = str(row.get("record_id", "record_1")).strip() or "record_1"
             query_id = sequence_query_id(input_id, record_id)
-            identity = (input_id, record_id)
+            identity = (input_id, record_id, kind)
             if query_id in query_identities and query_identities[query_id] != identity:
                 raise ValueError(f"sequence_query_identity_collision:{query_id}")
             query_identities[query_id] = identity
-            rows.append((query_id, input_id, record_id, sequence))
+            rows.append(SequenceInput(query_id, input_id, record_id, kind, sequence))
     return rows
 
 
-def sequence_query_id(input_id: str, record_id: str) -> str:
+def sequence_query_id(input_id: str, record_id: str, variant: str = "") -> str:
+    identity = [input_id, record_id]
+    if variant:
+        identity.append(variant)
     payload = json.dumps(
-        [input_id, record_id], ensure_ascii=False, separators=(",", ":")
+        identity, ensure_ascii=False, separators=(",", ":")
     ).encode("utf-8")
     return f"query_{hashlib.sha256(payload).hexdigest()}"
 
 
-def mmseqs_target_databases(science_store: Path) -> list[tuple[str, Path]]:
+def sequence_query_batches(sequences: list[SequenceInput]) -> list[QueryBatch]:
+    protein = [
+        record
+        for record in sequences
+        if record.canonical_kind in {"peptide", "protein_ligand"}
+    ]
+    nucleotide: list[SequenceInput] = []
+    translated: list[SequenceInput] = []
+    for record in sequences:
+        if record.canonical_kind != "genome_or_metagenome":
+            continue
+        sequence = record.sequence.replace("U", "T")
+        nucleotide.append(
+            SequenceInput(
+                sequence_query_id(record.input_id, record.record_id, "nucleotide"),
+                record.input_id,
+                record.record_id,
+                "nucleotide",
+                sequence,
+            )
+        )
+        for strand, frame, start, peptide in six_frame_orfs(sequence):
+            variant = f"translated_protein:{strand}:{frame}:{start}:{len(peptide)}"
+            translated.append(
+                SequenceInput(
+                    sequence_query_id(record.input_id, record.record_id, variant),
+                    record.input_id,
+                    record.record_id,
+                    "translated_protein",
+                    peptide,
+                )
+            )
+    batches = [
+        QueryBatch("protein", "1", "1", protein),
+        QueryBatch("nucleotide", "2", "2", nucleotide),
+        QueryBatch("translated_protein", "1", "1", translated),
+    ]
+    return [batch for batch in batches if batch.records]
+
+
+CODON_TABLE = {
+    "TTT": "F", "TTC": "F", "TTA": "L", "TTG": "L",
+    "TCT": "S", "TCC": "S", "TCA": "S", "TCG": "S",
+    "TAT": "Y", "TAC": "Y", "TAA": "*", "TAG": "*",
+    "TGT": "C", "TGC": "C", "TGA": "*", "TGG": "W",
+    "CTT": "L", "CTC": "L", "CTA": "L", "CTG": "L",
+    "CCT": "P", "CCC": "P", "CCA": "P", "CCG": "P",
+    "CAT": "H", "CAC": "H", "CAA": "Q", "CAG": "Q",
+    "CGT": "R", "CGC": "R", "CGA": "R", "CGG": "R",
+    "ATT": "I", "ATC": "I", "ATA": "I", "ATG": "M",
+    "ACT": "T", "ACC": "T", "ACA": "T", "ACG": "T",
+    "AAT": "N", "AAC": "N", "AAA": "K", "AAG": "K",
+    "AGT": "S", "AGC": "S", "AGA": "R", "AGG": "R",
+    "GTT": "V", "GTC": "V", "GTA": "V", "GTG": "V",
+    "GCT": "A", "GCC": "A", "GCA": "A", "GCG": "A",
+    "GAT": "D", "GAC": "D", "GAA": "E", "GAG": "E",
+    "GGT": "G", "GGC": "G", "GGA": "G", "GGG": "G",
+}
+
+
+def six_frame_orfs(sequence: str, minimum_amino_acids: int = 3) -> list[tuple[str, int, int, str]]:
+    dna = sequence.upper().replace("U", "T")
+    reverse = dna.translate(str.maketrans("ACGTN", "TGCAN"))[::-1]
+    out: list[tuple[str, int, int, str]] = []
+    for strand, oriented in (("forward", dna), ("reverse", reverse)):
+        for frame in range(3):
+            peptide: list[str] = []
+            peptide_start = frame
+            for offset in range(frame, len(oriented) - 2, 3):
+                amino_acid = CODON_TABLE.get(oriented[offset : offset + 3], "X")
+                if amino_acid == "*":
+                    if len(peptide) >= minimum_amino_acids:
+                        out.append((strand, frame, peptide_start, "".join(peptide)))
+                    peptide = []
+                    peptide_start = offset + 3
+                else:
+                    peptide.append(amino_acid)
+            if len(peptide) >= minimum_amino_acids:
+                out.append((strand, frame, peptide_start, "".join(peptide)))
+    return out
+
+
+def mmseqs_target_databases(science_store: Path) -> list[TargetDatabase]:
     manifest = science_store / "indexes" / "mmseqs" / "mmseqs_target_databases.tsv"
-    targets: list[tuple[str, Path]] = []
+    targets: list[TargetDatabase] = []
     if manifest.exists():
         with manifest.open("r", encoding="utf-8-sig", newline="") as handle:
             for row in csv.DictReader(handle, delimiter="\t"):
                 if row.get("status") != "ready":
                     continue
+                database_id = str(row.get("source_id", "")).strip()
                 db_path = str(row.get("db_path", "")).strip()
                 if not db_path:
-                    continue
+                    raise ValueError(f"mmseqs_target_database_path_missing:{database_id}")
                 path = Path(db_path)
                 if not path.is_absolute():
                     path = science_store / path
-                if db_ready(path):
-                    database_id = str(row.get("source_id", "")).strip() or path.parent.name
-                    targets.append((database_id, path))
-    if targets:
-        return sorted(dedupe_target_databases(targets))
-    return [(path.parent.name, path) for path in sorted(dedupe_paths(dbtype_prefixes(science_store / "indexes" / "mmseqs")))]
+                namespace = str(row.get("source_namespace", "")).strip()
+                source_class = str(row.get("source_class", "")).strip().lower()
+                source_digest = str(row.get("source_digest", "")).strip().lower()
+                builder_version = str(row.get("builder_version", "")).strip()
+                if not database_id or not namespace or not source_digest or not builder_version:
+                    raise ValueError("mmseqs_target_provenance_missing")
+                if source_class not in {"known", "metagenome"}:
+                    raise ValueError(f"mmseqs_target_source_class_invalid:{source_class}")
+                if len(source_digest) != 64 or any(ch not in "0123456789abcdef" for ch in source_digest):
+                    raise ValueError(f"mmseqs_target_source_digest_invalid:{database_id}")
+                if not mmseqs_database_ready(path):
+                    raise ValueError(f"mmseqs_target_database_not_ready:{database_id}")
+                targets.append(
+                    TargetDatabase(
+                        database_id,
+                        namespace,
+                        source_class,
+                        source_digest,
+                        builder_version,
+                        path,
+                    )
+                )
+    return sorted(dedupe_target_databases(targets), key=lambda target: str(target.path))
 
 
 def foldseek_target_database(science_store: Path) -> tuple[str, Path] | None:
@@ -378,14 +557,14 @@ def foldseek_target_database(science_store: Path) -> tuple[str, Path] | None:
     return (prefixes[0].parent.name, prefixes[0]) if prefixes else None
 
 
-def dedupe_target_databases(targets: list[tuple[str, Path]]) -> list[tuple[str, Path]]:
+def dedupe_target_databases(targets: list[TargetDatabase]) -> list[TargetDatabase]:
     seen: set[str] = set()
-    out: list[tuple[str, Path]] = []
-    for database_id, path in targets:
-        key = str(path)
+    out: list[TargetDatabase] = []
+    for target in targets:
+        key = str(target.path)
         if key not in seen:
             seen.add(key)
-            out.append((database_id, path))
+            out.append(target)
     return out
 
 
@@ -404,6 +583,14 @@ def db_ready(prefix: Path) -> bool:
     return prefix.with_suffix(".dbtype").exists() or Path(str(prefix) + ".dbtype").exists()
 
 
+def mmseqs_database_ready(prefix: Path) -> bool:
+    dbtype = Path(str(prefix) + ".dbtype")
+    try:
+        return prefix.is_file() and prefix.stat().st_size > 0 and dbtype.is_file() and dbtype.stat().st_size > 0
+    except OSError:
+        return False
+
+
 def dedupe_paths(paths: list[Path]) -> list[Path]:
     seen: set[str] = set()
     out: list[Path] = []
@@ -416,18 +603,19 @@ def dedupe_paths(paths: list[Path]) -> list[Path]:
     return out
 
 
-def write_fasta(path: Path, rows: list[tuple[str, str, str, str]]) -> None:
+def write_fasta(path: Path, rows: list[SequenceInput]) -> None:
     text = "".join(
-        f">{query_id}\n{sequence}\n"
-        for query_id, _input_id, _record_id, sequence in rows
+        f">{record.query_id}\n{record.sequence}\n"
+        for record in rows
     )
     write_text(path, text)
 
 
 def mmseqs_rows(
     path: Path,
-    target_path: Path,
-    query_identities: dict[str, tuple[str, str]],
+    target_database: TargetDatabase,
+    query_identities: dict[str, SequenceInput],
+    mmseqs_version: str,
 ) -> list[str]:
     if not path.exists():
         return []
@@ -435,24 +623,99 @@ def mmseqs_rows(
     with path.open("r", encoding="utf-8", errors="replace") as handle:
         for line in handle:
             cols = line.rstrip("\n").split("\t")
-            if len(cols) < 6:
-                continue
-            query, target, pident, alnlen, evalue, bits = cols[:6]
-            input_id, record_id = query_identities.get(query, (query, "record_1"))
-            score = alignment_score(pident, bits)
+            if len(cols) < 13:
+                raise ValueError("mmseqs_alignment_backtrace_missing")
+            (
+                query,
+                target,
+                pident,
+                alnlen,
+                qcov,
+                tcov,
+                evalue,
+                bits,
+                qstart,
+                qend,
+                tstart,
+                tend,
+                cigar,
+            ) = cols[:13]
+            validate_mmseqs_alignment(
+                pident, alnlen, qcov, tcov, evalue, bits, qstart, qend, tstart, tend, cigar
+            )
+            identity = query_identities.get(query)
+            if identity is None:
+                raise ValueError(f"mmseqs_query_identity_missing:{safe_note(query)}")
+            score = alignment_score(pident, bits, qcov, tcov, alnlen)
             target_id = safe_id(target.split()[0])
+            target_class = (
+                "known_protein"
+                if target_database.source_class == "known"
+                else "potential_metagenome_sequence"
+            )
             evidence = (
                 f"mmseqs2_search;evalue={safe_note(evalue)};bits={safe_note(bits)};"
                 f"pident={safe_note(pident)};alnlen={safe_note(alnlen)};"
-                f"target_database={safe_note(target_path.name)};"
-                f"query_id={safe_note(query)};record_id={safe_note(record_id)}"
+                f"qcov={safe_note(qcov)};tcov={safe_note(tcov)};cigar={safe_note(cigar)};"
+                f"target_database={safe_note(target_database.database_id)};"
+                f"source_namespace={safe_note(target_database.namespace)};"
+                f"source_class={safe_note(target_database.source_class)};"
+                f"source_digest={safe_note(target_database.source_digest)};"
+                f"builder_version={safe_note(target_database.builder_version)};"
+                f"mmseqs_version={safe_note(mmseqs_version)};"
+                f"query_id={safe_note(query)};record_id={safe_note(identity.record_id)}"
             )
             rows.append(
-                f"{clean_cell(input_id)}\tMMseqs2\t{target_id}\t{clean_cell(target)}\tunknown\t"
-                f"onsite_sequence_alignment\t{score:.4f}\t{clean_cell(target)}\t{evidence}\t"
-                f"{clean_cell(record_id)}\n"
+                f"{clean_cell(identity.input_id)}\t{clean_cell(target_database.namespace)}\t"
+                f"{target_id}\t{clean_cell(target)}\tunknown\t{target_class}\t{score:.4f}\t"
+                f"{clean_cell(target)}\t{evidence}\t{clean_cell(target_database.database_id)}\t"
+                f"{clean_cell(target_database.namespace)}\t{target_database.source_class}\t"
+                f"{target_database.source_digest}\t{clean_cell(target_database.builder_version)}\t"
+                f"{clean_cell(mmseqs_version)}\t{clean_cell(query)}\t{clean_cell(identity.record_id)}\t"
+                f"{clean_cell(identity.canonical_kind)}\t{clean_cell(alnlen)}\t"
+                f"{clean_cell(qcov)}\t{clean_cell(tcov)}\t{clean_cell(cigar)}\n"
             )
     return rows
+
+
+def validate_mmseqs_alignment(
+    pident: str,
+    alnlen: str,
+    qcov: str,
+    tcov: str,
+    evalue: str,
+    bits: str,
+    qstart: str,
+    qend: str,
+    tstart: str,
+    tend: str,
+    cigar: str,
+) -> None:
+    try:
+        identity = float(pident)
+        alignment_length = int(alnlen)
+        query_coverage = float(qcov)
+        target_coverage = float(tcov)
+        expectation = float(evalue)
+        bit_score = float(bits)
+        query_start, query_end = int(qstart), int(qend)
+        target_start, target_end = int(tstart), int(tend)
+    except ValueError as exc:
+        raise ValueError("mmseqs_alignment_backtrace_invalid:numeric") from exc
+    finite = (identity, query_coverage, target_coverage, expectation, bit_score)
+    if (
+        not all(math.isfinite(value) for value in finite)
+        or not 0.0 <= identity <= 100.0
+        or alignment_length <= 0
+        or not 0.0 <= query_coverage <= 1.0
+        or not 0.0 <= target_coverage <= 1.0
+        or query_start <= 0
+        or target_start <= 0
+        or target_end <= 0
+        or not cigar.strip()
+        or cigar.strip() == "*"
+    ):
+        raise ValueError("mmseqs_alignment_backtrace_invalid:range")
 
 
 def foldseek_rows(path: Path) -> list[str]:
@@ -522,7 +785,13 @@ def decode_tsv_cell(value: str) -> str:
     return "".join(out)
 
 
-def alignment_score(pident: str, bits: str) -> float:
+def alignment_score(
+    pident: str,
+    bits: str,
+    query_coverage: str | None = None,
+    target_coverage: str | None = None,
+    alignment_length: str | None = None,
+) -> float:
     try:
         identity = max(0.0, min(float(pident) / 100.0, 1.0))
     except ValueError:
@@ -531,7 +800,17 @@ def alignment_score(pident: str, bits: str) -> float:
         bit_score = max(0.0, min(float(bits) / 200.0, 1.0))
     except ValueError:
         bit_score = 0.0
-    return max(0.01, min(identity * 0.7 + bit_score * 0.3, 1.0))
+    if query_coverage is None or target_coverage is None or alignment_length is None:
+        return max(0.01, min(identity * 0.7 + bit_score * 0.3, 1.0))
+    coverage = math.sqrt(max(0.0, min(float(query_coverage), 1.0)) * max(0.0, min(float(target_coverage), 1.0)))
+    length_confidence = max(0.0, min(float(alignment_length) / 50.0, 1.0))
+    return max(
+        0.01,
+        min(
+            identity * 0.55 + bit_score * 0.20 + coverage * 0.20 + length_confidence * 0.05,
+            1.0,
+        ),
+    )
 
 
 def clean_cell(value: str) -> str:

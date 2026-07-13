@@ -2164,7 +2164,7 @@ fn metagenome_matching_preserves_mmseqs_source_database_and_query_id() {
     .expect("mmseqs manifest");
     write_text(
         &run.join("tool_outputs/mmseqs_alignment_matches.tsv"),
-        "input_id\tsource\ttarget_id\ttarget_name\torganism\ttarget_class\tmatch_score\tmatched_features\tevidence\ninput_1\tMMseqs2\tMG_REAL\tMGnify hit\tunknown\tpotential_metagenome_sequence\t0.9100\tikvav\tmmseqs_alignment;source_db=metagenome_mgy;query_id=input_1\n",
+        "input_id\tsource\ttarget_id\ttarget_name\torganism\ttarget_class\tmatch_score\tmatched_features\tevidence\tsource_database_id\tsource_namespace\tsource_class\tsource_digest\tbuilder_version\tmmseqs_version\tcurrent_run_query_id\trecord_id\tquery_kind\talignment_length\tquery_coverage\ttarget_coverage\talignment_cigar\ninput_1\tMGnify\tMG_REAL\tMGnify hit\tunknown\tpotential_metagenome_sequence\t0.9100\tikvav\tmmseqs_alignment\tmetagenome_mgy\tMGnify\tmetagenome\taaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\tmmseqs-builder-test\tMMseqs2-test\tquery_1\trecord_1\tprotein_ligand\t5\t1.0\t1.0\t5M\n",
     )
     .expect("mmseqs output");
     let options = ScienceOptions {
@@ -2194,9 +2194,66 @@ fn metagenome_matching_preserves_mmseqs_source_database_and_query_id() {
             .contains("current_run_query_id")
     );
     assert!(matches.contains("MG_REAL"));
-    assert!(matches.contains("\tmetagenome_mgy\tinput_1"));
+    assert!(matches.contains("\tmetagenome_mgy\tquery_1\trecord_1"));
     fs::remove_dir_all(&root).expect("cleanup temp root");
     assert!(!root.exists());
+}
+
+#[test]
+fn mmseqs_rows_route_known_and_metagenome_by_explicit_source_class() {
+    let root = temp_root("mmseqs_source_class_routing");
+    let run = root.join("run");
+    ensure_dir(&run.join("tool_outputs")).expect("tool outputs");
+    write_text(
+        &run.join("tool_outputs/mmseqs_alignment_matches.tsv"),
+        "input_id\tsource\ttarget_id\ttarget_name\torganism\ttarget_class\tmatch_score\tmatched_features\tevidence\tsource_database_id\tsource_namespace\tsource_class\tsource_digest\tbuilder_version\tmmseqs_version\tcurrent_run_query_id\trecord_id\tquery_kind\talignment_length\tquery_coverage\ttarget_coverage\talignment_cigar\ninput_1\tUniProt\tP12345\tKnown hit\tunknown\tknown_protein\t0.9500\tMKTAYI\tmmseqs2_search\tuniprot_human\tUniProt\tknown\taaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\tmmseqs-builder-test\tMMseqs2-test\tquery_known\trecord_1\tprotein_ligand\t6\t1.0\t1.0\t6M\ninput_1\tMGnify\tMG_REAL\tMetagenome hit\tunknown\tpotential_metagenome_sequence\t0.9100\tMKTAYI\tmmseqs2_search\tmetagenome_mgy\tMGnify\tmetagenome\tbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\tmmseqs-builder-test\tMMseqs2-test\tquery_mgy\trecord_1\tprotein_ligand\t6\t1.0\t1.0\t6M\n",
+    )
+    .expect("MMseqs output");
+    let options = ScienceOptions {
+        workspace_root: root.clone(),
+        science_store: root.join("science_store"),
+        input_manifest: root.join("input.json"),
+        run_dir: run,
+    };
+    let mut known = String::new();
+    let mut metagenome = String::new();
+
+    let known_count =
+        append_mmseqs_match_rows(&options, "known", &mut known, true).expect("route known rows");
+    let metagenome_count = append_mmseqs_match_rows(&options, "metagenome", &mut metagenome, false)
+        .expect("route metagenome rows");
+
+    assert_eq!(known_count, 1);
+    assert!(known.contains("P12345"));
+    assert!(known.contains("source_digest=aaaaaaaa"));
+    assert!(!known.contains("MG_REAL"));
+    assert_eq!(metagenome_count, 1);
+    assert!(metagenome.contains("MG_REAL"));
+    assert!(!metagenome.contains("P12345"));
+    fs::remove_dir_all(root).expect("cleanup temp root");
+}
+
+#[test]
+fn mmseqs_rows_reject_unknown_source_class() {
+    let root = temp_root("mmseqs_unknown_source_class");
+    let run = root.join("run");
+    ensure_dir(&run.join("tool_outputs")).expect("tool outputs");
+    write_text(
+        &run.join("tool_outputs/mmseqs_alignment_matches.tsv"),
+        "input_id\tsource\ttarget_id\ttarget_name\torganism\ttarget_class\tmatch_score\tmatched_features\tevidence\tsource_database_id\tsource_namespace\tsource_class\tsource_digest\tbuilder_version\tmmseqs_version\tcurrent_run_query_id\trecord_id\ninput_1\tUnknown\tX1\tUnknown hit\tunknown\tunknown\t0.5\tMKT\tmmseqs2_search\tdb_unknown\tUnknown\tambiguous\taaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\tmmseqs-builder-test\tMMseqs2-test\tquery_1\trecord_1\n",
+    )
+    .expect("MMseqs output");
+    let options = ScienceOptions {
+        workspace_root: root.clone(),
+        science_store: root.join("science_store"),
+        input_manifest: root.join("input.json"),
+        run_dir: run,
+    };
+    let error = append_mmseqs_match_rows(&options, "known", &mut String::new(), true)
+        .expect_err("unknown source class must fail");
+
+    assert!(error.contains("mmseqs_source_class_invalid"));
+    fs::remove_dir_all(root).expect("cleanup temp root");
 }
 
 #[test]
@@ -3691,9 +3748,14 @@ fn prepare_science_store_builds_structure_index_from_downloaded_sources() {
     .expect("write biolip2 table");
     write_text(
         &store.join("downloads/plinder/index/annotation_table.parquet"),
-        "plinder annotation marker",
+        "PAR1fixturePAR1",
     )
-    .expect("write plinder annotation marker");
+    .expect("write plinder parquet fixture marker");
+    write_text(
+        &store.join("indexes/plinder_targets.tsv"),
+        "source\ttarget_id\ttarget_name\torganism\ttarget_class\tligand_tokens\tsequence_tokens\tstructure_tokens\tevidence\nPLINDER\tPLINDER_SYSTEM_REAL\tPLINDER 3GRT system PLINDER_SYSTEM_REAL\tunknown\tstructure_record\tfad\tchain_a\t3grt system_real\tplinder_2024-06_v2_parquet;structure_id=3GRT;system_id=PLINDER_SYSTEM_REAL;ligand_id=FAD\n",
+    )
+    .expect("write canonical plinder rows");
     write_text(
         &store.join("downloads/binding_moad/bindingmoad.csv"),
         "pdb,ligand,affinity\n2XYZ,ATP,10 nM\n",
@@ -3715,13 +3777,35 @@ fn prepare_science_store_builds_structure_index_from_downloaded_sources() {
     assert!(structure.contains("BioLiP2"));
     assert!(structure.contains("Binding MOAD"));
     assert!(structure.contains("PLINDER"));
+    assert!(structure.contains("PLINDER_SYSTEM_REAL"));
     assert!(manifest.contains("rcsb_structure_file_rows"));
     assert!(manifest.contains("biolip2_interaction_rows"));
     assert!(manifest.contains("binding_moad_complex_rows"));
-    assert!(manifest.contains("plinder_annotation_rows"));
+    assert!(manifest.contains("plinder_canonical_rows"));
     assert!(status.contains("\"structure\":"));
     fs::remove_dir_all(&root).expect("cleanup temp root");
     assert!(!root.exists());
+}
+
+#[test]
+fn prepare_science_store_rejects_plinder_parquet_without_canonical_projection() {
+    let root = temp_root("plinder_requires_canonical_projection");
+    let store = root.join("science_store");
+    write_text(
+        &store.join("downloads/plinder/index/annotation_table.parquet"),
+        "PAR1fixturePAR1",
+    )
+    .expect("write plinder parquet fixture marker");
+    let options = StoreOptions {
+        workspace_root: root.clone(),
+        science_store: store,
+    };
+
+    let error = run_store_command(ScienceCommand::PrepareScienceStore, &options)
+        .expect_err("raw PLINDER parquet must not produce placeholder rows");
+
+    assert!(error.contains("plinder_canonical_index_missing"));
+    fs::remove_dir_all(root).expect("cleanup temp root");
 }
 
 #[test]

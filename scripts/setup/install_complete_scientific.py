@@ -3077,6 +3077,7 @@ def build_mmseqs_target_databases(
         db_path = index_root / safe_file_stem(label) / "target"
         source_summary = resource_payload_summary(source, cache=summary_cache)
         source_fields = alignment_source_manifest_fields(source_summary, builder_version)
+        source_namespace, source_class = mmseqs_source_provenance(label)
         force_rebuild = database_artifacts_present(db_path) and not alignment_source_manifest_matches(
             previous_rows.get(label, {}), source_summary, builder_version
         )
@@ -3094,6 +3095,8 @@ def build_mmseqs_target_databases(
         rows.append(
             {
                 "source_id": label,
+                "source_namespace": source_namespace,
+                "source_class": source_class,
                 "source_path": relative_path(science_store, source),
                 **source_fields,
                 "db_path": relative_path(science_store, db_path),
@@ -3105,6 +3108,8 @@ def build_mmseqs_target_databases(
         manifest,
         [
             "source_id",
+            "source_namespace",
+            "source_class",
             "source_path",
             "source_digest",
             "source_files",
@@ -3117,6 +3122,17 @@ def build_mmseqs_target_databases(
         rows,
     )
     return rows
+
+
+def mmseqs_source_provenance(source_id: str) -> tuple[str, str]:
+    normalized = source_id.strip().lower()
+    if normalized.startswith("uniprot_") or normalized == "uniprot":
+        return "UniProt", "known"
+    if normalized.startswith("biolip2_") or normalized == "biolip2":
+        return "BioLiP2", "known"
+    if normalized.startswith("metagenome_") or normalized == "metagenome":
+        return "MGnify", "metagenome"
+    raise ValueError(f"unsupported_mmseqs_source_provenance:{source_id}")
 
 
 def alignment_source_deferred(source: Path) -> bool:
@@ -4113,6 +4129,125 @@ def tsv_has_data_rows(path: Path) -> bool:
     return path.exists() and bool(read_tsv(path))
 
 
+def plinder_parquet_source(science_store: Path) -> Path | None:
+    root = science_store / "downloads" / "plinder"
+    if not root.exists():
+        return None
+    candidates = sorted(
+        path
+        for path in root.rglob("*.parquet")
+        if path.name.lower() in {
+            "annotation_table.parquet",
+            "annotation_table_nonredundant.parquet",
+        }
+    )
+    preferred = [path for path in candidates if path.name.lower() == "annotation_table.parquet"]
+    return (preferred or candidates or [None])[0]
+
+
+def plinder_canonical_index_ready(
+    source: Path,
+    canonical: Path,
+    manifest_path: Path,
+) -> bool:
+    if not source.is_file() or not canonical.is_file() or not manifest_path.is_file():
+        return False
+    manifest = load_json(manifest_path)
+    source_meta = manifest.get("source")
+    canonical_meta = manifest.get("canonical")
+    if (
+        manifest.get("status") != "ready"
+        or not isinstance(source_meta, dict)
+        or not isinstance(canonical_meta, dict)
+        or int(canonical_meta.get("row_count", 0) or 0) <= 0
+    ):
+        return False
+    try:
+        return (
+            int(source_meta.get("size_bytes", -1)) == source.stat().st_size
+            and str(source_meta.get("sha256", "")).lower() == sha256_file(source).lower()
+            and int(canonical_meta.get("size_bytes", -1)) == canonical.stat().st_size
+            and str(canonical_meta.get("sha256", "")).lower() == sha256_file(canonical).lower()
+        )
+    except (OSError, TypeError, ValueError):
+        return False
+
+
+def prepare_plinder_canonical_index(
+    workspace_root: Path,
+    science_store: Path,
+    python_command: str,
+    python_backend: str,
+    wsl_distro: str | None,
+) -> dict[str, object]:
+    source = plinder_parquet_source(science_store)
+    if source is None:
+        return {"status": "not_applicable", "rebuilt": False, "reason": "plinder_source_absent"}
+    canonical = science_store / "indexes" / "plinder_targets.tsv"
+    manifest = science_store / "indexes" / "plinder_targets.manifest.json"
+    if plinder_canonical_index_ready(source, canonical, manifest):
+        payload = load_json(manifest)
+        canonical_meta = payload.get("canonical", {})
+        return {
+            "status": "ready",
+            "rebuilt": False,
+            "reason": "plinder_canonical_reused",
+            "rows": canonical_meta.get("row_count", 0) if isinstance(canonical_meta, dict) else 0,
+            "manifest": str(manifest),
+        }
+    worker = workspace_root / "python" / "genoligand_workers" / "plinder_index_worker.py"
+    if not worker.is_file():
+        return {"status": "failed", "rebuilt": False, "reason": "plinder_worker_missing"}
+    canonical.parent.mkdir(parents=True, exist_ok=True)
+    arguments = [
+        "--source",
+        str(source),
+        "--canonical",
+        str(canonical),
+        "--manifest",
+        str(manifest),
+    ]
+    if python_backend == "wsl":
+        if not wsl_distro:
+            return {"status": "failed", "rebuilt": False, "reason": "plinder_wsl_distro_missing"}
+        home = wsl_home(wsl_distro)
+        if not home:
+            return {"status": "failed", "rebuilt": False, "reason": "plinder_wsl_home_missing"}
+        python_path = f"{home}/.local/state/genoligand/python-worker-env/bin/python"
+        completed = run_wsl_command(
+            wsl_distro,
+            [
+                python_path,
+                wsl_path(worker),
+                "--source",
+                wsl_path(source),
+                "--canonical",
+                wsl_path(canonical),
+                "--manifest",
+                wsl_path(manifest),
+            ],
+        )
+    elif python_command:
+        completed = run_command([python_command, str(worker), *arguments])
+    else:
+        return {"status": "failed", "rebuilt": False, "reason": "plinder_python_missing"}
+    if completed.returncode != 0 or not plinder_canonical_index_ready(source, canonical, manifest):
+        return {
+            "status": "failed",
+            "rebuilt": False,
+            "reason": process_note(completed) or "plinder_canonical_validation_failed",
+        }
+    payload = load_json(manifest)
+    canonical_meta = payload.get("canonical", {})
+    return {
+        "status": "ready",
+        "rebuilt": True,
+        "reason": "plinder_canonical_built",
+        "rows": canonical_meta.get("row_count", 0) if isinstance(canonical_meta, dict) else 0,
+        "manifest": str(manifest),
+    }
+
+
 def alignment_database_manifests_ready(
     science_store: Path,
     env: dict[str, str] | None = None,
@@ -4692,6 +4827,13 @@ def main() -> int:
     tool_python = str(tool_environment_result.get("python", "")).strip()
     if tool_python:
         command_env["GENOLIGAND_PYTHON"] = tool_python
+    plinder_index_result = prepare_plinder_canonical_index(
+        workspace_root,
+        science_store,
+        tool_python,
+        python_backend,
+        selected_wsl,
+    )
     write_install_progress(
         science_store,
         status="running",
@@ -4701,7 +4843,16 @@ def main() -> int:
         total_steps=6,
         message="正在构建数据库索引",
     )
-    if existing_science_indexes_ready(science_store, command_env, selected_wsl, resource_summary_cache):
+    if plinder_index_result.get("status") == "failed":
+        completed = subprocess.CompletedProcess(
+            command,
+            2,
+            "",
+            str(plinder_index_result.get("reason", "plinder_canonical_failed")),
+        )
+    elif plinder_index_result.get("rebuilt"):
+        completed = run_command(command, env=command_env)
+    elif existing_science_indexes_ready(science_store, command_env, selected_wsl, resource_summary_cache):
         write_install_progress(
             science_store,
             status="running",
@@ -4782,6 +4933,7 @@ def main() -> int:
         "resources": resource_result,
         "tool_environment": tool_environment_result,
         "alignment_databases": alignment_database_result,
+        "plinder_index": plinder_index_result,
         "forcefields": forcefield_result,
         "cuda_toolkit": cuda_toolkit_summary(),
         "runtime_binaries": {
