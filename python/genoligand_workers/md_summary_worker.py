@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import csv
+import hashlib
 import json
 import math
 import os
@@ -31,6 +32,36 @@ LIGAND_DRIFT_SCORE_SCALE_ANGSTROM = 3.0
 CONTACT_CUTOFF_ANGSTROM = 4.5
 HBOND_DISTANCE_CUTOFF_NM = 0.25
 HBOND_ANGLE_CUTOFF_DEGREES = 120.0
+MD_JOB_ID = "md_summary_ligand_dynamics"
+MD_PROVENANCE_SCHEMA_VERSION = "genoligand_md_artifact_provenance_v1"
+MD_PROVENANCE_ARTIFACT = "md_artifact_provenance.json"
+MD_OWNED_ARTIFACTS = (
+    "complex_md_manifest.json",
+    "gpu_telemetry.tsv",
+    "gpu_telemetry_status.tsv",
+    "ligand_placement.tsv",
+    MD_PROVENANCE_ARTIFACT,
+    "md_contacts.tsv",
+    "md_hbonds.tsv",
+    "md_ligand_drift.tsv",
+    "md_not_ready.tsv",
+    "md_protocol.tsv",
+    "md_rmsd.tsv",
+    "md_rmsf.tsv",
+    "md_run_manifest.json",
+    "md_state.tsv",
+    "md_summary.tsv",
+    "md_trajectory.tsv",
+)
+DOCKING_ARTIFACT_FIELDS = (
+    "receptor_coordinate",
+    "receptor_pdbqt",
+    "ligand_sdf",
+    "ligand_pdbqt",
+    "pose",
+    "pose_sdf",
+    "log",
+)
 
 
 @dataclass
@@ -52,16 +83,48 @@ class GpuTelemetry:
     lock: Any = field(default_factory=threading.Lock, repr=False)
 
 
+class MdProvenanceError(ValueError):
+    pass
+
+
+@dataclass(frozen=True)
+class MdInvocationBinding:
+    run_dir: Path
+    run_id: str
+    job_id: str
+    invocation_id: str
+    candidate_id: str
+    candidate_digest: str
+    input_id: str
+    input_digest: str
+    source_digest: str
+    input_kind: str
+    input_value: str
+    receptor_coordinate: Path | None
+    docking_ligand_sdf: Path | None
+    docking_ligand_pdbqt: Path | None
+    docking_pose_pdbqt: Path | None
+    docking_pose_sdf: Path | None
+
+
 def main() -> int:
     args = parse_worker_args()
     job = read_job(args.job)
+    try:
+        result_path = resolve_worker_output_path(job, args.out)
+    except MdProvenanceError:
+        return 2
+    if result_path.exists():
+        if not result_path.is_file():
+            return 2
+        result_path.unlink()
     try:
         execution = run_md_summary_job(job)
     except Exception as exc:  # pragma: no cover - depends on local scientific runtime
         reason = safe_note(str(exc)) or "md_summary_worker_failed"
         execution = md_execution("failed", reason, f"MD summary worker failed: {reason}", True)
     write_result(
-        args.out,
+        result_path,
         job,
         execution.result_status,
         execution.engine_version,
@@ -69,6 +132,11 @@ def main() -> int:
         reason=execution.reason,
         outcomes=execution.outcome_dicts(),
     )
+    try:
+        bind_worker_result(result_path, job)
+    except MdProvenanceError:
+        result_path.unlink(missing_ok=True)
+        return 2
     return 0 if execution.status in {"completed", "not_applicable"} else 2
 
 
@@ -82,27 +150,32 @@ def md_execution(status: str, reason: str, version: str, required: bool, row_cou
 
 
 def run_md_summary_job(job: dict[str, Any]) -> WorkerExecution:
-    input_manifest = runtime_path(str(job["input_manifest"]))
-    run_dir = runtime_path(str(job["run_dir"]))
+    try:
+        run_dir = resolve_md_run_dir(job)
+        clear_previous_md_outputs(run_dir)
+        validate_md_job_identity(job)
+        if not has_applicable_md_input(job, run_dir):
+            return md_execution(
+                "not_applicable",
+                "no_applicable_md_input",
+                "MD summary not executed",
+                False,
+            )
+        binding = resolve_md_invocation(job)
+    except MdProvenanceError as exc:
+        reason = safe_note(str(exc)) or "md_provenance_validation_failed"
+        return md_execution(
+            "failed",
+            reason,
+            f"MD summary provenance validation failed: {reason}",
+            True,
+        )
     science_store = runtime_path(str(job.get("science_store", "")))
-    smiles, input_id = read_input_conversion_manifest(run_dir, "small_molecule")
-    if not smiles:
-        smiles, input_id = read_small_molecule_input(input_manifest)
-    sequence = ""
-    if not smiles:
-        sequence, input_id = read_input_conversion_manifest(run_dir, "peptide")
-        if not sequence:
-            sequence, input_id = read_peptide_sequence_input(input_manifest)
-        if not sequence:
-            reason = "no_applicable_md_input"
-            write_md_not_ready(run_dir, reason, [])
-            return md_execution("not_applicable", reason, "MD summary not executed", False)
-
-    receptor_path = find_receptor_coordinate(run_dir) if smiles else None
-    if smiles and receptor_path is None:
-        reason = "missing_receptor_coordinate"
-        write_md_not_ready(run_dir, reason, [reason])
-        return md_execution("not_ready", reason, "OpenMM not executed", True)
+    candidate_id = binding.candidate_id
+    input_id = binding.input_id
+    smiles = binding.input_value if binding.input_kind == "small_molecule" else ""
+    sequence = binding.input_value if binding.input_kind == "peptide" else ""
+    receptor_path = binding.receptor_coordinate
 
     import numpy as np
     import openmm
@@ -124,9 +197,9 @@ def run_md_summary_job(job: dict[str, Any]) -> WorkerExecution:
                 run_dir,
                 f"peptide conformer calculation failed: {safe_note(str(exc))}",
                 [reason],
+                binding=binding,
             )
             return md_execution("not_ready", reason, openmm_version_text(openmm, "not_ready", reason), True)
-        candidate_id = top_candidate_id(run_dir) or input_id
         risk_flags = [
             *parameter_flags,
             "no_receptor_contact_model",
@@ -144,6 +217,7 @@ def run_md_summary_job(job: dict[str, Any]) -> WorkerExecution:
             parameterization,
             risk_flags,
             rdBase.rdkitVersion,
+            binding,
         )
         return md_execution(
             "completed",
@@ -162,20 +236,32 @@ def run_md_summary_job(job: dict[str, Any]) -> WorkerExecution:
             run_dir,
             f"receptor coordinate preparation failed: {safe_note(str(exc))}",
             [reason],
+            binding=binding,
         )
         return md_execution("not_ready", reason, openmm_version_text(openmm, "not_ready", reason), True)
     if not receptor.atoms:
         reason = "receptor_coordinate_parse_failed"
-        write_md_not_ready(run_dir, reason, [reason])
+        write_md_not_ready(run_dir, reason, [reason], binding=binding)
         return md_execution("not_ready", reason, openmm_version_text(openmm, "not_ready", reason), True)
 
-    mol = read_docking_pose_ligand(run_dir, Chem)
+    assert binding.docking_pose_sdf is not None
+    assert binding.docking_ligand_sdf is not None
+    assert binding.docking_ligand_pdbqt is not None
+    assert binding.docking_pose_pdbqt is not None
+    mol = read_docking_pose_ligand(
+        binding.docking_pose_sdf,
+        binding.docking_ligand_sdf,
+        binding.docking_ligand_pdbqt,
+        binding.docking_pose_pdbqt,
+        Chem,
+    )
     if mol is None:
         reason = "missing_docking_pose_sdf"
         write_md_not_ready(
             run_dir,
             "missing AutoDock Vina docking pose SDF for complex MD",
             [reason],
+            binding=binding,
         )
         return md_execution("not_ready", reason, openmm_version_text(openmm, "not_ready", reason), True)
 
@@ -190,7 +276,7 @@ def run_md_summary_job(job: dict[str, Any]) -> WorkerExecution:
     production_steps_total = production_segments * production_steps_per_segment
     sampling_reason = md_sampling_rejection_reason(production_steps_total, production_segments + 1)
     if sampling_reason:
-        write_md_not_ready(run_dir, sampling_reason, [sampling_reason])
+        write_md_not_ready(run_dir, sampling_reason, [sampling_reason], binding=binding)
         return md_execution(
             "not_ready",
             sampling_reason,
@@ -249,7 +335,6 @@ def run_md_summary_job(job: dict[str, Any]) -> WorkerExecution:
     sample_gpu_telemetry(gpu_telemetry, "after_minimization")
     context.setVelocitiesToTemperature(300 * unit.kelvin, SIMULATION_SEED)
     total_step = 0
-    candidate_id = top_candidate_id(run_dir) or input_id
     if equilibration_steps > 0:
         with GpuTelemetryMonitor(
             gpu_telemetry,
@@ -364,6 +449,8 @@ def run_md_summary_job(job: dict[str, Any]) -> WorkerExecution:
         gpu_telemetry,
         gpu_status,
         model_metadata,
+        binding,
+        openmm.version.full_version,
     )
     return md_execution(
         "completed",
@@ -380,11 +467,479 @@ def runtime_path(value: str) -> Path:
     path = Path(value)
     if path.exists():
         return path
-    if len(value) >= 3 and value[1] == ":" and value[2] in "\\/":
+    if os.name != "nt" and len(value) >= 3 and value[1] == ":" and value[2] in "\\/":
         drive = value[0].lower()
         rest = value[3:].replace("\\", "/")
         return Path(f"/mnt/{drive}/{rest}")
     return path
+
+
+def canonical_digest(value: Any) -> str:
+    payload = json.dumps(
+        value,
+        ensure_ascii=True,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    return hashlib.sha256(payload).hexdigest()
+
+
+def sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def valid_sha256(value: str) -> bool:
+    return len(value) == 64 and all(ch in "0123456789abcdef" for ch in value)
+
+
+def resolve_md_run_dir(job: dict[str, Any]) -> Path:
+    value = str(job.get("run_dir", "")).strip()
+    if not value:
+        raise MdProvenanceError("run_dir_missing")
+    try:
+        run_dir = runtime_path(value).resolve(strict=True)
+    except OSError as exc:
+        raise MdProvenanceError("run_dir_unavailable") from exc
+    if not run_dir.is_dir():
+        raise MdProvenanceError("run_dir_not_directory")
+    return run_dir
+
+
+def resolve_run_artifact(
+    run_dir: Path,
+    artifact: str | Path,
+    *,
+    must_exist: bool = True,
+) -> Path:
+    try:
+        root = run_dir.resolve(strict=True)
+    except OSError as exc:
+        raise MdProvenanceError("run_dir_unavailable") from exc
+    value = str(artifact).strip()
+    if not value:
+        raise MdProvenanceError("artifact_path_missing")
+    candidate = runtime_path(value)
+    if not candidate.is_absolute():
+        candidate = root / candidate
+    try:
+        resolved = candidate.resolve(strict=must_exist)
+    except OSError as exc:
+        raise MdProvenanceError(f"artifact_unavailable:{value}") from exc
+    try:
+        resolved.relative_to(root)
+    except ValueError as exc:
+        raise MdProvenanceError(f"artifact_outside_current_run:{value}") from exc
+    if must_exist and not resolved.is_file():
+        raise MdProvenanceError(f"artifact_not_file:{value}")
+    return resolved
+
+
+def resolve_worker_output_path(job: dict[str, Any], output: str | Path) -> Path:
+    return resolve_run_artifact(resolve_md_run_dir(job), output, must_exist=False)
+
+
+def read_tsv_dicts(path: Path) -> list[dict[str, str]]:
+    try:
+        with path.open("r", encoding="utf-8-sig", newline="") as handle:
+            return [
+                {str(key): str(value or "").strip() for key, value in row.items()}
+                for row in csv.DictReader(handle, delimiter="\t")
+            ]
+    except (OSError, csv.Error) as exc:
+        raise MdProvenanceError(f"artifact_parse_failed:{path.name}") from exc
+
+
+def read_json_object(path: Path) -> dict[str, Any]:
+    try:
+        with path.open("r", encoding="utf-8-sig") as handle:
+            value = json.load(handle)
+    except (OSError, json.JSONDecodeError) as exc:
+        raise MdProvenanceError(f"artifact_parse_failed:{path.name}") from exc
+    if not isinstance(value, dict):
+        raise MdProvenanceError(f"artifact_schema_invalid:{path.name}")
+    return value
+
+
+def selected_md_candidate(run_dir: Path) -> tuple[dict[str, str], str]:
+    path = resolve_run_artifact(run_dir, "complex_candidate_selection.tsv")
+    rows = read_tsv_dicts(path)
+    if len(rows) != 1:
+        raise MdProvenanceError("selected_md_candidate_must_be_unique")
+    row = rows[0]
+    if not row.get("candidate_id") or not row.get("input_id"):
+        raise MdProvenanceError("selected_md_candidate_binding_incomplete")
+    return row, canonical_digest(row)
+
+
+def selected_md_input(run_dir: Path, input_id: str) -> tuple[dict[str, str], str, str, str]:
+    path = resolve_run_artifact(run_dir, "input_conversion_manifest.tsv")
+    rows = [
+        row
+        for row in read_tsv_dicts(path)
+        if row.get("input_id") == input_id
+        and row.get("conversion_status") == "converted"
+        and row.get("canonical_kind") in {"small_molecule", "peptide"}
+    ]
+    if len(rows) != 1:
+        raise MdProvenanceError("selected_md_input_must_be_unique")
+    row = rows[0]
+    input_value = decode_tsv_cell(row.get("canonical_value", "")).strip()
+    if not input_value:
+        raise MdProvenanceError("selected_md_input_value_missing")
+    source_digest = row.get("content_sha256", "").lower()
+    if not valid_sha256(source_digest):
+        raise MdProvenanceError("selected_md_input_source_digest_invalid")
+    input_digest = canonical_digest(
+        {
+            "input_id": input_id,
+            "record_id": row.get("record_id", ""),
+            "canonical_kind": row.get("canonical_kind", ""),
+            "canonical_value": input_value,
+            "source_content_sha256": source_digest,
+        }
+    )
+    return row, input_value, source_digest, input_digest
+
+
+def validate_md_job_identity(job: dict[str, Any]) -> tuple[str, str]:
+    job_id = str(job.get("job_id", "")).strip()
+    invocation_id = str(job.get("invocation_id", "")).strip()
+    if job_id != MD_JOB_ID:
+        raise MdProvenanceError("md_job_id_mismatch")
+    if not invocation_id:
+        raise MdProvenanceError("md_invocation_id_missing")
+    return job_id, invocation_id
+
+
+def has_applicable_md_input(job: dict[str, Any], run_dir: Path) -> bool:
+    conversion_path = run_dir / "input_conversion_manifest.tsv"
+    if conversion_path.exists() or conversion_path.is_symlink():
+        path = resolve_run_artifact(run_dir, conversion_path)
+        if any(
+            row.get("conversion_status") == "converted"
+            and row.get("canonical_kind") in {"small_molecule", "peptide"}
+            and decode_tsv_cell(row.get("canonical_value", "")).strip()
+            for row in read_tsv_dicts(path)
+        ):
+            return True
+    input_manifest_value = str(job.get("input_manifest", "")).strip()
+    if not input_manifest_value:
+        return True
+    input_manifest = runtime_path(input_manifest_value)
+    try:
+        smiles, _ = read_small_molecule_input(input_manifest)
+        sequence, _ = read_peptide_sequence_input(input_manifest)
+    except (OSError, ValueError, json.JSONDecodeError):
+        return True
+    return bool(smiles or sequence)
+
+
+def validate_docking_binding(
+    run_dir: Path,
+    invocation_id: str,
+    candidate_id: str,
+    input_id: str,
+    source_digest: str,
+    input_digest: str,
+) -> dict[str, Path]:
+    manifest_path = resolve_run_artifact(run_dir, "tool_outputs/docking_manifest.json")
+    manifest = read_json_object(manifest_path)
+    checks = (
+        (manifest.get("status") == "completed", "docking_status_not_completed"),
+        (manifest.get("invocation_id") == invocation_id, "docking_invocation_id_mismatch"),
+        (manifest.get("candidate_id") == candidate_id, "docking_candidate_id_mismatch"),
+        (manifest.get("input_id") == input_id, "docking_input_id_mismatch"),
+        (
+            str(manifest.get("source_content_sha256", "")).lower() == source_digest,
+            "docking_source_digest_mismatch",
+        ),
+    )
+    for matches, reason in checks:
+        if not matches:
+            raise MdProvenanceError(reason)
+    seed_provenance = manifest.get("seed_provenance")
+    if not isinstance(seed_provenance, dict) or seed_provenance.get("input_digest") != input_digest:
+        raise MdProvenanceError("docking_input_digest_mismatch")
+    if manifest.get("input_digest") not in {None, input_digest}:
+        raise MdProvenanceError("docking_input_digest_mismatch")
+
+    resolved: dict[str, Path] = {}
+    for field_name in DOCKING_ARTIFACT_FIELDS:
+        value = manifest.get(field_name)
+        if value in {None, ""}:
+            raise MdProvenanceError(f"docking_artifact_missing:{field_name}")
+        if not isinstance(value, str):
+            raise MdProvenanceError(f"docking_artifact_path_invalid:{field_name}")
+        resolved[field_name] = resolve_run_artifact(run_dir, value)
+
+    artifact_rows = manifest.get("artifacts", [])
+    if not isinstance(artifact_rows, list):
+        raise MdProvenanceError("docking_artifacts_schema_invalid")
+    for row in artifact_rows:
+        if not isinstance(row, dict):
+            raise MdProvenanceError("docking_artifacts_schema_invalid")
+        path = resolve_run_artifact(run_dir, str(row.get("artifact_path", "")))
+        expected = str(row.get("artifact_sha256", "")).lower()
+        if not valid_sha256(expected) or sha256_file(path) != expected:
+            raise MdProvenanceError(f"docking_artifact_sha256_mismatch:{path.name}")
+
+    receptor = resolved["receptor_coordinate"]
+    receptor_digest = str(manifest.get("receptor_sha256", "")).lower()
+    if receptor_digest and (
+        not valid_sha256(receptor_digest) or sha256_file(receptor) != receptor_digest
+    ):
+        raise MdProvenanceError("docking_receptor_sha256_mismatch")
+    return resolved
+
+
+def resolve_md_invocation(job: dict[str, Any]) -> MdInvocationBinding:
+    run_dir = resolve_md_run_dir(job)
+    job_id, invocation_id = validate_md_job_identity(job)
+
+    selection, candidate_digest = selected_md_candidate(run_dir)
+    candidate_id = selection["candidate_id"]
+    input_id = selection["input_id"]
+    input_row, input_value, source_digest, input_digest = selected_md_input(run_dir, input_id)
+    expected_values = (
+        ("candidate_id", candidate_id, "job_candidate_id_mismatch"),
+        ("input_id", input_id, "job_input_id_mismatch"),
+        ("input_digest", input_digest, "job_input_digest_mismatch"),
+    )
+    for field_name, current, reason in expected_values:
+        expected = str(job.get(field_name, "")).strip()
+        if expected and expected != current:
+            raise MdProvenanceError(reason)
+
+    receptor_coordinate = None
+    docking_ligand_sdf = None
+    docking_ligand_pdbqt = None
+    docking_pose_pdbqt = None
+    docking_pose_sdf = None
+    if input_row["canonical_kind"] == "small_molecule":
+        docking_artifacts = validate_docking_binding(
+            run_dir,
+            invocation_id,
+            candidate_id,
+            input_id,
+            source_digest,
+            input_digest,
+        )
+        receptor_coordinate = docking_artifacts["receptor_coordinate"]
+        docking_ligand_sdf = docking_artifacts["ligand_sdf"]
+        docking_ligand_pdbqt = docking_artifacts["ligand_pdbqt"]
+        docking_pose_pdbqt = docking_artifacts["pose"]
+        docking_pose_sdf = docking_artifacts["pose_sdf"]
+    return MdInvocationBinding(
+        run_dir=run_dir,
+        run_id=str(job.get("run_id", "")).strip() or run_dir.name,
+        job_id=job_id,
+        invocation_id=invocation_id,
+        candidate_id=candidate_id,
+        candidate_digest=candidate_digest,
+        input_id=input_id,
+        input_digest=input_digest,
+        source_digest=source_digest,
+        input_kind=input_row["canonical_kind"],
+        input_value=input_value,
+        receptor_coordinate=receptor_coordinate,
+        docking_ligand_sdf=docking_ligand_sdf,
+        docking_ligand_pdbqt=docking_ligand_pdbqt,
+        docking_pose_pdbqt=docking_pose_pdbqt,
+        docking_pose_sdf=docking_pose_sdf,
+    )
+
+
+def clear_previous_md_outputs(run_dir: Path) -> None:
+    root = run_dir.resolve(strict=True)
+    tool_outputs = root / "tool_outputs"
+    if tool_outputs.is_symlink():
+        try:
+            resolved = tool_outputs.resolve(strict=True)
+            resolved.relative_to(root)
+        except (OSError, ValueError):
+            tool_outputs.unlink()
+            tool_outputs.mkdir()
+        else:
+            if not resolved.is_dir():
+                tool_outputs.unlink()
+                tool_outputs.mkdir()
+    elif tool_outputs.exists():
+        if not tool_outputs.is_dir():
+            raise MdProvenanceError("tool_outputs_not_directory")
+    else:
+        tool_outputs.mkdir(parents=True)
+    unexpected_directories = []
+    for name in MD_OWNED_ARTIFACTS:
+        path = tool_outputs / name
+        if path.is_dir() and not path.is_symlink():
+            unexpected_directories.append(name)
+            continue
+        if path.exists() or path.is_symlink():
+            path.unlink()
+    if unexpected_directories:
+        raise MdProvenanceError(
+            f"md_artifact_unexpected_directory:{','.join(unexpected_directories)}"
+        )
+
+
+def binding_fields(binding: MdInvocationBinding) -> dict[str, str]:
+    return {
+        "run_id": binding.run_id,
+        "job_id": binding.job_id,
+        "invocation_id": binding.invocation_id,
+        "candidate_id": binding.candidate_id,
+        "candidate_digest": binding.candidate_digest,
+        "input_id": binding.input_id,
+        "input_digest": binding.input_digest,
+        "source_digest": binding.source_digest,
+    }
+
+
+def ensure_md_output_binding(
+    run_dir: Path,
+    candidate_id: str,
+    input_id: str,
+    binding: MdInvocationBinding,
+) -> None:
+    if run_dir.resolve(strict=True) != binding.run_dir:
+        raise MdProvenanceError("md_output_run_dir_mismatch")
+    if candidate_id != binding.candidate_id:
+        raise MdProvenanceError("md_output_candidate_id_mismatch")
+    if input_id != binding.input_id:
+        raise MdProvenanceError("md_output_input_id_mismatch")
+
+
+def relative_run_artifact(
+    binding: MdInvocationBinding,
+    artifact: str | Path,
+    *,
+    must_exist: bool = True,
+) -> str:
+    path = resolve_run_artifact(binding.run_dir, artifact, must_exist=must_exist)
+    return path.relative_to(binding.run_dir).as_posix()
+
+
+def write_json(path: Path, value: dict[str, Any]) -> None:
+    with path.open("w", encoding="utf-8") as handle:
+        json.dump(value, handle, indent=2, sort_keys=True)
+        handle.write("\n")
+
+
+def write_md_artifact_provenance(
+    binding: MdInvocationBinding,
+    artifacts: list[Path],
+    *,
+    tool_name: str,
+    tool_version: str,
+    parameters: dict[str, Any],
+) -> Path:
+    if not tool_name.strip() or not tool_version.strip():
+        raise MdProvenanceError("md_tool_identity_missing")
+    parameters_digest = canonical_digest(parameters)
+    common = {
+        **binding_fields(binding),
+        "tool_name": tool_name,
+        "tool_version": tool_version,
+        "parameters_digest": parameters_digest,
+    }
+    rows = []
+    seen = set()
+    for artifact in artifacts:
+        path = resolve_run_artifact(binding.run_dir, artifact)
+        relative = path.relative_to(binding.run_dir).as_posix()
+        if relative == f"tool_outputs/{MD_PROVENANCE_ARTIFACT}" or relative in seen:
+            raise MdProvenanceError(f"duplicate_or_recursive_md_artifact:{relative}")
+        seen.add(relative)
+        rows.append(
+            {
+                **common,
+                "artifact_path": relative,
+                "artifact_sha256": sha256_file(path),
+            }
+        )
+    if not rows:
+        raise MdProvenanceError("md_artifact_list_empty")
+    rows.sort(key=lambda row: row["artifact_path"])
+    path = resolve_run_artifact(
+        binding.run_dir,
+        binding.run_dir / "tool_outputs" / MD_PROVENANCE_ARTIFACT,
+        must_exist=False,
+    )
+    write_json(
+        path,
+        {
+            "schema_version": MD_PROVENANCE_SCHEMA_VERSION,
+            **common,
+            "artifacts": rows,
+        },
+    )
+    return path
+
+
+def validate_md_artifact_provenance(path: Path, binding: MdInvocationBinding) -> None:
+    manifest_path = resolve_run_artifact(binding.run_dir, path)
+    value = read_json_object(manifest_path)
+    if value.get("schema_version") != MD_PROVENANCE_SCHEMA_VERSION:
+        raise MdProvenanceError("provenance_schema_version_mismatch")
+    for field_name, expected in binding_fields(binding).items():
+        if value.get(field_name) != expected:
+            raise MdProvenanceError(f"provenance_{field_name}_mismatch")
+    parameters_digest = str(value.get("parameters_digest", "")).lower()
+    if not valid_sha256(parameters_digest):
+        raise MdProvenanceError("provenance_parameters_digest_invalid")
+    tool_name = str(value.get("tool_name", "")).strip()
+    tool_version = str(value.get("tool_version", "")).strip()
+    if not tool_name or not tool_version:
+        raise MdProvenanceError("provenance_tool_identity_invalid")
+    artifacts = value.get("artifacts")
+    if not isinstance(artifacts, list) or not artifacts:
+        raise MdProvenanceError("provenance_artifacts_invalid")
+    seen = set()
+    for row in artifacts:
+        if not isinstance(row, dict):
+            raise MdProvenanceError("provenance_artifacts_invalid")
+        for field_name, expected in binding_fields(binding).items():
+            if row.get(field_name) != expected:
+                raise MdProvenanceError(f"provenance_{field_name}_mismatch")
+        if row.get("parameters_digest") != parameters_digest:
+            raise MdProvenanceError("provenance_parameters_digest_mismatch")
+        if row.get("tool_name") != tool_name or row.get("tool_version") != tool_version:
+            raise MdProvenanceError("provenance_tool_identity_mismatch")
+        artifact = resolve_run_artifact(binding.run_dir, str(row.get("artifact_path", "")))
+        relative = artifact.relative_to(binding.run_dir).as_posix()
+        if relative in seen:
+            raise MdProvenanceError(f"provenance_duplicate_artifact:{relative}")
+        seen.add(relative)
+        expected_digest = str(row.get("artifact_sha256", "")).lower()
+        if not valid_sha256(expected_digest) or sha256_file(artifact) != expected_digest:
+            raise MdProvenanceError(f"artifact_sha256_mismatch:{relative}")
+
+
+def bind_worker_result(path: Path, job: dict[str, Any]) -> None:
+    run_dir = resolve_md_run_dir(job)
+    output = resolve_worker_output_path(job, path)
+    result = read_json_object(output)
+    result["run_id"] = str(job.get("run_id", "")).strip() or run_dir.name
+    result["invocation_id"] = str(job.get("invocation_id", "")).strip()
+    for field_name in ("candidate_id", "input_id", "input_digest"):
+        value = str(job.get(field_name, "")).strip()
+        if value:
+            result[f"expected_{field_name}"] = value
+    input_manifest = runtime_path(str(job.get("input_manifest", "")).strip())
+    if input_manifest.is_file():
+        result["input_manifest_sha256"] = sha256_file(input_manifest)
+    provenance_path = run_dir / "tool_outputs" / MD_PROVENANCE_ARTIFACT
+    if provenance_path.is_file():
+        binding = resolve_md_invocation(job)
+        validate_md_artifact_provenance(provenance_path, binding)
+        result.update(binding_fields(binding))
+        result["artifact_provenance"] = provenance_path.relative_to(run_dir).as_posix()
+    result["artifact_path"] = output.relative_to(run_dir).as_posix()
+    write_json(output, result)
 
 
 def read_small_molecule_input(path: Path) -> tuple[str, str]:
@@ -402,24 +957,6 @@ def read_small_molecule_input(path: Path) -> tuple[str, str]:
         if normalize_peptide_sequence(value):
             continue
         return value, f"input_{index}"
-    return "", "input_1"
-
-
-def read_input_conversion_manifest(run_dir: Path, canonical_kind: str) -> tuple[str, str]:
-    path = run_dir / "input_conversion_manifest.tsv"
-    if not path.exists():
-        return "", "input_1"
-    with path.open("r", encoding="utf-8-sig", newline="") as handle:
-        reader = csv.DictReader(handle, delimiter="\t")
-        for row in reader:
-            if str(row.get("conversion_status", "")).strip() != "converted":
-                continue
-            if str(row.get("canonical_kind", "")).strip() != canonical_kind:
-                continue
-            value = decode_tsv_cell(str(row.get("canonical_value", ""))).strip()
-            input_id = str(row.get("input_id", "input_1")).strip() or "input_1"
-            if value:
-                return value, input_id
     return "", "input_1"
 
 
@@ -546,32 +1083,13 @@ def valid_element_symbol(symbol: str) -> bool:
     }
 
 
-def top_candidate_id(run_dir: Path) -> str:
-    selected = run_dir / "complex_candidate_selection.tsv"
-    if selected.exists():
-        with selected.open("r", encoding="utf-8-sig", newline="") as handle:
-            reader = csv.DictReader(handle, delimiter="\t")
-            for row in reader:
-                value = str(row.get("candidate_id", "")).strip()
-                if value:
-                    return value
-    path = run_dir / "target_candidate_ranking.tsv"
-    if not path.exists():
-        return ""
-    with path.open("r", encoding="utf-8-sig", newline="") as handle:
-        reader = csv.DictReader(handle, delimiter="\t")
-        for row in reader:
-            value = str(row.get("candidate_id", "")).strip()
-            if value:
-                return value
-    return ""
-
-
-def read_docking_pose_ligand(run_dir: Path, Chem: Any) -> Any | None:
-    pose_path = run_dir / "tool_outputs" / "docking_pose.sdf"
-    ligand_path = run_dir / "tool_outputs" / "docking_ligand.sdf"
-    ligand_pdbqt = run_dir / "tool_outputs" / "docking_ligand.pdbqt"
-    pose_pdbqt = run_dir / "tool_outputs" / "docking_pose.pdbqt"
+def read_docking_pose_ligand(
+    pose_path: Path,
+    ligand_path: Path,
+    ligand_pdbqt: Path,
+    pose_pdbqt: Path,
+    Chem: Any,
+) -> Any | None:
     if not pose_path.exists() or pose_path.stat().st_size == 0:
         return None
     ligand_mol = None
@@ -737,21 +1255,6 @@ def conformer_positions(mol: Any, conformer_id: int, np: Any) -> Any:
         ],
         dtype=float,
     )
-
-
-def find_receptor_coordinate(run_dir: Path) -> Path | None:
-    for rel in [
-        "structure_viewer.pdb",
-        "structure_viewer.cif",
-        "structure_viewer.mmcif",
-        "tool_outputs/structure_viewer.pdb",
-        "tool_outputs/structure_viewer.cif",
-        "tool_outputs/structure_viewer.mmcif",
-    ]:
-        path = run_dir / rel
-        if path.exists() and path.stat().st_size > 0:
-            return path
-    return None
 
 
 def load_receptor_coordinate(path: Path, unit: Any) -> ReceptorCoordinate:
@@ -1580,31 +2083,46 @@ def distance(left: Any, right: Any) -> float:
     return math.sqrt(sum((float(a) - float(b)) ** 2 for a, b in zip(left, right)))
 
 
-def write_md_not_ready(run_dir: Path, reason: str, risk_flags: list[str]) -> None:
+def write_md_not_ready(
+    run_dir: Path,
+    reason: str,
+    risk_flags: list[str],
+    *,
+    binding: MdInvocationBinding,
+) -> None:
+    if run_dir.resolve(strict=True) != binding.run_dir:
+        raise MdProvenanceError("md_output_run_dir_mismatch")
     tool_outputs = run_dir / "tool_outputs"
     tool_outputs.mkdir(parents=True, exist_ok=True)
+    not_ready_path = tool_outputs / "md_not_ready.tsv"
+    run_manifest_path = tool_outputs / "md_run_manifest.json"
     write_tsv(
-        tool_outputs / "md_not_ready.tsv",
+        not_ready_path,
         ["reason", "risk_flags"],
         [[reason, ";".join(risk_flags)]],
     )
-    with (tool_outputs / "md_run_manifest.json").open("w", encoding="utf-8") as handle:
-        json.dump(
-            {
-                "method": "not_ready",
-                "reason": reason,
-                "risk_flags": risk_flags,
-                "metric_artifacts": [],
-                "ligand_coordinate": "",
-                "ligand_placement_manifest": "",
-                "complex_manifest": "",
-                "trajectory": "",
-            },
-            handle,
-            indent=2,
-            sort_keys=True,
-        )
-        handle.write("\n")
+    write_json(
+        run_manifest_path,
+        {
+            **binding_fields(binding),
+            "method": "not_ready",
+            "reason": reason,
+            "risk_flags": risk_flags,
+            "metric_artifacts": [],
+            "ligand_coordinate": "",
+            "ligand_placement_manifest": "",
+            "complex_manifest": "",
+            "trajectory": "",
+            "artifact_provenance": f"tool_outputs/{MD_PROVENANCE_ARTIFACT}",
+        },
+    )
+    write_md_artifact_provenance(
+        binding,
+        [not_ready_path, run_manifest_path],
+        tool_name="md_summary",
+        tool_version="not_ready",
+        parameters={"reason": reason, "risk_flags": risk_flags},
+    )
 
 
 def write_md_artifacts(
@@ -1628,7 +2146,10 @@ def write_md_artifacts(
     gpu_telemetry: GpuTelemetry,
     gpu_status: dict[str, Any],
     model_metadata: dict[str, Any],
+    binding: MdInvocationBinding,
+    tool_version: str,
 ) -> None:
+    ensure_md_output_binding(run_dir, candidate_id, input_id, binding)
     tool_outputs = run_dir / "tool_outputs"
     tool_outputs.mkdir(parents=True, exist_ok=True)
     score_note = "score_decomposition.tsv records Rust-owned candidate scores"
@@ -1645,8 +2166,9 @@ def write_md_artifacts(
         "md_score_decomposition",
         "md_stability_score",
     ]
+    summary_path = tool_outputs / "md_summary.tsv"
     write_tsv(
-        tool_outputs / "md_summary.tsv",
+        summary_path,
         summary_header,
         [
             [
@@ -1670,9 +2192,12 @@ def write_md_artifacts(
         ("md_contacts.tsv", "contact_occupancy"),
         ("md_hbonds.tsv", "hydrogen_bond_occupancy"),
     ]
+    metric_paths = []
     for file_name, metric in metric_specs:
+        metric_path = tool_outputs / file_name
+        metric_paths.append(metric_path)
         write_tsv(
-            tool_outputs / file_name,
+            metric_path,
             ["candidate_id", "input_id", "metric", "value", "source"],
             [[candidate_id, input_id, metric, fmt(metrics[metric]), "openmm_receptor_ligand_complex_dynamics"]],
         )
@@ -1684,25 +2209,38 @@ def write_md_artifacts(
         "tool_outputs/md_contacts.tsv",
         "tool_outputs/md_hbonds.tsv",
     ]
+    ligand_placement_path = tool_outputs / "ligand_placement.tsv"
+    trajectory_path = tool_outputs / "md_trajectory.tsv"
+    state_path = tool_outputs / "md_state.tsv"
+    protocol_path = tool_outputs / "md_protocol.tsv"
+    gpu_telemetry_path = tool_outputs / "gpu_telemetry.tsv"
+    gpu_status_path = tool_outputs / "gpu_telemetry_status.tsv"
+    complex_manifest_path = tool_outputs / "complex_md_manifest.json"
+    run_manifest_path = tool_outputs / "md_run_manifest.json"
     write_ligand_placement(
-        tool_outputs / "ligand_placement.tsv",
+        ligand_placement_path,
         candidate_id,
         input_id,
         mol,
         ligand_positions,
         placement_method,
     )
-    write_trajectory(tool_outputs / "md_trajectory.tsv", candidate_id, frames, mol, receptor, role_ranges)
-    write_md_state(tool_outputs / "md_state.tsv", state_rows)
+    write_trajectory(trajectory_path, candidate_id, frames, mol, receptor, role_ranges)
+    write_md_state(state_path, state_rows)
+    bound_protocol_rows = [list(row) for row in protocol_rows]
+    receptor_artifact = relative_run_artifact(binding, receptor.path)
+    for row in bound_protocol_rows:
+        if len(row) > 4 and row[3] == "receptor_coordinate":
+            row[4] = receptor_artifact
     write_tsv(
-        tool_outputs / "md_protocol.tsv",
+        protocol_path,
         ["candidate_id", "input_id", "stage", "parameter", "value", "unit", "source"],
-        protocol_rows,
+        bound_protocol_rows,
     )
-    write_gpu_telemetry(tool_outputs / "gpu_telemetry.tsv", gpu_telemetry)
-    write_gpu_telemetry_status(tool_outputs / "gpu_telemetry_status.tsv", gpu_status)
+    write_gpu_telemetry(gpu_telemetry_path, gpu_telemetry)
+    write_gpu_telemetry_status(gpu_status_path, gpu_status)
     write_complex_md_manifest(
-        tool_outputs / "complex_md_manifest.json",
+        complex_manifest_path,
         candidate_id,
         input_id,
         platform_name,
@@ -1714,46 +2252,70 @@ def write_md_artifacts(
         platform_properties,
         gpu_status,
         model_metadata,
+        binding,
     )
-    with (tool_outputs / "md_run_manifest.json").open("w", encoding="utf-8") as handle:
-        json.dump(
-            {
-                "candidate_id": candidate_id,
-                "input_id": input_id,
-                "input_smiles": smiles,
-                "method": "openmm_receptor_ligand_complex_dynamics",
-                "platform": platform_name,
-                "platform_properties": platform_properties,
-                "cuda_ready": platform_name == "CUDA" and bool(gpu_status["gpu_observed"]),
-                "gpu_observed": bool(gpu_status["gpu_observed"]),
-                "gpu_telemetry_artifact": "tool_outputs/gpu_telemetry.tsv",
-                "gpu_telemetry_status_artifact": "tool_outputs/gpu_telemetry_status.tsv",
-                "gpu_telemetry": gpu_status,
-                "system": model_metadata,
-                "receptor_coordinate": str(receptor.path),
-                "receptor_preparation": receptor.preparation,
-                "receptor_atom_count": len(receptor.atoms),
-                "ligand_parameterization": parameterization,
-                "ligand_coordinate": "tool_outputs/ligand_placement.tsv",
-                "ligand_coordinate_format": "tsv_angstrom",
-                "ligand_atom_count": mol.GetNumAtoms(),
-                "ligand_placement": placement_method,
-                "ligand_placement_manifest": "tool_outputs/ligand_placement.tsv",
-                "complex_manifest": "tool_outputs/complex_md_manifest.json",
-                "protocol_artifact": "tool_outputs/md_protocol.tsv",
-                "frame_count": len(frames),
-                "state_artifact": "tool_outputs/md_state.tsv",
-                "state_row_count": len(state_rows),
-                "trajectory": "tool_outputs/md_trajectory.tsv",
-                "metric_artifacts": metric_artifacts,
-                "risk_flags": risk_flags,
-                "score_decomposition": "score_decomposition.tsv",
-            },
-            handle,
-            indent=2,
-            sort_keys=True,
-        )
-        handle.write("\n")
+    write_json(
+        run_manifest_path,
+        {
+            **binding_fields(binding),
+            "input_smiles": smiles,
+            "method": "openmm_receptor_ligand_complex_dynamics",
+            "platform": platform_name,
+            "platform_properties": platform_properties,
+            "cuda_ready": platform_name == "CUDA" and bool(gpu_status["gpu_observed"]),
+            "gpu_observed": bool(gpu_status["gpu_observed"]),
+            "gpu_telemetry_artifact": "tool_outputs/gpu_telemetry.tsv",
+            "gpu_telemetry_status_artifact": "tool_outputs/gpu_telemetry_status.tsv",
+            "gpu_telemetry": gpu_status,
+            "system": model_metadata,
+            "receptor_coordinate": receptor_artifact,
+            "receptor_preparation": receptor.preparation,
+            "receptor_atom_count": len(receptor.atoms),
+            "ligand_parameterization": parameterization,
+            "ligand_coordinate": "tool_outputs/ligand_placement.tsv",
+            "ligand_coordinate_format": "tsv_angstrom",
+            "ligand_atom_count": mol.GetNumAtoms(),
+            "ligand_placement": placement_method,
+            "ligand_placement_manifest": "tool_outputs/ligand_placement.tsv",
+            "complex_manifest": "tool_outputs/complex_md_manifest.json",
+            "protocol_artifact": "tool_outputs/md_protocol.tsv",
+            "frame_count": len(frames),
+            "state_artifact": "tool_outputs/md_state.tsv",
+            "state_row_count": len(state_rows),
+            "trajectory": "tool_outputs/md_trajectory.tsv",
+            "metric_artifacts": metric_artifacts,
+            "risk_flags": risk_flags,
+            "score_decomposition": relative_run_artifact(
+                binding, "score_decomposition.tsv", must_exist=False
+            ),
+            "artifact_provenance": f"tool_outputs/{MD_PROVENANCE_ARTIFACT}",
+        },
+    )
+    write_md_artifact_provenance(
+        binding,
+        [
+            summary_path,
+            *metric_paths,
+            ligand_placement_path,
+            trajectory_path,
+            state_path,
+            protocol_path,
+            gpu_telemetry_path,
+            gpu_status_path,
+            complex_manifest_path,
+            run_manifest_path,
+        ],
+        tool_name="OpenMM",
+        tool_version=tool_version,
+        parameters={
+            "method": "openmm_receptor_ligand_complex_dynamics",
+            "platform": platform_name,
+            "platform_properties": platform_properties,
+            "system": model_metadata,
+            "placement_method": placement_method,
+            "protocol": bound_protocol_rows,
+        },
+    )
 
 
 def write_peptide_conformer_artifacts(
@@ -1767,7 +2329,9 @@ def write_peptide_conformer_artifacts(
     parameterization: str,
     risk_flags: list[str],
     rdkit_version: str,
+    binding: MdInvocationBinding,
 ) -> None:
+    ensure_md_output_binding(run_dir, candidate_id, input_id, binding)
     tool_outputs = run_dir / "tool_outputs"
     tool_outputs.mkdir(parents=True, exist_ok=True)
     score_note = "score_decomposition.tsv records Rust-owned candidate scores"
@@ -1784,8 +2348,9 @@ def write_peptide_conformer_artifacts(
         "md_score_decomposition",
         "md_stability_score",
     ]
+    summary_path = tool_outputs / "md_summary.tsv"
     write_tsv(
-        tool_outputs / "md_summary.tsv",
+        summary_path,
         summary_header,
         [
             [
@@ -1809,9 +2374,12 @@ def write_peptide_conformer_artifacts(
         ("md_contacts.tsv", "contact_occupancy"),
         ("md_hbonds.tsv", "hydrogen_bond_occupancy"),
     ]
+    metric_paths = []
     for file_name, metric in metric_specs:
+        metric_path = tool_outputs / file_name
+        metric_paths.append(metric_path)
         write_tsv(
-            tool_outputs / file_name,
+            metric_path,
             ["candidate_id", "input_id", "metric", "value", "source"],
             [[candidate_id, input_id, metric, fmt(metrics[metric]), "rdkit_peptide_conformer_ensemble"]],
         )
@@ -1823,46 +2391,64 @@ def write_peptide_conformer_artifacts(
         "tool_outputs/md_contacts.tsv",
         "tool_outputs/md_hbonds.tsv",
     ]
+    ligand_placement_path = tool_outputs / "ligand_placement.tsv"
+    trajectory_path = tool_outputs / "md_trajectory.tsv"
+    run_manifest_path = tool_outputs / "md_run_manifest.json"
     write_ligand_placement(
-        tool_outputs / "ligand_placement.tsv",
+        ligand_placement_path,
         candidate_id,
         input_id,
         mol,
         frames[0],
         "rdkit_peptide_lowest_energy_conformer",
     )
-    write_peptide_trajectory(tool_outputs / "md_trajectory.tsv", candidate_id, frames, mol)
-    with (tool_outputs / "md_run_manifest.json").open("w", encoding="utf-8") as handle:
-        json.dump(
-            {
-                "candidate_id": candidate_id,
-                "input_id": input_id,
-                "input_kind": "peptide",
-                "input_sequence": sequence,
-                "method": "rdkit_peptide_conformer_ensemble",
-                "platform": "RDKit",
-                "cuda_ready": False,
-                "rdkit_version": rdkit_version,
-                "sequence_length": len(sequence),
-                "ligand_parameterization": parameterization,
-                "ligand_coordinate": "tool_outputs/ligand_placement.tsv",
-                "ligand_coordinate_format": "tsv_angstrom",
-                "ligand_atom_count": mol.GetNumAtoms(),
-                "ligand_heavy_atom_count": sum(1 for atom in mol.GetAtoms() if atom.GetAtomicNum() > 1),
-                "ligand_placement": "rdkit_peptide_lowest_energy_conformer",
-                "ligand_placement_manifest": "tool_outputs/ligand_placement.tsv",
-                "complex_manifest": "",
-                "frame_count": len(frames),
-                "trajectory": "tool_outputs/md_trajectory.tsv",
-                "metric_artifacts": metric_artifacts,
-                "risk_flags": risk_flags,
-                "score_decomposition": "score_decomposition.tsv",
-            },
-            handle,
-            indent=2,
-            sort_keys=True,
-        )
-        handle.write("\n")
+    write_peptide_trajectory(trajectory_path, candidate_id, frames, mol)
+    write_json(
+        run_manifest_path,
+        {
+            **binding_fields(binding),
+            "input_kind": "peptide",
+            "input_sequence": sequence,
+            "method": "rdkit_peptide_conformer_ensemble",
+            "platform": "RDKit",
+            "cuda_ready": False,
+            "rdkit_version": rdkit_version,
+            "sequence_length": len(sequence),
+            "ligand_parameterization": parameterization,
+            "ligand_coordinate": "tool_outputs/ligand_placement.tsv",
+            "ligand_coordinate_format": "tsv_angstrom",
+            "ligand_atom_count": mol.GetNumAtoms(),
+            "ligand_heavy_atom_count": sum(1 for atom in mol.GetAtoms() if atom.GetAtomicNum() > 1),
+            "ligand_placement": "rdkit_peptide_lowest_energy_conformer",
+            "ligand_placement_manifest": "tool_outputs/ligand_placement.tsv",
+            "complex_manifest": "",
+            "frame_count": len(frames),
+            "trajectory": "tool_outputs/md_trajectory.tsv",
+            "metric_artifacts": metric_artifacts,
+            "risk_flags": risk_flags,
+            "score_decomposition": relative_run_artifact(
+                binding, "score_decomposition.tsv", must_exist=False
+            ),
+            "artifact_provenance": f"tool_outputs/{MD_PROVENANCE_ARTIFACT}",
+        },
+    )
+    write_md_artifact_provenance(
+        binding,
+        [
+            summary_path,
+            *metric_paths,
+            ligand_placement_path,
+            trajectory_path,
+            run_manifest_path,
+        ],
+        tool_name="RDKit",
+        tool_version=rdkit_version,
+        parameters={
+            "method": "rdkit_peptide_conformer_ensemble",
+            "parameterization": parameterization,
+            "frame_count": len(frames),
+        },
+    )
 
 
 def write_ligand_placement(
@@ -1944,37 +2530,36 @@ def write_complex_md_manifest(
     platform_properties: dict[str, str],
     gpu_status: dict[str, Any],
     model_metadata: dict[str, Any],
+    binding: MdInvocationBinding,
 ) -> None:
-    with path.open("w", encoding="utf-8") as handle:
-        json.dump(
-            {
-                "candidate_id": candidate_id,
-                "input_id": input_id,
-                "method": "openmm_receptor_ligand_complex_dynamics",
-                "platform": platform_name,
-                "platform_properties": platform_properties,
-                "system": model_metadata,
-                "cuda_ready": platform_name == "CUDA" and bool(gpu_status["gpu_observed"]),
-                "gpu_observed": bool(gpu_status["gpu_observed"]),
-                "gpu_telemetry_artifact": "tool_outputs/gpu_telemetry.tsv",
-                "gpu_telemetry_status_artifact": "tool_outputs/gpu_telemetry_status.tsv",
-                "gpu_telemetry": gpu_status,
-                "receptor_coordinate": str(receptor.path),
-                "receptor_preparation": receptor.preparation,
-                "ligand_coordinate": "tool_outputs/ligand_placement.tsv",
-                "ligand_parameterization": parameterization,
-                "ligand_placement": placement_method,
-                "protocol_artifact": "tool_outputs/md_protocol.tsv",
-                "state_artifact": "tool_outputs/md_state.tsv",
-                "trajectory": "tool_outputs/md_trajectory.tsv",
-                "metric_artifacts": metric_artifacts,
-                "risk_flags": risk_flags,
-            },
-            handle,
-            indent=2,
-            sort_keys=True,
-        )
-        handle.write("\n")
+    ensure_md_output_binding(binding.run_dir, candidate_id, input_id, binding)
+    path = resolve_run_artifact(binding.run_dir, path, must_exist=False)
+    write_json(
+        path,
+        {
+            **binding_fields(binding),
+            "method": "openmm_receptor_ligand_complex_dynamics",
+            "platform": platform_name,
+            "platform_properties": platform_properties,
+            "system": model_metadata,
+            "cuda_ready": platform_name == "CUDA" and bool(gpu_status["gpu_observed"]),
+            "gpu_observed": bool(gpu_status["gpu_observed"]),
+            "gpu_telemetry_artifact": "tool_outputs/gpu_telemetry.tsv",
+            "gpu_telemetry_status_artifact": "tool_outputs/gpu_telemetry_status.tsv",
+            "gpu_telemetry": gpu_status,
+            "receptor_coordinate": relative_run_artifact(binding, receptor.path),
+            "receptor_preparation": receptor.preparation,
+            "ligand_coordinate": "tool_outputs/ligand_placement.tsv",
+            "ligand_parameterization": parameterization,
+            "ligand_placement": placement_method,
+            "protocol_artifact": "tool_outputs/md_protocol.tsv",
+            "state_artifact": "tool_outputs/md_state.tsv",
+            "trajectory": "tool_outputs/md_trajectory.tsv",
+            "metric_artifacts": metric_artifacts,
+            "risk_flags": risk_flags,
+            "artifact_provenance": f"tool_outputs/{MD_PROVENANCE_ARTIFACT}",
+        },
+    )
 
 
 def write_trajectory(

@@ -135,7 +135,13 @@ def main() -> int:
 
 
 def run_docking_job(job: dict[str, Any]) -> str:
-    run_dir = runtime_path(str(job["run_dir"]))
+    run_dir = runtime_path(str(job["run_dir"])).resolve(strict=True)
+    if not run_dir.is_dir():
+        raise DockingNotReady("run_dir_not_directory")
+    invocation_id = str(job.get("invocation_id", "")).strip()
+    if not invocation_id:
+        raise DockingNotReady("docking_invocation_id_missing")
+    clear_previous_docking_outputs(run_dir)
     tool_outputs = run_dir / "tool_outputs"
     tool_outputs.mkdir(parents=True, exist_ok=True)
     receptor_pdb = tool_outputs / "docking_receptor.pdb"
@@ -233,6 +239,8 @@ def run_docking_job(job: dict[str, Any]) -> str:
         json.dump(
             {
                 "status": "completed",
+                "job_id": str(job.get("job_id", "")),
+                "invocation_id": invocation_id,
                 "candidate_id": binding.candidate_id,
                 "input_id": binding.input_id,
                 "target_id": binding.target_id,
@@ -247,6 +255,7 @@ def run_docking_job(job: dict[str, Any]) -> str:
                 "ligand_smiles": binding.ligand_smiles,
                 "ligand_record_id": binding.ligand_record_id,
                 "source_content_sha256": binding.source_content_sha256,
+                "input_digest": seed.input_digest,
                 "ligand_pdbqt": "tool_outputs/docking_ligand.pdbqt",
                 "pose": "tool_outputs/docking_pose.pdbqt",
                 "pose_sdf": "tool_outputs/docking_pose.sdf",
@@ -291,6 +300,46 @@ def runtime_path(value: str) -> Path:
         rest = value[3:].replace("\\", "/")
         return Path(f"/mnt/{drive}/{rest}")
     return path
+
+
+def resolve_run_artifact(run_dir: Path, artifact: str | Path) -> Path:
+    root = run_dir.resolve(strict=True)
+    value = str(artifact).strip()
+    if not value:
+        raise DockingNotReady("artifact_path_missing")
+    candidate = runtime_path(value)
+    if not candidate.is_absolute():
+        candidate = root / candidate
+    try:
+        resolved = candidate.resolve(strict=True)
+        resolved.relative_to(root)
+    except (OSError, ValueError) as exc:
+        raise DockingNotReady(f"artifact_outside_current_run:{value}") from exc
+    if not resolved.is_file() or resolved.stat().st_size == 0:
+        raise DockingNotReady("selected_candidate_receptor_artifact_unavailable")
+    return resolved
+
+
+def clear_previous_docking_outputs(run_dir: Path) -> None:
+    root = run_dir.resolve(strict=True)
+    for relative in (
+        "docking_summary.tsv",
+        "tool_outputs/docking_summary.tsv",
+        "tool_outputs/docking_manifest.json",
+        "tool_outputs/docking_not_ready.tsv",
+        "tool_outputs/docking_receptor.pdb",
+        "tool_outputs/docking_receptor.pdbqt",
+        "tool_outputs/docking_ligand.sdf",
+        "tool_outputs/docking_ligand.pdbqt",
+        "tool_outputs/docking_pose.pdbqt",
+        "tool_outputs/docking_pose.sdf",
+        "tool_outputs/docking_vina.log",
+    ):
+        path = root / relative
+        if path.exists():
+            if not path.is_file():
+                raise DockingNotReady(f"stale_docking_output_not_file:{relative}")
+            path.unlink()
 
 
 def resolve_docking_binding(run_dir: Path) -> DockingBinding:
@@ -351,11 +400,7 @@ def resolve_docking_binding(run_dir: Path) -> DockingBinding:
     artifact = str(receptor_rows[0].get("artifact", "")).strip()
     if not artifact:
         raise DockingNotReady("selected_candidate_receptor_artifact_missing")
-    receptor_coordinate = runtime_path(artifact)
-    if not receptor_coordinate.is_absolute():
-        receptor_coordinate = run_dir / receptor_coordinate
-    if not receptor_coordinate.is_file() or receptor_coordinate.stat().st_size == 0:
-        raise DockingNotReady("selected_candidate_receptor_artifact_unavailable")
+    receptor_coordinate = resolve_run_artifact(run_dir, artifact)
 
     return DockingBinding(
         candidate_id=candidate_id,

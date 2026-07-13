@@ -3,7 +3,7 @@ use serde_json::{Value, json};
 use std::collections::{BTreeMap, HashMap, hash_map::RandomState};
 use std::fs::{self, OpenOptions};
 use std::hash::{BuildHasher, Hasher};
-use std::io::{Read, Seek, SeekFrom, Write};
+use std::io::{BufRead, BufReader, Read, Seek, SeekFrom, Write};
 use std::net::{TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitStatus, Stdio};
@@ -2355,6 +2355,14 @@ struct PagedRows {
 }
 
 impl PagedRows {
+    fn empty() -> Self {
+        Self {
+            rows: Vec::new(),
+            total_rows: 0,
+            filtered_rows: 0,
+        }
+    }
+
     fn map(self, f: impl Fn(Value) -> Value) -> Self {
         Self {
             rows: self.rows.into_iter().map(f).collect(),
@@ -5063,38 +5071,52 @@ fn read_tsv_rows(path: &Path) -> Vec<Value> {
 }
 
 fn read_tsv_rows_page(path: &Path, query: &ResultQuery) -> PagedRows {
-    let Ok(text) = fs::read_to_string(path) else {
-        return PagedRows {
-            rows: Vec::new(),
-            total_rows: 0,
-            filtered_rows: 0,
-        };
+    let Ok(file) = fs::File::open(path) else {
+        return PagedRows::empty();
     };
-    let mut lines = text.lines().filter(|line| !line.trim().is_empty());
-    let Some(header) = lines.next() else {
-        return PagedRows {
-            rows: Vec::new(),
-            total_rows: 0,
-            filtered_rows: 0,
-        };
+    read_tsv_rows_page_from(BufReader::new(file), query).unwrap_or_else(|_| PagedRows::empty())
+}
+
+fn read_tsv_rows_page_from(
+    mut reader: impl BufRead,
+    query: &ResultQuery,
+) -> std::io::Result<PagedRows> {
+    let mut line = String::new();
+    let headers = loop {
+        line.clear();
+        if reader.read_line(&mut line)? == 0 {
+            return Ok(PagedRows::empty());
+        }
+        let header = line.trim_end_matches(['\r', '\n']);
+        if !header.trim().is_empty() {
+            break header
+                .split('\t')
+                .map(|value| value.trim().to_string())
+                .collect::<Vec<_>>();
+        }
     };
-    let headers = header
-        .split('\t')
-        .map(|value| value.trim().to_string())
-        .collect::<Vec<_>>();
-    let data_lines = lines.collect::<Vec<_>>();
-    let total_rows = data_lines.len();
+
     let filter = query.filter.trim().to_ascii_lowercase();
-    let filtered = data_lines
-        .into_iter()
-        .filter(|line| filter.is_empty() || line.to_ascii_lowercase().contains(&filter))
-        .collect::<Vec<_>>();
-    let filtered_rows = filtered.len();
-    let rows = filtered
-        .into_iter()
-        .skip(query.offset())
-        .take(query.page_size)
-        .map(|line| {
+    let offset = query.offset();
+    let mut rows = Vec::new();
+    let mut total_rows = 0;
+    let mut filtered_rows = 0;
+    loop {
+        line.clear();
+        if reader.read_line(&mut line)? == 0 {
+            break;
+        }
+        let line = line.trim_end_matches(['\r', '\n']);
+        if line.trim().is_empty() {
+            continue;
+        }
+        total_rows += 1;
+        if filter.is_empty() || line.to_ascii_lowercase().contains(&filter) {
+            let filtered_index = filtered_rows;
+            filtered_rows += 1;
+            if filtered_index < offset || rows.len() >= query.page_size {
+                continue;
+            }
             let cols = line.split('\t').collect::<Vec<_>>();
             let mut row = serde_json::Map::new();
             for (index, header) in headers.iter().enumerate() {
@@ -5103,14 +5125,14 @@ fn read_tsv_rows_page(path: &Path, query: &ResultQuery) -> PagedRows {
                     Value::String(cols.get(index).copied().unwrap_or("").to_string()),
                 );
             }
-            Value::Object(row)
-        })
-        .collect();
-    PagedRows {
+            rows.push(Value::Object(row));
+        }
+    }
+    Ok(PagedRows {
         rows,
         total_rows,
         filtered_rows,
-    }
+    })
 }
 
 fn rows_len(path: &Path) -> usize {

@@ -31,6 +31,8 @@ const STRUCTURE_SCORE_WEIGHT: f64 = 0.10;
 const DOCKING_SCORE_WEIGHT: f64 = 0.05;
 const MD_SCORE_WEIGHT: f64 = 0.10;
 static PYTHON_SCRIPT_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+static WORKER_INVOCATION_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+const WORKER_INVOCATION_FILE: &str = "worker_invocation_id.txt";
 const AUTHENTICITY_FORBIDDEN_MARKERS: &[(&str, &str)] = &[
     ("unit_test_fixture", "unit test fixture row"),
     ("unit-test-fixture", "unit test fixture row"),
@@ -4091,6 +4093,8 @@ fn match_metagenome(options: &ScienceOptions) -> Result<String, String> {
 }
 
 fn evaluate_structure(options: &ScienceOptions) -> Result<String, String> {
+    start_worker_invocation(options)?;
+    clear_worker_task_outputs(options, &DOCKING_WORKER_TASK)?;
     let structure_matches = if options
         .run_dir
         .join("input_normalized_manifest.tsv")
@@ -4133,12 +4137,7 @@ fn evaluate_structure(options: &ScienceOptions) -> Result<String, String> {
     )? {
         structure_ready = true;
     }
-    if viewer_ready
-        && !options
-            .run_dir
-            .join("tool_outputs/docking_summary.tsv")
-            .exists()
-    {
+    if viewer_ready {
         run_single_worker_task(options, &DOCKING_WORKER_TASK)?;
     }
     let docking = options.run_dir.join("docking_summary.tsv");
@@ -4382,6 +4381,115 @@ fn append_tool_match_rows_to_file(
     Ok(count)
 }
 
+fn start_worker_invocation(options: &ScienceOptions) -> Result<String, String> {
+    ensure_dir(&options.run_dir)?;
+    let sequence = WORKER_INVOCATION_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+    let timestamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_nanos())
+        .unwrap_or_default();
+    let mut hasher = Sha256::new();
+    hasher.update(options.run_dir.display().to_string().as_bytes());
+    hasher.update(std::process::id().to_le_bytes());
+    hasher.update(timestamp.to_le_bytes());
+    hasher.update(sequence.to_le_bytes());
+    let suffix = hasher
+        .finalize()
+        .iter()
+        .take(12)
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+    let invocation_id = format!("invocation_{suffix}");
+    write_text(
+        &options.run_dir.join(WORKER_INVOCATION_FILE),
+        &(invocation_id.clone() + "\n"),
+    )?;
+    Ok(invocation_id)
+}
+
+fn current_worker_invocation(options: &ScienceOptions) -> Result<String, String> {
+    let path = options.run_dir.join(WORKER_INVOCATION_FILE);
+    if path.is_file() {
+        let value = read_text(&path)?.trim().to_string();
+        if !value.is_empty() {
+            return Ok(value);
+        }
+    }
+    start_worker_invocation(options)
+}
+
+fn clear_worker_task_outputs(options: &ScienceOptions, task: &WorkerTask) -> Result<(), String> {
+    let paths: &[&str] = match task.worker {
+        "docking" => &[
+            "docking_summary.tsv",
+            "tool_outputs/docking_summary.tsv",
+            "tool_outputs/docking_manifest.json",
+            "tool_outputs/docking_not_ready.tsv",
+            "tool_outputs/docking_receptor.pdb",
+            "tool_outputs/docking_receptor.pdbqt",
+            "tool_outputs/docking_ligand.sdf",
+            "tool_outputs/docking_ligand.pdbqt",
+            "tool_outputs/docking_pose.pdbqt",
+            "tool_outputs/docking_pose.sdf",
+            "tool_outputs/docking_vina.log",
+        ],
+        "md_summary" => &[
+            "md_summary.tsv",
+            "md_summary_status.tsv",
+            "tool_outputs/md_summary.tsv",
+            "tool_outputs/md_not_ready.tsv",
+            "tool_outputs/md_rmsd.tsv",
+            "tool_outputs/md_rmsf.tsv",
+            "tool_outputs/md_ligand_drift.tsv",
+            "tool_outputs/md_contacts.tsv",
+            "tool_outputs/md_hbonds.tsv",
+            "tool_outputs/md_protocol.tsv",
+            "tool_outputs/md_state.tsv",
+            "tool_outputs/gpu_telemetry.tsv",
+            "tool_outputs/gpu_telemetry_status.tsv",
+            "tool_outputs/ligand_placement.tsv",
+            "tool_outputs/md_trajectory.tsv",
+            "tool_outputs/complex_md_manifest.json",
+            "tool_outputs/md_run_manifest.json",
+            "tool_outputs/md_artifact_provenance.json",
+        ],
+        _ => &[],
+    };
+    for relative in paths {
+        remove_file_if_exists(&options.run_dir.join(relative))?;
+    }
+    Ok(())
+}
+
+fn remove_file_if_exists(path: &Path) -> Result<(), String> {
+    if !path.exists() {
+        return Ok(());
+    }
+    if !path.is_file() {
+        return Err(format!("worker_output_not_file:{}", path.display()));
+    }
+    fs::remove_file(path).map_err(|err| format!("remove_failed:{}:{err}", path.display()))
+}
+
+fn run_artifact_path_is_current(run_dir: &Path, artifact: &str) -> bool {
+    if artifact.trim().is_empty() {
+        return false;
+    }
+    let Ok(root) = run_dir.canonicalize() else {
+        return false;
+    };
+    let path = PathBuf::from(artifact);
+    let candidate = if path.is_absolute() {
+        path
+    } else {
+        run_dir.join(path)
+    };
+    candidate
+        .canonicalize()
+        .ok()
+        .is_some_and(|path| path.is_file() && path.starts_with(root))
+}
+
 fn run_scientific_workers(options: &ScienceOptions) -> Result<String, String> {
     let job_dir = options.run_dir.join("worker_jobs");
     let result_dir = options.run_dir.join("worker_results");
@@ -4392,25 +4500,27 @@ fn run_scientific_workers(options: &ScienceOptions) -> Result<String, String> {
     );
     let mut worker_errors = Vec::new();
     for task in SCIENTIFIC_WORKER_TASKS {
+        clear_worker_task_outputs(options, task)?;
         let job_path = job_dir.join(format!("{}.json", task.job_id));
         let result_path = result_dir.join(format!("{}.json", task.job_id));
-        let job = worker_job_value(options, task);
+        remove_file_if_exists(&result_path)?;
+        let job = worker_job_value(options, task)?;
         write_text(&job_path, &(job.to_string() + "\n"))?;
         let job_schema_valid = validate_worker_job(&job, task);
         let launch_status = match run_worker_task(options, task, &job_path, &result_path) {
             Ok(()) => "ok".to_string(),
             Err(err) => {
                 if !result_path.exists() {
-                    write_worker_failure_result(&result_path, task, &err)?;
+                    write_worker_failure_result(&result_path, task, &job, &err)?;
                 }
                 format!("failed:{}", clean_cell(&err))
             }
         };
         if !result_path.exists() {
-            write_worker_failure_result(&result_path, task, "worker_result_missing")?;
+            write_worker_failure_result(&result_path, task, &job, "worker_result_missing")?;
         }
-        let result = read_worker_result_or_failure(&result_path, task)?;
-        let result_schema_valid = validate_worker_result(&result, task);
+        let result = read_worker_result_or_failure(&result_path, task, &job)?;
+        let result_schema_valid = validate_worker_result_binding(&result, &job, options, task);
         let result_status = result
             .get("status")
             .and_then(Value::as_str)
@@ -4461,7 +4571,7 @@ fn run_scientific_workers(options: &ScienceOptions) -> Result<String, String> {
             python_owns_final_score,
             python_owns_report_semantics
         ));
-        if let Some(error) = worker_result_stage_error(&result, task) {
+        if let Some(error) = worker_result_stage_error_bound(&result, &job, options, task) {
             worker_errors.push(error);
         }
     }
@@ -4486,36 +4596,41 @@ fn run_single_worker_task(options: &ScienceOptions, task: &WorkerTask) -> Result
     let result_dir = options.run_dir.join("worker_results");
     ensure_dir(&job_dir)?;
     ensure_dir(&result_dir)?;
+    clear_worker_task_outputs(options, task)?;
     let job_path = job_dir.join(format!("{}.json", task.job_id));
     let result_path = result_dir.join(format!("{}.json", task.job_id));
-    let job = worker_job_value(options, task);
+    remove_file_if_exists(&result_path)?;
+    let job = worker_job_value(options, task)?;
     write_text(&job_path, &(job.to_string() + "\n"))?;
     if let Err(err) = run_worker_task(options, task, &job_path, &result_path)
         && !result_path.exists()
     {
-        write_worker_failure_result(&result_path, task, &err)?;
+        write_worker_failure_result(&result_path, task, &job, &err)?;
     }
-    let result = read_worker_result_or_failure(&result_path, task)?;
-    match worker_result_stage_error(&result, task) {
+    let result = read_worker_result_or_failure(&result_path, task, &job)?;
+    match worker_result_stage_error_bound(&result, &job, options, task) {
         Some(error) => Err(error),
         None => Ok(()),
     }
 }
 
-fn worker_job_value(options: &ScienceOptions, task: &WorkerTask) -> Value {
-    json!({
+fn worker_job_value(options: &ScienceOptions, task: &WorkerTask) -> Result<Value, String> {
+    let invocation_id = current_worker_invocation(options)?;
+    Ok(json!({
         "schema_version": WORKER_SCHEMA_VERSION,
         "pipeline_mode": WORKER_PIPELINE_MODE,
         "job_id": task.job_id,
         "worker": task.worker,
         "stage": task.stage,
+        "run_id": options.run_dir.file_name().and_then(|name| name.to_str()).unwrap_or("run"),
+        "invocation_id": invocation_id,
         "rust_owned_decision_logic": true,
         "decision_owner": "GenoLigand Rust core",
         "input_manifest": options.input_manifest.display().to_string(),
         "run_dir": options.run_dir.display().to_string(),
         "science_store": options.science_store.display().to_string(),
         "expected_result_schema": WORKER_SCHEMA_VERSION
-    })
+    }))
 }
 
 fn validate_worker_job(value: &Value, task: &WorkerTask) -> bool {
@@ -4524,6 +4639,10 @@ fn validate_worker_job(value: &Value, task: &WorkerTask) -> bool {
         && value.get("job_id").and_then(Value::as_str) == Some(task.job_id)
         && value.get("worker").and_then(Value::as_str) == Some(task.worker)
         && value.get("stage").and_then(Value::as_str) == Some(task.stage)
+        && value
+            .get("invocation_id")
+            .and_then(Value::as_str)
+            .is_some_and(|value| !value.trim().is_empty())
         && value
             .get("rust_owned_decision_logic")
             .and_then(Value::as_bool)
@@ -4638,26 +4757,36 @@ fn wsl_env_with_pythonpath() -> OsString {
     OsString::from(entries.join(":"))
 }
 
-fn read_worker_result_or_failure(path: &Path, task: &WorkerTask) -> Result<Value, String> {
+fn read_worker_result_or_failure(
+    path: &Path,
+    task: &WorkerTask,
+    job: &Value,
+) -> Result<Value, String> {
     match read_text(path)
         .ok()
         .and_then(|text| serde_json::from_str::<Value>(text.trim_start_matches('\u{feff}')).ok())
     {
         Some(value) => Ok(value),
         None => {
-            write_worker_failure_result(path, task, "worker_result_parse_failed")?;
+            write_worker_failure_result(path, task, job, "worker_result_parse_failed")?;
             serde_json::from_str::<Value>(&read_text(path)?)
                 .map_err(|err| format!("worker_result_reparse_failed:{}:{err}", path.display()))
         }
     }
 }
 
-fn write_worker_failure_result(path: &Path, task: &WorkerTask, reason: &str) -> Result<(), String> {
+fn write_worker_failure_result(
+    path: &Path,
+    task: &WorkerTask,
+    job: &Value,
+    reason: &str,
+) -> Result<(), String> {
     let reason = clean_cell(reason);
     let value = json!({
         "schema_version": WORKER_SCHEMA_VERSION,
         "job_id": task.job_id,
         "worker": task.worker,
+        "invocation_id": job.get("invocation_id").and_then(Value::as_str).unwrap_or("missing"),
         "status": "FAIL",
         "engine_version": format!("worker unavailable: {reason}"),
         "execution_status": "failed",
@@ -4735,6 +4864,40 @@ fn validate_worker_result(value: &Value, task: &WorkerTask) -> bool {
             .get("primitive_execution_only")
             .and_then(Value::as_bool)
             == Some(true)
+}
+
+fn validate_worker_result_binding(
+    value: &Value,
+    job: &Value,
+    options: &ScienceOptions,
+    task: &WorkerTask,
+) -> bool {
+    if !validate_worker_result(value, task) {
+        return false;
+    }
+    if task.worker != "md_summary" {
+        return true;
+    }
+    let expected_invocation = job.get("invocation_id").and_then(Value::as_str);
+    if value.get("invocation_id").and_then(Value::as_str) != expected_invocation {
+        return false;
+    }
+    ["artifact_path", "artifact_provenance"]
+        .into_iter()
+        .filter_map(|field| value.get(field).and_then(Value::as_str))
+        .all(|artifact| run_artifact_path_is_current(&options.run_dir, artifact))
+}
+
+fn worker_result_stage_error_bound(
+    value: &Value,
+    job: &Value,
+    options: &ScienceOptions,
+    task: &WorkerTask,
+) -> Option<String> {
+    if !validate_worker_result_binding(value, job, options, task) {
+        return Some(format!("{}_result_binding_invalid", task.worker));
+    }
+    worker_result_stage_error(value, task)
 }
 
 fn validate_worker_outcome(value: &Value) -> bool {

@@ -15,6 +15,7 @@ from genoligand_workers.docking_worker import (
     ReceptorPreparation,
     build_vina_command,
     choose_search_box,
+    clear_previous_docking_outputs,
     derive_docking_seed,
     main,
     prepare_receptor_for_docking,
@@ -483,6 +484,8 @@ class DockingWorkerOutputContractTests(unittest.TestCase):
             seed = manifest["seed"]
             self.assertIn("AutoDock Vina docking completed", result)
             self.assertEqual(manifest["status"], "completed")
+            self.assertEqual(manifest["job_id"], "docking_vina")
+            self.assertEqual(manifest["invocation_id"], "invocation-current")
             self.assertEqual(manifest["candidate_id"], "candidate_2")
             self.assertEqual(manifest["input_id"], "input_2")
             self.assertEqual(manifest["target_id"], "TARGET_2")
@@ -496,6 +499,9 @@ class DockingWorkerOutputContractTests(unittest.TestCase):
             self.assertEqual(manifest["seed_provenance"]["algorithm"], "sha256_canonical_v1")
             self.assertEqual(len(manifest["seed_provenance"]["invocation_digest"]), 64)
             self.assertEqual(len(manifest["seed_provenance"]["input_digest"]), 64)
+            self.assertEqual(
+                manifest["input_digest"], manifest["seed_provenance"]["input_digest"]
+            )
             self.assertEqual(len(manifest["seed_provenance"]["seed_digest"]), 64)
             self.assertEqual(ligand_writer.call_args.kwargs["seed"], seed)
 
@@ -507,6 +513,7 @@ class DockingWorkerOutputContractTests(unittest.TestCase):
             "job_id": "docking_vina",
             "worker": "docking_vina",
             "stage": "structure_evaluate",
+            "invocation_id": "invocation-current",
             "run_dir": str(run_dir),
             "input_manifest": str(run_dir / "input.json"),
         }
@@ -532,6 +539,44 @@ class DockingWorkerOutputContractTests(unittest.TestCase):
             "ready\tTARGET_2\t2XYZ\tstructure_viewer.pdb\tstore/2xyz.cif\tselected\n",
             encoding="utf-8",
         )
+
+    def test_receptor_artifact_must_stay_inside_current_run(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="genoligand_docking_outside_") as tmp:
+            root = Path(tmp)
+            run_dir = root / "run"
+            run_dir.mkdir()
+            self.write_binding_fixture(run_dir)
+            outside = root / "outside.pdb"
+            outside.write_text("ATOM\n", encoding="utf-8")
+            (run_dir / "structure_viewer_status.tsv").write_text(
+                "status\ttarget_id\tpdb_id\tartifact\texpected_path\treason\n"
+                f"ready\tTARGET_2\t2XYZ\t{outside}\tstore/2xyz.cif\tselected\n",
+                encoding="utf-8",
+            )
+
+            with self.assertRaisesRegex(
+                DockingNotReady, "artifact_outside_current_run"
+            ):
+                resolve_docking_binding(run_dir)
+
+    def test_rerun_removes_previous_docking_outputs(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="genoligand_docking_cleanup_") as tmp:
+            run_dir = Path(tmp)
+            tool_outputs = run_dir / "tool_outputs"
+            tool_outputs.mkdir()
+            stale = [
+                run_dir / "docking_summary.tsv",
+                tool_outputs / "docking_summary.tsv",
+                tool_outputs / "docking_manifest.json",
+                tool_outputs / "docking_pose.sdf",
+                tool_outputs / "docking_vina.log",
+            ]
+            for path in stale:
+                path.write_text("stale\n", encoding="utf-8")
+
+            clear_previous_docking_outputs(run_dir)
+
+            self.assertTrue(all(not path.exists() for path in stale))
 
 
 if __name__ == "__main__":

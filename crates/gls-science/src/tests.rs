@@ -219,6 +219,97 @@ fn worker_not_ready_requires_a_structured_required_outcome() {
 }
 
 #[test]
+fn worker_jobs_and_results_are_bound_to_current_run_invocation() {
+    let root = temp_root("worker_invocation_binding");
+    let run = root.join("run-current");
+    ensure_dir(&run.join("worker_results")).expect("worker result dir");
+    ensure_dir(&run.join("tool_outputs")).expect("tool outputs");
+    let options = ScienceOptions {
+        workspace_root: root.clone(),
+        science_store: root.join("science_store"),
+        input_manifest: run.join("input.json"),
+        run_dir: run.clone(),
+    };
+    let first = start_worker_invocation(&options).expect("first invocation");
+    let second = start_worker_invocation(&options).expect("second invocation");
+    assert_ne!(first, second);
+    let task = &SCIENTIFIC_WORKER_TASKS[0];
+    let job = worker_job_value(&options, task).expect("worker job");
+    assert_eq!(job["invocation_id"], second);
+
+    let result_path = run.join("worker_results/md_summary_ligand_dynamics.json");
+    let provenance_path = run.join("tool_outputs/md_artifact_provenance.json");
+    write_text(&result_path, "{}\n").expect("result artifact");
+    write_text(&provenance_path, "{}\n").expect("provenance artifact");
+    let mut result = json!({
+        "schema_version": WORKER_SCHEMA_VERSION,
+        "job_id": task.job_id,
+        "worker": task.worker,
+        "status": "PASS",
+        "engine_version": "OpenMM test",
+        "execution_status": "completed",
+        "reason": "completed",
+        "outcomes": [{
+            "status": "completed",
+            "reason": "completed",
+            "required": true,
+            "database_id": "md_summary",
+            "row_count": 1
+        }],
+        "python_owns_final_score": false,
+        "python_owns_report_semantics": false,
+        "primitive_execution_only": true,
+        "invocation_id": second,
+        "artifact_path": "worker_results/md_summary_ligand_dynamics.json",
+        "artifact_provenance": "tool_outputs/md_artifact_provenance.json"
+    });
+    assert!(validate_worker_result_binding(
+        &result, &job, &options, task
+    ));
+
+    result["invocation_id"] = json!("invocation-stale");
+    assert!(!validate_worker_result_binding(
+        &result, &job, &options, task
+    ));
+    result["invocation_id"] = job["invocation_id"].clone();
+    result["artifact_path"] = json!(root.join("outside.json").display().to_string());
+    write_text(&root.join("outside.json"), "{}\n").expect("outside artifact");
+    assert!(!validate_worker_result_binding(
+        &result, &job, &options, task
+    ));
+
+    fs::remove_dir_all(&root).expect("cleanup temp root");
+}
+
+#[test]
+fn worker_rerun_cleanup_removes_stale_docking_and_md_outputs() {
+    let root = temp_root("worker_rerun_cleanup");
+    let run = root.join("run");
+    let options = ScienceOptions {
+        workspace_root: root.clone(),
+        science_store: root.join("science_store"),
+        input_manifest: run.join("input.json"),
+        run_dir: run.clone(),
+    };
+    let stale = [
+        run.join("docking_summary.tsv"),
+        run.join("tool_outputs/docking_manifest.json"),
+        run.join("md_summary.tsv"),
+        run.join("tool_outputs/md_summary.tsv"),
+        run.join("tool_outputs/md_run_manifest.json"),
+    ];
+    for path in &stale {
+        write_text(path, "stale\n").expect("stale artifact");
+    }
+
+    clear_worker_task_outputs(&options, &DOCKING_WORKER_TASK).expect("clear docking");
+    clear_worker_task_outputs(&options, &SCIENTIFIC_WORKER_TASKS[0]).expect("clear md");
+
+    assert!(stale.iter().all(|path| !path.exists()));
+    fs::remove_dir_all(&root).expect("cleanup temp root");
+}
+
+#[test]
 fn pipeline_blocks_without_science_store_and_writes_zero_candidates() {
     let root = temp_root("blocked");
     let input = root.join("input.json");

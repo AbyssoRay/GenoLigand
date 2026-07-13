@@ -1,4 +1,5 @@
 use super::*;
+use std::sync::atomic::AtomicUsize;
 
 fn server_options(workspace_root: PathBuf) -> ServerOptions {
     ServerOptions {
@@ -2707,6 +2708,96 @@ fn result_routes_apply_page_and_filter_query_parameters() {
     assert_eq!(payload["pagination"]["filters_active"], true);
     assert_eq!(payload["pagination"]["active_filters"][0], "T505");
     fs::remove_dir_all(&root).ok();
+}
+
+struct GeneratedTsvReader {
+    total_rows: usize,
+    next_row: usize,
+    header_emitted: bool,
+    buffer: Vec<u8>,
+    consumed: usize,
+    read_calls: Arc<AtomicUsize>,
+    max_buffered_bytes: Arc<AtomicUsize>,
+}
+
+impl GeneratedTsvReader {
+    fn new(
+        total_rows: usize,
+        read_calls: Arc<AtomicUsize>,
+        max_buffered_bytes: Arc<AtomicUsize>,
+    ) -> Self {
+        Self {
+            total_rows,
+            next_row: 1,
+            header_emitted: false,
+            buffer: Vec::new(),
+            consumed: 0,
+            read_calls,
+            max_buffered_bytes,
+        }
+    }
+
+    fn refill(&mut self) {
+        if self.consumed < self.buffer.len() {
+            return;
+        }
+        self.buffer.clear();
+        self.consumed = 0;
+        if !self.header_emitted {
+            self.buffer.extend_from_slice(b"rank\tcandidate_id\n");
+            self.header_emitted = true;
+        } else if self.next_row <= self.total_rows {
+            self.buffer.extend_from_slice(
+                format!("{}\tC{:06}\n", self.next_row, self.next_row).as_bytes(),
+            );
+            self.next_row += 1;
+        }
+        self.max_buffered_bytes
+            .fetch_max(self.buffer.len(), Ordering::Relaxed);
+    }
+}
+
+impl std::io::Read for GeneratedTsvReader {
+    fn read(&mut self, _buffer: &mut [u8]) -> std::io::Result<usize> {
+        self.read_calls.fetch_add(1, Ordering::Relaxed);
+        Err(std::io::Error::new(
+            std::io::ErrorKind::Other,
+            "full-reader path is forbidden",
+        ))
+    }
+}
+
+impl std::io::BufRead for GeneratedTsvReader {
+    fn fill_buf(&mut self) -> std::io::Result<&[u8]> {
+        self.refill();
+        Ok(&self.buffer[self.consumed..])
+    }
+
+    fn consume(&mut self, amount: usize) {
+        self.consumed = self.consumed.saturating_add(amount).min(self.buffer.len());
+    }
+}
+
+#[test]
+fn large_tsv_late_page_uses_bounded_bufread_scan() {
+    let read_calls = Arc::new(AtomicUsize::new(0));
+    let max_buffered_bytes = Arc::new(AtomicUsize::new(0));
+    let reader = GeneratedTsvReader::new(
+        100_000,
+        read_calls.clone(),
+        max_buffered_bytes.clone(),
+    );
+    let query = ResultQuery::parse("page=20000&page_size=3");
+
+    let page = read_tsv_rows_page_from(reader, &query).expect("stream late page");
+
+    assert_eq!(page.total_rows, 100_000);
+    assert_eq!(page.filtered_rows, 100_000);
+    assert_eq!(page.rows.len(), 3);
+    assert_eq!(page.rows[0]["candidate_id"], "C059998");
+    assert_eq!(page.rows[2]["candidate_id"], "C060000");
+    assert_eq!(read_calls.load(Ordering::Relaxed), 0);
+    assert!(max_buffered_bytes.load(Ordering::Relaxed) < 64);
 }
 
 #[test]
