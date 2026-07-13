@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import re
 import sys
 import tempfile
@@ -30,6 +31,8 @@ def main() -> int:
     server = read("crates/gls-server/src/lib.rs")
     md_worker = read("python/genoligand_workers/md_summary_worker.py")
     alignment_worker = read("python/genoligand_workers/alignment_worker.py")
+    worker_common = read("python/genoligand_workers/common.py")
+    worker_result_schema = json.loads(read("schemas/worker_result.schema.json"))
     worker_cpu_requirements = read("python/requirements-workers-cpu.txt")
     worker_cuda_requirements = read("python/requirements-workers-cuda.txt")
     worker_environment = read("python/environment-workers.yml")
@@ -87,6 +90,19 @@ def main() -> int:
     require("mmseqs_target_databases" in alignment_worker, "MMseqs2 worker must discover persistent target databases")
     require("foldseek_target_database" in alignment_worker, "Foldseek worker must discover persistent target database")
     require('"-a"' in alignment_worker, "Foldseek search must request alignment backtrace for convertalis structure scores")
+    require("WorkerOutcome" in alignment_worker and "WorkerOutcome" in md_worker, "alignment and MD workers must emit structured outcomes")
+    require("worker_result_stage_error" in science, "Rust must reject not-ready and failed worker outcomes")
+    require(
+        set(worker_result_schema["properties"]["status"]["enum"])
+        == {"PASS", "NOT_APPLICABLE", "NOT_READY", "FAIL"},
+        "worker result schema must distinguish completed, inapplicable, not-ready and failed execution",
+    )
+    outcome_required = set(worker_result_schema["properties"]["outcomes"]["items"]["required"])
+    require(
+        outcome_required == {"status", "reason", "required", "database_id", "row_count"},
+        "worker outcomes must retain status, reason, required flag, database identity and row count",
+    )
+    require("EXECUTION_RESULT_STATUS" in worker_common, "worker status mapping must be shared across scientific workers")
     require("当前运行没有可展示的候选假设" in science, "report must preserve empty-result language")
     forbidden_report_claims = ["已确认靶点", "确认靶点", "已确认机制", "确认机制", "真实亲和力", "真实靶点"]
     for term in forbidden_report_claims:

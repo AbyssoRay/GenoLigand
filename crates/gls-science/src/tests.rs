@@ -147,7 +147,7 @@ fn wsl_python_wrapper_uses_wsl_paths_for_worker_inputs() {
 }
 
 #[test]
-fn valid_worker_fail_result_counts_as_executed_worker() {
+fn valid_worker_fail_result_is_schema_valid_but_fails_the_stage() {
     let root = temp_root("worker_fail_result");
     let path = root.join("worker_result.json");
     let task = &SCIENTIFIC_WORKER_TASKS[0];
@@ -161,6 +161,15 @@ fn valid_worker_fail_result_counts_as_executed_worker() {
                 "worker": task.worker,
                 "status": "FAIL",
                 "engine_version": "OpenMM platforms=Reference,CPU",
+                "execution_status": "failed",
+                "reason": "fixture_failed",
+                "outcomes": [{
+                    "status": "failed",
+                    "reason": "fixture_failed",
+                    "required": true,
+                    "database_id": "md_summary",
+                    "row_count": 0
+                }],
                 "python_owns_final_score": false,
                 "python_owns_report_semantics": false,
                 "primitive_execution_only": true
@@ -170,8 +179,43 @@ fn valid_worker_fail_result_counts_as_executed_worker() {
     .expect("write result");
 
     assert!(worker_result_file_is_valid(&path, task));
+    let value: Value =
+        serde_json::from_str(&read_text(&path).expect("result text")).expect("result json");
+    assert!(worker_result_stage_error(&value, task).is_some());
     fs::remove_dir_all(&root).expect("cleanup temp root");
     assert!(!root.exists());
+}
+
+#[test]
+fn worker_not_ready_requires_a_structured_required_outcome() {
+    let task = &SEQUENCE_ALIGNMENT_WORKER_TASK;
+    let mut value = json!({
+        "schema_version": WORKER_SCHEMA_VERSION,
+        "job_id": task.job_id,
+        "worker": task.worker,
+        "status": "NOT_READY",
+        "engine_version": "MMseqs2 not executed",
+        "execution_status": "not_ready",
+        "reason": "no_persistent_mmseqs_databases",
+        "outcomes": [{
+            "status": "not_ready",
+            "reason": "no_persistent_mmseqs_databases",
+            "required": true,
+            "database_id": "mmseqs_target_manifest",
+            "row_count": 0
+        }],
+        "python_owns_final_score": false,
+        "python_owns_report_semantics": false,
+        "primitive_execution_only": true
+    });
+
+    assert!(validate_worker_result(&value, task));
+    assert!(worker_result_stage_error(&value, task).is_some());
+    value
+        .as_object_mut()
+        .expect("result object")
+        .remove("outcomes");
+    assert!(!validate_worker_result(&value, task));
 }
 
 #[test]
@@ -241,6 +285,7 @@ fn report_empty_candidate_table_does_not_claim_result_outputs() {
 #[test]
 fn pipeline_uses_one_temporary_query_row_then_test_removes_it() {
     let root = temp_root("one_row");
+    install_not_applicable_worker_fixtures(&root).expect("worker fixtures");
     let store = create_temporary_test_store(&root).expect("store");
     let input = root.join("input.json");
     let run = root.join("run");
@@ -326,7 +371,7 @@ fn pipeline_uses_one_temporary_query_row_then_test_removes_it() {
 }
 
 #[test]
-fn pipeline_records_scientific_workers_without_smoke_artifacts() {
+fn scientific_worker_failures_are_recorded_without_smoke_artifacts() {
     let root = temp_root("schema_workers");
     let store = create_temporary_test_store(&root).expect("store");
     let input = root.join("input.json");
@@ -343,7 +388,8 @@ fn pipeline_records_scientific_workers_without_smoke_artifacts() {
         run_dir: run.clone(),
     };
 
-    run_science_command(ScienceCommand::PipelineRun, &options).expect("pipeline");
+    let error = run_scientific_workers(&options).expect_err("missing worker runtime must fail");
+    assert!(error.contains("scientific_workers_failed"));
     let summary = read_text(&run.join("scientific_runtime_summary.tsv")).expect("worker summary");
     let rows = summary.lines().skip(1).collect::<Vec<_>>();
     assert_eq!(rows.len(), SCIENTIFIC_WORKER_TASKS.len());
@@ -361,22 +407,18 @@ fn pipeline_records_scientific_workers_without_smoke_artifacts() {
         read_text(&run.join("worker_jobs/md_summary_ligand_dynamics.json")).expect("worker job");
     let result = read_text(&run.join("worker_results/md_summary_ligand_dynamics.json"))
         .expect("worker result");
-    let score = read_text(&run.join("score_decomposition.tsv")).expect("score");
-    let source_map = read_text(&run.join("artifact_source_map.tsv")).expect("source map");
 
     assert!(job.contains("\"rust_owned_decision_logic\":true"));
+    assert!(result.contains("\"status\":\"FAIL\""));
+    assert!(result.contains("\"execution_status\":\"failed\""));
+    assert!(result.contains("\"outcomes\":["));
     assert!(result.contains("\"python_owns_final_score\":false"));
     assert!(result.contains("\"python_owns_report_semantics\":false"));
     assert!(result.contains("\"primitive_execution_only\":true"));
-    assert!(source_map.contains("scientific_runtime_summary.tsv"));
-    assert!(!source_map.contains("worker_runtime_summary.tsv"));
     assert!(!run.join("worker_jobs/openmm_smoke.json").exists());
     assert!(!run.join("worker_results/openmm_smoke.json").exists());
     assert!(!run.join("worker_jobs/openff_rdkit_smoke.json").exists());
     assert!(!run.join("worker_results/openff_rdkit_smoke.json").exists());
-    assert!(score.contains("\tGenoLigand\n"));
-    assert!(!score.contains("Python"));
-
     fs::remove_dir_all(&root).expect("cleanup temp root");
     assert!(!root.exists());
 }
@@ -2248,6 +2290,7 @@ fn bindingdb_complex_pdb_parser_ignores_target_chain_structures() {
 #[test]
 fn structure_matching_uses_ligand_identity_from_known_search() {
     let root = temp_root("structure_uses_known_ligand_identity");
+    install_not_applicable_worker_fixtures(&root).expect("worker fixtures");
     let store = root.join("science_store");
     let run = root.join("run");
     let input = root.join("input.json");
@@ -2325,6 +2368,7 @@ fn webui_field_names_normalize_to_all_supported_input_types() {
 #[test]
 fn structure_and_dynamics_use_only_tool_outputs_when_present() {
     let root = temp_root("tool_outputs");
+    install_not_applicable_worker_fixtures(&root).expect("worker fixtures");
     let run = root.join("run");
     let store = root.join("science_store");
     let input = root.join("input.json");
@@ -2926,6 +2970,7 @@ fn ranking_blocks_final_artifacts_with_static_fallback_rows() {
 #[test]
 fn structure_evaluate_writes_viewer_from_real_coordinate_file() {
     let root = temp_root("structure_viewer_real");
+    install_not_applicable_worker_fixtures(&root).expect("worker fixtures");
     let run = root.join("run");
     let store = root.join("science_store");
     let input = root.join("input.json");
@@ -2968,6 +3013,7 @@ fn structure_evaluate_writes_viewer_from_real_coordinate_file() {
 #[test]
 fn structure_evaluate_prefers_bindingdb_pdb_candidate_over_token_noise() {
     let root = temp_root("structure_bindingdb_candidate");
+    install_not_applicable_worker_fixtures(&root).expect("worker fixtures");
     let run = root.join("run");
     let store = root.join("science_store");
     let input = root.join("input.json");
@@ -3030,6 +3076,7 @@ fn structure_evaluate_prefers_bindingdb_pdb_candidate_over_token_noise() {
 #[test]
 fn structure_evaluate_reads_canonical_index_rows_beyond_source_sampling_limit() {
     let root = temp_root("structure_index_full_scan");
+    install_not_applicable_worker_fixtures(&root).expect("worker fixtures");
     let run = root.join("run");
     let store = root.join("science_store");
     let input = root.join("input.json");
@@ -3863,4 +3910,49 @@ fn temp_root(label: &str) -> PathBuf {
         .expect("time")
         .as_millis();
     std::env::temp_dir().join(format!("genoligand_science_{label}_{millis}"))
+}
+
+fn install_not_applicable_worker_fixtures(root: &Path) -> Result<(), String> {
+    let package = root.join("python/genoligand_workers");
+    write_text(&package.join("__init__.py"), "")?;
+    let script = r#"import argparse
+import json
+
+parser = argparse.ArgumentParser()
+parser.add_argument("--job", required=True)
+parser.add_argument("--out", required=True)
+args = parser.parse_args()
+with open(args.job, "r", encoding="utf-8-sig") as handle:
+    job = json.load(handle)
+reason = "test_fixture_not_applicable"
+result = {
+    "schema_version": "genoligand_worker_current_v2",
+    "job_id": job["job_id"],
+    "worker": job["worker"],
+    "status": "NOT_APPLICABLE",
+    "engine_version": "test worker fixture",
+    "execution_status": "not_applicable",
+    "reason": reason,
+    "outcomes": [{
+        "status": "not_applicable",
+        "reason": reason,
+        "required": False,
+        "database_id": job["worker"],
+        "row_count": 0,
+    }],
+    "python_owns_final_score": False,
+    "python_owns_report_semantics": False,
+    "primitive_execution_only": True,
+}
+with open(args.out, "w", encoding="utf-8") as handle:
+    json.dump(result, handle)
+"#;
+    for module in [
+        "alignment_worker.py",
+        "docking_worker.py",
+        "md_summary_worker.py",
+    ] {
+        write_text(&package.join(module), script)?;
+    }
+    Ok(())
 }

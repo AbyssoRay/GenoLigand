@@ -10,6 +10,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+from genoligand_workers.common import WorkerExecution, WorkerOutcome
 from genoligand_workers.worker_io import parse_worker_args, read_job, write_result
 
 
@@ -49,99 +50,128 @@ def main() -> int:
     args = parse_worker_args()
     job = read_job(args.job)
     try:
-        version = run_md_summary_job(job)
-        status = "PASS"
+        execution = run_md_summary_job(job)
     except Exception as exc:  # pragma: no cover - depends on local scientific runtime
-        version = f"MD summary worker failed: {exc}"
-        status = "FAIL"
-    write_result(args.out, job, status, version)
-    return 0 if status == "PASS" else 2
+        reason = safe_note(str(exc)) or "md_summary_worker_failed"
+        execution = md_execution("failed", reason, f"MD summary worker failed: {reason}", True)
+    write_result(
+        args.out,
+        job,
+        execution.result_status,
+        execution.engine_version,
+        execution_status=execution.status,
+        reason=execution.reason,
+        outcomes=execution.outcome_dicts(),
+    )
+    return 0 if execution.status in {"completed", "not_applicable"} else 2
 
 
-def run_md_summary_job(job: dict[str, Any]) -> str:
-    import numpy as np
-    import openmm
-    from openmm import unit
-    from rdkit import Chem, rdBase
-    from rdkit.Chem import AllChem
+def md_execution(status: str, reason: str, version: str, required: bool, row_count: int = 0) -> WorkerExecution:
+    return WorkerExecution(
+        status,
+        reason,
+        version,
+        (WorkerOutcome(status, reason, required, "md_summary", row_count),),
+    )
 
+
+def run_md_summary_job(job: dict[str, Any]) -> WorkerExecution:
     input_manifest = runtime_path(str(job["input_manifest"]))
     run_dir = runtime_path(str(job["run_dir"]))
     science_store = runtime_path(str(job.get("science_store", "")))
     smiles, input_id = read_input_conversion_manifest(run_dir, "small_molecule")
     if not smiles:
         smiles, input_id = read_small_molecule_input(input_manifest)
+    sequence = ""
     if not smiles:
         sequence, input_id = read_input_conversion_manifest(run_dir, "peptide")
         if not sequence:
             sequence, input_id = read_peptide_sequence_input(input_manifest)
-        if sequence:
-            try:
-                mol, frames, parameterization, parameter_flags = prepare_peptide_conformer_ensemble(
-                    sequence,
-                    Chem,
-                    AllChem,
-                    np,
-                )
-            except Exception as exc:  # noqa: BLE001 - not-ready artifact is the contract for unusable sequence inputs
-                write_md_not_ready(
-                    run_dir,
-                    f"peptide conformer calculation failed: {safe_note(str(exc))}",
-                    ["peptide_conformer_calculation_failed"],
-                )
-                return openmm_version_text(openmm, "not_ready", "peptide_conformer_calculation_failed")
-            candidate_id = top_candidate_id(run_dir) or input_id
-            risk_flags = [
-                *parameter_flags,
-                "no_receptor_contact_model",
-                "rdkit_peptide_conformer_ensemble",
-            ]
-            metrics = summarize_peptide_conformer_frames(mol, frames, np)
-            write_peptide_conformer_artifacts(
-                run_dir,
-                candidate_id,
-                input_id,
-                sequence,
-                metrics,
-                frames,
-                mol,
-                parameterization,
-                risk_flags,
-                rdBase.rdkitVersion,
-            )
-            return (
-                f"RDKit {rdBase.rdkitVersion}; "
-                "method=rdkit_peptide_conformer_ensemble; input_kind=peptide"
-            )
-        write_md_not_ready(run_dir, "no small_molecule input available for MD summary", [])
-        return openmm_version_text(openmm, "not_ready", "missing_small_molecule")
+        if not sequence:
+            reason = "no_applicable_md_input"
+            write_md_not_ready(run_dir, reason, [])
+            return md_execution("not_applicable", reason, "MD summary not executed", False)
 
-    receptor_path = find_receptor_coordinate(run_dir)
-    if receptor_path is None:
-        write_md_not_ready(run_dir, "missing receptor coordinate artifact for complex MD", ["missing_receptor_coordinate"])
-        return openmm_version_text(openmm, "not_ready", "missing_receptor_coordinate")
+    receptor_path = find_receptor_coordinate(run_dir) if smiles else None
+    if smiles and receptor_path is None:
+        reason = "missing_receptor_coordinate"
+        write_md_not_ready(run_dir, reason, [reason])
+        return md_execution("not_ready", reason, "OpenMM not executed", True)
+
+    import numpy as np
+    import openmm
+    from openmm import unit
+    from rdkit import Chem, rdBase
+    from rdkit.Chem import AllChem
+
+    if sequence:
+        try:
+            mol, frames, parameterization, parameter_flags = prepare_peptide_conformer_ensemble(
+                sequence,
+                Chem,
+                AllChem,
+                np,
+            )
+        except Exception as exc:  # noqa: BLE001 - not-ready artifact is the contract for unusable sequence inputs
+            reason = "peptide_conformer_calculation_failed"
+            write_md_not_ready(
+                run_dir,
+                f"peptide conformer calculation failed: {safe_note(str(exc))}",
+                [reason],
+            )
+            return md_execution("not_ready", reason, openmm_version_text(openmm, "not_ready", reason), True)
+        candidate_id = top_candidate_id(run_dir) or input_id
+        risk_flags = [
+            *parameter_flags,
+            "no_receptor_contact_model",
+            "rdkit_peptide_conformer_ensemble",
+        ]
+        metrics = summarize_peptide_conformer_frames(mol, frames, np)
+        write_peptide_conformer_artifacts(
+            run_dir,
+            candidate_id,
+            input_id,
+            sequence,
+            metrics,
+            frames,
+            mol,
+            parameterization,
+            risk_flags,
+            rdBase.rdkitVersion,
+        )
+        return md_execution(
+            "completed",
+            "peptide_conformer_completed",
+            f"RDKit {rdBase.rdkitVersion}; method=rdkit_peptide_conformer_ensemble; input_kind=peptide",
+            True,
+            1,
+        )
 
     try:
+        assert receptor_path is not None
         receptor = load_receptor_coordinate(receptor_path, unit)
     except Exception as exc:  # noqa: BLE001 - not-ready artifact is the contract for unusable coordinates
+        reason = "receptor_coordinate_preparation_failed"
         write_md_not_ready(
             run_dir,
             f"receptor coordinate preparation failed: {safe_note(str(exc))}",
-            ["receptor_coordinate_preparation_failed"],
+            [reason],
         )
-        return openmm_version_text(openmm, "not_ready", "receptor_coordinate_preparation_failed")
+        return md_execution("not_ready", reason, openmm_version_text(openmm, "not_ready", reason), True)
     if not receptor.atoms:
-        write_md_not_ready(run_dir, "receptor coordinate file did not contain usable heavy atoms", ["receptor_coordinate_parse_failed"])
-        return openmm_version_text(openmm, "not_ready", "receptor_coordinate_parse_failed")
+        reason = "receptor_coordinate_parse_failed"
+        write_md_not_ready(run_dir, reason, [reason])
+        return md_execution("not_ready", reason, openmm_version_text(openmm, "not_ready", reason), True)
 
     mol = read_docking_pose_ligand(run_dir, Chem)
     if mol is None:
+        reason = "missing_docking_pose_sdf"
         write_md_not_ready(
             run_dir,
             "missing AutoDock Vina docking pose SDF for complex MD",
-            ["missing_docking_pose_sdf"],
+            [reason],
         )
-        return openmm_version_text(openmm, "not_ready", "missing_docking_pose_sdf")
+        return md_execution("not_ready", reason, openmm_version_text(openmm, "not_ready", reason), True)
 
     conformer = mol.GetConformer()
     initial_angstrom = np.array(
@@ -307,10 +337,14 @@ def run_md_summary_job(job: dict[str, Any]) -> str:
         gpu_status,
         model_metadata,
     )
-    return (
+    return md_execution(
+        "completed",
+        "complex_md_completed",
         f"OpenMM {openmm.version.full_version}; platform={platform_name}; "
         "method=openmm_receptor_ligand_complex_dynamics; "
-        f"gpu_observed={gpu_status['gpu_observed']}; receptor={receptor.path.name}"
+        f"gpu_observed={gpu_status['gpu_observed']}; receptor={receptor.path.name}",
+        True,
+        1,
     )
 
 

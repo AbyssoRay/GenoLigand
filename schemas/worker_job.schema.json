@@ -18,7 +18,7 @@
     "expected_result_schema"
   ],
   "properties": {
-    "schema_version": { "const": "genoligand_worker_current_v1" },
+    "schema_version": { "const": "genoligand_worker_current_v2" },
     "pipeline_mode": { "const": "genoligand_scientific_pipeline" },
     "job_id": { "type": "string", "minLength": 1 },
     "worker": { "type": "string", "minLength": 1 },
@@ -28,6 +28,6 @@
     "input_manifest": { "type": "string", "minLength": 1 },
     "run_dir": { "type": "string", "minLength": 1 },
     "science_store": { "type": "string", "minLength": 1 },
-    "expected_result_schema": { "const": "genoligand_worker_current_v1" }
+    "expected_result_schema": { "const": "genoligand_worker_current_v2" }
   }
 }

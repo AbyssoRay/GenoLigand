@@ -7,7 +7,7 @@ from typing import Any
 
 
 PIPELINE_MODE = "genoligand_scientific_pipeline"
-SCHEMA_VERSION = "genoligand_worker_current_v1"
+SCHEMA_VERSION = "genoligand_worker_current_v2"
 
 
 def parse_worker_args() -> argparse.Namespace:
@@ -29,13 +29,39 @@ def read_job(path: str | Path) -> dict[str, Any]:
     return job
 
 
-def write_result(path: str | Path, job: dict[str, Any], status: str, version: str) -> None:
+def write_result(
+    path: str | Path,
+    job: dict[str, Any],
+    status: str,
+    version: str,
+    *,
+    execution_status: str | None = None,
+    reason: str | None = None,
+    outcomes: list[dict[str, Any]] | None = None,
+) -> None:
+    if execution_status is None:
+        execution_status = "completed" if status == "PASS" else "failed"
+    if reason is None:
+        reason = execution_status
+    if outcomes is None:
+        outcomes = [
+            {
+                "status": execution_status,
+                "reason": reason,
+                "required": True,
+                "database_id": str(job["worker"]),
+                "row_count": 0,
+            }
+        ]
     result = {
         "schema_version": SCHEMA_VERSION,
         "job_id": job["job_id"],
         "worker": job["worker"],
         "status": status,
         "engine_version": version,
+        "execution_status": execution_status,
+        "reason": reason,
+        "outcomes": outcomes,
         "python_owns_final_score": False,
         "python_owns_report_semantics": False,
         "primitive_execution_only": True,

@@ -9,6 +9,7 @@ import subprocess
 from pathlib import Path
 from typing import Any
 
+from genoligand_workers.common import WorkerExecution, WorkerOutcome
 from genoligand_workers.worker_io import parse_worker_args, read_job, write_result
 
 
@@ -22,25 +23,37 @@ def main() -> int:
     args = parse_worker_args()
     job = read_job(args.job)
     try:
-        version = run_alignment_job(job)
-        status = "PASS"
+        execution = run_alignment_job(job)
     except Exception as exc:  # pragma: no cover - depends on local scientific runtime
-        version = f"alignment worker failed: {safe_note(str(exc))}"
-        status = "FAIL"
+        reason = safe_note(str(exc)) or "alignment_worker_failed"
+        execution = WorkerExecution(
+            "failed",
+            reason,
+            f"alignment worker failed: {reason}",
+            (WorkerOutcome("failed", reason, True, str(job.get("worker", "alignment")), 0),),
+        )
         try:
             run_dir = runtime_path(str(job["run_dir"]))
             tool_outputs(run_dir).mkdir(parents=True, exist_ok=True)
             if str(job.get("worker", "")).startswith("foldseek"):
-                write_status(tool_outputs(run_dir) / "foldseek_alignment_status.tsv", "not_ready", str(exc), 0)
+                write_status(tool_outputs(run_dir) / "foldseek_alignment_status.tsv", "failed", reason, 0)
             else:
-                write_status(tool_outputs(run_dir) / "mmseqs_alignment_status.tsv", "not_ready", str(exc), 0)
+                write_status(tool_outputs(run_dir) / "mmseqs_alignment_status.tsv", "failed", reason, 0)
         except Exception:
             pass
-    write_result(args.out, job, status, version)
-    return 0 if status == "PASS" else 2
+    write_result(
+        args.out,
+        job,
+        execution.result_status,
+        execution.engine_version,
+        execution_status=execution.status,
+        reason=execution.reason,
+        outcomes=execution.outcome_dicts(),
+    )
+    return 0 if execution.status in {"completed", "not_applicable"} else 2
 
 
-def run_alignment_job(job: dict[str, Any]) -> str:
+def run_alignment_job(job: dict[str, Any]) -> WorkerExecution:
     worker = str(job.get("worker", ""))
     run_dir = runtime_path(str(job["run_dir"]))
     science_store = runtime_path(str(job["science_store"]))
@@ -49,7 +62,7 @@ def run_alignment_job(job: dict[str, Any]) -> str:
     return run_mmseqs_alignment(run_dir, science_store)
 
 
-def run_mmseqs_alignment(run_dir: Path, science_store: Path) -> str:
+def run_mmseqs_alignment(run_dir: Path, science_store: Path) -> WorkerExecution:
     out_dir = tool_outputs(run_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
     matches_path = out_dir / "mmseqs_alignment_matches.tsv"
@@ -58,18 +71,36 @@ def run_mmseqs_alignment(run_dir: Path, science_store: Path) -> str:
 
     sequences = read_sequence_inputs(run_dir)
     if not sequences:
-        write_status(status_path, "not_ready", "no peptide or protein sequence input for MMseqs2", 0)
-        return "mmseqs2=not_ready;reason=no_sequence_input"
+        reason = "no_sequence_input"
+        write_status(status_path, "not_applicable", reason, 0)
+        return WorkerExecution(
+            "not_applicable",
+            reason,
+            "MMseqs2 not executed",
+            (WorkerOutcome("not_applicable", reason, False, "mmseqs", 0),),
+        )
 
     targets = mmseqs_target_databases(science_store)
     if not targets:
-        write_status(status_path, "not_ready", "no persistent MMseqs2 target databases in science store indexes", 0)
-        return "mmseqs2=not_ready;reason=no_persistent_mmseqs_databases"
+        reason = "no_persistent_mmseqs_databases"
+        write_status(status_path, "not_ready", reason, 0)
+        return WorkerExecution(
+            "not_ready",
+            reason,
+            "MMseqs2 not executed",
+            (WorkerOutcome("not_ready", reason, True, "mmseqs_target_manifest", 0),),
+        )
 
     mmseqs = shutil.which("mmseqs")
     if not mmseqs:
-        write_status(status_path, "not_ready", "mmseqs executable not found in worker PATH", 0)
-        return "mmseqs2=not_ready;reason=missing_mmseqs"
+        reason = "missing_mmseqs"
+        write_status(status_path, "not_ready", reason, 0)
+        return WorkerExecution(
+            "not_ready",
+            reason,
+            "MMseqs2 executable missing",
+            tuple(WorkerOutcome("not_ready", reason, True, database_id, 0) for database_id, _target in targets),
+        )
 
     query = out_dir / "mmseqs_query.fasta"
     write_fasta(query, sequences)
@@ -85,8 +116,8 @@ def run_mmseqs_alignment(run_dir: Path, science_store: Path) -> str:
     timeout = int(os.environ.get("GENOLIGAND_ALIGNMENT_TIMEOUT_SECONDS", "900"))
     run_command([mmseqs, "createdb", str(query), str(query_db)], timeout, "mmseqs_createdb")
     rows: list[str] = []
-    failures: list[str] = []
-    for index, target in enumerate(targets, start=1):
+    outcomes: list[WorkerOutcome] = []
+    for index, (database_id, target) in enumerate(targets, start=1):
         raw = raw_dir / f"target_{index}.m8"
         tmp = tmp_root / f"target_{index}"
         result_db = raw_dir / f"target_{index}_result"
@@ -102,7 +133,8 @@ def run_mmseqs_alignment(run_dir: Path, science_store: Path) -> str:
         ]
         completed = subprocess.run(command, capture_output=True, text=True, timeout=timeout)
         if completed.returncode != 0:
-            failures.append(f"{target.name}:{first_line(completed.stderr or completed.stdout)}")
+            reason = safe_note(first_line(completed.stderr or completed.stdout)) or "mmseqs_search_failed"
+            outcomes.append(WorkerOutcome("failed", reason, True, database_id, 0))
             continue
         command = [
             mmseqs,
@@ -116,20 +148,25 @@ def run_mmseqs_alignment(run_dir: Path, science_store: Path) -> str:
         ]
         completed = subprocess.run(command, capture_output=True, text=True, timeout=timeout)
         if completed.returncode != 0:
-            failures.append(f"{target.name}:{first_line(completed.stderr or completed.stdout)}")
+            reason = safe_note(first_line(completed.stderr or completed.stdout)) or "mmseqs_convertalis_failed"
+            outcomes.append(WorkerOutcome("failed", reason, True, database_id, 0))
             continue
-        rows.extend(mmseqs_rows(raw, target, query_identities))
+        target_rows = mmseqs_rows(raw, target, query_identities)
+        rows.extend(target_rows)
+        outcomes.append(WorkerOutcome("completed", "search_completed", True, database_id, len(target_rows)))
     write_text(matches_path, MATCH_HEADER + "".join(rows))
-    if rows:
-        write_status(status_path, "ready", f"mmseqs2 persistent database search completed against {len(targets)} target databases", len(rows))
-    elif failures:
-        write_status(status_path, "not_ready", ";".join(failures[:4]), 0)
-    else:
-        write_status(status_path, "ready", f"mmseqs2 persistent database search completed against {len(targets)} target databases with no hits", 0)
-    return f"mmseqs2_search;targets={len(targets)};matches={len(rows)}"
+    failures = [outcome for outcome in outcomes if outcome.status == "failed"]
+    version = f"MMseqs2 search; targets={len(targets)}; matches={len(rows)}"
+    if failures:
+        reason = ";".join(f"{outcome.database_id}:{outcome.reason}" for outcome in failures[:4])
+        write_status(status_path, "failed", reason, len(rows))
+        return WorkerExecution("failed", reason, version, tuple(outcomes))
+    reason = "search_completed" if rows else "search_completed_no_hits"
+    write_status(status_path, "completed", reason, len(rows))
+    return WorkerExecution("completed", reason, version, tuple(outcomes))
 
 
-def run_foldseek_alignment(run_dir: Path, science_store: Path) -> str:
+def run_foldseek_alignment(run_dir: Path, science_store: Path) -> WorkerExecution:
     out_dir = tool_outputs(run_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
     matches_path = out_dir / "foldseek_structure_matches.tsv"
@@ -138,18 +175,37 @@ def run_foldseek_alignment(run_dir: Path, science_store: Path) -> str:
 
     query = structure_query(run_dir)
     if query is None:
-        write_status(status_path, "not_ready", "no structure viewer coordinate available for Foldseek", 0)
-        return "foldseek=not_ready;reason=no_structure_query"
+        reason = "no_structure_query"
+        write_status(status_path, "not_applicable", reason, 0)
+        return WorkerExecution(
+            "not_applicable",
+            reason,
+            "Foldseek not executed",
+            (WorkerOutcome("not_applicable", reason, False, "foldseek", 0),),
+        )
 
-    target = foldseek_target_database(science_store)
-    if target is None:
-        write_status(status_path, "not_ready", "no persistent Foldseek target database in science store indexes", 0)
-        return "foldseek=not_ready;reason=no_persistent_foldseek_database"
+    target_record = foldseek_target_database(science_store)
+    if target_record is None:
+        reason = "no_persistent_foldseek_database"
+        write_status(status_path, "not_ready", reason, 0)
+        return WorkerExecution(
+            "not_ready",
+            reason,
+            "Foldseek not executed",
+            (WorkerOutcome("not_ready", reason, True, "foldseek_target_manifest", 0),),
+        )
+    database_id, target = target_record
 
     foldseek = shutil.which("foldseek")
     if not foldseek:
-        write_status(status_path, "not_ready", "foldseek executable not found in worker PATH", 0)
-        return "foldseek=not_ready;reason=missing_foldseek"
+        reason = "missing_foldseek"
+        write_status(status_path, "not_ready", reason, 0)
+        return WorkerExecution(
+            "not_ready",
+            reason,
+            "Foldseek executable missing",
+            (WorkerOutcome("not_ready", reason, True, database_id, 0),),
+        )
 
     raw = out_dir / "foldseek_structure_matches.m8"
     tmp = out_dir / "foldseek_tmp"
@@ -170,9 +226,14 @@ def run_foldseek_alignment(run_dir: Path, science_store: Path) -> str:
     ]
     completed = subprocess.run(command, capture_output=True, text=True, timeout=timeout)
     if completed.returncode != 0:
-        reason = first_line(completed.stderr or completed.stdout)
-        write_status(status_path, "not_ready", reason, 0)
-        return f"foldseek=not_ready;reason={safe_note(reason)}"
+        reason = safe_note(first_line(completed.stderr or completed.stdout)) or "foldseek_search_failed"
+        write_status(status_path, "failed", reason, 0)
+        return WorkerExecution(
+            "failed",
+            reason,
+            "Foldseek search failed",
+            (WorkerOutcome("failed", reason, True, database_id, 0),),
+        )
     command = [
         foldseek,
         "convertalis",
@@ -185,16 +246,24 @@ def run_foldseek_alignment(run_dir: Path, science_store: Path) -> str:
     ]
     completed = subprocess.run(command, capture_output=True, text=True, timeout=timeout)
     if completed.returncode != 0:
-        reason = first_line(completed.stderr or completed.stdout)
-        write_status(status_path, "not_ready", reason, 0)
-        return f"foldseek=not_ready;reason={safe_note(reason)}"
+        reason = safe_note(first_line(completed.stderr or completed.stdout)) or "foldseek_convertalis_failed"
+        write_status(status_path, "failed", reason, 0)
+        return WorkerExecution(
+            "failed",
+            reason,
+            "Foldseek convertalis failed",
+            (WorkerOutcome("failed", reason, True, database_id, 0),),
+        )
     rows = foldseek_rows(raw)
     write_text(matches_path, MATCH_HEADER + "".join(rows))
-    if rows:
-        write_status(status_path, "ready", "foldseek persistent database search completed against local RCSB targets", len(rows))
-    else:
-        write_status(status_path, "ready", "foldseek persistent database search completed with no hits", 0)
-    return f"foldseek_search;matches={len(rows)}"
+    reason = "search_completed" if rows else "search_completed_no_hits"
+    write_status(status_path, "completed", reason, len(rows))
+    return WorkerExecution(
+        "completed",
+        reason,
+        f"Foldseek search; matches={len(rows)}",
+        (WorkerOutcome("completed", reason, True, database_id, len(rows)),),
+    )
 
 
 def runtime_path(value: str) -> Path:
@@ -267,9 +336,9 @@ def sequence_query_id(input_id: str, record_id: str) -> str:
     return f"query_{hashlib.sha256(payload).hexdigest()}"
 
 
-def mmseqs_target_databases(science_store: Path) -> list[Path]:
+def mmseqs_target_databases(science_store: Path) -> list[tuple[str, Path]]:
     manifest = science_store / "indexes" / "mmseqs" / "mmseqs_target_databases.tsv"
-    targets: list[Path] = []
+    targets: list[tuple[str, Path]] = []
     if manifest.exists():
         with manifest.open("r", encoding="utf-8-sig", newline="") as handle:
             for row in csv.DictReader(handle, delimiter="\t"):
@@ -282,13 +351,14 @@ def mmseqs_target_databases(science_store: Path) -> list[Path]:
                 if not path.is_absolute():
                     path = science_store / path
                 if db_ready(path):
-                    targets.append(path)
+                    database_id = str(row.get("source_id", "")).strip() or path.parent.name
+                    targets.append((database_id, path))
     if targets:
-        return sorted(dedupe_paths(targets))
-    return sorted(dedupe_paths(dbtype_prefixes(science_store / "indexes" / "mmseqs")))
+        return sorted(dedupe_target_databases(targets))
+    return [(path.parent.name, path) for path in sorted(dedupe_paths(dbtype_prefixes(science_store / "indexes" / "mmseqs")))]
 
 
-def foldseek_target_database(science_store: Path) -> Path | None:
+def foldseek_target_database(science_store: Path) -> tuple[str, Path] | None:
     manifest = science_store / "indexes" / "foldseek" / "foldseek_target_databases.tsv"
     if manifest.exists():
         with manifest.open("r", encoding="utf-8-sig", newline="") as handle:
@@ -302,9 +372,21 @@ def foldseek_target_database(science_store: Path) -> Path | None:
                 if not path.is_absolute():
                     path = science_store / path
                 if db_ready(path):
-                    return path
+                    database_id = str(row.get("source_id", "")).strip() or path.parent.name
+                    return database_id, path
     prefixes = dbtype_prefixes(science_store / "indexes" / "foldseek")
-    return prefixes[0] if prefixes else None
+    return (prefixes[0].parent.name, prefixes[0]) if prefixes else None
+
+
+def dedupe_target_databases(targets: list[tuple[str, Path]]) -> list[tuple[str, Path]]:
+    seen: set[str] = set()
+    out: list[tuple[str, Path]] = []
+    for database_id, path in targets:
+        key = str(path)
+        if key not in seen:
+            seen.add(key)
+            out.append((database_id, path))
+    return out
 
 
 def dbtype_prefixes(root: Path) -> list[Path]:

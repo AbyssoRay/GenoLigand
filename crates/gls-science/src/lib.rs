@@ -18,7 +18,7 @@ use input_conversion::{
     normalized_inputs_from_conversions, write_input_conversion_manifest,
 };
 
-const WORKER_SCHEMA_VERSION: &str = "genoligand_worker_current_v1";
+const WORKER_SCHEMA_VERSION: &str = "genoligand_worker_current_v2";
 const WORKER_PIPELINE_MODE: &str = "genoligand_scientific_pipeline";
 const MAX_SEQUENCE_TOKEN_CHARS: usize = 96;
 const MAX_STRUCTURE_METADATA_CHARS: usize = 16_384;
@@ -3576,8 +3576,9 @@ fn run_scientific_workers(options: &ScienceOptions) -> Result<String, String> {
     ensure_dir(&job_dir)?;
     ensure_dir(&result_dir)?;
     let mut summary = String::from(
-        "job_id\tworker\tstage\tjob_schema_valid\tlaunch_status\tresult_schema_valid\tresult_status\tengine_version\tprimitive_execution_only\tpython_owns_final_score\tpython_owns_report_semantics\n",
+        "job_id\tworker\tstage\tjob_schema_valid\tlaunch_status\tresult_schema_valid\tresult_status\texecution_status\treason\toutcome_count\tengine_version\tprimitive_execution_only\tpython_owns_final_score\tpython_owns_report_semantics\n",
     );
+    let mut worker_errors = Vec::new();
     for task in SCIENTIFIC_WORKER_TASKS {
         let job_path = job_dir.join(format!("{}.json", task.job_id));
         let result_path = result_dir.join(format!("{}.json", task.job_id));
@@ -3606,6 +3607,19 @@ fn run_scientific_workers(options: &ScienceOptions) -> Result<String, String> {
             .get("engine_version")
             .and_then(Value::as_str)
             .unwrap_or("missing");
+        let execution_status = result
+            .get("execution_status")
+            .and_then(Value::as_str)
+            .unwrap_or("missing");
+        let reason = result
+            .get("reason")
+            .and_then(Value::as_str)
+            .unwrap_or("missing");
+        let outcome_count = result
+            .get("outcomes")
+            .and_then(Value::as_array)
+            .map(Vec::len)
+            .unwrap_or_default();
         let primitive_execution_only = result
             .get("primitive_execution_only")
             .and_then(Value::as_bool)
@@ -3619,7 +3633,7 @@ fn run_scientific_workers(options: &ScienceOptions) -> Result<String, String> {
             .and_then(Value::as_bool)
             .unwrap_or(true);
         summary.push_str(&format!(
-            "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\n",
+            "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\n",
             task.job_id,
             task.worker,
             task.stage,
@@ -3627,16 +3641,28 @@ fn run_scientific_workers(options: &ScienceOptions) -> Result<String, String> {
             clean_cell(&launch_status),
             result_schema_valid,
             clean_cell(result_status),
+            clean_cell(execution_status),
+            clean_cell(reason),
+            outcome_count,
             clean_cell(engine_version),
             primitive_execution_only,
             python_owns_final_score,
             python_owns_report_semantics
         ));
+        if let Some(error) = worker_result_stage_error(&result, task) {
+            worker_errors.push(error);
+        }
     }
     write_text(
         &options.run_dir.join("scientific_runtime_summary.tsv"),
         &summary,
     )?;
+    if !worker_errors.is_empty() {
+        return Err(format!(
+            "scientific_workers_failed:{}",
+            clean_cell(&worker_errors.join(" | "))
+        ));
+    }
     Ok(format!(
         "scientific_workers_checked\tworker_count={}",
         SCIENTIFIC_WORKER_TASKS.len()
@@ -3657,7 +3683,11 @@ fn run_single_worker_task(options: &ScienceOptions, task: &WorkerTask) -> Result
     {
         write_worker_failure_result(&result_path, task, &err)?;
     }
-    Ok(())
+    let result = read_worker_result_or_failure(&result_path, task)?;
+    match worker_result_stage_error(&result, task) {
+        Some(error) => Err(error),
+        None => Ok(()),
+    }
 }
 
 fn worker_job_value(options: &ScienceOptions, task: &WorkerTask) -> Value {
@@ -3811,12 +3841,22 @@ fn read_worker_result_or_failure(path: &Path, task: &WorkerTask) -> Result<Value
 }
 
 fn write_worker_failure_result(path: &Path, task: &WorkerTask, reason: &str) -> Result<(), String> {
+    let reason = clean_cell(reason);
     let value = json!({
         "schema_version": WORKER_SCHEMA_VERSION,
         "job_id": task.job_id,
         "worker": task.worker,
         "status": "FAIL",
-        "engine_version": format!("worker unavailable: {}", clean_cell(reason)),
+        "engine_version": format!("worker unavailable: {reason}"),
+        "execution_status": "failed",
+        "reason": reason,
+        "outcomes": [{
+            "status": "failed",
+            "reason": reason,
+            "required": true,
+            "database_id": task.worker,
+            "row_count": 0
+        }],
         "python_owns_final_score": false,
         "python_owns_report_semantics": false,
         "primitive_execution_only": true
@@ -3825,17 +3865,52 @@ fn write_worker_failure_result(path: &Path, task: &WorkerTask, reason: &str) -> 
 }
 
 fn validate_worker_result(value: &Value, task: &WorkerTask) -> bool {
+    let result_status = value.get("status").and_then(Value::as_str);
+    let execution_status = value.get("execution_status").and_then(Value::as_str);
+    let outcomes = value.get("outcomes").and_then(Value::as_array);
+    let status_matches = matches!(
+        (result_status, execution_status),
+        (Some("PASS"), Some("completed"))
+            | (Some("NOT_APPLICABLE"), Some("not_applicable"))
+            | (Some("NOT_READY"), Some("not_ready"))
+            | (Some("FAIL"), Some("failed"))
+    );
+    let outcomes_valid = outcomes.is_some_and(|rows| {
+        !rows.is_empty()
+            && rows.iter().all(validate_worker_outcome)
+            && match execution_status {
+                Some("completed") => rows.iter().all(|row| {
+                    row.get("required").and_then(Value::as_bool) == Some(false)
+                        || row.get("status").and_then(Value::as_str) == Some("completed")
+                }),
+                Some("not_applicable") => rows.iter().all(|row| {
+                    row.get("required").and_then(Value::as_bool) == Some(false)
+                        && row.get("status").and_then(Value::as_str) == Some("not_applicable")
+                }),
+                Some("not_ready") => rows.iter().any(|row| {
+                    row.get("required").and_then(Value::as_bool) == Some(true)
+                        && row.get("status").and_then(Value::as_str) == Some("not_ready")
+                }),
+                Some("failed") => rows.iter().any(|row| {
+                    row.get("required").and_then(Value::as_bool) == Some(true)
+                        && row.get("status").and_then(Value::as_str) == Some("failed")
+                }),
+                _ => false,
+            }
+    });
     value.get("schema_version").and_then(Value::as_str) == Some(WORKER_SCHEMA_VERSION)
         && value.get("job_id").and_then(Value::as_str) == Some(task.job_id)
         && value.get("worker").and_then(Value::as_str) == Some(task.worker)
-        && matches!(
-            value.get("status").and_then(Value::as_str),
-            Some("PASS") | Some("FAIL")
-        )
+        && status_matches
         && value
             .get("engine_version")
             .and_then(Value::as_str)
-            .is_some()
+            .is_some_and(|text| !text.trim().is_empty())
+        && value
+            .get("reason")
+            .and_then(Value::as_str)
+            .is_some_and(|text| !text.trim().is_empty())
+        && outcomes_valid
         && value
             .get("python_owns_final_score")
             .and_then(Value::as_bool)
@@ -3848,6 +3923,43 @@ fn validate_worker_result(value: &Value, task: &WorkerTask) -> bool {
             .get("primitive_execution_only")
             .and_then(Value::as_bool)
             == Some(true)
+}
+
+fn validate_worker_outcome(value: &Value) -> bool {
+    matches!(
+        value.get("status").and_then(Value::as_str),
+        Some("completed") | Some("not_applicable") | Some("not_ready") | Some("failed")
+    ) && value
+        .get("reason")
+        .and_then(Value::as_str)
+        .is_some_and(|text| !text.trim().is_empty())
+        && value.get("required").and_then(Value::as_bool).is_some()
+        && value
+            .get("database_id")
+            .and_then(Value::as_str)
+            .is_some_and(|text| !text.trim().is_empty())
+        && value.get("row_count").and_then(Value::as_u64).is_some()
+}
+
+fn worker_result_stage_error(value: &Value, task: &WorkerTask) -> Option<String> {
+    if !validate_worker_result(value, task) {
+        return Some(format!("{}_result_invalid", task.worker));
+    }
+    match value.get("status").and_then(Value::as_str) {
+        Some("PASS") | Some("NOT_APPLICABLE") => None,
+        Some(status) => Some(format!(
+            "{}_{}:{}",
+            task.worker,
+            status.to_ascii_lowercase(),
+            clean_cell(
+                value
+                    .get("reason")
+                    .and_then(Value::as_str)
+                    .unwrap_or("missing_reason")
+            )
+        )),
+        None => Some(format!("{}_result_status_missing", task.worker)),
+    }
 }
 
 fn match_structure_interactions(options: &ScienceOptions) -> Result<Vec<IndexMatch>, String> {
