@@ -30,6 +30,8 @@
   inputInspectionPending: false,
   inputInspectionError: "",
   inputInspectionGeneration: 0,
+  inputSavePending: false,
+  inputSaveGeneration: 0,
   alert: "",
 };
 

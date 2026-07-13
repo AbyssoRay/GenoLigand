@@ -1241,6 +1241,14 @@ fn user_input_inspection_rejects_mixed_manifest_with_bad_record() {
     assert_eq!(response["usable"], false);
     assert_eq!(response["error"], "input_file_not_found");
     assert_eq!(response["inputs"].as_array().expect("inputs").len(), 2);
+    assert_eq!(response["inputs"][0]["original_field"], "small_molecule");
+    assert_eq!(response["inputs"][0]["usable"], true);
+    assert_eq!(response["inputs"][1]["original_field"], "small_molecule");
+    assert_eq!(response["inputs"][1]["usable"], false);
+    assert_eq!(
+        response["inputs"][1]["message"],
+        "找不到输入文件，请检查文件路径。"
+    );
     assert_eq!(response["errors"].as_array().expect("errors").len(), 1);
     fs::remove_dir_all(&root).ok();
 }
@@ -1298,6 +1306,8 @@ fn user_input_inspection_route_returns_authoritative_response() {
 
     assert_eq!(status, 200);
     assert_eq!(response["usable"], true);
+    assert_eq!(response["inputs"][0]["original_field"], "small_molecule");
+    assert_eq!(response["inputs"][0]["usable"], true);
     assert_eq!(
         response["inputs"][0]["conversion_method"],
         "local_identifier_lookup"

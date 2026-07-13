@@ -7,6 +7,7 @@ use std::fs;
 use std::io::{BufRead, BufReader, Read};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 use zip::ZipArchive;
 
@@ -27,6 +28,7 @@ const METAGENOME_SCORE_WEIGHT: f64 = 0.25;
 const STRUCTURE_SCORE_WEIGHT: f64 = 0.10;
 const DOCKING_SCORE_WEIGHT: f64 = 0.05;
 const MD_SCORE_WEIGHT: f64 = 0.10;
+static PYTHON_SCRIPT_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 const AUTHENTICITY_FORBIDDEN_MARKERS: &[(&str, &str)] = &[
     ("unit_test_fixture", "unit test fixture row"),
     ("unit-test-fixture", "unit test fixture row"),
@@ -59,8 +61,11 @@ pub struct ScienceOptions {
 pub struct InputInspectionRow {
     pub input_id: String,
     pub record_id: String,
+    pub original_field: String,
     pub canonical_kind: String,
     pub conversion_method: String,
+    pub usable: bool,
+    pub error: Option<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -90,12 +95,15 @@ pub fn inspect_input_manifest(options: &ScienceOptions) -> Result<InputInspectio
         .map(|input| InputInspectionRow {
             input_id: input.input_id.clone(),
             record_id: input.record_id.clone(),
+            original_field: input.original_field.clone(),
             canonical_kind: input
                 .canonical_kind
                 .map(InputKind::as_str)
                 .unwrap_or("unknown")
                 .to_string(),
             conversion_method: input.conversion_method.to_string(),
+            usable: input.conversion_status != "failed",
+            error: (input.conversion_status == "failed").then(|| input.reason.clone()),
         })
         .collect::<Vec<_>>();
     let usable = !inputs.is_empty() && errors.is_empty();
@@ -7645,11 +7653,13 @@ fn temp_python_script_path(context: &str) -> PathBuf {
         .duration_since(UNIX_EPOCH)
         .map(|duration| duration.as_millis())
         .unwrap_or_default();
+    let sequence = PYTHON_SCRIPT_SEQUENCE.fetch_add(1, Ordering::Relaxed);
     env::temp_dir().join(format!(
-        "genoligand_{}_{}_{}.py",
+        "genoligand_{}_{}_{}_{}.py",
         safe_id(context),
         std::process::id(),
-        millis
+        millis,
+        sequence
     ))
 }
 

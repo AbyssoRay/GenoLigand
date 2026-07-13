@@ -1,5 +1,8 @@
 ﻿function setStep(step) {
   if (!canOpenStep(step)) return;
+  if (state.inputSavePending && step !== state.step) {
+    invalidateInputInspection();
+  }
   state.step = step;
   document.querySelectorAll("[data-step]").forEach((button) => {
     button.classList.toggle("active", button.dataset.step === step);

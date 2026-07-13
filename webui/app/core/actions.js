@@ -32,11 +32,30 @@ function clearInputInspectionTimer() {
 function invalidateInputInspection() {
   clearInputInspectionTimer();
   state.inputInspectionGeneration += 1;
+  state.inputSaveGeneration += 1;
+  state.inputSavePending = false;
   state.inputInspection = null;
   state.inputInspectionPayload = null;
   state.inputInspectionPayloadKey = "";
   state.inputInspectionPending = false;
   state.inputInspectionError = "";
+}
+
+function inputSaveIsCurrent(saveGeneration, inspectionGeneration, projectId, payload, payloadKey) {
+  return (
+    saveGeneration === state.inputSaveGeneration &&
+    inspectionGeneration === state.inputInspectionGeneration &&
+    state.project?.project_id === projectId &&
+    state.inputInspectionPayload === payload &&
+    state.inputInspectionPayloadKey === payloadKey &&
+    inputPayloadKey(inputPayloadFromForm()) === payloadKey
+  );
+}
+
+function finishInputSave(saveGeneration) {
+  if (saveGeneration === state.inputSaveGeneration) {
+    state.inputSavePending = false;
+  }
 }
 
 function scheduleInputInspection() {
@@ -108,6 +127,11 @@ async function inspectInputs(generation = null) {
 
 async function saveInput() {
   collectForm();
+  if (!state.project) {
+    state.alert = "请先新建或打开研究项目。";
+    render();
+    return false;
+  }
   const currentPayload = inputPayloadFromForm();
   if (
     !inputsReadyToSave() ||
@@ -118,38 +142,64 @@ async function saveInput() {
     return false;
   }
   const inputPayload = state.inputInspectionPayload;
+  const inputPayloadKeyValue = state.inputInspectionPayloadKey;
   const inspectionGeneration = state.inputInspectionGeneration;
+  const projectId = state.project.project_id;
+  const saveGeneration = state.inputSaveGeneration + 1;
+  state.inputSaveGeneration = saveGeneration;
+  state.inputSavePending = true;
   state.alert = "";
-  if (!state.project) {
-    const created = await api("/api/user/projects", { method: "POST", body: "{}" });
-    state.project = created.project;
-  }
-  if (
-    inspectionGeneration !== state.inputInspectionGeneration ||
-    state.inputInspectionPayload !== inputPayload ||
-    !inputsReadyToSave()
-  ) {
-    state.alert = "输入已变化，请等待最新检查完成后再保存。";
-    render();
+  render();
+  try {
+    const saved = await api(`/api/user/projects/${projectId}/inputs`, {
+      method: "POST",
+      body: JSON.stringify(inputPayload),
+    });
+    if (!inputSaveIsCurrent(saveGeneration, inspectionGeneration, projectId, inputPayload, inputPayloadKeyValue)) {
+      finishInputSave(saveGeneration);
+      state.alert = "保存期间输入或项目已变化，请检查当前输入后再继续。";
+      render();
+      return false;
+    }
+    if (saved.ok !== true) {
+      finishInputSave(saveGeneration);
+      state.project = saved.project || state.project;
+      state.alert = saved.message || "输入未保存，请检查填写内容。";
+      render();
+      return false;
+    }
+    let savedProject = saved.project;
+    if (!savedProject) {
+      savedProject = await api(`/api/user/projects/${projectId}`);
+    }
+    if (!inputSaveIsCurrent(saveGeneration, inspectionGeneration, projectId, inputPayload, inputPayloadKeyValue)) {
+      finishInputSave(saveGeneration);
+      state.alert = "保存期间输入或项目已变化，请检查当前输入后再继续。";
+      render();
+      return false;
+    }
+    state.project = savedProject;
+    state.run = null;
+    state.runData = null;
+    state.preflight = null;
+    await refreshProjects();
+    if (!inputSaveIsCurrent(saveGeneration, inspectionGeneration, projectId, inputPayload, inputPayloadKeyValue)) {
+      finishInputSave(saveGeneration);
+      state.alert = "保存完成后当前输入已变化，请重新检查。";
+      render();
+      return false;
+    }
+    finishInputSave(saveGeneration);
+    setStep("check");
+    return true;
+  } catch (error) {
+    finishInputSave(saveGeneration);
+    if (saveGeneration === state.inputSaveGeneration) {
+      state.alert = `输入保存失败：${error.message}`;
+      render();
+    }
     return false;
   }
-  const saved = await api(`/api/user/projects/${state.project.project_id}/inputs`, {
-    method: "POST",
-    body: JSON.stringify(inputPayload),
-  });
-  if (saved.ok !== true) {
-    state.project = saved.project || state.project;
-    state.alert = saved.message || "输入未保存，请检查填写内容。";
-    render();
-    return false;
-  }
-  state.project = saved.project || (await api(`/api/user/projects/${state.project.project_id}`));
-  state.run = null;
-  state.runData = null;
-  state.preflight = null;
-  await refreshProjects();
-  setStep("check");
-  return true;
 }
 
 async function createNewProject() {

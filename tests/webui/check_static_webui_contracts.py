@@ -83,6 +83,7 @@ def main() -> int:
     actions = read(WEB / "core/actions.js")
     selectors = read(WEB / "core/selectors.js")
     app_state = read(WEB / "state/app-state.js")
+    app = read(WEB / "app.js")
     require(
         "/api/user/inputs/inspect" in actions,
         "WebUI must call server inspection",
@@ -121,6 +122,19 @@ def main() -> int:
     require(
         "inputInspectionGeneration" in actions + app_state,
         "input inspection must reject stale asynchronous responses",
+    )
+    require(
+        'if (step === "input") return Boolean(state.project)' in selectors,
+        "input step must require an existing project",
+    )
+    require(
+        "state.inputSavePending" in input_page and "formDisabled" in input_page,
+        "input controls must be locked while save is pending",
+    )
+    require(
+        "state.inputSavePending && step !== state.step" in app
+        and "invalidateInputInspection();" in app,
+        "leaving the input step must invalidate a pending save",
     )
     require("function renderProject" in project_page, "project view must be the dedicated project manager")
     require('data-action="new-project"' in project_page, "project view must expose new project action")
@@ -193,15 +207,20 @@ def main() -> int:
     require(".stage-main" in components, "stage text column must have a stable width")
     require(".stage-reason" in components, "stage reasons must wrap as normal text")
 
-    inspection_probe = subprocess.run(
-        [
-            "node",
-            "-e",
-            """
+    inspection_probe_source = (
+        """
 const timerCallbacks = new Map();
 let nextTimerId = 1;
+const syntheticFormFields = [];
+const syntheticInputHandlers = [];
+const inertActionNode = { addEventListener: () => {} };
+const pageNode = {
+  querySelectorAll: (selector) => selector === "[data-form]" ? syntheticFormFields : [],
+  querySelector: () => inertActionNode
+};
 global.document = {
-  querySelector: () => ({ querySelectorAll: () => [] })
+  querySelector: () => pageNode,
+  querySelectorAll: () => []
 };
 global.window = {
   setTimeout: (callback) => {
@@ -218,19 +237,27 @@ global.window = {
             + read(WEB / "state/app-state.js")
             + read(WEB / "core/selectors.js")
             + read(WEB / "core/actions.js")
+            + read(WEB / "pages/input.js")
             + """
 const requests = [];
 const apiCalls = [];
+const saveRequests = [];
+const visitedSteps = [];
 function render() {}
-function setStep() {}
+function setStep(step) { visitedSteps.push(step); }
 function api(path, options = {}) {
   apiCalls.push({ path, options });
-  if (path !== "/api/user/inputs/inspect") {
-    return Promise.resolve({ projects: [] });
+  if (path === "/api/user/inputs/inspect") {
+    return new Promise((resolve, reject) => {
+      requests.push({ path, options, resolve, reject });
+    });
   }
-  return new Promise((resolve, reject) => {
-    requests.push({ path, options, resolve, reject });
-  });
+  if (path.startsWith("/api/user/projects/") && path.endsWith("/inputs")) {
+    return new Promise((resolve, reject) => {
+      saveRequests.push({ path, options, resolve, reject });
+    });
+  }
+  return Promise.resolve({ projects: [] });
 }
 function assert(condition, message) {
   if (!condition) throw new Error(message);
@@ -280,6 +307,32 @@ function clearScientificForm() {
   await latestAfterFailure;
   assert(state.inputInspection.summary === "latest after failure", "latest result must survive old failure");
 
+  state.project = null;
+  const createCallsBeforeInspectedSave = apiCalls.filter((call) => call.path === "/api/user/projects").length;
+  const noProjectSave = await saveInput();
+  assert(!noProjectSave, "input save must require an existing project");
+  assert(
+    apiCalls.filter((call) => call.path === "/api/user/projects").length === createCallsBeforeInspectedSave,
+    "input save must not create a project"
+  );
+
+  state.project = { project_id: "project-race" };
+  const acceptedRacePayload = inputPayloadFromForm();
+  state.inputInspection = { usable: true, summary: "save race", errors: [], inputs: [] };
+  state.inputInspectionPayload = acceptedRacePayload;
+  state.inputInspectionPayloadKey = inputPayloadKey(acceptedRacePayload);
+  state.inputInspectionPending = false;
+  state.inputInspectionError = "";
+  const saveRace = saveInput();
+  await Promise.resolve();
+  assert(saveRequests.length === 1, "valid inspected input must start one save request");
+  state.form.project_name = "edited after post";
+  scheduleInputInspection();
+  saveRequests[0].resolve({ ok: true, project: { project_id: "project-race" } });
+  const staleSaveResult = await saveRace;
+  assert(!staleSaveResult, "save response for changed form must be ignored");
+  assert(!visitedSteps.includes("check"), "stale save response must not enter check step");
+
   state.form.small_molecule = "changed-after-inspection";
   assert(!inputsReadyToSave(), "payload mismatch must disable save before debounce runs");
   const projectCallsBeforeStaleSave = apiCalls.filter((call) => call.path === "/api/user/projects").length;
@@ -300,18 +353,72 @@ function clearScientificForm() {
   assert(!inputsReadyToSave(), "empty form must not become saveable");
   assert(requests.length === requestCount, "empty form must not inspect");
 
+  state.form.small_molecule = "CCO";
+  scheduleInputInspection();
+  assert(timerCallbacks.size === 1, "non-empty input must schedule one debounce callback");
+  const debounceCallback = Array.from(timerCallbacks.values())[0];
+  timerCallbacks.clear();
+  debounceCallback();
+  await Promise.resolve();
+  assert(requests.length === requestCount + 1, "debounce callback must start server inspection");
+  requests[requestCount].resolve({ usable: true, summary: "debounced", errors: [], inputs: [] });
+  await new Promise((resolve) => setImmediate(resolve));
+  assert(state.inputInspection?.summary === "debounced", "debounced inspection result must become current");
+
   state.form.small_molecule = "unusable";
   const unusable = inspectInputs();
-  requests[4].resolve({ usable: false, message: "rejected", errors: ["bad input"], inputs: [] });
+  requests[requestCount + 1].resolve({ usable: false, message: "rejected", errors: ["bad input"], inputs: [] });
   await unusable;
   assert(!inputsReadyToSave(), "unusable inspection must disable save");
+
+  clearScientificForm();
+  state.form.small_molecule = "CCO";
+  state.form.peptide = "Z:/missing/peptide.fasta";
+  const mixedPayload = inputPayloadFromForm();
+  state.inputInspection = {
+    usable: false,
+    message: "one input failed",
+    errors: ["input_2:record_1:input_file_not_found"],
+    inputs: [
+      { original_field: "small_molecule", usable: true, message: null },
+      { original_field: "peptide", usable: false, message: "找不到输入文件，请检查文件路径。" }
+    ]
+  };
+  state.inputInspectionPayload = mixedPayload;
+  state.inputInspectionPayloadKey = inputPayloadKey(mixedPayload);
+  assert(inputCardStatus("small_molecule", true).ready, "valid mixed-input card must remain usable");
+  assert(!inputCardStatus("peptide", true).ready, "failed mixed-input card must remain blocked");
+  assert(inputInspectionMessage("small_molecule") === "服务端检查通过。", "valid field must show its own result");
+  assert(
+    inputInspectionMessage("peptide") === "找不到输入文件，请检查文件路径。",
+    "failed field must show its own server message"
+  );
+
+  clearScientificForm();
+  const syntheticField = {
+    dataset: { form: "small_molecule" },
+    value: "CCN",
+    addEventListener: (event, handler) => {
+      if (event === "input") syntheticInputHandlers.push(handler);
+    }
+  };
+  syntheticFormFields.push(syntheticField);
+  bindInputEvents();
+  assert(syntheticInputHandlers.length === 1, "input page must bind one synthetic input handler");
+  syntheticInputHandlers[0]();
+  assert(state.form.small_molecule === "CCN", "input event must collect the current field value");
+  assert(state.inputInspectionPending, "input event must immediately enter pending state");
+  assert(timerCallbacks.size === 1, "input event must schedule one debounce timer");
   console.log(JSON.stringify({ passed: true, requestCount: requests.length }));
 })().catch((error) => {
   console.error(error.stack || error.message);
   process.exitCode = 1;
 });
-""",
-        ],
+"""
+    )
+    inspection_probe = subprocess.run(
+        ["node", "-"],
+        input=inspection_probe_source,
         cwd=ROOT,
         capture_output=True,
         text=True,

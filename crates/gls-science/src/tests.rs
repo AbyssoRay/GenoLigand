@@ -107,8 +107,10 @@ fn script_python_candidates_use_installed_runtime_worker_without_env_override() 
 #[test]
 fn python_script_runner_uses_temp_script_file() {
     let path = temp_python_script_path("bindingdb onsite query");
+    let second = temp_python_script_path("bindingdb onsite query");
 
     assert_eq!(path.extension().and_then(|ext| ext.to_str()), Some("py"));
+    assert_ne!(path, second);
     assert!(
         path.file_name()
             .and_then(|name| name.to_str())

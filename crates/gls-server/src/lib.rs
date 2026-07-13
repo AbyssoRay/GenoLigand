@@ -695,8 +695,12 @@ fn inspection_json(inspection: &InputInspection) -> Value {
         "inputs": inspection.inputs.iter().map(|input| json!({
             "input_id": input.input_id,
             "record_id": input.record_id,
+            "original_field": input.original_field,
             "canonical_kind": input.canonical_kind,
-            "conversion_method": input.conversion_method
+            "conversion_method": input.conversion_method,
+            "usable": input.usable,
+            "error": input.error,
+            "message": input.error.as_deref().map(|error| input_error_message(resolver_error_code(error)))
         })).collect::<Vec<_>>()
     });
     if !inspection.usable {

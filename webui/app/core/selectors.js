@@ -11,6 +11,7 @@ function inputsReadyToSave() {
   return (
     filled.length > 0 &&
     !state.inputInspectionPending &&
+    !state.inputSavePending &&
     !state.inputInspectionError &&
     inputInspectionIsCurrent() &&
     state.inputInspection?.usable === true
@@ -28,7 +29,7 @@ function filledInputs() {
 }
 
 function usableInputs() {
-  return inputsReadyToSave() ? filledInputs() : [];
+  return filledInputs().filter((item) => inputFieldInspection(item.field).ready);
 }
 
 function inputInspectionIsCurrent() {
@@ -39,6 +40,7 @@ function inputInspectionIsCurrent() {
 }
 
 function inputStatusLabel() {
+  if (state.inputSavePending) return "保存中";
   if (state.inputInspectionPending) return "检查中";
   if (inputsReadyToSave()) return "输入可保存";
   if (hasAnyInput() && (state.inputInspectionError || inputInspectionIsCurrent())) return "检查未通过";
@@ -47,6 +49,7 @@ function inputStatusLabel() {
 }
 
 function inputStatusClass() {
+  if (state.inputSavePending) return "waiting";
   if (state.inputInspectionPending) return "waiting";
   if (inputsReadyToSave()) return "ready";
   if (hasAnyInput()) return "blocked";
@@ -69,29 +72,55 @@ function inputValidation(spec) {
     return { ready: false, value: "", message: spec.minimum };
   }
   return {
-    ready: inputsReadyToSave(),
+    ready: inputFieldInspection(spec.field).ready,
     value,
-    message: inputInspectionMessage(),
+    message: inputInspectionMessage(spec.field),
   };
 }
 
-function inputInspectionMessage() {
+function inputInspectionMessage(field) {
   if (state.inputInspectionPending) return "检查中";
+  if (state.inputSavePending) return "正在保存当前检查结果。";
   if (state.inputInspectionError) return state.inputInspectionError;
   if (!inputInspectionIsCurrent()) return "等待检查";
-  if (state.inputInspection?.usable === true) return "服务端检查通过。";
-  return (
-    state.inputInspection?.message ||
-    state.inputInspection?.errors?.[0] ||
-    state.inputInspection?.summary ||
-    "输入未通过检查。"
-  );
+  return inputFieldInspection(field).message;
 }
 
-function inputCardStatus(filled) {
+function inputInspectionRowsForField(field) {
+  if (!inputInspectionIsCurrent()) return [];
+  return (state.inputInspection?.inputs || []).filter((row) => row.original_field === field);
+}
+
+function inputFieldInspection(field) {
+  const rows = inputInspectionRowsForField(field);
+  if (rows.length) {
+    const failure = rows.find((row) => row.usable !== true);
+    if (failure) {
+      return {
+        ready: false,
+        message: failure.message || failure.error || "输入未通过检查。",
+      };
+    }
+    return { ready: true, message: "服务端检查通过。" };
+  }
+  if (state.inputInspection?.usable === true) {
+    return { ready: true, message: "服务端检查通过。" };
+  }
+  return {
+    ready: false,
+    message:
+      state.inputInspection?.message ||
+      state.inputInspection?.errors?.[0] ||
+      state.inputInspection?.summary ||
+      "输入未通过检查。",
+  };
+}
+
+function inputCardStatus(field, filled) {
   if (!filled) return { ready: false, label: "未填写" };
   if (state.inputInspectionPending) return { ready: false, label: "检查中" };
-  if (inputsReadyToSave()) return { ready: true, label: "可用" };
+  if (state.inputSavePending) return { ready: false, label: "保存中" };
+  if (inputFieldInspection(field).ready) return { ready: true, label: "可用" };
   if (state.inputInspectionError || inputInspectionIsCurrent()) {
     return { ready: false, label: "未通过" };
   }
@@ -193,7 +222,7 @@ function canViewResults() {
 
 function canOpenStep(step) {
   if (step === "project") return true;
-  if (step === "input") return true;
+  if (step === "input") return Boolean(state.project);
   if (step === "check" || step === "run") return Boolean(state.project);
   if (step === "results" || step === "report") return canViewResults();
   return false;

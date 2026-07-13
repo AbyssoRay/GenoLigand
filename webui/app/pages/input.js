@@ -3,6 +3,7 @@
   const active = inputSpecs.find((item) => item.kind === state.selectedInput) || inputSpecs[0];
   const activeValidation = inputValidation(active);
   const saveDisabled = inputsReadyToSave() ? "" : "disabled";
+  const formDisabled = state.inputSavePending ? "disabled" : "";
   page.innerHTML = `
     <div class="panel-grid">
       <section class="panel full">
@@ -27,17 +28,17 @@
         </div>
         <div class="field">
           <label for="project_name">项目名称</label>
-          <input id="project_name" data-form="project_name" value="${escapeAttr(state.form.project_name)}" placeholder="可选；不填时使用自动名称" />
+          <input id="project_name" data-form="project_name" value="${escapeAttr(state.form.project_name)}" placeholder="可选；不填时使用自动名称" ${formDisabled} />
         </div>
         <div class="field">
           <label for="${active.field}">${active.label}</label>
-          <textarea id="${active.field}" data-form="${active.field}" placeholder="${escapeAttr(active.placeholder)}">${escapeHtml(state.form[active.field])}</textarea>
+          <textarea id="${active.field}" data-form="${active.field}" placeholder="${escapeAttr(active.placeholder)}" ${formDisabled}>${escapeHtml(state.form[active.field])}</textarea>
           <div class="field-help ${activeValidation.ready ? "ready-text" : activeValidation.value ? "blocked-text" : ""}" data-active-validation>${escapeHtml(activeValidation.message)}</div>
         </div>
         <div class="actions">
           <button class="button" data-action="save-input" data-save-button ${saveDisabled}>保存输入</button>
           <button class="button secondary" data-action="save-and-check" data-save-button ${saveDisabled}>保存并检查</button>
-          <button class="button ghost" data-action="clear-input">清空当前输入</button>
+          <button class="button ghost" data-action="clear-input" ${formDisabled}>清空当前输入</button>
         </div>
       </section>
       <section class="panel third">
@@ -59,9 +60,9 @@ function renderInputTypeCard(spec) {
   const selected = state.selectedInput === spec.kind;
   const value = state.form[spec.field].trim();
   const filled = value.length > 0;
-  const status = inputCardStatus(filled);
+  const status = inputCardStatus(spec.field, filled);
   return `
-    <button class="input-card ${selected ? "selected" : ""}" data-select-input="${spec.kind}">
+    <button class="input-card ${selected ? "selected" : ""}" data-select-input="${spec.kind}" ${state.inputSavePending ? "disabled" : ""}>
       <h3>${spec.title}</h3>
       <p>${spec.minimum}</p>
       <span class="status-pill ${inputCardStatusClass(status.ready, filled)}" data-input-card-status="${spec.field}">${status.label}</span>
@@ -119,7 +120,7 @@ function updateInputValidationUi() {
     const statusNode = page.querySelector(`[data-input-card-status="${spec.field}"]`);
     if (!statusNode) return;
     const value = (state.form[spec.field] || "").trim();
-    const cardStatus = inputCardStatus(Boolean(value));
+    const cardStatus = inputCardStatus(spec.field, Boolean(value));
     statusNode.textContent = cardStatus.label;
     statusNode.className = `status-pill ${inputCardStatusClass(cardStatus.ready, Boolean(value))}`;
   });
