@@ -3000,7 +3000,7 @@ fn webui_field_names_normalize_to_all_supported_input_types() {
 }
 
 #[test]
-fn structure_and_dynamics_use_only_tool_outputs_when_present() {
+fn structure_and_dynamics_reject_unbound_tool_outputs_from_prior_runs() {
     let root = temp_root("tool_outputs");
     install_not_applicable_worker_fixtures(&root).expect("worker fixtures");
     let run = root.join("run");
@@ -3037,11 +3037,16 @@ fn structure_and_dynamics_use_only_tool_outputs_when_present() {
     let md_text = read_text(&run.join("md_summary.tsv")).expect("md summary");
 
     assert!(structure.contains("structure_artifact=ready"));
-    assert!(structure.contains("docking_artifact=ready"));
-    assert!(dynamics.contains("md_artifact=ready"));
+    assert!(structure.contains("docking_artifact=not_ready"));
+    assert!(
+        dynamics.contains("md_artifact=not_ready"),
+        "unexpected dynamics result: {dynamics}"
+    );
     assert!(structure_text.contains("worker_structure"));
-    assert!(docking_text.contains("worker_pose"));
-    assert!(md_text.contains("worker_md"));
+    assert!(!docking_text.contains("worker_pose"));
+    assert!(!md_text.contains("worker_md"));
+    assert_eq!(docking_text.lines().count(), 1);
+    assert_eq!(md_text.lines().count(), 1);
     fs::remove_dir_all(&root).expect("cleanup temp root");
     assert!(!root.exists());
 }
@@ -3062,11 +3067,12 @@ fn md_summary_score_participates_in_ranking_and_report() {
             "input_id\tsource\ttarget_id\ttarget_name\torganism\ttarget_class\tmatch_score\tmatched_features\tevidence\ninput_1\tChEMBL\tT1\tTarget 1\tHomo sapiens\tenzyme\t1.0\tcco\tchembl_activity_row\n",
         )
         .expect("known match");
+    write_md_binding_manifests(&run, "target_T1", "input_1", "CCO").expect("binding manifests");
     write_text(
-            &run.join("md_summary.tsv"),
-            "candidate_id\trmsd\trmsf\tligand_drift\thydrogen_bond_occupancy\tcontact_occupancy\tinteraction_persistence\tmd_risk_flags\tmd_score_decomposition\tmd_stability_score\ntarget_T1\t1.2\t0.4\t0.6\t0.72\t0.81\t0.77\tstable\tworker_md\t0.8\n",
-        )
-        .expect("md summary");
+        &run.join("tool_outputs/md_summary.tsv"),
+        "candidate_id\trmsd\trmsf\tligand_drift\thydrogen_bond_occupancy\tcontact_occupancy\tinteraction_persistence\tmd_risk_flags\tmd_score_decomposition\tmd_stability_score\ntarget_T1\t1.2\t0.4\t0.6\t0.72\t0.81\t0.77\tstable\tworker_md\t0.8\n",
+    )
+    .expect("md summary");
     write_text(
         &run.join("tool_outputs/complex_md_manifest.json"),
         r#"{"candidate_id":"target_T1","method":"openmm_receptor_ligand_complex_dynamics","platform":"CUDA","receptor_coordinate":"structure_viewer.cif","ligand_coordinate":"tool_outputs/ligand_placement.tsv","trajectory":"tool_outputs/md_trajectory.tsv","protocol_artifact":"tool_outputs/md_protocol.tsv","state_artifact":"tool_outputs/md_state.tsv","gpu_telemetry_artifact":"tool_outputs/gpu_telemetry.tsv","gpu_telemetry_status_artifact":"tool_outputs/gpu_telemetry_status.tsv","gpu_observed":true,"metric_artifacts":["tool_outputs/md_summary.tsv"]}"#,
@@ -3114,6 +3120,7 @@ fn md_summary_score_participates_in_ranking_and_report() {
         input_manifest: input,
         run_dir: run.clone(),
     };
+    bind_current_md_artifacts(&options, &["md_summary.tsv"]).expect("bind MD summary");
 
     rank_targets(&options).expect("rank");
     build_evidence(&options).expect("evidence");
@@ -3145,6 +3152,56 @@ fn md_summary_score_participates_in_ranking_and_report() {
 }
 
 #[test]
+fn target_rank_ignores_unbound_root_md_summary() {
+    let root = temp_root("target_rank_unbound_md");
+    let run = root.join("run");
+    let input = root.join("input.json");
+    write_text(
+        &input,
+        "{\"inputs\":[{\"field\":\"small_molecule\",\"value\":\"CCO\"}],\"files\":[]}\n",
+    )
+    .expect("input");
+    write_text(
+        &run.join("known_database_matches.tsv"),
+        "input_id\tsource\ttarget_id\ttarget_name\torganism\ttarget_class\tmatch_score\tmatched_features\tevidence\ninput_1\tChEMBL\tT1\tTarget 1\tHomo sapiens\tenzyme\t1.0\tcco\tchembl_activity_row\n",
+    )
+    .expect("known match");
+    write_text(
+        &run.join("md_summary.tsv"),
+        "candidate_id\trmsd\trmsf\tligand_drift\thydrogen_bond_occupancy\tcontact_occupancy\tinteraction_persistence\tmd_risk_flags\tmd_score_decomposition\tmd_stability_score\ntarget_T1\t1.2\t0.4\t0.6\t0.72\t0.81\t0.77\tstale\tstale_unbound_md\t0.8\n",
+    )
+    .expect("stale root MD summary");
+    for artifact in [
+        "structure_viewer.cif",
+        "tool_outputs/ligand_placement.tsv",
+        "tool_outputs/md_trajectory.tsv",
+        "tool_outputs/md_protocol.tsv",
+        "tool_outputs/md_state.tsv",
+    ] {
+        write_text(&run.join(artifact), "current artifact\n").expect("manifest artifact");
+    }
+    write_text(
+        &run.join("tool_outputs/complex_md_manifest.json"),
+        r#"{"candidate_id":"target_T1","method":"openmm_receptor_ligand_complex_dynamics","platform":"CPU","receptor_coordinate":"structure_viewer.cif","ligand_coordinate":"tool_outputs/ligand_placement.tsv","trajectory":"tool_outputs/md_trajectory.tsv","protocol_artifact":"tool_outputs/md_protocol.tsv","state_artifact":"tool_outputs/md_state.tsv"}"#,
+    )
+    .expect("complex MD manifest");
+    let options = ScienceOptions {
+        workspace_root: root.clone(),
+        science_store: root.join("science_store"),
+        input_manifest: input,
+        run_dir: run.clone(),
+    };
+
+    rank_targets(&options).expect("rank");
+
+    let ranking = read_text(&run.join("target_candidate_ranking.tsv")).expect("ranking");
+    assert!(ranking.contains("\t0.0000\tChEMBL:chembl_activity_row\t"));
+    assert!(!ranking.contains("MD:md_summary_stability_score"));
+    fs::remove_dir_all(&root).expect("cleanup temp root");
+    assert!(!root.exists());
+}
+
+#[test]
 fn md_manifest_accepts_wsl_receptor_path_for_current_run_scoring() {
     if !cfg!(windows) {
         return;
@@ -3163,8 +3220,9 @@ fn md_manifest_accepts_wsl_receptor_path_for_current_run_scoring() {
         "input_id\tsource\ttarget_id\ttarget_name\torganism\ttarget_class\tmatch_score\tmatched_features\tevidence\ninput_1\tChEMBL\tT1\tTarget 1\tHomo sapiens\tenzyme\t1.0\tcco\tchembl_activity_row\n",
     )
     .expect("known match");
+    write_md_binding_manifests(&run, "target_T1", "input_1", "CCO").expect("binding manifests");
     write_text(
-        &run.join("md_summary.tsv"),
+        &run.join("tool_outputs/md_summary.tsv"),
         "candidate_id\trmsd\trmsf\tligand_drift\thydrogen_bond_occupancy\tcontact_occupancy\tinteraction_persistence\tmd_risk_flags\tmd_score_decomposition\tmd_stability_score\ntarget_T1\t1.2\t0.4\t0.6\t0.72\t0.81\t0.77\tstable\tworker_md\t0.8\n",
     )
     .expect("md summary");
@@ -3224,6 +3282,7 @@ fn md_manifest_accepts_wsl_receptor_path_for_current_run_scoring() {
         input_manifest: input,
         run_dir: run.clone(),
     };
+    bind_current_md_artifacts(&options, &["md_summary.tsv"]).expect("bind MD summary");
 
     rank_targets(&options).expect("rank");
 
@@ -3787,6 +3846,18 @@ fn dynamics_screen_aggregates_real_metric_artifacts() {
         input_manifest: input,
         run_dir: run.clone(),
     };
+    write_md_binding_manifests(&run, "C1", "input_1", "CCO").expect("binding manifests");
+    bind_current_md_artifacts(
+        &options,
+        &[
+            "rmsd.tsv",
+            "rmsf.tsv",
+            "ligand_drift.tsv",
+            "hydrogen_bonds.tsv",
+            "contacts.tsv",
+        ],
+    )
+    .expect("bind current MD metrics");
 
     let out = run_science_command(ScienceCommand::DynamicsScreen, &options).expect("dynamics");
     let md = read_text(&run.join("md_summary.tsv")).expect("md summary");
@@ -3797,6 +3868,237 @@ fn dynamics_screen_aggregates_real_metric_artifacts() {
     assert!(status.contains("ready"));
     fs::remove_dir_all(&root).expect("cleanup temp root");
     assert!(!root.exists());
+}
+
+#[test]
+fn dynamics_screen_rejects_provenance_with_identity_missing_on_both_sides() {
+    let root = temp_root("md_missing_identity");
+    let run = root.join("run");
+    let input = root.join("input.json");
+    write_text(&input, "{\"inputs\":[],\"files\":[]}\n").expect("input");
+    write_text(
+        &run.join("tool_outputs/md_rmsd.tsv"),
+        "candidate_id\tvalue\nC1\t1.2\n",
+    )
+    .expect("metric");
+    let options = ScienceOptions {
+        workspace_root: root.clone(),
+        science_store: root.join("science_store"),
+        input_manifest: input,
+        run_dir: run.clone(),
+    };
+    write_md_binding_manifests(&run, "C1", "input_1", "CCO").expect("binding manifests");
+    bind_current_md_artifacts(&options, &["md_rmsd.tsv"]).expect("bind current MD metric");
+
+    let result_path = run.join("worker_results/md_summary_ligand_dynamics.json");
+    let provenance_path = run.join("tool_outputs/md_artifact_provenance.json");
+    let mut result: Value =
+        serde_json::from_str(&read_text(&result_path).expect("result")).expect("result json");
+    let mut provenance: Value =
+        serde_json::from_str(&read_text(&provenance_path).expect("provenance"))
+            .expect("provenance json");
+    result
+        .as_object_mut()
+        .expect("result object")
+        .remove("candidate_id");
+    provenance
+        .as_object_mut()
+        .expect("provenance object")
+        .remove("candidate_id");
+    provenance["artifacts"][0]
+        .as_object_mut()
+        .expect("artifact object")
+        .remove("candidate_id");
+    write_text(&result_path, &(result.to_string() + "\n")).expect("write result");
+    write_text(&provenance_path, &(provenance.to_string() + "\n")).expect("write provenance");
+
+    let out = run_science_command(ScienceCommand::DynamicsScreen, &options).expect("dynamics");
+    let status = read_text(&run.join("md_summary_status.tsv")).expect("status");
+    assert!(out.contains("md_artifact=not_ready"));
+    assert!(status.contains("result_identity_missing"));
+    fs::remove_dir_all(&root).expect("cleanup temp root");
+    assert!(!root.exists());
+}
+
+#[test]
+fn dynamics_screen_rejects_job_run_identity_drift() {
+    let root = temp_root("md_job_run_identity_drift");
+    let run = root.join("run-current");
+    let input = root.join("input.json");
+    write_text(
+        &input,
+        "{\"inputs\":[{\"field\":\"small_molecule\",\"value\":\"CCO\"}],\"files\":[]}\n",
+    )
+    .expect("input");
+    write_md_binding_manifests(&run, "C1", "input_1", "CCO").expect("binding manifests");
+    write_text(
+        &run.join("tool_outputs/md_summary.tsv"),
+        "candidate_id\trmsd\trmsf\tligand_drift\thydrogen_bond_occupancy\tcontact_occupancy\tinteraction_persistence\tmd_risk_flags\tmd_score_decomposition\tmd_stability_score\nC1\t1.2\t0.4\t0.6\t0.72\t0.81\t0.77\tstable\tbound\t0.8\n",
+    )
+    .expect("MD summary");
+    let options = ScienceOptions {
+        workspace_root: root.clone(),
+        science_store: root.join("science_store"),
+        input_manifest: input,
+        run_dir: run.clone(),
+    };
+    bind_current_md_artifacts(&options, &["md_summary.tsv"]).expect("bind MD summary");
+    let job_path = run.join("worker_jobs/md_summary_ligand_dynamics.json");
+    let mut job: Value =
+        serde_json::from_str(&read_text(&job_path).expect("job")).expect("job json");
+    job["run_id"] = json!("run-stale");
+    job["run_dir"] = json!(root.join("run-stale").display().to_string());
+    ensure_dir(&root.join("run-stale")).expect("stale run dir");
+    write_text(&job_path, &(job.to_string() + "\n")).expect("drift job identity");
+
+    let out = run_science_command(ScienceCommand::DynamicsScreen, &options).expect("dynamics");
+    let status = read_text(&run.join("md_summary_status.tsv")).expect("status");
+    assert!(out.contains("md_artifact=not_ready"));
+    assert!(status.contains("job_run_identity_mismatch"));
+    fs::remove_dir_all(&root).expect("cleanup temp root");
+    assert!(!root.exists());
+}
+
+#[test]
+fn md_binding_digest_matches_python_ascii_canonical_json() {
+    let value = json!({"target_name": "蛋白", "emoji": "🧬"});
+    assert_eq!(
+        canonical_json_sha256(&value),
+        "926673b9197113664316fd46c19c0703352634649a37bdfb303d4c55a99c884c"
+    );
+}
+
+#[test]
+fn dynamics_screen_rejects_candidate_manifest_changed_after_binding() {
+    let root = temp_root("md_candidate_manifest_drift");
+    let run = root.join("run");
+    let input = root.join("input.json");
+    write_text(
+        &input,
+        "{\"inputs\":[{\"field\":\"small_molecule\",\"value\":\"CCO\"}],\"files\":[]}\n",
+    )
+    .expect("input");
+    write_md_binding_manifests(&run, "C1", "input_1", "CCO").expect("binding manifests");
+    write_text(
+        &run.join("tool_outputs/md_summary.tsv"),
+        "candidate_id\trmsd\trmsf\tligand_drift\thydrogen_bond_occupancy\tcontact_occupancy\tinteraction_persistence\tmd_risk_flags\tmd_score_decomposition\tmd_stability_score\nC1\t1.2\t0.4\t0.6\t0.72\t0.81\t0.77\tstable\tbound\t0.8\n",
+    )
+    .expect("MD summary");
+    let options = ScienceOptions {
+        workspace_root: root.clone(),
+        science_store: root.join("science_store"),
+        input_manifest: input,
+        run_dir: run.clone(),
+    };
+    bind_current_md_artifacts(&options, &["md_summary.tsv"]).expect("bind MD summary");
+    write_md_binding_manifests(&run, "C2", "input_1", "CCO").expect("replace candidate manifest");
+
+    let out = run_science_command(ScienceCommand::DynamicsScreen, &options).expect("dynamics");
+    let status = read_text(&run.join("md_summary_status.tsv")).expect("status");
+    assert!(out.contains("md_artifact=not_ready"));
+    assert!(status.contains("candidate_manifest_mismatch"));
+    fs::remove_dir_all(&root).expect("cleanup temp root");
+    assert!(!root.exists());
+}
+
+#[test]
+fn dynamics_screen_rejects_input_manifest_changed_after_binding() {
+    let root = temp_root("md_input_manifest_drift");
+    let run = root.join("run");
+    let input = root.join("input.json");
+    write_text(
+        &input,
+        "{\"inputs\":[{\"field\":\"small_molecule\",\"value\":\"CCO\"}],\"files\":[]}\n",
+    )
+    .expect("input");
+    write_md_binding_manifests(&run, "C1", "input_1", "CCO").expect("binding manifests");
+    write_text(
+        &run.join("tool_outputs/md_summary.tsv"),
+        "candidate_id\trmsd\trmsf\tligand_drift\thydrogen_bond_occupancy\tcontact_occupancy\tinteraction_persistence\tmd_risk_flags\tmd_score_decomposition\tmd_stability_score\nC1\t1.2\t0.4\t0.6\t0.72\t0.81\t0.77\tstable\tbound\t0.8\n",
+    )
+    .expect("MD summary");
+    let options = ScienceOptions {
+        workspace_root: root.clone(),
+        science_store: root.join("science_store"),
+        input_manifest: input,
+        run_dir: run.clone(),
+    };
+    bind_current_md_artifacts(&options, &["md_summary.tsv"]).expect("bind MD summary");
+    write_md_binding_manifests(&run, "C1", "input_1", "CCC").expect("replace input manifest");
+
+    let out = run_science_command(ScienceCommand::DynamicsScreen, &options).expect("dynamics");
+    let status = read_text(&run.join("md_summary_status.tsv")).expect("status");
+    assert!(out.contains("md_artifact=not_ready"));
+    assert!(status.contains("input_manifest_mismatch"));
+    fs::remove_dir_all(&root).expect("cleanup temp root");
+    assert!(!root.exists());
+}
+
+#[test]
+fn dynamics_screen_uses_bound_non_pass_result_status_and_reason() {
+    for (status, execution_status, outcome_status, required) in [
+        ("FAIL", "failed", "failed", true),
+        ("NOT_READY", "not_ready", "not_ready", true),
+        ("NOT_APPLICABLE", "not_applicable", "not_applicable", false),
+    ] {
+        let root = temp_root(&format!("md_bound_{}", status.to_ascii_lowercase()));
+        let run = root.join("run");
+        let input = root.join("input.json");
+        write_text(&input, "{\"inputs\":[],\"files\":[]}\n").expect("input");
+        let options = ScienceOptions {
+            workspace_root: root.clone(),
+            science_store: root.join("science_store"),
+            input_manifest: input,
+            run_dir: run.clone(),
+        };
+        let invocation_id = start_worker_invocation(&options).expect("invocation");
+        let task = &SCIENTIFIC_WORKER_TASKS[0];
+        let job = worker_job_value(&options, task).expect("job");
+        write_text(
+            &run.join("worker_jobs/md_summary_ligand_dynamics.json"),
+            &(job.to_string() + "\n"),
+        )
+        .expect("job file");
+        let reason = format!("current_bound_{}_reason", status.to_ascii_lowercase());
+        let result = json!({
+            "schema_version": WORKER_SCHEMA_VERSION,
+            "job_id": task.job_id,
+            "worker": task.worker,
+            "invocation_id": invocation_id,
+            "status": status,
+            "engine_version": "test MD status 1",
+            "execution_status": execution_status,
+            "reason": reason,
+            "outcomes": [{
+                "status": outcome_status,
+                "reason": reason,
+                "required": required,
+                "database_id": "md_summary",
+                "row_count": 0,
+            }],
+            "python_owns_final_score": false,
+            "python_owns_report_semantics": false,
+            "primitive_execution_only": true,
+        });
+        write_text(
+            &run.join("worker_results/md_summary_ligand_dynamics.json"),
+            &(result.to_string() + "\n"),
+        )
+        .expect("result file");
+        write_text(
+            &run.join("tool_outputs/md_not_ready.tsv"),
+            "reason\trisk_flags\nstale_unbound_reason\tstale\n",
+        )
+        .expect("stale not-ready artifact");
+
+        let out = run_science_command(ScienceCommand::DynamicsScreen, &options).expect("dynamics");
+        let summary_status = read_text(&run.join("md_summary_status.tsv")).expect("summary status");
+        assert!(out.contains("md_artifact=not_ready"));
+        assert!(summary_status.contains(&format!("{}\t{}", status.to_ascii_lowercase(), reason)));
+        assert!(!summary_status.contains("stale_unbound_reason"));
+        fs::remove_dir_all(&root).expect("cleanup temp root");
+        assert!(!root.exists());
+    }
 }
 
 #[test]
@@ -5088,6 +5390,107 @@ fn temp_root(label: &str) -> PathBuf {
     std::env::temp_dir().join(format!("genoligand_science_{label}_{millis}"))
 }
 
+fn write_md_binding_manifests(
+    run_dir: &Path,
+    candidate_id: &str,
+    input_id: &str,
+    canonical_value: &str,
+) -> Result<(), String> {
+    write_text(
+        &run_dir.join("complex_candidate_selection.tsv"),
+        &format!(
+            "candidate_id\tinput_id\ttarget_id\ttarget_name\torganism\ttarget_class\tsource\tpdb_id\tevidence\n{}\t{}\tT1\tTarget 1\tHomo sapiens\tenzyme\tRCSB\t1ABC\tstructure match\n",
+            clean_cell(candidate_id),
+            clean_cell(input_id)
+        ),
+    )?;
+    write_text(
+        &run_dir.join("input_conversion_manifest.tsv"),
+        &format!(
+            "{INPUT_CONVERSION_HEADER}\n{}\trecord_1\tsmall_molecule\tsmall_molecule\tsmall_molecule\t{}\tconverted\tidentity\tsmiles\tinline\t\t{}\t\t\t\t0\t0\t0\n",
+            clean_cell(input_id),
+            encode_tsv_cell(canonical_value),
+            "a".repeat(64)
+        ),
+    )
+}
+
+fn bind_current_md_artifacts(
+    options: &ScienceOptions,
+    artifact_names: &[&str],
+) -> Result<(), String> {
+    let invocation_id = start_worker_invocation(options)?;
+    let task = &SCIENTIFIC_WORKER_TASKS[0];
+    let job = worker_job_value(options, task)?;
+    let facts = current_md_run_facts(options)?;
+    let job_path = options
+        .run_dir
+        .join("worker_jobs")
+        .join(format!("{}.json", task.job_id));
+    let result_path = options
+        .run_dir
+        .join("worker_results")
+        .join(format!("{}.json", task.job_id));
+    write_text(&job_path, &(job.to_string() + "\n"))?;
+
+    let identity = json!({
+        "run_id": facts.run_id,
+        "job_id": task.job_id,
+        "invocation_id": invocation_id,
+        "candidate_id": facts.candidate_id,
+        "candidate_digest": facts.candidate_digest,
+        "input_id": facts.input_id,
+        "input_digest": facts.input_digest,
+        "source_digest": facts.source_digest,
+    });
+    let mut rows = Vec::new();
+    for artifact_name in artifact_names {
+        let relative = format!("tool_outputs/{artifact_name}");
+        let digest = sha256_file_hex(&options.run_dir.join(&relative))
+            .ok_or_else(|| format!("fixture_artifact_unavailable:{relative}"))?;
+        let mut row = identity.clone();
+        row["parameters_digest"] = json!("4".repeat(64));
+        row["tool_name"] = json!("test MD metrics");
+        row["tool_version"] = json!("1");
+        row["artifact_path"] = json!(relative);
+        row["artifact_sha256"] = json!(digest);
+        rows.push(row);
+    }
+    let mut provenance = identity.clone();
+    provenance["schema_version"] = json!(MD_PROVENANCE_SCHEMA_VERSION);
+    provenance["parameters_digest"] = json!("4".repeat(64));
+    provenance["tool_name"] = json!("test MD metrics");
+    provenance["tool_version"] = json!("1");
+    provenance["artifacts"] = json!(rows);
+    write_text(
+        &options
+            .run_dir
+            .join("tool_outputs/md_artifact_provenance.json"),
+        &(provenance.to_string() + "\n"),
+    )?;
+
+    let mut result = identity;
+    result["schema_version"] = json!(WORKER_SCHEMA_VERSION);
+    result["worker"] = json!(task.worker);
+    result["status"] = json!("PASS");
+    result["engine_version"] = json!("test MD metrics 1");
+    result["execution_status"] = json!("completed");
+    result["reason"] = json!("completed");
+    result["outcomes"] = json!([{
+        "status": "completed",
+        "reason": "completed",
+        "required": true,
+        "database_id": "md_summary",
+        "row_count": 1,
+    }]);
+    result["python_owns_final_score"] = json!(false);
+    result["python_owns_report_semantics"] = json!(false);
+    result["primitive_execution_only"] = json!(true);
+    result["artifact_path"] = json!(format!("worker_results/{}.json", task.job_id));
+    result["artifact_provenance"] = json!("tool_outputs/md_artifact_provenance.json");
+    write_text(&result_path, &(result.to_string() + "\n"))
+}
+
 fn install_not_applicable_worker_fixtures(root: &Path) -> Result<(), String> {
     let package = root.join("python/genoligand_workers");
     write_text(&package.join("__init__.py"), "")?;
@@ -5105,6 +5508,7 @@ result = {
     "schema_version": "genoligand_worker_current_v2",
     "job_id": job["job_id"],
     "worker": job["worker"],
+    "invocation_id": job["invocation_id"],
     "status": "NOT_APPLICABLE",
     "engine_version": "test worker fixture",
     "execution_status": "not_applicable",

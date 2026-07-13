@@ -1207,33 +1207,61 @@ def main() -> int:
         runtime = tmp_path / "runtime"
         source.parent.mkdir()
         source.write_text("server", encoding="utf-8")
-        calls: list[object] = []
+        runtime.mkdir()
+        (runtime / "gls-server.instance.json").write_text(
+            json.dumps(
+                {
+                    "instance_id": "contract-instance",
+                    "binary": "gls-server",
+                    "pid": 4242,
+                    "started_at": 100.0,
+                }
+            ),
+            encoding="utf-8",
+        )
+        copy_calls: list[str] = []
+        subprocess_calls: list[list[str]] = []
         original_copy2 = installer.shutil.copy2
         original_run = installer.subprocess.run
         original_os_name = installer.os.name
+        original_identity_matches = installer.process_identity_matches
 
         def copy2_once_locked(src, dst):
-            if not calls:
-                calls.append("locked")
+            if not copy_calls:
+                copy_calls.append("locked")
                 raise PermissionError("locked")
-            calls.append("copied")
+            copy_calls.append("copied")
             return original_copy2(src, dst)
 
-        def fake_run(command, **kwargs):
-            calls.append(command)
+        def capture_run(command, **kwargs):
+            subprocess_calls.append(list(command))
             return installer.subprocess.CompletedProcess(command, 0, "stopped", "")
 
         installer.shutil.copy2 = copy2_once_locked
-        installer.subprocess.run = fake_run
+        installer.subprocess.run = capture_run
         installer.os.name = "nt"
+        installer.process_identity_matches = lambda pid, started_at: pid == 4242 and started_at == 100.0
         try:
             command, status = installer.publish_runtime_binary([str(source)], runtime, "gls-server")
             require(status["status"] == "ready" and Path(command[0]).exists(), "runtime publish must retry after locked exe is stopped")
-            require(any(isinstance(call, list) and call[:3] == ["taskkill", "/F", "/IM"] for call in calls), "locked runtime publish must stop the old Windows process")
+            expected_command = ["taskkill", "/PID", "4242", "/T", "/F"]
+            require(subprocess_calls == [expected_command], "locked runtime publish must execute the production PID termination command")
+            require(
+                status.get("stopped_locked_process", {}).get("command") == expected_command,
+                "runtime publish status must retain the production PID termination command",
+            )
+            require(
+                not any(
+                    any(str(argument).upper() == "/IM" for argument in call)
+                    for call in subprocess_calls
+                ),
+                "runtime publish must not stop processes by image name",
+            )
         finally:
             installer.shutil.copy2 = original_copy2
             installer.subprocess.run = original_run
             installer.os.name = original_os_name
+            installer.process_identity_matches = original_identity_matches
     with tempfile.TemporaryDirectory() as tmp:
         tmp_path = Path(tmp)
         source = tmp_path / "large.fasta.gz"

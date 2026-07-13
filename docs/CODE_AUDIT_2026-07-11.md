@@ -36,6 +36,27 @@
 
 现有测试通过说明测试基线稳定，同时也表明下列问题大多处在未覆盖的跨模块契约、异常路径、并发路径和科学语义中。
 
+## 2.1 修复完成状态（2026-07-13）
+
+- 当前版本：`0.9.72`
+- 完成：`44/44`
+- 剩余：`0/44`
+- 分支：`main`
+- 验证方式：全部在本机执行，未使用 GitHub Actions
+
+| 修复域 | 已完成问题 |
+|---|---|
+| 输入、现场检索、索引与大文件处理 | 001-010、015、023-024、035、037-040、043 |
+| docking、MD、运行绑定与可重放性 | 011-014、034、041 |
+| 服务端、WebUI、并发、生命周期与分页 | 016、019-022、027-032 |
+| 候选身份、Schema 与元数据质量 | 017-018、033、042 |
+| 安装器、WSL/CPU、CLI 与二进制发布 | 025、036、044 |
+| Nextflow 任务工作目录和产物边界 | 026 |
+
+最终运行绑定闭环要求 MD worker job、result、artifact provenance、当前 invocation、当前候选和输入清单、运行目录边界和逐文件 SHA-256 同时匹配。`TargetRank` 重新执行同一绑定检查；旧运行、目录外路径、摘要不一致或未列入 provenance 的 MD 汇总和指标均不会进入当前运行。
+
+最终本地复验包括：Rust 工作区格式与 Clippy 通过，`gls-science` 135/135、`gls-server` 101/101；77 个 tracked Python 文件编译、13 个 tracked JavaScript 文件语法检查、WSL 科学 worker 测试 52/52；architecture、production schema、authenticity、clean release、pipeline、install、installer runtime audit、Nextflow、static WebUI、state/paging 共 10 组契约脚本通过。该完成状态由本文档所在的 Git 提交确定。
+
 ## 3. 高严重度问题
 
 ### GL-AUDIT-001 文件路径被当作科学内容处理

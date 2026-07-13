@@ -45,7 +45,10 @@ def main() -> int:
     require("md_chart_rows" in server, "server must derive MD charts from run MD artifacts")
     require("structure_viewer.pdb" in server, "viewer must be backed by explicit structure coordinate artifacts")
     require("input_conversion_manifest.tsv" in science, "science pipeline must write input conversion manifest")
-    require("read_input_conversion_manifest" in md_worker, "MD worker must prefer canonical converted inputs")
+    require(
+        "selected_md_input" in md_worker and '"input_conversion_manifest.tsv"' in md_worker,
+        "MD worker must bind the selected candidate to one canonical converted input",
+    )
     require("read_peptide_sequence_input" in md_worker, "MD worker must accept peptide sequence inputs")
     require("MolFromFASTA" in md_worker, "MD worker must build peptide molecules through RDKit peptide conversion")
     require("rdkit_peptide_conformer_ensemble" in md_worker, "peptide MD artifacts must identify the real conformer calculation method")
@@ -61,8 +64,6 @@ def main() -> int:
     require("openff-interchange" in worker_cuda_requirements, "CUDA worker environment must install OpenFF interchange")
     require("openff-interchange" in worker_environment, "conda worker environment must install OpenFF interchange")
     require("SMIRNOFFTemplateGenerator" in md_worker or "SystemGenerator" in md_worker, "complex MD must use OpenMM/OpenFF small-molecule parameterization")
-    require("ligand_with_vina_pose_coordinates" in md_worker, "complex MD must map Vina pose coordinates onto the RDKit ligand topology")
-    require("docking_ligand.pdbqt" in md_worker and "docking_pose.pdbqt" in md_worker, "complex MD must use Vina PDBQT coordinates for ligand placement")
     require("Chem.RemoveHs" in md_worker and "Chem.AddHs" in md_worker, "complex MD must rebuild hydrogens after docking pose placement")
     require("GpuTelemetryMonitor" in md_worker, "CUDA MD must poll nvidia-smi while OpenMM production steps are running")
     require("production_poll_" in md_worker, "CUDA MD telemetry must label production-time GPU samples")
@@ -143,6 +144,104 @@ def main() -> int:
         require(smiles == "", "protein_ligand field must not be treated as a small-molecule hint")
         sequence, input_id = md_summary_worker.read_peptide_sequence_input(protein_ligand_text)
         require((sequence, input_id) == ("CCN", "input_1"), "protein_ligand peptide text must remain peptide-capable")
+
+        binding_run = tmp_path / "binding_run"
+        tool_outputs = binding_run / "tool_outputs"
+        tool_outputs.mkdir(parents=True)
+        candidate_id = "candidate-bound-pdbqt"
+        input_id = "input-bound-pdbqt"
+        source_digest = "a" * 64
+        (binding_run / "complex_candidate_selection.tsv").write_text(
+            "candidate_id\tinput_id\n"
+            f"{candidate_id}\t{input_id}\n",
+            encoding="utf-8",
+        )
+        (binding_run / "input_conversion_manifest.tsv").write_text(
+            "input_id\trecord_id\tcanonical_kind\tcanonical_value\tconversion_status\tcontent_sha256\n"
+            f"{input_id}\trecord-bound\tsmall_molecule\tCCO\tconverted\t{source_digest}\n",
+            encoding="utf-8",
+        )
+        _, _, _, input_digest = md_summary_worker.selected_md_input(binding_run, input_id)
+        artifact_names = {
+            "receptor_coordinate": "structure_viewer.pdb",
+            "receptor_pdbqt": "tool_outputs/receptor-bound.pdbqt",
+            "ligand_sdf": "tool_outputs/ligand-bound.sdf",
+            "ligand_pdbqt": "tool_outputs/ligand-bound.pdbqt",
+            "pose": "tool_outputs/pose-bound.pdbqt",
+            "pose_sdf": "tool_outputs/pose-bound.sdf",
+            "log": "tool_outputs/vina-bound.log",
+        }
+        for artifact_name in artifact_names.values():
+            artifact_path = binding_run / artifact_name
+            artifact_path.parent.mkdir(parents=True, exist_ok=True)
+            artifact_path.write_text(f"fixture:{artifact_name}\n", encoding="utf-8")
+        (tool_outputs / "docking_manifest.json").write_text(
+            json.dumps(
+                {
+                    "status": "completed",
+                    "invocation_id": "invocation-bound-pdbqt",
+                    "candidate_id": candidate_id,
+                    "input_id": input_id,
+                    "source_content_sha256": source_digest,
+                    "seed_provenance": {"input_digest": input_digest},
+                    **artifact_names,
+                },
+                indent=2,
+                sort_keys=True,
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        binding = md_summary_worker.resolve_md_invocation(
+            {
+                "job_id": "md_summary_ligand_dynamics",
+                "invocation_id": "invocation-bound-pdbqt",
+                "run_dir": str(binding_run),
+                "candidate_id": candidate_id,
+                "input_id": input_id,
+                "input_digest": input_digest,
+            }
+        )
+        expected_ligand_pdbqt = (binding_run / artifact_names["ligand_pdbqt"]).resolve()
+        expected_pose_pdbqt = (binding_run / artifact_names["pose"]).resolve()
+        require(
+            binding.docking_ligand_pdbqt == expected_ligand_pdbqt
+            and binding.docking_pose_pdbqt == expected_pose_pdbqt,
+            "MD invocation must bind the manifest-selected ligand and pose PDBQT artifacts",
+        )
+
+        ligand_marker = object()
+        placed_marker = object()
+        placement_calls: list[tuple[object, Path, Path, object]] = []
+
+        class FixtureChem:
+            @staticmethod
+            def SDMolSupplier(path, **kwargs):
+                return [ligand_marker]
+
+        original_placement = md_summary_worker.ligand_with_vina_pose_coordinates
+
+        def capture_placement(ligand, ligand_pdbqt, pose_pdbqt, chem):
+            placement_calls.append((ligand, ligand_pdbqt, pose_pdbqt, chem))
+            return placed_marker
+
+        md_summary_worker.ligand_with_vina_pose_coordinates = capture_placement
+        try:
+            placed = md_summary_worker.read_docking_pose_ligand(
+                binding.docking_pose_sdf,
+                binding.docking_ligand_sdf,
+                binding.docking_ligand_pdbqt,
+                binding.docking_pose_pdbqt,
+                FixtureChem,
+            )
+        finally:
+            md_summary_worker.ligand_with_vina_pose_coordinates = original_placement
+        require(placed is placed_marker, "complex MD must use Vina PDBQT placement before SDF fallback")
+        require(
+            placement_calls
+            == [(ligand_marker, expected_ligand_pdbqt, expected_pose_pdbqt, FixtureChem)],
+            "complex MD must pass the bound ligand and pose PDBQT paths to coordinate placement",
+        )
 
     weak = md_summary_worker.GpuTelemetry(
         rows=[

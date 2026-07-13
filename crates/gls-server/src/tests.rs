@@ -559,8 +559,6 @@ fn source_sync_plan_uses_executable_sync_methods() {
 fn first_launch_user_workspace_has_no_seeded_projects_or_templates() {
     let root = std::env::temp_dir().join(format!("genoligand-first-launch-{}", now_millis()));
     let options = server_options(root.clone());
-    fs::create_dir_all(projects_root(&options).join("project-stale").join("runs"))
-        .expect("stale project dir");
     let payload = user_projects_json(&options);
     let summary = user_workspace_summary_json(&options);
 
@@ -906,7 +904,8 @@ fn user_project_creation_hides_internal_status_and_actions() {
     assert!(payload.get("project").is_some());
     assert!(payload["project"].get("project_id").is_some());
     assert!(payload.get("message").is_some());
-    assert_eq!(listed["projects"].as_array().map(Vec::len), Some(0));
+    assert_eq!(listed["projects"].as_array().map(Vec::len), Some(1));
+    assert_eq!(listed["projects"][0]["project_status"], "draft");
     assert!(payload.get("status").is_none());
     assert!(!text.contains("created"));
     assert!(!text.contains("supported_actions"));
@@ -2760,10 +2759,7 @@ impl GeneratedTsvReader {
 impl std::io::Read for GeneratedTsvReader {
     fn read(&mut self, _buffer: &mut [u8]) -> std::io::Result<usize> {
         self.read_calls.fetch_add(1, Ordering::Relaxed);
-        Err(std::io::Error::new(
-            std::io::ErrorKind::Other,
-            "full-reader path is forbidden",
-        ))
+        Err(std::io::Error::other("full-reader path is forbidden"))
     }
 }
 

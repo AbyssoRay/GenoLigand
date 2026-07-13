@@ -17,7 +17,7 @@ from genoligand_workers.alignment_worker import (
     sequence_query_id,
     write_fasta,
 )
-from genoligand_workers.md_summary_worker import run_md_summary_job
+from genoligand_workers.md_summary_worker import canonical_digest, run_md_summary_job
 
 
 class AlignmentRecordIdentityTests(unittest.TestCase):
@@ -391,7 +391,7 @@ class AlignmentRecordIdentityTests(unittest.TestCase):
             low_score = float(rows[1].split("\t")[6])
             self.assertGreater(high_score, low_score)
 
-    def test_md_outcomes_distinguish_no_input_from_missing_receptor(self) -> None:
+    def test_md_outcomes_distinguish_no_input_from_missing_bound_candidate(self) -> None:
         with tempfile.TemporaryDirectory(prefix="genoligand_md_outcome_") as tmp:
             root = Path(tmp)
             run_dir = root / "run"
@@ -399,6 +399,8 @@ class AlignmentRecordIdentityTests(unittest.TestCase):
             input_manifest = root / "input.json"
             input_manifest.write_text(json.dumps({"inputs": [], "files": []}), encoding="utf-8")
             job = {
+                "job_id": "md_summary_ligand_dynamics",
+                "invocation_id": "invocation-current",
                 "input_manifest": str(input_manifest),
                 "run_dir": str(run_dir),
                 "science_store": str(root / "store"),
@@ -411,10 +413,89 @@ class AlignmentRecordIdentityTests(unittest.TestCase):
                 json.dumps({"inputs": [{"field": "small_molecule", "value": "CCO"}], "files": []}),
                 encoding="utf-8",
             )
+            missing_candidate = run_md_summary_job(job)
+            self.assertEqual(missing_candidate.status, "failed")
+            self.assertTrue(missing_candidate.outcomes[0].required)
+            self.assertIn(
+                "complex_candidate_selection.tsv", missing_candidate.outcomes[0].reason
+            )
+
+    def test_md_outcome_reports_missing_receptor_after_candidate_binding(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="genoligand_md_missing_receptor_") as tmp:
+            root = Path(tmp)
+            run_dir = root / "run"
+            tool_outputs = run_dir / "tool_outputs"
+            tool_outputs.mkdir(parents=True)
+            candidate_id = "candidate-current"
+            input_id = "input-current"
+            source_digest = "a" * 64
+            input_digest = canonical_digest(
+                {
+                    "input_id": input_id,
+                    "record_id": "record-current",
+                    "canonical_kind": "small_molecule",
+                    "canonical_value": "CCO",
+                    "source_content_sha256": source_digest,
+                }
+            )
+            input_manifest = root / "input.json"
+            input_manifest.write_text(
+                json.dumps({"inputs": [{"field": "small_molecule", "value": "CCO"}], "files": []}),
+                encoding="utf-8",
+            )
+            (run_dir / "complex_candidate_selection.tsv").write_text(
+                "candidate_id\tinput_id\n"
+                f"{candidate_id}\t{input_id}\n",
+                encoding="utf-8",
+            )
+            (run_dir / "input_conversion_manifest.tsv").write_text(
+                "input_id\trecord_id\tcanonical_kind\tcanonical_value\tconversion_status\tcontent_sha256\n"
+                f"{input_id}\trecord-current\tsmall_molecule\tCCO\tconverted\t{source_digest}\n",
+                encoding="utf-8",
+            )
+            docking_artifacts = {
+                "receptor_pdbqt": "tool_outputs/docking_receptor.pdbqt",
+                "ligand_sdf": "tool_outputs/docking_ligand.sdf",
+                "ligand_pdbqt": "tool_outputs/docking_ligand.pdbqt",
+                "pose": "tool_outputs/docking_pose.pdbqt",
+                "pose_sdf": "tool_outputs/docking_pose.sdf",
+                "log": "tool_outputs/docking_vina.log",
+            }
+            for artifact_name in docking_artifacts.values():
+                (run_dir / artifact_name).write_text(f"fixture:{artifact_name}\n", encoding="utf-8")
+            (tool_outputs / "docking_manifest.json").write_text(
+                json.dumps(
+                    {
+                        "status": "completed",
+                        "invocation_id": "invocation-current",
+                        "candidate_id": candidate_id,
+                        "input_id": input_id,
+                        "source_content_sha256": source_digest,
+                        "seed_provenance": {"input_digest": input_digest},
+                        **docking_artifacts,
+                    }
+                ),
+                encoding="utf-8",
+            )
+            job = {
+                "job_id": "md_summary_ligand_dynamics",
+                "invocation_id": "invocation-current",
+                "input_manifest": str(input_manifest),
+                "run_dir": str(run_dir),
+                "science_store": str(root / "store"),
+                "candidate_id": candidate_id,
+                "input_id": input_id,
+                "input_digest": input_digest,
+            }
+
             missing_receptor = run_md_summary_job(job)
-            self.assertEqual(missing_receptor.status, "not_ready")
+
+            self.assertEqual(missing_receptor.status, "failed")
             self.assertTrue(missing_receptor.outcomes[0].required)
-            self.assertEqual(missing_receptor.outcomes[0].reason, "missing_receptor_coordinate")
+            self.assertEqual(
+                missing_receptor.outcomes[0].reason,
+                "docking_artifact_missing:receptor_coordinate",
+            )
 
 
 if __name__ == "__main__":

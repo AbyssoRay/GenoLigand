@@ -21,6 +21,7 @@ use input_conversion::{
 
 const WORKER_SCHEMA_VERSION: &str = "genoligand_worker_current_v2";
 const WORKER_PIPELINE_MODE: &str = "genoligand_scientific_pipeline";
+const MD_PROVENANCE_SCHEMA_VERSION: &str = "genoligand_md_artifact_provenance_v1";
 const MAX_SEQUENCE_TOKEN_CHARS: usize = 96;
 const MAX_STRUCTURE_METADATA_CHARS: usize = 16_384;
 const LARGE_METAGENOME_FASTA_TSV_MAX_BYTES: u64 = 1_000_000_000;
@@ -4616,7 +4617,7 @@ fn run_single_worker_task(options: &ScienceOptions, task: &WorkerTask) -> Result
 
 fn worker_job_value(options: &ScienceOptions, task: &WorkerTask) -> Result<Value, String> {
     let invocation_id = current_worker_invocation(options)?;
-    Ok(json!({
+    let mut job = json!({
         "schema_version": WORKER_SCHEMA_VERSION,
         "pipeline_mode": WORKER_PIPELINE_MODE,
         "job_id": task.job_id,
@@ -4630,7 +4631,18 @@ fn worker_job_value(options: &ScienceOptions, task: &WorkerTask) -> Result<Value
         "run_dir": options.run_dir.display().to_string(),
         "science_store": options.science_store.display().to_string(),
         "expected_result_schema": WORKER_SCHEMA_VERSION
-    }))
+    });
+    if task.worker == "md_summary"
+        && let Ok(facts) = current_md_run_facts(options)
+    {
+        job["run_id"] = json!(facts.run_id);
+        job["candidate_id"] = json!(facts.candidate_id);
+        job["candidate_digest"] = json!(facts.candidate_digest);
+        job["input_id"] = json!(facts.input_id);
+        job["input_digest"] = json!(facts.input_digest);
+        job["source_digest"] = json!(facts.source_digest);
+    }
+    Ok(job)
 }
 
 fn validate_worker_job(value: &Value, task: &WorkerTask) -> bool {
@@ -5561,22 +5573,10 @@ fn coordinate_text_has_atoms(text: &str) -> bool {
 }
 
 fn screen_dynamics(options: &ScienceOptions) -> Result<String, String> {
-    let md_path = options.run_dir.join("md_summary.tsv");
-    let ready = copy_tool_output_if_available(options, "md_summary.tsv", &md_path)?
-        || write_md_summary_from_metric_artifacts(options, &md_path)?;
-    if ready {
-        write_md_summary_status(
-            options,
-            "ready",
-            "real MD summary artifact available for this run",
-        )?;
-    } else {
-        write_text(&md_path, md_summary_header())?;
-        write_md_summary_status(options, "not_ready", &md_not_ready_reason(options))?;
-    }
+    let summary = materialize_current_md_summary(options)?;
     Ok(format!(
         "dynamics_screened\tmd_artifact={}",
-        if ready { "ready" } else { "not_ready" }
+        if summary.ready { "ready" } else { "not_ready" }
     ))
 }
 
@@ -5587,6 +5587,7 @@ fn md_summary_header() -> &'static str {
 fn write_md_summary_from_metric_artifacts(
     options: &ScienceOptions,
     out_path: &Path,
+    current_artifacts: &BTreeSet<String>,
 ) -> Result<bool, String> {
     let mut rows = BTreeMap::<String, BTreeMap<String, String>>::new();
     for (metric, files) in [
@@ -5605,7 +5606,7 @@ fn write_md_summary_from_metric_artifacts(
             &["md_contacts.tsv", "contacts.tsv", "contact_occupancy.tsv"][..],
         ),
     ] {
-        for (candidate, value) in read_metric_values(options, files)? {
+        for (candidate, value) in read_metric_values(options, files, current_artifacts)? {
             rows.entry(candidate)
                 .or_default()
                 .insert(metric.to_string(), value);
@@ -5644,9 +5645,13 @@ fn write_md_summary_from_metric_artifacts(
 fn read_metric_values(
     options: &ScienceOptions,
     file_names: &[&str],
+    current_artifacts: &BTreeSet<String>,
 ) -> Result<BTreeMap<String, String>, String> {
     let mut values = BTreeMap::new();
     for file_name in file_names {
+        if !current_artifacts.contains(&format!("tool_outputs/{file_name}")) {
+            continue;
+        }
         let path = options.run_dir.join("tool_outputs").join(file_name);
         if !path.exists() {
             continue;
@@ -5674,6 +5679,485 @@ fn read_metric_values(
         }
     }
     Ok(values)
+}
+
+struct CurrentMdWorkerArtifacts {
+    artifacts: BTreeSet<String>,
+    candidate_id: Option<String>,
+    status: String,
+    reason: String,
+}
+
+struct CurrentMdRunFacts {
+    run_id: String,
+    candidate_id: String,
+    candidate_digest: String,
+    input_id: String,
+    input_digest: String,
+    source_digest: String,
+}
+
+struct CurrentMdSummary {
+    ready: bool,
+    candidate_id: Option<String>,
+}
+
+fn materialize_current_md_summary(options: &ScienceOptions) -> Result<CurrentMdSummary, String> {
+    let md_path = options.run_dir.join("md_summary.tsv");
+    let binding = current_md_worker_artifacts(options)?;
+    let ready = binding.status == "PASS"
+        && ((binding.artifacts.contains("tool_outputs/md_summary.tsv")
+            && copy_tool_output_if_available(options, "md_summary.tsv", &md_path)?)
+            || write_md_summary_from_metric_artifacts(options, &md_path, &binding.artifacts)?);
+    if ready {
+        write_md_summary_status(
+            options,
+            "ready",
+            "real MD summary artifact available for this run",
+        )?;
+    } else {
+        write_text(&md_path, md_summary_header())?;
+        let status = match binding.status.as_str() {
+            "FAIL" => "fail",
+            "NOT_READY" => "not_ready",
+            "NOT_APPLICABLE" => "not_applicable",
+            _ => "not_ready",
+        };
+        let reason = if matches!(
+            binding.status.as_str(),
+            "FAIL" | "NOT_READY" | "NOT_APPLICABLE"
+        ) {
+            binding.reason
+        } else {
+            let missing = md_not_ready_reason(&binding.artifacts);
+            match (missing.is_empty(), binding.reason.is_empty()) {
+                (true, _) => binding.reason,
+                (_, true) => missing,
+                _ => format!("{missing};{}", binding.reason),
+            }
+        };
+        write_md_summary_status(options, status, &reason)?;
+    }
+    Ok(CurrentMdSummary {
+        ready,
+        candidate_id: ready.then_some(binding.candidate_id).flatten(),
+    })
+}
+
+fn current_md_worker_artifacts(
+    options: &ScienceOptions,
+) -> Result<CurrentMdWorkerArtifacts, String> {
+    let invalid = |reason: &str| {
+        Ok(CurrentMdWorkerArtifacts {
+            artifacts: BTreeSet::new(),
+            candidate_id: None,
+            status: "INVALID".to_string(),
+            reason: format!("md_artifact_binding_invalid:{reason}"),
+        })
+    };
+    let invocation_path = options.run_dir.join(WORKER_INVOCATION_FILE);
+    if !invocation_path.is_file() {
+        return invalid("invocation_missing");
+    }
+    let invocation = read_text(&invocation_path)?.trim().to_string();
+    if invocation.is_empty() {
+        return invalid("invocation_missing");
+    }
+
+    let task = &SCIENTIFIC_WORKER_TASKS[0];
+    let job_path = options
+        .run_dir
+        .join("worker_jobs")
+        .join(format!("{}.json", task.job_id));
+    let result_path = options
+        .run_dir
+        .join("worker_results")
+        .join(format!("{}.json", task.job_id));
+    let Some(job) = read_json_value_if_file(&job_path) else {
+        return invalid("job_missing_or_invalid");
+    };
+    if !validate_worker_job(&job, task)
+        || job.get("invocation_id").and_then(Value::as_str) != Some(invocation.as_str())
+    {
+        return invalid("job_invocation_mismatch");
+    }
+    if !job_run_identity_matches(&job, options) {
+        return invalid("job_run_identity_mismatch");
+    }
+    let Some(result) = read_json_value_if_file(&result_path) else {
+        return invalid("result_missing_or_invalid");
+    };
+    if !validate_worker_result_binding(&result, &job, options, task) {
+        return invalid("result_binding_mismatch");
+    }
+    if result.get("status").and_then(Value::as_str) != Some("PASS") {
+        return Ok(CurrentMdWorkerArtifacts {
+            artifacts: BTreeSet::new(),
+            candidate_id: None,
+            status: result
+                .get("status")
+                .and_then(Value::as_str)
+                .unwrap_or("INVALID")
+                .to_string(),
+            reason: result
+                .get("reason")
+                .and_then(Value::as_str)
+                .unwrap_or("md_worker_result_reason_missing")
+                .to_string(),
+        });
+    }
+    let facts = match current_md_run_facts(options) {
+        Ok(facts) => facts,
+        Err(reason) => return invalid(&reason),
+    };
+    for (field, expected) in [
+        ("candidate_id", facts.candidate_id.as_str()),
+        ("candidate_digest", facts.candidate_digest.as_str()),
+    ] {
+        if job.get(field).and_then(Value::as_str) != Some(expected) {
+            return invalid("candidate_manifest_mismatch");
+        }
+        let Some(actual) = result.get(field).and_then(Value::as_str) else {
+            return invalid("result_identity_missing");
+        };
+        if actual != expected {
+            return invalid("candidate_manifest_mismatch");
+        }
+    }
+    for (field, expected) in [
+        ("input_id", facts.input_id.as_str()),
+        ("input_digest", facts.input_digest.as_str()),
+        ("source_digest", facts.source_digest.as_str()),
+    ] {
+        if job.get(field).and_then(Value::as_str) != Some(expected) {
+            return invalid("input_manifest_mismatch");
+        }
+        let Some(actual) = result.get(field).and_then(Value::as_str) else {
+            return invalid("result_identity_missing");
+        };
+        if actual != expected {
+            return invalid("input_manifest_mismatch");
+        }
+    }
+    let Some(provenance_path) = result.get("artifact_provenance").and_then(Value::as_str) else {
+        return invalid("provenance_missing");
+    };
+    let Some(provenance_relative) =
+        current_run_artifact_relative(&options.run_dir, provenance_path)
+    else {
+        return invalid("provenance_outside_run");
+    };
+    let Some(provenance) = read_json_value_if_file(&options.run_dir.join(&provenance_relative))
+    else {
+        return invalid("provenance_invalid");
+    };
+    if provenance.get("schema_version").and_then(Value::as_str)
+        != Some(MD_PROVENANCE_SCHEMA_VERSION)
+        || provenance.get("job_id").and_then(Value::as_str) != Some(task.job_id)
+        || provenance.get("invocation_id").and_then(Value::as_str) != Some(invocation.as_str())
+    {
+        return invalid("provenance_binding_mismatch");
+    }
+    for field in ["run_id", "candidate_id", "input_id"] {
+        let Some(expected) = result
+            .get(field)
+            .and_then(Value::as_str)
+            .filter(|value| !value.trim().is_empty())
+        else {
+            return invalid("result_identity_missing");
+        };
+        if provenance.get(field).and_then(Value::as_str) != Some(expected) {
+            return invalid("provenance_identity_mismatch");
+        }
+    }
+    for field in ["candidate_digest", "input_digest", "source_digest"] {
+        let Some(expected) = result.get(field).and_then(Value::as_str) else {
+            return invalid("result_digest_missing");
+        };
+        if !valid_sha256_hex(expected)
+            || provenance.get(field).and_then(Value::as_str) != Some(expected)
+        {
+            return invalid("provenance_digest_mismatch");
+        }
+    }
+    let parameters_digest = provenance
+        .get("parameters_digest")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    let tool_name = provenance
+        .get("tool_name")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    let tool_version = provenance
+        .get("tool_version")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    if !valid_sha256_hex(parameters_digest)
+        || tool_name.trim().is_empty()
+        || tool_version.trim().is_empty()
+    {
+        return invalid("provenance_tool_identity_invalid");
+    }
+    let Some(rows) = provenance.get("artifacts").and_then(Value::as_array) else {
+        return invalid("provenance_artifacts_missing");
+    };
+    if rows.is_empty() {
+        return invalid("provenance_artifacts_empty");
+    }
+    let mut artifacts = BTreeSet::new();
+    for row in rows {
+        if row.get("job_id").and_then(Value::as_str) != Some(task.job_id)
+            || row.get("invocation_id").and_then(Value::as_str) != Some(invocation.as_str())
+        {
+            return invalid("artifact_binding_mismatch");
+        }
+        for field in [
+            "run_id",
+            "candidate_id",
+            "candidate_digest",
+            "input_id",
+            "input_digest",
+            "source_digest",
+        ] {
+            if row.get(field).and_then(Value::as_str)
+                != provenance.get(field).and_then(Value::as_str)
+            {
+                return invalid("artifact_identity_mismatch");
+            }
+        }
+        if row.get("parameters_digest").and_then(Value::as_str) != Some(parameters_digest)
+            || row.get("tool_name").and_then(Value::as_str) != Some(tool_name)
+            || row.get("tool_version").and_then(Value::as_str) != Some(tool_version)
+        {
+            return invalid("artifact_tool_identity_mismatch");
+        }
+        let Some(artifact) = row.get("artifact_path").and_then(Value::as_str) else {
+            return invalid("artifact_path_missing");
+        };
+        let Some(relative) = current_run_artifact_relative(&options.run_dir, artifact) else {
+            return invalid("artifact_outside_run");
+        };
+        let expected_digest = row
+            .get("artifact_sha256")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        if !valid_sha256_hex(expected_digest)
+            || sha256_file_hex(&options.run_dir.join(&relative)).as_deref() != Some(expected_digest)
+        {
+            return invalid("artifact_digest_mismatch");
+        }
+        if !artifacts.insert(relative) {
+            return invalid("artifact_duplicate");
+        }
+    }
+    Ok(CurrentMdWorkerArtifacts {
+        artifacts,
+        candidate_id: Some(facts.candidate_id),
+        status: "PASS".to_string(),
+        reason: String::new(),
+    })
+}
+
+fn job_run_identity_matches(job: &Value, options: &ScienceOptions) -> bool {
+    if job.get("run_id").and_then(Value::as_str) != Some(infer_run_id(&options.run_dir).as_str()) {
+        return false;
+    }
+    let Some(job_run_dir) = job.get("run_dir").and_then(Value::as_str) else {
+        return false;
+    };
+    let Ok(expected) = options.run_dir.canonicalize() else {
+        return false;
+    };
+    PathBuf::from(job_run_dir)
+        .canonicalize()
+        .is_ok_and(|actual| actual == expected)
+}
+
+fn current_md_run_facts(options: &ScienceOptions) -> Result<CurrentMdRunFacts, String> {
+    let candidate_rows =
+        read_simple_tsv_rows(&options.run_dir.join("complex_candidate_selection.tsv"))?;
+    if candidate_rows.len() != 1 {
+        return Err("candidate_manifest_mismatch".to_string());
+    }
+    let candidate = candidate_rows[0]
+        .iter()
+        .map(|(key, value)| (key.clone(), value.trim().to_string()))
+        .collect::<BTreeMap<_, _>>();
+    let candidate_id = candidate
+        .get("candidate_id")
+        .map(String::as_str)
+        .filter(|value| !value.trim().is_empty())
+        .ok_or_else(|| "candidate_manifest_mismatch".to_string())?
+        .to_string();
+    let input_id = candidate
+        .get("input_id")
+        .map(String::as_str)
+        .filter(|value| !value.trim().is_empty())
+        .ok_or_else(|| "candidate_manifest_mismatch".to_string())?
+        .to_string();
+    let candidate_digest = canonical_json_sha256(&json!(candidate));
+
+    let input_rows = read_simple_tsv_rows(&options.run_dir.join("input_conversion_manifest.tsv"))?;
+    let selected = input_rows
+        .iter()
+        .filter(|row| {
+            row.get("input_id").map(String::as_str) == Some(input_id.as_str())
+                && row.get("conversion_status").map(String::as_str) == Some("converted")
+                && matches!(
+                    row.get("canonical_kind").map(String::as_str),
+                    Some("small_molecule") | Some("peptide")
+                )
+        })
+        .collect::<Vec<_>>();
+    if selected.len() != 1 {
+        return Err("input_manifest_mismatch".to_string());
+    }
+    let input = selected[0]
+        .iter()
+        .map(|(key, value)| (key.clone(), value.trim().to_string()))
+        .collect::<BTreeMap<_, _>>();
+    let canonical_value = input
+        .get("canonical_value")
+        .map(|value| decode_tsv_cell(value).trim().to_string())
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| "input_manifest_mismatch".to_string())?;
+    let source_digest = input
+        .get("content_sha256")
+        .map(|value| value.to_ascii_lowercase())
+        .filter(|value| valid_sha256_hex(value))
+        .ok_or_else(|| "input_manifest_mismatch".to_string())?;
+    let input_digest = canonical_json_sha256(&json!({
+        "input_id": input_id,
+        "record_id": input.get("record_id").map(String::as_str).unwrap_or(""),
+        "canonical_kind": input.get("canonical_kind").map(String::as_str).unwrap_or(""),
+        "canonical_value": canonical_value,
+        "source_content_sha256": source_digest,
+    }));
+    Ok(CurrentMdRunFacts {
+        run_id: infer_run_id(&options.run_dir),
+        candidate_id,
+        candidate_digest,
+        input_id,
+        input_digest,
+        source_digest,
+    })
+}
+
+fn canonical_json_sha256(value: &Value) -> String {
+    let mut payload = String::new();
+    write_canonical_ascii_json(value, &mut payload);
+    let mut hasher = Sha256::new();
+    hasher.update(payload.as_bytes());
+    hasher
+        .finalize()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
+}
+
+fn write_canonical_ascii_json(value: &Value, out: &mut String) {
+    match value {
+        Value::Null => out.push_str("null"),
+        Value::Bool(value) => out.push_str(if *value { "true" } else { "false" }),
+        Value::Number(value) => out.push_str(&value.to_string()),
+        Value::String(value) => {
+            let encoded =
+                serde_json::to_string(value).expect("JSON string serialization cannot fail");
+            for ch in encoded.chars() {
+                if ch.is_ascii() {
+                    out.push(ch);
+                } else {
+                    let code = ch as u32;
+                    if code <= 0xffff {
+                        out.push_str(&format!("\\u{code:04x}"));
+                    } else {
+                        let scalar = code - 0x1_0000;
+                        let high = 0xd800 + (scalar >> 10);
+                        let low = 0xdc00 + (scalar & 0x3ff);
+                        out.push_str(&format!("\\u{high:04x}\\u{low:04x}"));
+                    }
+                }
+            }
+        }
+        Value::Array(values) => {
+            out.push('[');
+            for (index, value) in values.iter().enumerate() {
+                if index > 0 {
+                    out.push(',');
+                }
+                write_canonical_ascii_json(value, out);
+            }
+            out.push(']');
+        }
+        Value::Object(values) => {
+            out.push('{');
+            let mut entries = values.iter().collect::<Vec<_>>();
+            entries.sort_by(|left, right| left.0.cmp(right.0));
+            for (index, (key, value)) in entries.into_iter().enumerate() {
+                if index > 0 {
+                    out.push(',');
+                }
+                write_canonical_ascii_json(&Value::String(key.clone()), out);
+                out.push(':');
+                write_canonical_ascii_json(value, out);
+            }
+            out.push('}');
+        }
+    }
+}
+
+fn read_json_value_if_file(path: &Path) -> Option<Value> {
+    read_text(path)
+        .ok()
+        .and_then(|text| serde_json::from_str(text.trim_start_matches('\u{feff}')).ok())
+}
+
+fn current_run_artifact_relative(run_dir: &Path, artifact: &str) -> Option<String> {
+    if artifact.trim().is_empty() {
+        return None;
+    }
+    let root = run_dir.canonicalize().ok()?;
+    let path = PathBuf::from(artifact);
+    let candidate = if path.is_absolute() {
+        path
+    } else {
+        run_dir.join(path)
+    };
+    let resolved = candidate.canonicalize().ok()?;
+    if !resolved.is_file() || !resolved.starts_with(&root) {
+        return None;
+    }
+    Some(
+        resolved
+            .strip_prefix(root)
+            .ok()?
+            .to_string_lossy()
+            .replace('\\', "/"),
+    )
+}
+
+fn valid_sha256_hex(value: &str) -> bool {
+    value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_hexdigit())
+}
+
+fn sha256_file_hex(path: &Path) -> Option<String> {
+    let mut file = fs::File::open(path).ok()?;
+    let mut hasher = Sha256::new();
+    let mut buffer = [0_u8; 64 * 1024];
+    loop {
+        let read = file.read(&mut buffer).ok()?;
+        if read == 0 {
+            break;
+        }
+        hasher.update(&buffer[..read]);
+    }
+    Some(
+        hasher
+            .finalize()
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect(),
+    )
 }
 
 fn read_simple_tsv_rows(path: &Path) -> Result<Vec<BTreeMap<String, String>>, String> {
@@ -5724,58 +6208,33 @@ fn write_md_summary_status(
     )
 }
 
-fn md_not_ready_reason(options: &ScienceOptions) -> String {
+fn md_not_ready_reason(current_artifacts: &BTreeSet<String>) -> String {
     let mut reasons = Vec::new();
-    if !options.run_dir.join("tool_outputs/md_summary.tsv").exists() {
+    if !current_artifacts.contains("tool_outputs/md_summary.tsv") {
         reasons.push("no md_summary.tsv in current run tool_outputs".to_string());
     }
-    if options
-        .run_dir
-        .join("tool_outputs/md_not_ready.tsv")
-        .exists()
-        && let Ok(rows) =
-            read_simple_tsv_rows(&options.run_dir.join("tool_outputs/md_not_ready.tsv"))
-    {
-        for row in rows {
-            if let Some(reason) = first_metric_value(&row, &["reason", "message", "risk_flags"]) {
-                reasons.push(reason.to_string());
-            }
-        }
-    }
-    if !options.run_dir.join("tool_outputs/md_rmsd.tsv").exists()
-        && !options.run_dir.join("tool_outputs/rmsd.tsv").exists()
+    if !current_artifacts.contains("tool_outputs/md_rmsd.tsv")
+        && !current_artifacts.contains("tool_outputs/rmsd.tsv")
     {
         reasons.push("no RMSD metric artifact".to_string());
     }
-    if !options.run_dir.join("tool_outputs/md_rmsf.tsv").exists()
-        && !options.run_dir.join("tool_outputs/rmsf.tsv").exists()
+    if !current_artifacts.contains("tool_outputs/md_rmsf.tsv")
+        && !current_artifacts.contains("tool_outputs/rmsf.tsv")
     {
         reasons.push("no RMSF metric artifact".to_string());
     }
-    if !options
-        .run_dir
-        .join("tool_outputs/md_ligand_drift.tsv")
-        .exists()
-        && !options
-            .run_dir
-            .join("tool_outputs/ligand_drift.tsv")
-            .exists()
+    if !current_artifacts.contains("tool_outputs/md_ligand_drift.tsv")
+        && !current_artifacts.contains("tool_outputs/ligand_drift.tsv")
     {
         reasons.push("no ligand drift metric artifact".to_string());
     }
-    if !options
-        .run_dir
-        .join("tool_outputs/md_contacts.tsv")
-        .exists()
-        && !options.run_dir.join("tool_outputs/contacts.tsv").exists()
+    if !current_artifacts.contains("tool_outputs/md_contacts.tsv")
+        && !current_artifacts.contains("tool_outputs/contacts.tsv")
     {
         reasons.push("no contact metric artifact".to_string());
     }
-    if !options.run_dir.join("tool_outputs/md_hbonds.tsv").exists()
-        && !options
-            .run_dir
-            .join("tool_outputs/hydrogen_bonds.tsv")
-            .exists()
+    if !current_artifacts.contains("tool_outputs/md_hbonds.tsv")
+        && !current_artifacts.contains("tool_outputs/hydrogen_bonds.tsv")
     {
         reasons.push("no hydrogen-bond metric artifact".to_string());
     }
@@ -6052,8 +6511,15 @@ fn docking_score_from_affinity(value: &str) -> Option<f64> {
 }
 
 fn apply_md_scores(candidates: &mut [Candidate], options: &ScienceOptions) -> Result<(), String> {
+    let current_summary = materialize_current_md_summary(options)?;
+    if !current_summary.ready {
+        return Ok(());
+    }
+    let Some(bound_candidate_id) = current_summary.candidate_id else {
+        return Ok(());
+    };
     let complex_candidates = complex_md_candidate_ids(options)?;
-    if complex_candidates.is_empty() {
+    if !complex_candidates.contains(&bound_candidate_id) {
         return Ok(());
     }
     let md_scores = read_md_scores(&options.run_dir.join("md_summary.tsv"))?;
@@ -6061,7 +6527,7 @@ fn apply_md_scores(candidates: &mut [Candidate], options: &ScienceOptions) -> Re
         return Ok(());
     }
     for candidate in candidates {
-        if !complex_candidates.contains(&candidate.candidate_id) {
+        if candidate.candidate_id != bound_candidate_id {
             continue;
         }
         if let Some(score) = md_scores.get(&candidate.candidate_id) {
