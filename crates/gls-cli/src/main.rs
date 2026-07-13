@@ -23,7 +23,7 @@ fn run_cli(args: &[String]) -> Result<String, String> {
         return Err(format!("missing_subcommand:{group}"));
     }
     let command = ScienceCommand::parse(group, &args[1])?;
-    let common = CommonArgs::parse(&args[2..])?;
+    let common = CommonArgs::parse(command, &args[2..])?;
     if command == ScienceCommand::PrepareScienceStore {
         return run_store_command(
             command,
@@ -53,7 +53,7 @@ struct CommonArgs {
 }
 
 impl CommonArgs {
-    fn parse(args: &[String]) -> Result<Self, String> {
+    fn parse(command: ScienceCommand, args: &[String]) -> Result<Self, String> {
         let mut workspace_root = None;
         let mut science_store = None;
         let mut input_manifest = None;
@@ -86,9 +86,14 @@ impl CommonArgs {
                     .map(PathBuf::from)
             })
             .unwrap_or_else(|| default_science_store(&workspace_root));
-        let input_manifest = input_manifest.unwrap_or_else(|| PathBuf::from("input_manifest.json"));
-        let run_dir =
-            run_dir.unwrap_or_else(|| workspace_root.join("outputs").join("current_pipeline"));
+        let (input_manifest, run_dir) = if command == ScienceCommand::PrepareScienceStore {
+            (PathBuf::new(), PathBuf::new())
+        } else {
+            (
+                input_manifest.ok_or("missing_required_option:--input-manifest")?,
+                run_dir.ok_or("missing_required_option:--run-dir")?,
+            )
+        };
         Ok(Self {
             workspace_root,
             science_store,
@@ -133,10 +138,13 @@ fn default_science_store(workspace_root: &Path) -> PathBuf {
 
 fn take_path(args: &[String], index: &mut usize, flag: &str) -> Result<PathBuf, String> {
     *index += 1;
-    args.get(*index)
-        .map(Path::new)
-        .map(Path::to_path_buf)
-        .ok_or_else(|| format!("missing_value_for:{flag}"))
+    let value = args
+        .get(*index)
+        .ok_or_else(|| format!("missing_value_for:{flag}"))?;
+    if value.trim().is_empty() {
+        return Err(format!("empty_value_for:{flag}"));
+    }
+    Ok(PathBuf::from(value))
 }
 
 fn is_help(args: &[String]) -> bool {
@@ -157,3 +165,32 @@ usage:
   gls-cli report render --input-manifest PATH --run-dir PATH [--science-store PATH]
   gls-cli pipeline run --input-manifest PATH --run-dir PATH [--science-store PATH]
 ";
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn science_command_requires_input_manifest_and_run_dir() {
+        let args = vec!["--science-store".into(), "store".into()];
+        let error = CommonArgs::parse(ScienceCommand::InputNormalize, &args)
+            .expect_err("science paths must be required");
+        assert_eq!(error, "missing_required_option:--input-manifest");
+    }
+
+    #[test]
+    fn path_options_reject_empty_values() {
+        let args = vec!["--science-store".into(), "".into()];
+        let error = CommonArgs::parse(ScienceCommand::PrepareScienceStore, &args)
+            .expect_err("empty path must fail");
+        assert_eq!(error, "empty_value_for:--science-store");
+    }
+
+    #[test]
+    fn install_command_does_not_require_run_paths() {
+        let args = vec!["--science-store".into(), "store".into()];
+        let parsed =
+            CommonArgs::parse(ScienceCommand::PrepareScienceStore, &args).expect("install args");
+        assert_eq!(parsed.science_store, PathBuf::from("store"));
+    }
+}

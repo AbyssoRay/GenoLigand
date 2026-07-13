@@ -52,8 +52,8 @@ pub(super) fn convert_inputs_from_manifest(path: &Path) -> Result<Vec<ConvertedI
 
 fn extract_raw_inputs(path: &Path) -> Result<Vec<RawInput>, String> {
     let text = read_text(path)?;
-    let value =
-        serde_json::from_str::<Value>(text.trim_start_matches('\u{feff}')).unwrap_or(Value::Null);
+    let value = serde_json::from_str::<Value>(text.trim_start_matches('\u{feff}'))
+        .map_err(|err| format!("invalid_input_manifest_json:{err}"))?;
     let mut raw = Vec::new();
     let mut file_count = 0usize;
     if let Some(inputs) = value.get("inputs").and_then(Value::as_array) {

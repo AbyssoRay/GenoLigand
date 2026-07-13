@@ -456,6 +456,16 @@ fn input_conversion_prefers_content_over_selected_field() {
 }
 
 #[test]
+fn input_conversion_rejects_malformed_manifest_json() {
+    let root = temp_root("malformed_input_manifest");
+    let input = root.join("input.json");
+    write_text(&input, "{not-json").expect("input");
+    let error = extract_inputs(&input).expect_err("malformed JSON must fail");
+    assert!(error.starts_with("invalid_input_manifest_json:"));
+    fs::remove_dir_all(root).expect("cleanup");
+}
+
+#[test]
 fn input_conversion_classifies_sequence_and_structure_text() {
     let root = temp_root("conversion_classification");
     let input = root.join("input.json");
