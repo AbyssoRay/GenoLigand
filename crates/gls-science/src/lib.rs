@@ -6160,6 +6160,7 @@ fn read_normalized_inputs(path: &Path) -> Result<Vec<NormalizedInput>, String> {
     }
     let mut out = Vec::new();
     let mut conversion_provenance = None;
+    let mut normalized_identities = BTreeSet::new();
     for (index, line) in lines.enumerate() {
         if line.trim().is_empty() {
             continue;
@@ -6246,6 +6247,13 @@ fn read_normalized_inputs(path: &Path) -> Result<Vec<NormalizedInput>, String> {
             conversion_provenance = Some(read_conversion_provenance(path)?);
         }
         let key = (cols[0].clone(), cols[5].clone());
+        if !normalized_identities.insert(key.clone()) {
+            return Err(format!(
+                "normalized_input_manifest_duplicate_identity:{}:{}",
+                clean_cell(&key.0),
+                clean_cell(&key.1)
+            ));
+        }
         let expected = conversion_provenance
             .as_ref()
             .and_then(|rows| rows.get(&key))

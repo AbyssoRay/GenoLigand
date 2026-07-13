@@ -1106,6 +1106,34 @@ fn normalized_manifest_rejects_incomplete_or_mismatched_provenance() {
 }
 
 #[test]
+fn normalized_manifest_rejects_duplicate_identity_before_feature_generation() {
+    let root = temp_root("normalized_duplicate_identity");
+    let input = root.join("input.json");
+    let run = root.join("run");
+    write_text(
+        &input,
+        r#"{"inputs":[{"field":"small_molecule","value":"CCO"}],"files":[]}"#,
+    )
+    .expect("input");
+    let options = science_options(&root, &input, &run);
+    run_science_command(ScienceCommand::InputNormalize, &options).expect("normalize");
+
+    let path = run.join("input_normalized_manifest.tsv");
+    let text = read_text(&path).expect("normalized manifest");
+    let mut lines = text.lines();
+    let header = lines.next().expect("header");
+    let row = lines.next().expect("row");
+    write_text(&path, &format!("{header}\n{row}\n{row}\n")).expect("duplicate row");
+    let error = run_science_command(ScienceCommand::FeaturesCompute, &options)
+        .expect_err("duplicate normalized identity must fail before features");
+    fs::remove_dir_all(root).expect("cleanup");
+    assert!(
+        error.contains("normalized_input_manifest_duplicate_identity"),
+        "{error}"
+    );
+}
+
+#[test]
 fn feature_manifest_rejects_empty_identity_and_kind_conflicts() {
     let root = temp_root("feature_identity_validation");
     let input = root.join("input.json");
