@@ -674,6 +674,318 @@ fn input_inspection_is_usable_only_when_all_non_project_records_convert() {
 }
 
 #[test]
+fn input_inspection_reports_each_malformed_non_project_input_value() {
+    let root = temp_root("input_inspection_malformed_values");
+    let input = root.join("input.json");
+    write_text(
+        &input,
+        &(serde_json::json!({
+            "inputs": [
+                {"field": "project_name", "value": "inspection fixture"},
+                {"field": "smiles", "value": "CCO"},
+                {"field": "small_molecule", "value": 42},
+                {"field": "peptide"},
+                {"field": "protein_ligand", "value": ""}
+            ],
+            "files": []
+        })
+        .to_string()
+            + "\n"),
+    )
+    .expect("input");
+
+    let inspection = inspect_input_manifest(&science_options(&root, &input, &root.join("run")))
+        .expect("inspect");
+    fs::remove_dir_all(root).expect("cleanup");
+
+    assert!(!inspection.usable);
+    assert_eq!(inspection.inputs.len(), 4);
+    for (index, row) in inspection.inputs.iter().enumerate() {
+        assert_eq!(row.input_id, format!("input_{}", index + 1));
+        assert_eq!(row.record_id, "record_1");
+    }
+    assert_eq!(inspection.inputs[0].canonical_kind, "small_molecule");
+    assert_eq!(inspection.inputs[1].canonical_kind, "unknown");
+    assert_eq!(inspection.inputs[2].canonical_kind, "unknown");
+    assert_eq!(inspection.inputs[3].canonical_kind, "unknown");
+    assert_eq!(
+        inspection.errors,
+        vec![
+            "input_2:record_1:invalid_input_value_type",
+            "input_3:record_1:missing_input_value",
+            "input_4:record_1:empty_input_value",
+        ]
+    );
+}
+
+#[test]
+fn input_inspection_reports_each_malformed_non_project_file_value() {
+    let root = temp_root("input_inspection_malformed_files");
+    let sdf = root.join("ethanol.sdf");
+    write_text(&sdf, &format!("{}$$$$\n", ethanol_mol_block())).expect("sdf");
+    let input = root.join("input.json");
+    write_text(
+        &input,
+        &(serde_json::json!({
+            "inputs": [{"field": "project_name", "value": "inspection fixture"}],
+            "files": [
+                {
+                    "field": "small_molecule",
+                    "name": "ethanol.sdf",
+                    "persisted_path": sdf.display().to_string()
+                },
+                {"field": "small_molecule", "name": "bad.sdf", "persisted_path": 42},
+                {"field": "peptide"},
+                {"field": "protein_ligand", "name": "", "persisted_path": ""},
+                {"field": "project_name", "name": "metadata"}
+            ]
+        })
+        .to_string()
+            + "\n"),
+    )
+    .expect("input");
+
+    let converted =
+        convert_inputs_from_manifest(&science_options(&root, &input, &root.join("run")))
+            .expect("convert");
+    fs::remove_dir_all(root).expect("cleanup");
+
+    assert_eq!(converted.len(), 4);
+    for (index, row) in converted.iter().enumerate() {
+        assert_eq!(row.input_id, format!("input_{}", index + 1));
+        assert_eq!(row.record_id, "record_1");
+        assert_eq!(row.source_kind, "file");
+    }
+    assert_eq!(converted[0].canonical_kind, Some(InputKind::SmallMolecule));
+    assert_eq!(converted[0].source_path, sdf.display().to_string());
+    assert_eq!(converted[0].content_sha256.len(), 64);
+    assert_eq!(converted[1].reason, "invalid_input_value_type");
+    assert_eq!(converted[2].reason, "missing_input_value");
+    assert_eq!(converted[3].reason, "empty_input_value");
+}
+
+#[test]
+fn input_inspection_rejects_unsupported_file_paths_without_inline_fallback() {
+    let root = temp_root("input_inspection_unsupported_file_paths");
+    let input = root.join("input.json");
+    let unknown_extension = root.join("ghost.unknown");
+    let no_extension = root.join("ghost");
+    let known_missing = root.join("ghost.sdf");
+    write_text(
+        &input,
+        &(serde_json::json!({
+            "inputs": [{"field": "smiles", "value": "CCO"}],
+            "files": [
+                {
+                    "field": "small_molecule",
+                    "name": "ghost.unknown",
+                    "persisted_path": unknown_extension.display().to_string()
+                },
+                {
+                    "field": "peptide",
+                    "name": "ghost",
+                    "persisted_path": no_extension.display().to_string()
+                },
+                {
+                    "field": "small_molecule",
+                    "name": "ghost.sdf",
+                    "persisted_path": known_missing.display().to_string()
+                }
+            ]
+        })
+        .to_string()
+            + "\n"),
+    )
+    .expect("input");
+    let options = science_options(&root, &input, &root.join("run"));
+
+    let converted = convert_inputs_from_manifest(&options).expect("convert");
+    let inspection = inspect_input_manifest(&options).expect("inspect");
+    fs::remove_dir_all(root).expect("cleanup");
+
+    assert!(!inspection.usable);
+    assert_eq!(converted.len(), 4);
+    assert_eq!(converted[0].canonical_kind, Some(InputKind::SmallMolecule));
+    for (index, row) in converted[1..].iter().enumerate() {
+        assert_eq!(row.input_id, format!("input_{}", index + 2));
+        assert_eq!(row.record_id, "record_1");
+        assert_eq!(row.source_kind, "file");
+        assert_eq!(row.conversion_status, "failed");
+    }
+    assert_eq!(
+        converted[1].source_path,
+        unknown_extension.display().to_string()
+    );
+    assert_eq!(converted[1].reason, "unsupported_input_file_format");
+    assert_eq!(converted[2].source_path, no_extension.display().to_string());
+    assert_eq!(converted[2].reason, "unsupported_input_file_format");
+    assert!(converted[3].reason.contains("input_file_not_found"));
+}
+
+#[test]
+fn input_manifest_rejects_non_array_input_and_file_sections() {
+    let root = temp_root("input_manifest_array_schema");
+    let input = root.join("input.json");
+
+    write_text(&input, r#"{"inputs":{},"files":[]}"#).expect("input");
+    let error = inspect_input_manifest(&science_options(&root, &input, &root.join("run")))
+        .expect_err("inputs object must fail schema validation");
+    assert_eq!(error, "invalid_input_manifest_schema:inputs_must_be_array");
+
+    write_text(&input, r#"{"inputs":[],"files":"not-an-array"}"#).expect("input");
+    let error = inspect_input_manifest(&science_options(&root, &input, &root.join("run")))
+        .expect_err("files string must fail schema validation");
+    assert_eq!(error, "invalid_input_manifest_schema:files_must_be_array");
+
+    write_text(&input, "{}\n").expect("input");
+    let inspection = inspect_input_manifest(&science_options(&root, &input, &root.join("run")))
+        .expect("missing sections are empty arrays");
+    assert!(!inspection.usable);
+    assert!(inspection.inputs.is_empty());
+    assert!(inspection.errors.is_empty());
+
+    fs::remove_dir_all(root).expect("cleanup");
+}
+
+fn minimal_pdb_block() -> &'static str {
+    "ATOM      1  N   GLY A   1       0.000   0.000   0.000  1.00  0.00           N  \nATOM      2  CA  GLY A   1       1.458   0.000   0.000  1.00  0.00           C  \nTER       3      GLY A   1\nEND\n"
+}
+
+fn convert_declared_file(root: &Path, label: &str, field: &str, source: &Path) -> ConvertedInput {
+    let input = root.join(format!("input_{label}.json"));
+    write_text(
+        &input,
+        &(serde_json::json!({
+            "inputs": [{"field": field, "value": source.display().to_string()}],
+            "files": []
+        })
+        .to_string()
+            + "\n"),
+    )
+    .expect("input");
+    let mut converted = convert_inputs_from_manifest(&science_options(
+        root,
+        &input,
+        &root.join(format!("run_{label}")),
+    ))
+    .expect("convert");
+    assert_eq!(converted.len(), 1);
+    converted.remove(0)
+}
+
+#[test]
+fn declared_fields_control_coordinate_and_molecule_file_compatibility() {
+    let root = temp_root("declared_file_compatibility");
+    let pdb = root.join("structure.pdb");
+    let sdf = root.join("ethanol.sdf");
+    write_text(&pdb, minimal_pdb_block()).expect("pdb");
+    write_text(&sdf, &format!("{}$$$$\n", ethanol_mol_block())).expect("sdf");
+
+    for (label, field, expected_kind) in [
+        ("pdb_peptide", "peptide", InputKind::Peptide),
+        ("pdb_protein", "protein_ligand", InputKind::ProteinLigand),
+        ("pdb_complex", "complex", InputKind::Complex),
+    ] {
+        let row = convert_declared_file(&root, label, field, &pdb);
+        assert_eq!(row.canonical_kind, Some(expected_kind), "field {field}");
+        assert_eq!(row.record_id, "record_1");
+        assert_eq!(row.source_kind, "file");
+        assert_eq!(row.source_path, pdb.display().to_string());
+        assert_eq!(row.content_sha256.len(), 64);
+        assert_eq!(row.structure_atom_count, 2);
+        assert_eq!(row.structure_chain_count, 1);
+        assert_eq!(row.structure_residue_count, 1);
+    }
+
+    for (label, field) in [
+        ("pdb_small", "small_molecule"),
+        ("pdb_genome", "genome_or_metagenome"),
+    ] {
+        let row = convert_declared_file(&root, label, field, &pdb);
+        assert_eq!(row.conversion_status, "failed", "field {field}");
+        assert!(
+            row.reason
+                .contains(&format!("field_format_incompatible:{field}:pdb")),
+            "{}",
+            row.reason
+        );
+    }
+
+    for (label, field) in [
+        ("sdf_peptide", "peptide"),
+        ("sdf_protein", "protein_ligand"),
+        ("sdf_genome", "genome_or_metagenome"),
+        ("sdf_complex", "complex"),
+    ] {
+        let row = convert_declared_file(&root, label, field, &sdf);
+        assert_eq!(row.conversion_status, "failed", "field {field}");
+        assert!(
+            row.reason
+                .contains(&format!("field_format_incompatible:{field}:sdf")),
+            "{}",
+            row.reason
+        );
+    }
+
+    let untyped_sdf = convert_declared_file(&root, "untyped_sdf", "unknown", &sdf);
+    assert_eq!(untyped_sdf.canonical_kind, Some(InputKind::SmallMolecule));
+    let untyped_pdb = convert_declared_file(&root, "untyped_pdb", "unknown", &pdb);
+    assert_eq!(untyped_pdb.canonical_kind, Some(InputKind::Complex));
+
+    fs::remove_dir_all(root).expect("cleanup");
+}
+
+#[test]
+fn genome_field_accepts_nucleotide_or_protein_content_as_genome_family() {
+    let root = temp_root("genome_nucleotide_or_protein");
+    let faa = root.join("protein.faa");
+    write_text(&faa, ">protein\nMKTAYI\n").expect("faa");
+
+    let inline_protein = root.join("inline_protein.json");
+    write_text(
+        &inline_protein,
+        r#"{"inputs":[{"field":"genome_or_metagenome","value":"MKTAYI"}],"files":[]}"#,
+    )
+    .expect("input");
+    let options = science_options(&root, &inline_protein, &root.join("run_inline"));
+    let inline_rows = convert_inputs_from_manifest(&options).expect("convert inline protein");
+    assert_eq!(
+        inline_rows[0].canonical_kind,
+        Some(InputKind::GenomeOrMetagenome)
+    );
+    assert_eq!(
+        inline_rows[0].conversion_method,
+        "standard_amino_acid_sequence"
+    );
+
+    let file_row = convert_declared_file(&root, "genome_faa", "genome_or_metagenome", &faa);
+    assert_eq!(file_row.canonical_kind, Some(InputKind::GenomeOrMetagenome));
+    assert_eq!(file_row.canonical_value, "MKTAYI");
+    assert_eq!(file_row.conversion_method, "standard_amino_acid_sequence");
+    assert_eq!(file_row.record_id, "protein");
+
+    let nucleotide = root.join("nucleotide.json");
+    write_text(
+        &nucleotide,
+        r#"{"inputs":[{"field":"genome_or_metagenome","value":"ACGTACGT"}],"files":[]}"#,
+    )
+    .expect("input");
+    let nucleotide_rows = convert_inputs_from_manifest(&science_options(
+        &root,
+        &nucleotide,
+        &root.join("run_nucleotide"),
+    ))
+    .expect("convert nucleotide");
+    assert_eq!(nucleotide_rows[0].conversion_method, "nucleotide_sequence");
+    assert_eq!(
+        nucleotide_rows[0].canonical_kind,
+        Some(InputKind::GenomeOrMetagenome)
+    );
+
+    fs::remove_dir_all(root).expect("cleanup");
+}
+
+#[test]
 fn input_conversion_manifest_records_inline_provenance() {
     let root = temp_root("inline_provenance");
     let input = root.join("input.json");

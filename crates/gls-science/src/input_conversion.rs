@@ -41,6 +41,8 @@ struct RawInput {
     input_id: String,
     original_field: String,
     value: String,
+    source_kind: &'static str,
+    validation_error: Option<&'static str>,
     file_count: usize,
 }
 
@@ -89,6 +91,10 @@ pub(super) fn convert_inputs_from_manifest(
     let raw_inputs = extract_raw_inputs(&options.input_manifest)?;
     let mut conversions = Vec::new();
     for raw in &raw_inputs {
+        if let Some(reason) = raw.validation_error {
+            conversions.push(failed_manifest_input(raw, reason));
+            continue;
+        }
         match resolve_raw_input(raw, options) {
             Ok(records) => conversions.extend(
                 records
@@ -106,54 +112,86 @@ fn extract_raw_inputs(path: &Path) -> Result<Vec<RawInput>, String> {
     let value = serde_json::from_str::<Value>(text.trim_start_matches('\u{feff}'))
         .map_err(|err| format!("invalid_input_manifest_json:{err}"))?;
     let mut raw = Vec::new();
+    let mut input_index = 0usize;
     let mut file_count = 0usize;
-    if let Some(inputs) = value.get("inputs").and_then(Value::as_array) {
+    if let Some(input_section) = value.get("inputs") {
+        let inputs = input_section
+            .as_array()
+            .ok_or_else(|| "invalid_input_manifest_schema:inputs_must_be_array".to_string())?;
         for item in inputs {
             let field = item.get("field").and_then(Value::as_str).unwrap_or("");
-            let val = item
-                .get("value")
-                .and_then(Value::as_str)
-                .unwrap_or("")
-                .trim();
-            if field != "project_name" && !val.is_empty() {
-                raw.push(RawInput {
-                    input_id: format!("input_{}", raw.len() + 1),
-                    original_field: field.to_ascii_lowercase(),
-                    value: val.to_string(),
-                    file_count,
-                });
+            if field == "project_name" {
+                continue;
             }
+            input_index += 1;
+            let (value, validation_error) = manifest_string_value(item.get("value"));
+            raw.push(RawInput {
+                input_id: format!("input_{input_index}"),
+                original_field: field.to_ascii_lowercase(),
+                value,
+                source_kind: "inline",
+                validation_error,
+                file_count,
+            });
         }
     }
-    if let Some(files) = value.get("files").and_then(Value::as_array) {
+    if let Some(file_section) = value.get("files") {
+        let files = file_section
+            .as_array()
+            .ok_or_else(|| "invalid_input_manifest_schema:files_must_be_array".to_string())?;
         file_count = files.len();
         for file in files {
             let field = file.get("field").and_then(Value::as_str).unwrap_or("");
-            let name = file.get("name").and_then(Value::as_str).unwrap_or("");
-            let persisted = file
-                .get("persisted_path")
-                .and_then(Value::as_str)
-                .unwrap_or("");
-            let key = format!("{field} {name}").to_ascii_lowercase();
-            let val = if persisted.is_empty() {
-                name
-            } else {
-                persisted
-            };
-            if field != "project_name" && !val.is_empty() {
-                raw.push(RawInput {
-                    input_id: format!("input_{}", raw.len() + 1),
-                    original_field: key,
-                    value: val.to_string(),
-                    file_count,
-                });
+            if field == "project_name" {
+                continue;
             }
+            input_index += 1;
+            let name = file.get("name").and_then(Value::as_str).unwrap_or("");
+            let key = format!("{field} {name}").to_ascii_lowercase();
+            let (value, validation_error) = manifest_file_value(file);
+            raw.push(RawInput {
+                input_id: format!("input_{input_index}"),
+                original_field: key,
+                value,
+                source_kind: "file",
+                validation_error,
+                file_count,
+            });
         }
     }
     for item in &mut raw {
         item.file_count = file_count;
     }
     Ok(raw)
+}
+
+fn manifest_string_value(value: Option<&Value>) -> (String, Option<&'static str>) {
+    match value {
+        None => (String::new(), Some("missing_input_value")),
+        Some(Value::String(value)) if value.trim().is_empty() => {
+            (String::new(), Some("empty_input_value"))
+        }
+        Some(Value::String(value)) => (value.trim().to_string(), None),
+        Some(_) => (String::new(), Some("invalid_input_value_type")),
+    }
+}
+
+fn manifest_file_value(file: &Value) -> (String, Option<&'static str>) {
+    match file.get("persisted_path") {
+        Some(Value::String(value)) if !value.trim().is_empty() => (value.trim().to_string(), None),
+        Some(Value::String(_)) | None => match file.get("name") {
+            None if file.get("persisted_path").is_none() => {
+                (String::new(), Some("missing_input_value"))
+            }
+            None => (String::new(), Some("empty_input_value")),
+            Some(Value::String(value)) if value.trim().is_empty() => {
+                (String::new(), Some("empty_input_value"))
+            }
+            Some(Value::String(value)) => (value.trim().to_string(), None),
+            Some(_) => (String::new(), Some("invalid_input_value_type")),
+        },
+        Some(_) => (String::new(), Some("invalid_input_value_type")),
+    }
 }
 
 pub(super) fn normalized_inputs_from_conversions(
@@ -186,40 +224,11 @@ fn convert_resolved_input(
     record: &ResolvedInputRecord,
     options: &ScienceOptions,
 ) -> ConvertedInput {
-    if is_molecule_format(&record.format) {
-        return converted_input(
-            record,
-            ConversionDetails {
-                kind: InputKind::SmallMolecule,
-                canonical_value: record.content.clone(),
-                inferred_kind: "small_molecule",
-                method: "rdkit_structure_file",
-                format: &record.format,
-                artifact: "",
-                risk_flag: "",
-            },
-        );
-    }
-    if is_coordinate_format(&record.format) {
-        let kind = coordinate_kind(&record.original_field);
-        return converted_input(
-            record,
-            ConversionDetails {
-                kind,
-                canonical_value: record.content.clone(),
-                inferred_kind: kind.as_str(),
-                method: "declared_structure_file",
-                format: &record.format,
-                artifact: "",
-                risk_flag: "",
-            },
-        );
-    }
     match normalized_field(&record.original_field) {
         "small_molecule" | "smiles" | "inchi" | "cas" => convert_small_molecule(record, options),
         "peptide" => convert_amino_acid_sequence(record, InputKind::Peptide),
         "protein_ligand" => convert_amino_acid_sequence(record, InputKind::ProteinLigand),
-        "genome_or_metagenome" => convert_nucleotide_sequence(record),
+        "genome_or_metagenome" => convert_nucleotide_or_protein_sequence(record),
         "complex" => convert_complex(record),
         _ => infer_untyped_record(record, options),
     }
@@ -243,6 +252,12 @@ fn convert_small_molecule(
     record: &ResolvedInputRecord,
     options: &ScienceOptions,
 ) -> ConvertedInput {
+    if is_molecule_format(&record.format) {
+        return converted_molecule_file(record);
+    }
+    if record.source_kind == "file" {
+        return failed_field_format(record, "small_molecule");
+    }
     let value = record.content.trim();
     let field = normalized_field(&record.original_field);
     if field == "inchi" || looks_like_inchi(value) {
@@ -331,7 +346,43 @@ fn converted_molecular_text(
     )
 }
 
+fn converted_molecule_file(record: &ResolvedInputRecord) -> ConvertedInput {
+    converted_input(
+        record,
+        ConversionDetails {
+            kind: InputKind::SmallMolecule,
+            canonical_value: record.content.clone(),
+            inferred_kind: "small_molecule",
+            method: "rdkit_structure_file",
+            format: &record.format,
+            artifact: "",
+            risk_flag: "",
+        },
+    )
+}
+
+fn converted_coordinate_file(record: &ResolvedInputRecord, kind: InputKind) -> ConvertedInput {
+    converted_input(
+        record,
+        ConversionDetails {
+            kind,
+            canonical_value: record.content.clone(),
+            inferred_kind: kind.as_str(),
+            method: "declared_structure_file",
+            format: &record.format,
+            artifact: "",
+            risk_flag: "",
+        },
+    )
+}
+
 fn convert_amino_acid_sequence(record: &ResolvedInputRecord, kind: InputKind) -> ConvertedInput {
+    if is_coordinate_format(&record.format) {
+        return converted_coordinate_file(record, kind);
+    }
+    if is_molecule_format(&record.format) {
+        return failed_field_format(record, kind.as_str());
+    }
     let sequence = compact_sequence(&record.content).to_ascii_uppercase();
     if sequence.len() < 2 || !sequence.chars().all(is_standard_amino_acid) {
         return failed_conversion_with_reason(
@@ -381,7 +432,60 @@ fn convert_nucleotide_sequence(record: &ResolvedInputRecord) -> ConvertedInput {
     )
 }
 
+fn convert_nucleotide_or_protein_sequence(record: &ResolvedInputRecord) -> ConvertedInput {
+    if is_molecule_format(&record.format) || is_coordinate_format(&record.format) {
+        return failed_field_format(record, "genome_or_metagenome");
+    }
+    let sequence = compact_sequence(&record.content).to_ascii_uppercase();
+    if sequence.chars().all(is_nucleotide_symbol) {
+        if sequence.len() >= 8 {
+            return converted_input(
+                record,
+                ConversionDetails {
+                    kind: InputKind::GenomeOrMetagenome,
+                    canonical_value: sequence,
+                    inferred_kind: "genome_or_metagenome",
+                    method: "nucleotide_sequence",
+                    format: sequence_text_format(&record.content),
+                    artifact: "",
+                    risk_flag: "",
+                },
+            );
+        }
+        return failed_conversion_with_reason(
+            record,
+            "invalid_nucleotide_or_protein_sequence",
+            "invalid_declared_sequence",
+        );
+    }
+    if sequence.len() >= 2 && sequence.chars().all(is_standard_amino_acid) {
+        return converted_input(
+            record,
+            ConversionDetails {
+                kind: InputKind::GenomeOrMetagenome,
+                canonical_value: sequence,
+                inferred_kind: "genome_or_metagenome",
+                method: "standard_amino_acid_sequence",
+                format: sequence_text_format(&record.content),
+                artifact: "",
+                risk_flag: "",
+            },
+        );
+    }
+    failed_conversion_with_reason(
+        record,
+        "invalid_nucleotide_or_protein_sequence",
+        "invalid_declared_sequence",
+    )
+}
+
 fn convert_complex(record: &ResolvedInputRecord) -> ConvertedInput {
+    if is_coordinate_format(&record.format) {
+        return converted_coordinate_file(record, InputKind::Complex);
+    }
+    if record.source_kind == "file" {
+        return failed_field_format(record, "complex");
+    }
     let value = record.content.trim();
     if count_alphanumeric(value) < 5 {
         return failed_conversion_with_reason(
@@ -405,6 +509,12 @@ fn convert_complex(record: &ResolvedInputRecord) -> ConvertedInput {
 }
 
 fn infer_untyped_record(record: &ResolvedInputRecord, options: &ScienceOptions) -> ConvertedInput {
+    if is_molecule_format(&record.format) {
+        return converted_molecule_file(record);
+    }
+    if is_coordinate_format(&record.format) {
+        return converted_coordinate_file(record, coordinate_kind(&record.original_field));
+    }
     let sequence = compact_sequence(&record.content).to_ascii_uppercase();
     if sequence.len() >= 8 && sequence.chars().all(is_nucleotide_symbol) {
         return convert_nucleotide_sequence(record);
@@ -418,6 +528,14 @@ fn infer_untyped_record(record: &ResolvedInputRecord, options: &ScienceOptions) 
         return convert_amino_acid_sequence(record, kind);
     }
     convert_small_molecule(record, options)
+}
+
+fn failed_field_format(record: &ResolvedInputRecord, field: &str) -> ConvertedInput {
+    failed_conversion_with_reason(
+        record,
+        &format!("field_format_incompatible:{field}:{}", record.format),
+        "declared_field_format_incompatible",
+    )
 }
 
 fn sequence_text_format(value: &str) -> &'static str {
@@ -498,6 +616,9 @@ fn resolve_raw_input(
 ) -> Result<Vec<ResolvedInputRecord>, String> {
     let declared_value = raw.value.trim();
     let Some(format) = recognized_file_format(declared_value) else {
+        if raw.source_kind == "file" {
+            return Err("unsupported_input_file_format".to_string());
+        }
         return Ok(vec![ResolvedInputRecord {
             input_id: raw.input_id.clone(),
             record_id: "record_1".to_string(),
@@ -955,6 +1076,38 @@ fn failed_resolution(raw: &RawInput, reason: &str) -> ConvertedInput {
         reason: reason.to_string(),
         artifact: String::new(),
         risk_flags: vec!["input_file_resolution_failed".to_string()],
+        file_count: raw.file_count,
+    }
+}
+
+fn failed_manifest_input(raw: &RawInput, reason: &str) -> ConvertedInput {
+    ConvertedInput {
+        input_id: raw.input_id.clone(),
+        record_id: "record_1".to_string(),
+        original_field: raw.original_field.clone(),
+        inferred_kind: "unknown".to_string(),
+        canonical_kind: None,
+        canonical_value: String::new(),
+        conversion_status: "failed",
+        conversion_method: "manifest_validation",
+        format: if raw.source_kind == "file" {
+            "file_path".to_string()
+        } else {
+            "plain_text".to_string()
+        },
+        source_kind: raw.source_kind,
+        source_path: if raw.source_kind == "file" {
+            raw.value.clone()
+        } else {
+            String::new()
+        },
+        content_sha256: String::new(),
+        structure_atom_count: 0,
+        structure_chain_count: 0,
+        structure_residue_count: 0,
+        reason: reason.to_string(),
+        artifact: String::new(),
+        risk_flags: vec!["manifest_input_invalid".to_string()],
         file_count: raw.file_count,
     }
 }

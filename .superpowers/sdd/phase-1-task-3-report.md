@@ -56,3 +56,50 @@ The Rust molecular tests execute the installed GenoLigand Python worker runtime 
 ## Remaining operational dependency
 
 Production name/CAS coverage depends on the Phase 2 producer populating `science_store/indexes/compound_identifiers.tsv` with the declared header and RDKit-valid mapped SMILES. Unknown identifiers fail explicitly until a matching local row exists.
+
+## Review follow-up: input inspection contracts
+
+### Baseline and scope
+
+- Review baseline HEAD: `ad80c9eb873055b90d990913c543312d79dfd89d`
+- Version: `0.9.46` -> `0.9.47`
+- Scope: malformed manifest records, field-first file classification, genome nucleotide-or-protein conversion, unsupported file identity, and top-level manifest schema validation.
+- Python resolver status: `python/genoligand_workers/input_resolver.py` did not require a review change; its bytecode compilation was still verified locally.
+
+### RED evidence
+
+The review tests were added before implementation and run individually against the review baseline behavior:
+
+| Command | RED result |
+|---|---|
+| `cargo test -p gls-science input_inspection_reports_each_malformed_non_project_input_value` | Failed: one valid SMILES made inspection usable because numeric, missing, and empty non-project values were omitted. |
+| `cargo test -p gls-science input_inspection_reports_each_malformed_non_project_file_value` | Failed: malformed and empty non-project file entries were omitted, leaving two rows instead of four. |
+| `cargo test -p gls-science declared_fields_control_coordinate_and_molecule_file_compatibility` | Failed: a PDB declared as peptide was classified as `ProteinLigand`; molecular and coordinate format handling preceded the declared field. |
+| `cargo test -p gls-science genome_field_accepts_nucleotide_or_protein_content_as_genome_family` | Failed: an inline standard amino-acid sequence under `genome_or_metagenome` had no canonical family. |
+| `cargo test -p gls-science input_inspection_rejects_unsupported_file_paths_without_inline_fallback` | Failed: unknown-extension and extensionless `files[]` values fell through as inline text and lost file source identity. |
+| `cargo test -p gls-science input_manifest_rejects_non_array_input_and_file_sections` | Failed: a present non-array `inputs` section returned an empty inspection instead of a schema error. |
+
+### Implementation
+
+- Retains every non-project `inputs[]` and `files[]` item with stable `input_id` and `record_1`, including invalid value types, missing values, and empty values.
+- Emits per-record `invalid_input_value_type`, `missing_input_value`, and `empty_input_value` failures while preserving inline or file provenance.
+- Rejects present non-array top-level sections with `invalid_input_manifest_schema:inputs_must_be_array` or `invalid_input_manifest_schema:files_must_be_array`; missing sections remain empty.
+- Dispatches declared scientific fields before file-format inference. PDB files retain declared peptide, protein, or complex families, while incompatible field/format pairs fail explicitly.
+- Restricts declared small molecules to RDKit molecular structure formats and retains actual-format inference for untyped files.
+- Converts declared genome/metagenome content as nucleotide first and standard amino acid second, preserving the `GenomeOrMetagenome` canonical family for inline and `.faa` protein sequences.
+- Rejects unknown-extension and extensionless `files[]` values as `unsupported_input_file_format` before inline inference, while known missing files continue to report `input_file_not_found`.
+- Preserves Task 2 source path, record identity, file SHA-256, structure metadata, and multi-record parsing through the existing RDKit/OpenMM-backed resolution paths.
+
+### GREEN evidence
+
+| Command | Result |
+|---|---|
+| `cargo test -p gls-science input_inspection` | PASS, 5/5 |
+| `cargo test -p gls-science input_manifest_rejects_non_array_input_and_file_sections` | PASS, 1/1 |
+| `cargo test -p gls-science declared_fields_control_coordinate_and_molecule_file_compatibility` | PASS, 1/1 |
+| `cargo test -p gls-science genome_field_accepts_nucleotide_or_protein_content_as_genome_family` | PASS, 1/1 |
+| `cargo test -p gls-science` | PASS, 99/99; doc-tests PASS |
+| `python -m py_compile python\genoligand_workers\input_resolver.py` | PASS |
+| `cargo fmt --all -- --check` | PASS |
+| `cargo clippy --workspace --all-targets --all-features -- -D warnings` | PASS for all workspace targets and features at 0.9.47 |
+| `cargo test --workspace --all-features` | PASS, 173/173: CLI 3, science 99, server 71; doc-tests PASS |
