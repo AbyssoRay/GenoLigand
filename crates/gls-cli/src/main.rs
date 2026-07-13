@@ -77,23 +77,32 @@ impl CommonArgs {
             }
             index += 1;
         }
-        let workspace_root =
-            workspace_root.unwrap_or(std::env::current_dir().map_err(|err| err.to_string())?);
-        let science_store = science_store
-            .or_else(|| {
-                std::env::var("GENOLIGAND_SCIENCE_STORE")
-                    .ok()
-                    .map(PathBuf::from)
-            })
-            .unwrap_or_else(|| default_science_store(&workspace_root));
-        let (input_manifest, run_dir) = if command == ScienceCommand::PrepareScienceStore {
-            (PathBuf::new(), PathBuf::new())
-        } else {
-            (
-                input_manifest.ok_or("missing_required_option:--input-manifest")?,
-                run_dir.ok_or("missing_required_option:--run-dir")?,
-            )
-        };
+        let (workspace_root, science_store, input_manifest, run_dir) =
+            if command == ScienceCommand::PrepareScienceStore {
+                let workspace_root = workspace_root
+                    .unwrap_or(std::env::current_dir().map_err(|err| err.to_string())?);
+                let science_store = science_store
+                    .or_else(|| {
+                        std::env::var("GENOLIGAND_SCIENCE_STORE")
+                            .ok()
+                            .filter(|value| !value.trim().is_empty())
+                            .map(PathBuf::from)
+                    })
+                    .unwrap_or_else(|| default_science_store(&workspace_root));
+                (
+                    workspace_root,
+                    science_store,
+                    PathBuf::new(),
+                    PathBuf::new(),
+                )
+            } else {
+                (
+                    workspace_root.ok_or("missing_required_option:--workspace-root")?,
+                    science_store.ok_or("missing_required_option:--science-store")?,
+                    input_manifest.ok_or("missing_required_option:--input-manifest")?,
+                    run_dir.ok_or("missing_required_option:--run-dir")?,
+                )
+            };
         Ok(Self {
             workspace_root,
             science_store,
@@ -154,43 +163,103 @@ fn is_help(args: &[String]) -> bool {
 const HELP: &str = "\
 usage:
   gls-cli install prepare-science-store [--science-store PATH] [--workspace-root PATH]
-  gls-cli input normalize --input-manifest PATH --run-dir PATH [--science-store PATH]
-  gls-cli features compute --input-manifest PATH --run-dir PATH [--science-store PATH]
-  gls-cli database match-known --input-manifest PATH --run-dir PATH [--science-store PATH]
-  gls-cli metagenome match-potential --input-manifest PATH --run-dir PATH [--science-store PATH]
-  gls-cli structure evaluate --input-manifest PATH --run-dir PATH [--science-store PATH]
-  gls-cli dynamics screen --input-manifest PATH --run-dir PATH [--science-store PATH]
-  gls-cli target rank --input-manifest PATH --run-dir PATH [--science-store PATH]
-  gls-cli evidence build --input-manifest PATH --run-dir PATH [--science-store PATH]
-  gls-cli report render --input-manifest PATH --run-dir PATH [--science-store PATH]
-  gls-cli pipeline run --input-manifest PATH --run-dir PATH [--science-store PATH]
+  gls-cli input normalize --workspace-root PATH --science-store PATH --input-manifest PATH --run-dir PATH
+  gls-cli features compute --workspace-root PATH --science-store PATH --input-manifest PATH --run-dir PATH
+  gls-cli database match-known --workspace-root PATH --science-store PATH --input-manifest PATH --run-dir PATH
+  gls-cli metagenome match-potential --workspace-root PATH --science-store PATH --input-manifest PATH --run-dir PATH
+  gls-cli structure evaluate --workspace-root PATH --science-store PATH --input-manifest PATH --run-dir PATH
+  gls-cli dynamics screen --workspace-root PATH --science-store PATH --input-manifest PATH --run-dir PATH
+  gls-cli target rank --workspace-root PATH --science-store PATH --input-manifest PATH --run-dir PATH
+  gls-cli evidence build --workspace-root PATH --science-store PATH --input-manifest PATH --run-dir PATH
+  gls-cli report render --workspace-root PATH --science-store PATH --input-manifest PATH --run-dir PATH
+  gls-cli pipeline run --workspace-root PATH --science-store PATH --input-manifest PATH --run-dir PATH
 ";
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    #[test]
-    fn science_command_requires_input_manifest_and_run_dir() {
-        let args = vec!["--science-store".into(), "store".into()];
-        let error = CommonArgs::parse(ScienceCommand::InputNormalize, &args)
-            .expect_err("science paths must be required");
-        assert_eq!(error, "missing_required_option:--input-manifest");
+    const SCIENCE_COMMANDS: [ScienceCommand; 10] = [
+        ScienceCommand::InputNormalize,
+        ScienceCommand::FeaturesCompute,
+        ScienceCommand::DatabaseMatchKnown,
+        ScienceCommand::MetagenomeMatchPotential,
+        ScienceCommand::StructureEvaluate,
+        ScienceCommand::DynamicsScreen,
+        ScienceCommand::TargetRank,
+        ScienceCommand::EvidenceBuild,
+        ScienceCommand::ReportRender,
+        ScienceCommand::PipelineRun,
+    ];
+
+    const REQUIRED_PATHS: [(&str, &str); 4] = [
+        ("--workspace-root", "workspace"),
+        ("--science-store", "store"),
+        ("--input-manifest", "input.json"),
+        ("--run-dir", "run"),
+    ];
+
+    fn science_args() -> Vec<String> {
+        REQUIRED_PATHS
+            .iter()
+            .flat_map(|(flag, value)| [flag.to_string(), value.to_string()])
+            .collect()
     }
 
     #[test]
-    fn path_options_reject_empty_values() {
-        let args = vec!["--science-store".into(), "".into()];
-        let error = CommonArgs::parse(ScienceCommand::PrepareScienceStore, &args)
-            .expect_err("empty path must fail");
-        assert_eq!(error, "empty_value_for:--science-store");
+    fn science_commands_require_all_documented_paths() {
+        for command in SCIENCE_COMMANDS {
+            for (flag, _) in REQUIRED_PATHS {
+                let mut args = science_args();
+                let position = args.iter().position(|arg| arg == flag).expect("test flag");
+                args.drain(position..=position + 1);
+
+                let error = CommonArgs::parse(command, &args)
+                    .expect_err("science command path must be required");
+                assert_eq!(error, format!("missing_required_option:{flag}"));
+            }
+        }
     }
 
     #[test]
-    fn install_command_does_not_require_run_paths() {
-        let args = vec!["--science-store".into(), "store".into()];
+    fn science_commands_reject_blank_path_values() {
+        for (flag, _) in REQUIRED_PATHS {
+            let mut args = science_args();
+            let position = args.iter().position(|arg| arg == flag).expect("test flag");
+            args[position + 1] = " \t".to_string();
+
+            let error = CommonArgs::parse(ScienceCommand::InputNormalize, &args)
+                .expect_err("blank science command path must fail");
+            assert_eq!(error, format!("empty_value_for:{flag}"));
+        }
+    }
+
+    #[test]
+    fn install_command_keeps_workspace_and_store_defaults() {
         let parsed =
-            CommonArgs::parse(ScienceCommand::PrepareScienceStore, &args).expect("install args");
-        assert_eq!(parsed.science_store, PathBuf::from("store"));
+            CommonArgs::parse(ScienceCommand::PrepareScienceStore, &[]).expect("install defaults");
+
+        assert_eq!(parsed.workspace_root, std::env::current_dir().unwrap());
+        assert!(!parsed.science_store.as_os_str().is_empty());
+        assert!(parsed.input_manifest.as_os_str().is_empty());
+        assert!(parsed.run_dir.as_os_str().is_empty());
+    }
+
+    #[test]
+    fn help_marks_only_install_paths_as_optional() {
+        let usage = HELP
+            .lines()
+            .filter(|line| line.starts_with("  gls-cli "))
+            .collect::<Vec<_>>();
+        let (install, science) = usage.split_first().expect("usage lines");
+
+        assert!(install.contains("[--science-store PATH]"));
+        assert!(install.contains("[--workspace-root PATH]"));
+        for line in science {
+            for (flag, _) in REQUIRED_PATHS {
+                assert!(line.contains(&format!("{flag} PATH")), "{line}");
+            }
+            assert!(!line.contains('['), "{line}");
+        }
     }
 }

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import atexit
 import concurrent.futures
 import csv
 import hashlib
@@ -12,10 +13,12 @@ import shutil
 import ssl
 import subprocess
 import sys
+import threading
 import time
 import urllib.error
 import urllib.parse
 import urllib.request
+import uuid
 from pathlib import Path
 from typing import Callable, Sequence
 
@@ -134,6 +137,10 @@ DEFAULT_ALIGNMENT_DB_MAX_SOURCE_BYTES = 0
 DEFAULT_PARTIAL_INDEX_LARGE_SOURCE_BYTES = 1 * 1024 * 1024 * 1024
 DEFAULT_BINDINGDB_PARTIAL_INDEX_LARGE_SOURCE_BYTES = 500 * 1024 * 1024
 RESERVED_WSL_DISTROS = {"Ubuntu-24.04"}
+INSTALL_LOCK_HEARTBEAT_SECONDS = 15.0
+INSTALL_LOCK_WAIT_SECONDS = 5.0
+INSTALL_LOCK_INCOMPLETE_GRACE_SECONDS = 10.0
+PROCESS_START_TOLERANCE_SECONDS = 2.0
 DOWNLOAD_RETRIES = 3
 DOWNLOAD_TIMEOUT_SECONDS = 120
 DOWNLOAD_USER_AGENT = "GenoLigand-science-store-installer/0.9"
@@ -353,18 +360,25 @@ def ensure_cargo_available() -> str:
     return ""
 
 
+class BinaryBuildError(RuntimeError):
+    pass
+
+
 def build_release_binary(root: Path, binary_name: str, cargo_package: str) -> Path | None:
     if not (root / "Cargo.toml").exists():
         return None
     cargo = ensure_cargo_available()
     if not cargo:
-        return None
+        raise BinaryBuildError(f"cannot build {binary_name}: cargo is unavailable")
     executable = f"{binary_name}.exe" if os.name == "nt" else binary_name
     binary = root / "target" / "release" / executable
     completed = run_command([cargo, "build", "--release", "-p", cargo_package])
-    if completed.returncode == 0 and binary.exists():
-        return binary
-    return binary if binary.exists() else None
+    if completed.returncode != 0:
+        detail = (completed.stderr or completed.stdout or "cargo build failed").strip()
+        raise BinaryBuildError(f"cannot build {binary_name} (exit {completed.returncode}): {detail}")
+    if not binary.is_file():
+        raise BinaryBuildError(f"cargo reported success but did not produce {binary}")
+    return binary
 
 
 def resolve_binary_command(
@@ -406,14 +420,51 @@ def runtime_executable_name(binary_name: str) -> str:
     return f"{binary_name}.exe" if os.name == "nt" else binary_name
 
 
-def stop_runtime_binary_process(binary_name: str) -> dict[str, object]:
-    executable = runtime_executable_name(binary_name)
+def runtime_instance_record_path(runtime_dir: Path, binary_name: str) -> Path:
+    return runtime_dir / f"{binary_name}.instance.json"
+
+
+def terminate_runtime_pid(pid: int) -> tuple[list[str], subprocess.CompletedProcess[str]]:
     if os.name == "nt":
-        command = ["taskkill", "/F", "/IM", executable]
+        command = ["taskkill", "/PID", str(pid), "/T", "/F"]
     else:
-        command = ["pkill", "-f", executable]
+        command = ["kill", "-TERM", "--", str(pid)]
     completed = subprocess.run(command, capture_output=True, text=True, check=False)
+    return command, completed
+
+
+def stop_runtime_binary_process(runtime_dir: Path, binary_name: str) -> dict[str, object]:
+    record_path = runtime_instance_record_path(runtime_dir, binary_name)
+    record = read_json_object(record_path)
+    instance_id = str(record.get("instance_id", ""))
+    recorded_binary = str(record.get("binary", ""))
+    try:
+        pid = int(record.get("pid", 0) or 0)
+    except (TypeError, ValueError):
+        pid = 0
+    if not instance_id or recorded_binary != binary_name or pid <= 0 or pid == os.getpid():
+        return {
+            "status": "missing_instance_pid",
+            "instance_id": instance_id,
+            "pid": pid,
+            "returncode": 1,
+            "stdout": "",
+            "stderr": "runtime instance record is missing or invalid",
+        }
+    if not process_identity_matches(pid, record.get("started_at")):
+        return {
+            "status": "stale_instance_record",
+            "instance_id": instance_id,
+            "pid": pid,
+            "returncode": 1,
+            "stdout": "",
+            "stderr": "recorded runtime process no longer exists",
+        }
+    command, completed = terminate_runtime_pid(pid)
     return {
+        "status": "stopped" if completed.returncode == 0 else "stop_failed",
+        "instance_id": instance_id,
+        "pid": pid,
         "command": command,
         "returncode": completed.returncode,
         "stdout": completed.stdout.strip(),
@@ -421,12 +472,19 @@ def stop_runtime_binary_process(binary_name: str) -> dict[str, object]:
     }
 
 
-def copy_runtime_binary(source: Path, target: Path, binary_name: str) -> dict[str, object] | None:
+def copy_runtime_binary(
+    source: Path,
+    target: Path,
+    runtime_dir: Path,
+    binary_name: str,
+) -> dict[str, object] | None:
     try:
         shutil.copy2(source, target)
         return None
     except PermissionError:
-        stop_result = stop_runtime_binary_process(binary_name)
+        stop_result = stop_runtime_binary_process(runtime_dir, binary_name)
+        if stop_result.get("returncode") != 0:
+            raise
         time.sleep(1)
         shutil.copy2(source, target)
         return stop_result
@@ -450,7 +508,7 @@ def publish_runtime_binary(command: list[str], runtime_dir: Path, binary_name: s
         target = bin_dir / executable
         stop_result = None
         if source.resolve() != target.resolve():
-            stop_result = copy_runtime_binary(source, target, binary_name)
+            stop_result = copy_runtime_binary(source, target, runtime_dir, binary_name)
         try:
             target.chmod(target.stat().st_mode | 0o755)
         except OSError:
@@ -462,6 +520,50 @@ def publish_runtime_binary(command: list[str], runtime_dir: Path, binary_name: s
         return published, status
     status["status"] = "external_command"
     return command, status
+
+
+def write_runtime_instance_record(
+    runtime_dir: Path,
+    binary_name: str,
+    process: subprocess.Popen[object],
+) -> tuple[Path, str]:
+    instance_id = uuid.uuid4().hex
+    record_path = runtime_instance_record_path(runtime_dir, binary_name)
+    write_json_atomic(
+        record_path,
+        {
+            "instance_id": instance_id,
+            "binary": binary_name,
+            "pid": process.pid,
+            "started_at": process_start_time(process.pid) or time.time(),
+            "created_at": time.time(),
+        },
+    )
+    return record_path, instance_id
+
+
+def clear_runtime_instance_record(record_path: Path, instance_id: str) -> None:
+    current = read_json_object(record_path)
+    if current.get("instance_id") != instance_id:
+        return
+    try:
+        record_path.unlink()
+    except FileNotFoundError:
+        pass
+
+
+def run_runtime_instance(
+    command: list[str],
+    runtime_dir: Path,
+    binary_name: str,
+    env: dict[str, str],
+) -> int:
+    process = subprocess.Popen(command, env=env)
+    record_path, instance_id = write_runtime_instance_record(runtime_dir, binary_name, process)
+    try:
+        return process.wait()
+    finally:
+        clear_runtime_instance_record(record_path, instance_id)
 
 
 def command_env_value(command: list[str]) -> str:
@@ -509,22 +611,60 @@ def write_runtime_launch_environment(
         "path_prepend": path_prepend,
         "server_command": server_command,
     }
+    runtime_launcher = runtime_dir / "run-genoligand-webui.py"
+    runtime_launcher.write_text(
+        "\n".join(
+            [
+                "from __future__ import annotations",
+                "",
+                "import json",
+                "import os",
+                "import subprocess",
+                "import time",
+                "import uuid",
+                "from pathlib import Path",
+                "",
+                f"command = {server_command!r}",
+                f"configured_env = {env!r}",
+                f"path_prepend = {path_prepend!r}",
+                f"runtime_dir = Path({str(runtime_dir)!r})",
+                "environment = os.environ.copy()",
+                "environment.update(configured_env)",
+                "environment['PATH'] = os.pathsep.join([*path_prepend, environment.get('PATH', '')])",
+                "process = subprocess.Popen(command, env=environment)",
+                "instance_id = uuid.uuid4().hex",
+                "record_path = runtime_dir / 'gls-server.instance.json'",
+                "record = {'instance_id': instance_id, 'binary': 'gls-server', 'pid': process.pid, 'started_at': time.time(), 'created_at': time.time()}",
+                "temporary = record_path.with_name(f'.{record_path.name}.{instance_id}.tmp')",
+                "temporary.write_text(json.dumps(record, indent=2) + '\\n', encoding='utf-8')",
+                "os.replace(temporary, record_path)",
+                "try:",
+                "    returncode = process.wait()",
+                "finally:",
+                "    try:",
+                "        current = json.loads(record_path.read_text(encoding='utf-8'))",
+                "    except (OSError, json.JSONDecodeError):",
+                "        current = {}",
+                "    if current.get('instance_id') == instance_id:",
+                "        record_path.unlink(missing_ok=True)",
+                "raise SystemExit(returncode)",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    launch_payload["runtime_launcher"] = str(runtime_launcher)
     launch_json.write_text(json.dumps(launch_payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    launcher_command = [sys.executable, str(runtime_launcher)]
     if os.name == "nt":
         launcher = runtime_dir / "start-genoligand-webui.cmd"
         lines = ["@echo off", "setlocal"]
-        for key, value in env.items():
-            lines.append(f'set "{key}={value}"')
-        lines.append(f'set "PATH={";".join(path_prepend)};%PATH%"')
-        lines.append(subprocess.list2cmdline(server_command))
+        lines.append(subprocess.list2cmdline(launcher_command))
         launcher.write_text("\r\n".join(lines) + "\r\n", encoding="utf-8")
     else:
         launcher = runtime_dir / "start-genoligand-webui.sh"
         lines = ["#!/usr/bin/env sh", "set -eu"]
-        for key, value in env.items():
-            lines.append(f"export {key}={shell_quote(value)}")
-        lines.append(f"export PATH={shell_quote(':'.join(path_prepend))}:$PATH")
-        lines.append(" ".join(shell_quote(part) for part in server_command))
+        lines.append("exec " + " ".join(shell_quote(part) for part in launcher_command))
         launcher.write_text("\n".join(lines) + "\n", encoding="utf-8")
         launcher.chmod(0o755)
     return {
@@ -542,6 +682,11 @@ def runtime_backend() -> str:
     if "microsoft" in platform.release().lower():
         return "wsl2_linux"
     return "native_linux"
+
+
+def gpu_md_required(explicit: bool = False) -> bool:
+    configured = os.environ.get("GENOLIGAND_REQUIRE_GPU_MD", "").strip().lower()
+    return explicit or configured in {"1", "true", "yes", "on"}
 
 
 def tool_path_entries(workspace_root: Path, extra_entries: Sequence[Path] | None = None) -> list[str]:
@@ -679,6 +824,8 @@ def list_wsl_distributions() -> list[str]:
     if os.name != "nt":
         return []
     completed = run_command_bytes(["wsl.exe", "-l", "-q"])
+    if completed.returncode != 0:
+        return []
     text = decode_process_bytes(completed.stdout)
     names = []
     for line in text.splitlines():
@@ -688,15 +835,31 @@ def list_wsl_distributions() -> list[str]:
     return names
 
 
+def reserved_wsl_distro(name: str) -> bool:
+    normalized = name.strip().casefold()
+    return any(normalized == reserved.casefold() for reserved in RESERVED_WSL_DISTROS)
+
+
+def wsl_distribution_usable(distro: str) -> bool:
+    completed = run_wsl_command(
+        distro,
+        ["bash", "-lc", "test -n \"$HOME\" && command -v sh >/dev/null 2>&1 && printf GENOLIGAND_WSL_READY"],
+    )
+    return completed.returncode == 0 and "GENOLIGAND_WSL_READY" in completed.stdout
+
+
 def selected_project_wsl_distro(explicit: str | None) -> str | None:
     if os.name != "nt":
         return None
     names = list_wsl_distributions()
     requested = explicit or os.environ.get("GENOLIGAND_WSL_DISTRO", "")
     if requested:
-        return requested if requested in names and requested not in RESERVED_WSL_DISTROS else None
+        selected = next((name for name in names if name.casefold() == requested.casefold()), None)
+        if selected and not reserved_wsl_distro(selected) and wsl_distribution_usable(selected):
+            return selected
+        return None
     for name in names:
-        if name not in RESERVED_WSL_DISTROS and name.lower().startswith("genoligand"):
+        if not reserved_wsl_distro(name) and wsl_distribution_usable(name):
             return name
     return None
 
@@ -799,8 +962,8 @@ def probe_python_import(python: Path, import_name: str, version_expr: str) -> di
     }
 
 
-def python_tool_total() -> int:
-    return len(PYTHON_TOOL_PACKAGES) + 1
+def python_tool_total(require_cuda: bool = False) -> int:
+    return len(PYTHON_TOOL_PACKAGES) + int(require_cuda)
 
 
 OPENMM_CUDA_PROBE_CODE = r"""
@@ -918,8 +1081,14 @@ def openmm_cuda_manifest_row(
     }
 
 
-def ensure_local_openmm_cuda(python: Path, skip_install: bool) -> dict[str, object]:
+def ensure_local_openmm_cuda(
+    python: Path,
+    skip_install: bool,
+    required: bool = False,
+) -> dict[str, object]:
     probe = probe_local_openmm_cuda(python)
+    if not required:
+        return openmm_cuda_manifest_row(str(python), probe, "not_required")
     repair_action = "not_needed" if probe.get("cuda_ready") else "pending"
     if not probe.get("cuda_ready") and not skip_install:
         installed = run_command([str(python), "-m", "pip", "install", OPENMM_CUDA_PIP_PACKAGE])
@@ -943,9 +1112,17 @@ def probe_wsl_cuda_runtime(distro: str) -> str:
     return (completed.stdout or completed.stderr or "wsl_cuda_probe_failed").strip().replace("\n", " ")
 
 
-def ensure_wsl_openmm_cuda(distro: str, python_path: str, wrapper: Path, skip_install: bool) -> dict[str, object]:
+def ensure_wsl_openmm_cuda(
+    distro: str,
+    python_path: str,
+    wrapper: Path,
+    skip_install: bool,
+    required: bool = False,
+) -> dict[str, object]:
     runtime_notes = probe_wsl_cuda_runtime(distro)
     probe = probe_wsl_openmm_cuda(distro, python_path)
+    if not required:
+        return openmm_cuda_manifest_row(str(wrapper), probe, "not_required", runtime_notes)
     repair_action = "not_needed" if probe.get("cuda_ready") else "pending"
     if not probe.get("cuda_ready") and not skip_install:
         installed = run_wsl_command(distro, [python_path, "-m", "pip", "install", OPENMM_CUDA_PIP_PACKAGE])
@@ -963,6 +1140,7 @@ def ensure_python_tool_environment(
     skip_install: bool,
     backend: str = "local",
     wsl_distro: str | None = None,
+    require_cuda: bool = False,
 ) -> dict[str, object]:
     if backend == "wsl":
         if not wsl_distro:
@@ -972,14 +1150,18 @@ def ensure_python_tool_environment(
                 "python": "",
                 "manifest": str(env_dir / "tool_environment_manifest.tsv"),
                 "ready": 0,
-                "total": python_tool_total(),
+                "total": python_tool_total(require_cuda),
                 "environment": "missing_wsl_distribution",
             }
-        return ensure_wsl_python_tool_environment(env_dir, wsl_distro, skip_install)
-    return ensure_local_python_tool_environment(env_dir, skip_install)
+        return ensure_wsl_python_tool_environment(env_dir, wsl_distro, skip_install, require_cuda)
+    return ensure_local_python_tool_environment(env_dir, skip_install, require_cuda)
 
 
-def ensure_local_python_tool_environment(env_dir: Path, skip_install: bool) -> dict[str, object]:
+def ensure_local_python_tool_environment(
+    env_dir: Path,
+    skip_install: bool,
+    require_cuda: bool = False,
+) -> dict[str, object]:
     manifest = env_dir / "tool_environment_manifest.tsv"
     python = venv_python(env_dir)
     env_dir.mkdir(parents=True, exist_ok=True)
@@ -1010,7 +1192,7 @@ def ensure_local_python_tool_environment(env_dir: Path, skip_install: bool) -> d
                 "python": str(python),
                     "manifest": str(manifest),
                     "ready": 0,
-                    "total": python_tool_total(),
+                    "total": python_tool_total(require_cuda),
                 }
         create_status = "created"
     if not skip_install:
@@ -1042,12 +1224,12 @@ def ensure_local_python_tool_environment(env_dir: Path, skip_install: bool) -> d
                 "notes": notes,
             }
         )
-    cuda_row = ensure_local_openmm_cuda(python, skip_install)
-    if cuda_row["status"] == "ready":
+    cuda_row = ensure_local_openmm_cuda(python, skip_install, require_cuda)
+    if require_cuda and cuda_row["status"] == "ready":
         ready += 1
     rows.append(cuda_row)
     write_python_tool_manifest(manifest, rows)
-    total = python_tool_total()
+    total = python_tool_total(require_cuda)
     return {
         "status": "ready" if ready == total else "needs_repair" if not skip_install else "skipped",
         "backend": "local",
@@ -1059,7 +1241,12 @@ def ensure_local_python_tool_environment(env_dir: Path, skip_install: bool) -> d
     }
 
 
-def ensure_wsl_python_tool_environment(env_dir: Path, distro: str, skip_install: bool) -> dict[str, object]:
+def ensure_wsl_python_tool_environment(
+    env_dir: Path,
+    distro: str,
+    skip_install: bool,
+    require_cuda: bool = False,
+) -> dict[str, object]:
     manifest = env_dir / "tool_environment_manifest.tsv"
     wrapper = env_dir / "genoligand-wsl-python.cmd"
     env_dir.mkdir(parents=True, exist_ok=True)
@@ -1086,7 +1273,7 @@ def ensure_wsl_python_tool_environment(env_dir: Path, distro: str, skip_install:
             "python": str(wrapper),
                     "manifest": str(manifest),
                     "ready": 0,
-                    "total": python_tool_total(),
+                    "total": python_tool_total(require_cuda),
                     "environment": "wsl_unavailable",
                 }
     python_path = f"{home}/.local/state/genoligand/python-worker-env/bin/python"
@@ -1124,7 +1311,7 @@ def ensure_wsl_python_tool_environment(env_dir: Path, distro: str, skip_install:
             "python": str(wrapper),
             "manifest": str(manifest),
             "ready": 0,
-            "total": python_tool_total(),
+            "total": python_tool_total(require_cuda),
             "environment": "skipped",
         }
     if not skip_install:
@@ -1174,7 +1361,7 @@ def ensure_wsl_python_tool_environment(env_dir: Path, distro: str, skip_install:
                 "python": str(wrapper),
                     "manifest": str(manifest),
                     "ready": 0,
-                    "total": python_tool_total(),
+                    "total": python_tool_total(require_cuda),
                     "environment": "failed",
                 }
     ready = 0
@@ -1208,12 +1395,12 @@ def ensure_wsl_python_tool_environment(env_dir: Path, distro: str, skip_install:
                 "notes": notes,
             }
         )
-    cuda_row = ensure_wsl_openmm_cuda(distro, python_path, wrapper, skip_install)
-    if cuda_row["status"] == "ready":
+    cuda_row = ensure_wsl_openmm_cuda(distro, python_path, wrapper, skip_install, require_cuda)
+    if require_cuda and cuda_row["status"] == "ready":
         ready += 1
     rows.append(cuda_row)
     write_python_tool_manifest(manifest, rows)
-    total = python_tool_total()
+    total = python_tool_total(require_cuda)
     return {
         "status": "ready" if ready == total else "needs_repair",
         "backend": "wsl",
@@ -1640,11 +1827,104 @@ def write_install_progress(
 def process_exists(pid: int) -> bool:
     if pid <= 0:
         return False
+    if os.name == "nt":
+        try:
+            import ctypes
+            from ctypes import wintypes
+
+            kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+            kernel32.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+            kernel32.OpenProcess.restype = wintypes.HANDLE
+            kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+            kernel32.CloseHandle.restype = wintypes.BOOL
+            handle = kernel32.OpenProcess(0x1000, False, pid)
+            if handle:
+                kernel32.CloseHandle(handle)
+                return True
+            return ctypes.get_last_error() == 5
+        except (AttributeError, OSError, ValueError):
+            return False
     try:
         os.kill(pid, 0)
         return True
+    except PermissionError:
+        return True
     except OSError:
         return False
+
+
+def process_start_time(pid: int) -> float | None:
+    if pid <= 0:
+        return None
+    if os.name == "nt":
+        try:
+            import ctypes
+            from ctypes import wintypes
+
+            kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+            kernel32.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+            kernel32.OpenProcess.restype = wintypes.HANDLE
+            kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+            kernel32.CloseHandle.restype = wintypes.BOOL
+            filetime_pointer = ctypes.POINTER(wintypes.FILETIME)
+            kernel32.GetProcessTimes.argtypes = [
+                wintypes.HANDLE,
+                filetime_pointer,
+                filetime_pointer,
+                filetime_pointer,
+                filetime_pointer,
+            ]
+            kernel32.GetProcessTimes.restype = wintypes.BOOL
+            handle = kernel32.OpenProcess(0x1000, False, pid)
+            if not handle:
+                return None
+            try:
+                created = wintypes.FILETIME()
+                exited = wintypes.FILETIME()
+                kernel = wintypes.FILETIME()
+                user = wintypes.FILETIME()
+                if not kernel32.GetProcessTimes(
+                    handle,
+                    ctypes.byref(created),
+                    ctypes.byref(exited),
+                    ctypes.byref(kernel),
+                    ctypes.byref(user),
+                ):
+                    return None
+                ticks = (created.dwHighDateTime << 32) | created.dwLowDateTime
+                return (ticks - 116_444_736_000_000_000) / 10_000_000
+            finally:
+                kernel32.CloseHandle(handle)
+        except (AttributeError, OSError, ValueError):
+            return None
+    proc_stat = Path(f"/proc/{pid}/stat")
+    proc_system = Path("/proc/stat")
+    if not proc_stat.is_file() or not proc_system.is_file():
+        return None
+    try:
+        fields = proc_stat.read_text(encoding="utf-8").rsplit(")", 1)[1].split()
+        start_ticks = int(fields[19])
+        boot_time = next(
+            int(line.split()[1])
+            for line in proc_system.read_text(encoding="utf-8").splitlines()
+            if line.startswith("btime ")
+        )
+        return boot_time + start_ticks / int(os.sysconf("SC_CLK_TCK"))
+    except (IndexError, OSError, StopIteration, ValueError):
+        return None
+
+
+def process_identity_matches(pid: int, started_at: object) -> bool:
+    if not process_exists(pid):
+        return False
+    try:
+        expected = float(started_at or 0)
+    except (TypeError, ValueError):
+        expected = 0
+    actual = process_start_time(pid)
+    if expected <= 0 or actual is None:
+        return True
+    return abs(actual - expected) <= PROCESS_START_TOLERANCE_SECONDS
 
 
 def read_json_object(path: Path) -> dict[str, object]:
@@ -1655,54 +1935,176 @@ def read_json_object(path: Path) -> dict[str, object]:
     return value if isinstance(value, dict) else {}
 
 
-def acquire_install_lock(science_store: Path) -> Path:
-    lock_path = science_store / "install.lock.json"
-    science_store.mkdir(parents=True, exist_ok=True)
-    while True:
-        existing = read_json_object(lock_path)
-        existing_pid = int(existing.get("pid", 0) or 0)
-        if existing_pid and process_exists(existing_pid) and existing_pid != os.getpid():
-            write_install_progress(
-                science_store,
-                status="running",
-                stage="等待安装",
-                current_resource="安装/修复",
-                completed_steps=0,
-                total_steps=6,
-                message="检测到安装/修复正在运行，正在等待当前任务完成。",
-            )
-            time.sleep(30)
-            continue
+def write_json_atomic(path: Path, payload: dict[str, object]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_name(
+        f".{path.name}.{os.getpid()}.{threading.get_ident()}.{uuid.uuid4().hex}.tmp"
+    )
+    try:
+        with temporary.open("x", encoding="utf-8") as handle:
+            json.dump(payload, handle, ensure_ascii=False, indent=2)
+            handle.write("\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary, path)
+    finally:
         try:
-            with lock_path.open("x", encoding="utf-8") as handle:
-                json.dump(
-                    {
-                        "pid": os.getpid(),
-                        "started_at": int(time.time()),
-                        "command": " ".join(sys.argv),
-                    },
-                    handle,
-                    ensure_ascii=False,
-                    indent=2,
-                )
-                handle.write("\n")
-            return lock_path
-        except FileExistsError:
+            temporary.unlink()
+        except FileNotFoundError:
+            pass
+
+
+def create_json_new(path: Path, payload: dict[str, object]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    descriptor = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    try:
+        with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
+            json.dump(payload, handle, ensure_ascii=False, indent=2)
+            handle.write("\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+    except BaseException:
+        try:
+            path.unlink()
+        except FileNotFoundError:
+            pass
+        raise
+
+
+def install_lock_is_stale(payload: dict[str, object], lock_path: Path | None = None) -> bool:
+    try:
+        pid = int(payload.get("pid", 0) or 0)
+    except (TypeError, ValueError):
+        pid = 0
+    if pid > 0:
+        if not process_exists(pid):
+            return True
+        if not payload.get("owner_id"):
+            return False
+        return not process_identity_matches(pid, payload.get("started_at"))
+    if lock_path is None:
+        return True
+    try:
+        age = max(0.0, time.time() - lock_path.stat().st_mtime)
+    except FileNotFoundError:
+        return True
+    return age >= INSTALL_LOCK_INCOMPLETE_GRACE_SECONDS
+
+
+def reclaim_stale_install_lock(lock_path: Path) -> bool:
+    claim_path = lock_path.with_name(f"{lock_path.name}.reclaim")
+    owner_id = uuid.uuid4().hex
+    started_at = process_start_time(os.getpid()) or time.time()
+    claim = {
+        "owner_id": owner_id,
+        "pid": os.getpid(),
+        "started_at": started_at,
+        "heartbeat_at": time.time(),
+    }
+    try:
+        create_json_new(claim_path, claim)
+    except FileExistsError:
+        existing_claim = read_json_object(claim_path)
+        if install_lock_is_stale(existing_claim, claim_path):
             try:
-                lock_path.unlink()
-            except OSError:
-                time.sleep(5)
-
-
-def release_install_lock(lock_path: Path | None) -> None:
-    if not lock_path:
-        return
-    existing = read_json_object(lock_path)
-    existing_pid = int(existing.get("pid", 0) or 0)
-    if existing_pid in (0, os.getpid()):
+                claim_path.unlink()
+            except FileNotFoundError:
+                pass
+        return False
+    try:
+        current = read_json_object(lock_path)
+        if not install_lock_is_stale(current, lock_path):
+            return False
         try:
             lock_path.unlink()
-        except OSError:
+        except FileNotFoundError:
+            pass
+        return True
+    finally:
+        current_claim = read_json_object(claim_path)
+        if current_claim.get("owner_id") == owner_id:
+            try:
+                claim_path.unlink()
+            except FileNotFoundError:
+                pass
+
+
+class InstallLock:
+    def __init__(self, path: Path, owner_id: str) -> None:
+        self.path = path
+        self.owner_id = owner_id
+        self._stopped = threading.Event()
+        self._released = False
+        self._release_guard = threading.Lock()
+        self._thread = threading.Thread(target=self._heartbeat, name="genoligand-install-lock", daemon=True)
+        self._thread.start()
+        atexit.register(self.release)
+
+    def _heartbeat(self) -> None:
+        while not self._stopped.wait(max(0.01, INSTALL_LOCK_HEARTBEAT_SECONDS)):
+            current = read_json_object(self.path)
+            if current.get("owner_id") != self.owner_id:
+                return
+            current["heartbeat_at"] = time.time()
+            try:
+                write_json_atomic(self.path, current)
+            except OSError:
+                continue
+
+    def release(self) -> None:
+        with self._release_guard:
+            if self._released:
+                return
+            self._released = True
+            self._stopped.set()
+            if threading.current_thread() is not self._thread:
+                self._thread.join()
+            current = read_json_object(self.path)
+            if current.get("owner_id") != self.owner_id:
+                return
+            try:
+                self.path.unlink()
+            except FileNotFoundError:
+                pass
+
+
+def acquire_install_lock(science_store: Path) -> InstallLock:
+    lock_path = science_store / "install.lock.json"
+    science_store.mkdir(parents=True, exist_ok=True)
+    owner_id = uuid.uuid4().hex
+    started_at = process_start_time(os.getpid()) or time.time()
+    while True:
+        heartbeat_at = time.time()
+        payload = {
+            "owner_id": owner_id,
+            "pid": os.getpid(),
+            "started_at": started_at,
+            "heartbeat_at": heartbeat_at,
+            "command": " ".join(sys.argv),
+        }
+        try:
+            create_json_new(lock_path, payload)
+            return InstallLock(lock_path, owner_id)
+        except FileExistsError:
+            existing = read_json_object(lock_path)
+            if install_lock_is_stale(existing, lock_path) and reclaim_stale_install_lock(lock_path):
+                continue
+            time.sleep(max(0.01, INSTALL_LOCK_WAIT_SECONDS))
+
+
+def release_install_lock(lock: InstallLock | Path | None) -> None:
+    if not lock:
+        return
+    if isinstance(lock, InstallLock):
+        lock.release()
+        return
+    lock_path = lock
+    existing = read_json_object(lock_path)
+    existing_pid = int(existing.get("pid", 0) or 0)
+    if existing_pid == os.getpid() and process_identity_matches(existing_pid, existing.get("started_at")):
+        try:
+            lock_path.unlink()
+        except FileNotFoundError:
             pass
 
 
@@ -4658,6 +5060,7 @@ def main() -> int:
     parser.add_argument("--python-env-dir")
     parser.add_argument("--python-backend", choices=["auto", "local", "wsl"], default="auto")
     parser.add_argument("--wsl-distro")
+    parser.add_argument("--require-gpu-md", action="store_true")
     parser.add_argument("--no-download", action="store_true")
     parser.add_argument("--no-tool-install", action="store_true")
     parser.add_argument("--host", default="127.0.0.1")
@@ -4665,6 +5068,7 @@ def main() -> int:
     parser.add_argument("--start-webui", action="store_true")
     parser.add_argument("--debug-output", action="store_true")
     args = parser.parse_args()
+    require_cuda = gpu_md_required(args.require_gpu_md)
 
     workspace_root = Path(args.workspace_root).resolve()
     science_store = Path(args.science_store).resolve()
@@ -4777,6 +5181,7 @@ def main() -> int:
         args.no_tool_install,
         python_backend,
         selected_wsl,
+        require_cuda,
     )
     write_install_progress(
         science_store,
@@ -4807,14 +5212,53 @@ def main() -> int:
         total_steps=6,
         message="正在构建优化版 GenoLigand 程序",
     )
-    cli_command = resolve_binary_command(
-        args.gls_cli,
-        "GENOLIGAND_GLS_CLI",
-        "gls-cli",
-        "gls-cli",
-        workspace_root,
-    )
-    cli_command, cli_runtime_status = publish_runtime_binary(cli_command, runtime_dir, "gls-cli")
+    try:
+        cli_command = resolve_binary_command(
+            args.gls_cli,
+            "GENOLIGAND_GLS_CLI",
+            "gls-cli",
+            "gls-cli",
+            workspace_root,
+        )
+        cli_command, cli_runtime_status = publish_runtime_binary(cli_command, runtime_dir, "gls-cli")
+        server_base_command = resolve_binary_command(
+            args.gls_server,
+            "GENOLIGAND_GLS_SERVER",
+            "gls-server",
+            "gls-server",
+            workspace_root,
+        )
+        server_base_command, server_runtime_status = publish_runtime_binary(
+            server_base_command,
+            runtime_dir,
+            "gls-server",
+        )
+    except BinaryBuildError as err:
+        progress = write_install_progress(
+            science_store,
+            status="failed",
+            stage="构建程序",
+            current_resource="GenoLigand release binaries",
+            completed_steps=4,
+            total_steps=6,
+            failed_steps=1,
+            message=str(err),
+        )
+        print(
+            json.dumps(
+                {
+                    "status": "failed",
+                    "summary": "GenoLigand release 构建失败，安装已停止。",
+                    "next_action": "修复构建错误后重新运行安装/修复",
+                    "progress": progress,
+                    "build_error": str(err),
+                },
+                ensure_ascii=False,
+                indent=2,
+            )
+        )
+        release_install_lock(install_lock)
+        return 2
     command = cli_command + [
         "install",
         "prepare-science-store",
@@ -4936,6 +5380,7 @@ def main() -> int:
         "plinder_index": plinder_index_result,
         "forcefields": forcefield_result,
         "cuda_toolkit": cuda_toolkit_summary(),
+        "gpu_md_required": require_cuda,
         "runtime_binaries": {
             "gls_cli": cli_runtime_status,
         },
@@ -4976,18 +5421,6 @@ def main() -> int:
     exit_code = 0 if payload["install_ready"] else 2
     if completed.returncode != 0:
         exit_code = completed.returncode
-    server_base_command = resolve_binary_command(
-        args.gls_server,
-        "GENOLIGAND_GLS_SERVER",
-        "gls-server",
-        "gls-server",
-        workspace_root,
-    )
-    server_base_command, server_runtime_status = publish_runtime_binary(
-        server_base_command,
-        runtime_dir,
-        "gls-server",
-    )
     server_command = server_base_command + [
         "--host",
         args.host,
@@ -5048,7 +5481,7 @@ def main() -> int:
             indent=2,
         )
     )
-    return subprocess.call(server_command, env=env)
+    return run_runtime_instance(server_command, runtime_dir, "gls-server", env)
 
 
 if __name__ == "__main__":
