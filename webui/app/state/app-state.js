@@ -16,6 +16,8 @@
   runData: null,
   resultTab: "ranking",
   resultQueries: {},
+  inputCapabilities: null,
+  savedInputs: null,
   form: {
     project_name: "",
     small_molecule: "",
@@ -38,50 +40,22 @@
 let setupProgressTimer = null;
 let runProgressTimer = null;
 let inputInspectionTimer = null;
+let setupProgressRequestPromise = null;
+let runProgressRequestPromise = null;
+let resultRequestController = null;
+let resultRequestPromise = null;
+let projectOpenGeneration = 0;
+let setupProgressPollingGeneration = 0;
+let runProgressPollingGeneration = 0;
 
 const page = document.querySelector("[data-page]");
 const alerts = document.querySelector("[data-alerts]");
 const inputSpecs = [
-  {
-    kind: "small_molecule",
-    title: "小分子",
-    field: "small_molecule",
-    label: "SMILES、SDF、MOL2、化合物名称或登记号",
-    placeholder: "粘贴 SMILES，或填写本机结构文件路径",
-    minimum: "至少提供一个可解析的分子表示。",
-  },
-  {
-    kind: "peptide",
-    title: "多肽",
-    field: "peptide",
-    label: "短肽序列、修饰说明或结构文件",
-    placeholder: "输入肽序列；修饰说明可另起一行填写",
-    minimum: "至少提供肽序列或结构文件路径。",
-  },
-  {
-    kind: "protein_ligand",
-    title: "蛋白质配体",
-    field: "protein_ligand",
-    label: "FASTA、蛋白序列或结构文件",
-    placeholder: "粘贴 FASTA、蛋白序列，或填写结构文件路径",
-    minimum: "至少提供序列或结构文件路径。",
-  },
-  {
-    kind: "complex",
-    title: "复合物结构",
-    field: "complex",
-    label: "蛋白-配体复合物结构、链信息或结合区域",
-    placeholder: "填写 PDB/mmCIF 文件路径，并注明链或配体",
-    minimum: "至少提供结构文件路径或复合物描述。",
-  },
-  {
-    kind: "genome_or_metagenome",
-    title: "自定义基因组",
-    field: "genome_or_metagenome",
-    label: "基因组、宏基因组、转录组或蛋白序列文件",
-    placeholder: "填写 FASTA/FASTQ 文件路径，或粘贴蛋白序列",
-    minimum: "至少提供序列文件路径或序列文本。",
-  },
+  { kind: "small_molecule", field: "small_molecule" },
+  { kind: "peptide", field: "peptide" },
+  { kind: "protein_ligand", field: "protein_ligand" },
+  { kind: "complex", field: "complex" },
+  { kind: "genome_or_metagenome", field: "genome_or_metagenome" },
 ];
 
 const stepMeta = {

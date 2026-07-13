@@ -70,11 +70,21 @@ function setupRepairSummary() {
     </div>`;
 }
 
-function installerProgressSummary() {
+function setupProgressForDisplay() {
   const progress = [state.setupProgress, state.setupRepair?.progress, state.setupRepair?.installer?.progress].find(
     (item) => item && item.status !== "idle",
   );
-  if (!progress || progress.status === "idle") return "";
+  if (!progress) return null;
+  const terminal = ["ready", "failed", "needs_repair"].includes(progress.status);
+  const progressReady = progress.status === "ready";
+  const setupReady = state.setup?.database_ready === true;
+  if (terminal && progressReady !== setupReady) return null;
+  return progress;
+}
+
+function installerProgressSummary() {
+  const progress = setupProgressForDisplay();
+  if (!progress) return "";
   const percent = boundedPercent(progress.percent);
   const failed = Number(progress.failed_steps || 0);
   const ok = progress.status === "ready";

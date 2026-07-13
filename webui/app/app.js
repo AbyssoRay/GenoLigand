@@ -24,6 +24,7 @@ async function refreshAll() {
     let projectList;
     [
       state.health,
+      state.inputCapabilities,
       state.databases,
       state.diagnostics,
       state.setup,
@@ -33,6 +34,7 @@ async function refreshAll() {
       projectList,
     ] = await Promise.all([
       api("/api/user/health"),
+      loadInputCapabilities(),
       api("/api/user/databases"),
       api("/api/user/diagnostics"),
       api("/api/user/setup/status"),

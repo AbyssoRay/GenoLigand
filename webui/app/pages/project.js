@@ -30,11 +30,31 @@ function renderProject() {
         ${
           projects.length
             ? `<div class="input-grid">${projects.map(renderProjectCard).join("")}</div>`
-            : `<div class="empty">保存有效输入后，项目会出现在这里。</div>`
+            : `<div class="empty">新建项目后，草稿会保留在这里。</div>`
         }
       </section>
     </div>`;
   bindProjectEvents();
+}
+
+function projectStateMeta(project) {
+  const status = project?.project_status || "";
+  const states = {
+    "draft": { label: "草稿", className: "waiting", description: "可继续填写输入", action: "继续填写" },
+    "input_ready": { label: "输入已就绪", className: "ready", description: "输入已保存，可继续检查", action: "查看输入" },
+    "running": { label: "运行中", className: "loading", description: "可查看当前运行进度", action: "查看运行" },
+    "completed": { label: "已完成", className: "ready", description: "可查看结果或继续编辑输入", action: "查看项目" },
+    "blocked": { label: "等待处理", className: "blocked", description: "需要处理当前阻塞项", action: "查看项目" },
+    "failed": { label: "需要处理", className: "blocked", description: "需要检查日志和输入", action: "查看项目" },
+  };
+  return (
+    states[status] || {
+      label: project?.project_state || "等待输入",
+      className: project?.latest_run_id ? "ready" : "waiting",
+      description: project?.latest_run_id ? "可继续上次运行或查看结果" : "可继续编辑输入",
+      action: "进入",
+    }
+  );
 }
 
 function currentProjectSection(project) {
@@ -45,6 +65,7 @@ function currentProjectSection(project) {
         <div class="empty">当前未进入项目。可以新建项目，或从历史项目进入。</div>
       </section>`;
   }
+  const status = projectStateMeta(project);
   return `
     <section class="panel full">
       <div class="panel-header">
@@ -52,10 +73,10 @@ function currentProjectSection(project) {
           <h2>当前项目</h2>
           <p>${escapeHtml(project.project_name || "未命名研究项目")}</p>
         </div>
-        <span class="status-pill ${project.latest_run_id ? "ready" : "waiting"}">${escapeHtml(project.project_state || "等待输入")}</span>
+        <span class="status-pill ${status.className}">${escapeHtml(status.label)}</span>
       </div>
       ${metricRow("项目名称", project.project_name || "未命名研究项目")}
-      ${metricRow("运行状态", project.project_state || "等待输入")}
+      ${metricRow("项目状态", status.label)}
       ${metricRow("最近运行", project.latest_run_id ? "已有运行记录" : "暂无运行记录")}
       <div class="actions">
         <button class="button" data-action="to-input">进入输入</button>
@@ -68,14 +89,14 @@ function currentProjectSection(project) {
 function renderProjectCard(project) {
   const projectId = project.project_id || "";
   const selected = state.project?.project_id === projectId;
-  const hasRun = Boolean(project.latest_run_id);
+  const status = projectStateMeta(project);
   return `
     <section class="input-card ${selected ? "selected" : ""}">
       <h3>${escapeHtml(project.project_name || "未命名研究项目")}</h3>
-      <p>${hasRun ? "可继续上次运行或查看结果" : "可继续编辑输入"}</p>
-      <span class="status-pill ${hasRun ? "ready" : "waiting"}">${escapeHtml(project.project_state || "等待输入")}</span>
+      <p>${escapeHtml(status.description)}</p>
+      <span class="status-pill ${status.className}">${escapeHtml(status.label)}</span>
       <div class="actions">
-        <button class="button secondary" data-open-project="${escapeAttr(projectId)}">进入</button>
+        <button class="button secondary" data-open-project="${escapeAttr(projectId)}">${status.action}</button>
         <button class="button ghost" data-delete-project="${escapeAttr(projectId)}">删除</button>
       </div>
     </section>`;

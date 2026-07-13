@@ -1,18 +1,41 @@
 use gls_science::{InputInspection, ScienceOptions, inspect_input_manifest};
 use serde_json::{Value, json};
-use std::collections::BTreeMap;
-use std::fs;
-use std::io::{Read, Write};
+use std::collections::{BTreeMap, HashMap, hash_map::RandomState};
+use std::fs::{self, OpenOptions};
+use std::hash::{BuildHasher, Hasher};
+use std::io::{Read, Seek, SeekFrom, Write};
 use std::net::{TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::process::{Child, Command, ExitStatus, Stdio};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 pub const PRODUCT_NAME: &str = "GenoLigand Local WebUI";
 pub const PRODUCT_VERSION: &str = env!("CARGO_PKG_VERSION");
 const RESULT_PAGE_SIZE: usize = 500;
+const RUN_LOG_MAX_BYTES: usize = 1024 * 1024;
+const RUN_LOG_READ_BYTES: usize = 128 * 1024;
+const RUN_LOG_READ_LINES: usize = 500;
+const PROCESS_POLL_INTERVAL: Duration = Duration::from_millis(50);
 static INPUT_INSPECTION_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+static UUID_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+static SERVER_REGISTRY: OnceLock<Mutex<ServerRegistry>> = OnceLock::new();
+
+#[derive(Default)]
+struct ServerRegistry {
+    project_locks: HashMap<PathBuf, Arc<Mutex<()>>>,
+    run_state_locks: HashMap<PathBuf, Arc<Mutex<()>>>,
+    runs: HashMap<PathBuf, Arc<RegisteredRun>>,
+}
+
+struct RegisteredRun {
+    project_dir: PathBuf,
+    process_id: u32,
+    child: Mutex<Child>,
+    log_lock: Arc<Mutex<()>>,
+    monitor_finished: AtomicBool,
+}
 
 const REQUIRED_TOOL_IDS: &[&str] = &[
     "java",
@@ -367,6 +390,7 @@ fn route_user_project(
     let suffix = parts.collect::<Vec<_>>().join("/");
     let value = match (method, suffix.as_str()) {
         ("GET", "") => user_project_detail(options, &project_id),
+        ("GET", "inputs") => read_input_manifest(options, &project_id),
         ("POST", "inputs") => write_user_input_manifest(options, &project_id, request_body),
         ("GET", "preflight") | ("POST", "preflight") => user_preflight_json(options, &project_id),
         ("POST", "runs") => start_user_run(options, &project_id),
@@ -403,7 +427,7 @@ fn route_run(
         }
         ("GET", "structure") => structure_endpoint_json_with_query(options, &run_id, &result_query),
         ("GET", "md-summary") => md_endpoint_json_with_query(options, &run_id, &result_query),
-        ("POST", "cancel") => update_run_state(options, &run_id, "cancelled"),
+        ("POST", "cancel") => cancel_run(options, &run_id),
         ("POST", "resume") => update_run_state(options, &run_id, "resumable"),
         _ => {
             if method == "GET"
@@ -444,6 +468,7 @@ fn route_user_run(
         }
         ("GET", "structure") => structure_endpoint_json_with_query(options, &run_id, &result_query),
         ("GET", "md-summary") => md_endpoint_json_with_query(options, &run_id, &result_query),
+        ("POST", "cancel") => cancel_run(options, &run_id),
         _ => {
             if method == "GET"
                 && let Some(file) = suffix.strip_prefix("download/")
@@ -528,7 +553,9 @@ fn user_workspace_summary_json(options: &ServerOptions) -> Value {
                     }
                     run_count += 1;
                     let run_dir = run.path();
-                    if run_state(&run_dir) == "completed" {
+                    if run_state(&run_dir) == "completed"
+                        && authenticity_gate_allows_results(&run_dir)
+                    {
                         let candidates = rows_len(&run_dir.join("target_candidate_ranking.tsv"));
                         candidate_count += candidates;
                         result_count += candidates
@@ -572,18 +599,28 @@ fn create_user_project(options: &ServerOptions) -> Value {
 }
 
 fn create_project_record(options: &ServerOptions) -> Result<Value, String> {
-    let project_id = format!("project-{}", now_millis());
-    let dir = project_dir(options, &project_id);
-    if let Err(err) = fs::create_dir_all(dir.join("runs")) {
-        return Err(err.to_string());
+    let root = projects_root(options);
+    fs::create_dir_all(&root).map_err(|err| err.to_string())?;
+    for _ in 0..8 {
+        let project_id = format!("project-{}", new_uuid());
+        let dir = root.join(&project_id);
+        match fs::create_dir(&dir) {
+            Ok(()) => {
+                if let Err(err) = fs::create_dir(dir.join("runs")) {
+                    let _ = fs::remove_dir(&dir);
+                    return Err(err.to_string());
+                }
+                return Ok(read_project(options, &project_id));
+            }
+            Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(err) => return Err(err.to_string()),
+        }
     }
-    Ok(read_project(options, &project_id))
+    Err("project_id_allocation_failed".to_string())
 }
 
 fn project_visible_to_user(options: &ServerOptions, project_id: &str) -> bool {
-    let dir = project_dir(options, project_id);
-    input_has_user_value(options, &dir.join("input_manifest.json"))
-        || dir.join("latest_run_id.txt").exists()
+    project_dir(options, project_id).is_dir()
 }
 
 fn user_project_summary(project: &Value) -> Value {
@@ -594,6 +631,7 @@ fn user_project_summary(project: &Value) -> Value {
     json!({
         "project_id": project.get("project_id").cloned().unwrap_or(Value::Null),
         "project_name": project.get("project_name").cloned().unwrap_or(Value::Null),
+        "project_status": status,
         "project_state": friendly_project_state(status),
         "latest_run_id": project.get("latest_run_id").cloned().unwrap_or(Value::Null)
     })
@@ -605,6 +643,8 @@ fn friendly_project_state(status: &str) -> &'static str {
         "running" => "运行中",
         "failed" => "需要处理",
         "blocked" => "等待处理",
+        "input_ready" => "输入已就绪",
+        "draft" => "等待输入",
         _ => "等待输入",
     }
 }
@@ -615,7 +655,13 @@ fn read_project(options: &ServerOptions, project_id: &str) -> Value {
     let status = latest_run_id
         .as_deref()
         .map(|run_id| run_state(&dir.join("runs").join(run_id)))
-        .unwrap_or_else(|| "created".to_string());
+        .unwrap_or_else(|| {
+            if input_has_user_value(options, &dir.join("input_manifest.json")) {
+                "input_ready".to_string()
+            } else {
+                "draft".to_string()
+            }
+        });
     json!({
         "project_id": project_id,
         "project_name": read_trimmed(&dir.join("project_name.txt")).unwrap_or_else(|| "未命名研究项目".to_string()),
@@ -768,6 +814,7 @@ fn input_error_message(code: &str) -> &'static str {
         "unknown_compound_identifier" => "本地科学仓库中没有对应的化合物名称或标识符。",
         "input_manifest_replace_failed" => "无法发布新的输入清单，请检查项目目录权限。",
         "input_manifest_cleanup_failed" => "无法清理待发布的输入清单，请检查项目目录权限。",
+        "project_run_active" => "项目正在运行，请先取消或等待当前运行结束。",
         "input_not_usable" => "请至少提供一项可转换为计算输入的内容。",
         _ => "无法转换为可计算结构或序列，请检查输入。",
     }
@@ -851,6 +898,16 @@ where
     C: FnMut(&Path) -> Result<(), String>,
 {
     let dir = project_dir(options, project_id);
+    let project_lock = project_operation_lock(&dir);
+    let _project_guard = lock_unpoisoned(&project_lock);
+    if active_project_run_id(&dir).is_some() {
+        return json!({
+            "status": "failed",
+            "error": "project_run_active",
+            "message": input_error_message("project_run_active"),
+            "project": read_project(options, project_id)
+        });
+    }
     let pending = dir.join("input_manifest.pending.json");
     let formal = dir.join("input_manifest.json");
     let value = match serde_json::from_str::<Value>(body.trim_start_matches('\u{feff}')) {
@@ -1296,14 +1353,16 @@ fn windows_path_to_wsl(value: &str) -> Option<String> {
 
 fn start_run(options: &ServerOptions, project_id: &str) -> Value {
     let project = project_dir(options, project_id);
-    if let Some(run_id) = read_trimmed(&project.join("latest_run_id.txt"))
-        && run_state(&project.join("runs").join(&run_id)) == "running"
-    {
-        return json!({"status":"running","run":run_json(options,&run_id)});
+    let project_lock = project_operation_lock(&project);
+    let _project_guard = lock_unpoisoned(&project_lock);
+    if let Some(run_id) = active_project_run_id(&project) {
+        let state = run_state(&project.join("runs").join(&run_id));
+        return json!({"status":state,"run":run_json(options,&run_id)});
     }
-    let run_id = format!("run-{}", now_millis());
-    let run_dir = project.join("runs").join(&run_id);
-    let _ = fs::create_dir_all(&run_dir);
+    let (run_id, run_dir) = match allocate_run_directory(&project) {
+        Ok(run) => run,
+        Err(err) => return json!({"status":"failed","error":err}),
+    };
     let _ = write_text(&run_dir.join("run_state.txt"), "running\n");
     let _ = write_text(&run_dir.join("current_stage.txt"), "input_normalize\n");
     let worker = worker_environment_status(options);
@@ -1333,106 +1392,210 @@ fn start_run(options: &ServerOptions, project_id: &str) -> Value {
     let command = gls_cli_command(options, &input, &run_dir);
     let command_text = command.join(" ");
     let _ = write_text(&run_dir.join("current_command.txt"), &command_text);
-    let _ = write_text(
-        &run_dir.join("run.log"),
-        &format!("command\t{command_text}\nstate\trunning\n"),
-    );
+    let _ = write_text(&run_dir.join("run.log"), "state\trunning\n");
     let _ = write_text(&project.join("latest_run_id.txt"), &run_id);
-    let background_options = options.clone();
-    let background_project = project.clone();
-    let background_run_dir = run_dir.clone();
-    let background_command = command.clone();
-    let background_command_text = command_text.clone();
-    match std::thread::Builder::new()
-        .name(format!("genoligand-run-{run_id}"))
-        .spawn(move || {
-            finish_run_command(
-                &background_options,
-                &background_project,
-                &background_run_dir,
-                &background_command,
-                &background_command_text,
-            );
-        }) {
-        Ok(_) => json!({"status":"running","run":run_json(options,&run_id)}),
-        Err(err) => {
-            let reason = format!("pipeline_thread_launch_failed:{err}");
-            let _ = write_text(&run_dir.join("run_state.txt"), "failed\n");
+    match launch_run_process(options, &project, &run_dir, &command) {
+        Ok(()) => json!({"status":"running","run":run_json(options,&run_id)}),
+        Err(reason) => {
+            let _ = compare_and_set_run_state(&run_dir, &["running"], "failed");
             let _ = write_text(
                 &run_dir.join("failure_reason.txt"),
                 &(reason.clone() + "\n"),
             );
-            let _ = write_text(
+            let _ = append_bounded_log(
                 &run_dir.join("run.log"),
-                &format!("command\t{command_text}\nstate\tfailed\nstderr\n{reason}\n"),
+                format!("state\tfailed\nerror\t{reason}\n").as_bytes(),
+                RUN_LOG_MAX_BYTES,
             );
             json!({"status":"failed","run":run_json(options,&run_id)})
         }
     }
 }
 
-fn finish_run_command(
+fn allocate_run_directory(project: &Path) -> Result<(String, PathBuf), String> {
+    let runs = project.join("runs");
+    fs::create_dir_all(&runs).map_err(|err| format!("create_runs_dir_failed:{err}"))?;
+    for _ in 0..8 {
+        let run_id = format!("run-{}", new_uuid());
+        let run_dir = runs.join(&run_id);
+        match fs::create_dir(&run_dir) {
+            Ok(()) => return Ok((run_id, run_dir)),
+            Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(err) => return Err(format!("create_run_dir_failed:{err}")),
+        }
+    }
+    Err("run_id_allocation_failed".to_string())
+}
+
+fn launch_run_process(
     options: &ServerOptions,
     project: &Path,
     run_dir: &Path,
     command: &[String],
-    command_text: &str,
-) {
-    let output = Command::new(&command[0])
+) -> Result<(), String> {
+    let Some(program) = command.first() else {
+        return Err("pipeline_command_empty".to_string());
+    };
+    let mut process = Command::new(program);
+    process
         .args(&command[1..])
         .current_dir(&options.workspace_root)
         .envs(runtime_command_environment(options))
-        .output();
-    let (state, reason, stdout, stderr) = match output {
-        Ok(output) => {
-            let stdout = String::from_utf8_lossy(&output.stdout).to_string();
-            let stderr = String::from_utf8_lossy(&output.stderr).to_string();
-            if output.status.success() {
-                let blocked =
-                    read_trimmed(&run_dir.join("run_state.txt")).as_deref() == Some("blocked");
-                if blocked {
-                    (
-                        "blocked".to_string(),
-                        read_trimmed(&run_dir.join("failure_reason.txt")).unwrap_or_default(),
-                        stdout,
-                        stderr,
-                    )
-                } else {
-                    ("completed".to_string(), String::new(), stdout, stderr)
-                }
-            } else {
-                (
-                    "failed".to_string(),
-                    format!("pipeline_command_failed_exit_{:?}", output.status.code()),
-                    stdout,
-                    stderr,
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        process.process_group(0);
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
+        process.creation_flags(CREATE_NEW_PROCESS_GROUP);
+    }
+    let mut child = process
+        .spawn()
+        .map_err(|err| format!("pipeline_command_launch_failed:{err}"))?;
+    let stdout = child.stdout.take();
+    let stderr = child.stderr.take();
+    let registered = Arc::new(RegisteredRun {
+        project_dir: project.to_path_buf(),
+        process_id: child.id(),
+        child: Mutex::new(child),
+        log_lock: Arc::new(Mutex::new(())),
+        monitor_finished: AtomicBool::new(false),
+    });
+    if let Err(err) = register_run_process(run_dir, registered.clone()) {
+        let stopped = terminate_registered_run(&registered);
+        return Err(format!("{err};process_stopped={stopped}"));
+    }
+    let _ = write_text(
+        &run_dir.join("process_id.txt"),
+        &format!("{}\n", registered.process_id),
+    );
+    let background_run_dir = run_dir.to_path_buf();
+    let background_process = registered.clone();
+    let thread_name = run_dir
+        .file_name()
+        .and_then(|value| value.to_str())
+        .unwrap_or("run")
+        .to_string();
+    if let Err(err) = std::thread::Builder::new()
+        .name(format!("genoligand-{thread_name}"))
+        .spawn(move || {
+            let stdout_thread = stdout.map(|reader| {
+                spawn_log_reader(
+                    reader,
+                    "stdout",
+                    background_run_dir.join("run.log"),
+                    background_process.log_lock.clone(),
                 )
+            });
+            let stderr_thread = stderr.map(|reader| {
+                spawn_log_reader(
+                    reader,
+                    "stderr",
+                    background_run_dir.join("run.log"),
+                    background_process.log_lock.clone(),
+                )
+            });
+            let status = wait_for_run_process(&background_process);
+            if let Some(thread) = stdout_thread {
+                let _ = thread.join();
             }
+            if let Some(thread) = stderr_thread {
+                let _ = thread.join();
+            }
+            finish_run_process(&background_run_dir, &background_process.log_lock, status);
+            unregister_run_process(&background_run_dir);
+            background_process
+                .monitor_finished
+                .store(true, Ordering::Release);
+        })
+    {
+        let stopped = terminate_registered_run(&registered);
+        unregister_run_process(run_dir);
+        return Err(format!(
+            "pipeline_monitor_launch_failed:{err};process_stopped={stopped}"
+        ));
+    }
+    Ok(())
+}
+
+fn spawn_log_reader<R>(
+    mut reader: R,
+    stream: &'static str,
+    log_path: PathBuf,
+    log_lock: Arc<Mutex<()>>,
+) -> std::thread::JoinHandle<()>
+where
+    R: Read + Send + 'static,
+{
+    std::thread::spawn(move || {
+        let mut buffer = [0_u8; 8192];
+        loop {
+            let count = match reader.read(&mut buffer) {
+                Ok(0) => break,
+                Ok(count) => count,
+                Err(_) => break,
+            };
+            let mut chunk = Vec::with_capacity(stream.len() + count + 2);
+            chunk.extend_from_slice(stream.as_bytes());
+            chunk.push(b'\t');
+            chunk.extend_from_slice(&buffer[..count]);
+            if !chunk.ends_with(b"\n") {
+                chunk.push(b'\n');
+            }
+            let _guard = lock_unpoisoned(&log_lock);
+            let _ = append_bounded_log(&log_path, &chunk, RUN_LOG_MAX_BYTES);
         }
-        Err(err) => (
-            "failed".to_string(),
-            format!("pipeline_command_launch_failed:{err}"),
-            String::new(),
-            String::new(),
+    })
+}
+
+fn wait_for_run_process(process: &RegisteredRun) -> Result<ExitStatus, String> {
+    loop {
+        let status = {
+            let mut child = lock_unpoisoned(&process.child);
+            child.try_wait()
+        };
+        match status {
+            Ok(Some(status)) => return Ok(status),
+            Ok(None) => std::thread::sleep(PROCESS_POLL_INTERVAL),
+            Err(err) => return Err(format!("pipeline_process_wait_failed:{err}")),
+        }
+    }
+}
+
+fn finish_run_process(run_dir: &Path, log_lock: &Mutex<()>, result: Result<ExitStatus, String>) {
+    let (state, reason) = match result {
+        Ok(status) if status.success() => ("completed", String::new()),
+        Ok(status) => (
+            "failed",
+            format!("pipeline_command_failed_exit_{:?}", status.code()),
         ),
+        Err(err) => ("failed", err),
     };
-    let _ = write_text(&run_dir.join("run_state.txt"), &(state.clone() + "\n"));
+    if !compare_and_set_run_state(run_dir, &["running"], state) {
+        return;
+    }
     let _ = write_text(
         &run_dir.join("failure_reason.txt"),
         &(reason.clone() + "\n"),
     );
-    let _ = write_text(
-        &run_dir.join("run.log"),
-        &format!("command\t{command_text}\nstate\t{state}\nstdout\n{stdout}\nstderr\n{stderr}\n"),
-    );
-    let run_id = run_dir
-        .file_name()
-        .and_then(|value| value.to_str())
-        .unwrap_or_default();
-    let _ = write_text(
-        &project.join("latest_run_id.txt"),
-        &(run_id.to_string() + "\n"),
-    );
+    {
+        let _guard = lock_unpoisoned(log_lock);
+        let detail = if reason.is_empty() {
+            format!("state\t{state}\n")
+        } else {
+            format!("state\t{state}\nerror\t{reason}\n")
+        };
+        let _ = append_bounded_log(
+            &run_dir.join("run.log"),
+            detail.as_bytes(),
+            RUN_LOG_MAX_BYTES,
+        );
+    }
     let artifact_index = artifact_index(run_dir);
     let _ = write_text(
         &run_dir.join("artifact_index.json"),
@@ -1741,7 +1904,45 @@ fn logs_json(options: &ServerOptions, run_id: &str) -> Value {
     let Some(run_dir) = find_run_dir(options, run_id) else {
         return json!({"logs":[]});
     };
-    json!({"logs":user_run_events(&run_dir, run_id)})
+    let mut logs = user_run_events(&run_dir, run_id);
+    let (mut streamed, truncated) = read_run_log_tail(&run_dir.join("run.log"));
+    logs.append(&mut streamed);
+    json!({"logs":logs,"truncated":truncated})
+}
+
+fn read_run_log_tail(path: &Path) -> (Vec<String>, bool) {
+    let Ok(mut file) = OpenOptions::new().read(true).open(path) else {
+        return (Vec::new(), false);
+    };
+    let length = file.metadata().map(|metadata| metadata.len()).unwrap_or(0);
+    let start = length.saturating_sub(RUN_LOG_READ_BYTES as u64);
+    if file.seek(SeekFrom::Start(start)).is_err() {
+        return (Vec::new(), false);
+    }
+    let mut bytes = Vec::with_capacity((length - start) as usize);
+    if (&mut file)
+        .take(RUN_LOG_READ_BYTES as u64)
+        .read_to_end(&mut bytes)
+        .is_err()
+    {
+        return (Vec::new(), false);
+    }
+    if start > 0
+        && let Some(first_line_end) = bytes.iter().position(|byte| *byte == b'\n')
+    {
+        bytes.drain(..=first_line_end);
+    }
+    let mut lines = String::from_utf8_lossy(&bytes)
+        .lines()
+        .map(str::trim_end)
+        .filter(|line| !line.is_empty())
+        .map(ToOwned::to_owned)
+        .collect::<Vec<_>>();
+    let line_truncated = lines.len() > RUN_LOG_READ_LINES;
+    if line_truncated {
+        lines.drain(..lines.len() - RUN_LOG_READ_LINES);
+    }
+    (lines, start > 0 || line_truncated)
 }
 
 fn artifacts_json(options: &ServerOptions, run_id: &str) -> Value {
@@ -1767,7 +1968,7 @@ fn download_artifact_response(
     };
     let path = run_dir.join(artifact_file);
     let completed = run_state(&run_dir) == "completed";
-    if path.exists() && !authenticity_gate_allows_download(&run_dir) {
+    if completed && path.exists() && !authenticity_gate_allows_results(&run_dir) {
         return json_response(409, json!({"error":"authenticity_gate_failed"}));
     }
     if !artifact_visible_for_user(artifact_id, &path, &run_dir, completed) {
@@ -2140,7 +2341,7 @@ fn pagination_payload(
 
 fn completed_run_dir(options: &ServerOptions, run_id: &str) -> Option<PathBuf> {
     let run_dir = find_run_dir(options, run_id)?;
-    if run_state(&run_dir) == "completed" {
+    if run_state(&run_dir) == "completed" && authenticity_gate_allows_results(&run_dir) {
         Some(run_dir)
     } else {
         None
@@ -3152,13 +3353,19 @@ fn user_diagnostics_json(options: &ServerOptions) -> Value {
 }
 
 fn user_setup_status_json(options: &ServerOptions) -> Value {
-    let ready = preflight_store_ready(options);
+    let reconciliation = reconcile_setup_status_progress(options);
+    let ready = reconciliation.database_ready;
     let store = science_store_path(options);
     let required = required_resource_rows(&store);
     let worker = worker_environment_status(options);
+    let setup_ready = ready
+        && worker
+            .get("ready")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
     json!({
-        "database_ready": ready && worker.get("ready").and_then(Value::as_bool).unwrap_or(false),
-        "repair_action": if ready && worker.get("ready").and_then(Value::as_bool).unwrap_or(false) {"继续"} else {"运行安装/修复"},
+        "database_ready": ready,
+        "repair_action": if setup_ready {"继续"} else {"运行安装/修复"},
         "checks": required,
         "missing": missing_resource_rows(&required),
         "worker_environment": worker,
@@ -3168,16 +3375,52 @@ fn user_setup_status_json(options: &ServerOptions) -> Value {
 }
 
 fn user_setup_progress_json(options: &ServerOptions) -> Value {
+    reconcile_setup_status_progress(options).progress
+}
+
+struct SetupReconciliation {
+    database_ready: bool,
+    progress: Value,
+}
+
+fn reconcile_setup_status_progress(options: &ServerOptions) -> SetupReconciliation {
+    let database_ready = preflight_store_ready(options);
     let path = science_store_path(options).join("install_progress.json");
     let value = read_json_or(&path, json!({}));
     let mut progress = setup_user_install_progress(Some(&value));
-    if setup_progress_is_stale(&progress) {
+    let historical_status = progress
+        .get("status")
+        .and_then(Value::as_str)
+        .unwrap_or("idle")
+        .to_string();
+    let historical_ready = matches!(
+        historical_status.as_str(),
+        "ready" | "completed" | "success"
+    ) || progress.get("percent").and_then(Value::as_u64) == Some(100);
+    if database_ready {
+        progress["status"] = json!("ready");
+        progress["failed_steps"] = json!(0);
+        progress["percent"] = json!(100);
+        progress["message"] = json!("科学仓库已就绪。");
+    } else if setup_progress_is_stale(&progress) {
         progress["status"] = json!("needs_repair");
         progress["failed_steps"] = json!(1);
+        progress["percent"] = json!(progress["percent"].as_u64().unwrap_or(0).min(99));
         progress["message"] =
             json!("安装进度长时间没有更新，请重新运行安装/修复并检查网络、磁盘和依赖状态。");
+    } else if historical_status == "running" {
+        progress["percent"] = json!(progress["percent"].as_u64().unwrap_or(0).min(99));
+    } else if historical_ready {
+        progress["status"] = json!("needs_repair");
+        progress["failed_steps"] = json!(progress["failed_steps"].as_u64().unwrap_or(0).max(1));
+        progress["percent"] = json!(progress["percent"].as_u64().unwrap_or(0).min(99));
+        progress["message"] = json!("实时检查发现科学仓库需要修复，请重新运行安装/修复。");
     }
-    progress
+    progress["database_ready"] = json!(database_ready);
+    SetupReconciliation {
+        database_ready,
+        progress,
+    }
 }
 
 fn run_setup_repair_json(options: &ServerOptions) -> Value {
@@ -3683,15 +3926,152 @@ fn update_run_state(options: &ServerOptions, run_id: &str, state: &str) -> Value
     }
 }
 
+fn cancel_run(options: &ServerOptions, run_id: &str) -> Value {
+    let Some(run_dir) = find_run_dir(options, run_id) else {
+        return json!({"status":"not_found","run_id":run_id,"process_stopped":true});
+    };
+    let Some(project) = run_dir.parent().and_then(Path::parent) else {
+        return json!({"status":"failed","run_id":run_id,"process_stopped":false});
+    };
+    let project_lock = project_operation_lock(project);
+    let _project_guard = lock_unpoisoned(&project_lock);
+    let process = registered_run_process(&run_dir);
+    let state_before = run_state(&run_dir);
+    if state_before == "running" && process.is_none() {
+        return json!({
+            "status":"failed",
+            "run_id":run_id,
+            "error":"active_run_handle_missing",
+            "process_stopped":false
+        });
+    }
+    let cancelled = compare_and_set_run_state(&run_dir, &["running"], "cancelled");
+    let process_stopped = process
+        .as_deref()
+        .map(terminate_registered_run)
+        .unwrap_or(state_before != "running");
+    if cancelled {
+        let log_lock = process
+            .as_ref()
+            .map(|process| process.log_lock.clone())
+            .unwrap_or_else(|| Arc::new(Mutex::new(())));
+        let _guard = lock_unpoisoned(&log_lock);
+        let _ = append_bounded_log(
+            &run_dir.join("run.log"),
+            b"state\tcancelled\n",
+            RUN_LOG_MAX_BYTES,
+        );
+    }
+    if process_stopped && let Some(process) = process.as_deref() {
+        let _ = wait_for_monitor_completion(process, Duration::from_secs(2));
+    }
+    json!({
+        "status": run_state(&run_dir),
+        "run_id": run_id,
+        "process_stopped": process_stopped
+    })
+}
+
+fn terminate_registered_run(process: &RegisteredRun) -> bool {
+    if run_process_exited(process) {
+        return true;
+    }
+    std::thread::sleep(Duration::from_millis(100));
+    if run_process_exited(process) {
+        return true;
+    }
+    terminate_process_tree(process.process_id);
+    if wait_for_process_exit(process, Duration::from_secs(3)) {
+        return true;
+    }
+    let _ = lock_unpoisoned(&process.child).kill();
+    wait_for_process_exit(process, Duration::from_secs(2))
+}
+
+fn run_process_exited(process: &RegisteredRun) -> bool {
+    lock_unpoisoned(&process.child)
+        .try_wait()
+        .map(|status| status.is_some())
+        .unwrap_or(true)
+}
+
+fn wait_for_process_exit(process: &RegisteredRun, timeout: Duration) -> bool {
+    let deadline = std::time::Instant::now() + timeout;
+    while std::time::Instant::now() < deadline {
+        if run_process_exited(process) {
+            return true;
+        }
+        std::thread::sleep(PROCESS_POLL_INTERVAL);
+    }
+    run_process_exited(process)
+}
+
+fn wait_for_monitor_completion(process: &RegisteredRun, timeout: Duration) -> bool {
+    let deadline = std::time::Instant::now() + timeout;
+    while std::time::Instant::now() < deadline {
+        if process.monitor_finished.load(Ordering::Acquire) {
+            return true;
+        }
+        std::thread::sleep(PROCESS_POLL_INTERVAL);
+    }
+    process.monitor_finished.load(Ordering::Acquire)
+}
+
+#[cfg(windows)]
+fn terminate_process_tree(process_id: u32) {
+    let _ = Command::new("taskkill")
+        .args(["/PID", &process_id.to_string(), "/T", "/F"])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status();
+}
+
+#[cfg(unix)]
+fn terminate_process_tree(process_id: u32) {
+    let _ = Command::new("kill")
+        .args(["-TERM", "--", &format!("-{process_id}")])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status();
+}
+
 fn delete_project(options: &ServerOptions, project_id: &str) -> Value {
     let dir = project_dir(options, project_id);
-    if dir.exists() {
-        match fs::remove_dir_all(&dir) {
-            Ok(()) => json!({"status":"deleted","project_id":project_id}),
-            Err(err) => json!({"status":"failed","error":err.to_string()}),
+    let project_lock = project_operation_lock(&dir);
+    let _project_guard = lock_unpoisoned(&project_lock);
+    if !dir.exists() {
+        return json!({"status":"not_found","project_id":project_id});
+    }
+    let processes = registered_project_processes(&dir);
+    if active_project_run_id(&dir).is_some() && processes.is_empty() {
+        return json!({
+            "status":"failed",
+            "project_id":project_id,
+            "error":"active_run_handle_missing"
+        });
+    }
+    for (run_dir, process) in &processes {
+        let _ = compare_and_set_run_state(run_dir, &["running"], "cancelled");
+        if !terminate_registered_run(process) {
+            return json!({
+                "status":"failed",
+                "project_id":project_id,
+                "error":"process_tree_termination_failed"
+            });
         }
-    } else {
-        json!({"status":"not_found","project_id":project_id})
+    }
+    for (_, process) in &processes {
+        if !wait_for_monitor_completion(process, Duration::from_secs(3)) {
+            return json!({
+                "status":"failed",
+                "project_id":project_id,
+                "error":"run_monitor_shutdown_timeout"
+            });
+        }
+    }
+    match fs::remove_dir_all(&dir) {
+        Ok(()) => json!({"status":"deleted","project_id":project_id}),
+        Err(err) => json!({"status":"failed","error":err.to_string()}),
     }
 }
 
@@ -4264,22 +4644,120 @@ fn projects_root(options: &ServerOptions) -> PathBuf {
     options.artifact_dir.join("projects")
 }
 
+fn server_registry() -> &'static Mutex<ServerRegistry> {
+    SERVER_REGISTRY.get_or_init(|| Mutex::new(ServerRegistry::default()))
+}
+
+fn lock_unpoisoned<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
+    mutex
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+fn project_operation_lock(project: &Path) -> Arc<Mutex<()>> {
+    let mut registry = lock_unpoisoned(server_registry());
+    registry
+        .project_locks
+        .entry(project.to_path_buf())
+        .or_insert_with(|| Arc::new(Mutex::new(())))
+        .clone()
+}
+
+fn run_state_lock(run_dir: &Path) -> Arc<Mutex<()>> {
+    let mut registry = lock_unpoisoned(server_registry());
+    registry
+        .run_state_locks
+        .entry(run_dir.to_path_buf())
+        .or_insert_with(|| Arc::new(Mutex::new(())))
+        .clone()
+}
+
+fn register_run_process(
+    run_dir: &Path,
+    process: Arc<RegisteredRun>,
+) -> Result<Arc<RegisteredRun>, String> {
+    let mut registry = lock_unpoisoned(server_registry());
+    if registry.runs.contains_key(run_dir) {
+        return Err("run_process_already_registered".to_string());
+    }
+    registry.runs.insert(run_dir.to_path_buf(), process.clone());
+    Ok(process)
+}
+
+fn registered_run_process(run_dir: &Path) -> Option<Arc<RegisteredRun>> {
+    lock_unpoisoned(server_registry())
+        .runs
+        .get(run_dir)
+        .cloned()
+}
+
+fn registered_project_processes(project: &Path) -> Vec<(PathBuf, Arc<RegisteredRun>)> {
+    lock_unpoisoned(server_registry())
+        .runs
+        .iter()
+        .filter(|(_, process)| process.project_dir == project)
+        .map(|(run_dir, process)| (run_dir.clone(), process.clone()))
+        .collect()
+}
+
+fn unregister_run_process(run_dir: &Path) {
+    lock_unpoisoned(server_registry()).runs.remove(run_dir);
+}
+
 fn project_dir(options: &ServerOptions, project_id: &str) -> PathBuf {
     projects_root(options).join(safe_id(project_id))
 }
 
+fn active_project_run_id(project: &Path) -> Option<String> {
+    if let Some(run_id) = lock_unpoisoned(server_registry())
+        .runs
+        .iter()
+        .find(|(_, process)| process.project_dir == project)
+        .and_then(|(run_dir, _)| run_dir.file_name())
+        .map(|run_id| run_id.to_string_lossy().to_string())
+    {
+        return Some(run_id);
+    }
+    if let Some(run_id) = read_trimmed(&project.join("latest_run_id.txt"))
+        && run_state(&project.join("runs").join(&run_id)) == "running"
+    {
+        return Some(run_id);
+    }
+    fs::read_dir(project.join("runs"))
+        .ok()?
+        .flatten()
+        .find_map(|entry| {
+            let path = entry.path();
+            (path.is_dir() && run_state(&path) == "running")
+                .then(|| entry.file_name().to_string_lossy().to_string())
+        })
+}
+
 fn find_run_dir(options: &ServerOptions, run_id: &str) -> Option<PathBuf> {
+    let mut found = None;
     for entry in fs::read_dir(projects_root(options)).ok()?.flatten() {
         let path = entry.path().join("runs").join(run_id);
-        if path.exists() {
-            return Some(path);
+        if path.is_dir() {
+            if found.is_some() {
+                return None;
+            }
+            found = Some(path);
         }
     }
-    None
+    found
 }
 
 fn run_state(run_dir: &Path) -> String {
     read_trimmed(&run_dir.join("run_state.txt")).unwrap_or_else(|| "created".to_string())
+}
+
+fn compare_and_set_run_state(run_dir: &Path, expected: &[&str], next: &str) -> bool {
+    let state_lock = run_state_lock(run_dir);
+    let _state_guard = lock_unpoisoned(&state_lock);
+    if !expected.contains(&run_state(run_dir).as_str()) {
+        return false;
+    }
+    write_text(&run_dir.join("run_state.txt"), &(next.to_string() + "\n")).is_ok()
 }
 
 fn run_trace(options: &ServerOptions, run_dir: &Path, run_id: &str) -> Value {
@@ -4307,12 +4785,13 @@ fn run_trace(options: &ServerOptions, run_dir: &Path, run_id: &str) -> Value {
         .unwrap_or(0);
     let state = run_state(run_dir);
     let completed = state == "completed";
-    let candidate_rows = if completed {
+    let results_visible = completed && authenticity_gate_allows_results(run_dir);
+    let candidate_rows = if results_visible {
         rows_len(&run_dir.join("target_candidate_ranking.tsv"))
     } else {
         0
     };
-    let evidence_rows = if completed {
+    let evidence_rows = if results_visible {
         rows_len(&run_dir.join("evidence_ledger.tsv"))
     } else {
         0
@@ -4382,7 +4861,7 @@ fn artifact_visible_for_user(id: &str, path: &Path, run_dir: &Path, completed: b
     if !path.exists() {
         return false;
     }
-    if !authenticity_gate_allows_download(run_dir) {
+    if !authenticity_gate_allows_results(run_dir) {
         return false;
     }
     match id {
@@ -4400,15 +4879,33 @@ fn artifact_visible_for_user(id: &str, path: &Path, run_dir: &Path, completed: b
     }
 }
 
-fn authenticity_gate_allows_download(run_dir: &Path) -> bool {
+fn authenticity_gate_allows_results(run_dir: &Path) -> bool {
     let path = run_dir.join("authenticity_gate.tsv");
     let Ok(text) = fs::read_to_string(path) else {
-        return true;
+        return false;
     };
-    !text
-        .lines()
-        .skip(1)
-        .any(|line| line.split('\t').nth(1) == Some("blocked") || line.contains("\tblocked\t"))
+    let mut lines = text.lines().filter(|line| !line.trim().is_empty());
+    let Some(header) = lines.next() else {
+        return false;
+    };
+    let headers = header
+        .trim_start_matches('\u{feff}')
+        .split('\t')
+        .collect::<Vec<_>>();
+    if !headers.contains(&"artifact") {
+        return false;
+    }
+    let Some(status_index) = headers.iter().position(|header| *header == "status") else {
+        return false;
+    };
+    let mut saw_row = false;
+    for line in lines {
+        saw_row = true;
+        if line.split('\t').nth(status_index).map(str::trim) != Some("passed") {
+            return false;
+        }
+    }
+    saw_row
 }
 
 fn artifact_specs() -> &'static [(&'static str, &'static str, &'static str)] {
@@ -4635,6 +5132,52 @@ fn write_text(path: &Path, text: &str) -> Result<(), String> {
     fs::write(path, text).map_err(|err| format!("write_failed:{}:{err}", path.display()))
 }
 
+fn append_bounded_log(path: &Path, data: &[u8], max_bytes: usize) -> Result<(), String> {
+    if max_bytes == 0 || data.is_empty() {
+        return Ok(());
+    }
+    let data = if data.len() > max_bytes {
+        &data[data.len() - max_bytes..]
+    } else {
+        data
+    };
+    let mut file = OpenOptions::new()
+        .create(true)
+        .read(true)
+        .write(true)
+        .truncate(false)
+        .open(path)
+        .map_err(|err| format!("open_log_failed:{}:{err}", path.display()))?;
+    let existing_len = file
+        .metadata()
+        .map_err(|err| format!("read_log_metadata_failed:{}:{err}", path.display()))?
+        .len();
+    if existing_len.saturating_add(data.len() as u64) <= max_bytes as u64 {
+        file.seek(SeekFrom::End(0))
+            .and_then(|_| file.write_all(data))
+            .map_err(|err| format!("append_log_failed:{}:{err}", path.display()))?;
+        return Ok(());
+    }
+    let keep = max_bytes.saturating_sub(data.len());
+    let mut tail = vec![0_u8; keep];
+    if keep > 0 {
+        let available = existing_len.min(keep as u64) as usize;
+        if available < keep {
+            tail.drain(..keep - available);
+        }
+        file.seek(SeekFrom::Start(
+            existing_len.saturating_sub(available as u64),
+        ))
+        .and_then(|_| file.read_exact(&mut tail))
+        .map_err(|err| format!("read_log_tail_failed:{}:{err}", path.display()))?;
+    }
+    file.set_len(0)
+        .and_then(|_| file.seek(SeekFrom::Start(0)))
+        .and_then(|_| file.write_all(&tail))
+        .and_then(|_| file.write_all(data))
+        .map_err(|err| format!("truncate_log_failed:{}:{err}", path.display()))
+}
+
 fn read_trimmed(path: &Path) -> Option<String> {
     fs::read_to_string(path)
         .ok()
@@ -4654,6 +5197,40 @@ fn safe_id(raw: &str) -> String {
     }
 }
 
+fn new_uuid() -> String {
+    let sequence = UUID_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+    let timestamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_nanos())
+        .unwrap_or(0);
+    let state = RandomState::new();
+    let mut first = state.build_hasher();
+    first.write_u128(timestamp);
+    first.write_u64(sequence);
+    first.write_u32(std::process::id());
+    let first = first.finish();
+    let mut second = state.build_hasher();
+    second.write_u64(first);
+    second.write_u64(sequence.rotate_left(17));
+    second.write_u128(timestamp.rotate_left(43));
+    let second = second.finish();
+    let mut bytes = [0_u8; 16];
+    bytes[..8].copy_from_slice(&first.to_be_bytes());
+    bytes[8..].copy_from_slice(&second.to_be_bytes());
+    bytes[6] = (bytes[6] & 0x0f) | 0x40;
+    bytes[8] = (bytes[8] & 0x3f) | 0x80;
+    format!(
+        "{:08x}-{:04x}-{:04x}-{:04x}-{:012x}",
+        u32::from_be_bytes(bytes[0..4].try_into().expect("uuid field")),
+        u16::from_be_bytes(bytes[4..6].try_into().expect("uuid field")),
+        u16::from_be_bytes(bytes[6..8].try_into().expect("uuid field")),
+        u16::from_be_bytes(bytes[8..10].try_into().expect("uuid field")),
+        u64::from_be_bytes([
+            0, 0, bytes[10], bytes[11], bytes[12], bytes[13], bytes[14], bytes[15],
+        ])
+    )
+}
+
 fn now_millis() -> u128 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -4669,4 +5246,451 @@ fn now_seconds() -> u64 {
 }
 
 #[cfg(test)]
-mod tests;
+mod tests {
+    include!("tests.rs");
+
+    fn looks_like_uuid(value: &str) -> bool {
+        let parts = value.split('-').collect::<Vec<_>>();
+        parts.len() == 5
+            && parts.iter().map(|part| part.len()).eq([8, 4, 4, 4, 12])
+            && value.chars().all(|ch| ch == '-' || ch.is_ascii_hexdigit())
+    }
+
+    #[test]
+    fn audit_project_ids_are_uuids_and_drafts_are_visible() {
+        let root =
+            std::env::temp_dir().join(format!("genoligand-audit-project-id-{}", now_millis()));
+        let options = server_options(root.clone());
+
+        let first = create_project_record(&options).expect("first project");
+        let second = create_project_record(&options).expect("second project");
+        let first_id = first["project_id"].as_str().expect("first project id");
+        let second_id = second["project_id"].as_str().expect("second project id");
+        let first_project_dir = project_dir(&options, first_id);
+        let (first_run_id, _) = allocate_run_directory(&first_project_dir).expect("first run id");
+        let (second_run_id, _) = allocate_run_directory(&first_project_dir).expect("second run id");
+        let listed = user_projects_json(&options);
+
+        assert!(looks_like_uuid(
+            first_id.strip_prefix("project-").expect("project prefix")
+        ));
+        assert!(looks_like_uuid(
+            second_id.strip_prefix("project-").expect("project prefix")
+        ));
+        assert_ne!(first_id, second_id);
+        assert!(looks_like_uuid(
+            first_run_id.strip_prefix("run-").expect("run prefix")
+        ));
+        assert!(looks_like_uuid(
+            second_run_id.strip_prefix("run-").expect("run prefix")
+        ));
+        assert_ne!(first_run_id, second_run_id);
+        assert_eq!(first["project_status"], "draft");
+        assert_eq!(listed["projects"].as_array().map(Vec::len), Some(2));
+        assert_eq!(listed["projects"][0]["project_status"], "draft");
+
+        fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn audit_saved_inputs_are_reloadable_and_mark_input_ready() {
+        let root =
+            std::env::temp_dir().join(format!("genoligand-audit-input-ready-{}", now_millis()));
+        let options = server_options(root.clone());
+        let project = create_project_record(&options).expect("project");
+        let project_id = project["project_id"].as_str().expect("project id");
+        let manifest = r#"{"inputs":[{"field":"project_name","value":"Audit project"},{"field":"small_molecule","value":"CCO"}],"files":[]}"#;
+
+        let saved = write_input_manifest(&options, project_id, manifest);
+        let (status, _, body) = route(
+            "GET",
+            &format!("/api/user/projects/{project_id}/inputs"),
+            &options,
+            "",
+        );
+        let reloaded: Value = serde_json::from_str(&body).expect("input response");
+        let detail = user_project_detail(&options, project_id);
+
+        assert_eq!(saved["status"], "saved");
+        assert_eq!(status, 200);
+        assert_eq!(reloaded["inputs"][1]["value"], "CCO");
+        assert_eq!(detail["project_status"], "input_ready");
+        assert_eq!(detail["project_state"], "输入已就绪");
+
+        fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn audit_save_rejects_changes_while_run_is_active() {
+        let root =
+            std::env::temp_dir().join(format!("genoligand-audit-save-lock-{}", now_millis()));
+        let options = server_options(root.clone());
+        let project_id = "project-save-lock";
+        let project = project_dir(&options, project_id);
+        let run_dir = project.join("runs").join("run-active");
+        fs::create_dir_all(&run_dir).expect("run dir");
+        let original = r#"{"inputs":[{"field":"small_molecule","value":"CCO"}],"files":[]}"#;
+        fs::write(project.join("input_manifest.json"), original).expect("original manifest");
+        fs::write(project.join("latest_run_id.txt"), "run-active\n").expect("latest run");
+        fs::write(run_dir.join("run_state.txt"), "running\n").expect("run state");
+
+        let response = write_input_manifest(
+            &options,
+            project_id,
+            r#"{"inputs":[{"field":"small_molecule","value":"CCC"}],"files":[]}"#,
+        );
+
+        assert_eq!(response["status"], "failed");
+        assert_eq!(response["error"], "project_run_active");
+        assert_eq!(
+            fs::read_to_string(project.join("input_manifest.json")).expect("manifest"),
+            original
+        );
+        assert_eq!(
+            read_trimmed(&project.join("latest_run_id.txt")).as_deref(),
+            Some("run-active")
+        );
+
+        fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn audit_run_completion_uses_compare_and_set() {
+        let root = std::env::temp_dir().join(format!("genoligand-audit-run-cas-{}", now_millis()));
+        let run_dir = root.join("projects/project-1/runs/run-1");
+        fs::create_dir_all(&run_dir).expect("run dir");
+        fs::write(run_dir.join("run_state.txt"), "running\n").expect("running state");
+
+        assert!(compare_and_set_run_state(
+            &run_dir,
+            &["running"],
+            "completed"
+        ));
+        fs::write(run_dir.join("run_state.txt"), "cancelled\n").expect("cancelled state");
+        assert!(!compare_and_set_run_state(
+            &run_dir,
+            &["running"],
+            "completed"
+        ));
+        assert_eq!(run_state(&run_dir), "cancelled");
+
+        fs::remove_dir_all(&root).ok();
+    }
+
+    fn streaming_test_command() -> Vec<String> {
+        if cfg!(windows) {
+            vec![
+                "cmd.exe".to_string(),
+                "/D".to_string(),
+                "/C".to_string(),
+                "echo stream-first & ping -n 20 127.0.0.1 & echo stream-second".to_string(),
+            ]
+        } else {
+            vec![
+                "sh".to_string(),
+                "-c".to_string(),
+                "printf 'stream-first\\n'; sleep 5; printf 'stream-second\\n'".to_string(),
+            ]
+        }
+    }
+
+    #[test]
+    fn audit_running_process_streams_logs_and_cancel_stops_child() {
+        let root =
+            std::env::temp_dir().join(format!("genoligand-audit-stream-cancel-{}", now_millis()));
+        let options = server_options(root.clone());
+        let project = project_dir(&options, "project-stream");
+        let run_dir = project.join("runs").join("run-stream");
+        fs::create_dir_all(&run_dir).expect("run dir");
+        fs::write(run_dir.join("run_state.txt"), "running\n").expect("running state");
+
+        launch_run_process(&options, &project, &run_dir, &streaming_test_command())
+            .expect("launch process");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(8);
+        while std::time::Instant::now() < deadline {
+            if fs::read_to_string(run_dir.join("run.log"))
+                .unwrap_or_default()
+                .contains("stream-first")
+            {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+
+        assert!(
+            fs::read_to_string(run_dir.join("run.log"))
+                .unwrap_or_default()
+                .contains("stream-first")
+        );
+        assert_eq!(run_state(&run_dir), "running");
+        let cancel_started = std::time::Instant::now();
+        let cancelled = cancel_run(&options, "run-stream");
+        assert_eq!(cancelled["status"], "cancelled");
+        assert_eq!(cancelled["process_stopped"], true);
+        assert!(cancel_started.elapsed() < std::time::Duration::from_secs(5));
+        assert_eq!(run_state(&run_dir), "cancelled");
+
+        fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn audit_cancel_without_registered_child_fails_closed() {
+        let root = std::env::temp_dir().join(format!(
+            "genoligand-audit-cancel-missing-handle-{}",
+            now_millis()
+        ));
+        let options = server_options(root.clone());
+        let run_dir = project_dir(&options, "project-missing-handle")
+            .join("runs")
+            .join("run-missing-handle");
+        fs::create_dir_all(&run_dir).expect("run dir");
+        fs::write(run_dir.join("run_state.txt"), "running\n").expect("run state");
+
+        let response = cancel_run(&options, "run-missing-handle");
+
+        assert_eq!(response["status"], "failed");
+        assert_eq!(response["error"], "active_run_handle_missing");
+        assert_eq!(response["process_stopped"], false);
+        assert_eq!(run_state(&run_dir), "running");
+
+        fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn audit_run_logs_are_bounded_on_disk_and_in_api() {
+        let root =
+            std::env::temp_dir().join(format!("genoligand-audit-bounded-log-{}", now_millis()));
+        let options = server_options(root.clone());
+        let run_dir = project_dir(&options, "project-log")
+            .join("runs")
+            .join("run-log");
+        fs::create_dir_all(&run_dir).expect("run dir");
+        fs::write(run_dir.join("run_state.txt"), "running\n").expect("run state");
+        let log_path = run_dir.join("run.log");
+        for index in 0..200 {
+            append_bounded_log(
+                &log_path,
+                format!("stdout\tlog-line-{index:03}-xxxxxxxxxxxxxxxxxxxxxxxx\n").as_bytes(),
+                1024,
+            )
+            .expect("append log");
+        }
+
+        let payload = logs_json(&options, "run-log");
+        let logs = payload["logs"].as_array().expect("logs");
+        assert!(fs::metadata(&log_path).expect("log metadata").len() <= 1024);
+        assert!(
+            logs.iter()
+                .any(|line| line.as_str().unwrap_or_default().contains("log-line-199"))
+        );
+        assert!(logs.len() <= RUN_LOG_READ_LINES + 8);
+
+        fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn audit_delete_stops_registered_process_before_removing_project() {
+        let root =
+            std::env::temp_dir().join(format!("genoligand-audit-delete-run-{}", now_millis()));
+        let options = server_options(root.clone());
+        let project_id = "project-delete-run";
+        let project = project_dir(&options, project_id);
+        let run_dir = project.join("runs").join("run-delete");
+        fs::create_dir_all(&run_dir).expect("run dir");
+        fs::write(run_dir.join("run_state.txt"), "running\n").expect("run state");
+        launch_run_process(&options, &project, &run_dir, &streaming_test_command())
+            .expect("launch process");
+        let process = registered_run_process(&run_dir).expect("registered process");
+
+        let delete_started = std::time::Instant::now();
+        let deleted = delete_project(&options, project_id);
+
+        assert_eq!(deleted["status"], "deleted");
+        assert!(delete_started.elapsed() < std::time::Duration::from_secs(5));
+        assert!(run_process_exited(&process));
+        assert!(registered_run_process(&run_dir).is_none());
+        assert!(!project.exists());
+
+        fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn audit_duplicate_historical_run_ids_fail_closed() {
+        let root =
+            std::env::temp_dir().join(format!("genoligand-audit-run-lookup-{}", now_millis()));
+        let options = server_options(root.clone());
+        for project_id in ["project-a", "project-b"] {
+            let run_dir = project_dir(&options, project_id)
+                .join("runs")
+                .join("run-duplicate");
+            fs::create_dir_all(&run_dir).expect("run dir");
+            fs::write(run_dir.join("run_state.txt"), "completed\n").expect("run state");
+        }
+
+        assert!(find_run_dir(&options, "run-duplicate").is_none());
+        assert_eq!(run_json(&options, "run-duplicate")["state"], "not_found");
+
+        fs::remove_dir_all(&root).ok();
+    }
+
+    fn write_authenticity_result_fixture(run_dir: &Path) {
+        fs::create_dir_all(run_dir).expect("run dir");
+        fs::write(run_dir.join("run_state.txt"), "completed\n").expect("run state");
+        fs::write(
+            run_dir.join("target_candidate_ranking.tsv"),
+            "rank\tcandidate_id\ttarget_id\ttarget_name\tcandidate_scope\torganism\tfinal_score\tknown_database_score\tmetagenome_score\tstructure_score\tdocking_score\tmd_score\tevidence_summary\tstatus\n1\tC1\tT1\tTarget 1\tknown_human_protein\tHomo sapiens\t0.9\t0.8\t0.0\t0.1\t0.0\t0.0\tcurrent evidence\tcomputed_prediction\n",
+        )
+        .expect("ranking");
+        fs::write(
+            run_dir.join("evidence_ledger.tsv"),
+            "claim_id\tevidence_artifact\towner\tstatus\tnotes\nclaim-1\ttarget_candidate_ranking.tsv\tGenoLigand\tavailable\tcurrent run\n",
+        )
+        .expect("evidence");
+        fs::write(run_dir.join("research_report.md"), "# Authentic report\n").expect("report");
+    }
+
+    fn assert_authenticity_gate_denies_results<F>(label: &str, setup_gate: F)
+    where
+        F: FnOnce(&Path),
+    {
+        let root = std::env::temp_dir().join(format!(
+            "genoligand-audit-authenticity-{label}-{}",
+            now_millis()
+        ));
+        let options = server_options(root.clone());
+        let run_id = format!("run-{label}");
+        let run_dir = project_dir(&options, &format!("project-{label}"))
+            .join("runs")
+            .join(&run_id);
+        write_authenticity_result_fixture(&run_dir);
+        setup_gate(&run_dir.join("authenticity_gate.tsv"));
+
+        let candidates = candidates_endpoint_json(&options, &run_id);
+        let evidence = evidence_endpoint_json(&options, &run_id);
+        let artifacts = artifacts_json(&options, &run_id);
+        let workspace = user_workspace_summary_json(&options);
+        let (download_status, _, download_body) =
+            download_artifact_response(&options, &run_id, "research_report");
+
+        assert_eq!(candidates["has_output"], false);
+        assert!(
+            candidates["candidates"]
+                .as_array()
+                .is_some_and(Vec::is_empty)
+        );
+        assert_eq!(evidence["has_output"], false);
+        assert!(evidence["evidence"].as_array().is_some_and(Vec::is_empty));
+        assert_eq!(workspace["candidate_count"], 0);
+        assert_eq!(workspace["result_count"], 0);
+        for id in ["candidate_ranking", "evidence", "research_report"] {
+            let visible = artifacts["items"]
+                .as_array()
+                .and_then(|items| {
+                    items
+                        .iter()
+                        .find(|item| item.get("id").and_then(Value::as_str) == Some(id))
+                })
+                .and_then(|item| item.get("exists"))
+                .and_then(Value::as_bool)
+                .unwrap_or(true);
+            assert!(!visible, "{id} must be hidden when gate is {label}");
+        }
+        assert_eq!(download_status, 409);
+        assert!(download_body.contains("authenticity_gate_failed"));
+        assert!(!download_body.contains("Authentic report"));
+
+        fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn audit_authenticity_gate_missing_fails_closed() {
+        assert_authenticity_gate_denies_results("missing", |_| {});
+    }
+
+    #[test]
+    fn audit_authenticity_gate_read_failure_fails_closed() {
+        assert_authenticity_gate_denies_results("unreadable", |gate| {
+            fs::create_dir(gate).expect("unreadable gate path");
+        });
+    }
+
+    #[test]
+    fn audit_authenticity_gate_non_allowed_status_fails_closed() {
+        assert_authenticity_gate_denies_results("not-allowed", |gate| {
+            fs::write(
+                gate,
+                "artifact\tstatus\tline_number\tmarker\treason\nfinal_run_artifacts\tready\t0\t\tunchecked\n",
+            )
+            .expect("gate");
+        });
+    }
+
+    #[test]
+    fn audit_authenticity_gate_passed_allows_results() {
+        let root = std::env::temp_dir().join(format!(
+            "genoligand-audit-authenticity-passed-{}",
+            now_millis()
+        ));
+        let options = server_options(root.clone());
+        let run_dir = project_dir(&options, "project-passed")
+            .join("runs")
+            .join("run-passed");
+        write_authenticity_result_fixture(&run_dir);
+        fs::write(
+            run_dir.join("authenticity_gate.tsv"),
+            "artifact\tstatus\tline_number\tmarker\treason\nfinal_run_artifacts\tpassed\t0\t\tclean\n",
+        )
+        .expect("gate");
+
+        assert_eq!(
+            candidates_endpoint_json(&options, "run-passed")["has_output"],
+            true
+        );
+        assert_eq!(
+            evidence_endpoint_json(&options, "run-passed")["has_output"],
+            true
+        );
+        let (status, _, body) =
+            download_artifact_response(&options, "run-passed", "research_report");
+        assert_eq!(status, 200);
+        assert!(body.contains("Authentic report"));
+
+        fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn audit_setup_progress_reconciles_historical_ready_with_live_status() {
+        let root =
+            std::env::temp_dir().join(format!("genoligand-audit-setup-reconcile-{}", now_millis()));
+        let options = server_options(root.clone());
+        let store = science_store_path(&options);
+        fs::create_dir_all(&store).expect("store");
+        fs::write(
+            store.join("install_progress.json"),
+            json!({
+                "status": "ready",
+                "stage": "安装完成",
+                "current_resource": "科学仓库",
+                "completed_steps": 6,
+                "total_steps": 6,
+                "failed_steps": 0,
+                "percent": 100,
+                "message": "科学仓库已就绪",
+                "updated_at": now_seconds()
+            })
+            .to_string(),
+        )
+        .expect("progress");
+
+        let status = user_setup_status_json(&options);
+        let progress = user_setup_progress_json(&options);
+
+        assert_eq!(status["database_ready"], false);
+        assert_eq!(progress["database_ready"], false);
+        assert_eq!(progress["status"], "needs_repair");
+        assert!(progress["percent"].as_u64().unwrap_or(100) < 100);
+        assert!(progress["failed_steps"].as_u64().unwrap_or(0) >= 1);
+
+        fs::remove_dir_all(&root).ok();
+    }
+}

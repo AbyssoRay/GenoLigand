@@ -4,6 +4,56 @@
   });
 }
 
+async function loadInputCapabilities() {
+  const capabilities = await api("/api/user/inputs/capabilities");
+  const specs = capabilities?.input_types;
+  const valid =
+    Array.isArray(specs) &&
+    specs.length > 0 &&
+    specs.every(
+      (spec) =>
+        spec &&
+        typeof spec.kind === "string" &&
+        typeof spec.field === "string" &&
+        typeof spec.title === "string" &&
+        typeof spec.label === "string" &&
+        typeof spec.placeholder === "string" &&
+        typeof spec.minimum === "string",
+    );
+  if (!valid) throw new Error("输入能力描述不可用。");
+  state.inputCapabilities = capabilities;
+  inputSpecs.splice(0, inputSpecs.length, ...specs);
+  if (!inputSpecs.some((spec) => spec.kind === state.selectedInput)) {
+    state.selectedInput = inputSpecs[0].kind;
+  }
+  inputSpecs.forEach((spec) => {
+    if (!(spec.field in state.form)) state.form[spec.field] = "";
+  });
+  return capabilities;
+}
+
+function emptyInputForm() {
+  const form = { project_name: "" };
+  inputSpecs.forEach((spec) => {
+    form[spec.field] = "";
+  });
+  return form;
+}
+
+function restoreInputForm(project, savedInputs) {
+  invalidateInputInspection();
+  const form = emptyInputForm();
+  const fields = new Set(["project_name", ...inputSpecs.map((spec) => spec.field)]);
+  (savedInputs?.inputs || []).forEach((row) => {
+    if (fields.has(row?.field)) form[row.field] = String(row.value ?? "");
+  });
+  if (!form.project_name.trim()) {
+    form.project_name = project?.project_name || "";
+  }
+  state.form = form;
+  state.savedInputs = savedInputs;
+}
+
 function inputPayloadFromForm() {
   return {
     input_kind: "multi_input_workbench",
@@ -180,6 +230,7 @@ async function saveInput() {
       return discardStaleInputSave(saveGeneration);
     }
     state.project = savedProject;
+    state.savedInputs = inputPayload;
     state.run = null;
     state.runData = null;
     state.preflight = null;
@@ -209,6 +260,8 @@ async function saveInput() {
 }
 
 async function createNewProject() {
+  projectOpenGeneration += 1;
+  cancelResultRequest();
   state.alert = "";
   invalidateInputInspection();
   const created = await api("/api/user/projects", { method: "POST", body: "{}" });
@@ -222,26 +275,43 @@ async function createNewProject() {
 }
 
 async function openExistingProject(projectId) {
+  const generation = projectOpenGeneration + 1;
+  projectOpenGeneration = generation;
   state.alert = "";
+  cancelResultRequest();
+  stopRunProgressPolling();
   resetInputForm();
-  state.project = await api(`/api/user/projects/${projectId}`);
   state.preflight = null;
   state.run = null;
   state.runData = null;
+  const [project, savedInputs] = await Promise.all([
+    api(`/api/user/projects/${projectId}`),
+    api(`/api/user/projects/${projectId}/inputs`),
+  ]);
+  if (generation !== projectOpenGeneration) return false;
+  state.project = project;
+  restoreInputForm(project, savedInputs);
   if (state.project.latest_run_id) {
     state.run = await api(`/api/user/runs/${state.project.latest_run_id}`);
+    if (generation !== projectOpenGeneration) return false;
     await loadRunData();
+    if (generation !== projectOpenGeneration) return false;
     setStep(state.run.state === "completed" ? "results" : "run");
-    return;
+    return true;
   }
   setStep("input");
+  return true;
 }
 
 async function deleteExistingProject(projectId) {
   const project = (state.projects || []).find((item) => item.project_id === projectId) || state.project;
   const name = project?.project_name || "当前项目";
   if (!window.confirm(`删除“${name}”？项目运行输出也会删除。`)) return;
-  if (state.project?.project_id === projectId) invalidateInputInspection();
+  if (state.project?.project_id === projectId) {
+    projectOpenGeneration += 1;
+    cancelResultRequest();
+    invalidateInputInspection();
+  }
   const deleted = await api(`/api/user/projects/${projectId}`, { method: "DELETE" });
   if (deleted.status === "failed") {
     state.alert = deleted.error || "项目删除失败。";
@@ -266,14 +336,8 @@ async function refreshProjects() {
 
 function resetInputForm() {
   invalidateInputInspection();
-  state.form = {
-    project_name: "",
-    small_molecule: "",
-    peptide: "",
-    protein_ligand: "",
-    complex: "",
-    genome_or_metagenome: "",
-  };
+  state.form = emptyInputForm();
+  state.savedInputs = null;
 }
 
 async function runPreflight() {
@@ -289,56 +353,94 @@ async function runPreflight() {
   render();
 }
 
-async function refreshSetupProgress() {
-  try {
-    state.setupProgress = await api("/api/user/setup/progress");
-  } catch {
-    state.setupProgress = state.setupProgress || null;
-  }
+function refreshSetupProgress() {
+  if (setupProgressRequestPromise) return setupProgressRequestPromise;
+  let request;
+  request = (async () => {
+    try {
+      const setup = await api("/api/user/setup/status");
+      const progress = await api("/api/user/setup/progress");
+      state.setup = setup;
+      state.setupProgress = progress;
+    } catch {
+      state.setupProgress = state.setupProgress || null;
+    } finally {
+      if (setupProgressRequestPromise === request) setupProgressRequestPromise = null;
+    }
+  })();
+  setupProgressRequestPromise = request;
+  return request;
 }
 
-async function refreshRunProgress() {
-  if (!state.run?.run_id) return;
-  try {
-    state.run = await api(`/api/user/runs/${state.run.run_id}`);
-    await loadRunData();
-  } catch (error) {
-    state.alert = `无法刷新运行进度：${error.message}`;
-  }
+function refreshRunProgress() {
+  if (runProgressRequestPromise) return runProgressRequestPromise;
+  if (!state.run?.run_id) return Promise.resolve(null);
+  const runId = state.run.run_id;
+  let request;
+  request = (async () => {
+    try {
+      const run = await api(`/api/user/runs/${runId}`);
+      if (state.run?.run_id !== runId) return null;
+      state.run = run;
+      await loadRunData();
+      return run;
+    } catch (error) {
+      state.alert = `无法刷新运行进度：${error.message}`;
+      return null;
+    } finally {
+      if (runProgressRequestPromise === request) runProgressRequestPromise = null;
+    }
+  })();
+  runProgressRequestPromise = request;
+  return request;
 }
 
 function startRunProgressPolling() {
   stopRunProgressPolling();
-  runProgressTimer = window.setInterval(async () => {
-    await refreshRunProgress();
-    if (state.run?.state !== "running") {
-      stopRunProgressPolling();
-    }
-    if (state.step === "run") render();
-  }, 1000);
+  const generation = runProgressPollingGeneration;
+  const schedule = () => {
+    if (generation !== runProgressPollingGeneration) return;
+    runProgressTimer = window.setTimeout(async () => {
+      runProgressTimer = null;
+      await refreshRunProgress();
+      if (generation !== runProgressPollingGeneration) return;
+      if (state.step === "run") render();
+      if (state.run?.state === "running") schedule();
+      else stopRunProgressPolling();
+    }, 1000);
+  };
+  schedule();
 }
 
 function stopRunProgressPolling() {
-  if (runProgressTimer) {
-    window.clearInterval(runProgressTimer);
+  runProgressPollingGeneration += 1;
+  if (runProgressTimer !== null) {
+    window.clearTimeout(runProgressTimer);
     runProgressTimer = null;
   }
 }
 
 function startSetupProgressPolling() {
   stopSetupProgressPolling();
-  setupProgressTimer = window.setInterval(async () => {
-    await refreshSetupProgress();
-    if (state.setupProgress && state.setupProgress.status !== "running") {
-      stopSetupProgressPolling();
-    }
-    if (state.step === "check") render();
-  }, 1000);
+  const generation = setupProgressPollingGeneration;
+  const schedule = () => {
+    if (generation !== setupProgressPollingGeneration) return;
+    setupProgressTimer = window.setTimeout(async () => {
+      setupProgressTimer = null;
+      await refreshSetupProgress();
+      if (generation !== setupProgressPollingGeneration) return;
+      if (state.step === "check") render();
+      if (state.setupProgress?.status === "running") schedule();
+      else stopSetupProgressPolling();
+    }, 1000);
+  };
+  schedule();
 }
 
 function stopSetupProgressPolling() {
-  if (setupProgressTimer) {
-    window.clearInterval(setupProgressTimer);
+  setupProgressPollingGeneration += 1;
+  if (setupProgressTimer !== null) {
+    window.clearTimeout(setupProgressTimer);
     setupProgressTimer = null;
   }
 }
@@ -405,6 +507,7 @@ async function startRun() {
     return;
   }
   state.alert = "";
+  cancelResultRequest();
   setStep("run");
   state.run = {
     state: "running",
@@ -436,19 +539,56 @@ async function startRun() {
   setStep("run");
 }
 
+function resultRequestAborted(error) {
+  return error?.name === "AbortError";
+}
+
+function cancelResultRequest() {
+  const controller = resultRequestController;
+  resultRequestController = null;
+  resultRequestPromise = null;
+  if (controller && !controller.signal.aborted) controller.abort();
+}
+
+function runResultRequest(task, { replace = false } = {}) {
+  if (resultRequestPromise && !replace) return resultRequestPromise;
+  if (replace) cancelResultRequest();
+  const controller = new AbortController();
+  const request = Promise.resolve()
+    .then(() => task(controller.signal))
+    .catch((error) => {
+      if (resultRequestAborted(error)) return null;
+      throw error;
+    });
+  const tracked = request.finally(() => {
+    if (resultRequestPromise === tracked) {
+      resultRequestPromise = null;
+      resultRequestController = null;
+    }
+  });
+  resultRequestController = controller;
+  resultRequestPromise = tracked;
+  return tracked;
+}
+
 async function loadRunData() {
   if (!state.run?.run_id) {
+    cancelResultRequest();
     state.runData = null;
-    return;
+    return Promise.resolve(null);
   }
   const runId = state.run.run_id;
-  const candidates = await api(`/api/user/runs/${runId}/candidates`);
-  const detail = await api(`/api/user/runs/${runId}/candidate-detail`);
-  const evidence = await api(`/api/user/runs/${runId}/evidence`);
-  const genome = await api(`/api/user/runs/${runId}/genome-context`);
-  const structure = await api(`/api/user/runs/${runId}/structure`);
-  const md = await api(`/api/user/runs/${runId}/md-summary`);
-  const logs = await api(`/api/user/runs/${runId}/logs`);
-  const artifacts = await api(`/api/user/runs/${runId}/artifacts`);
-  state.runData = { candidates, detail, evidence, genome, structure, md, logs, artifacts };
+  return runResultRequest(async (signal) => {
+    const candidates = await api(`/api/user/runs/${runId}/candidates`, { signal });
+    const detail = await api(`/api/user/runs/${runId}/candidate-detail`, { signal });
+    const evidence = await api(`/api/user/runs/${runId}/evidence`, { signal });
+    const genome = await api(`/api/user/runs/${runId}/genome-context`, { signal });
+    const structure = await api(`/api/user/runs/${runId}/structure`, { signal });
+    const md = await api(`/api/user/runs/${runId}/md-summary`, { signal });
+    const logs = await api(`/api/user/runs/${runId}/logs`, { signal });
+    const artifacts = await api(`/api/user/runs/${runId}/artifacts`, { signal });
+    if (signal.aborted || state.run?.run_id !== runId) return null;
+    state.runData = { candidates, detail, evidence, genome, structure, md, logs, artifacts };
+    return state.runData;
+  });
 }

@@ -9,6 +9,14 @@ fn server_options(workspace_root: PathBuf) -> ServerOptions {
     }
 }
 
+fn write_passed_authenticity_gate(run_dir: &Path) {
+    fs::write(
+        run_dir.join("authenticity_gate.tsv"),
+        "artifact\tstatus\tline_number\tmarker\treason\nfinal_run_artifacts\tpassed\t0\t\tclean\n",
+    )
+    .expect("authenticity gate");
+}
+
 #[test]
 fn gls_cli_invocation_prefers_runtime_bin_over_cargo_fallback() {
     let root = std::env::temp_dir().join(format!("genoligand-runtime-bin-{}", now_millis()));
@@ -626,13 +634,25 @@ fn user_workspace_summary_counts_visible_completed_run_artifacts() {
     .expect("structure header");
     fs::write(run_dir.join("md_summary.tsv"), "candidate_id\n").expect("md header");
     fs::write(run_dir.join("research_report.md"), "# Report\n").expect("report");
+    write_passed_authenticity_gate(&run_dir);
 
     let summary = user_workspace_summary_json(&options);
-    assert_eq!(summary["project_count"], 1);
-    assert_eq!(summary["run_count"], 1);
+    let projects = user_projects_json(&options);
+    let draft = projects["projects"]
+        .as_array()
+        .and_then(|items| {
+            items
+                .iter()
+                .find(|item| item["project_id"] == "hidden-project")
+        })
+        .expect("draft project");
+    assert_eq!(summary["project_count"], 2);
+    assert_eq!(summary["run_count"], 2);
     assert_eq!(summary["candidate_count"], 2);
     assert_eq!(summary["result_count"], 4);
     assert_eq!(summary["export_item_count"], 3);
+    assert_eq!(projects["projects"].as_array().map(Vec::len), Some(2));
+    assert_eq!(draft["project_status"], "draft");
     assert_eq!(summary["demo_count"], 0);
     assert_eq!(summary["sample_count"], 0);
     assert_eq!(summary["test_result_count"], 0);
@@ -1686,8 +1706,9 @@ fn artifact_download_is_limited_to_current_run_allowlist() {
     fs::write(run_dir.join("research_report.md"), "# Report\n").expect("write report");
     fs::write(run_dir.join("secret.txt"), "hidden\n").expect("write secret");
 
-    let (status, _, _) = download_artifact_response(&options, "run-1", "research_report");
-    assert_eq!(status, 404);
+    let (status, _, body) = download_artifact_response(&options, "run-1", "research_report");
+    assert_eq!(status, 409);
+    assert!(body.contains("authenticity_gate_failed"));
 
     fs::write(
             run_dir.join("target_candidate_ranking.tsv"),
@@ -1700,6 +1721,11 @@ fn artifact_download_is_limited_to_current_run_allowlist() {
         )
         .expect("evidence");
 
+    let (status, _, body) = download_artifact_response(&options, "run-1", "research_report");
+    assert_eq!(status, 409);
+    assert!(body.contains("authenticity_gate_failed"));
+
+    write_passed_authenticity_gate(&run_dir);
     let (status, content_type, body) =
         download_artifact_response(&options, "run-1", "research_report");
     assert_eq!(status, 200);
@@ -1740,6 +1766,7 @@ fn candidate_ranking_download_returns_full_completed_table() {
         ));
     }
     fs::write(run_dir.join("target_candidate_ranking.tsv"), ranking).expect("ranking");
+    write_passed_authenticity_gate(&run_dir);
 
     let (status, _, body) = download_artifact_response(&options, "run-1", "candidate_ranking");
 
@@ -1911,6 +1938,7 @@ fn completed_header_only_result_files_do_not_count_as_user_outputs() {
     .expect("structure");
     fs::write(run_dir.join("md_summary.tsv"), "candidate_id\trmsd\n").expect("md");
     fs::write(run_dir.join("research_report.md"), "# Empty report\n").expect("report");
+    write_passed_authenticity_gate(&run_dir);
 
     for response in [
         candidates_endpoint_json(&options, "run-1"),
@@ -2330,6 +2358,7 @@ fn user_api_responses_do_not_expose_local_paths_or_commands() {
     fs::write(run_dir.join("run_context.json"), r#"{"path":"hidden"}"#).expect("context");
     fs::write(run_dir.join("artifact_source_map.tsv"), "hidden\n").expect("source trace");
     fs::write(run_dir.join("research_report.md"), "# Report\n").expect("report");
+    write_passed_authenticity_gate(&run_dir);
 
     let run = run_json(&options, "run-1");
     assert_eq!(run["trace"]["project_label"], "蛋白靶点筛选");
@@ -2512,6 +2541,7 @@ fn user_downloads_are_sanitized_exports() {
         "sample_label\ttimestamp\tgpu_index\tname\tutilization_gpu_percent\tmemory_used_mb\tmemory_total_mb\tpower_draw_w\tcurrent_pid_observed\tcompute_process_count\tcompute_process_memory_used_mb\tfailure_reason\tdebug_path\nproduction_poll_1\t2026-07-03\t0\tNVIDIA\t70\t2048\t8192\t80\ttrue\t1\t2048\t\tD:/hidden\n",
     )
     .expect("gpu");
+    write_passed_authenticity_gate(&run_dir);
 
     for artifact_id in [
         "candidate_ranking",
@@ -2561,6 +2591,7 @@ fn candidate_detail_endpoint_uses_detail_artifact_without_internal_fields() {
             r#"{"candidate_count":1,"project_id":"project-1","run_id":"run-1","candidates":[{"candidate_id":"C1","target_id":"P24941","target_name":"CDK2","candidate_scope":"known_database","organism":"Homo sapiens","scores":{"final":0.8,"known_database":0.7,"metagenome":0.0,"structure":0.1,"docking":0.0,"md":0.0},"evidence_summary":"matched current run","source_artifacts":["target_candidate_ranking.tsv","evidence_ledger.tsv"],"sha256":"abc123","path":"D:/hidden"}]}"#,
         )
         .expect("candidate detail");
+    write_passed_authenticity_gate(&run_dir);
 
     let payload = candidate_detail_json(&options, "run-1");
     assert_eq!(payload["candidate_count"], 1);
@@ -2609,6 +2640,7 @@ fn result_endpoints_expose_pagination_metadata_for_large_tables() {
         ));
     }
     fs::write(run_dir.join("target_candidate_ranking.tsv"), ranking).expect("ranking");
+    write_passed_authenticity_gate(&run_dir);
 
     let payload = candidates_endpoint_json(&options, "run-1");
 
@@ -2642,6 +2674,7 @@ fn result_routes_apply_page_and_filter_query_parameters() {
         ));
     }
     fs::write(run_dir.join("target_candidate_ranking.tsv"), ranking).expect("ranking");
+    write_passed_authenticity_gate(&run_dir);
 
     let (status, _, body) = route(
         "GET",
@@ -2696,6 +2729,7 @@ fn structure_endpoint_exposes_viewer_coordinates_only_from_completed_run_artifac
             "ATOM      1  N   GLY A   1      11.104  13.207   2.100  1.00 20.00           N\nATOM      2  CA  GLY A   1      12.456  13.607   2.500  1.00 20.00           C\n",
         )
         .expect("viewer pdb");
+    write_passed_authenticity_gate(&run_dir);
 
     let payload = structure_endpoint_json(&options, "run-1");
     assert_eq!(payload["has_output"], true);
@@ -2733,6 +2767,7 @@ fn structure_endpoint_reports_missing_viewer_reason() {
             "status\ttarget_id\tpdb_id\tartifact\texpected_path\treason\nnot_ready\t10GS\t10GS\t\tdownloads/rcsb/mmcif/0g/10gs.cif.gz\tmatched structure rows did not have a local coordinate artifact\n",
         )
         .expect("viewer status");
+    write_passed_authenticity_gate(&run_dir);
 
     let payload = structure_endpoint_json(&options, "run-1");
 
@@ -2786,6 +2821,7 @@ fn md_endpoint_builds_chart_rows_from_current_run_summaries() {
         "cuda_platform\tnvidia_smi_available\tgpu_observed\tmax_utilization_gpu_percent\tmax_memory_delta_mb\tprocess_observed\tsample_count\tproduction_sample_count\tproduction_max_utilization_gpu_percent\tproduction_max_memory_delta_mb\tmonitoring_mode\tobservation_basis\tfailure_reason\nCUDA\ttrue\ttrue\t70.0000\t512.0000\ttrue\t4\t2\t70.0000\t512.0000\tnvidia-smi_polling\tcurrent_pid\t\n",
     )
     .expect("gpu status");
+    write_passed_authenticity_gate(&run_dir);
 
     let payload = md_endpoint_json(&options, "run-1");
     assert_eq!(payload["has_output"], true);
@@ -2823,6 +2859,7 @@ fn md_endpoint_reports_missing_md_reason() {
         "status\treason\nnot_ready\tno RMSD metric artifact;no trajectory artifact\n",
     )
     .expect("md status");
+    write_passed_authenticity_gate(&run_dir);
 
     let payload = md_endpoint_json(&options, "run-1");
 

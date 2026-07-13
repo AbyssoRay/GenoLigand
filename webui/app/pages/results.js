@@ -246,6 +246,7 @@ function hydrateResultPagination() {
 
 async function loadResultPage(kind, pageNumber, filterText) {
   if (!state.run?.run_id) return;
+  const runId = state.run.run_id;
   const config = resultEndpointConfig(kind);
   if (!config) return;
   const pageNumberSafe = Math.max(1, Number(pageNumber) || 1);
@@ -260,9 +261,17 @@ async function loadResultPage(kind, pageNumber, filterText) {
   state.resultQueries[kind] = { page: pageNumberSafe, filter };
   state.resultTab = kind;
   try {
-    state.runData = state.runData || {};
-    state.runData[config.key] = await api(`/api/user/runs/${state.run.run_id}/${config.endpoint}?${params.toString()}`);
-    render();
+    const result = await runResultRequest(
+      async (signal) => {
+        const value = await api(`/api/user/runs/${runId}/${config.endpoint}?${params.toString()}`, { signal });
+        if (signal.aborted || state.run?.run_id !== runId) return null;
+        state.runData = state.runData || {};
+        state.runData[config.key] = value;
+        return value;
+      },
+      { replace: true },
+    );
+    if (result) render();
   } catch (error) {
     state.alert = `结果分页加载失败：${error.message}`;
     render();
