@@ -1,3 +1,4 @@
+use gls_science::{InputInspection, ScienceOptions, inspect_input_manifest};
 use serde_json::{Value, json};
 use std::collections::BTreeMap;
 use std::fs;
@@ -5,15 +6,13 @@ use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
-
-mod input_recognition;
-
-use input_recognition::{input_recognition_summary, input_value_has_usable_user_input};
 
 pub const PRODUCT_NAME: &str = "GenoLigand Local WebUI";
 pub const PRODUCT_VERSION: &str = env!("CARGO_PKG_VERSION");
 const RESULT_PAGE_SIZE: usize = 500;
+static INPUT_INSPECTION_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
 const REQUIRED_TOOL_IDS: &[&str] = &[
     "java",
@@ -149,6 +148,7 @@ fn route(
         ("GET", "/api/user/projects") => user_projects_json(options),
         ("GET", "/api/user/workspace-summary") => user_workspace_summary_json(options),
         ("POST", "/api/user/projects") => create_user_project(options),
+        ("POST", "/api/user/inputs/inspect") => inspect_user_input_json(options, request_body),
         ("GET", "/api/projects") => projects_json(options),
         ("POST", "/api/projects") => create_project(options),
         ("GET", "/api/user/databases") => user_databases_json(options),
@@ -582,7 +582,8 @@ fn create_project_record(options: &ServerOptions) -> Result<Value, String> {
 
 fn project_visible_to_user(options: &ServerOptions, project_id: &str) -> bool {
     let dir = project_dir(options, project_id);
-    input_has_user_value(&dir.join("input_manifest.json")) || dir.join("latest_run_id.txt").exists()
+    input_has_user_value(options, &dir.join("input_manifest.json"))
+        || dir.join("latest_run_id.txt").exists()
 }
 
 fn user_project_summary(project: &Value) -> Value {
@@ -635,6 +636,145 @@ fn read_input_manifest(options: &ServerOptions, project_id: &str) -> Value {
     )
 }
 
+fn inspect_user_input_json(options: &ServerOptions, body: &str) -> Value {
+    let inspection_dir = options.artifact_dir.join("input-inspection");
+    let sequence = INPUT_INSPECTION_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+    let pending = inspection_dir.join(format!(
+        "inspection-{}-{sequence}.pending.json",
+        std::process::id()
+    ));
+    if let Err(err) = write_text(&pending, body) {
+        let failure = failed_inspection_json(err);
+        return match remove_pending_file(&pending) {
+            Ok(()) => failure,
+            Err(cleanup_err) => cleanup_failure_inspection(failure, cleanup_err),
+        };
+    }
+    let result = inspect_manifest(options, &pending);
+    if let Err(err) = remove_pending_file(&pending) {
+        return failed_inspection_json(err);
+    }
+    match result {
+        Ok(inspection) => inspection_json(&inspection),
+        Err(err) => failed_inspection_json(err),
+    }
+}
+
+fn inspect_manifest(options: &ServerOptions, path: &Path) -> Result<InputInspection, String> {
+    inspect_input_manifest(&ScienceOptions {
+        workspace_root: options.workspace_root.clone(),
+        science_store: science_store_path(options),
+        input_manifest: path.to_path_buf(),
+        run_dir: path
+            .parent()
+            .map(Path::to_path_buf)
+            .unwrap_or_else(|| options.artifact_dir.clone()),
+    })
+}
+
+fn inspection_json(inspection: &InputInspection) -> Value {
+    let mut response = json!({
+        "usable": inspection.usable,
+        "summary": inspection.summary,
+        "errors": inspection.errors,
+        "inputs": inspection.inputs.iter().map(|input| json!({
+            "input_id": input.input_id,
+            "record_id": input.record_id,
+            "canonical_kind": input.canonical_kind,
+            "conversion_method": input.conversion_method
+        })).collect::<Vec<_>>()
+    });
+    if !inspection.usable {
+        let error = inspection_error_code(inspection);
+        response["error"] = json!(error);
+        response["message"] = json!(input_error_message(error));
+    }
+    response
+}
+
+fn inspection_error_code(inspection: &InputInspection) -> &str {
+    let Some(error) = inspection.errors.first() else {
+        return "input_not_usable";
+    };
+    for input in &inspection.inputs {
+        let record_id = input.record_id.replace(['\t', '\r', '\n'], " ");
+        let prefix = format!("{}:{record_id}:", input.input_id);
+        if let Some(reason) = error.strip_prefix(&prefix) {
+            return resolver_error_code(reason);
+        }
+    }
+    resolver_error_code(error)
+}
+
+fn failed_inspection_json(error: String) -> Value {
+    let code = resolver_error_code(&error);
+    json!({
+        "usable": false,
+        "summary": "输入检查失败",
+        "errors": [error],
+        "inputs": [],
+        "error": code,
+        "message": input_error_message(code)
+    })
+}
+
+fn resolver_error_code(error: &str) -> &str {
+    let mut parts = error.split(':');
+    let first = parts.next().unwrap_or("input_not_usable");
+    let is_input_id = first
+        .strip_prefix("input_")
+        .is_some_and(|suffix| !suffix.is_empty() && suffix.chars().all(|ch| ch.is_ascii_digit()));
+    if is_input_id {
+        let _ = parts.next();
+        parts.next().unwrap_or("input_not_usable")
+    } else {
+        first
+    }
+}
+
+fn input_error_message(code: &str) -> &'static str {
+    match code {
+        "invalid_input_manifest_json" => "输入清单不是有效的 JSON，请检查后重试。",
+        "invalid_input_manifest_schema" => "输入清单结构无效，请检查后重试。",
+        "input_file_not_found" => "找不到输入文件，请检查文件路径。",
+        "input_file_requires_reference_sequence" => "该输入文件还需要配套参考序列。",
+        "unknown_compound_identifier" => "本地科学仓库中没有对应的化合物名称或标识符。",
+        "input_manifest_replace_failed" => "无法发布新的输入清单，请检查项目目录权限。",
+        "input_manifest_cleanup_failed" => "无法清理待发布的输入清单，请检查项目目录权限。",
+        "input_not_usable" => "请至少提供一项可转换为计算输入的内容。",
+        _ => "无法转换为可计算结构或序列，请检查输入。",
+    }
+}
+
+fn successful_inspection_message(inspection: &InputInspection) -> String {
+    let mut labels = Vec::new();
+    for input in &inspection.inputs {
+        let label = match input.canonical_kind.as_str() {
+            "small_molecule" => "小分子",
+            "peptide" => "多肽",
+            "protein_ligand" => "蛋白序列",
+            "complex" => "复合物",
+            "genome_or_metagenome" => "核酸或宏基因组序列",
+            _ => "可计算输入",
+        };
+        if !labels.contains(&label) {
+            labels.push(label);
+        }
+    }
+    format!("已识别为{}", labels.join("、"))
+}
+
+fn remove_pending_file(path: &Path) -> Result<(), String> {
+    match fs::remove_file(path) {
+        Ok(()) => Ok(()),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(err) => Err(format!(
+            "input_manifest_cleanup_failed:{}:{err}",
+            path.display()
+        )),
+    }
+}
+
 fn write_user_input_manifest(options: &ServerOptions, project_id: &str, body: &str) -> Value {
     let response = write_input_manifest(options, project_id, body);
     let ok = response.get("status").and_then(Value::as_str) == Some("saved");
@@ -642,36 +782,152 @@ fn write_user_input_manifest(options: &ServerOptions, project_id: &str, body: &s
         .get("project")
         .map(user_project_summary)
         .unwrap_or_else(|| user_project_detail(options, project_id));
-    json!({
+    let mut user_response = json!({
         "ok": ok,
         "message": if ok {"输入已保存"} else {response.get("message").and_then(Value::as_str).unwrap_or("输入未保存，请检查填写内容")},
         "project": project
-    })
+    });
+    if let Some(error) = response.get("error") {
+        user_response["error"] = error.clone();
+    }
+    if let Some(inspection) = response.get("inspection") {
+        user_response["inspection"] = inspection.clone();
+    }
+    user_response
 }
 
 fn write_input_manifest(options: &ServerOptions, project_id: &str, body: &str) -> Value {
+    write_input_manifest_with_promoter(options, project_id, body, promote_input_manifest)
+}
+
+fn write_input_manifest_with_promoter<F>(
+    options: &ServerOptions,
+    project_id: &str,
+    body: &str,
+    promoter: F,
+) -> Value
+where
+    F: FnOnce(&Path, &Path) -> Result<(), String>,
+{
+    write_input_manifest_with_operations(options, project_id, body, promoter, remove_pending_file)
+}
+
+fn write_input_manifest_with_operations<F, C>(
+    options: &ServerOptions,
+    project_id: &str,
+    body: &str,
+    promoter: F,
+    mut cleanup: C,
+) -> Value
+where
+    F: FnOnce(&Path, &Path) -> Result<(), String>,
+    C: FnMut(&Path) -> Result<(), String>,
+{
     let dir = project_dir(options, project_id);
-    let path = dir.join("input_manifest.json");
-    let value = serde_json::from_str::<Value>(body.trim_start_matches('\u{feff}'))
-        .unwrap_or_else(|_| json!({"inputs":[],"files":[]}));
-    if !input_value_has_usable_user_input(&value) {
-        return json!({
-            "status":"failed",
-            "error":"input_not_usable",
-            "message":"无法转换为可计算结构/序列，请检查输入。",
-            "project": read_project(options, project_id)
-        });
+    let pending = dir.join("input_manifest.pending.json");
+    let formal = dir.join("input_manifest.json");
+    let value = match serde_json::from_str::<Value>(body.trim_start_matches('\u{feff}')) {
+        Ok(value) => value,
+        Err(err) => {
+            let inspection = failed_inspection_json(format!("invalid_input_manifest_json:{err}"));
+            return failed_input_save(options, project_id, inspection);
+        }
+    };
+    if let Err(err) = write_text(&pending, body) {
+        return failed_save_after_cleanup(
+            options,
+            project_id,
+            &pending,
+            failed_inspection_json(err),
+            &mut cleanup,
+        );
+    }
+    let inspection = match inspect_manifest(options, &pending) {
+        Ok(inspection) => inspection_json(&inspection),
+        Err(err) => failed_inspection_json(err),
+    };
+    if inspection.get("usable").and_then(Value::as_bool) != Some(true) {
+        return failed_save_after_cleanup(options, project_id, &pending, inspection, &mut cleanup);
+    }
+    if let Err(err) = promoter(&pending, &formal) {
+        return failed_save_after_cleanup(
+            options,
+            project_id,
+            &pending,
+            operation_failure_inspection(inspection, err),
+            &mut cleanup,
+        );
     }
     if let Some(name) = input_project_name(&value) {
         let _ = write_text(&dir.join("project_name.txt"), &name);
     }
-    match write_text(&path, &(value.to_string() + "\n")) {
-        Ok(()) => {
-            clear_current_run_selection(&dir);
-            json!({"status":"saved","project":read_project(options, project_id)})
-        }
-        Err(err) => json!({"status":"failed","error":err}),
+    clear_current_run_selection(&dir);
+    json!({
+        "status": "saved",
+        "inspection": inspection,
+        "project": read_project(options, project_id)
+    })
+}
+
+fn failed_save_after_cleanup<C>(
+    options: &ServerOptions,
+    project_id: &str,
+    pending: &Path,
+    inspection: Value,
+    cleanup: &mut C,
+) -> Value
+where
+    C: FnMut(&Path) -> Result<(), String>,
+{
+    let inspection = match cleanup(pending) {
+        Ok(()) => inspection,
+        Err(err) => cleanup_failure_inspection(inspection, err),
+    };
+    failed_input_save(options, project_id, inspection)
+}
+
+fn cleanup_failure_inspection(cause: Value, cleanup_error: String) -> Value {
+    let cleanup_error = if resolver_error_code(&cleanup_error) == "input_manifest_cleanup_failed" {
+        cleanup_error
+    } else {
+        format!("input_manifest_cleanup_failed:{cleanup_error}")
+    };
+    let mut errors = vec![Value::String(cleanup_error)];
+    if let Some(cause_errors) = cause.get("errors").and_then(Value::as_array) {
+        errors.extend(cause_errors.iter().cloned());
     }
+    let inputs = cause.get("inputs").cloned().unwrap_or_else(|| json!([]));
+    json!({
+        "usable": false,
+        "summary": "输入清单清理失败",
+        "errors": errors,
+        "inputs": inputs,
+        "error": "input_manifest_cleanup_failed",
+        "message": input_error_message("input_manifest_cleanup_failed"),
+        "cause": cause
+    })
+}
+
+fn operation_failure_inspection(cause: Value, error: String) -> Value {
+    let mut failure = failed_inspection_json(error);
+    failure["summary"] = json!("输入清单发布失败");
+    failure["inputs"] = cause.get("inputs").cloned().unwrap_or_else(|| json!([]));
+    failure["cause"] = cause;
+    failure
+}
+
+fn failed_input_save(options: &ServerOptions, project_id: &str, inspection: Value) -> Value {
+    json!({
+        "status": "failed",
+        "error": inspection.get("error").cloned().unwrap_or_else(|| json!("input_not_usable")),
+        "message": inspection.get("message").cloned().unwrap_or_else(|| json!(input_error_message("input_not_usable"))),
+        "inspection": inspection,
+        "project": read_project(options, project_id)
+    })
+}
+
+fn promote_input_manifest(pending: &Path, formal: &Path) -> Result<(), String> {
+    fs::rename(pending, formal).map_err(|err| format!("input_manifest_replace_failed:{err}"))
 }
 
 fn clear_current_run_selection(project_dir: &Path) {
@@ -681,12 +937,17 @@ fn clear_current_run_selection(project_dir: &Path) {
 fn preflight_json(options: &ServerOptions, project_id: &str) -> Value {
     let input = project_dir(options, project_id).join("input_manifest.json");
     let store = science_store_path(options);
-    let input_ready = input.exists() && input_has_user_value(&input);
-    let input_detail = if input_ready {
-        input_recognition_summary(&read_json_or(&input, json!({})))
-            .unwrap_or_else(|| "已识别为可计算输入".to_string())
-    } else {
-        "无法转换为可计算结构/序列".to_string()
+    let inspection = inspect_manifest(options, &input);
+    let (input_ready, input_detail) = match inspection {
+        Ok(inspection) if inspection.usable => (true, successful_inspection_message(&inspection)),
+        Ok(inspection) => {
+            let code = inspection_error_code(&inspection);
+            (false, input_error_message(code).to_string())
+        }
+        Err(err) => (
+            false,
+            input_error_message(resolver_error_code(&err)).to_string(),
+        ),
     };
     let checks = vec![
         check_with_detail("input", input_ready, input_detail),
@@ -3999,7 +4260,7 @@ fn run_trace(options: &ServerOptions, run_dir: &Path, run_id: &str) -> Value {
         .unwrap_or_else(|| "未命名研究项目".to_string());
     let input_ready = project
         .as_ref()
-        .map(|dir| input_has_user_value(&dir.join("input_manifest.json")))
+        .map(|dir| input_has_user_value(options, &dir.join("input_manifest.json")))
         .unwrap_or(false);
     let artifact_items = artifact_index(run_dir);
     let output_count = artifact_items["items"]
@@ -4049,9 +4310,10 @@ fn input_project_name(value: &Value) -> Option<String> {
         .map(ToOwned::to_owned)
 }
 
-fn input_has_user_value(path: &Path) -> bool {
-    let value = read_json_or(path, json!({}));
-    input_value_has_usable_user_input(&value)
+fn input_has_user_value(options: &ServerOptions, path: &Path) -> bool {
+    inspect_manifest(options, path)
+        .map(|inspection| inspection.usable)
+        .unwrap_or(false)
 }
 
 fn read_json_or(path: &Path, fallback: Value) -> Value {

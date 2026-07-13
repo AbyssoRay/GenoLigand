@@ -1090,145 +1090,407 @@ fn user_setup_and_diagnostics_expose_openmm_platforms() {
     fs::remove_dir_all(&root).ok();
 }
 
+fn server_options_with_compound_lookup(root: &Path, data_row: &str) -> ServerOptions {
+    let options = server_options(root.to_path_buf());
+    let store = science_store_path(&options);
+    fs::create_dir_all(store.join("indexes")).expect("indexes");
+    fs::write(
+        store.join("indexes/compound_identifiers.tsv"),
+        format!(
+            "identifier_type\tidentifier\tcanonical_smiles\tdisplay_name\tsource\n{data_row}\ttest\n"
+        ),
+    )
+    .expect("compound lookup");
+    options
+}
+
+fn inspection_pending_files(options: &ServerOptions) -> Vec<PathBuf> {
+    let dir = options.artifact_dir.join("input-inspection");
+    fs::read_dir(dir)
+        .map(|entries| {
+            entries
+                .filter_map(Result::ok)
+                .map(|entry| entry.path())
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
 #[test]
-fn input_validation_blocks_punctuation_only_payloads() {
-    let root = std::env::temp_dir().join(format!("genoligand-input-validation-{}", now_millis()));
+fn user_input_inspection_uses_science_resolver() {
+    let root = std::env::temp_dir().join(format!("genoligand-user-inspection-{}", now_millis()));
+    let options = server_options_with_compound_lookup(
+        &root,
+        "name\tcaffeine\tCn1c(=O)n(C)c2ncn(C)c2c1=O\tCaffeine",
+    );
+
+    let response = inspect_user_input_json(
+        &options,
+        r#"{"inputs":[{"field":"small_molecule","value":"caffeine"}],"files":[]}"#,
+    );
+
+    assert_eq!(response["usable"], true);
+    assert_eq!(response["errors"], json!([]));
+    assert_eq!(response["inputs"][0]["input_id"], "input_1");
+    assert_eq!(response["inputs"][0]["record_id"], "record_1");
+    assert_eq!(response["inputs"][0]["canonical_kind"], "small_molecule");
+    assert_eq!(
+        response["inputs"][0]["conversion_method"],
+        "local_identifier_lookup"
+    );
+    assert!(inspection_pending_files(&options).is_empty());
+    fs::remove_dir_all(&root).ok();
+}
+
+#[test]
+fn user_input_inspection_rejects_missing_structure_path() {
+    let root = std::env::temp_dir().join(format!("genoligand-missing-inspection-{}", now_millis()));
     let options = server_options(root.clone());
-    fs::create_dir_all(project_dir(&options, "project-1")).expect("project dir");
+
+    let response = inspect_user_input_json(
+        &options,
+        r#"{"inputs":[{"field":"small_molecule","value":"Z:\\missing\\ghost.sdf"}],"files":[]}"#,
+    );
+
+    assert_eq!(response["usable"], false);
+    assert_eq!(response["error"], "input_file_not_found");
+    assert!(
+        response["errors"][0]
+            .as_str()
+            .unwrap_or_default()
+            .contains("input_file_not_found")
+    );
+    assert!(inspection_pending_files(&options).is_empty());
+    fs::remove_dir_all(&root).ok();
+}
+
+#[test]
+fn user_input_inspection_rejects_malformed_json() {
+    let root =
+        std::env::temp_dir().join(format!("genoligand-malformed-inspection-{}", now_millis()));
+    let options = server_options(root.clone());
+
+    let response = inspect_user_input_json(&options, r#"{"inputs":["#);
+
+    assert_eq!(response["usable"], false);
+    assert_eq!(response["error"], "invalid_input_manifest_json");
+    assert!(response["inputs"].as_array().expect("inputs").is_empty());
+    assert!(inspection_pending_files(&options).is_empty());
+    fs::remove_dir_all(&root).ok();
+}
+
+#[test]
+fn user_input_inspection_rejects_project_only_and_empty_input() {
+    let root = std::env::temp_dir().join(format!("genoligand-empty-inspection-{}", now_millis()));
+    let options = server_options(root.clone());
+
+    for body in [
+        r#"{"inputs":[],"files":[]}"#,
+        r#"{"inputs":[{"field":"project_name","value":"研究项目"}],"files":[]}"#,
+    ] {
+        let response = inspect_user_input_json(&options, body);
+        assert_eq!(response["usable"], false);
+        assert_eq!(response["error"], "input_not_usable");
+        assert!(response["inputs"].as_array().expect("inputs").is_empty());
+    }
+    assert!(inspection_pending_files(&options).is_empty());
+    fs::remove_dir_all(&root).ok();
+}
+
+#[test]
+fn user_input_inspection_rejects_mixed_manifest_with_bad_record() {
+    let root = std::env::temp_dir().join(format!("genoligand-mixed-inspection-{}", now_millis()));
+    let options = server_options(root.clone());
+    let response = inspect_user_input_json(
+        &options,
+        r#"{"inputs":[{"field":"small_molecule","value":"CCO"},{"field":"small_molecule","value":"Z:\\missing\\ghost.sdf"}],"files":[]}"#,
+    );
+
+    assert_eq!(response["usable"], false);
+    assert_eq!(response["error"], "input_file_not_found");
+    assert_eq!(response["inputs"].as_array().expect("inputs").len(), 2);
+    assert_eq!(response["errors"].as_array().expect("errors").len(), 1);
+    fs::remove_dir_all(&root).ok();
+}
+
+#[test]
+fn user_input_inspection_parses_error_after_colon_record_id() {
+    let root = std::env::temp_dir().join(format!(
+        "genoligand-colon-record-inspection-{}",
+        now_millis()
+    ));
+    let options = server_options(root.clone());
+    let fasta = root.join("invalid-peptide.fasta");
+    fs::create_dir_all(&root).expect("root");
+    fs::write(&fasta, ">sample:chain\nZZ\n").expect("fasta");
+    let body = json!({
+        "inputs": [{"field": "peptide", "value": fasta.display().to_string()}],
+        "files": []
+    })
+    .to_string();
+
+    let response = inspect_user_input_json(&options, &body);
+
+    assert_eq!(response["usable"], false);
+    assert_eq!(response["inputs"][0]["record_id"], "sample:chain");
+    assert_eq!(response["error"], "invalid_peptide_sequence");
+    fs::remove_dir_all(&root).ok();
+}
+
+#[test]
+fn user_input_inspection_cleans_unique_pending_files() {
+    let root = std::env::temp_dir().join(format!("genoligand-clean-inspection-{}", now_millis()));
+    let options = server_options(root.clone());
+    let body = r#"{"inputs":[{"field":"peptide","value":"ACDEFG"}],"files":[]}"#;
+
+    assert_eq!(inspect_user_input_json(&options, body)["usable"], true);
+    assert_eq!(inspect_user_input_json(&options, body)["usable"], true);
+    assert!(inspection_pending_files(&options).is_empty());
+    fs::remove_dir_all(&root).ok();
+}
+
+#[test]
+fn user_input_inspection_route_returns_authoritative_response() {
+    let root = std::env::temp_dir().join(format!("genoligand-inspection-route-{}", now_millis()));
+    let options = server_options_with_compound_lookup(
+        &root,
+        "name\tcaffeine\tCn1c(=O)n(C)c2ncn(C)c2c1=O\tCaffeine",
+    );
+    let (status, _, body) = route(
+        "POST",
+        "/api/user/inputs/inspect",
+        &options,
+        r#"{"inputs":[{"field":"small_molecule","value":"caffeine"}],"files":[]}"#,
+    );
+    let response: Value = serde_json::from_str(&body).expect("inspection response");
+
+    assert_eq!(status, 200);
+    assert_eq!(response["usable"], true);
+    assert_eq!(
+        response["inputs"][0]["conversion_method"],
+        "local_identifier_lookup"
+    );
+    assert!(inspection_pending_files(&options).is_empty());
+    fs::remove_dir_all(&root).ok();
+}
+
+#[test]
+fn user_input_save_rejects_missing_structure_path() {
+    let root = std::env::temp_dir().join(format!("genoligand-missing-save-{}", now_millis()));
+    let options = server_options(root.clone());
+    let project = project_dir(&options, "project-1");
+    fs::create_dir_all(&project).expect("project");
 
     let response = write_input_manifest(
         &options,
         "project-1",
-        r#"{"inputs":[{"field":"project_name","value":"研究项目"},{"field":"small_molecule","value":"!!!"}],"files":[]}"#,
+        r#"{"inputs":[{"field":"small_molecule","value":"Z:\\missing\\ghost.sdf"}],"files":[]}"#,
     );
+
     assert_eq!(response["status"], "failed");
-    assert_eq!(response["error"], "input_not_usable");
-    assert!(
-        !project_dir(&options, "project-1")
-            .join("project_name.txt")
-            .exists()
-    );
-    assert!(
-        !project_dir(&options, "project-1")
-            .join("input_manifest.json")
-            .exists()
-    );
-    assert!(!input_value_has_usable_user_input(&json!({
-        "inputs":[{"field":"complex","value":"---"}]
-    })));
-    assert!(!input_value_has_usable_user_input(&json!({
-        "inputs":[
-            {"field":"small_molecule","value":"CCO"},
-            {"field":"protein_ligand","value":"???"}
-        ]
-    })));
-    assert!(!input_value_has_usable_user_input(&json!({
-        "inputs":[{"field":"peptide","value":"lqtu0we9ur"}]
-    })));
-    assert!(!input_value_has_usable_user_input(&json!({
-        "inputs":[{"field":"protein_ligand","value":"lqtu0we9ur"}]
-    })));
-    assert!(!input_value_has_usable_user_input(&json!({
-        "inputs":[{"field":"genome_or_metagenome","value":"lqtu0we9ur"}]
-    })));
-    assert!(!input_value_has_usable_user_input(&json!({
-        "inputs":[{"field":"small_molecule","value":"lqtu0we9ur"}]
-    })));
-
-    let preflight = preflight_json(&options, "project-1");
-    let input_ready = preflight["checks"]
-        .as_array()
-        .and_then(|rows| {
-            rows.iter()
-                .find(|row| row.get("id").and_then(Value::as_str) == Some("input"))
-        })
-        .and_then(|row| row.get("ready").and_then(Value::as_bool))
-        .unwrap_or(true);
-    assert!(!input_ready);
-
+    assert_eq!(response["error"], "input_file_not_found");
+    assert_eq!(response["inspection"]["usable"], false);
+    assert!(!project.join("input_manifest.pending.json").exists());
+    assert!(!project.join("input_manifest.json").exists());
     fs::remove_dir_all(&root).ok();
 }
 
 #[test]
-fn input_validation_accepts_supported_input_types() {
-    for (field, value) in [
-        ("small_molecule", "CCO"),
-        ("small_molecule", "IKVAV"),
-        ("peptide", "ACDEFG"),
-        ("protein_ligand", ">protein\nMSTNPKPQR"),
-        ("complex", "complex_chain_A_ligand_LIG.pdb"),
-        ("genome_or_metagenome", ">orf1\nATGCGTACGTAA"),
-    ] {
-        assert!(
-            input_value_has_usable_user_input(&json!({
-                "inputs":[{"field":field,"value":value}]
-            })),
-            "{field} should be accepted"
-        );
-    }
+fn user_input_save_replaces_existing_manifest_and_updates_project_state() {
+    let root = std::env::temp_dir().join(format!("genoligand-replace-save-{}", now_millis()));
+    let options = server_options(root.clone());
+    let project = project_dir(&options, "project-1");
+    fs::create_dir_all(&project).expect("project");
+
+    let first = write_input_manifest(
+        &options,
+        "project-1",
+        r#"{"inputs":[{"field":"project_name","value":"第一个项目"},{"field":"small_molecule","value":"CCO"}],"files":[]}"#,
+    );
+    assert_eq!(first["status"], "saved");
+    fs::write(project.join("latest_run_id.txt"), "run-old\n").expect("latest run");
+
+    let second = write_input_manifest(
+        &options,
+        "project-1",
+        r#"{"inputs":[{"field":"project_name","value":"第二个项目"},{"field":"small_molecule","value":"CCN"}],"files":[]}"#,
+    );
+    let manifest = read_json_or(&project.join("input_manifest.json"), json!({}));
+
+    assert_eq!(second["status"], "saved");
+    assert_eq!(manifest["inputs"][1]["value"], "CCN");
+    assert_eq!(
+        read_trimmed(&project.join("project_name.txt")).as_deref(),
+        Some("第二个项目")
+    );
+    assert!(!project.join("latest_run_id.txt").exists());
+    assert!(!project.join("input_manifest.pending.json").exists());
+    fs::remove_dir_all(&root).ok();
 }
 
 #[test]
-fn preflight_reports_user_facing_input_recognition() {
-    assert_eq!(
-        input_recognition_summary(&json!({
-            "inputs":[{"field":"small_molecule","value":"ikv AV"}]
-        }))
-        .as_deref(),
-        Some("已识别为多肽")
-    );
-    assert_eq!(
-        input_recognition_summary(&json!({
-            "inputs":[{"field":"small_molecule","value":"CC(=O)OC1=CC=CC=C1C(=O)O"}]
-        }))
-        .as_deref(),
-        Some("已识别为小分子")
-    );
-    assert_eq!(
-        input_recognition_summary(&json!({
-            "inputs":[{"field":"small_molecule","value":"ATGCGTACGTAA"}]
-        }))
-        .as_deref(),
-        Some("已识别为核酸序列")
-    );
-    assert_eq!(
-        input_recognition_summary(&json!({
-            "inputs":[{"field":"small_molecule","value":"CCN"}]
-        }))
-        .as_deref(),
-        Some("已识别为小分子")
-    );
-    assert_eq!(
-        input_recognition_summary(&json!({
-            "inputs":[{"field":"peptide","value":">pep1\nIKVAV\n>pep2\nIKVAV"}]
-        }))
-        .as_deref(),
-        Some("已识别为多肽")
+fn user_input_save_failed_promotion_preserves_formal_state() {
+    let root = std::env::temp_dir().join(format!("genoligand-failed-promotion-{}", now_millis()));
+    let options = server_options(root.clone());
+    let project = project_dir(&options, "project-1");
+    fs::create_dir_all(&project).expect("project");
+    let old_manifest = r#"{"inputs":[{"field":"project_name","value":"旧项目"},{"field":"peptide","value":"ACDEFG"}],"files":[]}"#;
+    fs::write(project.join("input_manifest.json"), old_manifest).expect("old manifest");
+    fs::write(project.join("project_name.txt"), "旧项目\n").expect("old project name");
+    fs::write(project.join("latest_run_id.txt"), "run-old\n").expect("old run");
+
+    let response = write_input_manifest_with_promoter(
+        &options,
+        "project-1",
+        r#"{"inputs":[{"field":"project_name","value":"新项目"},{"field":"peptide","value":"MSTNPKPQR"}],"files":[]}"#,
+        |_, _| Err("input_manifest_replace_failed:test".to_string()),
     );
 
-    let root = std::env::temp_dir().join(format!("genoligand-preflight-input-{}", now_millis()));
+    assert_eq!(response["status"], "failed");
+    assert_eq!(response["error"], "input_manifest_replace_failed");
+    assert_eq!(response["inspection"]["cause"]["usable"], true);
+    assert_eq!(
+        response["inspection"]["cause"]["inputs"][0]["canonical_kind"],
+        "peptide"
+    );
+    assert_eq!(
+        fs::read_to_string(project.join("input_manifest.json")).expect("manifest"),
+        old_manifest
+    );
+    assert_eq!(
+        read_trimmed(&project.join("project_name.txt")).as_deref(),
+        Some("旧项目")
+    );
+    assert_eq!(
+        read_trimmed(&project.join("latest_run_id.txt")).as_deref(),
+        Some("run-old")
+    );
+    assert!(!project.join("input_manifest.pending.json").exists());
+    fs::remove_dir_all(&root).ok();
+}
+
+#[test]
+fn user_input_save_reports_cleanup_failure_with_original_context() {
+    let root =
+        std::env::temp_dir().join(format!("genoligand-failed-save-cleanup-{}", now_millis()));
     let options = server_options(root.clone());
-    let project_dir = project_dir(&options, "project-1");
-    fs::create_dir_all(&project_dir).expect("project dir");
+    fs::create_dir_all(project_dir(&options, "project-1")).expect("project");
+
+    let response = write_input_manifest_with_operations(
+        &options,
+        "project-1",
+        r#"{"inputs":[{"field":"small_molecule","value":"Z:\\missing\\ghost.sdf"}],"files":[]}"#,
+        |_, _| panic!("unusable inspection must not promote"),
+        |_| Err("input_manifest_cleanup_failed:injected".to_string()),
+    );
+
+    assert_eq!(response["status"], "failed");
+    assert_eq!(response["error"], "input_manifest_cleanup_failed");
+    assert_eq!(
+        response["inspection"]["cause"]["error"],
+        "input_file_not_found"
+    );
+    assert!(
+        response["inspection"]["errors"]
+            .as_array()
+            .expect("errors")
+            .iter()
+            .any(|error| error
+                .as_str()
+                .unwrap_or_default()
+                .contains("input_file_not_found"))
+    );
+    fs::remove_dir_all(&root).ok();
+}
+
+#[test]
+fn user_input_save_does_not_cleanup_after_successful_promotion() {
+    let root =
+        std::env::temp_dir().join(format!("genoligand-successful-promotion-{}", now_millis()));
+    let options = server_options(root.clone());
+    let project = project_dir(&options, "project-1");
+    fs::create_dir_all(&project).expect("project");
+
+    let response = write_input_manifest_with_operations(
+        &options,
+        "project-1",
+        r#"{"inputs":[{"field":"project_name","value":"新项目"},{"field":"peptide","value":"ACDEFG"}],"files":[]}"#,
+        |pending, formal| {
+            fs::rename(pending, formal).map_err(|err| format!("promotion_failed:{err}"))
+        },
+        |_| panic!("successful promotion consumes the pending manifest"),
+    );
+
+    assert_eq!(response["status"], "saved");
+    assert!(project.join("input_manifest.json").exists());
+    assert!(!project.join("input_manifest.pending.json").exists());
+    fs::remove_dir_all(&root).ok();
+}
+
+#[test]
+fn input_validation_rejects_malformed_save_without_state_changes() {
+    let root = std::env::temp_dir().join(format!("genoligand-malformed-save-{}", now_millis()));
+    let options = server_options(root.clone());
+    let project = project_dir(&options, "project-1");
+    fs::create_dir_all(&project).expect("project");
+    fs::write(project.join("project_name.txt"), "旧项目\n").expect("project name");
+    fs::write(project.join("latest_run_id.txt"), "run-old\n").expect("latest run");
+
+    let response = write_input_manifest(&options, "project-1", r#"{"inputs":["#);
+
+    assert_eq!(response["status"], "failed");
+    assert_eq!(response["error"], "invalid_input_manifest_json");
+    assert!(!project.join("input_manifest.json").exists());
+    assert!(!project.join("input_manifest.pending.json").exists());
+    assert_eq!(
+        read_trimmed(&project.join("project_name.txt")).as_deref(),
+        Some("旧项目")
+    );
+    assert_eq!(
+        read_trimmed(&project.join("latest_run_id.txt")).as_deref(),
+        Some("run-old")
+    );
+    fs::remove_dir_all(&root).ok();
+}
+
+#[test]
+fn input_validation_preflight_uses_science_resolver() {
+    let root = std::env::temp_dir().join(format!("genoligand-science-preflight-{}", now_millis()));
+    let options = server_options(root.clone());
+    let project = project_dir(&options, "project-1");
+    fs::create_dir_all(&project).expect("project");
     fs::write(
-        project_dir.join("input_manifest.json"),
-        r#"{"inputs":[{"field":"small_molecule","value":"ikv AV"}],"files":[]}"#,
+        project.join("input_manifest.json"),
+        r#"{"inputs":[{"field":"small_molecule","value":"Z:\\missing\\ghost.sdf"}],"files":[]}"#,
     )
-    .expect("input");
+    .expect("manifest");
 
     let preflight = user_preflight_json(&options, "project-1");
-    let input_detail = preflight["checks"]
+    let input = preflight["checks"]
         .as_array()
-        .and_then(|rows| {
-            rows.iter()
-                .find(|row| row.get("id").and_then(Value::as_str) == Some("input"))
-        })
-        .and_then(|row| row.get("detail").and_then(Value::as_str))
-        .unwrap_or("");
-    assert_eq!(input_detail, "已识别为多肽");
+        .expect("checks")
+        .iter()
+        .find(|row| row["id"] == "input")
+        .expect("input check");
+    assert_eq!(input["ready"], false);
+    assert!(
+        input["detail"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("找不到输入文件")
+    );
     assert!(!preflight.to_string().contains(&root.display().to_string()));
-
     fs::remove_dir_all(&root).ok();
+}
+
+#[test]
+fn input_validation_has_no_server_owned_recognizer_module() {
+    let module = ["input", "recognition"].join("_");
+    let source_root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src");
+    let lib_source = fs::read_to_string(source_root.join("lib.rs")).expect("server source");
+
+    assert!(!source_root.join(format!("{module}.rs")).exists());
+    assert!(!lib_source.contains(&format!("mod {module}")));
 }
 
 #[test]
@@ -1596,7 +1858,7 @@ fn completed_header_only_result_files_do_not_count_as_user_outputs() {
 }
 
 #[test]
-fn user_input_and_preflight_endpoints_hide_internal_status_codes() {
+fn user_input_save_endpoint_returns_structured_validation_error() {
     let root = std::env::temp_dir().join(format!("genoligand-user-flow-{}", now_millis()));
     let options = server_options(root.clone());
     fs::create_dir_all(project_dir(&options, "project-1")).expect("project dir");
@@ -1604,14 +1866,15 @@ fn user_input_and_preflight_endpoints_hide_internal_status_codes() {
     let invalid = write_user_input_manifest(
         &options,
         "project-1",
-        r#"{"inputs":[{"field":"project_name","value":"研究项目"},{"field":"small_molecule","value":"!!!"}],"files":[]}"#,
+        r#"{"inputs":[{"field":"project_name","value":"研究项目"},{"field":"small_molecule","value":"Z:\\missing\\ghost.sdf"}],"files":[]}"#,
     );
     let invalid_text = invalid.to_string();
     assert_eq!(invalid["ok"], false);
+    assert_eq!(invalid["error"], "input_file_not_found");
+    assert_eq!(invalid["inspection"]["usable"], false);
     assert!(invalid.get("message").is_some());
     assert!(invalid.get("status").is_none());
-    assert!(!invalid_text.contains("failed"));
-    assert!(!invalid_text.contains("input_not_usable"));
+    assert!(!invalid_text.contains(r#""status":"failed""#));
 
     let preflight = user_preflight_json(&options, "project-1");
     let preflight_text = preflight.to_string();

@@ -15,4 +15,5 @@ path = "src/main.rs"
 workspace = true
 
 [dependencies]
+gls-science = { path = "../gls-science" }
 serde_json = "1"
