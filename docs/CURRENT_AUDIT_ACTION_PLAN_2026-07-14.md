@@ -55,7 +55,7 @@
 | science_store/indexes | 188.422 GiB | MGnify MMseqs 182.042 GiB，其余 MMseqs 和 RCSB Foldseek 为运行依赖 |
 | repository/target | 10.120 GiB | Cargo debug、deps、incremental，可在相关服务退出后清理 |
 | repository/work | 183.050 MiB | 浏览器验收、临时 venv、日志和运行产物，可在相关服务退出后清理 |
-| repository/.git | 261.838 MiB | 其中约 246.283 MiB 为 Git 判定的不可达对象 |
+| repository/.git | 审查前 261.838 MiB，清理后 12.870 MiB | 约 246.283 MiB 不可达对象已通过 Git GC 回收 |
 | science_store 中断下载 | 4.770 GiB | 审查确认后已清理 MGnify 与 RCSB 的 .part 残留 |
 
 未发现大于 100 MiB 的同尺寸重复文件。science_store 中约 277.8 GiB 的完整下载源与索引均有 manifest 或运行时读取链路，不能按体积直接删除。
@@ -753,6 +753,12 @@
 
 ### GL-CURRENT-032 .git 含约 246.283 MiB 不可达对象
 
+**本轮状态**
+
+- 已在提交 020a4994 推送后执行 git gc --prune=now。
+- git fsck --full 无输出且成功。
+- Git pack 从 3 个、242.73 MiB 降为 1 个、12.72 MiB；.git 当前实测 12.870 MiB。
+
 **问题与证据**
 
 - .git 总大小 261.838 MiB。
@@ -852,4 +858,5 @@
 - 删除已被本计划替代、仍指向 0.9.36 的根目录续作说明。
 - 清理本轮审查生成的临时 run、日志、Python cache 和临时脚本。
 - 已完成 science store 中 26 个中断下载、36 个旧安装日志、7 个历史索引 tmp 和 14 个空分桶目录的清理。
+- 已完成 Git 不可达对象回收，.git 从 261.838 MiB 降至 12.870 MiB。
 - target/work 对应的两个现有验收服务退出后执行 GL-CURRENT-031。
