@@ -53,8 +53,8 @@
 | D:/GenoLigandData/science_store | 277.776 GiB | 绝大部分是有效下载源和 MMseqs/Foldseek 持久数据库 |
 | science_store/downloads | 89.347 GiB | MGnify、ChEMBL、RCSB、PLINDER、BindingDB、BioLiP2 有效源需保留 |
 | science_store/indexes | 188.422 GiB | MGnify MMseqs 182.042 GiB，其余 MMseqs 和 RCSB Foldseek 为运行依赖 |
-| repository/target | 10.120 GiB | Cargo debug、deps、incremental，可在相关服务退出后清理 |
-| repository/work | 183.050 MiB | 浏览器验收、临时 venv、日志和运行产物，可在相关服务退出后清理 |
+| repository/target | 审查时 10.120 GiB | 相关服务退出后已清理 |
+| repository/work | 审查时 183.050 MiB | 相关服务退出后已清理 |
 | repository/.git | 审查前 261.838 MiB，清理后 12.870 MiB | 约 246.283 MiB 不可达对象已通过 Git GC 回收 |
 | science_store 中断下载 | 4.770 GiB | 审查确认后已清理 MGnify 与 RCSB 的 .part 残留 |
 
@@ -732,6 +732,12 @@
 
 ### GL-CURRENT-031 repository/target 与 repository/work 占用 10.30 GiB
 
+**本轮状态**
+
+- 最终复验时两个验收服务均已退出，target/work 占用进程为 0。
+- 已删除 target 和 work，实测释放 11057515266 B。
+- 删除后两个目录均不存在，Git 跟踪状态没有变化。
+
 **问题与证据**
 
 - target 为 10.120 GiB，主体是 Cargo debug、deps 和 incremental。
@@ -859,4 +865,5 @@
 - 清理本轮审查生成的临时 run、日志、Python cache 和临时脚本。
 - 已完成 science store 中 26 个中断下载、36 个旧安装日志、7 个历史索引 tmp 和 14 个空分桶目录的清理。
 - 已完成 Git 不可达对象回收，.git 从 261.838 MiB 降至 12.870 MiB。
-- target/work 对应的两个现有验收服务退出后执行 GL-CURRENT-031。
+- 已在两个验收服务退出后删除 target/work，释放 11057515266 B。
+- 本轮已确认清理合计释放约 15.31 GiB。
