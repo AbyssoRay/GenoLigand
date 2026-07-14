@@ -8,6 +8,8 @@
     "schema_version",
     "job_id",
     "worker",
+    "run_id",
+    "invocation_id",
     "status",
     "engine_version",
     "execution_status",
@@ -20,7 +22,11 @@
   "properties": {
     "schema_version": { "const": "genoligand_worker_current_v2" },
     "job_id": { "type": "string", "minLength": 1 },
-    "worker": { "type": "string", "minLength": 1 },
+    "worker": {
+      "enum": ["mmseqs_alignment", "foldseek_alignment", "docking", "md_summary"]
+    },
+    "run_id": { "type": "string", "minLength": 1 },
+    "invocation_id": { "type": "string", "minLength": 1 },
     "status": { "enum": ["PASS", "NOT_APPLICABLE", "NOT_READY", "FAIL"] },
     "engine_version": { "type": "string", "minLength": 1 },
     "execution_status": { "enum": ["completed", "not_applicable", "not_ready", "failed"] },
@@ -43,6 +49,65 @@
     },
     "python_owns_final_score": { "const": false },
     "python_owns_report_semantics": { "const": false },
-    "primitive_execution_only": { "const": true }
-  }
+    "primitive_execution_only": { "const": true },
+    "candidate_id": { "type": "string", "minLength": 1 },
+    "candidate_digest": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+    "input_id": { "type": "string", "minLength": 1 },
+    "record_id": { "type": "string", "minLength": 1 },
+    "input_digest": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+    "source_digest": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+    "receptor_digest": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+    "expected_candidate_id": { "type": "string", "minLength": 1 },
+    "expected_input_id": { "type": "string", "minLength": 1 },
+    "expected_input_digest": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+    "input_manifest_sha256": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+    "artifact_path": { "type": "string", "minLength": 1 },
+    "manifest": { "type": "string", "minLength": 1 },
+    "artifact_provenance": { "type": "string", "minLength": 1 }
+  },
+  "allOf": [
+    {
+      "if": {
+        "properties": {
+          "worker": { "const": "docking" },
+          "status": { "enum": ["PASS", "NOT_READY"] }
+        },
+        "required": ["worker", "status"]
+      },
+      "then": {
+        "required": [
+          "candidate_id",
+          "candidate_digest",
+          "input_id",
+          "record_id",
+          "input_digest",
+          "source_digest",
+          "receptor_digest",
+          "manifest"
+        ]
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "worker": { "const": "md_summary" },
+          "status": { "enum": ["PASS", "NOT_READY"] }
+        },
+        "required": ["worker", "status"]
+      },
+      "then": {
+        "required": [
+          "candidate_id",
+          "candidate_digest",
+          "input_id",
+          "record_id",
+          "input_digest",
+          "source_digest",
+          "artifact_path",
+          "manifest",
+          "artifact_provenance"
+        ]
+      }
+    }
+  ]
 }

@@ -1,5 +1,8 @@
-use gls_science::{InputInspection, ScienceOptions, inspect_input_manifest};
+use gls_science::{
+    InputInspection, ScienceOptions, evaluate_science_store_readiness, inspect_input_manifest,
+};
 use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, HashMap, hash_map::RandomState};
 use std::fs::{self, OpenOptions};
 use std::hash::{BuildHasher, Hasher};
@@ -13,11 +16,13 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 pub const PRODUCT_NAME: &str = "GenoLigand Local WebUI";
 pub const PRODUCT_VERSION: &str = env!("CARGO_PKG_VERSION");
+pub const PRODUCT_COMMIT: &str = env!("GENOLIGAND_BUILD_COMMIT");
 const RESULT_PAGE_SIZE: usize = 500;
 const RUN_LOG_MAX_BYTES: usize = 1024 * 1024;
 const RUN_LOG_READ_BYTES: usize = 128 * 1024;
 const RUN_LOG_READ_LINES: usize = 500;
 const PROCESS_POLL_INTERVAL: Duration = Duration::from_millis(50);
+const INPUT_CAPABILITIES_JSON: &str = include_str!("../../../schemas/input_capabilities.json");
 static INPUT_INSPECTION_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 static UUID_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 static SERVER_REGISTRY: OnceLock<Mutex<ServerRegistry>> = OnceLock::new();
@@ -161,16 +166,15 @@ fn route(
         return response;
     }
     let value = match (method, path) {
-        ("GET", "/api/health") => {
-            json!({"status":"ready","service":"gls-server","version":PRODUCT_VERSION})
-        }
-        ("GET", "/api/user/health") => user_health_json(),
+        ("GET", "/api/health") => user_health_json(options),
+        ("GET", "/api/user/health") => user_health_json(options),
         ("GET", "/api/version") => {
             json!({"name":PRODUCT_NAME,"version":PRODUCT_VERSION,"science_flow":"scientific_pipeline"})
         }
         ("GET", "/api/user/projects") => user_projects_json(options),
         ("GET", "/api/user/workspace-summary") => user_workspace_summary_json(options),
         ("POST", "/api/user/projects") => create_user_project(options),
+        ("GET", "/api/user/inputs/capabilities") => user_input_capabilities_json(),
         ("POST", "/api/user/inputs/inspect") => inspect_user_input_json(options, request_body),
         ("GET", "/api/projects") => projects_json(options),
         ("POST", "/api/projects") => create_project(options),
@@ -680,6 +684,11 @@ fn read_input_manifest(options: &ServerOptions, project_id: &str) -> Value {
         &path,
         json!({"inputs":[],"files":[],"status":"waiting_for_user_input"}),
     )
+}
+
+fn user_input_capabilities_json() -> Value {
+    serde_json::from_str(INPUT_CAPABILITIES_JSON)
+        .expect("schemas/input_capabilities.json must contain valid JSON")
 }
 
 fn inspect_user_input_json(options: &ServerOptions, body: &str) -> Value {
@@ -3298,8 +3307,170 @@ fn databases_json(options: &ServerOptions) -> Value {
     json!({"science_store":store.display().to_string(),"required":rows,"user_configures_paths":false})
 }
 
-fn user_health_json() -> Value {
-    json!({"status":"ready","application":PRODUCT_NAME,"version":PRODUCT_VERSION})
+fn user_health_json(options: &ServerOptions) -> Value {
+    json!({
+        "status":"ready",
+        "application":PRODUCT_NAME,
+        "version":PRODUCT_VERSION,
+        "commit":PRODUCT_COMMIT,
+        "build_id":PRODUCT_COMMIT,
+        "runtime":runtime_binary_identity(),
+        "science_store_readiness":science_store_readiness_json(options)
+    })
+}
+
+fn science_store_readiness_json(options: &ServerOptions) -> Value {
+    match evaluate_science_store_readiness(&science_store_path(options)) {
+        Ok(readiness) => {
+            let blocker_details = readiness
+                .blocker_details
+                .iter()
+                .map(|blocker| {
+                    json!({
+                        "code": blocker.code,
+                        "component": blocker.component,
+                        "evidence": blocker.evidence,
+                        "repair_action": blocker.repair_action,
+                    })
+                })
+                .collect::<Vec<_>>();
+            let evidence_manifest = readiness
+                .evidence_manifest
+                .iter()
+                .map(|row| json!({"path": row.path, "sha256": row.sha256}))
+                .collect::<Vec<_>>();
+            json!({
+                "schema_version":"genoligand_science_store_readiness_v1",
+                "status":readiness.status,
+                "ready":readiness.ready,
+                "blockers":readiness.blockers,
+                "blocker_details":blocker_details,
+                "repair_actions":readiness.repair_actions,
+                "evidence_manifest":evidence_manifest,
+                "evidence_digest":readiness.evidence_digest,
+                "sources":readiness.sources,
+                "indexes":readiness.indexes,
+            })
+        }
+        Err(reason) => json!({
+            "schema_version":"genoligand_science_store_readiness_v1",
+            "status":"needs_repair",
+            "ready":false,
+            "blockers":["science_store_readiness_evaluation_failed"],
+            "blocker_details":[{
+                "code":"science_store_readiness_evaluation_failed",
+                "component":"science_store_readiness",
+                "evidence":reason,
+                "repair_action":"rerun_science_store_installer"
+            }],
+            "repair_actions":["rerun_science_store_installer"],
+            "evidence_manifest":[],
+            "evidence_digest":"",
+            "sources":[],
+            "indexes":[]
+        }),
+    }
+}
+
+fn sha256_file(path: &Path) -> Option<String> {
+    let mut file = fs::File::open(path).ok()?;
+    let mut hasher = Sha256::new();
+    let mut buffer = [0_u8; 1024 * 1024];
+    loop {
+        let read = file.read(&mut buffer).ok()?;
+        if read == 0 {
+            break;
+        }
+        hasher.update(&buffer[..read]);
+    }
+    Some(format!("{:x}", hasher.finalize()))
+}
+
+fn runtime_binary_manifest_path() -> Option<PathBuf> {
+    if let Some(path) = std::env::var_os("GENOLIGAND_RUNTIME_DIR")
+        .map(PathBuf::from)
+        .map(|path| path.join("runtime_binary_manifest.json"))
+        .filter(|path| path.is_file())
+    {
+        return Some(path);
+    }
+    if let Ok(executable) = std::env::current_exe()
+        && let Some(runtime_dir) = executable.parent().and_then(Path::parent)
+    {
+        let path = runtime_dir.join("runtime_binary_manifest.json");
+        if path.is_file() {
+            return Some(path);
+        }
+    }
+    std::env::var_os("LOCALAPPDATA")
+        .map(PathBuf::from)
+        .map(|path| {
+            path.join("GenoLigand")
+                .join("runtime")
+                .join("runtime_binary_manifest.json")
+        })
+        .filter(|path| path.is_file())
+}
+
+fn runtime_binary_identity() -> Value {
+    let Some(manifest_path) = runtime_binary_manifest_path() else {
+        return json!({
+            "status":"unpublished",
+            "commit":PRODUCT_COMMIT,
+            "manifest_digest":""
+        });
+    };
+    let manifest = read_json_or(&manifest_path, json!({}));
+    let manifest_digest = manifest
+        .get("manifest_digest")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    let tsv_path = manifest
+        .get("manifest")
+        .and_then(Value::as_str)
+        .map(PathBuf::from);
+    let current_executable = std::env::current_exe()
+        .ok()
+        .and_then(|path| path.canonicalize().ok());
+    let server = manifest
+        .get("binaries")
+        .and_then(Value::as_array)
+        .and_then(|rows| {
+            rows.iter()
+                .find(|row| row.get("binary").and_then(Value::as_str) == Some("gls-server"))
+        });
+    let verified = manifest.get("schema_version").and_then(Value::as_str)
+        == Some("genoligand_runtime_binary_manifest_v1")
+        && manifest.get("status").and_then(Value::as_str) == Some("ready")
+        && manifest_digest.len() == 64
+        && tsv_path
+            .as_ref()
+            .and_then(|path| sha256_file(path))
+            .as_deref()
+            == Some(manifest_digest)
+        && server.is_some_and(|record| {
+            let recorded_path = record
+                .get("path")
+                .and_then(Value::as_str)
+                .map(PathBuf::from)
+                .and_then(|path| path.canonicalize().ok());
+            record.get("status").and_then(Value::as_str) == Some("ready")
+                && record.get("smoke").and_then(Value::as_str) == Some("ready")
+                && record.get("version").and_then(Value::as_str) == Some(PRODUCT_VERSION)
+                && record.get("commit").and_then(Value::as_str) == Some(PRODUCT_COMMIT)
+                && recorded_path == current_executable
+                && current_executable
+                    .as_ref()
+                    .and_then(|path| sha256_file(path))
+                    .as_deref()
+                    == record.get("sha256").and_then(Value::as_str)
+        });
+    json!({
+        "status":if verified {"verified"} else {"mismatch"},
+        "commit":PRODUCT_COMMIT,
+        "manifest_digest":manifest_digest,
+        "manifest":manifest_path.display().to_string()
+    })
 }
 
 fn user_databases_json(options: &ServerOptions) -> Value {
@@ -3310,6 +3481,7 @@ fn user_databases_json(options: &ServerOptions) -> Value {
         "required": rows,
         "sources": source_status_rows(&store),
         "missing": missing,
+        "readiness": science_store_readiness_json(options),
         "summary": if preflight_store_ready(options) {"科学仓库已就绪"} else {"需要运行安装/修复"},
         "repair_actions_available": store.join("repair_actions.tsv").exists()
     })
@@ -3373,6 +3545,7 @@ fn user_setup_status_json(options: &ServerOptions) -> Value {
             .unwrap_or(false);
     json!({
         "database_ready": ready,
+        "readiness": science_store_readiness_json(options),
         "repair_action": if setup_ready {"继续"} else {"运行安装/修复"},
         "checks": required,
         "missing": missing_resource_rows(&required),
@@ -4084,16 +4257,8 @@ fn delete_project(options: &ServerOptions, project_id: &str) -> Value {
 }
 
 fn preflight_store_ready(options: &ServerOptions) -> bool {
-    let store = science_store_path(options);
-    store.join("science_store_manifest.tsv").exists()
-        && store.join("indexes/known_targets.tsv").exists()
-        && store.join("indexes/metagenome_targets.tsv").exists()
-        && store.join("indexes/structure_targets.tsv").exists()
-        && tool_versions_ready(&store.join("indexes/tool_versions.tsv"))
-        && install_status_ready(&store.join("install_status.json"))
-        && source_requirements_ready(&store.join("source_requirements.tsv"))
-        && source_manifests_ready(&store.join("manifests"))
-        && index_build_ready(&store.join("index_build_manifest.tsv"))
+    evaluate_science_store_readiness(&science_store_path(options))
+        .is_ok_and(|readiness| readiness.ready)
 }
 
 fn install_status_ready(path: &Path) -> bool {
@@ -5340,6 +5505,52 @@ mod tests {
         assert_eq!(detail["project_state"], "输入已就绪");
 
         fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn input_capabilities_route_exposes_the_runtime_input_contract() {
+        let root =
+            std::env::temp_dir().join(format!("genoligand-input-capabilities-{}", now_millis()));
+        let options = server_options(root.clone());
+
+        let (status, content_type, body) =
+            route("GET", "/api/user/inputs/capabilities", &options, "");
+        let capabilities: Value = serde_json::from_str(&body).expect("capabilities JSON");
+        let input_types = capabilities["input_types"]
+            .as_array()
+            .expect("input types array");
+
+        assert_eq!(status, 200);
+        assert_eq!(content_type, "application/json; charset=utf-8");
+        assert_eq!(
+            capabilities["schema_version"],
+            "genoligand_input_capabilities_v1"
+        );
+        assert_eq!(input_types.len(), 5);
+        for capability in input_types {
+            assert!(
+                capability["kind"]
+                    .as_str()
+                    .is_some_and(|value| !value.is_empty())
+            );
+            assert!(
+                capability["field"]
+                    .as_str()
+                    .is_some_and(|value| !value.is_empty())
+            );
+            assert_eq!(capability["text"]["supported"], true);
+            assert_eq!(capability["file"]["supported"], true);
+            assert!(
+                capability["file"]["extensions"]
+                    .as_array()
+                    .is_some_and(|extensions| !extensions.is_empty())
+            );
+            assert_eq!(capability["constraints"]["minimum_records"], 1);
+        }
+
+        let (missing_status, _, _) = route("GET", "/api/user/inputs/capability", &options, "");
+        assert_eq!(missing_status, 404);
+        fs::remove_dir_all(root).ok();
     }
 
     #[test]

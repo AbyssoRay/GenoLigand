@@ -32,6 +32,10 @@ def main() -> int:
         "input descriptions must be loaded from the server capability endpoint",
     )
     require(
+        "Promise.allSettled" in app_source and "healthFailure" in app_source,
+        "startup refreshes must preserve successful health state when an auxiliary request fails",
+    )
+    require(
         "/inputs`" in actions_source and "restoreInputForm" in actions_source,
         "opening a project must reload and restore its saved inputs",
     )
@@ -135,6 +139,9 @@ async function tick() {{
       label: "服务端支持名称、CAS、SMILES 和文件",
       placeholder: "服务端占位",
       minimum: "服务端最低要求",
+      text: {{ supported: true, forms: ["smiles"] }},
+      file: {{ supported: true, extensions: ["sdf"] }},
+      constraints: {{ minimum_records: 1 }},
     }}],
   }});
   await capabilities;

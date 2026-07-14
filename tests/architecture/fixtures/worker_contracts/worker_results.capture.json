@@ -1,0 +1,306 @@
+{
+  "capture_schema_version": "genoligand_worker_contract_capture_v1",
+  "producers": [
+    {
+      "id": "python",
+      "language": "Python",
+      "source": "python/genoligand_workers/worker_io.py",
+      "symbols": ["write_result"],
+      "postprocessors": [
+        "python/genoligand_workers/docking_worker.py:bind_docking_result",
+        "python/genoligand_workers/md_summary_worker.py:bind_worker_result"
+      ]
+    },
+    {
+      "id": "rust_fallback",
+      "language": "Rust",
+      "source": "crates/gls-science/src/lib.rs",
+      "symbols": ["write_worker_failure_result"]
+    }
+  ],
+  "captures": [
+    {
+      "case": "mmseqs_success",
+      "producer": "python",
+      "payload": {
+        "schema_version": "genoligand_worker_current_v2",
+        "job_id": "mmseqs_onsite_sequence_alignment",
+        "worker": "mmseqs_alignment",
+        "run_id": "run-contract",
+        "invocation_id": "invocation_mmseqs_contract",
+        "status": "PASS",
+        "engine_version": "MMseqs2 18-8cc5c",
+        "execution_status": "completed",
+        "reason": "completed",
+        "outcomes": [{"status": "completed", "reason": "completed", "required": true, "database_id": "mmseqs_alignment", "row_count": 1}],
+        "python_owns_final_score": false,
+        "python_owns_report_semantics": false,
+        "primitive_execution_only": true
+      }
+    },
+    {
+      "case": "mmseqs_failure",
+      "producer": "python",
+      "payload": {
+        "schema_version": "genoligand_worker_current_v2",
+        "job_id": "mmseqs_onsite_sequence_alignment",
+        "worker": "mmseqs_alignment",
+        "run_id": "run-contract",
+        "invocation_id": "invocation_mmseqs_contract",
+        "status": "FAIL",
+        "engine_version": "alignment worker failed: fixture capture",
+        "execution_status": "failed",
+        "reason": "fixture_capture_failure",
+        "outcomes": [{"status": "failed", "reason": "fixture_capture_failure", "required": true, "database_id": "mmseqs_alignment", "row_count": 0}],
+        "python_owns_final_score": false,
+        "python_owns_report_semantics": false,
+        "primitive_execution_only": true
+      }
+    },
+    {
+      "case": "foldseek_success",
+      "producer": "python",
+      "payload": {
+        "schema_version": "genoligand_worker_current_v2",
+        "job_id": "foldseek_onsite_structure_alignment",
+        "worker": "foldseek_alignment",
+        "run_id": "run-contract",
+        "invocation_id": "invocation_foldseek_contract",
+        "status": "PASS",
+        "engine_version": "Foldseek 10.941cd33",
+        "execution_status": "completed",
+        "reason": "completed",
+        "outcomes": [{"status": "completed", "reason": "completed", "required": true, "database_id": "foldseek_alignment", "row_count": 1}],
+        "python_owns_final_score": false,
+        "python_owns_report_semantics": false,
+        "primitive_execution_only": true
+      }
+    },
+    {
+      "case": "foldseek_failure",
+      "producer": "python",
+      "payload": {
+        "schema_version": "genoligand_worker_current_v2",
+        "job_id": "foldseek_onsite_structure_alignment",
+        "worker": "foldseek_alignment",
+        "run_id": "run-contract",
+        "invocation_id": "invocation_foldseek_contract",
+        "status": "FAIL",
+        "engine_version": "alignment worker failed: fixture capture",
+        "execution_status": "failed",
+        "reason": "fixture_capture_failure",
+        "outcomes": [{"status": "failed", "reason": "fixture_capture_failure", "required": true, "database_id": "foldseek_alignment", "row_count": 0}],
+        "python_owns_final_score": false,
+        "python_owns_report_semantics": false,
+        "primitive_execution_only": true
+      }
+    },
+    {
+      "case": "docking_success",
+      "producer": "python",
+      "payload": {
+        "schema_version": "genoligand_worker_current_v2",
+        "job_id": "autodock_vina_complex_docking__target_P00001_a91bc06b14205d5a",
+        "worker": "docking",
+        "run_id": "run",
+        "invocation_id": "invocation_d8ed3cd36e3087945af5f544",
+        "status": "PASS",
+        "engine_version": "AutoDock Vina 1.2.7",
+        "execution_status": "completed",
+        "reason": "completed",
+        "outcomes": [{"status": "completed", "reason": "completed", "required": true, "database_id": "docking", "row_count": 1}],
+        "python_owns_final_score": false,
+        "python_owns_report_semantics": false,
+        "primitive_execution_only": true,
+        "candidate_id": "target_P00001_a91bc06b14205d5a",
+        "candidate_digest": "85905d27d43df8a7743a3c47d9922e4882e3950c50420f77e08d1e3d514bd5f8",
+        "input_id": "input_1",
+        "record_id": "record_1",
+        "input_digest": "70f0d23a2330f7fbbd8be8f8dbd4a4e797b5e6bf7b1b8689160a315148d97fad",
+        "source_digest": "ab1de819ede91df490e6441934decfa9041b49f91d6bbadbba4df634ccff57fa",
+        "receptor_digest": "33ed536e88acb3206595b003924f39f76041169088f3ff44d18c6fcc19274599",
+        "manifest": "tool_outputs/docking/target_P00001_a91bc06b14205d5a/invocation_d8ed3cd36e3087945af5f544/docking_manifest.json",
+        "artifact_path": "worker_results/autodock_vina_complex_docking__target_P00001_a91bc06b14205d5a.json"
+      }
+    },
+    {
+      "case": "docking_failure",
+      "producer": "python",
+      "payload": {
+        "schema_version": "genoligand_worker_current_v2",
+        "job_id": "autodock_vina_complex_docking__target_P00001_a91bc06b14205d5a",
+        "worker": "docking",
+        "run_id": "run",
+        "invocation_id": "invocation_d8ed3cd36e3087945af5f544",
+        "status": "FAIL",
+        "engine_version": "docking worker failed: fixture capture",
+        "execution_status": "failed",
+        "reason": "fixture_capture_failure",
+        "outcomes": [{"status": "failed", "reason": "fixture_capture_failure", "required": true, "database_id": "docking", "row_count": 0}],
+        "python_owns_final_score": false,
+        "python_owns_report_semantics": false,
+        "primitive_execution_only": true,
+        "candidate_id": "target_P00001_a91bc06b14205d5a",
+        "candidate_digest": "85905d27d43df8a7743a3c47d9922e4882e3950c50420f77e08d1e3d514bd5f8",
+        "input_id": "input_1",
+        "record_id": "record_1",
+        "input_digest": "70f0d23a2330f7fbbd8be8f8dbd4a4e797b5e6bf7b1b8689160a315148d97fad",
+        "source_digest": "ab1de819ede91df490e6441934decfa9041b49f91d6bbadbba4df634ccff57fa",
+        "receptor_digest": "33ed536e88acb3206595b003924f39f76041169088f3ff44d18c6fcc19274599"
+      }
+    },
+    {
+      "case": "md_success",
+      "producer": "python",
+      "payload": {
+        "schema_version": "genoligand_worker_current_v2",
+        "job_id": "md_summary_ligand_dynamics__target_P00001_a91bc06b14205d5a",
+        "worker": "md_summary",
+        "run_id": "run",
+        "invocation_id": "invocation_76671cf9d614136351b5d95b",
+        "status": "PASS",
+        "engine_version": "OpenMM 8.3.1",
+        "execution_status": "completed",
+        "reason": "completed",
+        "outcomes": [{"status": "completed", "reason": "completed", "required": true, "database_id": "md_summary", "row_count": 1}],
+        "python_owns_final_score": false,
+        "python_owns_report_semantics": false,
+        "primitive_execution_only": true,
+        "candidate_id": "target_P00001_a91bc06b14205d5a",
+        "candidate_digest": "85905d27d43df8a7743a3c47d9922e4882e3950c50420f77e08d1e3d514bd5f8",
+        "input_id": "input_1",
+        "record_id": "record_1",
+        "input_digest": "70f0d23a2330f7fbbd8be8f8dbd4a4e797b5e6bf7b1b8689160a315148d97fad",
+        "source_digest": "ab1de819ede91df490e6441934decfa9041b49f91d6bbadbba4df634ccff57fa",
+        "receptor_digest": "33ed536e88acb3206595b003924f39f76041169088f3ff44d18c6fcc19274599",
+        "expected_candidate_id": "target_P00001_a91bc06b14205d5a",
+        "expected_input_id": "input_1",
+        "expected_input_digest": "70f0d23a2330f7fbbd8be8f8dbd4a4e797b5e6bf7b1b8689160a315148d97fad",
+        "input_manifest_sha256": "ed1f67c5746eb2c657b02c5b21c596734f42f1772c57342a418d5b7c0b956b6d",
+        "artifact_path": "worker_results/md_summary_ligand_dynamics__target_P00001_a91bc06b14205d5a.json",
+        "manifest": "tool_outputs/md/target_P00001_a91bc06b14205d5a/invocation_76671cf9d614136351b5d95b/md_run_manifest.json",
+        "artifact_provenance": "tool_outputs/md/target_P00001_a91bc06b14205d5a/invocation_76671cf9d614136351b5d95b/md_artifact_provenance.json"
+      }
+    },
+    {
+      "case": "md_failure",
+      "producer": "python",
+      "payload": {
+        "schema_version": "genoligand_worker_current_v2",
+        "job_id": "md_summary_ligand_dynamics__target_P00001_a91bc06b14205d5a",
+        "worker": "md_summary",
+        "run_id": "run",
+        "invocation_id": "invocation_76671cf9d614136351b5d95b",
+        "status": "FAIL",
+        "engine_version": "MD summary worker failed: fixture capture",
+        "execution_status": "failed",
+        "reason": "fixture_capture_failure",
+        "outcomes": [{"status": "failed", "reason": "fixture_capture_failure", "required": true, "database_id": "md_summary", "row_count": 0}],
+        "python_owns_final_score": false,
+        "python_owns_report_semantics": false,
+        "primitive_execution_only": true,
+        "candidate_id": "target_P00001_a91bc06b14205d5a",
+        "candidate_digest": "85905d27d43df8a7743a3c47d9922e4882e3950c50420f77e08d1e3d514bd5f8",
+        "input_id": "input_1",
+        "record_id": "record_1",
+        "input_digest": "70f0d23a2330f7fbbd8be8f8dbd4a4e797b5e6bf7b1b8689160a315148d97fad",
+        "source_digest": "ab1de819ede91df490e6441934decfa9041b49f91d6bbadbba4df634ccff57fa",
+        "receptor_digest": "33ed536e88acb3206595b003924f39f76041169088f3ff44d18c6fcc19274599",
+        "expected_candidate_id": "target_P00001_a91bc06b14205d5a",
+        "expected_input_id": "input_1",
+        "expected_input_digest": "70f0d23a2330f7fbbd8be8f8dbd4a4e797b5e6bf7b1b8689160a315148d97fad",
+        "artifact_path": "worker_results/md_summary_ligand_dynamics__target_P00001_a91bc06b14205d5a.json"
+      }
+    },
+    {
+      "case": "mmseqs_rust_fallback",
+      "producer": "rust_fallback",
+      "payload": {
+        "schema_version": "genoligand_worker_current_v2",
+        "job_id": "mmseqs_onsite_sequence_alignment",
+        "worker": "mmseqs_alignment",
+        "run_id": "run-contract",
+        "invocation_id": "invocation_mmseqs_contract",
+        "status": "FAIL",
+        "engine_version": "worker unavailable: fixture_capture_launch_failed",
+        "execution_status": "failed",
+        "reason": "fixture_capture_launch_failed",
+        "outcomes": [{"status": "failed", "reason": "fixture_capture_launch_failed", "required": true, "database_id": "mmseqs_alignment", "row_count": 0}],
+        "python_owns_final_score": false,
+        "python_owns_report_semantics": false,
+        "primitive_execution_only": true
+      }
+    },
+    {
+      "case": "foldseek_rust_fallback",
+      "producer": "rust_fallback",
+      "payload": {
+        "schema_version": "genoligand_worker_current_v2",
+        "job_id": "foldseek_onsite_structure_alignment",
+        "worker": "foldseek_alignment",
+        "run_id": "run-contract",
+        "invocation_id": "invocation_foldseek_contract",
+        "status": "FAIL",
+        "engine_version": "worker unavailable: fixture_capture_launch_failed",
+        "execution_status": "failed",
+        "reason": "fixture_capture_launch_failed",
+        "outcomes": [{"status": "failed", "reason": "fixture_capture_launch_failed", "required": true, "database_id": "foldseek_alignment", "row_count": 0}],
+        "python_owns_final_score": false,
+        "python_owns_report_semantics": false,
+        "primitive_execution_only": true
+      }
+    },
+    {
+      "case": "docking_rust_fallback",
+      "producer": "rust_fallback",
+      "payload": {
+        "schema_version": "genoligand_worker_current_v2",
+        "job_id": "autodock_vina_complex_docking__target_P00001_a91bc06b14205d5a",
+        "worker": "docking",
+        "run_id": "run",
+        "invocation_id": "invocation_d8ed3cd36e3087945af5f544",
+        "status": "FAIL",
+        "engine_version": "worker unavailable: fixture_capture_launch_failed",
+        "execution_status": "failed",
+        "reason": "fixture_capture_launch_failed",
+        "outcomes": [{"status": "failed", "reason": "fixture_capture_launch_failed", "required": true, "database_id": "docking", "row_count": 0}],
+        "python_owns_final_score": false,
+        "python_owns_report_semantics": false,
+        "primitive_execution_only": true,
+        "candidate_id": "target_P00001_a91bc06b14205d5a",
+        "candidate_digest": "85905d27d43df8a7743a3c47d9922e4882e3950c50420f77e08d1e3d514bd5f8",
+        "input_id": "input_1",
+        "record_id": "record_1",
+        "input_digest": "70f0d23a2330f7fbbd8be8f8dbd4a4e797b5e6bf7b1b8689160a315148d97fad",
+        "source_digest": "ab1de819ede91df490e6441934decfa9041b49f91d6bbadbba4df634ccff57fa",
+        "receptor_digest": "33ed536e88acb3206595b003924f39f76041169088f3ff44d18c6fcc19274599"
+      }
+    },
+    {
+      "case": "md_rust_fallback",
+      "producer": "rust_fallback",
+      "payload": {
+        "schema_version": "genoligand_worker_current_v2",
+        "job_id": "md_summary_ligand_dynamics__target_P00001_a91bc06b14205d5a",
+        "worker": "md_summary",
+        "run_id": "run",
+        "invocation_id": "invocation_76671cf9d614136351b5d95b",
+        "status": "FAIL",
+        "engine_version": "worker unavailable: fixture_capture_launch_failed",
+        "execution_status": "failed",
+        "reason": "fixture_capture_launch_failed",
+        "outcomes": [{"status": "failed", "reason": "fixture_capture_launch_failed", "required": true, "database_id": "md_summary", "row_count": 0}],
+        "python_owns_final_score": false,
+        "python_owns_report_semantics": false,
+        "primitive_execution_only": true,
+        "candidate_id": "target_P00001_a91bc06b14205d5a",
+        "candidate_digest": "85905d27d43df8a7743a3c47d9922e4882e3950c50420f77e08d1e3d514bd5f8",
+        "input_id": "input_1",
+        "record_id": "record_1",
+        "input_digest": "70f0d23a2330f7fbbd8be8f8dbd4a4e797b5e6bf7b1b8689160a315148d97fad",
+        "source_digest": "ab1de819ede91df490e6441934decfa9041b49f91d6bbadbba4df634ccff57fa",
+        "receptor_digest": "33ed536e88acb3206595b003924f39f76041169088f3ff44d18c6fcc19274599"
+      }
+    }
+  ]
+}

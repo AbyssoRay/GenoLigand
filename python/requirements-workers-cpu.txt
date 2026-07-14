@@ -1,17 +1,2 @@
-# GenoLigand schema-bound scientific worker runtime, CPU profile.
-numpy
-pandas
-pyarrow==24.0.0
-rdkit
-openbabel-wheel
-openmm
-openmmforcefields
-pdbfixer
-openff-toolkit
-git+https://github.com/openforcefield/openff-interchange.git
-xmltodict
-python-constraint
-lxml
-mdtraj
-MDAnalysis
-jsonschema
+# GenoLigand worker profile: CPU, CPython 3.12.
+# The installer selects the Windows x86_64 or manylinux_2_34 x86_64 hashed artifact from requirements-workers.lock.txt.

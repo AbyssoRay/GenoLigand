@@ -9,7 +9,11 @@ fn main() {
         Ok(output) => println!("{output}"),
         Err(reason) => {
             eprintln!("{reason}");
-            std::process::exit(1);
+            std::process::exit(if reason.starts_with("pipeline_blocked") {
+                2
+            } else {
+                1
+            });
         }
     }
 }
@@ -17,6 +21,13 @@ fn main() {
 fn run_cli(args: &[String]) -> Result<String, String> {
     if args.is_empty() || is_help(args) {
         return Ok(HELP.to_string());
+    }
+    if args.len() == 1 && matches!(args[0].as_str(), "--version" | "-V") {
+        return Ok(format!(
+            "gls-cli {} commit {}",
+            env!("CARGO_PKG_VERSION"),
+            env!("GENOLIGAND_BUILD_COMMIT")
+        ));
     }
     let group = args[0].as_str();
     if args.len() < 2 {
@@ -243,6 +254,19 @@ mod tests {
         assert!(!parsed.science_store.as_os_str().is_empty());
         assert!(parsed.input_manifest.as_os_str().is_empty());
         assert!(parsed.run_dir.as_os_str().is_empty());
+    }
+
+    #[test]
+    fn version_matches_workspace_package_version() {
+        let output = run_cli(&["--version".to_string()]).expect("version output");
+        assert_eq!(
+            output,
+            format!(
+                "gls-cli {} commit {}",
+                env!("CARGO_PKG_VERSION"),
+                env!("GENOLIGAND_BUILD_COMMIT")
+            )
+        );
     }
 
     #[test]

@@ -4,6 +4,7 @@ import csv
 import hashlib
 import json
 import math
+import os
 import shutil
 import subprocess
 from dataclasses import dataclass
@@ -33,6 +34,7 @@ COMMON_ADDITIVES = {
     "ACT", "BME", "BOG", "CIT", "DMS", "EDO", "EOH", "FMT", "GOL", "MPD",
     "PEG", "PG4", "PO4", "SO4", "TRS",
 }
+DOCKING_ARTIFACT_SCHEMA_VERSION = "genoligand_docking_artifacts_v1"
 
 
 class DockingNotReady(ValueError):
@@ -50,6 +52,9 @@ class DockingBinding:
     source_content_sha256: str
     receptor_coordinate: Path
     selection: dict[str, str]
+    candidate_digest: str = ""
+    input_digest: str = ""
+    receptor_digest: str = ""
 
 
 @dataclass(frozen=True)
@@ -111,7 +116,7 @@ def main() -> int:
         execution_status = "failed"
         reason = str(exc) or "docking_worker_failed"
         try:
-            write_docking_not_ready(runtime_path(str(job["run_dir"])), str(exc))
+            write_docking_not_ready(runtime_path(str(job["run_dir"])), str(exc), job=job)
         except Exception:
             pass
     write_result(
@@ -131,6 +136,10 @@ def main() -> int:
             }
         ],
     )
+    try:
+        bind_docking_result(args.out, job)
+    except DockingNotReady:
+        return 2
     return 0 if status == "PASS" else 2
 
 
@@ -141,8 +150,20 @@ def run_docking_job(job: dict[str, Any]) -> str:
     invocation_id = str(job.get("invocation_id", "")).strip()
     if not invocation_id:
         raise DockingNotReady("docking_invocation_id_missing")
-    clear_previous_docking_outputs(run_dir)
-    tool_outputs = run_dir / "tool_outputs"
+    try:
+        binding = resolve_docking_binding(
+            run_dir,
+            str(job.get("candidate_id", "")).strip(),
+            str(job.get("input_id", "")).strip(),
+            str(job.get("record_id", "")).strip(),
+        )
+        validate_docking_job_binding(job, binding)
+    except DockingNotReady as exc:
+        reason = str(exc)
+        write_docking_not_ready(run_dir, reason, job=job)
+        return f"docking=not_ready;reason={reason}"
+    clear_previous_docking_outputs(run_dir, binding.candidate_id)
+    tool_outputs = docking_output_dir(run_dir, binding.candidate_id, invocation_id)
     tool_outputs.mkdir(parents=True, exist_ok=True)
     receptor_pdb = tool_outputs / "docking_receptor.pdb"
     receptor_pdbqt = tool_outputs / "docking_receptor.pdbqt"
@@ -151,13 +172,6 @@ def run_docking_job(job: dict[str, Any]) -> str:
     pose_pdbqt = tool_outputs / "docking_pose.pdbqt"
     pose_sdf = tool_outputs / "docking_pose.sdf"
     log_path = tool_outputs / "docking_vina.log"
-
-    try:
-        binding = resolve_docking_binding(run_dir)
-    except DockingNotReady as exc:
-        reason = str(exc)
-        write_docking_not_ready(run_dir, reason)
-        return f"docking=not_ready;reason={reason}"
     try:
         preparation = prepare_receptor_for_docking(
             binding.receptor_coordinate,
@@ -166,19 +180,19 @@ def run_docking_job(job: dict[str, Any]) -> str:
         )
     except DockingNotReady as exc:
         reason = str(exc)
-        write_docking_not_ready(run_dir, reason, binding=binding)
+        write_docking_not_ready(run_dir, reason, binding=binding, job=job)
         return f"docking=not_ready;reason={reason}"
 
     vina = shutil.which("vina")
     obabel = shutil.which("obabel")
     if not vina:
         write_docking_not_ready(
-            run_dir, "missing_vina", binding=binding, preparation=preparation
+            run_dir, "missing_vina", binding=binding, preparation=preparation, job=job
         )
         return "docking=not_ready;reason=missing_vina"
     if not obabel:
         write_docking_not_ready(
-            run_dir, "missing_obabel", binding=binding, preparation=preparation
+            run_dir, "missing_obabel", binding=binding, preparation=preparation, job=job
         )
         return "docking=not_ready;reason=missing_obabel"
 
@@ -218,31 +232,81 @@ def run_docking_job(job: dict[str, Any]) -> str:
         for item in preparation.retained_components
         if item.get("component_id")
     )
+    receptor_pdb_relative = relative_run_path(run_dir, receptor_pdb)
+    receptor_pdbqt_relative = relative_run_path(run_dir, receptor_pdbqt)
+    ligand_sdf_relative = relative_run_path(run_dir, ligand_sdf)
+    ligand_pdbqt_relative = relative_run_path(run_dir, ligand_pdbqt)
+    pose_pdbqt_relative = relative_run_path(run_dir, pose_pdbqt)
+    pose_sdf_relative = relative_run_path(run_dir, pose_sdf)
+    log_relative = relative_run_path(run_dir, log_path)
+    summary_row = [
+        binding.candidate_id,
+        "completed",
+        fmt(affinity),
+        "vina",
+        f"input_id={binding.input_id};record_id={binding.ligand_record_id};"
+        f"target_id={binding.target_id};pdb_id={binding.pdb_id};"
+        f"pose={pose_pdbqt_relative};pose_sdf={pose_sdf_relative};"
+        f"receptor={binding.receptor_coordinate.name};box_center={center_text};"
+        f"box_source={preparation.box.source};box_size={BOX_SIZE_ANGSTROM};"
+        f"seed={seed.seed};retained_components={retained_ids}",
+    ]
     write_tsv(
         tool_outputs / "docking_summary.tsv",
         ["candidate_id", "docking_status", "docking_score", "docking_engine", "notes"],
-        [
-            [
-                binding.candidate_id,
-                "completed",
-                fmt(affinity),
-                "vina",
-                f"input_id={binding.input_id};target_id={binding.target_id};pdb_id={binding.pdb_id};"
-                f"pose=tool_outputs/docking_pose.pdbqt;pose_sdf=tool_outputs/docking_pose.sdf;"
-                f"receptor={binding.receptor_coordinate.name};box_center={center_text};"
-                f"box_source={preparation.box.source};box_size={BOX_SIZE_ANGSTROM};"
-                f"seed={seed.seed};retained_components={retained_ids}",
-            ]
-        ],
+        [summary_row],
+    )
+    upsert_tsv_row(
+        run_dir / "tool_outputs" / "docking_summary.tsv",
+        ["candidate_id", "docking_status", "docking_score", "docking_engine", "notes"],
+        summary_row,
     )
     with (tool_outputs / "docking_manifest.json").open("w", encoding="utf-8") as handle:
-        json.dump(
+        run_id = str(job.get("run_id", "")).strip() or run_dir.name
+        candidate_digest = binding.candidate_digest
+        artifact_paths = {
+            "receptor_coordinate": binding.receptor_coordinate,
+            "receptor_pdb": receptor_pdb,
+            "receptor_pdbqt": receptor_pdbqt,
+            "ligand_sdf": ligand_sdf,
+            "ligand_pdbqt": ligand_pdbqt,
+            "pose": pose_pdbqt,
+            "pose_sdf": pose_sdf,
+            "log": log_path,
+        }
+        artifact_rows = [
             {
-                "status": "completed",
+                "artifact_name": name,
+                "artifact_path": path.resolve(strict=True).relative_to(run_dir).as_posix(),
+                "artifact_sha256": sha256_file(path),
                 "job_id": str(job.get("job_id", "")),
+                "run_id": run_id,
                 "invocation_id": invocation_id,
                 "candidate_id": binding.candidate_id,
+                "candidate_digest": candidate_digest,
                 "input_id": binding.input_id,
+                "record_id": binding.ligand_record_id,
+                "input_digest": seed.input_digest,
+                "source_digest": binding.source_content_sha256,
+                **(
+                    {"receptor_digest": binding.receptor_digest}
+                    if name == "receptor_coordinate"
+                    else {}
+                ),
+            }
+            for name, path in sorted(artifact_paths.items())
+        ]
+        json.dump(
+            {
+                "artifact_schema_version": DOCKING_ARTIFACT_SCHEMA_VERSION,
+                "status": "completed",
+                "job_id": str(job.get("job_id", "")),
+                "run_id": run_id,
+                "invocation_id": invocation_id,
+                "candidate_id": binding.candidate_id,
+                "candidate_digest": candidate_digest,
+                "input_id": binding.input_id,
+                "record_id": binding.ligand_record_id,
                 "target_id": binding.target_id,
                 "pdb_id": binding.pdb_id,
                 "method": "autodock_vina",
@@ -251,15 +315,19 @@ def run_docking_job(job: dict[str, Any]) -> str:
                 "openbabel_path": obabel,
                 "receptor_coordinate": str(binding.receptor_coordinate),
                 "receptor_sha256": preparation.receptor_sha256,
-                "receptor_pdbqt": "tool_outputs/docking_receptor.pdbqt",
+                "receptor_digest": binding.receptor_digest,
+                "identity_namespace": binding.selection.get("identity_namespace", ""),
+                "receptor_pdb": receptor_pdb_relative,
+                "receptor_pdbqt": receptor_pdbqt_relative,
                 "ligand_smiles": binding.ligand_smiles,
                 "ligand_record_id": binding.ligand_record_id,
                 "source_content_sha256": binding.source_content_sha256,
                 "input_digest": seed.input_digest,
-                "ligand_pdbqt": "tool_outputs/docking_ligand.pdbqt",
-                "pose": "tool_outputs/docking_pose.pdbqt",
-                "pose_sdf": "tool_outputs/docking_pose.sdf",
-                "log": "tool_outputs/docking_vina.log",
+                "ligand_sdf": ligand_sdf_relative,
+                "ligand_pdbqt": ligand_pdbqt_relative,
+                "pose": pose_pdbqt_relative,
+                "pose_sdf": pose_sdf_relative,
+                "log": log_relative,
                 "affinity_kcal_mol": affinity,
                 "box_center": list(preparation.box.center),
                 "box_size_angstrom": BOX_SIZE_ANGSTROM,
@@ -279,12 +347,32 @@ def run_docking_job(job: dict[str, Any]) -> str:
                     "seed_digest": seed.seed_digest,
                 },
                 "vina_command": vina_command,
+                "artifacts": artifact_rows,
             },
             handle,
             indent=2,
             sort_keys=True,
         )
         handle.write("\n")
+    manifest_relative = relative_run_path(run_dir, tool_outputs / "docking_manifest.json")
+    upsert_manifest_index(
+        run_dir,
+        "docking",
+        {
+            "candidate_id": binding.candidate_id,
+            "input_id": binding.input_id,
+            "record_id": binding.ligand_record_id,
+            "candidate_digest": binding.candidate_digest,
+            "input_digest": binding.input_digest,
+            "source_digest": binding.source_content_sha256,
+            "job_id": str(job.get("job_id", "")),
+            "invocation_id": invocation_id,
+            "status": "completed",
+            "reason": "completed",
+            "manifest": manifest_relative,
+            "artifact_provenance": "",
+        },
+    )
     return (
         f"AutoDock Vina docking completed; vina={vina}; rdkit={rdBase.rdkitVersion}; "
         f"affinity={fmt(affinity)}; seed={seed.seed}"
@@ -300,6 +388,152 @@ def runtime_path(value: str) -> Path:
         rest = value[3:].replace("\\", "/")
         return Path(f"/mnt/{drive}/{rest}")
     return path
+
+
+def candidate_artifact_key(candidate_id: str) -> str:
+    cleaned = "".join(ch if ch.isalnum() or ch in "-_" else "_" for ch in candidate_id).strip("_")
+    digest = hashlib.sha256(candidate_id.encode("utf-8")).hexdigest()[:12]
+    return f"{cleaned[:64] or 'candidate'}-{digest}"
+
+
+def docking_candidate_dir(run_dir: Path, candidate_id: str) -> Path:
+    return run_dir / "tool_outputs" / "docking" / candidate_artifact_key(candidate_id)
+
+
+def docking_output_dir(run_dir: Path, candidate_id: str, invocation_id: str) -> Path:
+    return docking_candidate_dir(run_dir, candidate_id) / candidate_artifact_key(invocation_id)
+
+
+def relative_run_path(run_dir: Path, path: Path) -> str:
+    root = run_dir.resolve(strict=True)
+    resolved = path.resolve(strict=True)
+    try:
+        return resolved.relative_to(root).as_posix()
+    except ValueError as exc:
+        raise DockingNotReady(f"artifact_outside_current_run:{path}") from exc
+
+
+def bind_docking_result(path: str | Path, job: dict[str, Any]) -> None:
+    output = runtime_path(str(path))
+    if not output.is_file():
+        return
+    run_dir = runtime_path(str(job.get("run_dir", ""))).resolve(strict=True)
+    resolved_output = output.resolve(strict=True)
+    try:
+        artifact_path = resolved_output.relative_to(run_dir).as_posix()
+    except ValueError as exc:
+        raise DockingNotReady("docking_result_outside_current_run") from exc
+    try:
+        result = json.loads(resolved_output.read_text(encoding="utf-8-sig"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise DockingNotReady("docking_result_invalid") from exc
+    index_path = run_dir / "tool_outputs" / "docking_manifest_index.json"
+    try:
+        index = json.loads(index_path.read_text(encoding="utf-8-sig"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise DockingNotReady("docking_manifest_index_invalid") from exc
+    candidate_id = str(job.get("candidate_id", "")).strip()
+    invocation_id = str(job.get("invocation_id", "")).strip()
+    entries = [
+        row
+        for row in index.get("entries", [])
+        if isinstance(row, dict)
+        and row.get("candidate_id") == candidate_id
+        and row.get("invocation_id") == invocation_id
+    ]
+    if (
+        index.get("schema_version") != "genoligand_docking_manifest_index_v1"
+        or index.get("run_id") != str(job.get("run_id", "")).strip()
+        or len(entries) != 1
+        or not str(entries[0].get("manifest", "")).strip()
+    ):
+        raise DockingNotReady("docking_manifest_index_invalid")
+    result["manifest"] = str(entries[0]["manifest"])
+    provenance = str(entries[0].get("artifact_provenance", "")).strip()
+    if provenance:
+        result["artifact_provenance"] = provenance
+    result["artifact_path"] = artifact_path
+    atomic_write_json(resolved_output, result)
+
+
+def validate_docking_job_binding(job: dict[str, Any], binding: DockingBinding) -> None:
+    expected = {
+        "candidate_id": binding.candidate_id,
+        "candidate_digest": binding.candidate_digest,
+        "input_id": binding.input_id,
+        "record_id": binding.ligand_record_id,
+        "input_digest": binding.input_digest,
+        "source_digest": binding.source_content_sha256,
+        "receptor_digest": binding.receptor_digest,
+    }
+    for field_name, current in expected.items():
+        value = str(job.get(field_name, "")).strip()
+        if not value:
+            raise DockingNotReady(f"docking_job_{field_name}_missing")
+        if value != current:
+            raise DockingNotReady(f"docking_job_{field_name}_mismatch")
+    identity_namespace = str(job.get("identity_namespace", "")).strip()
+    if identity_namespace and identity_namespace != binding.selection.get("identity_namespace", ""):
+        raise DockingNotReady("docking_job_identity_namespace_mismatch")
+
+
+def atomic_write_json(path: Path, value: dict[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+    temporary.write_text(
+        json.dumps(value, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+    temporary.replace(path)
+
+
+def upsert_manifest_index(run_dir: Path, kind: str, entry: dict[str, Any]) -> None:
+    path = run_dir / "tool_outputs" / f"{kind}_manifest_index.json"
+    schema_version = f"genoligand_{kind}_manifest_index_v1"
+    current: dict[str, Any] = {}
+    if path.is_file():
+        try:
+            current = json.loads(path.read_text(encoding="utf-8-sig"))
+        except (OSError, json.JSONDecodeError) as exc:
+            raise DockingNotReady(f"{kind}_manifest_index_invalid") from exc
+    if current and (
+        current.get("schema_version") != schema_version
+        or current.get("run_id") != run_dir.name
+        or not isinstance(current.get("entries"), list)
+    ):
+        raise DockingNotReady(f"{kind}_manifest_index_invalid")
+    entries = {
+        str(row.get("candidate_id", "")): row
+        for row in current.get("entries", [])
+        if isinstance(row, dict) and str(row.get("candidate_id", ""))
+    }
+    entries[str(entry["candidate_id"])] = entry
+    atomic_write_json(
+        path,
+        {
+            "schema_version": schema_version,
+            "run_id": run_dir.name,
+            "entries": [entries[key] for key in sorted(entries)],
+        },
+    )
+
+
+def upsert_tsv_row(path: Path, header: list[str], row: list[Any]) -> None:
+    rows: dict[str, list[str]] = {}
+    if path.is_file():
+        with path.open("r", encoding="utf-8-sig", newline="") as handle:
+            reader = csv.DictReader(handle, delimiter="\t")
+            if reader.fieldnames != header:
+                raise DockingNotReady("docking_summary_schema_invalid")
+            for current in reader:
+                candidate_id = str(current.get("candidate_id", "")).strip()
+                if candidate_id:
+                    rows[candidate_id] = [str(current.get(name, "")) for name in header]
+    rows[str(row[0])] = [str(value) for value in row]
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+    write_tsv(temporary, header, [rows[key] for key in sorted(rows)])
+    temporary.replace(path)
 
 
 def resolve_run_artifact(run_dir: Path, artifact: str | Path) -> Path:
@@ -320,8 +554,20 @@ def resolve_run_artifact(run_dir: Path, artifact: str | Path) -> Path:
     return resolved
 
 
-def clear_previous_docking_outputs(run_dir: Path) -> None:
+def clear_previous_docking_outputs(run_dir: Path, candidate_id: str = "") -> None:
     root = run_dir.resolve(strict=True)
+    if candidate_id:
+        candidate_root = docking_candidate_dir(root, candidate_id)
+        if candidate_root.exists() or candidate_root.is_symlink():
+            try:
+                resolved = candidate_root.resolve(strict=True)
+                resolved.relative_to(root)
+            except (OSError, ValueError) as exc:
+                raise DockingNotReady("docking_candidate_output_outside_run") from exc
+            if candidate_root.is_symlink() or not candidate_root.is_dir():
+                raise DockingNotReady("docking_candidate_output_not_directory")
+            shutil.rmtree(candidate_root)
+        return
     for relative in (
         "docking_summary.tsv",
         "tool_outputs/docking_summary.tsv",
@@ -342,7 +588,12 @@ def clear_previous_docking_outputs(run_dir: Path) -> None:
             path.unlink()
 
 
-def resolve_docking_binding(run_dir: Path) -> DockingBinding:
+def resolve_docking_binding(
+    run_dir: Path,
+    candidate_id: str = "",
+    input_id: str = "",
+    record_id: str = "",
+) -> DockingBinding:
     selection_path = run_dir / "complex_candidate_selection.tsv"
     if not selection_path.exists():
         raise DockingNotReady("missing_selected_complex_candidate")
@@ -351,15 +602,26 @@ def resolve_docking_binding(run_dir: Path) -> DockingBinding:
             {str(key): str(value or "").strip() for key, value in row.items()}
             for row in csv.DictReader(handle, delimiter="\t")
         ]
+    if candidate_id:
+        selections = [row for row in selections if row.get("candidate_id") == candidate_id]
+    if input_id:
+        selections = [row for row in selections if row.get("input_id") == input_id]
+    if record_id:
+        selections = [row for row in selections if row.get("record_id") == record_id]
     if len(selections) != 1:
         raise DockingNotReady("selected_complex_candidate_must_be_unique")
     selection = selections[0]
     candidate_id = selection.get("candidate_id", "")
     input_id = selection.get("input_id", "")
+    selected_record_id = selection.get("record_id", "")
     target_id = selection.get("target_id", "")
     pdb_id = selection.get("pdb_id", "")
-    if not candidate_id or not input_id or not target_id:
+    if not candidate_id or not input_id or not selected_record_id or not target_id or not pdb_id:
         raise DockingNotReady("selected_complex_candidate_missing_binding_identity")
+    receptor_artifact = selection.get("receptor_artifact", "")
+    receptor_digest = selection.get("coordinate_sha256", "").lower()
+    if not receptor_artifact or not valid_sha256(receptor_digest):
+        raise DockingNotReady("selected_candidate_receptor_provenance_missing")
 
     ligand_path = run_dir / "input_conversion_manifest.tsv"
     if not ligand_path.exists():
@@ -369,6 +631,10 @@ def resolve_docking_binding(run_dir: Path) -> DockingBinding:
             row
             for row in csv.DictReader(handle, delimiter="\t")
             if str(row.get("input_id", "")).strip() == input_id
+            and (
+                not selected_record_id
+                or str(row.get("record_id", "")).strip() == selected_record_id
+            )
             and str(row.get("conversion_status", "")).strip() == "converted"
             and str(row.get("canonical_kind", "")).strip() == "small_molecule"
             and decode_tsv_cell(str(row.get("canonical_value", ""))).strip()
@@ -391,6 +657,12 @@ def resolve_docking_binding(run_dir: Path) -> DockingBinding:
                 continue
             if str(row.get("target_id", "")).strip() != target_id:
                 continue
+            if str(row.get("candidate_id", "")).strip() != candidate_id:
+                continue
+            if str(row.get("input_id", "")).strip() != input_id:
+                continue
+            if str(row.get("record_id", "")).strip() != selected_record_id:
+                continue
             row_pdb_id = str(row.get("pdb_id", "")).strip()
             if pdb_id and row_pdb_id.upper() != pdb_id.upper():
                 continue
@@ -398,20 +670,36 @@ def resolve_docking_binding(run_dir: Path) -> DockingBinding:
     if len(receptor_rows) != 1:
         raise DockingNotReady("selected_candidate_receptor_binding_not_ready")
     artifact = str(receptor_rows[0].get("artifact", "")).strip()
-    if not artifact:
-        raise DockingNotReady("selected_candidate_receptor_artifact_missing")
+    status_digest = str(receptor_rows[0].get("coordinate_sha256", "")).strip().lower()
+    if artifact != receptor_artifact or status_digest != receptor_digest:
+        raise DockingNotReady("selected_candidate_receptor_provenance_mismatch")
     receptor_coordinate = resolve_run_artifact(run_dir, artifact)
+    if sha256_file(receptor_coordinate) != receptor_digest:
+        raise DockingNotReady("selected_candidate_receptor_digest_mismatch")
 
+    ligand_record_id = str(ligand_row.get("record_id", "")).strip()
+    input_digest = canonical_digest(
+        {
+            "input_id": input_id,
+            "record_id": ligand_record_id,
+            "canonical_kind": "small_molecule",
+            "canonical_value": ligand_smiles,
+            "source_content_sha256": source_digest,
+        }
+    )
     return DockingBinding(
         candidate_id=candidate_id,
         input_id=input_id,
         target_id=target_id,
         pdb_id=pdb_id,
         ligand_smiles=ligand_smiles,
-        ligand_record_id=str(ligand_row.get("record_id", "")).strip(),
+        ligand_record_id=ligand_record_id,
         source_content_sha256=source_digest,
         receptor_coordinate=receptor_coordinate,
         selection=selection,
+        candidate_digest=canonical_digest(selection),
+        input_digest=input_digest,
+        receptor_digest=receptor_digest,
     )
 
 
@@ -759,6 +1047,10 @@ def sha256_file(path: Path) -> str:
     return digest.hexdigest()
 
 
+def valid_sha256(value: str) -> bool:
+    return len(value) == 64 and all(ch in "0123456789abcdef" for ch in value)
+
+
 def decode_tsv_cell(value: str) -> str:
     out = []
     index = 0
@@ -846,31 +1138,60 @@ def write_docking_not_ready(
     *,
     binding: DockingBinding | None = None,
     preparation: ReceptorPreparation | None = None,
+    job: dict[str, Any] | None = None,
 ) -> None:
-    tool_outputs = run_dir / "tool_outputs"
+    job = job or {}
+    candidate_id = binding.candidate_id if binding else str(job.get("candidate_id", "")).strip()
+    if not candidate_id:
+        candidate_id = "unbound"
+    invocation_id = str(job.get("invocation_id", "")).strip() or "unbound-invocation"
+    clear_previous_docking_outputs(run_dir, candidate_id)
+    tool_outputs = docking_output_dir(run_dir, candidate_id, invocation_id)
     tool_outputs.mkdir(parents=True, exist_ok=True)
-    candidate_id = binding.candidate_id if binding else ""
+    summary_row = [candidate_id, "not_ready", "", "vina", reason]
     write_tsv(
         tool_outputs / "docking_summary.tsv",
         ["candidate_id", "docking_status", "docking_score", "docking_engine", "notes"],
-        [[candidate_id, "not_ready", "", "vina", reason]],
+        [summary_row],
+    )
+    upsert_tsv_row(
+        run_dir / "tool_outputs" / "docking_summary.tsv",
+        ["candidate_id", "docking_status", "docking_score", "docking_engine", "notes"],
+        summary_row,
     )
     manifest: dict[str, Any] = {
+        "artifact_schema_version": DOCKING_ARTIFACT_SCHEMA_VERSION,
         "method": "autodock_vina",
         "status": "not_ready",
         "execution_state": "blocked",
         "reason": reason,
+        "job_id": str(job.get("job_id", "")),
+        "run_id": str(job.get("run_id", "")).strip() or run_dir.name,
+        "invocation_id": str(job.get("invocation_id", "")),
+        "candidate_id": candidate_id,
+        "candidate_digest": str(job.get("candidate_digest", "")),
+        "input_id": str(job.get("input_id", "")),
+        "record_id": str(job.get("record_id", "")),
+        "input_digest": str(job.get("input_digest", "")),
+        "source_digest": str(job.get("source_digest", "")),
+        "receptor_digest": str(job.get("receptor_digest", "")),
+        "artifacts": [],
     }
     if binding is not None:
         manifest.update(
             {
                 "candidate_id": binding.candidate_id,
+                "candidate_digest": binding.candidate_digest,
                 "input_id": binding.input_id,
+                "record_id": binding.ligand_record_id,
+                "input_digest": binding.input_digest,
                 "target_id": binding.target_id,
                 "pdb_id": binding.pdb_id,
                 "ligand_smiles": binding.ligand_smiles,
                 "ligand_record_id": binding.ligand_record_id,
                 "source_content_sha256": binding.source_content_sha256,
+                "source_digest": binding.source_content_sha256,
+                "receptor_digest": binding.receptor_digest,
                 "receptor_coordinate": str(binding.receptor_coordinate),
             }
         )
@@ -888,9 +1209,26 @@ def write_docking_not_ready(
                 "retained_receptor_components": preparation.retained_components,
             }
         )
-    with (tool_outputs / "docking_manifest.json").open("w", encoding="utf-8") as handle:
-        json.dump(manifest, handle, indent=2, sort_keys=True)
-        handle.write("\n")
+    manifest_path = tool_outputs / "docking_manifest.json"
+    atomic_write_json(manifest_path, manifest)
+    upsert_manifest_index(
+        run_dir,
+        "docking",
+        {
+            "candidate_id": candidate_id,
+            "input_id": str(manifest.get("input_id", "")),
+            "record_id": str(manifest.get("record_id", "")),
+            "candidate_digest": str(manifest.get("candidate_digest", "")),
+            "input_digest": str(manifest.get("input_digest", "")),
+            "source_digest": str(manifest.get("source_digest", "")),
+            "job_id": str(manifest.get("job_id", "")),
+            "invocation_id": str(manifest.get("invocation_id", "")),
+            "status": "not_ready",
+            "reason": reason,
+            "manifest": relative_run_path(run_dir, manifest_path),
+            "artifact_provenance": "",
+        },
+    )
 
 
 def write_tsv(path: Path, header: list[str], rows: list[list[Any]]) -> None:

@@ -18,7 +18,13 @@ async function loadInputCapabilities() {
         typeof spec.title === "string" &&
         typeof spec.label === "string" &&
         typeof spec.placeholder === "string" &&
-        typeof spec.minimum === "string",
+        typeof spec.minimum === "string" &&
+        spec.text?.supported === true &&
+        spec.file?.supported === true &&
+        Array.isArray(spec.file.extensions) &&
+        spec.file.extensions.length > 0 &&
+        Number.isInteger(spec.constraints?.minimum_records) &&
+        spec.constraints.minimum_records > 0,
     );
   if (!valid) throw new Error("输入能力描述不可用。");
   state.inputCapabilities = capabilities;

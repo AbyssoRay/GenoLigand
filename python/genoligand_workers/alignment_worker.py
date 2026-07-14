@@ -16,8 +16,22 @@ from genoligand_workers.worker_io import parse_worker_args, read_job, write_resu
 
 FOLDSEEK_MATCH_HEADER = (
     "input_id\tsource\ttarget_id\ttarget_name\torganism\ttarget_class\tmatch_score\t"
-    "matched_features\tevidence\trecord_id\n"
+    "matched_features\tevidence\trecord_id\tsource_database_id\tsource_digest\t"
+    "builder_version\tfoldseek_version\tcurrent_run_query_id\tquery_digest\ttm_score\n"
 )
+ALIGNMENT_MANIFEST_SCHEMA_VERSION = "genoligand_alignment_database_manifest_v2"
+ALIGNMENT_MANIFEST_REQUIRED_FIELDS = {
+    "source_id",
+    "manifest_schema_version",
+    "source_namespace",
+    "source_class",
+    "source_digest",
+    "source_files",
+    "source_bytes",
+    "builder_version",
+    "db_path",
+    "status",
+}
 
 MMSEQS_MATCH_HEADER = (
     "input_id\tsource\ttarget_id\ttarget_name\torganism\ttarget_class\tmatch_score\t"
@@ -49,6 +63,23 @@ class TargetDatabase(NamedTuple):
     source_digest: str
     builder_version: str
     path: Path
+
+
+class FoldseekTargetDatabase(NamedTuple):
+    database_id: str
+    source_digest: str
+    source_files: int
+    source_bytes: int
+    builder_version: str
+    path: Path
+
+
+class StructureQuery(NamedTuple):
+    path: Path
+    input_id: str
+    record_id: str
+    query_id: str
+    query_digest: str
 
 
 def main() -> int:
@@ -246,8 +277,8 @@ def run_foldseek_alignment(run_dir: Path, science_store: Path) -> WorkerExecutio
             (WorkerOutcome("not_applicable", reason, False, "foldseek", 0),),
         )
 
-    target_record = foldseek_target_database(science_store)
-    if target_record is None:
+    targets = foldseek_target_databases(science_store)
+    if not targets:
         reason = "no_persistent_foldseek_database"
         write_status(status_path, "not_ready", reason, 0)
         return WorkerExecution(
@@ -256,8 +287,6 @@ def run_foldseek_alignment(run_dir: Path, science_store: Path) -> WorkerExecutio
             "Foldseek not executed",
             (WorkerOutcome("not_ready", reason, True, "foldseek_target_manifest", 0),),
         )
-    database_id, target = target_record
-
     foldseek = shutil.which("foldseek")
     if not foldseek:
         reason = "missing_foldseek"
@@ -266,65 +295,80 @@ def run_foldseek_alignment(run_dir: Path, science_store: Path) -> WorkerExecutio
             "not_ready",
             reason,
             "Foldseek executable missing",
-            (WorkerOutcome("not_ready", reason, True, database_id, 0),),
+            tuple(
+                WorkerOutcome("not_ready", reason, True, target.database_id, 0)
+                for target in targets
+            ),
         )
 
-    raw = out_dir / "foldseek_structure_matches.m8"
-    tmp = out_dir / "foldseek_tmp"
+    foldseek_version = executable_version(foldseek, timeout=30)
+    raw_dir = out_dir / "foldseek_raw"
+    raw_dir.mkdir(parents=True, exist_ok=True)
+    tmp_root = out_dir / "foldseek_tmp"
+    tmp_root.mkdir(parents=True, exist_ok=True)
     query_db = out_dir / "foldseek_query_db"
-    result_db = out_dir / "foldseek_result_db"
     timeout = int(os.environ.get("GENOLIGAND_ALIGNMENT_TIMEOUT_SECONDS", "900"))
-    run_command([foldseek, "createdb", str(query), str(query_db)], timeout, "foldseek_createdb")
-    command = [
-        foldseek,
-        "search",
-        str(query_db),
-        str(target),
-        str(result_db),
-        str(tmp),
-        "-a",
-        "--threads",
-        os.environ.get("GENOLIGAND_ALIGNMENT_THREADS", "1"),
-    ]
-    completed = subprocess.run(command, capture_output=True, text=True, timeout=timeout)
-    if completed.returncode != 0:
-        reason = safe_note(first_line(completed.stderr or completed.stdout)) or "foldseek_search_failed"
-        write_status(status_path, "failed", reason, 0)
-        return WorkerExecution(
-            "failed",
-            reason,
-            "Foldseek search failed",
-            (WorkerOutcome("failed", reason, True, database_id, 0),),
+    run_command([foldseek, "createdb", str(query.path), str(query_db)], timeout, "foldseek_createdb")
+    rows: list[str] = []
+    outcomes: list[WorkerOutcome] = []
+    for index, target in enumerate(targets, start=1):
+        raw = raw_dir / f"target_{index}.m8"
+        tmp = tmp_root / f"target_{index}"
+        result_db = raw_dir / f"target_{index}_result"
+        command = [
+            foldseek,
+            "search",
+            str(query_db),
+            str(target.path),
+            str(result_db),
+            str(tmp),
+            "-a",
+            "--threads",
+            os.environ.get("GENOLIGAND_ALIGNMENT_THREADS", "1"),
+        ]
+        completed = subprocess.run(command, capture_output=True, text=True, timeout=timeout)
+        if completed.returncode != 0:
+            reason = safe_note(first_line(completed.stderr or completed.stdout)) or "foldseek_search_failed"
+            outcomes.append(WorkerOutcome("failed", reason, True, target.database_id, 0))
+            continue
+        command = [
+            foldseek,
+            "convertalis",
+            str(query_db),
+            str(target.path),
+            str(result_db),
+            str(raw),
+            "--format-output",
+            "query,target,pident,alntmscore,evalue,bits",
+        ]
+        completed = subprocess.run(command, capture_output=True, text=True, timeout=timeout)
+        if completed.returncode != 0:
+            reason = safe_note(first_line(completed.stderr or completed.stdout)) or "foldseek_convertalis_failed"
+            outcomes.append(WorkerOutcome("failed", reason, True, target.database_id, 0))
+            continue
+        target_rows = foldseek_rows(raw, target, query, foldseek_version)
+        rows.extend(target_rows)
+        outcomes.append(
+            WorkerOutcome("completed", "search_completed", True, target.database_id, len(target_rows))
         )
-    command = [
-        foldseek,
-        "convertalis",
-        str(query_db),
-        str(target),
-        str(result_db),
-        str(raw),
-        "--format-output",
-        "query,target,pident,alntmscore,evalue,bits",
-    ]
-    completed = subprocess.run(command, capture_output=True, text=True, timeout=timeout)
-    if completed.returncode != 0:
-        reason = safe_note(first_line(completed.stderr or completed.stdout)) or "foldseek_convertalis_failed"
-        write_status(status_path, "failed", reason, 0)
-        return WorkerExecution(
-            "failed",
-            reason,
-            "Foldseek convertalis failed",
-            (WorkerOutcome("failed", reason, True, database_id, 0),),
-        )
-    rows = foldseek_rows(raw)
     write_text(matches_path, FOLDSEEK_MATCH_HEADER + "".join(rows))
+    failures = [outcome for outcome in outcomes if outcome.status == "failed"]
+    if failures:
+        reason = ";".join(f"{outcome.database_id}:{outcome.reason}" for outcome in failures[:4])
+        write_status(status_path, "failed", reason, len(rows))
+        return WorkerExecution(
+            "failed",
+            reason,
+            f"{foldseek_version}; targets={len(targets)}; matches={len(rows)}",
+            tuple(outcomes),
+        )
     reason = "search_completed" if rows else "search_completed_no_hits"
     write_status(status_path, "completed", reason, len(rows))
     return WorkerExecution(
         "completed",
         reason,
-        f"Foldseek search; matches={len(rows)}",
-        (WorkerOutcome("completed", reason, True, database_id, len(rows)),),
+        f"{foldseek_version}; targets={len(targets)}; matches={len(rows)}",
+        tuple(outcomes),
     )
 
 
@@ -500,61 +544,112 @@ def six_frame_orfs(sequence: str, minimum_amino_acids: int = 3) -> list[tuple[st
 def mmseqs_target_databases(science_store: Path) -> list[TargetDatabase]:
     manifest = science_store / "indexes" / "mmseqs" / "mmseqs_target_databases.tsv"
     targets: list[TargetDatabase] = []
-    if manifest.exists():
-        with manifest.open("r", encoding="utf-8-sig", newline="") as handle:
-            for row in csv.DictReader(handle, delimiter="\t"):
-                if row.get("status") != "ready":
-                    continue
-                database_id = str(row.get("source_id", "")).strip()
-                db_path = str(row.get("db_path", "")).strip()
-                if not db_path:
-                    raise ValueError(f"mmseqs_target_database_path_missing:{database_id}")
-                path = Path(db_path)
-                if not path.is_absolute():
-                    path = science_store / path
-                namespace = str(row.get("source_namespace", "")).strip()
-                source_class = str(row.get("source_class", "")).strip().lower()
-                source_digest = str(row.get("source_digest", "")).strip().lower()
-                builder_version = str(row.get("builder_version", "")).strip()
-                if not database_id or not namespace or not source_digest or not builder_version:
-                    raise ValueError("mmseqs_target_provenance_missing")
-                if source_class not in {"known", "metagenome"}:
-                    raise ValueError(f"mmseqs_target_source_class_invalid:{source_class}")
-                if len(source_digest) != 64 or any(ch not in "0123456789abcdef" for ch in source_digest):
-                    raise ValueError(f"mmseqs_target_source_digest_invalid:{database_id}")
-                if not mmseqs_database_ready(path):
-                    raise ValueError(f"mmseqs_target_database_not_ready:{database_id}")
-                targets.append(
-                    TargetDatabase(
-                        database_id,
-                        namespace,
-                        source_class,
-                        source_digest,
-                        builder_version,
-                        path,
-                    )
-                )
+    for row in validated_alignment_manifest_rows(manifest, science_store, "mmseqs"):
+        database_id = row["source_id"]
+        path = resolved_manifest_database_path(science_store, row["db_path"])
+        source_class = row["source_class"].lower()
+        if source_class not in {"known", "metagenome"}:
+            raise ValueError(f"mmseqs_target_source_class_invalid:{source_class}")
+        if not mmseqs_database_ready(path):
+            raise ValueError(f"mmseqs_target_database_not_ready:{database_id}")
+        targets.append(
+            TargetDatabase(
+                database_id,
+                row["source_namespace"],
+                source_class,
+                row["source_digest"].lower(),
+                row["builder_version"],
+                path,
+            )
+        )
     return sorted(dedupe_target_databases(targets), key=lambda target: str(target.path))
 
 
-def foldseek_target_database(science_store: Path) -> tuple[str, Path] | None:
+def foldseek_target_databases(science_store: Path) -> list[FoldseekTargetDatabase]:
     manifest = science_store / "indexes" / "foldseek" / "foldseek_target_databases.tsv"
-    if manifest.exists():
-        with manifest.open("r", encoding="utf-8-sig", newline="") as handle:
-            for row in csv.DictReader(handle, delimiter="\t"):
-                if row.get("status") != "ready":
-                    continue
-                db_path = str(row.get("db_path", "")).strip()
-                if not db_path:
-                    continue
-                path = Path(db_path)
-                if not path.is_absolute():
-                    path = science_store / path
-                if db_ready(path):
-                    database_id = str(row.get("source_id", "")).strip() or path.parent.name
-                    return database_id, path
-    prefixes = dbtype_prefixes(science_store / "indexes" / "foldseek")
-    return (prefixes[0].parent.name, prefixes[0]) if prefixes else None
+    targets: list[FoldseekTargetDatabase] = []
+    for row in validated_alignment_manifest_rows(manifest, science_store, "foldseek"):
+        database_id = row["source_id"]
+        path = resolved_manifest_database_path(science_store, row["db_path"])
+        if not foldseek_database_ready(path):
+            raise ValueError(f"foldseek_target_database_not_ready:{database_id}")
+        targets.append(
+            FoldseekTargetDatabase(
+                database_id,
+                row["source_digest"].lower(),
+                int(row["source_files"]),
+                int(row["source_bytes"]),
+                row["builder_version"],
+                path,
+            )
+        )
+    deduped: dict[str, FoldseekTargetDatabase] = {}
+    for target in targets:
+        key = str(target.path.resolve())
+        if key in deduped:
+            raise ValueError(f"foldseek_target_database_duplicate:{target.database_id}")
+        deduped[key] = target
+    return sorted(deduped.values(), key=lambda target: (target.database_id, str(target.path)))
+
+
+def validated_alignment_manifest_rows(
+    manifest: Path,
+    science_store: Path,
+    tool: str,
+) -> list[dict[str, str]]:
+    if not manifest.is_file():
+        return []
+    with manifest.open("r", encoding="utf-8-sig", newline="") as handle:
+        reader = csv.DictReader(handle, delimiter="\t")
+        missing_headers = sorted(
+            ALIGNMENT_MANIFEST_REQUIRED_FIELDS - set(reader.fieldnames or [])
+        )
+        if missing_headers:
+            raise ValueError(
+                f"{tool}_target_manifest_fields_missing:{','.join(missing_headers)}"
+            )
+        rows = [
+            {str(key): str(value or "").strip() for key, value in row.items()}
+            for row in reader
+        ]
+    for row in rows:
+        database_id = row["source_id"]
+        missing = sorted(
+            field
+            for field in ALIGNMENT_MANIFEST_REQUIRED_FIELDS
+            if not row.get(field, "")
+        )
+        if missing:
+            raise ValueError(
+                f"{tool}_target_manifest_fields_missing:{database_id}:{','.join(missing)}"
+            )
+        if row["manifest_schema_version"] != ALIGNMENT_MANIFEST_SCHEMA_VERSION:
+            raise ValueError(f"{tool}_target_manifest_schema_invalid:{database_id}")
+        if row["status"] != "ready":
+            raise ValueError(f"{tool}_target_database_not_ready:{database_id}")
+        if not valid_digest(row["source_digest"].lower()):
+            raise ValueError(f"{tool}_target_source_digest_invalid:{database_id}")
+        try:
+            source_files = int(row["source_files"])
+            source_bytes = int(row["source_bytes"])
+        except ValueError as exc:
+            raise ValueError(f"{tool}_target_provenance_invalid:{database_id}") from exc
+        if source_files <= 0 or source_bytes <= 0:
+            raise ValueError(f"{tool}_target_provenance_invalid:{database_id}")
+        resolved_manifest_database_path(science_store, row["db_path"])
+    return rows
+
+
+def resolved_manifest_database_path(science_store: Path, value: str) -> Path:
+    path = Path(value)
+    return path if path.is_absolute() else science_store / path
+
+
+def foldseek_target_database(science_store: Path) -> tuple[str, Path] | None:
+    targets = foldseek_target_databases(science_store)
+    if len(targets) != 1:
+        return None
+    return targets[0].database_id, targets[0].path
 
 
 def dedupe_target_databases(targets: list[TargetDatabase]) -> list[TargetDatabase]:
@@ -568,19 +663,32 @@ def dedupe_target_databases(targets: list[TargetDatabase]) -> list[TargetDatabas
     return out
 
 
-def dbtype_prefixes(root: Path) -> list[Path]:
-    if not root.exists():
-        return []
-    prefixes: list[Path] = []
-    for dbtype in root.rglob("*.dbtype"):
-        if dbtype.name.endswith("_h.dbtype") or dbtype.name.endswith("_seq.dbtype"):
-            continue
-        prefixes.append(dbtype.with_suffix(""))
-    return dedupe_paths(prefixes)
-
-
-def db_ready(prefix: Path) -> bool:
-    return prefix.with_suffix(".dbtype").exists() or Path(str(prefix) + ".dbtype").exists()
+def foldseek_database_ready(prefix: Path) -> bool:
+    companions = [
+        prefix,
+        Path(f"{prefix}.dbtype"),
+        Path(f"{prefix}.index"),
+        Path(f"{prefix}.lookup"),
+    ]
+    try:
+        if any(not path.is_file() or path.stat().st_size <= 0 for path in companions):
+            return False
+        if Path(f"{prefix}.dbtype").stat().st_size != 4:
+            return False
+        index_companions = {
+            Path(f"{prefix}.idx"),
+            Path(f"{prefix}.idx.dbtype"),
+            Path(f"{prefix}.idx.index"),
+        }
+        present = {path for path in prefix.parent.glob(f"{prefix.name}.idx*") if path.is_file()}
+        if present and present != index_companions:
+            return False
+        return not present or (
+            all(path.stat().st_size > 0 for path in index_companions)
+            and Path(f"{prefix}.idx.dbtype").stat().st_size == 4
+        )
+    except OSError:
+        return False
 
 
 def mmseqs_database_ready(prefix: Path) -> bool:
@@ -589,18 +697,6 @@ def mmseqs_database_ready(prefix: Path) -> bool:
         return prefix.is_file() and prefix.stat().st_size > 0 and dbtype.is_file() and dbtype.stat().st_size > 0
     except OSError:
         return False
-
-
-def dedupe_paths(paths: list[Path]) -> list[Path]:
-    seen: set[str] = set()
-    out: list[Path] = []
-    for path in paths:
-        key = str(path)
-        if key in seen:
-            continue
-        seen.add(key)
-        out.append(path)
-    return out
 
 
 def write_fasta(path: Path, rows: list[SequenceInput]) -> None:
@@ -718,7 +814,12 @@ def validate_mmseqs_alignment(
         raise ValueError("mmseqs_alignment_backtrace_invalid:range")
 
 
-def foldseek_rows(path: Path) -> list[str]:
+def foldseek_rows(
+    path: Path,
+    target_database: FoldseekTargetDatabase,
+    query_identity: StructureQuery,
+    foldseek_version: str,
+) -> list[str]:
     if not path.exists():
         return []
     rows: list[str] = []
@@ -726,23 +827,49 @@ def foldseek_rows(path: Path) -> list[str]:
         for line in handle:
             cols = line.rstrip("\n").split("\t")
             if len(cols) < 6:
-                continue
+                raise ValueError("foldseek_alignment_row_invalid")
             query, target, pident, tm_score, evalue, bits = cols[:6]
-            score = alignment_score(pident, bits)
+            if query != query_identity.query_id:
+                raise ValueError(f"foldseek_query_identity_mismatch:{safe_note(query)}")
+            try:
+                identity_value = float(pident)
+                tm_value = float(tm_score)
+                evalue_value = float(evalue)
+                bits_value = float(bits)
+            except ValueError as exc:
+                raise ValueError("foldseek_alignment_row_invalid") from exc
+            if (
+                not all(math.isfinite(value) for value in (identity_value, tm_value, evalue_value, bits_value))
+                or not 0.0 <= identity_value <= 100.0
+                or not 0.0 <= tm_value <= 1.0
+                or evalue_value < 0.0
+            ):
+                raise ValueError("foldseek_alignment_row_invalid")
+            score = max(0.0, min(1.0, 0.40 * alignment_score(pident, bits) + 0.60 * tm_value))
             target_id = safe_id(Path(target).stem or target.split()[0])
             evidence = (
                 f"foldseek_search;evalue={safe_note(evalue)};bits={safe_note(bits)};"
-                f"pident={safe_note(pident)};alntmscore={safe_note(tm_score)}"
+                f"pident={safe_note(pident)};alntmscore={safe_note(tm_score)};"
+                f"source_database_id={safe_note(target_database.database_id)};"
+                f"source_digest={target_database.source_digest};"
+                f"builder_version={safe_note(target_database.builder_version)};"
+                f"foldseek_version={safe_note(foldseek_version)};"
+                f"query_id={query_identity.query_id};query_digest={query_identity.query_digest};"
+                f"input_id={safe_note(query_identity.input_id)};record_id={safe_note(query_identity.record_id)}"
             )
             rows.append(
-                f"{safe_id(query)}\tFoldseek\t{target_id}\t{clean_cell(target)}\tunknown\t"
+                f"{clean_cell(query_identity.input_id)}\tFoldseek\t{target_id}\t{clean_cell(target)}\tunknown\t"
                 f"onsite_structure_alignment\t{score:.4f}\t{clean_cell(target)}\t{evidence}\t"
-                "record_1\n"
+                f"{clean_cell(query_identity.record_id)}\t{clean_cell(target_database.database_id)}\t"
+                f"{target_database.source_digest}\t{clean_cell(target_database.builder_version)}\t"
+                f"{clean_cell(foldseek_version)}\t{query_identity.query_id}\t"
+                f"{query_identity.query_digest}\t{tm_value:.6f}\n"
             )
     return rows
 
 
-def structure_query(run_dir: Path) -> Path | None:
+def structure_query(run_dir: Path) -> StructureQuery | None:
+    query_path = None
     for rel in [
         "structure_viewer.cif",
         "structure_viewer.mmcif",
@@ -753,8 +880,45 @@ def structure_query(run_dir: Path) -> Path | None:
     ]:
         path = run_dir / rel
         if path.exists() and path.stat().st_size > 0:
-            return path
-    return None
+            query_path = path.resolve()
+            break
+    if query_path is None:
+        return None
+    manifest = run_dir / "input_conversion_manifest.tsv"
+    if not manifest.is_file():
+        raise ValueError("foldseek_query_identity_missing")
+    with manifest.open("r", encoding="utf-8-sig", newline="") as handle:
+        candidates = [
+            row
+            for row in csv.DictReader(handle, delimiter="\t")
+            if str(row.get("conversion_status", "")).strip() == "converted"
+            and str(row.get("format", "")).strip().lower() in {"pdb", "cif", "mmcif"}
+            and str(row.get("input_id", "")).strip()
+            and str(row.get("record_id", "")).strip()
+        ]
+    if len(candidates) != 1:
+        raise ValueError("foldseek_query_identity_missing")
+    query_digest = sha256_path(query_path)
+    row = candidates[0]
+    return StructureQuery(
+        query_path,
+        str(row.get("input_id", "")).strip(),
+        str(row.get("record_id", "")).strip(),
+        f"query_{query_digest}",
+        query_digest,
+    )
+
+
+def valid_digest(value: str) -> bool:
+    return len(value) == 64 and all(ch in "0123456789abcdef" for ch in value)
+
+
+def sha256_path(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
 
 
 def write_status(path: Path, status: str, reason: str, row_count: int) -> None:

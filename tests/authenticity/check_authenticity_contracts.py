@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import csv
 import json
 import re
 import sys
@@ -36,7 +37,26 @@ def main() -> int:
     worker_cpu_requirements = read("python/requirements-workers-cpu.txt")
     worker_cuda_requirements = read("python/requirements-workers-cuda.txt")
     worker_environment = read("python/environment-workers.yml")
+    worker_lock_rows = list(
+        csv.DictReader(
+            read("python/requirements-workers.lock.txt").splitlines(),
+            delimiter="\t",
+        )
+    )
+    worker_runtime_requirements = {
+        row["platform"]: read(f"python/{row['file']}")
+        for row in worker_lock_rows
+        if row["profile"] == "cpu" and row["artifact_id"].startswith("runtime_")
+    }
+    worker_cuda_platforms = {
+        row["platform"] for row in worker_lock_rows if row["profile"] == "cuda"
+    }
+    worker_source_requirements = read("python/requirements-workers-sources.lock.tsv")
 
+    require(
+        not (ROOT / "configs" / "target_ranking.yml").exists(),
+        "ranking policy must have one runtime-owned source of truth",
+    )
     require("无输入、无数据库、无工具或无运行产物时" in architecture, "authenticity rule missing from architecture docs")
     require("candidate_count" in science, "science pipeline must write candidate count metadata")
     require("user_candidate_rows" in server, "server must derive candidate rows from run artifacts")
@@ -53,16 +73,22 @@ def main() -> int:
     require("MolFromFASTA" in md_worker, "MD worker must build peptide molecules through RDKit peptide conversion")
     require("rdkit_peptide_conformer_ensemble" in md_worker, "peptide MD artifacts must identify the real conformer calculation method")
     require("no_receptor_contact_model" in md_worker, "peptide MD artifacts must mark missing receptor contact modeling")
-    require("openmmforcefields" in worker_cpu_requirements, "CPU worker environment must install OpenMM small-molecule force-field support")
-    require("openmmforcefields" in worker_cuda_requirements, "CUDA worker environment must install OpenMM small-molecule force-field support")
+    require("requirements-workers.lock.txt" in worker_cpu_requirements, "CPU worker entry point must select a hashed platform lock")
+    require("requirements-workers.lock.txt" in worker_cuda_requirements, "CUDA worker entry point must select hashed runtime and CUDA platform locks")
+    require(
+        set(worker_runtime_requirements) == worker_cuda_platforms
+        == {"windows_x86_64", "manylinux_2_34_x86_64"},
+        "CPU and CUDA worker profiles must cover the same supported platforms",
+    )
+    require("openmmforcefields" in worker_source_requirements, "worker source lock must pin OpenMM small-molecule force-field support")
     require("openmmforcefields" in worker_environment, "conda worker environment must install OpenMM small-molecule force-field support")
     for dependency in ["xmltodict", "python-constraint", "lxml"]:
-        require(dependency in worker_cpu_requirements, f"CPU worker environment must install OpenFF runtime dependency: {dependency}")
-        require(dependency in worker_cuda_requirements, f"CUDA worker environment must install OpenFF runtime dependency: {dependency}")
+        require(
+            all(dependency in requirements for requirements in worker_runtime_requirements.values()),
+            f"every hashed worker runtime lock must install OpenFF runtime dependency: {dependency}",
+        )
         require(dependency in worker_environment, f"conda worker environment must install OpenFF runtime dependency: {dependency}")
-    require("openff-interchange" in worker_cpu_requirements, "CPU worker environment must install OpenFF interchange")
-    require("openff-interchange" in worker_cuda_requirements, "CUDA worker environment must install OpenFF interchange")
-    require("openff-interchange" in worker_environment, "conda worker environment must install OpenFF interchange")
+    require("openff-interchange" in worker_source_requirements, "worker source lock must pin OpenFF interchange")
     require("SMIRNOFFTemplateGenerator" in md_worker or "SystemGenerator" in md_worker, "complex MD must use OpenMM/OpenFF small-molecule parameterization")
     require("Chem.RemoveHs" in md_worker and "Chem.AddHs" in md_worker, "complex MD must rebuild hydrogens after docking pose placement")
     require("GpuTelemetryMonitor" in md_worker, "CUDA MD must poll nvidia-smi while OpenMM production steps are running")
@@ -72,11 +98,14 @@ def main() -> int:
     require("canonical_smiles" in science and "Chem.MolFromSmiles" in science, "BindingDB onsite matching must use canonical SMILES when RDKit is available")
     require("temp_python_script_path" in science, "onsite Python scripts must run from a script file to avoid Windows cmd quoting loss")
     require('command.push("-c"' not in science, "onsite Python scripts must not pass multiline code through python -c")
-    require("AUTHENTICITY_FORBIDDEN_MARKERS" in science, "science pipeline must define forbidden final artifact source markers")
+    require("CanonicalSourceBinding" in science, "science pipeline must model canonical source-manifest bindings")
+    require("bind_database_evidence" in science, "science pipeline must bind database evidence before final consumption")
+    require("source_file_manifest.tsv" in science, "database evidence must resolve through the canonical source manifest")
+    for binding_field in ["source_id", "source_path", "source_digest", "run_id", "pipeline_invocation_id"]:
+        require(binding_field in science, f"database evidence must carry positive provenance field: {binding_field}")
+    require("validate_current_run_tsv_provenance" in science, "science pipeline must validate current-run provenance bindings")
     require("ensure_final_artifacts_authentic" in science, "science pipeline must gate final artifact consumption")
     require("authenticity_gate.tsv" in science, "science pipeline must write an authenticity gate report")
-    for forbidden_source in ["static_fallback_candidate", "demo_data", "smoke", "fixture"]:
-        require(forbidden_source in science, f"authenticity gate must block {forbidden_source}")
     for forbidden in [
         "MAX_RECEPTOR_ATOMS",
         "receptor_heavy_atom_subset",
@@ -150,20 +179,25 @@ def main() -> int:
         tool_outputs.mkdir(parents=True)
         candidate_id = "candidate-bound-pdbqt"
         input_id = "input-bound-pdbqt"
+        record_id = "record-bound"
         source_digest = "a" * 64
         (binding_run / "complex_candidate_selection.tsv").write_text(
-            "candidate_id\tinput_id\n"
-            f"{candidate_id}\t{input_id}\n",
+            "candidate_id\tinput_id\trecord_id\ttarget_id\ttarget_name\torganism\t"
+            "target_class\tsource\tpdb_id\tevidence\n"
+            f"{candidate_id}\t{input_id}\t{record_id}\tT1\tTarget 1\tHomo sapiens\t"
+            "protein\tchembl\t1ABC\tselected\n",
             encoding="utf-8",
         )
         (binding_run / "input_conversion_manifest.tsv").write_text(
             "input_id\trecord_id\tcanonical_kind\tcanonical_value\tconversion_status\tcontent_sha256\n"
-            f"{input_id}\trecord-bound\tsmall_molecule\tCCO\tconverted\t{source_digest}\n",
+            f"{input_id}\t{record_id}\tsmall_molecule\tCCO\tconverted\t{source_digest}\n",
             encoding="utf-8",
         )
         _, _, _, input_digest = md_summary_worker.selected_md_input(binding_run, input_id)
+        _, candidate_digest = md_summary_worker.selected_md_candidate(binding_run, candidate_id, input_id, record_id)
         artifact_names = {
             "receptor_coordinate": "structure_viewer.pdb",
+            "receptor_pdb": "tool_outputs/receptor-bound.pdb",
             "receptor_pdbqt": "tool_outputs/receptor-bound.pdbqt",
             "ligand_sdf": "tool_outputs/ligand-bound.sdf",
             "ligand_pdbqt": "tool_outputs/ligand-bound.pdbqt",
@@ -175,15 +209,49 @@ def main() -> int:
             artifact_path = binding_run / artifact_name
             artifact_path.parent.mkdir(parents=True, exist_ok=True)
             artifact_path.write_text(f"fixture:{artifact_name}\n", encoding="utf-8")
-        (tool_outputs / "docking_manifest.json").write_text(
+        receptor_digest = md_summary_worker.sha256_file(binding_run / artifact_names["receptor_coordinate"])
+        docking_job_id = "autodock_vina_complex_docking"
+        docking_invocation_id = "invocation-bound-pdbqt"
+        run_id = binding_run.name
+        artifacts = []
+        for artifact_name, artifact_value in artifact_names.items():
+            artifact_path = binding_run / artifact_value
+            artifact = {
+                "artifact_name": artifact_name,
+                "artifact_path": artifact_path.relative_to(binding_run).as_posix(),
+                "artifact_sha256": md_summary_worker.sha256_file(artifact_path),
+                "job_id": docking_job_id,
+                "run_id": run_id,
+                "invocation_id": docking_invocation_id,
+                "candidate_id": candidate_id,
+                "candidate_digest": candidate_digest,
+                "input_id": input_id,
+                "record_id": record_id,
+                "input_digest": input_digest,
+                "source_digest": source_digest,
+            }
+            if artifact_name == "receptor_coordinate":
+                artifact["receptor_digest"] = receptor_digest
+            artifacts.append(artifact)
+        docking_manifest = tool_outputs / "docking_manifest.json"
+        docking_manifest.write_text(
             json.dumps(
                 {
+                    "artifact_schema_version": "genoligand_docking_artifacts_v1",
                     "status": "completed",
-                    "invocation_id": "invocation-bound-pdbqt",
+                    "job_id": docking_job_id,
+                    "run_id": run_id,
+                    "invocation_id": docking_invocation_id,
                     "candidate_id": candidate_id,
+                    "candidate_digest": candidate_digest,
                     "input_id": input_id,
+                    "record_id": record_id,
+                    "input_digest": input_digest,
                     "source_content_sha256": source_digest,
+                    "receptor_sha256": receptor_digest,
+                    "receptor_digest": receptor_digest,
                     "seed_provenance": {"input_digest": input_digest},
+                    "artifacts": artifacts,
                     **artifact_names,
                 },
                 indent=2,
@@ -192,14 +260,23 @@ def main() -> int:
             + "\n",
             encoding="utf-8",
         )
+        docking_manifest_digest = md_summary_worker.sha256_file(docking_manifest)
         binding = md_summary_worker.resolve_md_invocation(
             {
                 "job_id": "md_summary_ligand_dynamics",
-                "invocation_id": "invocation-bound-pdbqt",
+                "invocation_id": docking_invocation_id,
+                "run_id": run_id,
                 "run_dir": str(binding_run),
                 "candidate_id": candidate_id,
+                "candidate_digest": candidate_digest,
                 "input_id": input_id,
+                "record_id": record_id,
                 "input_digest": input_digest,
+                "source_digest": source_digest,
+                "docking_manifest": "tool_outputs/docking_manifest.json",
+                "docking_manifest_digest": docking_manifest_digest,
+                "docking_job_id": docking_job_id,
+                "docking_invocation_id": docking_invocation_id,
             }
         )
         expected_ligand_pdbqt = (binding_run / artifact_names["ligand_pdbqt"]).resolve()

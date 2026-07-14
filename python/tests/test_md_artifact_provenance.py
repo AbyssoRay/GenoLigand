@@ -51,6 +51,11 @@ class MdArtifactProvenanceTests(unittest.TestCase):
         self.tool_outputs.mkdir(parents=True)
         self.candidate_id = "candidate-current"
         self.input_id = "input-current"
+        self.md_outputs = worker.md_output_dir(
+            self.run_dir,
+            self.candidate_id,
+            "invocation-current",
+        )
         self.source_digest = hashlib.sha256(b"CCO").hexdigest()
         self.input_digest = canonical_digest(
             {
@@ -67,9 +72,9 @@ class MdArtifactProvenanceTests(unittest.TestCase):
             encoding="utf-8",
         )
         (self.run_dir / "complex_candidate_selection.tsv").write_text(
-            "candidate_id\tinput_id\ttarget_id\ttarget_name\torganism\ttarget_class\t"
+            "candidate_id\tinput_id\trecord_id\ttarget_id\ttarget_name\torganism\ttarget_class\t"
             "source\tpdb_id\tevidence\n"
-            f"{self.candidate_id}\t{self.input_id}\tT1\tTarget 1\tHomo sapiens\tprotein\t"
+            f"{self.candidate_id}\t{self.input_id}\trecord-current\tT1\tTarget 1\tHomo sapiens\tprotein\t"
             "fixture\t1ABC\tselected\n",
             encoding="utf-8",
         )
@@ -84,6 +89,7 @@ class MdArtifactProvenanceTests(unittest.TestCase):
         self.receptor = self.run_dir / "structure_viewer.pdb"
         self.receptor.write_text("ATOM\n", encoding="utf-8")
         for name in [
+            "docking_receptor.pdb",
             "docking_receptor.pdbqt",
             "docking_ligand.sdf",
             "docking_ligand.pdbqt",
@@ -92,7 +98,8 @@ class MdArtifactProvenanceTests(unittest.TestCase):
             "docking_vina.log",
         ]:
             (self.tool_outputs / name).write_text(name + "\n", encoding="utf-8")
-        self.write_docking_manifest()
+        docking_manifest_digest = self.write_docking_manifest()
+        candidate_digest = worker.selected_md_candidate(self.run_dir)[1]
         self.job = {
             "schema_version": "genoligand_worker_current_v2",
             "pipeline_mode": "genoligand_scientific_pipeline",
@@ -104,22 +111,42 @@ class MdArtifactProvenanceTests(unittest.TestCase):
             "run_dir": str(self.run_dir),
             "input_manifest": str(self.run_dir / "input.json"),
             "candidate_id": self.candidate_id,
+            "candidate_digest": candidate_digest,
             "input_id": self.input_id,
+            "record_id": "record-current",
             "input_digest": self.input_digest,
+            "source_digest": self.source_digest,
+            "docking_manifest": "tool_outputs/docking_manifest.json",
+            "docking_manifest_digest": docking_manifest_digest,
+            "docking_job_id": "autodock_vina_complex_docking",
+            "docking_invocation_id": "invocation-current",
+            "platform_policy": "disabled",
         }
 
     def tearDown(self) -> None:
         self.temp_dir.cleanup()
 
-    def write_docking_manifest(self, **updates: object) -> None:
+    def md_relative(self, name: str) -> str:
+        return (self.md_outputs / name).relative_to(self.run_dir).as_posix()
+
+    def write_docking_manifest(self, **updates: object) -> str:
+        candidate_digest = worker.selected_md_candidate(self.run_dir)[1]
         manifest = {
+            "artifact_schema_version": "genoligand_docking_artifacts_v1",
             "status": "completed",
             "job_id": "autodock_vina_complex_docking",
+            "run_id": "run-current",
             "invocation_id": "invocation-current",
             "candidate_id": self.candidate_id,
+            "candidate_digest": candidate_digest,
             "input_id": self.input_id,
+            "record_id": "record-current",
+            "input_digest": self.input_digest,
             "source_content_sha256": self.source_digest,
             "receptor_coordinate": str(self.receptor),
+            "receptor_sha256": hashlib.sha256(self.receptor.read_bytes()).hexdigest(),
+            "receptor_digest": hashlib.sha256(self.receptor.read_bytes()).hexdigest(),
+            "receptor_pdb": "tool_outputs/docking_receptor.pdb",
             "receptor_pdbqt": "tool_outputs/docking_receptor.pdbqt",
             "ligand_sdf": "tool_outputs/docking_ligand.sdf",
             "ligand_pdbqt": "tool_outputs/docking_ligand.pdbqt",
@@ -129,10 +156,63 @@ class MdArtifactProvenanceTests(unittest.TestCase):
             "seed_provenance": {"input_digest": self.input_digest},
         }
         manifest.update(updates)
-        (self.tool_outputs / "docking_manifest.json").write_text(
+        artifact_fields = {
+            "receptor_coordinate": manifest.get("receptor_coordinate"),
+            "receptor_pdb": manifest.get("receptor_pdb"),
+            "receptor_pdbqt": manifest.get("receptor_pdbqt"),
+            "ligand_sdf": manifest.get("ligand_sdf"),
+            "ligand_pdbqt": manifest.get("ligand_pdbqt"),
+            "pose": manifest.get("pose"),
+            "pose_sdf": manifest.get("pose_sdf"),
+            "log": manifest.get("log"),
+        }
+        artifacts = []
+        for artifact_name, value in artifact_fields.items():
+            path = Path(str(value))
+            if not path.is_absolute():
+                path = self.run_dir / path
+            if path.is_file():
+                try:
+                    relative = path.resolve().relative_to(self.run_dir.resolve()).as_posix()
+                except ValueError:
+                    continue
+                artifacts.append(
+                    {
+                        "artifact_name": artifact_name,
+                        "artifact_path": relative,
+                        "artifact_sha256": hashlib.sha256(path.read_bytes()).hexdigest(),
+                        "job_id": manifest["job_id"],
+                        "run_id": manifest["run_id"],
+                        "invocation_id": manifest["invocation_id"],
+                        "candidate_id": manifest["candidate_id"],
+                        "candidate_digest": manifest["candidate_digest"],
+                        "input_id": manifest["input_id"],
+                        "record_id": manifest["record_id"],
+                        "input_digest": manifest["input_digest"],
+                        "source_digest": manifest["source_content_sha256"],
+                        **(
+                            {"receptor_digest": manifest["receptor_digest"]}
+                            if artifact_name == "receptor_coordinate"
+                            else {}
+                        ),
+                    }
+                )
+        manifest["artifacts"] = artifacts
+        manifest_path = self.tool_outputs / "docking_manifest.json"
+        manifest_path.write_text(
             json.dumps(manifest, indent=2, sort_keys=True) + "\n",
             encoding="utf-8",
         )
+        digest = hashlib.sha256(manifest_path.read_bytes()).hexdigest()
+        if hasattr(self, "job"):
+            self.job["docking_manifest_digest"] = digest
+        return digest
+
+    def refresh_docking_manifest_digest(self) -> None:
+        manifest_path = self.tool_outputs / "docking_manifest.json"
+        self.job["docking_manifest_digest"] = hashlib.sha256(
+            manifest_path.read_bytes()
+        ).hexdigest()
 
     def test_current_job_candidate_input_and_docking_artifacts_are_bound(self) -> None:
         binding = worker.resolve_md_invocation(self.job)
@@ -148,6 +228,40 @@ class MdArtifactProvenanceTests(unittest.TestCase):
             binding.docking_pose_sdf,
             (self.tool_outputs / "docking_pose.sdf").resolve(),
         )
+
+    def test_missing_or_wrong_job_docking_bindings_fail_closed(self) -> None:
+        for field in [
+            "docking_manifest_digest",
+            "docking_job_id",
+            "docking_invocation_id",
+        ]:
+            with self.subTest(field=field):
+                missing = {**self.job}
+                missing.pop(field)
+                with self.assertRaisesRegex(
+                    worker.MdProvenanceError,
+                    "docking_manifest_binding_missing",
+                ):
+                    worker.resolve_md_invocation(missing)
+
+        wrong_bindings = [
+            (
+                {**self.job, "docking_manifest_digest": "0" * 64},
+                "docking_manifest_sha256_mismatch",
+            ),
+            (
+                {**self.job, "docking_job_id": "docking-old"},
+                "docking_job_id_mismatch",
+            ),
+            (
+                {**self.job, "docking_invocation_id": "invocation-old"},
+                "docking_invocation_id_mismatch",
+            ),
+        ]
+        for job, reason in wrong_bindings:
+            with self.subTest(reason=reason):
+                with self.assertRaisesRegex(worker.MdProvenanceError, reason):
+                    worker.resolve_md_invocation(job)
 
     def test_stale_or_mismatched_docking_binding_fails_closed(self) -> None:
         cases = [
@@ -171,6 +285,52 @@ class MdArtifactProvenanceTests(unittest.TestCase):
         with self.assertRaisesRegex(worker.MdProvenanceError, "job_input_digest_mismatch"):
             worker.resolve_md_invocation(mismatched_job)
 
+    def test_docking_artifact_set_is_exact_bound_and_tamper_evident(self) -> None:
+        manifest_path = self.tool_outputs / "docking_manifest.json"
+        original = json.loads(manifest_path.read_text(encoding="utf-8"))
+
+        cases = []
+        missing = json.loads(json.dumps(original))
+        missing["artifacts"] = missing["artifacts"][1:]
+        cases.append((missing, "docking_artifact_set_mismatch"))
+        duplicate = json.loads(json.dumps(original))
+        duplicate["artifacts"].append(dict(duplicate["artifacts"][0]))
+        cases.append((duplicate, "docking_artifact_duplicate"))
+        extra_path = self.tool_outputs / "unexpected.txt"
+        extra_path.write_text("unexpected\n", encoding="utf-8")
+        extra = json.loads(json.dumps(original))
+        extra["artifacts"].append(
+            {
+                **extra["artifacts"][0],
+                "artifact_name": "unexpected",
+                "artifact_path": "tool_outputs/unexpected.txt",
+                "artifact_sha256": hashlib.sha256(extra_path.read_bytes()).hexdigest(),
+            }
+        )
+        cases.append((extra, "docking_artifact_set_mismatch"))
+        foreign = json.loads(json.dumps(original))
+        foreign["artifacts"][0]["candidate_id"] = "candidate-old"
+        cases.append((foreign, "docking_artifact_candidate_id_mismatch"))
+
+        for manifest, reason in cases:
+            with self.subTest(reason=reason):
+                manifest_path.write_text(
+                    json.dumps(manifest, indent=2, sort_keys=True) + "\n",
+                    encoding="utf-8",
+                )
+                self.refresh_docking_manifest_digest()
+                with self.assertRaisesRegex(worker.MdProvenanceError, reason):
+                    worker.resolve_md_invocation(self.job)
+
+        manifest_path.write_text(
+            json.dumps(original, indent=2, sort_keys=True) + "\n",
+            encoding="utf-8",
+        )
+        self.refresh_docking_manifest_digest()
+        self.tool_outputs.joinpath("docking_pose.sdf").write_text("tampered\n", encoding="utf-8")
+        with self.assertRaisesRegex(worker.MdProvenanceError, "docking_artifact_sha256_mismatch"):
+            worker.resolve_md_invocation(self.job)
+
     def test_absolute_relative_and_symlink_artifact_escapes_fail_closed(self) -> None:
         outside = self.root / "outside.sdf"
         outside.write_text("outside\n", encoding="utf-8")
@@ -190,14 +350,15 @@ class MdArtifactProvenanceTests(unittest.TestCase):
             worker.resolve_md_invocation(self.job)
 
     def test_rerun_clears_md_outputs_without_removing_docking_inputs(self) -> None:
-        old_summary = self.tool_outputs / "md_summary.tsv"
-        old_manifest = self.tool_outputs / "md_run_manifest.json"
-        old_provenance = self.tool_outputs / "md_artifact_provenance.json"
+        self.md_outputs.mkdir(parents=True)
+        old_summary = self.md_outputs / "md_summary.tsv"
+        old_manifest = self.md_outputs / "md_run_manifest.json"
+        old_provenance = self.md_outputs / "md_artifact_provenance.json"
         for path in [old_summary, old_manifest, old_provenance]:
             path.write_text("old invocation\n", encoding="utf-8")
         docking_pose = self.tool_outputs / "docking_pose.sdf"
 
-        worker.clear_previous_md_outputs(self.run_dir)
+        worker.clear_previous_md_outputs(self.run_dir, self.candidate_id)
 
         self.assertFalse(old_summary.exists())
         self.assertFalse(old_manifest.exists())
@@ -205,7 +366,8 @@ class MdArtifactProvenanceTests(unittest.TestCase):
         self.assertTrue(docking_pose.exists())
 
     def test_worker_rejects_stale_docking_before_scientific_execution(self) -> None:
-        old_summary = self.tool_outputs / "md_summary.tsv"
+        self.md_outputs.mkdir(parents=True)
+        old_summary = self.md_outputs / "md_summary.tsv"
         old_summary.write_text("old invocation\n", encoding="utf-8")
         self.write_docking_manifest(invocation_id="invocation-old")
 
@@ -214,7 +376,7 @@ class MdArtifactProvenanceTests(unittest.TestCase):
         self.assertEqual(execution.status, "failed")
         self.assertEqual(execution.reason, "docking_invocation_id_mismatch")
         self.assertFalse(old_summary.exists())
-        self.assertFalse((self.tool_outputs / "md_run_manifest.json").exists())
+        self.assertFalse((self.md_outputs / "md_run_manifest.json").exists())
 
     def test_worker_preserves_not_applicable_for_a_current_job_without_md_input(self) -> None:
         (self.run_dir / "input_conversion_manifest.tsv").write_text(
@@ -226,7 +388,8 @@ class MdArtifactProvenanceTests(unittest.TestCase):
             '{"inputs":[],"files":[]}\n',
             encoding="utf-8",
         )
-        old_summary = self.tool_outputs / "md_summary.tsv"
+        self.md_outputs.mkdir(parents=True)
+        old_summary = self.md_outputs / "md_summary.tsv"
         old_summary.write_text("old invocation\n", encoding="utf-8")
 
         execution = worker.run_md_summary_job(self.job)
@@ -247,20 +410,20 @@ class MdArtifactProvenanceTests(unittest.TestCase):
         )
 
         run_manifest = json.loads(
-            (self.tool_outputs / "md_run_manifest.json").read_text(encoding="utf-8")
+            (self.md_outputs / "md_run_manifest.json").read_text(encoding="utf-8")
         )
         self.assertEqual(run_manifest["job_id"], self.job["job_id"])
         self.assertEqual(run_manifest["invocation_id"], self.job["invocation_id"])
         self.assertEqual(run_manifest["candidate_id"], self.candidate_id)
         self.assertEqual(run_manifest["input_digest"], self.input_digest)
-        provenance_path = self.tool_outputs / "md_artifact_provenance.json"
+        provenance_path = self.md_outputs / "md_artifact_provenance.json"
         worker.validate_md_artifact_provenance(provenance_path, binding)
         provenance = json.loads(provenance_path.read_text(encoding="utf-8"))
         self.assertEqual(
             {row["artifact_path"] for row in provenance["artifacts"]},
             {
-                "tool_outputs/md_not_ready.tsv",
-                "tool_outputs/md_run_manifest.json",
+                self.md_relative("md_not_ready.tsv"),
+                self.md_relative("md_run_manifest.json"),
             },
         )
 
@@ -290,13 +453,9 @@ class MdArtifactProvenanceTests(unittest.TestCase):
         )
         worker.clear_previous_md_outputs(self.run_dir)
         metrics = {
-            "rmsd": 1.0,
-            "rmsf": 1.1,
-            "ligand_drift": 1.2,
-            "hydrogen_bond_occupancy": 0.0,
-            "contact_occupancy": 0.0,
-            "interaction_persistence": 0.0,
-            "md_stability_score": 0.5,
+            "mean_heavy_atom_rmsd_angstrom": 1.0,
+            "mean_heavy_atom_rmsf_angstrom": 1.1,
+            "mean_centroid_drift_angstrom": 1.2,
         }
 
         worker.write_peptide_conformer_artifacts(
@@ -313,29 +472,35 @@ class MdArtifactProvenanceTests(unittest.TestCase):
             binding,
         )
 
-        provenance_path = self.tool_outputs / "md_artifact_provenance.json"
+        provenance_path = self.md_outputs / "md_artifact_provenance.json"
         worker.validate_md_artifact_provenance(provenance_path, binding)
         provenance = json.loads(provenance_path.read_text(encoding="utf-8"))
-        self.assertEqual(len(provenance["artifacts"]), 9)
+        self.assertEqual(len(provenance["artifacts"]), 5)
         self.assertEqual(
             {row["artifact_path"] for row in provenance["artifacts"]},
             {
-                "tool_outputs/ligand_placement.tsv",
-                "tool_outputs/md_contacts.tsv",
-                "tool_outputs/md_hbonds.tsv",
-                "tool_outputs/md_ligand_drift.tsv",
-                "tool_outputs/md_rmsd.tsv",
-                "tool_outputs/md_rmsf.tsv",
-                "tool_outputs/md_run_manifest.json",
-                "tool_outputs/md_summary.tsv",
-                "tool_outputs/md_trajectory.tsv",
+                self.md_relative("md_run_manifest.json"),
+                self.md_relative("peptide_conformer_coordinates.tsv"),
+                self.md_relative("peptide_conformer_ensemble.tsv"),
+                self.md_relative("peptide_conformer_metrics.tsv"),
+                self.md_relative("peptide_conformer_summary.tsv"),
             },
         )
+        run_manifest = json.loads(
+            (self.md_outputs / "md_run_manifest.json").read_text(encoding="utf-8")
+        )
+        self.assertEqual(run_manifest["artifact_schema_version"], "genoligand_peptide_conformer_v1")
+        self.assertEqual(run_manifest["method_class"], "conformer_ensemble")
+        self.assertFalse(run_manifest["has_receptor"])
+        self.assertFalse(run_manifest["uses_openmm"])
+        self.assertEqual(run_manifest["md_score"], 0.0)
+        self.assertFalse((self.md_outputs / "md_summary.tsv").exists())
 
     def test_provenance_hashes_every_output_and_detects_stale_or_tampered_files(self) -> None:
         binding = worker.resolve_md_invocation(self.job)
-        summary = self.tool_outputs / "md_summary.tsv"
-        state = self.tool_outputs / "md_state.tsv"
+        self.md_outputs.mkdir(parents=True, exist_ok=True)
+        summary = self.md_outputs / "md_summary.tsv"
+        state = self.md_outputs / "md_state.tsv"
         summary.write_text("candidate_id\ncurrent\n", encoding="utf-8")
         state.write_text("candidate_id\ncurrent\n", encoding="utf-8")
 
@@ -354,7 +519,7 @@ class MdArtifactProvenanceTests(unittest.TestCase):
         self.assertEqual(manifest["input_digest"], self.input_digest)
         self.assertEqual(
             {row["artifact_path"] for row in manifest["artifacts"]},
-            {"tool_outputs/md_summary.tsv", "tool_outputs/md_state.tsv"},
+            {self.md_relative("md_summary.tsv"), self.md_relative("md_state.tsv")},
         )
         for row in manifest["artifacts"]:
             self.assertEqual(row["job_id"], self.job["job_id"])
@@ -407,10 +572,10 @@ class MdArtifactProvenanceTests(unittest.TestCase):
         self.assertEqual(result["input_digest"], self.input_digest)
         self.assertEqual(
             result["artifact_provenance"],
-            "tool_outputs/md_artifact_provenance.json",
+            self.md_relative("md_artifact_provenance.json"),
         )
 
-        provenance_path = self.tool_outputs / "md_artifact_provenance.json"
+        provenance_path = self.md_outputs / "md_artifact_provenance.json"
         provenance = json.loads(provenance_path.read_text(encoding="utf-8"))
         provenance["invocation_id"] = "invocation-old"
         provenance_path.write_text(

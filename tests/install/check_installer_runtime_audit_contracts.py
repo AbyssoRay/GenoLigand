@@ -105,20 +105,105 @@ class InstallerRuntimeAuditContracts(unittest.TestCase):
         ready_import = {"ready": True, "version": "installed", "notes": "import_ok"}
         with tempfile.TemporaryDirectory() as tmp, mock.patch.object(
             installer, "venv_python", return_value=Path(sys.executable)
+        ), mock.patch.object(
+            installer,
+            "python_version_probe",
+            return_value={"supported": True, "version": "3.12", "executable": sys.executable, "reason": "supported"},
+        ), mock.patch.object(
+            installer, "select_supported_local_python", return_value=Path(sys.executable)
         ), mock.patch.object(installer, "probe_python_import", return_value=ready_import), mock.patch.object(
             installer, "probe_local_openmm_cuda", return_value=missing_cuda
-        ), mock.patch.object(installer, "run_command", side_effect=fake_run):
+        ), mock.patch.object(installer, "install_locked_sources_local", return_value={"status": "ready", "reason": "fixture"}), mock.patch.object(
+            installer, "run_command", side_effect=fake_run
+        ):
             cpu = installer.ensure_local_python_tool_environment(Path(tmp) / "cpu", False, require_cuda=False)
             self.assertEqual(cpu["status"], "ready")
             self.assertEqual(cpu["ready"], len(installer.PYTHON_TOOL_PACKAGES))
             self.assertEqual(cpu["total"], len(installer.PYTHON_TOOL_PACKAGES))
-            self.assertFalse(any(installer.OPENMM_CUDA_PIP_PACKAGE in command for command in calls))
+            self.assertFalse(any("cuda12" in " ".join(command).lower() for command in calls))
 
             calls.clear()
             gpu = installer.ensure_local_python_tool_environment(Path(tmp) / "gpu", False, require_cuda=True)
             self.assertEqual(gpu["status"], "needs_repair")
             self.assertEqual(gpu["total"], len(installer.PYTHON_TOOL_PACKAGES) + 1)
-            self.assertTrue(any(installer.OPENMM_CUDA_PIP_PACKAGE in command for command in calls))
+            self.assertTrue(any("cuda12" in " ".join(command).lower() for command in calls))
+
+    def test_cuda_profile_recovers_after_cpu_repair_and_stays_version_aligned(self) -> None:
+        installer = self.installer
+        state = {"version": installer.OPENMM_RUNTIME_VERSION, "cuda": True}
+        force_repairs: list[Path] = []
+
+        def import_probe(_python: Path, import_name: str, _version_expr: str) -> dict[str, object]:
+            version = state["version"] if import_name == "openmm" else "installed"
+            return {"ready": True, "version": version, "notes": "import_ok"}
+
+        def cuda_probe(_python: Path) -> dict[str, object]:
+            return {
+                "openmm_ready": True,
+                "version": state["version"],
+                "platforms": ["Reference", "CPU", *( ["CUDA"] if state["cuda"] else [])],
+                "cuda_ready": state["cuda"],
+                "plugin_dir": "/plugins" if state["cuda"] else "",
+                "default_plugin_dir": "/default-plugins",
+                "loaded_plugins": ["libOpenMMCUDA.so"] if state["cuda"] else [],
+                "plugin_load_failures": [],
+                "failure_reason": "" if state["cuda"] else "CUDA_platform_missing",
+            }
+
+        def regular_install(_python: Path, _locks: list[Path]) -> dict[str, str]:
+            state.update(version=installer.OPENMM_RUNTIME_VERSION, cuda=False)
+            return {"status": "ready", "reason": "runtime_then_cuda_metadata_satisfied"}
+
+        def force_cuda(_python: Path, lock: Path) -> dict[str, str]:
+            force_repairs.append(lock)
+            state.update(version=installer.OPENMM_CUDA_VERSION, cuda=True)
+            return {"status": "ready", "reason": "hashed_cuda_lock_force_reinstalled"}
+
+        locks = [Path("bootstrap.lock"), Path("runtime.lock"), Path("cuda.lock")]
+        ready_install = {"status": "ready", "reason": "locked_sources_ready"}
+        ready_version = {
+            "supported": True,
+            "version": "3.12",
+            "executable": sys.executable,
+            "reason": "supported",
+        }
+        with tempfile.TemporaryDirectory() as tmp, mock.patch.object(
+            installer, "venv_python", return_value=Path(sys.executable)
+        ), mock.patch.object(installer, "python_version_probe", return_value=ready_version), mock.patch.object(
+            installer, "select_supported_local_python", return_value=Path(sys.executable)
+        ), mock.patch.object(installer, "worker_platform_id", return_value="windows_x86_64"), mock.patch.object(
+            installer, "worker_lock_paths", return_value=locks
+        ), mock.patch.object(installer, "environment_lock_digest", side_effect=lambda _p, _v, cuda: f"lock-{cuda}"), mock.patch.object(
+            installer, "worker_source_locks", return_value=[]
+        ), mock.patch.object(installer, "probe_python_import", side_effect=import_probe), mock.patch.object(
+            installer, "probe_local_openmm_cuda", side_effect=cuda_probe
+        ), mock.patch.object(installer, "install_hashed_requirements_local", side_effect=regular_install), mock.patch.object(
+            installer, "force_reinstall_hashed_cuda_lock_local", side_effect=force_cuda
+        ), mock.patch.object(installer, "install_locked_sources_local", return_value=ready_install):
+            env = Path(tmp) / "worker"
+            first_gpu = installer.ensure_local_python_tool_environment(env, False, require_cuda=True)
+            cpu = installer.ensure_local_python_tool_environment(env, False, require_cuda=False)
+            second_gpu = installer.ensure_local_python_tool_environment(env, False, require_cuda=True)
+
+        self.assertEqual(first_gpu["status"], "ready")
+        self.assertEqual(cpu["status"], "ready")
+        self.assertEqual(second_gpu["status"], "ready")
+        self.assertTrue(state["cuda"])
+        self.assertEqual(state["version"], installer.OPENMM_CUDA_VERSION)
+        self.assertEqual(force_repairs, [locks[-1], locks[-1]])
+
+    def test_worker_locks_keep_openmm_runtime_and_cuda_versions_equal(self) -> None:
+        installer = self.installer
+        for platform_id in ("windows_x86_64", "manylinux_2_34_x86_64"):
+            locks = installer.worker_lock_paths(platform_id, "3.12", True)
+            self.assertEqual(
+                installer.locked_requirement_version(locks[1], "openmm"),
+                installer.OPENMM_RUNTIME_VERSION,
+            )
+            self.assertEqual(
+                installer.locked_requirement_version(locks[2], "openmm-cuda-12"),
+                installer.OPENMM_RUNTIME_VERSION,
+            )
 
     def test_wsl_selection_probes_all_non_reserved_distributions(self) -> None:
         installer = self.installer

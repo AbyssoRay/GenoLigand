@@ -27,6 +27,13 @@ DEFAULT_TIMESTEP_PS = 0.002
 DEFAULT_GPU_TELEMETRY_POLL_SECONDS = 1.0
 GAS_CONSTANT_KJ_PER_MOL_K = 0.00831446261815324
 MINIMUM_MD_PRODUCTION_SAMPLES = 10
+COMPLEX_MD_METRIC_UNITS = {
+    "rmsd": "angstrom",
+    "rmsf": "angstrom",
+    "ligand_drift": "angstrom",
+    "contact_occupancy": "fraction",
+    "hydrogen_bond_occupancy": "fraction",
+}
 RMSD_SCORE_SCALE_ANGSTROM = 4.0
 LIGAND_DRIFT_SCORE_SCALE_ANGSTROM = 3.0
 CONTACT_CUTOFF_ANGSTROM = 4.5
@@ -52,9 +59,14 @@ MD_OWNED_ARTIFACTS = (
     "md_state.tsv",
     "md_summary.tsv",
     "md_trajectory.tsv",
+    "peptide_conformer_coordinates.tsv",
+    "peptide_conformer_ensemble.tsv",
+    "peptide_conformer_metrics.tsv",
+    "peptide_conformer_summary.tsv",
 )
 DOCKING_ARTIFACT_FIELDS = (
     "receptor_coordinate",
+    "receptor_pdb",
     "receptor_pdbqt",
     "ligand_sdf",
     "ligand_pdbqt",
@@ -96,6 +108,7 @@ class MdInvocationBinding:
     candidate_id: str
     candidate_digest: str
     input_id: str
+    record_id: str
     input_digest: str
     source_digest: str
     input_kind: str
@@ -105,6 +118,7 @@ class MdInvocationBinding:
     docking_ligand_pdbqt: Path | None
     docking_pose_pdbqt: Path | None
     docking_pose_sdf: Path | None
+    output_dir: Path
 
 
 def main() -> int:
@@ -152,8 +166,10 @@ def md_execution(status: str, reason: str, version: str, required: bool, row_cou
 def run_md_summary_job(job: dict[str, Any]) -> WorkerExecution:
     try:
         run_dir = resolve_md_run_dir(job)
-        clear_previous_md_outputs(run_dir)
         validate_md_job_identity(job)
+        candidate_id = str(job.get("candidate_id", "")).strip()
+        if candidate_id:
+            clear_previous_md_outputs(run_dir, candidate_id)
         if not has_applicable_md_input(job, run_dir):
             return md_execution(
                 "not_applicable",
@@ -161,9 +177,15 @@ def run_md_summary_job(job: dict[str, Any]) -> WorkerExecution:
                 "MD summary not executed",
                 False,
             )
+        if not candidate_id:
+            raise MdProvenanceError("candidate_id_missing")
         binding = resolve_md_invocation(job)
     except MdProvenanceError as exc:
         reason = safe_note(str(exc)) or "md_provenance_validation_failed"
+        try:
+            record_failed_md_index(job, reason)
+        except MdProvenanceError:
+            pass
         return md_execution(
             "failed",
             reason,
@@ -178,8 +200,6 @@ def run_md_summary_job(job: dict[str, Any]) -> WorkerExecution:
     receptor_path = binding.receptor_coordinate
 
     import numpy as np
-    import openmm
-    from openmm import unit
     from rdkit import Chem, rdBase
     from rdkit.Chem import AllChem
 
@@ -199,7 +219,12 @@ def run_md_summary_job(job: dict[str, Any]) -> WorkerExecution:
                 [reason],
                 binding=binding,
             )
-            return md_execution("not_ready", reason, openmm_version_text(openmm, "not_ready", reason), True)
+            return md_execution(
+                "not_ready",
+                reason,
+                f"RDKit {rdBase.rdkitVersion}; method=rdkit_peptide_conformer_ensemble; status=not_ready",
+                True,
+            )
         risk_flags = [
             *parameter_flags,
             "no_receptor_contact_model",
@@ -226,6 +251,9 @@ def run_md_summary_job(job: dict[str, Any]) -> WorkerExecution:
             True,
             1,
         )
+
+    import openmm
+    from openmm import unit
 
     try:
         assert receptor_path is not None
@@ -298,11 +326,8 @@ def run_md_summary_job(job: dict[str, Any]) -> WorkerExecution:
     )
     ligand_positions = initial_angstrom
     off_mol, parameterization, parameter_flags = prepare_openff_ligand(mol)
-    platform_name = select_openmm_platform(openmm)
-    platform = openmm.Platform.getPlatformByName(platform_name)
-    platform_properties = openmm_platform_properties(platform_name, platform)
+    platform_policy = md_platform_policy(job)
     gpu_telemetry = GpuTelemetry(rows=[])
-    sample_gpu_telemetry(gpu_telemetry, "baseline_before_openmm_context")
     system, role_ranges, context_positions, model_metadata = build_complex_system(
         openmm,
         unit,
@@ -318,10 +343,18 @@ def run_md_summary_job(job: dict[str, Any]) -> WorkerExecution:
         timestep_ps * unit.picoseconds,
     )
     integrator.setRandomNumberSeed(SIMULATION_SEED)
-    if platform_properties:
-        context = openmm.Context(system, integrator, platform, platform_properties)
-    else:
-        context = openmm.Context(system, integrator, platform)
+    sample_gpu_telemetry(gpu_telemetry, "baseline_before_openmm_context")
+    try:
+        context, platform_name, platform_properties, platform_failures = create_openmm_context(
+            openmm,
+            system,
+            integrator,
+            platform_policy,
+        )
+    except ValueError as exc:
+        reason = safe_note(str(exc)) or "openmm_platform_unavailable"
+        write_md_not_ready(run_dir, reason, [reason], binding=binding)
+        return md_execution("not_ready", reason, openmm_version_text(openmm, "not_ready", reason), True)
     sample_gpu_telemetry(gpu_telemetry, "after_openmm_context")
     context.setPositions(context_positions)
     sample_gpu_telemetry(gpu_telemetry, "after_positions_set")
@@ -414,9 +447,24 @@ def run_md_summary_job(job: dict[str, Any]) -> WorkerExecution:
         gpu_status,
         model_metadata,
     )
+    protocol_rows.extend(
+        [
+            [candidate_id, input_id, "platform", "platform_policy", platform_policy, "", "GenoLigand job"],
+            [
+                candidate_id,
+                input_id,
+                "platform",
+                "context_creation_failures",
+                ";".join(platform_failures),
+                "",
+                "OpenMM Context",
+            ],
+        ]
+    )
     risk_flags = [
         *receptor.risk_flags,
         *parameter_flags,
+        *(f"platform_fallback:{failure}" for failure in platform_failures),
         "ligand_placement_from_autodock_vina_pose",
         "standard_openmm_forcefield_complex",
     ]
@@ -451,6 +499,8 @@ def run_md_summary_job(job: dict[str, Any]) -> WorkerExecution:
         model_metadata,
         binding,
         openmm.version.full_version,
+        platform_policy,
+        platform_failures,
     )
     return md_execution(
         "completed",
@@ -472,6 +522,183 @@ def runtime_path(value: str) -> Path:
         rest = value[3:].replace("\\", "/")
         return Path(f"/mnt/{drive}/{rest}")
     return path
+
+
+def candidate_artifact_key(candidate_id: str) -> str:
+    cleaned = "".join(ch if ch.isalnum() or ch in "-_" else "_" for ch in candidate_id).strip("_")
+    digest = hashlib.sha256(candidate_id.encode("utf-8")).hexdigest()[:12]
+    return f"{cleaned[:64] or 'candidate'}-{digest}"
+
+
+def md_candidate_dir(run_dir: Path, candidate_id: str) -> Path:
+    return run_dir / "tool_outputs" / "md" / candidate_artifact_key(candidate_id)
+
+
+def md_output_dir(run_dir: Path, candidate_id: str, invocation_id: str) -> Path:
+    return md_candidate_dir(run_dir, candidate_id) / candidate_artifact_key(invocation_id)
+
+
+def md_artifact_path(
+    binding: MdInvocationBinding,
+    name: str,
+    *,
+    must_exist: bool = True,
+) -> Path:
+    return resolve_run_artifact(binding.run_dir, binding.output_dir / name, must_exist=must_exist)
+
+
+def md_artifact_relative(
+    binding: MdInvocationBinding,
+    name: str,
+    *,
+    must_exist: bool = True,
+) -> str:
+    return md_artifact_path(binding, name, must_exist=must_exist).relative_to(binding.run_dir).as_posix()
+
+
+def atomic_write_json(path: Path, value: dict[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+    temporary.write_text(
+        json.dumps(value, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+    temporary.replace(path)
+
+
+def upsert_md_manifest_index(
+    binding: MdInvocationBinding,
+    *,
+    status: str,
+    reason: str,
+    manifest: str,
+    artifact_provenance: str,
+) -> None:
+    path = binding.run_dir / "tool_outputs" / "md_manifest_index.json"
+    current: dict[str, Any] = {}
+    if path.is_file():
+        try:
+            current = json.loads(path.read_text(encoding="utf-8-sig"))
+        except (OSError, json.JSONDecodeError) as exc:
+            raise MdProvenanceError("md_manifest_index_invalid") from exc
+    if current and (
+        current.get("schema_version") != "genoligand_md_manifest_index_v1"
+        or current.get("run_id") != binding.run_id
+        or not isinstance(current.get("entries"), list)
+    ):
+        raise MdProvenanceError("md_manifest_index_invalid")
+    entries = {
+        str(row.get("candidate_id", "")): row
+        for row in current.get("entries", [])
+        if isinstance(row, dict) and str(row.get("candidate_id", ""))
+    }
+    entries[binding.candidate_id] = {
+        "candidate_id": binding.candidate_id,
+        "input_id": binding.input_id,
+        "record_id": binding.record_id,
+        "candidate_digest": binding.candidate_digest,
+        "input_digest": binding.input_digest,
+        "source_digest": binding.source_digest,
+        "job_id": binding.job_id,
+        "invocation_id": binding.invocation_id,
+        "status": status,
+        "reason": reason,
+        "manifest": manifest,
+        "artifact_provenance": artifact_provenance,
+    }
+    atomic_write_json(
+        path,
+        {
+            "schema_version": "genoligand_md_manifest_index_v1",
+            "run_id": binding.run_id,
+            "entries": [entries[key] for key in sorted(entries)],
+        },
+    )
+
+
+def upsert_md_summary(run_dir: Path, row: list[str]) -> None:
+    path = run_dir / "tool_outputs" / "md_summary.tsv"
+    header = [
+        "candidate_id",
+        "rmsd",
+        "rmsf",
+        "ligand_drift",
+        "hydrogen_bond_occupancy",
+        "contact_occupancy",
+        "interaction_persistence",
+        "md_risk_flags",
+        "md_score_decomposition",
+        "md_stability_score",
+    ]
+    rows: dict[str, list[str]] = {}
+    if path.is_file():
+        with path.open("r", encoding="utf-8-sig", newline="") as handle:
+            reader = csv.DictReader(handle, delimiter="\t")
+            if reader.fieldnames != header:
+                raise MdProvenanceError("md_summary_schema_invalid")
+            for current in reader:
+                candidate_id = str(current.get("candidate_id", "")).strip()
+                if candidate_id:
+                    rows[candidate_id] = [str(current.get(name, "")) for name in header]
+    rows[row[0]] = row
+    temporary = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+    write_tsv(temporary, header, [rows[key] for key in sorted(rows)])
+    temporary.replace(path)
+
+
+def failed_md_binding(job: dict[str, Any]) -> MdInvocationBinding:
+    run_dir = resolve_md_run_dir(job)
+    fields = {
+        name: str(job.get(name, "")).strip()
+        for name in (
+            "run_id",
+            "job_id",
+            "invocation_id",
+            "candidate_id",
+            "candidate_digest",
+            "input_id",
+            "record_id",
+            "input_digest",
+            "source_digest",
+        )
+    }
+    missing = [name for name, value in fields.items() if not value]
+    if missing:
+        raise MdProvenanceError(f"md_failure_binding_missing:{','.join(missing)}")
+    return MdInvocationBinding(
+        run_dir=run_dir,
+        run_id=fields["run_id"],
+        job_id=fields["job_id"],
+        invocation_id=fields["invocation_id"],
+        candidate_id=fields["candidate_id"],
+        candidate_digest=fields["candidate_digest"],
+        input_id=fields["input_id"],
+        record_id=fields["record_id"],
+        input_digest=fields["input_digest"],
+        source_digest=fields["source_digest"],
+        input_kind="",
+        input_value="",
+        receptor_coordinate=None,
+        docking_ligand_sdf=None,
+        docking_ligand_pdbqt=None,
+        docking_pose_pdbqt=None,
+        docking_pose_sdf=None,
+        output_dir=md_output_dir(
+            run_dir,
+            fields["candidate_id"],
+            fields["invocation_id"],
+        ).resolve(),
+    )
+
+
+def record_failed_md_index(job: dict[str, Any], reason: str) -> None:
+    upsert_md_manifest_index(
+        failed_md_binding(job),
+        status="failed",
+        reason=reason,
+        manifest="",
+        artifact_provenance="",
+    )
 
 
 def canonical_digest(value: Any) -> str:
@@ -564,9 +791,20 @@ def read_json_object(path: Path) -> dict[str, Any]:
     return value
 
 
-def selected_md_candidate(run_dir: Path) -> tuple[dict[str, str], str]:
+def selected_md_candidate(
+    run_dir: Path,
+    candidate_id: str = "",
+    input_id: str = "",
+    record_id: str = "",
+) -> tuple[dict[str, str], str]:
     path = resolve_run_artifact(run_dir, "complex_candidate_selection.tsv")
     rows = read_tsv_dicts(path)
+    if candidate_id:
+        rows = [row for row in rows if row.get("candidate_id") == candidate_id]
+    if input_id:
+        rows = [row for row in rows if row.get("input_id") == input_id]
+    if record_id:
+        rows = [row for row in rows if row.get("record_id") == record_id]
     if len(rows) != 1:
         raise MdProvenanceError("selected_md_candidate_must_be_unique")
     row = rows[0]
@@ -608,7 +846,7 @@ def selected_md_input(run_dir: Path, input_id: str) -> tuple[dict[str, str], str
 def validate_md_job_identity(job: dict[str, Any]) -> tuple[str, str]:
     job_id = str(job.get("job_id", "")).strip()
     invocation_id = str(job.get("invocation_id", "")).strip()
-    if job_id != MD_JOB_ID:
+    if job_id != MD_JOB_ID and not job_id.startswith(f"{MD_JOB_ID}__"):
         raise MdProvenanceError("md_job_id_mismatch")
     if not invocation_id:
         raise MdProvenanceError("md_invocation_id_missing")
@@ -640,19 +878,41 @@ def has_applicable_md_input(job: dict[str, Any], run_dir: Path) -> bool:
 
 def validate_docking_binding(
     run_dir: Path,
-    invocation_id: str,
+    run_id: str,
+    docking_job_id: str,
+    docking_invocation_id: str,
+    docking_manifest_digest: str,
     candidate_id: str,
+    candidate_digest: str,
     input_id: str,
+    record_id: str,
     source_digest: str,
     input_digest: str,
+    manifest_artifact: str = "tool_outputs/docking_manifest.json",
 ) -> dict[str, Path]:
-    manifest_path = resolve_run_artifact(run_dir, "tool_outputs/docking_manifest.json")
+    manifest_path = resolve_run_artifact(run_dir, manifest_artifact)
+    if not valid_sha256(docking_manifest_digest) or sha256_file(manifest_path) != docking_manifest_digest:
+        raise MdProvenanceError("docking_manifest_sha256_mismatch")
     manifest = read_json_object(manifest_path)
     checks = (
+        (
+            manifest.get("artifact_schema_version") == "genoligand_docking_artifacts_v1",
+            "docking_artifact_schema_version_mismatch",
+        ),
         (manifest.get("status") == "completed", "docking_status_not_completed"),
-        (manifest.get("invocation_id") == invocation_id, "docking_invocation_id_mismatch"),
+        (manifest.get("run_id") == run_id, "docking_run_id_mismatch"),
+        (manifest.get("job_id") == docking_job_id, "docking_job_id_mismatch"),
+        (
+            manifest.get("invocation_id") == docking_invocation_id,
+            "docking_invocation_id_mismatch",
+        ),
         (manifest.get("candidate_id") == candidate_id, "docking_candidate_id_mismatch"),
+        (
+            manifest.get("candidate_digest") == candidate_digest,
+            "docking_candidate_digest_mismatch",
+        ),
         (manifest.get("input_id") == input_id, "docking_input_id_mismatch"),
+        (manifest.get("record_id") == record_id, "docking_record_id_mismatch"),
         (
             str(manifest.get("source_content_sha256", "")).lower() == source_digest,
             "docking_source_digest_mismatch",
@@ -664,7 +924,7 @@ def validate_docking_binding(
     seed_provenance = manifest.get("seed_provenance")
     if not isinstance(seed_provenance, dict) or seed_provenance.get("input_digest") != input_digest:
         raise MdProvenanceError("docking_input_digest_mismatch")
-    if manifest.get("input_digest") not in {None, input_digest}:
+    if manifest.get("input_digest") != input_digest:
         raise MdProvenanceError("docking_input_digest_mismatch")
 
     resolved: dict[str, Path] = {}
@@ -676,21 +936,50 @@ def validate_docking_binding(
             raise MdProvenanceError(f"docking_artifact_path_invalid:{field_name}")
         resolved[field_name] = resolve_run_artifact(run_dir, value)
 
-    artifact_rows = manifest.get("artifacts", [])
-    if not isinstance(artifact_rows, list):
+    artifact_rows = manifest.get("artifacts")
+    if not isinstance(artifact_rows, list) or not artifact_rows:
         raise MdProvenanceError("docking_artifacts_schema_invalid")
+    expected_names = set(DOCKING_ARTIFACT_FIELDS)
+    actual_names: set[str] = set()
     for row in artifact_rows:
         if not isinstance(row, dict):
             raise MdProvenanceError("docking_artifacts_schema_invalid")
+        artifact_name = str(row.get("artifact_name", "")).strip()
+        if artifact_name in actual_names:
+            raise MdProvenanceError(f"docking_artifact_duplicate:{artifact_name}")
+        actual_names.add(artifact_name)
+        for field_name, expected in {
+            "run_id": run_id,
+            "job_id": docking_job_id,
+            "invocation_id": docking_invocation_id,
+            "candidate_id": candidate_id,
+            "candidate_digest": candidate_digest,
+            "input_id": input_id,
+            "record_id": record_id,
+            "input_digest": input_digest,
+            "source_digest": source_digest,
+        }.items():
+            if row.get(field_name) != expected:
+                raise MdProvenanceError(f"docking_artifact_{field_name}_mismatch")
         path = resolve_run_artifact(run_dir, str(row.get("artifact_path", "")))
+        if artifact_name in resolved and path != resolved[artifact_name]:
+            raise MdProvenanceError(f"docking_artifact_path_mismatch:{artifact_name}")
         expected = str(row.get("artifact_sha256", "")).lower()
         if not valid_sha256(expected) or sha256_file(path) != expected:
             raise MdProvenanceError(f"docking_artifact_sha256_mismatch:{path.name}")
+    if actual_names != expected_names:
+        raise MdProvenanceError("docking_artifact_set_mismatch")
 
     receptor = resolved["receptor_coordinate"]
-    receptor_digest = str(manifest.get("receptor_sha256", "")).lower()
-    if receptor_digest and (
-        not valid_sha256(receptor_digest) or sha256_file(receptor) != receptor_digest
+    receptor_digest = str(manifest.get("receptor_digest", "")).lower()
+    receptor_row = next(
+        row for row in artifact_rows if row.get("artifact_name") == "receptor_coordinate"
+    )
+    if (
+        not valid_sha256(receptor_digest)
+        or manifest.get("receptor_sha256") != receptor_digest
+        or receptor_row.get("receptor_digest") != receptor_digest
+        or sha256_file(receptor) != receptor_digest
     ):
         raise MdProvenanceError("docking_receptor_sha256_mismatch")
     return resolved
@@ -700,18 +989,29 @@ def resolve_md_invocation(job: dict[str, Any]) -> MdInvocationBinding:
     run_dir = resolve_md_run_dir(job)
     job_id, invocation_id = validate_md_job_identity(job)
 
-    selection, candidate_digest = selected_md_candidate(run_dir)
+    selection, candidate_digest = selected_md_candidate(
+        run_dir,
+        str(job.get("candidate_id", "")).strip(),
+        str(job.get("input_id", "")).strip(),
+        str(job.get("record_id", "")).strip(),
+    )
     candidate_id = selection["candidate_id"]
     input_id = selection["input_id"]
     input_row, input_value, source_digest, input_digest = selected_md_input(run_dir, input_id)
+    record_id = input_row.get("record_id", "")
     expected_values = (
         ("candidate_id", candidate_id, "job_candidate_id_mismatch"),
+        ("candidate_digest", candidate_digest, "job_candidate_digest_mismatch"),
         ("input_id", input_id, "job_input_id_mismatch"),
+        ("record_id", record_id, "job_record_id_mismatch"),
         ("input_digest", input_digest, "job_input_digest_mismatch"),
+        ("source_digest", source_digest, "job_source_digest_mismatch"),
     )
     for field_name, current, reason in expected_values:
         expected = str(job.get(field_name, "")).strip()
-        if expected and expected != current:
+        if not expected:
+            raise MdProvenanceError(f"{field_name}_missing")
+        if expected != current:
             raise MdProvenanceError(reason)
 
     receptor_coordinate = None
@@ -720,13 +1020,28 @@ def resolve_md_invocation(job: dict[str, Any]) -> MdInvocationBinding:
     docking_pose_pdbqt = None
     docking_pose_sdf = None
     if input_row["canonical_kind"] == "small_molecule":
+        run_id = str(job.get("run_id", "")).strip() or run_dir.name
+        docking_manifest = str(job.get("docking_manifest", "")).strip()
+        if not docking_manifest:
+            raise MdProvenanceError("docking_manifest_missing")
+        docking_job_id = str(job.get("docking_job_id", "")).strip()
+        docking_invocation_id = str(job.get("docking_invocation_id", "")).strip()
+        docking_manifest_digest = str(job.get("docking_manifest_digest", "")).strip().lower()
+        if not docking_job_id or not docking_invocation_id or not valid_sha256(docking_manifest_digest):
+            raise MdProvenanceError("docking_manifest_binding_missing")
         docking_artifacts = validate_docking_binding(
             run_dir,
-            invocation_id,
+            run_id,
+            docking_job_id,
+            docking_invocation_id,
+            docking_manifest_digest,
             candidate_id,
+            candidate_digest,
             input_id,
+            input_row.get("record_id", ""),
             source_digest,
             input_digest,
+            docking_manifest,
         )
         receptor_coordinate = docking_artifacts["receptor_coordinate"]
         docking_ligand_sdf = docking_artifacts["ligand_sdf"]
@@ -741,6 +1056,7 @@ def resolve_md_invocation(job: dict[str, Any]) -> MdInvocationBinding:
         candidate_id=candidate_id,
         candidate_digest=candidate_digest,
         input_id=input_id,
+        record_id=record_id,
         input_digest=input_digest,
         source_digest=source_digest,
         input_kind=input_row["canonical_kind"],
@@ -750,11 +1066,26 @@ def resolve_md_invocation(job: dict[str, Any]) -> MdInvocationBinding:
         docking_ligand_pdbqt=docking_ligand_pdbqt,
         docking_pose_pdbqt=docking_pose_pdbqt,
         docking_pose_sdf=docking_pose_sdf,
+        output_dir=md_output_dir(run_dir, candidate_id, invocation_id).resolve(),
     )
 
 
-def clear_previous_md_outputs(run_dir: Path) -> None:
+def clear_previous_md_outputs(run_dir: Path, candidate_id: str = "") -> None:
     root = run_dir.resolve(strict=True)
+    if candidate_id:
+        candidate_root = md_candidate_dir(root, candidate_id)
+        if candidate_root.exists() or candidate_root.is_symlink():
+            try:
+                resolved = candidate_root.resolve(strict=True)
+                resolved.relative_to(root)
+            except (OSError, ValueError) as exc:
+                raise MdProvenanceError("md_candidate_output_outside_run") from exc
+            if candidate_root.is_symlink() or not candidate_root.is_dir():
+                raise MdProvenanceError("md_candidate_output_not_directory")
+            import shutil
+
+            shutil.rmtree(candidate_root)
+        return
     tool_outputs = root / "tool_outputs"
     if tool_outputs.is_symlink():
         try:
@@ -794,6 +1125,7 @@ def binding_fields(binding: MdInvocationBinding) -> dict[str, str]:
         "candidate_id": binding.candidate_id,
         "candidate_digest": binding.candidate_digest,
         "input_id": binding.input_id,
+        "record_id": binding.record_id,
         "input_digest": binding.input_digest,
         "source_digest": binding.source_digest,
     }
@@ -851,7 +1183,11 @@ def write_md_artifact_provenance(
     for artifact in artifacts:
         path = resolve_run_artifact(binding.run_dir, artifact)
         relative = path.relative_to(binding.run_dir).as_posix()
-        if relative == f"tool_outputs/{MD_PROVENANCE_ARTIFACT}" or relative in seen:
+        if relative == md_artifact_relative(
+            binding,
+            MD_PROVENANCE_ARTIFACT,
+            must_exist=False,
+        ) or relative in seen:
             raise MdProvenanceError(f"duplicate_or_recursive_md_artifact:{relative}")
         seen.add(relative)
         rows.append(
@@ -866,7 +1202,7 @@ def write_md_artifact_provenance(
     rows.sort(key=lambda row: row["artifact_path"])
     path = resolve_run_artifact(
         binding.run_dir,
-        binding.run_dir / "tool_outputs" / MD_PROVENANCE_ARTIFACT,
+        binding.output_dir / MD_PROVENANCE_ARTIFACT,
         must_exist=False,
     )
     write_json(
@@ -919,6 +1255,288 @@ def validate_md_artifact_provenance(path: Path, binding: MdInvocationBinding) ->
             raise MdProvenanceError(f"artifact_sha256_mismatch:{relative}")
 
 
+def finite_float(value: object, reason: str) -> float:
+    try:
+        number = float(str(value))
+    except (TypeError, ValueError) as exc:
+        raise MdProvenanceError(reason) from exc
+    if not math.isfinite(number):
+        raise MdProvenanceError(reason)
+    return number
+
+
+def validate_manifest_binding(manifest: dict[str, Any], binding: MdInvocationBinding) -> None:
+    for field_name, expected in binding_fields(binding).items():
+        if manifest.get(field_name) != expected:
+            raise MdProvenanceError(f"md_manifest_{field_name}_mismatch")
+
+
+def bound_tsv_rows(binding: MdInvocationBinding, artifact: str) -> list[dict[str, str]]:
+    rows = read_tsv_dicts(md_artifact_path(binding, artifact))
+    if not rows:
+        raise MdProvenanceError(f"md_artifact_rows_missing:{artifact}")
+    return rows
+
+
+def validate_completed_md_semantics(binding: MdInvocationBinding) -> dict[str, Any]:
+    manifest = read_json_object(md_artifact_path(binding, "md_run_manifest.json"))
+    validate_manifest_binding(manifest, binding)
+    method = str(manifest.get("method", "")).strip()
+    if method == "rdkit_peptide_conformer_ensemble":
+        return validate_peptide_conformer_semantics(binding, manifest)
+    if method != "openmm_receptor_ligand_complex_dynamics":
+        raise MdProvenanceError("md_method_invalid")
+    return validate_complex_md_semantics(binding, manifest)
+
+
+def validate_complex_md_semantics(
+    binding: MdInvocationBinding,
+    manifest: dict[str, Any],
+) -> dict[str, Any]:
+    if manifest.get("metric_units") != COMPLEX_MD_METRIC_UNITS:
+        raise MdProvenanceError("md_metric_unit_schema_invalid")
+    expected_metric_artifacts = {
+        md_artifact_relative(binding, name, must_exist=False)
+        for name in (
+            "md_summary.tsv",
+            "md_rmsd.tsv",
+            "md_rmsf.tsv",
+            "md_ligand_drift.tsv",
+            "md_contacts.tsv",
+            "md_hbonds.tsv",
+        )
+    }
+    metric_artifacts = manifest.get("metric_artifacts")
+    if not isinstance(metric_artifacts, list) or set(metric_artifacts) != expected_metric_artifacts:
+        raise MdProvenanceError("md_metric_artifact_set_mismatch")
+    for artifact in expected_metric_artifacts:
+        if not resolve_run_artifact(
+            binding.run_dir,
+            artifact,
+            must_exist=False,
+        ).is_file():
+            raise MdProvenanceError(f"md_metric_artifact_missing:{Path(artifact).name}")
+
+    required_artifacts = {
+        "trajectory": md_artifact_relative(binding, "md_trajectory.tsv"),
+        "state_artifact": md_artifact_relative(binding, "md_state.tsv"),
+        "protocol_artifact": md_artifact_relative(binding, "md_protocol.tsv"),
+        "ligand_coordinate": md_artifact_relative(binding, "ligand_placement.tsv"),
+        "complex_manifest": md_artifact_relative(binding, "complex_md_manifest.json"),
+        "gpu_telemetry_artifact": md_artifact_relative(binding, "gpu_telemetry.tsv"),
+        "gpu_telemetry_status_artifact": md_artifact_relative(
+            binding,
+            "gpu_telemetry_status.tsv",
+        ),
+    }
+    for field_name, expected in required_artifacts.items():
+        if manifest.get(field_name) != expected:
+            raise MdProvenanceError(f"md_manifest_artifact_mismatch:{field_name}")
+        resolve_run_artifact(binding.run_dir, expected)
+
+    summary_rows = bound_tsv_rows(binding, "md_summary.tsv")
+    if len(summary_rows) != 1 or summary_rows[0].get("candidate_id") != binding.candidate_id:
+        raise MdProvenanceError("md_summary_candidate_id_mismatch")
+    summary = summary_rows[0]
+    metric_ranges = {
+        "rmsd": (0.0, None),
+        "rmsf": (0.0, None),
+        "ligand_drift": (0.0, None),
+        "hydrogen_bond_occupancy": (0.0, 1.0),
+        "contact_occupancy": (0.0, 1.0),
+        "interaction_persistence": (0.0, 1.0),
+        "md_stability_score": (0.0, 1.0),
+    }
+    summary_values: dict[str, float] = {}
+    for metric, (minimum, maximum) in metric_ranges.items():
+        value = finite_float(summary.get(metric), "md_metric_value_invalid")
+        if value < minimum or (maximum is not None and value > maximum):
+            raise MdProvenanceError("md_metric_value_invalid")
+        summary_values[metric] = value
+
+    metric_files = {
+        "md_rmsd.tsv": ("rmsd", "angstrom"),
+        "md_rmsf.tsv": ("rmsf", "angstrom"),
+        "md_ligand_drift.tsv": ("ligand_drift", "angstrom"),
+        "md_contacts.tsv": ("contact_occupancy", "fraction"),
+        "md_hbonds.tsv": ("hydrogen_bond_occupancy", "fraction"),
+    }
+    for file_name, (metric, unit) in metric_files.items():
+        rows = bound_tsv_rows(binding, file_name)
+        if len(rows) != 1:
+            raise MdProvenanceError(f"md_metric_row_count_invalid:{file_name}")
+        row = rows[0]
+        if row.get("candidate_id") != binding.candidate_id:
+            raise MdProvenanceError("md_metric_candidate_id_mismatch")
+        if row.get("input_id") != binding.input_id:
+            raise MdProvenanceError("md_metric_input_id_mismatch")
+        if row.get("metric") != metric:
+            raise MdProvenanceError("md_metric_name_mismatch")
+        if row.get("unit") != unit:
+            raise MdProvenanceError("md_metric_unit_invalid")
+        value = finite_float(row.get("value"), "md_metric_value_invalid")
+        if abs(value - summary_values[metric]) > 1e-6:
+            raise MdProvenanceError("md_metric_summary_mismatch")
+
+    protocol_rows = bound_tsv_rows(binding, "md_protocol.tsv")
+    protocol: dict[tuple[str, str], dict[str, str]] = {}
+    for row in protocol_rows:
+        if row.get("candidate_id") != binding.candidate_id:
+            raise MdProvenanceError("md_protocol_candidate_id_mismatch")
+        if row.get("input_id") != binding.input_id:
+            raise MdProvenanceError("md_protocol_input_id_mismatch")
+        key = (row.get("stage", ""), row.get("parameter", ""))
+        if key in protocol:
+            raise MdProvenanceError("md_protocol_parameter_duplicate")
+        protocol[key] = row
+    required_protocol = {
+        ("platform", "openmm_platform"): "",
+        ("integrator", "time_step"): "ps",
+        ("production", "total_steps"): "steps",
+        ("output", "frame_count"): "frames",
+        ("output", "state_rows"): "rows",
+    }
+    for key, unit in required_protocol.items():
+        row = protocol.get(key)
+        if row is None:
+            raise MdProvenanceError("md_protocol_parameter_missing")
+        if row.get("unit", "") != unit:
+            raise MdProvenanceError("md_protocol_unit_invalid")
+    timestep = finite_float(protocol[("integrator", "time_step")].get("value"), "md_timestep_invalid")
+    production_steps = int(
+        finite_float(protocol[("production", "total_steps")].get("value"), "md_production_steps_invalid")
+    )
+    frame_count = int(
+        finite_float(protocol[("output", "frame_count")].get("value"), "md_frame_count_invalid")
+    )
+    state_row_count = int(
+        finite_float(protocol[("output", "state_rows")].get("value"), "md_state_row_count_invalid")
+    )
+    if timestep <= 0.0:
+        raise MdProvenanceError("md_timestep_invalid")
+    if production_steps <= 0:
+        raise MdProvenanceError("md_production_steps_invalid")
+    if frame_count < MINIMUM_MD_PRODUCTION_SAMPLES:
+        raise MdProvenanceError("md_frame_count_invalid")
+    if state_row_count < 2:
+        raise MdProvenanceError("md_state_row_count_invalid")
+    if manifest.get("frame_count") != frame_count or manifest.get("state_row_count") != state_row_count:
+        raise MdProvenanceError("md_manifest_sampling_count_mismatch")
+
+    state_rows = bound_tsv_rows(binding, "md_state.tsv")
+    if len(state_rows) != state_row_count:
+        raise MdProvenanceError("md_state_row_count_invalid")
+    steps = []
+    for row in state_rows:
+        if row.get("candidate_id") != binding.candidate_id:
+            raise MdProvenanceError("md_state_candidate_id_mismatch")
+        if row.get("input_id") != binding.input_id:
+            raise MdProvenanceError("md_state_input_id_mismatch")
+        step = int(finite_float(row.get("step"), "md_state_value_invalid"))
+        if step < 0:
+            raise MdProvenanceError("md_state_value_invalid")
+        steps.append(step)
+        for field_name in (
+            "time_ps",
+            "potential_energy_kj_mol",
+            "kinetic_energy_kj_mol",
+            "total_energy_kj_mol",
+            "temperature_estimate_K",
+        ):
+            finite_float(row.get(field_name), "md_state_value_invalid")
+    if max(steps) < production_steps:
+        raise MdProvenanceError("md_state_steps_incomplete")
+
+    trajectory_rows = bound_tsv_rows(binding, "md_trajectory.tsv")
+    frames: set[int] = set()
+    for row in trajectory_rows:
+        if row.get("candidate_id") != binding.candidate_id:
+            raise MdProvenanceError("md_trajectory_candidate_id_mismatch")
+        frame = int(finite_float(row.get("frame"), "md_trajectory_frame_invalid"))
+        if frame < 0:
+            raise MdProvenanceError("md_trajectory_frame_invalid")
+        frames.add(frame)
+    if len(frames) != frame_count:
+        raise MdProvenanceError("md_trajectory_frame_count_mismatch")
+    return {
+        "method": "openmm_receptor_ligand_complex_dynamics",
+        "candidate_id": binding.candidate_id,
+        "frame_count": frame_count,
+        "production_steps": production_steps,
+        "platform": str(manifest.get("platform", "")),
+        "platform_policy": str(manifest.get("platform_policy", "")),
+    }
+
+
+def validate_peptide_conformer_semantics(
+    binding: MdInvocationBinding,
+    manifest: dict[str, Any],
+) -> dict[str, Any]:
+    if (
+        manifest.get("artifact_schema_version") != "genoligand_peptide_conformer_v1"
+        or manifest.get("method_class") != "conformer_ensemble"
+        or manifest.get("has_receptor") is not False
+        or manifest.get("uses_openmm") is not False
+        or manifest.get("md_score") != 0.0
+    ):
+        raise MdProvenanceError("peptide_conformer_method_schema_invalid")
+    expected_metrics = {
+        md_artifact_relative(binding, "peptide_conformer_summary.tsv"),
+        md_artifact_relative(binding, "peptide_conformer_metrics.tsv"),
+    }
+    if set(manifest.get("metric_artifacts", [])) != expected_metrics:
+        raise MdProvenanceError("peptide_conformer_artifact_set_invalid")
+    if manifest.get("coordinate_artifact") != md_artifact_relative(
+        binding,
+        "peptide_conformer_coordinates.tsv",
+    ):
+        raise MdProvenanceError("peptide_conformer_coordinate_artifact_invalid")
+    if manifest.get("ensemble_artifact") != md_artifact_relative(
+        binding,
+        "peptide_conformer_ensemble.tsv",
+    ):
+        raise MdProvenanceError("peptide_conformer_ensemble_artifact_invalid")
+    if (binding.output_dir / "md_summary.tsv").exists():
+        raise MdProvenanceError("peptide_conformer_must_not_emit_md_summary")
+    summary_rows = bound_tsv_rows(binding, "peptide_conformer_summary.tsv")
+    if len(summary_rows) != 1:
+        raise MdProvenanceError("peptide_conformer_summary_invalid")
+    summary = summary_rows[0]
+    if summary.get("candidate_id") != binding.candidate_id or summary.get("input_id") != binding.input_id:
+        raise MdProvenanceError("peptide_conformer_binding_mismatch")
+    if summary.get("has_receptor") != "false" or summary.get("uses_openmm") != "false":
+        raise MdProvenanceError("peptide_conformer_method_schema_invalid")
+    conformer_count = int(finite_float(summary.get("conformer_count"), "peptide_conformer_count_invalid"))
+    if conformer_count <= 0 or manifest.get("conformer_count") != conformer_count:
+        raise MdProvenanceError("peptide_conformer_count_invalid")
+    metric_rows = bound_tsv_rows(binding, "peptide_conformer_metrics.tsv")
+    expected_names = {
+        "mean_heavy_atom_rmsd_angstrom",
+        "mean_heavy_atom_rmsf_angstrom",
+        "mean_centroid_drift_angstrom",
+    }
+    if {row.get("metric") for row in metric_rows} != expected_names:
+        raise MdProvenanceError("peptide_conformer_metric_set_invalid")
+    for row in metric_rows:
+        if row.get("candidate_id") != binding.candidate_id or row.get("input_id") != binding.input_id:
+            raise MdProvenanceError("peptide_conformer_binding_mismatch")
+        if row.get("unit") != "angstrom" or finite_float(
+            row.get("value"), "peptide_conformer_metric_invalid"
+        ) < 0.0:
+            raise MdProvenanceError("peptide_conformer_metric_invalid")
+    ensemble_rows = bound_tsv_rows(binding, "peptide_conformer_ensemble.tsv")
+    frames = {row.get("frame") for row in ensemble_rows if row.get("candidate_id") == binding.candidate_id}
+    if len(frames) != conformer_count:
+        raise MdProvenanceError("peptide_conformer_count_invalid")
+    md_artifact_path(binding, "peptide_conformer_coordinates.tsv")
+    return {
+        "method": "rdkit_peptide_conformer_ensemble",
+        "candidate_id": binding.candidate_id,
+        "conformer_count": conformer_count,
+        "md_score": 0.0,
+    }
+
+
 def bind_worker_result(path: Path, job: dict[str, Any]) -> None:
     run_dir = resolve_md_run_dir(job)
     output = resolve_worker_output_path(job, path)
@@ -932,11 +1550,16 @@ def bind_worker_result(path: Path, job: dict[str, Any]) -> None:
     input_manifest = runtime_path(str(job.get("input_manifest", "")).strip())
     if input_manifest.is_file():
         result["input_manifest_sha256"] = sha256_file(input_manifest)
-    provenance_path = run_dir / "tool_outputs" / MD_PROVENANCE_ARTIFACT
+    candidate_id = str(job.get("candidate_id", "")).strip()
+    invocation_id = str(job.get("invocation_id", "")).strip()
+    provenance_path = md_output_dir(run_dir, candidate_id, invocation_id) / MD_PROVENANCE_ARTIFACT
     if provenance_path.is_file():
         binding = resolve_md_invocation(job)
         validate_md_artifact_provenance(provenance_path, binding)
+        if result.get("status") == "PASS":
+            validate_completed_md_semantics(binding)
         result.update(binding_fields(binding))
+        result["manifest"] = md_artifact_relative(binding, "md_run_manifest.json")
         result["artifact_provenance"] = provenance_path.relative_to(run_dir).as_posix()
     result["artifact_path"] = output.relative_to(run_dir).as_posix()
     write_json(output, result)
@@ -1369,17 +1992,71 @@ def prepare_openff_ligand(mol: Any) -> tuple[Any, str, list[str]]:
         raise ValueError(f"OpenFF ligand parameterization failed: {safe_note(str(exc))}") from exc
 
 
-def select_openmm_platform(openmm: Any) -> str:
-    names = [
+def md_platform_policy(job: dict[str, Any]) -> str:
+    policy = str(job.get("platform_policy", "")).strip().lower()
+    if policy not in {"required", "preferred", "disabled"}:
+        raise ValueError("openmm_platform_policy_invalid")
+    return policy
+
+
+def available_openmm_platforms(openmm: Any) -> list[str]:
+    return [
         openmm.Platform.getPlatform(index).getName()
         for index in range(openmm.Platform.getNumPlatforms())
     ]
-    for preferred in ["CUDA", "CPU", "Reference"]:
+
+
+def select_openmm_platform(openmm: Any, policy: str = "preferred") -> str:
+    names = available_openmm_platforms(openmm)
+    preferences = {
+        "required": ["CUDA"],
+        "preferred": ["CUDA", "CPU", "Reference"],
+        "disabled": ["CPU", "Reference"],
+    }
+    if policy not in preferences:
+        raise ValueError("openmm_platform_policy_invalid")
+    for preferred in preferences[policy]:
         if preferred in names:
             return preferred
-    if not names:
-        raise ValueError("OpenMM has no available platform")
-    return names[0]
+    if policy == "required":
+        raise ValueError("gpu_required_context_unavailable:CUDA_platform_missing")
+    raise ValueError(f"openmm_{policy}_platform_unavailable")
+
+
+def create_openmm_context(
+    openmm: Any,
+    system: Any,
+    integrator: Any,
+    policy: str,
+) -> tuple[Any, str, dict[str, str], list[str]]:
+    names = set(available_openmm_platforms(openmm))
+    preferences = {
+        "required": ["CUDA"],
+        "preferred": ["CUDA", "CPU", "Reference"],
+        "disabled": ["CPU", "Reference"],
+    }
+    if policy not in preferences:
+        raise ValueError("openmm_platform_policy_invalid")
+    failures: list[str] = []
+    for name in preferences[policy]:
+        if name not in names:
+            continue
+        platform = openmm.Platform.getPlatformByName(name)
+        properties = openmm_platform_properties(name, platform)
+        try:
+            if properties:
+                context = openmm.Context(system, integrator, platform, properties)
+            else:
+                context = openmm.Context(system, integrator, platform)
+        except Exception as exc:  # noqa: BLE001 - each policy defines deterministic fallback
+            failures.append(f"{name}:{type(exc).__name__}")
+            continue
+        return context, name, properties, failures
+    if policy == "required":
+        detail = ";".join(failures) or "CUDA_platform_missing"
+        raise ValueError(f"gpu_required_context_unavailable:{detail}")
+    detail = ";".join(failures) or "no_allowed_platform"
+    raise ValueError(f"openmm_{policy}_context_unavailable:{detail}")
 
 
 def openmm_platform_properties(platform_name: str, platform: Any) -> dict[str, str]:
@@ -1998,15 +2675,10 @@ def summarize_peptide_conformer_frames(mol: Any, frames: list[Any], np: Any) -> 
     rmsd = float(np.mean(rmsd_values)) if rmsd_values else 0.0
     rmsf = float(np.mean(rmsf_by_atom)) if len(rmsf_by_atom) else 0.0
     drift = float(np.mean(drift_values)) if len(drift_values) else 0.0
-    stability = max(0.0, min(1.0, 1.0 - (rmsd / 5.0 + rmsf / 5.0 + drift / 5.0) / 3.0))
     return {
-        "rmsd": rmsd,
-        "rmsf": rmsf,
-        "ligand_drift": drift,
-        "contact_occupancy": 0.0,
-        "hydrogen_bond_occupancy": 0.0,
-        "interaction_persistence": 0.0,
-        "md_stability_score": stability,
+        "mean_heavy_atom_rmsd_angstrom": rmsd,
+        "mean_heavy_atom_rmsf_angstrom": rmsf,
+        "mean_centroid_drift_angstrom": drift,
     }
 
 
@@ -2092,7 +2764,7 @@ def write_md_not_ready(
 ) -> None:
     if run_dir.resolve(strict=True) != binding.run_dir:
         raise MdProvenanceError("md_output_run_dir_mismatch")
-    tool_outputs = run_dir / "tool_outputs"
+    tool_outputs = binding.output_dir
     tool_outputs.mkdir(parents=True, exist_ok=True)
     not_ready_path = tool_outputs / "md_not_ready.tsv"
     run_manifest_path = tool_outputs / "md_run_manifest.json"
@@ -2113,15 +2785,26 @@ def write_md_not_ready(
             "ligand_placement_manifest": "",
             "complex_manifest": "",
             "trajectory": "",
-            "artifact_provenance": f"tool_outputs/{MD_PROVENANCE_ARTIFACT}",
+            "artifact_provenance": md_artifact_relative(
+                binding,
+                MD_PROVENANCE_ARTIFACT,
+                must_exist=False,
+            ),
         },
     )
-    write_md_artifact_provenance(
+    provenance_path = write_md_artifact_provenance(
         binding,
         [not_ready_path, run_manifest_path],
         tool_name="md_summary",
         tool_version="not_ready",
         parameters={"reason": reason, "risk_flags": risk_flags},
+    )
+    upsert_md_manifest_index(
+        binding,
+        status="not_ready",
+        reason=reason,
+        manifest=run_manifest_path.relative_to(binding.run_dir).as_posix(),
+        artifact_provenance=provenance_path.relative_to(binding.run_dir).as_posix(),
     )
 
 
@@ -2148,9 +2831,11 @@ def write_md_artifacts(
     model_metadata: dict[str, Any],
     binding: MdInvocationBinding,
     tool_version: str,
+    platform_policy: str,
+    platform_failures: list[str],
 ) -> None:
     ensure_md_output_binding(run_dir, candidate_id, input_id, binding)
-    tool_outputs = run_dir / "tool_outputs"
+    tool_outputs = binding.output_dir
     tool_outputs.mkdir(parents=True, exist_ok=True)
     score_note = "score_decomposition.tsv records Rust-owned candidate scores"
     risk_text = ";".join(risk_flags)
@@ -2167,47 +2852,54 @@ def write_md_artifacts(
         "md_stability_score",
     ]
     summary_path = tool_outputs / "md_summary.tsv"
-    write_tsv(
-        summary_path,
-        summary_header,
-        [
-            [
-                candidate_id,
-                fmt(metrics["rmsd"]),
-                fmt(metrics["rmsf"]),
-                fmt(metrics["ligand_drift"]),
-                fmt(metrics["hydrogen_bond_occupancy"]),
-                fmt(metrics["contact_occupancy"]),
-                fmt(metrics["interaction_persistence"]),
-                risk_text,
-                score_note,
-                fmt(metrics["md_stability_score"]),
-            ]
-        ],
-    )
+    summary_row = [
+        candidate_id,
+        fmt(metrics["rmsd"]),
+        fmt(metrics["rmsf"]),
+        fmt(metrics["ligand_drift"]),
+        fmt(metrics["hydrogen_bond_occupancy"]),
+        fmt(metrics["contact_occupancy"]),
+        fmt(metrics["interaction_persistence"]),
+        risk_text,
+        score_note,
+        fmt(metrics["md_stability_score"]),
+    ]
+    write_tsv(summary_path, summary_header, [summary_row])
     metric_specs = [
-        ("md_rmsd.tsv", "rmsd"),
-        ("md_rmsf.tsv", "rmsf"),
-        ("md_ligand_drift.tsv", "ligand_drift"),
-        ("md_contacts.tsv", "contact_occupancy"),
-        ("md_hbonds.tsv", "hydrogen_bond_occupancy"),
+        ("md_rmsd.tsv", "rmsd", "angstrom"),
+        ("md_rmsf.tsv", "rmsf", "angstrom"),
+        ("md_ligand_drift.tsv", "ligand_drift", "angstrom"),
+        ("md_contacts.tsv", "contact_occupancy", "fraction"),
+        ("md_hbonds.tsv", "hydrogen_bond_occupancy", "fraction"),
     ]
     metric_paths = []
-    for file_name, metric in metric_specs:
+    for file_name, metric, unit in metric_specs:
         metric_path = tool_outputs / file_name
         metric_paths.append(metric_path)
         write_tsv(
             metric_path,
-            ["candidate_id", "input_id", "metric", "value", "source"],
-            [[candidate_id, input_id, metric, fmt(metrics[metric]), "openmm_receptor_ligand_complex_dynamics"]],
+            ["candidate_id", "input_id", "metric", "value", "unit", "source"],
+            [
+                [
+                    candidate_id,
+                    input_id,
+                    metric,
+                    fmt(metrics[metric]),
+                    unit,
+                    "openmm_receptor_ligand_complex_dynamics",
+                ]
+            ],
         )
     metric_artifacts = [
-        "tool_outputs/md_summary.tsv",
-        "tool_outputs/md_rmsd.tsv",
-        "tool_outputs/md_rmsf.tsv",
-        "tool_outputs/md_ligand_drift.tsv",
-        "tool_outputs/md_contacts.tsv",
-        "tool_outputs/md_hbonds.tsv",
+        md_artifact_relative(binding, name)
+        for name in (
+            "md_summary.tsv",
+            "md_rmsd.tsv",
+            "md_rmsf.tsv",
+            "md_ligand_drift.tsv",
+            "md_contacts.tsv",
+            "md_hbonds.tsv",
+        )
     ]
     ligand_placement_path = tool_outputs / "ligand_placement.tsv"
     trajectory_path = tool_outputs / "md_trajectory.tsv"
@@ -2253,6 +2945,8 @@ def write_md_artifacts(
         gpu_status,
         model_metadata,
         binding,
+        platform_policy,
+        platform_failures,
     )
     write_json(
         run_manifest_path,
@@ -2261,37 +2955,47 @@ def write_md_artifacts(
             "input_smiles": smiles,
             "method": "openmm_receptor_ligand_complex_dynamics",
             "platform": platform_name,
+            "platform_policy": platform_policy,
+            "platform_context_failures": platform_failures,
             "platform_properties": platform_properties,
             "cuda_ready": platform_name == "CUDA" and bool(gpu_status["gpu_observed"]),
             "gpu_observed": bool(gpu_status["gpu_observed"]),
-            "gpu_telemetry_artifact": "tool_outputs/gpu_telemetry.tsv",
-            "gpu_telemetry_status_artifact": "tool_outputs/gpu_telemetry_status.tsv",
+            "gpu_telemetry_artifact": md_artifact_relative(binding, "gpu_telemetry.tsv"),
+            "gpu_telemetry_status_artifact": md_artifact_relative(
+                binding,
+                "gpu_telemetry_status.tsv",
+            ),
             "gpu_telemetry": gpu_status,
             "system": model_metadata,
             "receptor_coordinate": receptor_artifact,
             "receptor_preparation": receptor.preparation,
             "receptor_atom_count": len(receptor.atoms),
             "ligand_parameterization": parameterization,
-            "ligand_coordinate": "tool_outputs/ligand_placement.tsv",
+            "ligand_coordinate": md_artifact_relative(binding, "ligand_placement.tsv"),
             "ligand_coordinate_format": "tsv_angstrom",
             "ligand_atom_count": mol.GetNumAtoms(),
             "ligand_placement": placement_method,
-            "ligand_placement_manifest": "tool_outputs/ligand_placement.tsv",
-            "complex_manifest": "tool_outputs/complex_md_manifest.json",
-            "protocol_artifact": "tool_outputs/md_protocol.tsv",
+            "ligand_placement_manifest": md_artifact_relative(binding, "ligand_placement.tsv"),
+            "complex_manifest": md_artifact_relative(binding, "complex_md_manifest.json"),
+            "protocol_artifact": md_artifact_relative(binding, "md_protocol.tsv"),
             "frame_count": len(frames),
-            "state_artifact": "tool_outputs/md_state.tsv",
+            "state_artifact": md_artifact_relative(binding, "md_state.tsv"),
             "state_row_count": len(state_rows),
-            "trajectory": "tool_outputs/md_trajectory.tsv",
+            "trajectory": md_artifact_relative(binding, "md_trajectory.tsv"),
             "metric_artifacts": metric_artifacts,
+            "metric_units": COMPLEX_MD_METRIC_UNITS,
             "risk_flags": risk_flags,
             "score_decomposition": relative_run_artifact(
                 binding, "score_decomposition.tsv", must_exist=False
             ),
-            "artifact_provenance": f"tool_outputs/{MD_PROVENANCE_ARTIFACT}",
+            "artifact_provenance": md_artifact_relative(
+                binding,
+                MD_PROVENANCE_ARTIFACT,
+                must_exist=False,
+            ),
         },
     )
-    write_md_artifact_provenance(
+    provenance_path = write_md_artifact_provenance(
         binding,
         [
             summary_path,
@@ -2310,11 +3014,21 @@ def write_md_artifacts(
         parameters={
             "method": "openmm_receptor_ligand_complex_dynamics",
             "platform": platform_name,
+            "platform_policy": platform_policy,
+            "platform_context_failures": platform_failures,
             "platform_properties": platform_properties,
             "system": model_metadata,
             "placement_method": placement_method,
             "protocol": bound_protocol_rows,
         },
+    )
+    upsert_md_summary(binding.run_dir, summary_row)
+    upsert_md_manifest_index(
+        binding,
+        status="completed",
+        reason="complex_md_completed",
+        manifest=run_manifest_path.relative_to(binding.run_dir).as_posix(),
+        artifact_provenance=provenance_path.relative_to(binding.run_dir).as_posix(),
     )
 
 
@@ -2332,113 +3046,105 @@ def write_peptide_conformer_artifacts(
     binding: MdInvocationBinding,
 ) -> None:
     ensure_md_output_binding(run_dir, candidate_id, input_id, binding)
-    tool_outputs = run_dir / "tool_outputs"
+    tool_outputs = binding.output_dir
     tool_outputs.mkdir(parents=True, exist_ok=True)
-    score_note = "score_decomposition.tsv records Rust-owned candidate scores"
     risk_text = ";".join(risk_flags)
-    summary_header = [
-        "candidate_id",
-        "rmsd",
-        "rmsf",
-        "ligand_drift",
-        "hydrogen_bond_occupancy",
-        "contact_occupancy",
-        "interaction_persistence",
-        "md_risk_flags",
-        "md_score_decomposition",
-        "md_stability_score",
-    ]
-    summary_path = tool_outputs / "md_summary.tsv"
+    summary_path = tool_outputs / "peptide_conformer_summary.tsv"
     write_tsv(
         summary_path,
-        summary_header,
+        [
+            "candidate_id",
+            "input_id",
+            "method",
+            "conformer_count",
+            "mean_heavy_atom_rmsd_angstrom",
+            "mean_heavy_atom_rmsf_angstrom",
+            "mean_centroid_drift_angstrom",
+            "has_receptor",
+            "uses_openmm",
+            "notes",
+        ],
         [
             [
                 candidate_id,
-                fmt(metrics["rmsd"]),
-                fmt(metrics["rmsf"]),
-                fmt(metrics["ligand_drift"]),
-                fmt(metrics["hydrogen_bond_occupancy"]),
-                fmt(metrics["contact_occupancy"]),
-                fmt(metrics["interaction_persistence"]),
+                input_id,
+                "rdkit_peptide_conformer_ensemble",
+                str(len(frames)),
+                fmt(metrics["mean_heavy_atom_rmsd_angstrom"]),
+                fmt(metrics["mean_heavy_atom_rmsf_angstrom"]),
+                fmt(metrics["mean_centroid_drift_angstrom"]),
+                "false",
+                "false",
                 risk_text,
-                score_note,
-                fmt(metrics["md_stability_score"]),
             ]
         ],
     )
-    metric_specs = [
-        ("md_rmsd.tsv", "rmsd"),
-        ("md_rmsf.tsv", "rmsf"),
-        ("md_ligand_drift.tsv", "ligand_drift"),
-        ("md_contacts.tsv", "contact_occupancy"),
-        ("md_hbonds.tsv", "hydrogen_bond_occupancy"),
-    ]
-    metric_paths = []
-    for file_name, metric in metric_specs:
-        metric_path = tool_outputs / file_name
-        metric_paths.append(metric_path)
-        write_tsv(
-            metric_path,
-            ["candidate_id", "input_id", "metric", "value", "source"],
-            [[candidate_id, input_id, metric, fmt(metrics[metric]), "rdkit_peptide_conformer_ensemble"]],
-        )
+    metrics_path = tool_outputs / "peptide_conformer_metrics.tsv"
+    write_tsv(
+        metrics_path,
+        ["candidate_id", "input_id", "metric", "value", "unit", "source"],
+        [
+            [candidate_id, input_id, metric, fmt(value), "angstrom", "rdkit_peptide_conformer_ensemble"]
+            for metric, value in sorted(metrics.items())
+        ],
+    )
     metric_artifacts = [
-        "tool_outputs/md_summary.tsv",
-        "tool_outputs/md_rmsd.tsv",
-        "tool_outputs/md_rmsf.tsv",
-        "tool_outputs/md_ligand_drift.tsv",
-        "tool_outputs/md_contacts.tsv",
-        "tool_outputs/md_hbonds.tsv",
+        md_artifact_relative(binding, "peptide_conformer_summary.tsv"),
+        md_artifact_relative(binding, "peptide_conformer_metrics.tsv"),
     ]
-    ligand_placement_path = tool_outputs / "ligand_placement.tsv"
-    trajectory_path = tool_outputs / "md_trajectory.tsv"
+    coordinate_path = tool_outputs / "peptide_conformer_coordinates.tsv"
+    ensemble_path = tool_outputs / "peptide_conformer_ensemble.tsv"
     run_manifest_path = tool_outputs / "md_run_manifest.json"
     write_ligand_placement(
-        ligand_placement_path,
+        coordinate_path,
         candidate_id,
         input_id,
         mol,
         frames[0],
         "rdkit_peptide_lowest_energy_conformer",
     )
-    write_peptide_trajectory(trajectory_path, candidate_id, frames, mol)
+    write_peptide_trajectory(ensemble_path, candidate_id, frames, mol)
     write_json(
         run_manifest_path,
         {
             **binding_fields(binding),
+            "artifact_schema_version": "genoligand_peptide_conformer_v1",
             "input_kind": "peptide",
             "input_sequence": sequence,
             "method": "rdkit_peptide_conformer_ensemble",
+            "method_class": "conformer_ensemble",
             "platform": "RDKit",
-            "cuda_ready": False,
+            "has_receptor": False,
+            "uses_openmm": False,
+            "md_score": 0.0,
             "rdkit_version": rdkit_version,
             "sequence_length": len(sequence),
-            "ligand_parameterization": parameterization,
-            "ligand_coordinate": "tool_outputs/ligand_placement.tsv",
-            "ligand_coordinate_format": "tsv_angstrom",
-            "ligand_atom_count": mol.GetNumAtoms(),
-            "ligand_heavy_atom_count": sum(1 for atom in mol.GetAtoms() if atom.GetAtomicNum() > 1),
-            "ligand_placement": "rdkit_peptide_lowest_energy_conformer",
-            "ligand_placement_manifest": "tool_outputs/ligand_placement.tsv",
-            "complex_manifest": "",
-            "frame_count": len(frames),
-            "trajectory": "tool_outputs/md_trajectory.tsv",
+            "conformer_parameterization": parameterization,
+            "coordinate_artifact": md_artifact_relative(
+                binding,
+                "peptide_conformer_coordinates.tsv",
+            ),
+            "coordinate_format": "tsv_angstrom",
+            "atom_count": mol.GetNumAtoms(),
+            "heavy_atom_count": sum(1 for atom in mol.GetAtoms() if atom.GetAtomicNum() > 1),
+            "conformer_count": len(frames),
+            "ensemble_artifact": md_artifact_relative(binding, "peptide_conformer_ensemble.tsv"),
             "metric_artifacts": metric_artifacts,
             "risk_flags": risk_flags,
-            "score_decomposition": relative_run_artifact(
-                binding, "score_decomposition.tsv", must_exist=False
+            "artifact_provenance": md_artifact_relative(
+                binding,
+                MD_PROVENANCE_ARTIFACT,
+                must_exist=False,
             ),
-            "artifact_provenance": f"tool_outputs/{MD_PROVENANCE_ARTIFACT}",
         },
     )
-    write_md_artifact_provenance(
+    provenance_path = write_md_artifact_provenance(
         binding,
         [
             summary_path,
-            *metric_paths,
-            ligand_placement_path,
-            trajectory_path,
+            metrics_path,
+            coordinate_path,
+            ensemble_path,
             run_manifest_path,
         ],
         tool_name="RDKit",
@@ -2448,6 +3154,13 @@ def write_peptide_conformer_artifacts(
             "parameterization": parameterization,
             "frame_count": len(frames),
         },
+    )
+    upsert_md_manifest_index(
+        binding,
+        status="completed",
+        reason="peptide_conformer_completed",
+        manifest=run_manifest_path.relative_to(binding.run_dir).as_posix(),
+        artifact_provenance=provenance_path.relative_to(binding.run_dir).as_posix(),
     )
 
 
@@ -2531,6 +3244,8 @@ def write_complex_md_manifest(
     gpu_status: dict[str, Any],
     model_metadata: dict[str, Any],
     binding: MdInvocationBinding,
+    platform_policy: str,
+    platform_failures: list[str],
 ) -> None:
     ensure_md_output_binding(binding.run_dir, candidate_id, input_id, binding)
     path = resolve_run_artifact(binding.run_dir, path, must_exist=False)
@@ -2540,24 +3255,34 @@ def write_complex_md_manifest(
             **binding_fields(binding),
             "method": "openmm_receptor_ligand_complex_dynamics",
             "platform": platform_name,
+            "platform_policy": platform_policy,
+            "platform_context_failures": platform_failures,
             "platform_properties": platform_properties,
             "system": model_metadata,
             "cuda_ready": platform_name == "CUDA" and bool(gpu_status["gpu_observed"]),
             "gpu_observed": bool(gpu_status["gpu_observed"]),
-            "gpu_telemetry_artifact": "tool_outputs/gpu_telemetry.tsv",
-            "gpu_telemetry_status_artifact": "tool_outputs/gpu_telemetry_status.tsv",
+            "gpu_telemetry_artifact": md_artifact_relative(binding, "gpu_telemetry.tsv"),
+            "gpu_telemetry_status_artifact": md_artifact_relative(
+                binding,
+                "gpu_telemetry_status.tsv",
+            ),
             "gpu_telemetry": gpu_status,
             "receptor_coordinate": relative_run_artifact(binding, receptor.path),
             "receptor_preparation": receptor.preparation,
-            "ligand_coordinate": "tool_outputs/ligand_placement.tsv",
+            "ligand_coordinate": md_artifact_relative(binding, "ligand_placement.tsv"),
             "ligand_parameterization": parameterization,
             "ligand_placement": placement_method,
-            "protocol_artifact": "tool_outputs/md_protocol.tsv",
-            "state_artifact": "tool_outputs/md_state.tsv",
-            "trajectory": "tool_outputs/md_trajectory.tsv",
+            "protocol_artifact": md_artifact_relative(binding, "md_protocol.tsv"),
+            "state_artifact": md_artifact_relative(binding, "md_state.tsv"),
+            "trajectory": md_artifact_relative(binding, "md_trajectory.tsv"),
             "metric_artifacts": metric_artifacts,
+            "metric_units": COMPLEX_MD_METRIC_UNITS,
             "risk_flags": risk_flags,
-            "artifact_provenance": f"tool_outputs/{MD_PROVENANCE_ARTIFACT}",
+            "artifact_provenance": md_artifact_relative(
+                binding,
+                MD_PROVENANCE_ARTIFACT,
+                must_exist=False,
+            ),
         },
     )
 

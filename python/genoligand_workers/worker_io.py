@@ -26,6 +26,15 @@ def read_job(path: str | Path) -> dict[str, Any]:
         raise ValueError("unsupported pipeline_mode")
     if job.get("rust_owned_decision_logic") is not True:
         raise ValueError("worker job must declare Rust-owned decision logic")
+    for field_name in ("run_id", "invocation_id"):
+        if not str(job.get(field_name, "")).strip():
+            raise ValueError(f"worker job must declare {field_name}")
+    if job.get("worker") == "md_summary" and job.get("platform_policy") not in {
+        "required",
+        "preferred",
+        "disabled",
+    }:
+        raise ValueError("md_summary job must declare platform_policy")
     return job
 
 
@@ -57,6 +66,8 @@ def write_result(
         "schema_version": SCHEMA_VERSION,
         "job_id": job["job_id"],
         "worker": job["worker"],
+        "run_id": str(job.get("run_id", "")).strip() or Path(str(job["run_dir"])).name,
+        "invocation_id": str(job.get("invocation_id", "")).strip(),
         "status": status,
         "engine_version": version,
         "execution_status": execution_status,
@@ -66,6 +77,18 @@ def write_result(
         "python_owns_report_semantics": False,
         "primitive_execution_only": True,
     }
+    for field_name in (
+        "candidate_id",
+        "candidate_digest",
+        "input_id",
+        "record_id",
+        "input_digest",
+        "source_digest",
+        "receptor_digest",
+    ):
+        value = str(job.get(field_name, "")).strip()
+        if value:
+            result[field_name] = value
     output = Path(path)
     output.parent.mkdir(parents=True, exist_ok=True)
     with output.open("w", encoding="utf-8") as handle:

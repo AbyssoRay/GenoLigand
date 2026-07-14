@@ -1,0 +1,41 @@
+{
+  "capture_schema_version": "genoligand_worker_contract_capture_v1",
+  "producer": {
+    "language": "Rust",
+    "source": "crates/gls-science/src/lib.rs",
+    "symbols": ["worker_job_value"],
+    "serialization": "serde_json worker job written to worker_jobs"
+  },
+  "jobs": [
+    {
+      "schema_version": "genoligand_worker_current_v2",
+      "pipeline_mode": "genoligand_scientific_pipeline",
+      "job_id": "mmseqs_onsite_sequence_alignment",
+      "worker": "mmseqs_alignment",
+      "stage": "onsite_sequence_alignment",
+      "run_id": "run-contract",
+      "invocation_id": "invocation_mmseqs_contract",
+      "rust_owned_decision_logic": true,
+      "decision_owner": "GenoLigand Rust core",
+      "input_manifest": "D:\\contract-capture\\input.json",
+      "run_dir": "D:\\contract-capture\\run-contract",
+      "science_store": "D:\\contract-capture\\science_store",
+      "expected_result_schema": "genoligand_worker_current_v2"
+    },
+    {
+      "schema_version": "genoligand_worker_current_v2",
+      "pipeline_mode": "genoligand_scientific_pipeline",
+      "job_id": "foldseek_onsite_structure_alignment",
+      "worker": "foldseek_alignment",
+      "stage": "onsite_structure_alignment",
+      "run_id": "run-contract",
+      "invocation_id": "invocation_foldseek_contract",
+      "rust_owned_decision_logic": true,
+      "decision_owner": "GenoLigand Rust core",
+      "input_manifest": "D:\\contract-capture\\input.json",
+      "run_dir": "D:\\contract-capture\\run-contract",
+      "science_store": "D:\\contract-capture\\science_store",
+      "expected_result_schema": "genoligand_worker_current_v2"
+    }
+  ]
+}

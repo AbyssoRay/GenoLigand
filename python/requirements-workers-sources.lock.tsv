@@ -1,0 +1,7 @@
+package	version	git_url	commit	archive_sha256
+openff-utilities	0.1.17.dev19	https://github.com/openforcefield/openff-utilities.git	ef92f3e661e4dcb1d7b8be80ec12352c0ff349b6	0cc90ab35692dfe999214aa37b8b17415f267a93c51bbeff4831ee004e8b760b
+openff-units	0.4.0b1	https://github.com/openforcefield/openff-units.git	17e8b6bf4e8c855ea22d2c9e9f57a57cb496c99e	b842947ed6134207ce03dbc55b4593a9874b24c405ff940967dfff27646f6376
+openff-toolkit	0.18.0	https://github.com/openforcefield/openff-toolkit.git	f63576a20fe8014c6b1d4c008bd43774c66a35c0	85f78bb1fffad8388a8a22f432d48faa2963e3af6cd478934f20eb99c08595d0
+openff-interchange	0.5.4.dev5	https://github.com/openforcefield/openff-interchange.git	190706c681e9564ea5ba82f0cc0de8a954e27f83	81a3e36b35d8faec0d19df426b676b56ae32e3d0dfe0b1dc4294dd22a7c92fef
+pdbfixer	1.12.0	https://github.com/openmm/pdbfixer.git	5e658a4fb8d2b90d65ca8408c845cbf104ce7099	a4b0cc666bf5badba81ffb7ed84cc2a8ed268704ac8ee7d167455de5233100fa
+openmmforcefields	0.15.0	https://github.com/openmm/openmmforcefields.git	6d91c7099e56e95e6f4b790f234889f663780b9c	7a7a30e97e5805e7ad15e82bdf82be4f40608c11b9b043557feeb647ec7c35ee

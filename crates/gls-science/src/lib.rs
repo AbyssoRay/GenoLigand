@@ -14,9 +14,11 @@ use zip::ZipArchive;
 
 mod input_conversion;
 
+#[cfg(test)]
+use input_conversion::extract_inputs;
 use input_conversion::{
-    INPUT_CONVERSION_HEADER, convert_inputs_from_manifest, extract_inputs,
-    normalized_inputs_from_conversions, write_input_conversion_manifest,
+    INPUT_CONVERSION_HEADER, convert_inputs_from_manifest, for_each_converted_input,
+    input_manifest_has_declared_input, write_input_conversion_row,
 };
 
 const WORKER_SCHEMA_VERSION: &str = "genoligand_worker_current_v2";
@@ -31,28 +33,29 @@ const METAGENOME_SCORE_WEIGHT: f64 = 0.25;
 const STRUCTURE_SCORE_WEIGHT: f64 = 0.10;
 const DOCKING_SCORE_WEIGHT: f64 = 0.05;
 const MD_SCORE_WEIGHT: f64 = 0.10;
+const RANKING_POLICY_VERSION: &str = "genoligand_target_ranking_v1";
+const SCIENCE_READINESS_SCHEMA_VERSION: &str = "genoligand_science_store_readiness_v1";
+const SCIENCE_READINESS_EVIDENCE_PATHS: &[&str] = &[
+    "source_requirements.tsv",
+    "manifests/source_file_manifest.tsv",
+    "install_status.json",
+    "index_build_manifest.tsv",
+    "index_readiness_manifest.tsv",
+    "science_index_readiness.tsv",
+    "indexes/known_targets.tsv",
+    "indexes/metagenome_targets.tsv",
+    "indexes/structure_targets.tsv",
+    "indexes/tool_versions.tsv",
+    "indexes/mmseqs/mmseqs_target_databases.tsv",
+    "indexes/foldseek/foldseek_target_databases.tsv",
+    "downloads/rcsb/ligand_bound_pdb_scope.json",
+    "downloads/rcsb/ligand_bound_pdb_scope.tsv",
+];
 static PYTHON_SCRIPT_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 static WORKER_INVOCATION_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+static PIPELINE_INVOCATION_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 const WORKER_INVOCATION_FILE: &str = "worker_invocation_id.txt";
-const AUTHENTICITY_FORBIDDEN_MARKERS: &[(&str, &str)] = &[
-    ("unit_test_fixture", "unit test fixture row"),
-    ("unit-test-fixture", "unit test fixture row"),
-    ("unit_test_store_fixture", "unit test fixture row"),
-    ("test_only", "test-only source row"),
-    ("test-only", "test-only source row"),
-    ("fixture", "fixture source row"),
-    ("smoke", "smoke output row"),
-    ("sample_output", "sample output row"),
-    ("sample_data", "sample data row"),
-    ("synthetic_placeholder", "synthetic placeholder row"),
-    ("placeholder_row", "synthetic placeholder row"),
-    ("static_fallback_candidate", "static fallback row"),
-    ("static_fallback", "static fallback row"),
-    ("static fallback", "static fallback row"),
-    ("demodb", "demo source row"),
-    ("demo_data", "demo source row"),
-    ("demo/sample", "demo source row"),
-];
+const PIPELINE_INVOCATION_FILE: &str = "pipeline_invocation_id.txt";
 
 #[derive(Clone, Debug)]
 pub struct ScienceOptions {
@@ -63,9 +66,30 @@ pub struct ScienceOptions {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ScienceStoreReadinessBlocker {
+    pub code: String,
+    pub component: String,
+    pub evidence: String,
+    pub repair_action: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ScienceStoreReadinessEvidence {
+    pub path: String,
+    pub sha256: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ScienceStoreReadiness {
+    pub status: String,
     pub ready: bool,
     pub blockers: Vec<String>,
+    pub blocker_details: Vec<ScienceStoreReadinessBlocker>,
+    pub repair_actions: Vec<String>,
+    pub evidence_manifest: Vec<ScienceStoreReadinessEvidence>,
+    pub evidence_digest: String,
+    pub sources: Vec<Value>,
+    pub indexes: Vec<Value>,
 }
 
 impl ScienceStoreReadiness {
@@ -77,27 +101,251 @@ impl ScienceStoreReadiness {
 pub fn evaluate_science_store_readiness(
     science_store: &Path,
 ) -> Result<ScienceStoreReadiness, String> {
-    let mut blockers = Vec::new();
-    evaluate_index_build_manifest(
-        science_store,
-        &science_store.join("index_build_manifest.tsv"),
-        &mut blockers,
-    )?;
-    for name in [
-        "index_readiness_manifest.tsv",
-        "science_index_readiness.tsv",
-    ] {
-        let path = science_store.join(name);
-        if path.is_file() {
-            evaluate_persisted_index_readiness(&path, &mut blockers)?;
-        }
+    let serialized = science_store.join("science_store_readiness.json");
+    if !serialized.is_file() {
+        return Ok(readiness_failure(
+            "science_store_readiness_missing",
+            "science_store_readiness.json is absent",
+            "run_science_store_installer",
+        ));
     }
-    blockers.sort();
-    blockers.dedup();
+    let value = match read_text(&serialized)
+        .ok()
+        .and_then(|text| serde_json::from_str::<Value>(text.trim_start_matches('\u{feff}')).ok())
+    {
+        Some(Value::Object(value)) => Value::Object(value),
+        _ => {
+            return Ok(readiness_failure(
+                "science_store_readiness_invalid",
+                "science_store_readiness.json is not valid JSON object",
+                "rerun_science_store_installer",
+            ));
+        }
+    };
+    if value.get("schema_version").and_then(Value::as_str) != Some(SCIENCE_READINESS_SCHEMA_VERSION)
+    {
+        return Ok(readiness_failure(
+            "science_store_readiness_invalid",
+            "schema_version mismatch",
+            "rerun_science_store_installer",
+        ));
+    }
+    let Some(expected_evidence) = parse_readiness_evidence(value.get("evidence_manifest")) else {
+        return Ok(readiness_failure(
+            "science_store_readiness_invalid",
+            "evidence_manifest is invalid",
+            "rerun_science_store_installer",
+        ));
+    };
+    let expected_digest = readiness_evidence_digest(&expected_evidence);
+    if value.get("evidence_digest").and_then(Value::as_str) != Some(&expected_digest) {
+        return Ok(readiness_failure(
+            "science_store_readiness_invalid",
+            "evidence_digest does not bind evidence_manifest",
+            "rerun_science_store_installer",
+        ));
+    }
+    let Ok((current_evidence, current_digest)) = science_readiness_evidence(science_store) else {
+        return Ok(readiness_failure(
+            "science_store_readiness_stale",
+            "current readiness evidence cannot be read",
+            "rerun_science_store_installer",
+        ));
+    };
+    if expected_evidence != current_evidence || expected_digest != current_digest {
+        return Ok(readiness_failure(
+            "science_store_readiness_stale",
+            "authoritative readiness evidence changed after generation",
+            "rerun_science_store_installer",
+        ));
+    }
+    let Some(blocker_values) = value.get("blockers").and_then(Value::as_array) else {
+        return Ok(readiness_failure(
+            "science_store_readiness_invalid",
+            "blockers is not an array",
+            "rerun_science_store_installer",
+        ));
+    };
+    let mut blocker_details = Vec::with_capacity(blocker_values.len());
+    for blocker in blocker_values {
+        let Some(code) = blocker.get("code").and_then(Value::as_str) else {
+            return Ok(readiness_failure(
+                "science_store_readiness_invalid",
+                "blocker code is missing",
+                "rerun_science_store_installer",
+            ));
+        };
+        let Some(component) = blocker.get("component").and_then(Value::as_str) else {
+            return Ok(readiness_failure(
+                "science_store_readiness_invalid",
+                "blocker component is missing",
+                "rerun_science_store_installer",
+            ));
+        };
+        let Some(evidence) = blocker.get("evidence").and_then(Value::as_str) else {
+            return Ok(readiness_failure(
+                "science_store_readiness_invalid",
+                "blocker evidence is missing",
+                "rerun_science_store_installer",
+            ));
+        };
+        let Some(repair_action) = blocker.get("repair_action").and_then(Value::as_str) else {
+            return Ok(readiness_failure(
+                "science_store_readiness_invalid",
+                "blocker repair_action is missing",
+                "rerun_science_store_installer",
+            ));
+        };
+        if code.trim().is_empty() {
+            return Ok(readiness_failure(
+                "science_store_readiness_invalid",
+                "blocker code is empty",
+                "rerun_science_store_installer",
+            ));
+        }
+        blocker_details.push(ScienceStoreReadinessBlocker {
+            code: code.to_string(),
+            component: component.to_string(),
+            evidence: evidence.to_string(),
+            repair_action: repair_action.to_string(),
+        });
+    }
+    let Some(repair_actions) = value
+        .get("repair_actions")
+        .and_then(Value::as_array)
+        .and_then(|values| {
+            values
+                .iter()
+                .map(|value| value.as_str().map(ToOwned::to_owned))
+                .collect::<Option<Vec<_>>>()
+        })
+    else {
+        return Ok(readiness_failure(
+            "science_store_readiness_invalid",
+            "repair_actions is not a string array",
+            "rerun_science_store_installer",
+        ));
+    };
+    let ready = value.get("ready").and_then(Value::as_bool);
+    let status = value.get("status").and_then(Value::as_str);
+    if !matches!(
+        (ready, status),
+        (Some(true), Some("ready")) | (Some(false), Some("needs_repair"))
+    ) || ready != Some(blocker_details.is_empty())
+        || blocker_details.iter().any(|blocker| {
+            !blocker.repair_action.is_empty() && !repair_actions.contains(&blocker.repair_action)
+        })
+    {
+        return Ok(readiness_failure(
+            "science_store_readiness_invalid",
+            "status, blockers, and repair_actions are inconsistent",
+            "rerun_science_store_installer",
+        ));
+    }
+    let blockers = blocker_details
+        .iter()
+        .map(|blocker| blocker.code.clone())
+        .collect();
+    let Some(sources) = value.get("sources").and_then(Value::as_array).cloned() else {
+        return Ok(readiness_failure(
+            "science_store_readiness_invalid",
+            "sources is not an array",
+            "rerun_science_store_installer",
+        ));
+    };
+    let Some(indexes) = value.get("indexes").and_then(Value::as_array).cloned() else {
+        return Ok(readiness_failure(
+            "science_store_readiness_invalid",
+            "indexes is not an array",
+            "rerun_science_store_installer",
+        ));
+    };
     Ok(ScienceStoreReadiness {
-        ready: blockers.is_empty(),
+        status: status.expect("validated status").to_string(),
+        ready: ready.expect("validated ready flag"),
         blockers,
+        blocker_details,
+        repair_actions,
+        evidence_manifest: current_evidence,
+        evidence_digest: current_digest,
+        sources,
+        indexes,
     })
+}
+
+fn readiness_failure(code: &str, evidence: &str, repair_action: &str) -> ScienceStoreReadiness {
+    ScienceStoreReadiness {
+        status: "needs_repair".to_string(),
+        ready: false,
+        blockers: vec![code.to_string()],
+        blocker_details: vec![ScienceStoreReadinessBlocker {
+            code: code.to_string(),
+            component: "science_store_readiness".to_string(),
+            evidence: evidence.to_string(),
+            repair_action: repair_action.to_string(),
+        }],
+        repair_actions: vec![repair_action.to_string()],
+        evidence_manifest: Vec::new(),
+        evidence_digest: String::new(),
+        sources: Vec::new(),
+        indexes: Vec::new(),
+    }
+}
+
+fn parse_readiness_evidence(value: Option<&Value>) -> Option<Vec<ScienceStoreReadinessEvidence>> {
+    let rows = value?.as_array()?;
+    let mut seen = BTreeSet::new();
+    rows.iter()
+        .map(|row| {
+            let path = row.get("path")?.as_str()?;
+            let sha256 = row.get("sha256")?.as_str()?;
+            if !SCIENCE_READINESS_EVIDENCE_PATHS.contains(&path)
+                || !seen.insert(path.to_string())
+                || !valid_sha256_hex(sha256)
+            {
+                return None;
+            }
+            Some(ScienceStoreReadinessEvidence {
+                path: path.to_string(),
+                sha256: sha256.to_ascii_lowercase(),
+            })
+        })
+        .collect()
+}
+
+fn science_readiness_evidence(
+    science_store: &Path,
+) -> Result<(Vec<ScienceStoreReadinessEvidence>, String), String> {
+    let mut evidence = Vec::new();
+    for rel_path in SCIENCE_READINESS_EVIDENCE_PATHS {
+        let path = science_store.join(rel_path);
+        if !path.is_file() {
+            continue;
+        }
+        let sha256 = sha256_file_hex(&path)
+            .ok_or_else(|| format!("science_readiness_evidence_read_failed:{rel_path}"))?;
+        evidence.push(ScienceStoreReadinessEvidence {
+            path: (*rel_path).to_string(),
+            sha256,
+        });
+    }
+    let digest = readiness_evidence_digest(&evidence);
+    Ok((evidence, digest))
+}
+
+fn readiness_evidence_digest(evidence: &[ScienceStoreReadinessEvidence]) -> String {
+    let mut hasher = Sha256::new();
+    for row in evidence {
+        hasher.update(row.path.as_bytes());
+        hasher.update(b"\t");
+        hasher.update(row.sha256.as_bytes());
+        hasher.update(b"\n");
+    }
+    hasher
+        .finalize()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
 }
 
 #[derive(Clone, Debug)]
@@ -227,15 +475,19 @@ impl InputKind {
 }
 
 #[derive(Clone, Debug)]
+#[allow(dead_code)]
 struct NormalizedInput {
     input_id: String,
     record_id: String,
     kind: InputKind,
     primary_value: String,
+    #[cfg_attr(not(test), allow(dead_code))]
     file_count: usize,
     tokens: BTreeSet<String>,
+    #[cfg_attr(not(test), allow(dead_code))]
     source_kind: &'static str,
     source_path: String,
+    #[cfg_attr(not(test), allow(dead_code))]
     content_sha256: String,
     structure_atom_count: usize,
     structure_chain_count: usize,
@@ -246,35 +498,35 @@ const NORMALIZED_INPUT_HEADER: &str = "input_id\tinput_kind\tprimary_value\tfile
 const FEATURE_MANIFEST_HEADER: &str = "input_id\tinput_kind\tfeature_family\tfeature_name\tfeature_value\tfeature_source\tfeature_token\trecord_id";
 
 #[derive(Clone, Copy, Debug)]
-struct WorkerTask {
-    job_id: &'static str,
+struct WorkerTask<'a> {
+    job_id: &'a str,
     worker: &'static str,
     module: &'static str,
     stage: &'static str,
 }
 
-const SCIENTIFIC_WORKER_TASKS: &[WorkerTask] = &[WorkerTask {
+const SCIENTIFIC_WORKER_TASKS: &[WorkerTask<'static>] = &[WorkerTask {
     job_id: "md_summary_ligand_dynamics",
     worker: "md_summary",
     module: "genoligand_workers.md_summary_worker",
     stage: "dynamics_summary_primitive",
 }];
 
-const SEQUENCE_ALIGNMENT_WORKER_TASK: WorkerTask = WorkerTask {
+const SEQUENCE_ALIGNMENT_WORKER_TASK: WorkerTask<'static> = WorkerTask {
     job_id: "mmseqs_onsite_sequence_alignment",
     worker: "mmseqs_alignment",
     module: "genoligand_workers.alignment_worker",
     stage: "onsite_sequence_alignment",
 };
 
-const STRUCTURE_ALIGNMENT_WORKER_TASK: WorkerTask = WorkerTask {
+const STRUCTURE_ALIGNMENT_WORKER_TASK: WorkerTask<'static> = WorkerTask {
     job_id: "foldseek_onsite_structure_alignment",
     worker: "foldseek_alignment",
     module: "genoligand_workers.alignment_worker",
     stage: "onsite_structure_alignment",
 };
 
-const DOCKING_WORKER_TASK: WorkerTask = WorkerTask {
+const DOCKING_WORKER_TASK: WorkerTask<'static> = WorkerTask {
     job_id: "autodock_vina_complex_docking",
     worker: "docking",
     module: "genoligand_workers.docking_worker",
@@ -282,6 +534,7 @@ const DOCKING_WORKER_TASK: WorkerTask = WorkerTask {
 };
 
 const REPORT_CANDIDATE_LIMIT: usize = 50;
+const COMPLEX_CANDIDATE_TOP_N: usize = 3;
 
 #[derive(Clone, Debug)]
 struct ComputedFeatureInput {
@@ -321,8 +574,17 @@ struct StoreRow {
 }
 
 #[derive(Clone, Debug)]
+struct CanonicalSourceBinding {
+    source_id: String,
+    source_path: String,
+    source_digest: String,
+}
+
+#[derive(Clone, Debug)]
 struct Candidate {
     candidate_id: String,
+    input_id: String,
+    record_id: String,
     identity_namespace: String,
     target_id: String,
     target_name: String,
@@ -355,6 +617,7 @@ struct IndexMatch {
 #[derive(Clone, Debug)]
 struct KnownStructureHint {
     input_id: String,
+    record_id: String,
     target_id: String,
     target_name: String,
     organism: String,
@@ -367,7 +630,9 @@ struct KnownStructureHint {
 #[derive(Clone, Debug)]
 struct SelectedComplexCandidate {
     candidate_id: String,
+    identity_namespace: String,
     input_id: String,
+    record_id: String,
     target_id: String,
     target_name: String,
     organism: String,
@@ -375,6 +640,26 @@ struct SelectedComplexCandidate {
     source: String,
     pdb_id: String,
     evidence: String,
+}
+
+#[derive(Clone, Debug)]
+struct CoordinateBackedCandidate {
+    selected: SelectedComplexCandidate,
+    coordinate_path: PathBuf,
+    priority: i64,
+    score: f64,
+}
+
+#[derive(Clone, Debug)]
+struct CandidateWorkerOutcome {
+    candidate_id: String,
+    input_id: String,
+    record_id: String,
+    job_id: String,
+    invocation_id: String,
+    status: String,
+    reason: String,
+    manifest: String,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -611,7 +896,7 @@ fn create_temporary_test_store(root: &Path) -> Result<PathBuf, String> {
     )?;
     write_text(
         &store.join("indexes/metagenome_targets.tsv"),
-        "source\ttarget_id\ttarget_name\torganism\ttarget_class\tligand_tokens\tsequence_tokens\tstructure_tokens\tevidence\n",
+        "source\ttarget_id\ttarget_name\torganism\ttarget_class\tligand_tokens\tsequence_tokens\tstructure_tokens\tevidence\nMGnify\tMGYP000000001\tTest metagenome protein\tmetagenome\tmetagenome_potential\t\tmetagenome test sequence\t\tunit_test_record\n",
     )?;
     write_text(
         &store.join("indexes/structure_targets.tsv"),
@@ -630,7 +915,7 @@ fn create_temporary_test_store(root: &Path) -> Result<PathBuf, String> {
     )?;
     write_text(
         &store.join("index_build_manifest.tsv"),
-        "index\tinput_path\tstatus\trows\toutput_path\tnotes\nknown_targets\tunit_test/known_targets.tsv\tused\t1\tindexes/known_targets.tsv\tfull_test_index\nmetagenome_targets\tunit_test/metagenome_targets.tsv\tempty\t0\tindexes/metagenome_targets.tsv\tfull_test_index\nstructure_targets\tunit_test/structure_targets.tsv\tused\t1\tindexes/structure_targets.tsv\tfull_test_index\n",
+        "index\tinput_path\tstatus\trows\toutput_path\tnotes\nknown_targets\tunit_test/known_targets.tsv\tused\t1\tindexes/known_targets.tsv\tfull_test_index\nmetagenome_targets\tunit_test/metagenome_targets.tsv\tused\t1\tindexes/metagenome_targets.tsv\tfull_test_index\nstructure_targets\tunit_test/structure_targets.tsv\tused\t1\tindexes/structure_targets.tsv\tfull_test_index\n",
     )?;
     let mut sources = String::from(
         "source_id\tlabel\tcategory\tstatus\tlanding_url\taccess_method\tlicense_note\tlocal_path\tindex_target\trepair_action\n",
@@ -650,7 +935,99 @@ fn create_temporary_test_store(root: &Path) -> Result<PathBuf, String> {
         ));
     }
     write_text(&store.join("source_requirements.tsv"), &sources)?;
+    ensure_dir(&store.join("manifests"))?;
+    let mut source_manifest = String::from(
+        "source_id\tsource_label\tsource_class\tlocal_path\tstatus\tfile_count\tbytes\tsha256\tprovenance\trelease_identity\ttrust_source\n",
+    );
+    for source in REQUIRED_SOURCES {
+        source_manifest.push_str(&format!(
+            "{}\t{}\tunit_test\t{}\tready\t1\t1\t{}\tunit_test\tunit_test_release\tunit_test\n",
+            source.id,
+            source.label,
+            source.local_rel_path,
+            "a".repeat(64)
+        ));
+    }
+    write_text(
+        &store.join("manifests/source_file_manifest.tsv"),
+        &source_manifest,
+    )?;
+    for (tool, db_rel) in [
+        ("mmseqs", "indexes/mmseqs/unit_test/target"),
+        ("foldseek", "indexes/foldseek/unit_test/target"),
+    ] {
+        let prefix = store.join(db_rel);
+        ensure_dir(prefix.parent().expect("unit test database parent"))?;
+        write_text(&prefix, "unit-test-database\n")?;
+        write_text(
+            &PathBuf::from(format!("{}.dbtype", prefix.display())),
+            "1234",
+        )?;
+        write_text(
+            &PathBuf::from(format!("{}.index", prefix.display())),
+            "index\n",
+        )?;
+        write_text(
+            &PathBuf::from(format!("{}.lookup", prefix.display())),
+            "lookup\n",
+        )?;
+        let manifest = store.join(format!("indexes/{tool}/{tool}_target_databases.tsv"));
+        write_text(
+            &manifest,
+            &format!(
+                "source_id\tmanifest_schema_version\tsource_namespace\tsource_class\tsource_digest\tsource_files\tsource_bytes\tbuilder_version\tdb_path\tstatus\nunit_test\tgenoligand_alignment_database_manifest_v2\tunit_test\tunit_test\t{}\t1\t1\tunit_test_builder\t{db_rel}\tready\n",
+                "a".repeat(64)
+            ),
+        )?;
+    }
+    write_test_science_store_readiness(&store, &[])?;
     Ok(store)
+}
+
+#[cfg(test)]
+fn write_test_science_store_readiness(
+    store: &Path,
+    blockers: &[(&str, &str, &str, &str)],
+) -> Result<(), String> {
+    let (evidence_manifest, evidence_digest) = science_readiness_evidence(store)?;
+    let blocker_values = blockers
+        .iter()
+        .map(|(code, component, evidence, repair_action)| {
+            json!({
+                "code": code,
+                "component": component,
+                "evidence": evidence,
+                "repair_action": repair_action,
+            })
+        })
+        .collect::<Vec<_>>();
+    let repair_actions = blockers
+        .iter()
+        .map(|(_, _, _, repair_action)| *repair_action)
+        .filter(|action| !action.is_empty())
+        .collect::<BTreeSet<_>>();
+    let evidence_values = evidence_manifest
+        .iter()
+        .map(|row| json!({"path": row.path, "sha256": row.sha256}))
+        .collect::<Vec<_>>();
+    write_text(
+        &store.join("science_store_readiness.json"),
+        &format!(
+            "{}\n",
+            json!({
+                "schema_version": SCIENCE_READINESS_SCHEMA_VERSION,
+                "status": if blockers.is_empty() {"ready"} else {"needs_repair"},
+                "ready": blockers.is_empty(),
+                "generated_at": 1,
+                "evidence_manifest": evidence_values,
+                "evidence_digest": evidence_digest,
+                "sources": [],
+                "indexes": [],
+                "blockers": blocker_values,
+                "repair_actions": repair_actions,
+            })
+        ),
+    )
 }
 
 #[cfg(test)]
@@ -2820,39 +3197,63 @@ fn first_nonempty_line(text: &str) -> Option<String> {
 
 fn run_pipeline(options: &ScienceOptions) -> Result<String, String> {
     ensure_dir(&options.run_dir)?;
+    let invocation_id = start_pipeline_invocation(options)?;
+    write_text(&options.run_dir.join("last_successful_stage.txt"), "none\n")?;
     write_run_context(options, "starting", &[])?;
-    let blocked = pipeline_blockers(options)?;
+    let blocked = pipeline_blockers(options).map_err(|err| {
+        record_pipeline_failure(options, &invocation_id, "preflight", &err);
+        format!("pipeline_failed:preflight:{err}")
+    })?;
     if !blocked.is_empty() {
-        write_blocked_outputs(options, &blocked)?;
+        let readiness = evaluate_science_store_readiness(&options.science_store)?;
+        write_blocked_outputs(options, &invocation_id, &blocked, &readiness)?;
         write_run_context(options, "blocked", &blocked)?;
-        return Ok(format!(
-            "pipeline_blocked\treasons={}\trun_dir={}",
+        return Err(format!(
+            "pipeline_blocked\treasons={}\trepair_actions={}\trun_dir={}",
             blocked.join(","),
+            readiness.repair_actions.join(","),
             options.run_dir.display()
         ));
     }
-    run_pipeline_stage(options, "input_normalize", || normalize_input(options))?;
-    run_pipeline_stage(options, "features_compute", || compute_features(options))?;
-    run_pipeline_stage(options, "onsite_sequence_alignment", || {
+    run_pipeline_stage(options, &invocation_id, "input_normalize", || {
+        normalize_input(options)
+    })?;
+    run_pipeline_stage(options, &invocation_id, "features_compute", || {
+        compute_features(options)
+    })?;
+    run_pipeline_stage(options, &invocation_id, "onsite_sequence_alignment", || {
         run_single_worker_task(options, &SEQUENCE_ALIGNMENT_WORKER_TASK)?;
         Ok("onsite_sequence_alignment_checked".to_string())
     })?;
-    run_pipeline_stage(options, "database_match_known", || match_known(options))?;
-    run_pipeline_stage(options, "metagenome_match_potential", || {
-        match_metagenome(options)
+    run_pipeline_stage(options, &invocation_id, "database_match_known", || {
+        match_known(options)
     })?;
-    run_pipeline_stage(options, "target_rank", || rank_targets(options))?;
-    run_pipeline_stage(options, "structure_evaluate", || {
+    run_pipeline_stage(
+        options,
+        &invocation_id,
+        "metagenome_match_potential",
+        || match_metagenome(options),
+    )?;
+    run_pipeline_stage(options, &invocation_id, "structure_evaluate", || {
         evaluate_structure(options)
     })?;
-    run_pipeline_stage(options, "dynamics_screen", || {
+    run_pipeline_stage(options, &invocation_id, "dynamics_screen", || {
         run_scientific_workers(options)?;
         screen_dynamics(options)
     })?;
-    run_pipeline_stage(options, "target_rank", || rank_targets(options))?;
-    run_pipeline_stage(options, "evidence_build", || build_evidence(options))?;
-    run_pipeline_stage(options, "report_render", || render_report(options))?;
+    run_pipeline_stage(options, &invocation_id, "target_rank", || {
+        rank_targets(options)
+    })?;
+    run_pipeline_stage(options, &invocation_id, "evidence_build", || {
+        build_evidence(options)
+    })?;
+    run_pipeline_stage(options, &invocation_id, "report_render", || {
+        render_report(options)
+    })?;
     write_artifact_source_map(options)?;
+    if !pipeline_invocation_is_current(options, &invocation_id) {
+        return Err("pipeline_invocation_superseded".to_string());
+    }
     write_text(&options.run_dir.join("run_state.txt"), "completed\n")?;
     write_run_context(options, "completed", &[])?;
     Ok(format!(
@@ -2863,6 +3264,7 @@ fn run_pipeline(options: &ScienceOptions) -> Result<String, String> {
 
 fn run_pipeline_stage<F>(
     options: &ScienceOptions,
+    invocation_id: &str,
     stage: &str,
     operation: F,
 ) -> Result<String, String>
@@ -2873,374 +3275,133 @@ where
         &options.run_dir.join("current_stage.txt"),
         &(stage.to_string() + "\n"),
     )?;
-    operation()
+    if !pipeline_invocation_is_current(options, invocation_id) {
+        return Err("pipeline_invocation_superseded".to_string());
+    }
+    match operation() {
+        Ok(result) => {
+            write_text(
+                &options.run_dir.join("last_successful_stage.txt"),
+                &(stage.to_string() + "\n"),
+            )?;
+            Ok(result)
+        }
+        Err(err) => {
+            record_pipeline_failure(options, invocation_id, stage, &err);
+            Err(format!("pipeline_failed:{stage}:{err}"))
+        }
+    }
 }
 
-fn evaluate_index_build_manifest(
-    science_store: &Path,
-    path: &Path,
-    blockers: &mut Vec<String>,
-) -> Result<(), String> {
-    if !path.is_file() {
-        blockers.push("missing_index_build_manifest".to_string());
-        return Ok(());
+fn start_pipeline_invocation(options: &ScienceOptions) -> Result<String, String> {
+    let sequence = PIPELINE_INVOCATION_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+    let millis = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_millis())
+        .unwrap_or_default();
+    let invocation_id = format!("pipeline_{millis}_{sequence}");
+    write_text(
+        &options.run_dir.join(PIPELINE_INVOCATION_FILE),
+        &(invocation_id.clone() + "\n"),
+    )?;
+    Ok(invocation_id)
+}
+
+fn pipeline_invocation_is_current(options: &ScienceOptions, invocation_id: &str) -> bool {
+    read_text(&options.run_dir.join(PIPELINE_INVOCATION_FILE))
+        .is_ok_and(|value| value.trim() == invocation_id)
+}
+
+fn repair_action_for_stage(stage: &str) -> &'static str {
+    match stage {
+        "preflight" => "repair_science_store_or_input_then_rerun",
+        "input_normalize" => "correct_the_reported_input_record_then_rerun",
+        "onsite_sequence_alignment" | "database_match_known" | "metagenome_match_potential" => {
+            "repair_the_reported_database_or_worker_then_rerun"
+        }
+        "structure_evaluate" | "dynamics_screen" => {
+            "repair_the_reported_candidate_artifact_or_worker_then_rerun"
+        }
+        _ => "inspect_failure_reason_then_rerun",
     }
-    let file = fs::File::open(path)
-        .map_err(|err| format!("index_build_manifest_open_failed:{}:{err}", path.display()))?;
-    let mut lines = BufReader::new(file).lines();
-    let Some(header) = lines.next() else {
-        blockers.push("empty_index_build_manifest".to_string());
-        return Ok(());
-    };
-    let headers = split_tsv(
-        header
-            .map_err(|err| format!("index_build_manifest_read_failed:{err}"))?
-            .trim_start_matches('\u{feff}'),
+}
+
+fn stable_pipeline_error_code(reason: &str) -> String {
+    reason
+        .split([':', '\t', '\n'])
+        .next()
+        .map(clean_cell)
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| "pipeline_stage_failed".to_string())
+}
+
+fn record_pipeline_failure(
+    options: &ScienceOptions,
+    invocation_id: &str,
+    stage: &str,
+    reason: &str,
+) {
+    if !pipeline_invocation_is_current(options, invocation_id) {
+        return;
+    }
+    let last_successful_stage = read_text(&options.run_dir.join("last_successful_stage.txt"))
+        .unwrap_or_else(|_| "none".to_string());
+    let failure = format!(
+        "schema_version=genoligand_pipeline_failure_v1\nstate=failed\nerror_code={}\nstage={}\ninvocation_id={}\nlast_successful_stage={}\nrepair_action={}\nreason={}\n",
+        stable_pipeline_error_code(reason),
+        clean_cell(stage),
+        clean_cell(invocation_id),
+        clean_cell(last_successful_stage.trim()),
+        repair_action_for_stage(stage),
+        clean_cell(reason),
     );
-    let required = |name: &str| {
-        headers
-            .iter()
-            .position(|header| header == name)
-            .ok_or_else(|| format!("index_build_manifest_schema_missing:{name}"))
-    };
-    let index_idx = required("index")?;
-    let input_idx = required("input_path")?;
-    let status_idx = required("status")?;
-    let rows_idx = required("rows")?;
-    let output_idx = required("output_path")?;
-    let notes_idx = required("notes")?;
-    let required_columns = [
-        index_idx, input_idx, status_idx, rows_idx, output_idx, notes_idx,
-    ]
-    .into_iter()
-    .max()
-    .unwrap_or_default()
-        + 1;
-    let mut saw_row = false;
-    for (line_index, line) in lines.enumerate() {
-        let line = line.map_err(|err| format!("index_build_manifest_read_failed:{err}"))?;
-        if line.trim().is_empty() {
-            continue;
-        }
-        saw_row = true;
-        let cols = split_tsv(&line);
-        if cols.len() < required_columns {
-            blockers.push(format!(
-                "index_build_manifest_malformed_row:line_{}",
-                line_index + 2
-            ));
-            continue;
-        }
-        let index = cols[index_idx].trim();
-        let input_path = cols[input_idx].trim();
-        let status = cols[status_idx].trim();
-        let output_path = cols[output_idx].trim();
-        let notes = cols[notes_idx].trim();
-        if notes.contains("index_row_limit_reached") {
-            blockers.push(index_projection_blocker(
-                index,
-                input_path,
-                "index_row_limit_reached",
-            ));
-        }
-        if status != "used" {
-            continue;
-        }
-        let row_count = match cols[rows_idx].trim().parse::<u64>() {
-            Ok(value) => value,
-            Err(_) => {
-                blockers.push(index_projection_blocker(
-                    index,
-                    input_path,
-                    "invalid_row_count",
-                ));
-                continue;
-            }
-        };
-        if legacy_5000_row_projection(input_path, output_path, notes, row_count) {
-            blockers.push(index_projection_blocker(
-                index,
-                input_path,
-                "legacy_5000_row_projection",
-            ));
-        } else if row_count <= 10_000 && large_projection_source(science_store, input_path) {
-            blockers.push(index_projection_blocker(
-                index,
-                input_path,
-                "large_source_small_tsv_projection",
-            ));
-        }
-    }
-    if !saw_row {
-        blockers.push("empty_index_build_manifest".to_string());
-    }
-    Ok(())
-}
-
-fn evaluate_persisted_index_readiness(
-    path: &Path,
-    blockers: &mut Vec<String>,
-) -> Result<(), String> {
-    let file = fs::File::open(path).map_err(|err| {
-        format!(
-            "index_readiness_manifest_open_failed:{}:{err}",
-            path.display()
-        )
-    })?;
-    let mut lines = BufReader::new(file).lines();
-    let Some(header) = lines.next() else {
-        return Ok(());
-    };
-    let headers = split_tsv(
-        header
-            .map_err(|err| format!("index_readiness_manifest_read_failed:{err}"))?
-            .trim_start_matches('\u{feff}'),
+    let _ = write_text(&options.run_dir.join("run_state.txt"), "failed\n");
+    let _ = write_text(&options.run_dir.join("failure_reason.txt"), &failure);
+    let _ = write_run_context(
+        options,
+        "failed",
+        &[format!("{stage}:{}", clean_cell(reason))],
     );
-    let status_idx = headers
-        .iter()
-        .position(|header| header == "readiness_status")
-        .ok_or_else(|| "index_readiness_manifest_schema_missing:readiness_status".to_string())?;
-    let reason_idx = headers.iter().position(|header| header == "reason");
-    let index_idx = headers.iter().position(|header| header == "index");
-    let input_idx = headers.iter().position(|header| header == "input_path");
-    for line in lines {
-        let line = line.map_err(|err| format!("index_readiness_manifest_read_failed:{err}"))?;
-        if line.trim().is_empty() {
-            continue;
-        }
-        let cols = split_tsv(&line);
-        let status = cols.get(status_idx).map(String::as_str).unwrap_or_default();
-        if !matches!(status, "projection_only" | "incomplete") {
-            continue;
-        }
-        blockers.push(index_projection_blocker(
-            index_idx
-                .and_then(|idx| cols.get(idx))
-                .map(String::as_str)
-                .unwrap_or("unknown_index"),
-            input_idx
-                .and_then(|idx| cols.get(idx))
-                .map(String::as_str)
-                .unwrap_or("unknown_source"),
-            reason_idx
-                .and_then(|idx| cols.get(idx))
-                .map(String::as_str)
-                .filter(|reason| !reason.trim().is_empty())
-                .unwrap_or(status),
-        ));
-    }
-    Ok(())
-}
-
-fn index_projection_blocker(index: &str, input_path: &str, reason: &str) -> String {
-    format!(
-        "science_index_projection_incomplete:{}:{}:{}",
-        clean_cell(index),
-        clean_cell(input_path),
-        clean_cell(reason)
-    )
-}
-
-fn legacy_5000_row_projection(
-    input_path: &str,
-    output_path: &str,
-    notes: &str,
-    row_count: u64,
-) -> bool {
-    if row_count != 5_000 || !output_path.to_ascii_lowercase().ends_with(".tsv") {
-        return false;
-    }
-    let input = input_path.to_ascii_lowercase();
-    let notes = notes.to_ascii_lowercase();
-    if notes.split(';').any(|note| note == "complete_source_scan") {
-        return false;
-    }
-    ["bindingdb", "chembl", "uniprot", "metagenome", "mgnify"]
-        .iter()
-        .any(|marker| input.contains(marker))
-        || matches!(
-            notes.as_str(),
-            "canonical_or_source_table_rows"
-                | "chembl_sqlite_archive_rows"
-                | "chembl_sqlite_rows"
-                | "fasta_sequence_rows"
-        )
-}
-
-fn large_projection_source(science_store: &Path, input_path: &str) -> bool {
-    if input_path.trim().is_empty() {
-        return false;
-    }
-    let input = PathBuf::from(input_path);
-    let path = if input.is_absolute() {
-        input
-    } else {
-        science_store.join(input)
-    };
-    let threshold = env::var("GENOLIGAND_PARTIAL_INDEX_LARGE_SOURCE_BYTES")
-        .ok()
-        .and_then(|value| value.trim().parse::<u64>().ok())
-        .unwrap_or_else(|| {
-            if input_path.to_ascii_lowercase().contains("bindingdb") {
-                500 * 1024 * 1024
-            } else {
-                1024 * 1024 * 1024
-            }
-        });
-    threshold > 0
-        && fs::metadata(path)
-            .map(|metadata| metadata.len() > threshold)
-            .unwrap_or(false)
 }
 
 fn pipeline_blockers(options: &ScienceOptions) -> Result<Vec<String>, String> {
     let mut blockers = Vec::new();
     if !options.input_manifest.exists() {
         blockers.push("missing_input_manifest".to_string());
-    } else if extract_inputs(options)?.is_empty() {
+    } else if !input_manifest_has_declared_input(options)? {
         blockers.push("missing_input".to_string());
     }
-    let manifest = options.science_store.join("science_store_manifest.tsv");
-    let known = options.science_store.join("indexes/known_targets.tsv");
-    let metagenome = options.science_store.join("indexes/metagenome_targets.tsv");
-    let structure = options.science_store.join("indexes/structure_targets.tsv");
-    let tools = options.science_store.join("indexes/tool_versions.tsv");
-    for (label, path) in [
-        ("missing_science_store_manifest", manifest),
-        ("missing_known_database_index", known),
-        ("missing_metagenome_potential_index", metagenome),
-        ("missing_structure_interaction_index", structure),
-        ("missing_tool_versions_manifest", tools),
-    ] {
-        if !path.exists() {
-            blockers.push(label.to_string());
-        }
-    }
-    let status = options.science_store.join("install_status.json");
-    if status.exists() {
-        let status_text = read_text(&status)?;
-        let value: Value = serde_json::from_str(status_text.trim_start_matches('\u{feff}'))
-            .map_err(|err| format!("install_status_parse_failed:{err}"))?;
-        if value.get("status").and_then(Value::as_str) != Some("ready") {
-            blockers.push("science_store_needs_repair".to_string());
-        }
-    } else {
-        blockers.push("missing_install_status".to_string());
-    }
-    let source_requirements = options.science_store.join("source_requirements.tsv");
-    if source_requirements.exists() {
-        for source in unready_source_ids(&source_requirements)? {
-            blockers.push(format!("source_needs_repair:{source}"));
-        }
-    } else {
-        blockers.push("missing_source_requirements".to_string());
-    }
-    if options
-        .science_store
-        .join("indexes/tool_versions.tsv")
-        .exists()
-    {
-        let tool_text = read_text(&options.science_store.join("indexes/tool_versions.tsv"))?;
-        for tool in REQUIRED_TOOLS {
-            if !tool_text.lines().any(|line| {
-                line.split('\t')
-                    .next()
-                    .is_some_and(|name| name.eq_ignore_ascii_case(tool.id))
-                    && line.contains("\tready\t")
-            }) {
-                blockers.push(format!("missing_or_unready_tool:{}", tool.id));
-            }
-        }
-    }
-    if alignment_database_manifest_required(&options.science_store)
-        && !alignment_database_manifest_ready(&options.science_store)?
-    {
-        blockers.push("alignment_database_needs_repair".to_string());
-    }
-    match evaluate_science_store_readiness(&options.science_store) {
-        Ok(readiness) => blockers.extend(readiness.blockers),
-        Err(err) => blockers.push(format!(
-            "science_store_readiness_failed:{}",
-            clean_cell(&err)
-        )),
-    }
+    let readiness = evaluate_science_store_readiness(&options.science_store)?;
+    blockers.extend(readiness.blockers);
+    blockers.sort();
+    blockers.dedup();
     Ok(blockers)
 }
 
-fn alignment_database_manifest_required(store: &Path) -> bool {
-    store
-        .join("indexes/mmseqs/mmseqs_target_databases.tsv")
-        .exists()
-        || store
-            .join("indexes/foldseek/foldseek_target_databases.tsv")
-            .exists()
-}
-
-fn alignment_database_manifest_ready(store: &Path) -> Result<bool, String> {
-    for rel in [
-        "indexes/mmseqs/mmseqs_target_databases.tsv",
-        "indexes/foldseek/foldseek_target_databases.tsv",
-    ] {
-        let path = store.join(rel);
-        if !path.exists() {
-            return Ok(false);
-        }
-        let rows = read_simple_tsv_rows(&path)?;
-        if rows.is_empty()
-            || rows
-                .iter()
-                .any(|row| row.get("status").map(String::as_str) != Some("ready"))
-        {
-            return Ok(false);
-        }
-    }
-    Ok(true)
-}
-
-fn unready_source_ids(path: &Path) -> Result<Vec<String>, String> {
-    let text = read_text(path)?;
-    let mut lines = text.lines();
-    let Some(header) = lines.next() else {
-        return Ok(vec!["source_requirements_empty".to_string()]);
-    };
-    let headers = header.split('\t').collect::<Vec<_>>();
-    let source_index = headers
-        .iter()
-        .position(|value| *value == "source_id")
-        .unwrap_or(0);
-    let status_index = headers
-        .iter()
-        .position(|value| *value == "status")
-        .unwrap_or(3);
-    Ok(lines
-        .filter(|line| !line.trim().is_empty())
-        .filter_map(|line| {
-            let cols = line.split('\t').collect::<Vec<_>>();
-            let status = cols.get(status_index).copied().unwrap_or("");
-            if status == "ready" {
-                None
-            } else {
-                Some(
-                    cols.get(source_index)
-                        .copied()
-                        .unwrap_or("source")
-                        .to_string(),
-                )
-            }
-        })
-        .collect())
-}
-
-fn write_blocked_outputs(options: &ScienceOptions, blockers: &[String]) -> Result<(), String> {
+fn write_blocked_outputs(
+    options: &ScienceOptions,
+    invocation_id: &str,
+    blockers: &[String],
+    readiness: &ScienceStoreReadiness,
+) -> Result<(), String> {
     ensure_dir(&options.run_dir)?;
+    if !pipeline_invocation_is_current(options, invocation_id) {
+        return Err("pipeline_invocation_superseded".to_string());
+    }
     write_text(&options.run_dir.join("run_state.txt"), "blocked\n")?;
     write_text(
         &options.run_dir.join("failure_reason.txt"),
-        &blockers.join("\n"),
+        &format!(
+            "schema_version=genoligand_pipeline_failure_v1\nstate=blocked\nerror_code=pipeline_preflight_blocked\nstage=preflight\ninvocation_id={}\nlast_successful_stage=none\nrepair_action=repair_science_store_or_input_then_rerun\nblockers={}\nreadiness_evidence={}\nreadiness_repair_actions={}\n",
+            clean_cell(invocation_id),
+            clean_cell(&blockers.join(",")),
+            clean_cell(&readiness_blocker_details(readiness)),
+            clean_cell(&readiness.repair_actions.join(",")),
+        ),
     )?;
     write_text(
         &options.run_dir.join("target_candidate_ranking.tsv"),
-        "rank\tcandidate_id\ttarget_id\ttarget_name\tcandidate_scope\torganism\tfinal_score\tknown_database_score\tmetagenome_score\tstructure_score\tdocking_score\tmd_score\tevidence_summary\tstatus\n",
+        "rank\tcandidate_id\ttarget_id\ttarget_name\tcandidate_scope\torganism\tfinal_score\tknown_database_score\tmetagenome_score\tstructure_score\tdocking_score\tmd_score\tevidence_summary\tstatus\tinput_id\trecord_id\tidentity_namespace\n",
     )?;
     write_text(
         &options.run_dir.join("candidate_detail.json"),
@@ -3257,48 +3418,124 @@ fn write_blocked_outputs(options: &ScienceOptions, blockers: &[String]) -> Resul
     Ok(())
 }
 
+fn readiness_blocker_details(readiness: &ScienceStoreReadiness) -> String {
+    readiness
+        .blocker_details
+        .iter()
+        .map(|blocker| {
+            format!(
+                "{}|component={}|evidence={}|repair_action={}",
+                clean_cell(&blocker.code),
+                clean_cell(&blocker.component),
+                clean_cell(&blocker.evidence),
+                clean_cell(&blocker.repair_action),
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(";")
+}
+
 fn normalize_input(options: &ScienceOptions) -> Result<String, String> {
     ensure_dir(&options.run_dir)?;
-    let conversions = convert_inputs_from_manifest(options)?;
-    write_input_conversion_manifest(options, &conversions)?;
-    if let Some(failed) = conversions
-        .iter()
-        .find(|input| input.conversion_status == "failed")
-    {
-        write_artifact_source_map(options)?;
-        return Err(format!(
-            "input_conversion_failed:{}:{}",
-            failed.input_id,
-            clean_cell(&failed.reason)
-        ));
+    let conversion_path = options.run_dir.join("input_conversion_manifest.tsv");
+    let normalized_path = options.run_dir.join("input_normalized_manifest.tsv");
+    let conversion_pending = options
+        .run_dir
+        .join("input_conversion_manifest.tsv.pending");
+    let normalized_pending = options
+        .run_dir
+        .join("input_normalized_manifest.tsv.pending");
+    let mut conversion_writer = BufWriter::new(
+        fs::File::create(&conversion_pending)
+            .map_err(|err| format!("input_conversion_manifest_write_failed:{err}"))?,
+    );
+    let mut normalized_writer = BufWriter::new(
+        fs::File::create(&normalized_pending)
+            .map_err(|err| format!("input_normalized_manifest_write_failed:{err}"))?,
+    );
+    writeln!(conversion_writer, "{INPUT_CONVERSION_HEADER}")
+        .map_err(|err| format!("input_conversion_manifest_write_failed:{err}"))?;
+    writeln!(normalized_writer, "{NORMALIZED_INPUT_HEADER}")
+        .map_err(|err| format!("input_normalized_manifest_write_failed:{err}"))?;
+    let mut failed = None::<(String, String)>;
+    let mut normalized_rows = 0usize;
+    let mut row_count = 0usize;
+    let conversion_result = for_each_converted_input(options, |input| {
+        write_input_conversion_row(&mut conversion_writer, input)
+            .map_err(|err| format!("input_conversion_manifest_write_failed:{err}"))?;
+        row_count += 1;
+        if input.conversion_status == "failed" {
+            if failed.is_none() {
+                failed = Some((input.input_id.clone(), clean_cell(&input.reason)));
+            }
+        } else if let Some(kind) = input.canonical_kind {
+            let tokens = tokenize(&input.canonical_value)
+                .into_iter()
+                .collect::<Vec<_>>()
+                .join(" ");
+            writeln!(
+                normalized_writer,
+                "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\tnormalized\t{}\t{}\t{}",
+                input.input_id,
+                kind.as_str(),
+                encode_tsv_cell(&input.canonical_value),
+                input.file_count,
+                tokens,
+                clean_cell(&input.record_id),
+                input.source_kind,
+                clean_cell(&input.source_path),
+                input.content_sha256,
+                input.structure_atom_count,
+                input.structure_chain_count,
+                input.structure_residue_count,
+            )
+            .map_err(|err| format!("input_normalized_manifest_write_failed:{err}"))?;
+            normalized_rows += 1;
+        }
+        if row_count.is_multiple_of(input_conversion::INPUT_MANIFEST_WRITE_BATCH_SIZE) {
+            conversion_writer
+                .flush()
+                .map_err(|err| format!("input_conversion_manifest_write_failed:{err}"))?;
+            normalized_writer
+                .flush()
+                .map_err(|err| format!("input_normalized_manifest_write_failed:{err}"))?;
+        }
+        Ok(())
+    });
+    if let Err(err) = conversion_result {
+        drop(conversion_writer);
+        drop(normalized_writer);
+        let _ = fs::remove_file(&conversion_pending);
+        let _ = fs::remove_file(&normalized_pending);
+        return Err(err);
     }
-    let inputs = normalized_inputs_from_conversions(&conversions);
-    if inputs.is_empty() {
+    conversion_writer
+        .flush()
+        .map_err(|err| format!("input_conversion_manifest_write_failed:{err}"))?;
+    normalized_writer
+        .flush()
+        .map_err(|err| format!("input_normalized_manifest_write_failed:{err}"))?;
+    drop(conversion_writer);
+    drop(normalized_writer);
+    publish_pending_file(&conversion_pending, &conversion_path)?;
+    write_json_manifest(
+        &options.run_dir.join("input_conversion_manifest.json"),
+        "input_conversion_manifest.tsv",
+        "converted",
+    )?;
+    if let Some((input_id, reason)) = failed {
+        let _ = fs::remove_file(&normalized_pending);
+        let _ = fs::remove_file(&normalized_path);
+        write_artifact_source_map(options)?;
+        return Err(format!("input_conversion_failed:{input_id}:{reason}"));
+    }
+    if normalized_rows == 0 {
+        let _ = fs::remove_file(&normalized_pending);
+        let _ = fs::remove_file(&normalized_path);
         write_artifact_source_map(options)?;
         return Err("missing_input".to_string());
     }
-    let mut normalized = format!("{NORMALIZED_INPUT_HEADER}\n");
-    for input in inputs {
-        normalized.push_str(&format!(
-            "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\tnormalized\t{}\t{}\t{}\n",
-            input.input_id,
-            input.kind.as_str(),
-            encode_tsv_cell(&input.primary_value),
-            input.file_count,
-            input.tokens.iter().cloned().collect::<Vec<_>>().join(" "),
-            clean_cell(&input.record_id),
-            input.source_kind,
-            clean_cell(&input.source_path),
-            input.content_sha256,
-            input.structure_atom_count,
-            input.structure_chain_count,
-            input.structure_residue_count,
-        ));
-    }
-    write_text(
-        &options.run_dir.join("input_normalized_manifest.tsv"),
-        &normalized,
-    )?;
+    publish_pending_file(&normalized_pending, &normalized_path)?;
     write_json_manifest(
         &options.run_dir.join("input_normalized_manifest.json"),
         "input_normalized_manifest.tsv",
@@ -3312,6 +3549,20 @@ fn normalize_input(options: &ScienceOptions) -> Result<String, String> {
             .join("input_normalized_manifest.tsv")
             .display()
     ))
+}
+
+fn publish_pending_file(pending: &Path, output: &Path) -> Result<(), String> {
+    if output.exists() {
+        fs::remove_file(output)
+            .map_err(|err| format!("remove_failed:{}:{err}", output.display()))?;
+    }
+    fs::rename(pending, output).map_err(|err| {
+        format!(
+            "rename_failed:{}:{}:{err}",
+            pending.display(),
+            output.display()
+        )
+    })
 }
 
 fn compute_features(options: &ScienceOptions) -> Result<String, String> {
@@ -3393,39 +3644,48 @@ fn match_known(options: &ScienceOptions) -> Result<String, String> {
         b"input_id\tsource\ttarget_id\ttarget_name\torganism\ttarget_class\tmatch_score\tmatched_features\tevidence\tsource_row_provenance\tactivity_value\tligand_identity\tcurrent_run_query_id\trecord_id\n",
     )
     .map_err(|err| format!("write_failed:{}:{err}", output_path.display()))?;
-    for_each_store_row_batch(
-        &options.science_store.join("indexes/known_targets.tsv"),
-        "known_database_index",
-        |rows| {
-            for input in &inputs {
-                for row in rows {
-                    let score = known_database_match_score(input, row);
-                    if score > 0.0 {
-                        let matched = matched_tokens(input, row).join(" ");
-                        writeln!(
-                            out,
-                            "{}\t{}\t{}\t{}\t{}\t{}\t{score:.4}\t{}\t{}\t{}\t\t{}\tprojection_index_match\t{}",
-                            input.input_id,
-                            row.source,
-                            row.target_id,
-                            clean_cell(&row.target_name),
-                            clean_cell(&row.organism),
-                            row.target_class,
-                            clean_cell(&matched),
-                            clean_cell(&row.evidence),
-                            clean_cell(&row.evidence),
-                            clean_cell(&matched),
-                            clean_cell(&input.record_id),
-                        )
-                        .map_err(|err| {
-                            format!("write_failed:{}:{err}", output_path.display())
-                        })?;
-                    }
+    let known_index = options.science_store.join("indexes/known_targets.tsv");
+    for_each_store_row_batch(&known_index, "known_database_index", |rows| {
+        for input in &inputs {
+            for row in rows {
+                let score = known_database_match_score(input, row);
+                if score > 0.0 {
+                    let matched = matched_tokens(input, row).join(" ");
+                    let evidence =
+                        bind_database_evidence(options, &row.source, &clean_cell(&row.evidence))?;
+                    let source_digest = evidence_field(&evidence, &["source_digest"]);
+                    let query_digest = canonical_json_sha256(&json!({
+                        "input_id": &input.input_id,
+                        "record_id": &input.record_id,
+                        "target_id": &row.target_id,
+                        "source": &row.source,
+                        "source_digest": &source_digest,
+                    }));
+                    let evidence = format!("{evidence};query_digest={query_digest}");
+                    let source_provenance =
+                        bind_database_evidence(options, &row.source, "known_database_index")?;
+                    writeln!(
+                        out,
+                        "{}\t{}\t{}\t{}\t{}\t{}\t{score:.4}\t{}\t{}\t{}\t\t{}\t{}\t{}",
+                        input.input_id,
+                        row.source,
+                        row.target_id,
+                        clean_cell(&row.target_name),
+                        clean_cell(&row.organism),
+                        row.target_class,
+                        clean_cell(&matched),
+                        evidence,
+                        source_provenance,
+                        clean_cell(&matched),
+                        query_digest,
+                        clean_cell(&input.record_id),
+                    )
+                    .map_err(|err| format!("write_failed:{}:{err}", output_path.display()))?;
                 }
             }
-            Ok(())
-        },
-    )?;
+        }
+        Ok(())
+    })?;
     append_chembl_onsite_matches(options, &normalized, &mut out)?;
     append_bindingdb_onsite_matches(options, &normalized, &mut out)?;
     let mut mmseqs = String::new();
@@ -3460,8 +3720,10 @@ fn append_chembl_onsite_matches<W: Write>(
     if small_molecules.is_empty() {
         return Ok(());
     }
-    let sources = discover_chembl_sqlite_sources(&options.science_store.join("downloads/chembl"))?;
-    if sources.is_empty() {
+    let source = options
+        .science_store
+        .join("downloads/chembl/chembl_query.sqlite");
+    if !source.is_file() {
         return Ok(());
     }
     ensure_dir(&options.run_dir)?;
@@ -3477,18 +3739,24 @@ fn append_chembl_onsite_matches<W: Write>(
     }
     write_text(&query_path, &queries)?;
     let result_path = temporary_data_path(&options.run_dir, "chembl_onsite_matches", "tsv");
-    let mut args = sources
-        .iter()
-        .map(|source| source.display().to_string())
-        .collect::<Vec<_>>();
-    args.push(query_path.display().to_string());
-    args.push(result_path.display().to_string());
+    let run_id = infer_run_id(&options.run_dir);
+    let query_invocation = format!(
+        "chembl_query_{}",
+        stable_hash(&format!("{run_id}:{}", stable_hash(&queries)))
+    );
+    let args = vec![
+        source.display().to_string(),
+        query_path.display().to_string(),
+        result_path.display().to_string(),
+        run_id,
+        query_invocation,
+    ];
     let result = run_python_script(chembl_onsite_query_script(), &args, "chembl_onsite_query");
     if let Err(err) = result {
         let _ = fs::remove_file(&result_path);
         return Err(err);
     }
-    let copy_result = append_file_to_writer(&result_path, out, "chembl_onsite_results");
+    let copy_result = append_bound_known_rows(options, &result_path, out);
     let _ = fs::remove_file(&result_path);
     copy_result
 }
@@ -3496,14 +3764,15 @@ fn append_chembl_onsite_matches<W: Write>(
 fn chembl_onsite_query_script() -> &'static str {
     r#"
 import csv
-import os
-import shutil
+import hashlib
 import sqlite3
 import sys
-import tarfile
-import tempfile
+from pathlib import Path
 
-source_paths, query_path, result_path = sys.argv[1:-2], sys.argv[-2], sys.argv[-1]
+database_path, query_path, result_path, run_id, invocation_id = sys.argv[1:6]
+
+if database_path.lower().endswith((".tar.gz", ".tgz", ".zip")):
+    raise RuntimeError("chembl_query_requires_published_sqlite")
 
 def clean(value):
     return str(value or "").replace("\t", " ").replace("\r", " ").replace("\n", " ").strip()
@@ -3519,16 +3788,7 @@ def decode(value):
             index += 1
             continue
         nxt = text[index + 1]
-        if nxt == "t":
-            out.append("\t")
-        elif nxt == "n":
-            out.append("\n")
-        elif nxt == "r":
-            out.append("\r")
-        elif nxt == "\\":
-            out.append("\\")
-        else:
-            out.append(nxt)
+        out.append({"t": "\t", "n": "\n", "r": "\r", "\\": "\\"}.get(nxt, nxt))
         index += 2
     return "".join(out)
 
@@ -3537,40 +3797,26 @@ try:
 except Exception as exc:
     raise RuntimeError("rdkit_required_for_exact_smiles_matching") from exc
 
-canonical_cache = {}
-
 def canonical_smiles(value):
-    text = clean(value)
-    if not text:
+    molecule = Chem.MolFromSmiles(clean(value))
+    if molecule is None:
         return ""
-    if text in canonical_cache:
-        return canonical_cache[text]
-    mol = Chem.MolFromSmiles(text)
-    if mol is None:
-        canonical_cache[text] = ""
-    else:
-        canonical_cache[text] = Chem.MolToSmiles(mol, isomericSmiles=True)
-    return canonical_cache[text]
+    return Chem.MolToSmiles(molecule, isomericSmiles=True)
 
 def target_class(organism):
     low = organism.lower()
-    if "homo sapiens" in low or "human" in low:
-        return "known_human_protein"
-    return "known_protein"
+    return "known_human_protein" if "homo sapiens" in low or "human" in low else "known_protein"
 
 def numeric_activity(value):
-    text = clean(value).replace(",", "")
     try:
-        return float(text) if text else float("inf")
+        return float(clean(value).replace(",", ""))
     except ValueError:
         return float("inf")
 
 def activity_score(value, relation):
     if clean(relation) != "=":
-        return 0.65
+        return 0.0
     numeric = numeric_activity(value)
-    if numeric == float("inf"):
-        return 0.65
     if numeric <= 10:
         return 1.0
     if numeric <= 100:
@@ -3581,7 +3827,7 @@ def activity_score(value, relation):
         return 0.70
     if numeric <= 100000:
         return 0.55
-    return 0.40
+    return 0.40 if numeric != float("inf") else 0.0
 
 def format_activity_number(value):
     text = clean(value)
@@ -3589,16 +3835,13 @@ def format_activity_number(value):
         numeric = float(text)
     except ValueError:
         return text
-    if numeric.is_integer():
-        return str(int(numeric))
-    return text
+    return str(int(numeric)) if numeric.is_integer() else text
 
 queries = []
 with open(query_path, "r", encoding="utf-8-sig", newline="") as handle:
     for row in csv.DictReader(handle, delimiter="\t"):
-        query = decode(row.get("query", "")).strip()
-        canonical = canonical_smiles(query)
-        if query and canonical:
+        canonical = canonical_smiles(decode(row.get("query", "")).strip())
+        if canonical:
             queries.append((
                 clean(row.get("input_id", "input_1")) or "input_1",
                 clean(row.get("record_id", "record_1")) or "record_1",
@@ -3606,140 +3849,129 @@ with open(query_path, "r", encoding="utf-8-sig", newline="") as handle:
             ))
 
 if not queries:
-    open(result_path, "w", encoding="utf-8").close()
+    Path(result_path).write_text("", encoding="utf-8")
     raise SystemExit(0)
 
 query_by_smiles = {}
 for input_id, record_id, canonical in queries:
     query_by_smiles.setdefault(canonical, []).append((input_id, record_id))
 
-def sqlite_paths_from_source(path, temp_root):
-    if not path.lower().endswith(".tar.gz"):
-        return [path]
-    paths = []
-    with tarfile.open(path, "r:gz") as archive:
-        members = sorted(
-            (member for member in archive.getmembers() if member.isfile() and member.name.lower().endswith((".db", ".sqlite", ".sqlite3"))),
-            key=lambda member: member.name.lower(),
-        )
-        for index, member in enumerate(members):
-            extracted = archive.extractfile(member)
-            if extracted is None:
-                continue
-            db_path = os.path.join(temp_root, f"source_{index}_{os.path.basename(member.name)}")
-            with open(db_path, "wb") as handle:
-                shutil.copyfileobj(extracted, handle, length=1024 * 1024)
-            paths.append(db_path)
-    return paths
-
 placeholders = ",".join("?" for _ in query_by_smiles)
 sql = f"""
-SELECT
-    t.chembl_id AS target_id,
-    COALESCE(t.pref_name, t.chembl_id) AS target_name,
-    COALESCE(t.organism, '') AS organism,
-    COALESCE(cs.canonical_smiles, '') AS canonical_smiles,
-    COALESCE(md.pref_name, '') AS compound_name,
-    COALESCE(act.standard_type, '') AS standard_type,
-    COALESCE(act.standard_relation, '') AS standard_relation,
-    COALESCE(CAST(act.standard_value AS TEXT), '') AS standard_value,
-    COALESCE(act.standard_units, '') AS standard_units
-FROM activities act
-JOIN assays a ON act.assay_id = a.assay_id
-JOIN target_dictionary t ON a.tid = t.tid
-LEFT JOIN molecule_dictionary md ON act.molregno = md.molregno
-LEFT JOIN compound_structures cs ON act.molregno = cs.molregno
-WHERE act.standard_type IN ('Ki', 'Kd', 'IC50', 'EC50')
-  AND act.standard_value IS NOT NULL
-  AND (act.standard_units IS NULL OR act.standard_units = '' OR act.standard_units = 'nM')
-  AND genoligand_canonical_smiles(cs.canonical_smiles) IN ({placeholders})
+SELECT canonical_isomeric_smiles, target_id, target_name, organism, compound_name,
+       standard_type, standard_relation, standard_value, standard_units,
+       source_release, source_digest
+FROM genoligand_onsite_activity
+WHERE canonical_isomeric_smiles IN ({placeholders})
+  AND standard_type IN ('Ki', 'Kd', 'IC50', 'EC50')
+  AND (standard_units = '' OR standard_units = 'nM')
 """
 
-tmp_dir = tempfile.TemporaryDirectory(prefix="genoligand_chembl_onsite_")
-best_connection = sqlite3.connect(os.path.join(tmp_dir.name, "best.sqlite"))
+uri = Path(database_path).resolve().as_uri() + "?mode=ro"
+connection = sqlite3.connect(uri, uri=True)
+best = {}
 try:
-    best_connection.execute("""
-        CREATE TABLE best (
-            input_id TEXT NOT NULL,
-            record_id TEXT NOT NULL,
-            target_id TEXT NOT NULL,
-            relation_rank INTEGER NOT NULL,
-            numeric_rank REAL NOT NULL,
-            tie_rank TEXT NOT NULL,
-            row_text TEXT NOT NULL,
-            PRIMARY KEY (input_id, target_id)
-        )
-    """)
-    upsert = """
-        INSERT INTO best VALUES (?, ?, ?, ?, ?, ?, ?)
-        ON CONFLICT(input_id, target_id) DO UPDATE SET
-            record_id=excluded.record_id,
-            relation_rank=excluded.relation_rank,
-            numeric_rank=excluded.numeric_rank,
-            tie_rank=excluded.tie_rank,
-            row_text=excluded.row_text
-        WHERE excluded.relation_rank < best.relation_rank
-           OR (excluded.relation_rank = best.relation_rank AND excluded.numeric_rank < best.numeric_rank)
-           OR (excluded.relation_rank = best.relation_rank AND excluded.numeric_rank = best.numeric_rank AND excluded.tie_rank < best.tie_rank)
-    """
-    pending = 0
-    db_paths = []
-    for source_path in source_paths:
-        db_paths.extend(sqlite_paths_from_source(source_path, tmp_dir.name))
-    for db_path in db_paths:
-        connection = sqlite3.connect(db_path)
-        try:
-            connection.create_function("genoligand_canonical_smiles", 1, canonical_smiles, deterministic=True)
-            for row in connection.execute(sql, list(query_by_smiles.keys())):
-                target_id, target_name, organism, smiles, compound_name, standard_type, relation, value, units = [clean(item) for item in row]
-                canonical = canonical_smiles(smiles)
-                if not target_id or not canonical:
-                    continue
-                relation = clean(relation)
-                activity = f"{standard_type}{relation or '?'}{format_activity_number(value)} {units}".strip()
-                matched = f"canonical_smiles={canonical};source_smiles={smiles};compound_name={compound_name}"
-                evidence = f"chembl_onsite_activity_row;{activity};relation={relation};compound_name={compound_name}"
-                relation_rank = 0 if relation == "=" else 1
-                numeric_rank = numeric_activity(value) if relation_rank == 0 else 1e300
-                base_tie_rank = f"{target_name.lower()}\x1f{organism.lower()}\x1f{activity}"
-                for input_id, record_id in query_by_smiles.get(canonical, []):
-                    tie_rank = f"{base_tie_rank}\x1f{record_id}"
-                    out_row = [
-                        input_id,
-                        "ChEMBL",
-                        target_id,
-                        target_name or target_id,
-                        organism or "unknown",
-                        target_class(organism),
-                        f"{activity_score(value, relation):.4f}",
-                        matched,
-                        evidence,
-                        "chembl_onsite_activity_row",
-                        activity,
-                        matched,
-                        "current_run_onsite_query",
-                        record_id,
-                    ]
-                    best_connection.execute(
-                        upsert,
-                        (input_id, record_id, target_id, relation_rank, numeric_rank, tie_rank, "\t".join(out_row)),
-                    )
-                    pending += 1
-                    if pending >= 1000:
-                        best_connection.commit()
-                        pending = 0
-        finally:
-            connection.close()
-    best_connection.commit()
-    with open(result_path, "w", encoding="utf-8", newline="") as handle:
-        for (row_text,) in best_connection.execute(
-            "SELECT row_text FROM best ORDER BY input_id, record_id, relation_rank, numeric_rank, target_id, tie_rank"
+    columns = {
+        row[1]
+        for row in connection.execute("PRAGMA table_info(genoligand_onsite_activity)")
+    }
+    required = {
+        "canonical_isomeric_smiles", "target_id", "target_name", "organism",
+        "compound_name", "standard_type", "standard_relation", "standard_value",
+        "standard_units", "source_release", "source_digest",
+    }
+    if not required.issubset(columns):
+        raise RuntimeError("chembl_query_table_schema_invalid")
+    indexed = False
+    for index_row in connection.execute("PRAGMA index_list(genoligand_onsite_activity)"):
+        index_name = index_row[1]
+        index_columns = [
+            item[2] for item in connection.execute(f"PRAGMA index_info('{index_name}')")
+        ]
+        if index_columns and index_columns[0] == "canonical_isomeric_smiles":
+            indexed = True
+            break
+    if not indexed:
+        raise RuntimeError("chembl_query_canonical_index_missing")
+    plan = connection.execute(
+        "EXPLAIN QUERY PLAN " + sql, list(query_by_smiles.keys())
+    ).fetchall()
+    if any(
+        "SCAN GENOLIGAND_ONSITE_ACTIVITY" in clean(row[-1]).upper()
+        for row in plan
+    ):
+        raise RuntimeError("chembl_query_plan_full_scan")
+
+    for row in connection.execute(sql, list(query_by_smiles.keys())):
+        (
+            canonical, target_id, target_name, organism, compound_name,
+            standard_type, relation, value, units, source_release, source_digest,
+        ) = [clean(item) for item in row]
+        if (
+            not canonical
+            or not target_id
+            or not source_release
+            or len(source_digest) != 64
+            or any(ch not in "0123456789abcdefABCDEF" for ch in source_digest)
         ):
-            handle.write(row_text)
-            handle.write("\n")
+            raise RuntimeError("chembl_query_row_provenance_invalid")
+        activity = f"{standard_type}{relation or '?'}{format_activity_number(value)} {units}".strip()
+        relation_rank = 0 if relation == "=" else 1
+        numeric_rank = numeric_activity(value) if relation_rank == 0 else 1e300
+        for input_id, record_id in query_by_smiles.get(canonical, []):
+            query_digest = hashlib.sha256(
+                "\0".join([
+                    run_id, invocation_id, input_id, record_id, canonical,
+                    source_release, source_digest,
+                ]).encode("utf-8")
+            ).hexdigest()
+            matched = (
+                f"canonical_smiles={canonical};compound_name={compound_name};"
+                f"source_release={source_release};source_digest={source_digest}"
+            )
+            evidence = (
+                f"chembl_onsite_activity_row;{activity};relation={relation};"
+                f"quantitative={'true' if relation == '=' else 'false'};"
+                f"source_release={source_release};source_digest={source_digest};"
+                f"query_digest={query_digest};run_id={run_id};invocation_id={invocation_id}"
+            )
+            out_row = [
+                input_id,
+                "ChEMBL",
+                target_id,
+                target_name or target_id,
+                organism or "unknown",
+                target_class(organism),
+                f"{activity_score(value, relation):.4f}",
+                matched,
+                evidence,
+                (
+                    "chembl_onsite_activity_row;"
+                    f"source_release={source_release};source_digest={source_digest}"
+                ),
+                activity,
+                matched,
+                query_digest,
+                record_id,
+            ]
+            key = (input_id, record_id, target_id)
+            rank = (
+                relation_rank,
+                numeric_rank,
+                target_name.lower(),
+                organism.lower(),
+                activity,
+            )
+            current = best.get(key)
+            if current is None or rank < current[0]:
+                best[key] = (rank, out_row)
 finally:
-    best_connection.close()
-    tmp_dir.cleanup()
+    connection.close()
+
+with open(result_path, "w", encoding="utf-8", newline="") as handle:
+    for key in sorted(best):
+        handle.write("\t".join(best[key][1]))
+        handle.write("\n")
 "#
 }
 
@@ -3774,12 +4006,23 @@ fn append_bindingdb_onsite_matches<W: Write>(
     }
     write_text(&query_path, &queries)?;
     let result_path = temporary_data_path(&options.run_dir, "bindingdb_onsite_matches", "tsv");
+    let (source_digest, source_release) =
+        science_store_source_identity(&options.science_store, "bindingdb")?;
+    let run_id = infer_run_id(&options.run_dir);
+    let invocation_id = format!(
+        "bindingdb_query_{}",
+        stable_hash(&format!("{run_id}:{}", stable_hash(&queries)))
+    );
     let result = run_python_script(
         bindingdb_onsite_query_script(),
         &[
             bindingdb.display().to_string(),
             query_path.display().to_string(),
             result_path.display().to_string(),
+            source_digest,
+            source_release,
+            run_id,
+            invocation_id,
         ],
         "bindingdb_onsite_query",
     );
@@ -3787,21 +4030,202 @@ fn append_bindingdb_onsite_matches<W: Write>(
         let _ = fs::remove_file(&result_path);
         return Err(err);
     }
-    let copy_result = append_file_to_writer(&result_path, out, "bindingdb_onsite_results");
+    let copy_result = append_bound_known_rows(options, &result_path, out);
     let _ = fs::remove_file(&result_path);
     copy_result
+}
+
+fn science_store_source_identity(
+    science_store: &Path,
+    source_id: &str,
+) -> Result<(String, String), String> {
+    let rows = read_simple_tsv_rows(&science_store.join("manifests/source_file_manifest.tsv"))?;
+    let row = rows
+        .iter()
+        .find(|row| {
+            row.get("source_id").map(String::as_str) == Some(source_id)
+                && row.get("status").map(String::as_str) == Some("ready")
+        })
+        .ok_or_else(|| format!("source_manifest_identity_missing:{source_id}"))?;
+    let digest = row
+        .get("sha256")
+        .filter(|value| valid_sha256_hex(value))
+        .cloned()
+        .ok_or_else(|| format!("source_manifest_digest_invalid:{source_id}"))?;
+    let release = row
+        .get("release_identity")
+        .filter(|value| !value.trim().is_empty())
+        .cloned()
+        .ok_or_else(|| format!("source_manifest_release_missing:{source_id}"))?;
+    Ok((digest, release))
+}
+
+fn canonical_source_id(source: &str) -> Option<&'static str> {
+    let normalized = source
+        .chars()
+        .filter(|ch| ch.is_ascii_alphanumeric())
+        .flat_map(char::to_lowercase)
+        .collect::<String>();
+    match normalized.as_str() {
+        "chembl" => Some("chembl"),
+        "bindingdb" => Some("bindingdb"),
+        "uniprot" | "uniprothumanreviewed" | "uniprotreviewedhumanproteome" => {
+            Some("uniprot_human_reviewed")
+        }
+        "rcsb" | "foldseek" | "rcsbligandbound" | "rcsbligandboundstructures" => {
+            Some("rcsb_ligand_bound")
+        }
+        "biolip" | "biolip2" => Some("biolip2"),
+        "plinder" => Some("plinder"),
+        "bindingmoad" => Some("binding_moad"),
+        "mgnify" | "metagenome" | "metagenomepotential" | "mmseqs" => Some("metagenome_potential"),
+        _ => None,
+    }
+}
+
+fn canonical_source_binding(
+    science_store: &Path,
+    source_hint: &str,
+    digest_hint: &str,
+) -> Result<CanonicalSourceBinding, String> {
+    let rows = read_simple_tsv_rows(&science_store.join("manifests/source_file_manifest.tsv"))?;
+    let canonical_id = canonical_source_id(source_hint);
+    let row = rows
+        .iter()
+        .find(|row| {
+            row.get("status").map(String::as_str) == Some("ready")
+                && canonical_id.is_some_and(|source_id| {
+                    row.get("source_id").map(String::as_str) == Some(source_id)
+                })
+        })
+        .or_else(|| {
+            (!digest_hint.is_empty()).then_some(())?;
+            let mut matching = rows.iter().filter(|row| {
+                row.get("status").map(String::as_str) == Some("ready")
+                    && row.get("sha256").map(String::as_str) == Some(digest_hint)
+            });
+            let row = matching.next()?;
+            matching.next().is_none().then_some(row)
+        })
+        .ok_or_else(|| format!("canonical_source_manifest_binding_missing:{source_hint}"))?;
+    let source_id = row
+        .get("source_id")
+        .filter(|value| !value.trim().is_empty())
+        .cloned()
+        .ok_or_else(|| "canonical_source_manifest_source_id_missing".to_string())?;
+    let source_path = row
+        .get("local_path")
+        .filter(|value| !value.trim().is_empty())
+        .cloned()
+        .ok_or_else(|| format!("canonical_source_manifest_path_missing:{source_id}"))?;
+    let source_digest = row
+        .get("sha256")
+        .filter(|value| valid_sha256_hex(value))
+        .cloned()
+        .ok_or_else(|| format!("canonical_source_manifest_digest_invalid:{source_id}"))?;
+    if !digest_hint.is_empty() && digest_hint != source_digest {
+        return Err(format!(
+            "canonical_source_manifest_digest_mismatch:{source_id}"
+        ));
+    }
+    Ok(CanonicalSourceBinding {
+        source_id,
+        source_path,
+        source_digest,
+    })
+}
+
+fn current_pipeline_invocation_id(options: &ScienceOptions) -> Result<String, String> {
+    let value = read_text(&options.run_dir.join(PIPELINE_INVOCATION_FILE))?
+        .trim()
+        .to_string();
+    if value.is_empty() {
+        Err("pipeline_invocation_id_missing".to_string())
+    } else {
+        Ok(value)
+    }
+}
+
+fn current_or_start_pipeline_invocation_id(options: &ScienceOptions) -> Result<String, String> {
+    current_pipeline_invocation_id(options).or_else(|_| start_pipeline_invocation(options))
+}
+
+fn bind_database_evidence(
+    options: &ScienceOptions,
+    source_hint: &str,
+    evidence: &str,
+) -> Result<String, String> {
+    let existing_digest = evidence_field(evidence, &["source_digest"]);
+    let binding = canonical_source_binding(&options.science_store, source_hint, &existing_digest)?;
+    let run_id = infer_run_id(&options.run_dir);
+    let pipeline_invocation_id = current_or_start_pipeline_invocation_id(options)?;
+    let existing_run = evidence_field(evidence, &["run_id"]);
+    if !existing_run.is_empty() && existing_run != run_id {
+        return Err("database_evidence_run_id_mismatch".to_string());
+    }
+    let existing_pipeline = evidence_field(evidence, &["pipeline_invocation_id"]);
+    if !existing_pipeline.is_empty() && existing_pipeline != pipeline_invocation_id {
+        return Err("database_evidence_pipeline_invocation_mismatch".to_string());
+    }
+    let binding_keys = [
+        "source_id",
+        "source_path",
+        "source_digest",
+        "run_id",
+        "pipeline_invocation_id",
+    ];
+    let mut parts = evidence
+        .split(';')
+        .map(str::trim)
+        .filter(|part| {
+            part.split_once('=')
+                .is_none_or(|(key, _)| !binding_keys.contains(&key.trim()))
+        })
+        .filter(|part| !part.is_empty())
+        .map(str::to_string)
+        .collect::<Vec<_>>();
+    parts.extend([
+        format!("source_id={}", binding.source_id),
+        format!("source_path={}", binding.source_path),
+        format!("source_digest={}", binding.source_digest),
+        format!("run_id={run_id}"),
+        format!("pipeline_invocation_id={pipeline_invocation_id}"),
+    ]);
+    Ok(parts.join(";"))
+}
+
+fn append_bound_known_rows<W: Write>(
+    options: &ScienceOptions,
+    path: &Path,
+    out: &mut W,
+) -> Result<(), String> {
+    let text = read_text(path)?;
+    let mut bound = String::new();
+    for line in text.lines().filter(|line| !line.trim().is_empty()) {
+        let mut cols = split_tsv(line);
+        if cols.len() < 10 {
+            return Err("database_evidence_row_invalid".to_string());
+        }
+        cols[8] = bind_database_evidence(options, &cols[1], &cols[8])?;
+        cols[9] = bind_database_evidence(options, &cols[1], &cols[9])?;
+        bound.push_str(&cols.join("\t"));
+        bound.push('\n');
+    }
+    out.write_all(bound.as_bytes())
+        .map_err(|err| format!("database_evidence_append_failed:{err}"))
 }
 
 fn bindingdb_onsite_query_script() -> &'static str {
     r#"
 import csv
+import hashlib
 import os
 import sqlite3
 import sys
 import tempfile
 import zipfile
 
-zip_path, query_path, result_path = sys.argv[1], sys.argv[2], sys.argv[3]
+zip_path, query_path, result_path, source_digest, source_release, run_id, invocation_id = sys.argv[1:8]
 
 def clean(value):
     return str(value or "").replace("\t", " ").replace("\r", " ").replace("\n", " ").strip()
@@ -3867,10 +4291,10 @@ def activity_relation(value):
 
 def activity_score(value):
     if activity_relation(value) != "=":
-        return 0.65
+        return 0.0
     numeric = numeric_activity(value)
     if numeric == float("inf"):
-        return 0.65
+        return 0.0
     if numeric <= 10:
         score = 1.0
     elif numeric <= 100:
@@ -3946,13 +4370,12 @@ try:
             numeric_rank REAL NOT NULL,
             tie_rank TEXT NOT NULL,
             row_text TEXT NOT NULL,
-            PRIMARY KEY (input_id, target_id)
+            PRIMARY KEY (input_id, record_id, target_id)
         )
     """)
     upsert = """
         INSERT INTO best VALUES (?, ?, ?, ?, ?, ?, ?)
-        ON CONFLICT(input_id, target_id) DO UPDATE SET
-            record_id=excluded.record_id,
+        ON CONFLICT(input_id, record_id, target_id) DO UPDATE SET
             relation_rank=excluded.relation_rank,
             numeric_rank=excluded.numeric_rank,
             tie_rank=excluded.tie_rank,
@@ -3980,6 +4403,7 @@ try:
                     for query_info in queries:
                         input_id = query_info[0]
                         record_id = query_info[1]
+                        query_value = query_info[3] or query_info[2]
                         if not query_matches(query_info, smiles, ligand_name):
                             continue
                         target_name = first(row, ["Target Name", "UniProt (SwissProt) Recommended Name of Target Chain 1"])
@@ -4003,8 +4427,14 @@ try:
                         matched = f"ligand_name={ligand_name};ligand_smiles={smiles};ligand_code={ligand_code};pdb_ids={ligand_complex_pdb_ids};target_chain_pdb_ids={target_chain_pdb_ids}"
                         activity_value = f"{activity_type}={activity}".strip()
                         ligand_identity = f"ligand_smiles={smiles};ligand_name={ligand_name};ligand_code={ligand_code}"
-                        evidence = f"bindingdb_onsite_activity_row;{activity_value};ligand_code={ligand_code};pdb_ids={ligand_complex_pdb_ids};target_chain_pdb_ids={target_chain_pdb_ids};pubchem_cid={pubchem}"
                         relation = activity_relation(activity)
+                        query_digest = hashlib.sha256(
+                            "\0".join([
+                                run_id, invocation_id, input_id, record_id, query_value,
+                                source_release, source_digest,
+                            ]).encode("utf-8")
+                        ).hexdigest()
+                        evidence = f"bindingdb_onsite_activity_row;{activity_value};relation={relation};quantitative={'true' if relation == '=' else 'false'};ligand_code={ligand_code};pdb_ids={ligand_complex_pdb_ids};target_chain_pdb_ids={target_chain_pdb_ids};pubchem_cid={pubchem};source_release={source_release};source_digest={source_digest};query_digest={query_digest};run_id={run_id};invocation_id={invocation_id}"
                         relation_rank = 0 if relation == "=" else 1
                         numeric_rank = numeric_activity(activity) if relation_rank == 0 else 1e300
                         tie_rank = f"{target_name.lower()}\x1f{organism.lower()}\x1f{activity_value}\x1f{record_id}"
@@ -4018,10 +4448,10 @@ try:
                             f"{activity_score(activity):.4f}",
                             clean(matched),
                             clean(evidence),
-                            "bindingdb_onsite_activity_row",
+                            f"bindingdb_onsite_activity_row;source_release={source_release};source_digest={source_digest}",
                             clean(activity_value),
                             clean(ligand_identity),
-                            "current_run_onsite_query",
+                            query_digest,
                             record_id,
                         ]
                         best_connection.execute(
@@ -4047,14 +4477,7 @@ finally:
 
 fn match_metagenome(options: &ScienceOptions) -> Result<String, String> {
     let inputs = read_computed_feature_inputs(&options.run_dir.join("feature_manifest.tsv"))?;
-    let rows = if alignment_database_manifest_required(&options.science_store) {
-        Vec::new()
-    } else {
-        read_store_rows(
-            &options.science_store.join("indexes/metagenome_targets.tsv"),
-            "metagenome_potential_index",
-        )?
-    };
+    let rows = Vec::<StoreRow>::new();
     let mut out = String::from(
         "input_id\tsource\ttarget_id\ttarget_name\torganism\ttarget_class\tmatch_score\tmatched_features\tevidence\tsource_database_id\tcurrent_run_query_id\trecord_id\n",
     );
@@ -4114,9 +4537,6 @@ fn evaluate_structure(options: &ScienceOptions) -> Result<String, String> {
             write_structure_summary_from_matches(&structure, &structure_matches)?;
             !structure_matches.is_empty()
         };
-    let viewer_ready = copy_structure_viewer_artifact_if_available(options)?
-        || write_structure_viewer_from_known_hints(options)?
-        || write_structure_viewer_from_matches(options, &structure_matches)?;
     run_single_worker_task(options, &STRUCTURE_ALIGNMENT_WORKER_TASK)?;
     if append_tool_match_rows_to_file(
         options,
@@ -4126,6 +4546,11 @@ fn evaluate_structure(options: &ScienceOptions) -> Result<String, String> {
     {
         structure_ready = true;
     }
+    let final_structure_matches =
+        read_index_matches(&options.run_dir.join("structure_interaction_matches.tsv"))?;
+    let viewer_ready =
+        write_coordinate_backed_candidate_selection(options, &final_structure_matches)?
+            || copy_structure_viewer_artifact_if_available(options)?;
     if append_selected_structure_match(
         &options.run_dir.join("structure_interaction_matches.tsv"),
         &options.run_dir.join("complex_candidate_selection.tsv"),
@@ -4139,7 +4564,7 @@ fn evaluate_structure(options: &ScienceOptions) -> Result<String, String> {
         structure_ready = true;
     }
     if viewer_ready {
-        run_single_worker_task(options, &DOCKING_WORKER_TASK)?;
+        run_docking_candidate_workers(options)?;
     }
     let docking = options.run_dir.join("docking_summary.tsv");
     let docking_ready = copy_tool_output_or_header(
@@ -4172,6 +4597,9 @@ fn append_tool_match_rows(
     tool_output_name: &str,
     out: &mut String,
 ) -> Result<usize, String> {
+    if tool_output_name == "foldseek_structure_matches.tsv" {
+        return append_foldseek_match_rows(options, out);
+    }
     let path = options.run_dir.join("tool_outputs").join(tool_output_name);
     if !path.exists() {
         return Ok(0);
@@ -4223,6 +4651,113 @@ fn append_tool_match_rows(
                 evidence_field(&evidence, &["record_id"]),
                 "record_1".to_string(),
             ])),
+        ));
+        count += 1;
+    }
+    Ok(count)
+}
+
+fn append_foldseek_match_rows(options: &ScienceOptions, out: &mut String) -> Result<usize, String> {
+    let path = options
+        .run_dir
+        .join("tool_outputs/foldseek_structure_matches.tsv");
+    if !path.is_file() {
+        return Ok(0);
+    }
+    let text = read_text(&path)?;
+    let mut lines = text.lines();
+    let header = lines
+        .next()
+        .ok_or_else(|| "foldseek_provenance_header_missing".to_string())?;
+    let headers = split_tsv(header);
+    let required = |name: &str| {
+        find_header(&headers, &[name])
+            .ok_or_else(|| format!("foldseek_provenance_header_missing:{name}"))
+    };
+    let input_idx = required("input_id")?;
+    let source_idx = required("source")?;
+    let target_idx = required("target_id")?;
+    let target_name_idx = required("target_name")?;
+    let organism_idx = required("organism")?;
+    let class_idx = required("target_class")?;
+    let score_idx = required("match_score")?;
+    let matched_idx = required("matched_features")?;
+    let evidence_idx = required("evidence")?;
+    let record_idx = required("record_id")?;
+    let database_idx = required("source_database_id")?;
+    let source_digest_idx = required("source_digest")?;
+    let builder_idx = required("builder_version")?;
+    let version_idx = required("foldseek_version")?;
+    let query_idx = required("current_run_query_id")?;
+    let query_digest_idx = required("query_digest")?;
+    let tm_idx = required("tm_score")?;
+    let current_inputs = current_run_input_identities(options)?;
+    let mut count = 0usize;
+    for (line_index, line) in lines.enumerate() {
+        if line.trim().is_empty() {
+            continue;
+        }
+        let cols = split_tsv(line);
+        let value = |index: usize| cols.get(index).map(String::as_str).unwrap_or("").trim();
+        let input_id = value(input_idx);
+        let record_id = value(record_idx);
+        let evidence = value(evidence_idx);
+        let source_digest = value(source_digest_idx);
+        let query_digest = value(query_digest_idx);
+        if !current_inputs.contains(&(input_id.to_string(), record_id.to_string()))
+            || value(database_idx).is_empty()
+            || !valid_sha256_hex(source_digest)
+            || value(builder_idx).is_empty()
+            || value(version_idx).is_empty()
+            || value(query_idx).is_empty()
+            || !valid_sha256_hex(query_digest)
+        {
+            return Err(format!(
+                "foldseek_provenance_invalid:line={}",
+                line_index + 2
+            ));
+        }
+        let parse_finite = |name: &str, raw: &str| {
+            raw.parse::<f64>()
+                .ok()
+                .filter(|number| number.is_finite())
+                .ok_or_else(|| format!("foldseek_{name}_invalid:line={}", line_index + 2))
+        };
+        let tm_score = parse_finite("tm_score", value(tm_idx))?;
+        let match_score = parse_finite("match_score", value(score_idx))?;
+        let pident = parse_finite("pident", &evidence_field(evidence, &["pident"]))?;
+        let bits = parse_finite("bits", &evidence_field(evidence, &["bits"]))?;
+        if !(0.0..=1.0).contains(&tm_score) || !(0.0..=1.0).contains(&match_score) {
+            return Err(format!(
+                "foldseek_score_out_of_range:line={}",
+                line_index + 2
+            ));
+        }
+        let alignment_score = (0.7 * (pident / 100.0).clamp(0.0, 1.0)
+            + 0.3 * (bits / 200.0).clamp(0.0, 1.0))
+        .clamp(0.01, 1.0);
+        let expected_score = (0.4 * alignment_score + 0.6 * tm_score).clamp(0.0, 1.0);
+        if (match_score - expected_score).abs() > 0.0002 {
+            return Err(format!(
+                "foldseek_tm_score_not_reflected:line={}",
+                line_index + 2
+            ));
+        }
+        let evidence = bind_database_evidence(options, value(source_idx), evidence)?;
+        out.push_str(&format!(
+            "{}\t{}\t{}\t{}\t{}\t{}\t{:.4}\t{}\t{}\t{}\t{}\t{}\n",
+            clean_cell(input_id),
+            clean_cell(value(source_idx)),
+            clean_cell(value(target_idx)),
+            clean_cell(value(target_name_idx)),
+            clean_cell(value(organism_idx)),
+            clean_cell(value(class_idx)),
+            match_score,
+            clean_cell(value(matched_idx)),
+            clean_cell(&evidence),
+            clean_cell(value(database_idx)),
+            clean_cell(value(query_idx)),
+            clean_cell(record_id),
         ));
         count += 1;
     }
@@ -4301,23 +4836,31 @@ fn append_mmseqs_match_rows(
         } else {
             "potential_metagenome_sequence"
         };
-        let evidence = format!(
-            "{};source_digest={};builder_version={};mmseqs_version={}",
-            clean_cell(&cols[8]),
-            clean_cell(&source_digest),
-            clean_cell(&builder_version),
-            clean_cell(&mmseqs_version)
-        );
-        if known_output {
-            let provenance = format!(
-                "mmseqs_database={};source_namespace={};source_class={};source_digest={};builder_version={};mmseqs_version={}",
-                clean_cell(&source_database_id),
-                clean_cell(&source_namespace),
-                source_class,
+        let evidence = bind_database_evidence(
+            options,
+            &source_namespace,
+            &format!(
+                "{};source_digest={};builder_version={};mmseqs_version={}",
+                clean_cell(&cols[8]),
                 clean_cell(&source_digest),
                 clean_cell(&builder_version),
                 clean_cell(&mmseqs_version)
-            );
+            ),
+        )?;
+        if known_output {
+            let provenance = bind_database_evidence(
+                options,
+                &source_namespace,
+                &format!(
+                    "mmseqs_database={};source_namespace={};source_class={};source_digest={};builder_version={};mmseqs_version={}",
+                    clean_cell(&source_database_id),
+                    clean_cell(&source_namespace),
+                    source_class,
+                    clean_cell(&source_digest),
+                    clean_cell(&builder_version),
+                    clean_cell(&mmseqs_version)
+                ),
+            )?;
             out.push_str(&format!(
                 "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t\t\t{}\t{}\n",
                 clean_cell(&cols[0]),
@@ -4419,12 +4962,17 @@ fn current_worker_invocation(options: &ScienceOptions) -> Result<String, String>
     start_worker_invocation(options)
 }
 
-fn clear_worker_task_outputs(options: &ScienceOptions, task: &WorkerTask) -> Result<(), String> {
+fn clear_worker_task_outputs(
+    options: &ScienceOptions,
+    task: &WorkerTask<'_>,
+) -> Result<(), String> {
     let paths: &[&str] = match task.worker {
         "docking" => &[
             "docking_summary.tsv",
             "tool_outputs/docking_summary.tsv",
             "tool_outputs/docking_manifest.json",
+            "tool_outputs/docking_manifest_index.json",
+            "tool_outputs/docking_outcomes.tsv",
             "tool_outputs/docking_not_ready.tsv",
             "tool_outputs/docking_receptor.pdb",
             "tool_outputs/docking_receptor.pdbqt",
@@ -4453,11 +5001,52 @@ fn clear_worker_task_outputs(options: &ScienceOptions, task: &WorkerTask) -> Res
             "tool_outputs/complex_md_manifest.json",
             "tool_outputs/md_run_manifest.json",
             "tool_outputs/md_artifact_provenance.json",
+            "tool_outputs/md_manifest_index.json",
         ],
         _ => &[],
     };
     for relative in paths {
         remove_file_if_exists(&options.run_dir.join(relative))?;
+    }
+    Ok(())
+}
+
+fn remove_run_subdir_if_exists(run_dir: &Path, relative: &str) -> Result<(), String> {
+    let path = run_dir.join(relative);
+    if !path.exists() {
+        return Ok(());
+    }
+    let root = run_dir
+        .canonicalize()
+        .map_err(|err| format!("run_dir_canonicalize_failed:{}:{err}", run_dir.display()))?;
+    let resolved = path
+        .canonicalize()
+        .map_err(|err| format!("worker_dir_canonicalize_failed:{}:{err}", path.display()))?;
+    if resolved == root || !resolved.starts_with(&root) || !resolved.is_dir() {
+        return Err(format!("worker_dir_cleanup_outside_run:{}", path.display()));
+    }
+    fs::remove_dir_all(&resolved)
+        .map_err(|err| format!("worker_dir_cleanup_failed:{}:{err}", resolved.display()))
+}
+
+fn clear_candidate_worker_files(options: &ScienceOptions, job_prefix: &str) -> Result<(), String> {
+    let prefix = format!("{job_prefix}__");
+    for relative in ["worker_jobs", "worker_results"] {
+        let directory = options.run_dir.join(relative);
+        if !directory.is_dir() {
+            continue;
+        }
+        let entries = fs::read_dir(&directory)
+            .map_err(|err| format!("worker_dir_read_failed:{}:{err}", directory.display()))?;
+        for entry in entries {
+            let entry = entry
+                .map_err(|err| format!("worker_dir_entry_failed:{}:{err}", directory.display()))?;
+            let path = entry.path();
+            let name = entry.file_name().to_string_lossy().to_string();
+            if path.is_file() && name.starts_with(&prefix) && name.ends_with(".json") {
+                remove_file_if_exists(&path)?;
+            }
+        }
     }
     Ok(())
 }
@@ -4479,7 +5068,11 @@ fn run_artifact_path_is_current(run_dir: &Path, artifact: &str) -> bool {
     let Ok(root) = run_dir.canonicalize() else {
         return false;
     };
-    let path = PathBuf::from(artifact);
+    let path = if cfg!(windows) {
+        wsl_path_to_windows(artifact).unwrap_or_else(|| PathBuf::from(artifact))
+    } else {
+        PathBuf::from(artifact)
+    };
     let candidate = if path.is_absolute() {
         path
     } else {
@@ -4492,6 +5085,9 @@ fn run_artifact_path_is_current(run_dir: &Path, artifact: &str) -> bool {
 }
 
 fn run_scientific_workers(options: &ScienceOptions) -> Result<String, String> {
+    if SCIENTIFIC_WORKER_TASKS.len() == 1 && SCIENTIFIC_WORKER_TASKS[0].worker == "md_summary" {
+        return run_md_candidate_workers(options);
+    }
     let job_dir = options.run_dir.join("worker_jobs");
     let result_dir = options.run_dir.join("worker_results");
     ensure_dir(&job_dir)?;
@@ -4592,7 +5188,7 @@ fn run_scientific_workers(options: &ScienceOptions) -> Result<String, String> {
     ))
 }
 
-fn run_single_worker_task(options: &ScienceOptions, task: &WorkerTask) -> Result<(), String> {
+fn run_single_worker_task(options: &ScienceOptions, task: &WorkerTask<'_>) -> Result<(), String> {
     let job_dir = options.run_dir.join("worker_jobs");
     let result_dir = options.run_dir.join("worker_results");
     ensure_dir(&job_dir)?;
@@ -4615,7 +5211,540 @@ fn run_single_worker_task(options: &ScienceOptions, task: &WorkerTask) -> Result
     }
 }
 
-fn worker_job_value(options: &ScienceOptions, task: &WorkerTask) -> Result<Value, String> {
+fn selected_candidate_rows(
+    options: &ScienceOptions,
+) -> Result<Vec<BTreeMap<String, String>>, String> {
+    let path = options.run_dir.join("complex_candidate_selection.tsv");
+    if !path.is_file() {
+        return Ok(Vec::new());
+    }
+    let mut rows = read_simple_tsv_rows(&path)?;
+    rows.sort_by_key(|row| {
+        row.get("selection_rank")
+            .and_then(|value| value.parse::<usize>().ok())
+            .unwrap_or(usize::MAX)
+    });
+    Ok(rows)
+}
+
+fn candidate_worker_job_id(worker: &str, candidate_id: &str) -> String {
+    format!("{worker}__{}", safe_id(candidate_id))
+}
+
+fn candidate_worker_job_value(
+    options: &ScienceOptions,
+    task: &WorkerTask<'_>,
+    candidate: &BTreeMap<String, String>,
+) -> Result<(Value, CurrentMdRunFacts), String> {
+    start_worker_invocation(options)?;
+    let facts = selected_candidate_run_facts(options, candidate)?;
+    let mut job = worker_job_value(options, task)?;
+    job["run_id"] = json!(facts.run_id);
+    job["candidate_id"] = json!(facts.candidate_id);
+    job["candidate_digest"] = json!(facts.candidate_digest);
+    job["input_id"] = json!(facts.input_id);
+    job["record_id"] = json!(facts.record_id);
+    job["input_digest"] = json!(facts.input_digest);
+    job["source_digest"] = json!(facts.source_digest);
+    if let Some(namespace) = candidate.get("identity_namespace") {
+        job["identity_namespace"] = json!(namespace);
+    }
+    job["candidate_selection"] = json!("complex_candidate_selection.tsv");
+    if let Some(receptor_artifact) = candidate.get("receptor_artifact") {
+        job["receptor_artifact"] = json!(receptor_artifact);
+    }
+    if let Some(receptor_digest) = candidate.get("coordinate_sha256") {
+        job["receptor_digest"] = json!(receptor_digest);
+    }
+    if task.worker == "md_summary" {
+        if let Some(entry) = candidate_index_entry(options, "docking", &facts.candidate_id)
+            && entry.get("status").and_then(Value::as_str) == Some("completed")
+            && let Some(manifest) = entry
+                .get("manifest")
+                .and_then(Value::as_str)
+                .filter(|value| !value.trim().is_empty())
+        {
+            let manifest_relative = current_run_artifact_relative(&options.run_dir, manifest)
+                .ok_or_else(|| "docking_manifest_not_in_current_run".to_string())?;
+            let manifest_digest = sha256_file_hex(&options.run_dir.join(&manifest_relative))
+                .ok_or_else(|| "docking_manifest_digest_unavailable".to_string())?;
+            job["docking_manifest"] = json!(manifest_relative);
+            job["docking_manifest_digest"] = json!(manifest_digest);
+            job["docking_job_id"] = json!(
+                entry
+                    .get("job_id")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+            );
+            job["docking_invocation_id"] = json!(
+                entry
+                    .get("invocation_id")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+            );
+        }
+        job["platform_policy"] = json!(md_platform_policy(options)?);
+    }
+    Ok((job, facts))
+}
+
+fn md_platform_policy(options: &ScienceOptions) -> Result<String, String> {
+    let configured = std::env::var("GENOLIGAND_MD_PLATFORM_POLICY")
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+        .or_else(|| {
+            read_json_value_if_file(&options.input_manifest).and_then(|value| {
+                value
+                    .get("md_platform_policy")
+                    .or_else(|| value.get("run_config")?.get("md_platform_policy"))
+                    .and_then(Value::as_str)
+                    .map(str::to_string)
+            })
+        })
+        .unwrap_or_else(|| "disabled".to_string())
+        .to_ascii_lowercase();
+    if matches!(configured.as_str(), "required" | "preferred" | "disabled") {
+        Ok(configured)
+    } else {
+        Err(format!("md_platform_policy_invalid:{configured}"))
+    }
+}
+
+fn candidate_manifest_from_index(
+    options: &ScienceOptions,
+    kind: &str,
+    candidate_id: &str,
+) -> Option<String> {
+    candidate_index_entry(options, kind, candidate_id)?
+        .get("manifest")?
+        .as_str()
+        .filter(|value| !value.trim().is_empty())
+        .map(str::to_string)
+}
+
+fn candidate_index_entry(
+    options: &ScienceOptions,
+    kind: &str,
+    candidate_id: &str,
+) -> Option<Value> {
+    let path = options
+        .run_dir
+        .join(format!("tool_outputs/{kind}_manifest_index.json"));
+    read_json_value_if_file(&path)?
+        .get("entries")?
+        .as_array()?
+        .iter()
+        .find(|entry| entry.get("candidate_id").and_then(Value::as_str) == Some(candidate_id))
+        .cloned()
+}
+
+fn run_candidate_worker_task(
+    options: &ScienceOptions,
+    task: &WorkerTask<'_>,
+    job: &Value,
+) -> Result<Value, String> {
+    if !validate_candidate_worker_job(job, task, options) {
+        return Err(format!("{}_candidate_job_binding_invalid", task.worker));
+    }
+    let job_dir = options.run_dir.join("worker_jobs");
+    let result_dir = options.run_dir.join("worker_results");
+    ensure_dir(&job_dir)?;
+    ensure_dir(&result_dir)?;
+    let job_path = job_dir.join(format!("{}.json", task.job_id));
+    let result_path = result_dir.join(format!("{}.json", task.job_id));
+    remove_file_if_exists(&result_path)?;
+    write_text(&job_path, &(job.to_string() + "\n"))?;
+    if let Err(error) = run_worker_task(options, task, &job_path, &result_path)
+        && !result_path.is_file()
+    {
+        write_worker_failure_result(&result_path, task, job, &error)?;
+    }
+    let mut result = read_worker_result_or_failure(&result_path, task, job)?;
+    if !validate_candidate_worker_result(&result, job, task) {
+        let reason = format!(
+            "{}_candidate_result_binding_invalid:{}",
+            task.worker,
+            job.get("candidate_id")
+                .and_then(Value::as_str)
+                .unwrap_or("missing")
+        );
+        write_worker_failure_result(&result_path, task, job, &reason)?;
+        result = read_worker_result_or_failure(&result_path, task, job)?;
+        if !validate_candidate_worker_result(&result, job, task) {
+            return Err(reason);
+        }
+    }
+    Ok(result)
+}
+
+fn validate_candidate_worker_job(
+    job: &Value,
+    task: &WorkerTask<'_>,
+    options: &ScienceOptions,
+) -> bool {
+    validate_worker_job(job, task)
+        && ["run_id", "candidate_id", "input_id", "record_id"]
+            .into_iter()
+            .all(|field| {
+                job.get(field)
+                    .and_then(Value::as_str)
+                    .is_some_and(|value| !value.trim().is_empty())
+            })
+        && ["candidate_digest", "input_digest", "source_digest"]
+            .into_iter()
+            .all(|field| {
+                job.get(field)
+                    .and_then(Value::as_str)
+                    .is_some_and(valid_sha256_hex)
+            })
+        && (task.worker != "docking"
+            || (job
+                .get("receptor_artifact")
+                .and_then(Value::as_str)
+                .is_some_and(|artifact| run_artifact_path_is_current(&options.run_dir, artifact))
+                && job
+                    .get("receptor_digest")
+                    .and_then(Value::as_str)
+                    .is_some_and(valid_sha256_hex)))
+}
+
+fn validate_candidate_worker_result(result: &Value, job: &Value, task: &WorkerTask<'_>) -> bool {
+    let run_dir = Path::new(job.get("run_dir").and_then(Value::as_str).unwrap_or(""));
+    let status = result.get("status").and_then(Value::as_str);
+    let artifacts_bound = if matches!(status, Some("PASS") | Some("NOT_READY")) {
+        result
+            .get("manifest")
+            .and_then(Value::as_str)
+            .is_some_and(|path| run_artifact_path_is_current(run_dir, path))
+            && (task.worker != "md_summary"
+                || result
+                    .get("artifact_provenance")
+                    .and_then(Value::as_str)
+                    .is_some_and(|path| run_artifact_path_is_current(run_dir, path)))
+    } else {
+        true
+    };
+    validate_worker_result(result, task)
+        && artifacts_bound
+        && [
+            "run_id",
+            "invocation_id",
+            "candidate_id",
+            "candidate_digest",
+            "input_id",
+            "record_id",
+            "input_digest",
+            "source_digest",
+        ]
+        .into_iter()
+        .all(|field| {
+            let expected = job.get(field).and_then(Value::as_str);
+            expected.is_some_and(|value| !value.trim().is_empty())
+                && result.get(field).and_then(Value::as_str) == expected
+        })
+        && (task.worker != "docking"
+            || result.get("receptor_digest").and_then(Value::as_str)
+                == job.get("receptor_digest").and_then(Value::as_str))
+}
+
+fn candidate_worker_summary_row(task: &WorkerTask<'_>, result: &Value, job_valid: bool) -> String {
+    format!(
+        "{}\t{}\t{}\t{}\tok\ttrue\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\n",
+        task.job_id,
+        task.worker,
+        task.stage,
+        job_valid,
+        clean_cell(
+            result
+                .get("status")
+                .and_then(Value::as_str)
+                .unwrap_or("FAIL")
+        ),
+        clean_cell(
+            result
+                .get("execution_status")
+                .and_then(Value::as_str)
+                .unwrap_or("failed")
+        ),
+        clean_cell(
+            result
+                .get("reason")
+                .and_then(Value::as_str)
+                .unwrap_or("missing_reason")
+        ),
+        result
+            .get("outcomes")
+            .and_then(Value::as_array)
+            .map(Vec::len)
+            .unwrap_or_default(),
+        clean_cell(
+            result
+                .get("engine_version")
+                .and_then(Value::as_str)
+                .unwrap_or("missing")
+        ),
+        result
+            .get("primitive_execution_only")
+            .and_then(Value::as_bool)
+            .unwrap_or(false),
+        result
+            .get("python_owns_final_score")
+            .and_then(Value::as_bool)
+            .unwrap_or(true),
+        result
+            .get("python_owns_report_semantics")
+            .and_then(Value::as_bool)
+            .unwrap_or(true),
+    )
+}
+
+fn run_docking_candidate_workers(options: &ScienceOptions) -> Result<(), String> {
+    remove_run_subdir_if_exists(&options.run_dir, "tool_outputs/docking")?;
+    clear_candidate_worker_files(options, DOCKING_WORKER_TASK.job_id)?;
+    let rows = selected_candidate_rows(options)?;
+    if rows.is_empty() {
+        return Ok(());
+    }
+    let mut outcomes = String::from(
+        "candidate_id\tinput_id\trecord_id\tjob_id\tinvocation_id\tstatus\treason\tmanifest\n",
+    );
+    let mut worker_outcomes = Vec::new();
+    for candidate in rows {
+        let candidate_id = candidate
+            .get("candidate_id")
+            .map(String::as_str)
+            .unwrap_or_default();
+        let job_id = candidate_worker_job_id(DOCKING_WORKER_TASK.job_id, candidate_id);
+        let task = WorkerTask {
+            job_id: &job_id,
+            worker: DOCKING_WORKER_TASK.worker,
+            module: DOCKING_WORKER_TASK.module,
+            stage: DOCKING_WORKER_TASK.stage,
+        };
+        let (job, facts) = candidate_worker_job_value(options, &task, &candidate)?;
+        let result = run_candidate_worker_task(options, &task, &job)?;
+        ensure_manifest_index_entry(options, "docking", &facts, &task, &result)?;
+        let invocation_id = job
+            .get("invocation_id")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string();
+        let status = result
+            .get("execution_status")
+            .and_then(Value::as_str)
+            .unwrap_or("failed")
+            .to_string();
+        let reason = result
+            .get("reason")
+            .and_then(Value::as_str)
+            .unwrap_or("missing_reason")
+            .to_string();
+        let manifest = candidate_manifest_from_index(options, "docking", &facts.candidate_id)
+            .unwrap_or_default();
+        outcomes.push_str(&format!(
+            "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\n",
+            clean_cell(&facts.candidate_id),
+            clean_cell(&facts.input_id),
+            clean_cell(&facts.record_id),
+            clean_cell(task.job_id),
+            clean_cell(&invocation_id),
+            clean_cell(&status),
+            clean_cell(&reason),
+            clean_cell(&manifest),
+        ));
+        worker_outcomes.push(CandidateWorkerOutcome {
+            candidate_id: facts.candidate_id,
+            input_id: facts.input_id,
+            record_id: facts.record_id,
+            job_id,
+            invocation_id,
+            status,
+            reason,
+            manifest,
+        });
+    }
+    write_text(
+        &options.run_dir.join("tool_outputs/docking_outcomes.tsv"),
+        &outcomes,
+    )?;
+    ensure_docking_summary_outcomes(options, &worker_outcomes)
+}
+
+fn ensure_docking_summary_outcomes(
+    options: &ScienceOptions,
+    outcomes: &[CandidateWorkerOutcome],
+) -> Result<(), String> {
+    let path = options.run_dir.join("tool_outputs/docking_summary.tsv");
+    let mut text = if path.is_file() {
+        read_text(&path)?
+    } else {
+        String::from("candidate_id\tdocking_status\tdocking_score\tdocking_engine\tnotes\n")
+    };
+    let present = if path.is_file() {
+        read_simple_tsv_rows(&path)?
+            .into_iter()
+            .filter_map(|row| row.get("candidate_id").cloned())
+            .collect::<BTreeSet<_>>()
+    } else {
+        BTreeSet::new()
+    };
+    for outcome in outcomes {
+        if present.contains(&outcome.candidate_id) {
+            continue;
+        }
+        text.push_str(&format!(
+            "{}\t{}\t\tvina\t{}\n",
+            clean_cell(&outcome.candidate_id),
+            clean_cell(&outcome.status),
+            clean_cell(&format!(
+                "reason={};input_id={};record_id={};job_id={};invocation_id={};manifest={}",
+                outcome.reason,
+                outcome.input_id,
+                outcome.record_id,
+                outcome.job_id,
+                outcome.invocation_id,
+                outcome.manifest,
+            )),
+        ));
+    }
+    write_text(&path, &text)
+}
+
+fn run_md_candidate_workers(options: &ScienceOptions) -> Result<String, String> {
+    let base = SCIENTIFIC_WORKER_TASKS[0];
+    clear_worker_task_outputs(options, &base)?;
+    remove_run_subdir_if_exists(&options.run_dir, "tool_outputs/md")?;
+    clear_candidate_worker_files(options, base.job_id)?;
+    let rows = selected_candidate_rows(options)?;
+    let mut summary = String::from(
+        "job_id\tworker\tstage\tjob_schema_valid\tlaunch_status\tresult_schema_valid\tresult_status\texecution_status\treason\toutcome_count\tengine_version\tprimitive_execution_only\tpython_owns_final_score\tpython_owns_report_semantics\n",
+    );
+    for candidate in rows {
+        let candidate_id = candidate
+            .get("candidate_id")
+            .map(String::as_str)
+            .unwrap_or_default();
+        let job_id = candidate_worker_job_id(base.job_id, candidate_id);
+        let task = WorkerTask {
+            job_id: &job_id,
+            worker: base.worker,
+            module: base.module,
+            stage: base.stage,
+        };
+        let (job, facts) = candidate_worker_job_value(options, &task, &candidate)?;
+        let job_valid = validate_candidate_worker_job(&job, &task, options);
+        let result = run_candidate_worker_task(options, &task, &job)?;
+        ensure_manifest_index_entry(options, "md", &facts, &task, &result)?;
+        summary.push_str(&candidate_worker_summary_row(&task, &result, job_valid));
+    }
+    write_text(
+        &options.run_dir.join("scientific_runtime_summary.tsv"),
+        &summary,
+    )?;
+    Ok(format!(
+        "scientific_workers_checked\tworker_count={}",
+        summary.lines().count().saturating_sub(1)
+    ))
+}
+
+fn ensure_manifest_index_entry(
+    options: &ScienceOptions,
+    kind: &str,
+    facts: &CurrentMdRunFacts,
+    task: &WorkerTask<'_>,
+    result: &Value,
+) -> Result<(), String> {
+    let (schema_version, relative) = match kind {
+        "docking" => (
+            "genoligand_docking_manifest_index_v1",
+            "tool_outputs/docking_manifest_index.json",
+        ),
+        "md" => (
+            "genoligand_md_manifest_index_v1",
+            "tool_outputs/md_manifest_index.json",
+        ),
+        _ => return Err(format!("worker_manifest_index_kind_invalid:{kind}")),
+    };
+    let path = options.run_dir.join(relative);
+    let mut index = read_json_value_if_file(&path).unwrap_or_else(|| {
+        json!({
+            "schema_version": schema_version,
+            "run_id": facts.run_id,
+            "entries": []
+        })
+    });
+    if index.get("schema_version").and_then(Value::as_str) != Some(schema_version)
+        || index.get("run_id").and_then(Value::as_str) != Some(facts.run_id.as_str())
+    {
+        return Err(format!("{kind}_manifest_index_identity_mismatch"));
+    }
+    let entries = index
+        .get_mut("entries")
+        .and_then(Value::as_array_mut)
+        .ok_or_else(|| format!("{kind}_manifest_index_entries_invalid"))?;
+    let existing = entries
+        .iter()
+        .position(|entry| {
+            entry.get("candidate_id").and_then(Value::as_str) == Some(facts.candidate_id.as_str())
+        })
+        .map(|position| entries.remove(position));
+    let execution_status = result
+        .get("execution_status")
+        .and_then(Value::as_str)
+        .unwrap_or("failed");
+    let completed = execution_status == "completed";
+    let index_status = if execution_status == "not_applicable" {
+        "not_ready"
+    } else {
+        execution_status
+    };
+    let existing_field = |field: &str| {
+        existing
+            .as_ref()
+            .and_then(|entry| entry.get(field))
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string()
+    };
+    let manifest = result
+        .get("manifest")
+        .and_then(Value::as_str)
+        .or_else(|| result.get("artifact_path").and_then(Value::as_str))
+        .filter(|value| !value.trim().is_empty())
+        .map(str::to_string)
+        .unwrap_or_else(|| existing_field("manifest"));
+    let artifact_provenance = result
+        .get("artifact_provenance")
+        .and_then(Value::as_str)
+        .filter(|value| !value.trim().is_empty())
+        .map(str::to_string)
+        .unwrap_or_else(|| existing_field("artifact_provenance"));
+    if completed && (manifest.is_empty() || (kind == "md" && artifact_provenance.is_empty())) {
+        return Err(format!("{kind}_completed_manifest_binding_missing"));
+    }
+    entries.push(json!({
+        "candidate_id": facts.candidate_id,
+        "input_id": facts.input_id,
+        "record_id": facts.record_id,
+        "candidate_digest": facts.candidate_digest,
+        "input_digest": facts.input_digest,
+        "source_digest": facts.source_digest,
+        "job_id": task.job_id,
+        "invocation_id": result.get("invocation_id").and_then(Value::as_str).unwrap_or(""),
+        "status": index_status,
+        "reason": result.get("reason").and_then(Value::as_str).unwrap_or("missing_reason"),
+        "manifest": manifest,
+        "artifact_provenance": artifact_provenance,
+    }));
+    entries.sort_by(|left, right| {
+        left.get("candidate_id")
+            .and_then(Value::as_str)
+            .cmp(&right.get("candidate_id").and_then(Value::as_str))
+    });
+    write_text(&path, &(index.to_string() + "\n"))
+}
+
+fn worker_job_value(options: &ScienceOptions, task: &WorkerTask<'_>) -> Result<Value, String> {
     let invocation_id = current_worker_invocation(options)?;
     let mut job = json!({
         "schema_version": WORKER_SCHEMA_VERSION,
@@ -4639,13 +5768,14 @@ fn worker_job_value(options: &ScienceOptions, task: &WorkerTask) -> Result<Value
         job["candidate_id"] = json!(facts.candidate_id);
         job["candidate_digest"] = json!(facts.candidate_digest);
         job["input_id"] = json!(facts.input_id);
+        job["record_id"] = json!(facts.record_id);
         job["input_digest"] = json!(facts.input_digest);
         job["source_digest"] = json!(facts.source_digest);
     }
     Ok(job)
 }
 
-fn validate_worker_job(value: &Value, task: &WorkerTask) -> bool {
+fn validate_worker_job(value: &Value, task: &WorkerTask<'_>) -> bool {
     value.get("schema_version").and_then(Value::as_str) == Some(WORKER_SCHEMA_VERSION)
         && value.get("pipeline_mode").and_then(Value::as_str) == Some(WORKER_PIPELINE_MODE)
         && value.get("job_id").and_then(Value::as_str) == Some(task.job_id)
@@ -4665,7 +5795,7 @@ fn validate_worker_job(value: &Value, task: &WorkerTask) -> bool {
 
 fn run_worker_task(
     options: &ScienceOptions,
-    task: &WorkerTask,
+    task: &WorkerTask<'_>,
     job_path: &Path,
     result_path: &Path,
 ) -> Result<(), String> {
@@ -4720,7 +5850,7 @@ fn run_worker_task(
     ))
 }
 
-fn worker_result_file_is_valid(path: &Path, task: &WorkerTask) -> bool {
+fn worker_result_file_is_valid(path: &Path, task: &WorkerTask<'_>) -> bool {
     read_text(path)
         .ok()
         .and_then(|text| serde_json::from_str::<Value>(text.trim_start_matches('\u{feff}')).ok())
@@ -4771,7 +5901,7 @@ fn wsl_env_with_pythonpath() -> OsString {
 
 fn read_worker_result_or_failure(
     path: &Path,
-    task: &WorkerTask,
+    task: &WorkerTask<'_>,
     job: &Value,
 ) -> Result<Value, String> {
     match read_text(path)
@@ -4789,15 +5919,16 @@ fn read_worker_result_or_failure(
 
 fn write_worker_failure_result(
     path: &Path,
-    task: &WorkerTask,
+    task: &WorkerTask<'_>,
     job: &Value,
     reason: &str,
 ) -> Result<(), String> {
     let reason = clean_cell(reason);
-    let value = json!({
+    let mut value = json!({
         "schema_version": WORKER_SCHEMA_VERSION,
         "job_id": task.job_id,
         "worker": task.worker,
+        "run_id": job.get("run_id").and_then(Value::as_str).unwrap_or(""),
         "invocation_id": job.get("invocation_id").and_then(Value::as_str).unwrap_or("missing"),
         "status": "FAIL",
         "engine_version": format!("worker unavailable: {reason}"),
@@ -4814,10 +5945,27 @@ fn write_worker_failure_result(
         "python_owns_report_semantics": false,
         "primitive_execution_only": true
     });
+    for field in [
+        "candidate_id",
+        "candidate_digest",
+        "input_id",
+        "record_id",
+        "input_digest",
+        "source_digest",
+        "receptor_digest",
+    ] {
+        if let Some(binding) = job
+            .get(field)
+            .and_then(Value::as_str)
+            .filter(|binding| !binding.trim().is_empty())
+        {
+            value[field] = json!(binding);
+        }
+    }
     write_text(path, &(value.to_string() + "\n"))
 }
 
-fn validate_worker_result(value: &Value, task: &WorkerTask) -> bool {
+fn validate_worker_result(value: &Value, task: &WorkerTask<'_>) -> bool {
     let result_status = value.get("status").and_then(Value::as_str);
     let execution_status = value.get("execution_status").and_then(Value::as_str);
     let outcomes = value.get("outcomes").and_then(Value::as_array);
@@ -4882,7 +6030,7 @@ fn validate_worker_result_binding(
     value: &Value,
     job: &Value,
     options: &ScienceOptions,
-    task: &WorkerTask,
+    task: &WorkerTask<'_>,
 ) -> bool {
     if !validate_worker_result(value, task) {
         return false;
@@ -4904,7 +6052,7 @@ fn worker_result_stage_error_bound(
     value: &Value,
     job: &Value,
     options: &ScienceOptions,
-    task: &WorkerTask,
+    task: &WorkerTask<'_>,
 ) -> Option<String> {
     if !validate_worker_result_binding(value, job, options, task) {
         return Some(format!("{}_result_binding_invalid", task.worker));
@@ -4928,7 +6076,7 @@ fn validate_worker_outcome(value: &Value) -> bool {
         && value.get("row_count").and_then(Value::as_u64).is_some()
 }
 
-fn worker_result_stage_error(value: &Value, task: &WorkerTask) -> Option<String> {
+fn worker_result_stage_error(value: &Value, task: &WorkerTask<'_>) -> Option<String> {
     if !validate_worker_result(value, task) {
         return Some(format!("{}_result_invalid", task.worker));
     }
@@ -4970,6 +6118,7 @@ fn match_structure_interactions(options: &ScienceOptions) -> Result<Vec<IndexMat
                 continue;
             }
             let matched_features = matched_tokens(input, row).join(" ");
+            let evidence = bind_database_evidence(options, &row.source, &row.evidence)?;
             let item = IndexMatch {
                 input_id: input.input_id.clone(),
                 record_id: input.record_id.clone(),
@@ -4980,7 +6129,7 @@ fn match_structure_interactions(options: &ScienceOptions) -> Result<Vec<IndexMat
                 target_class: row.target_class.clone(),
                 match_score: score,
                 matched_features,
-                evidence: row.evidence.clone(),
+                evidence,
             };
             out.push_str(&format!(
                 "{}\t{}\t{}\t{}\t{}\t{}\t{:.4}\t{}\t{}\t{}\n",
@@ -5044,7 +6193,11 @@ fn write_structure_summary_from_matches(path: &Path, matches: &[IndexMatch]) -> 
     );
     let mut by_target = BTreeMap::<String, &IndexMatch>::new();
     for item in matches {
-        let key = item.target_id.clone();
+        let namespace = canonical_target_namespace(&item.source, &item.source, &item.target_id);
+        let key = format!(
+            "{}\u{1f}{}\u{1f}{}\u{1f}{}",
+            item.input_id, item.record_id, namespace, item.target_id
+        );
         match by_target.get(&key) {
             Some(existing) if existing.match_score >= item.match_score => {}
             _ => {
@@ -5053,9 +6206,10 @@ fn write_structure_summary_from_matches(path: &Path, matches: &[IndexMatch]) -> 
         }
     }
     for item in by_target.values() {
+        let namespace = canonical_target_namespace(&item.source, &item.source, &item.target_id);
         text.push_str(&format!(
-            "target_{}\t{:.4}\t{}\t{}\t{}\t{}\t\t\t\t{}\n",
-            safe_id(&item.target_id),
+            "{}\t{:.4}\t{}\t{}\t{}\t{}\t\t\t\t{}\n",
+            candidate_id_for(&item.input_id, &item.record_id, &namespace, &item.target_id),
             item.match_score,
             clean_cell(&format!("{} {}", item.source, item.evidence)),
             "structure_index_match",
@@ -5082,14 +6236,14 @@ fn copy_structure_viewer_artifact_if_available(options: &ScienceOptions) -> Resu
             continue;
         }
         if let Some(artifact) = write_coordinate_viewer_artifact(&options.run_dir, &source) {
-            write_structure_viewer_status(
-                options,
-                "ready",
-                "",
-                "",
-                &artifact,
-                &relative_display(&options.run_dir, &source),
-                "worker coordinate artifact copied from current run output",
+            write_text(
+                &options.run_dir.join("structure_viewer_status.tsv"),
+                &format!(
+                    "status\ttarget_id\tpdb_id\tartifact\texpected_path\treason\tcandidate_id\tinput_id\trecord_id\tselection_rank\tcoordinate_sha256\nready\t\t\t{}\t{}\tworker coordinate artifact copied from current run output\t\t\t\t\t{}\n",
+                    clean_cell(&artifact),
+                    clean_cell(&relative_display(&options.run_dir, &source)),
+                    sha256_file_hex(&options.run_dir.join(&artifact)).unwrap_or_default(),
+                ),
             )?;
             return Ok(true);
         }
@@ -5097,56 +6251,130 @@ fn copy_structure_viewer_artifact_if_available(options: &ScienceOptions) -> Resu
     Ok(false)
 }
 
-fn write_structure_viewer_from_known_hints(options: &ScienceOptions) -> Result<bool, String> {
-    let hints = known_structure_hints(&options.run_dir.join("known_database_matches.tsv"))?;
-    let mut candidates = Vec::new();
-    for hint in hints {
+fn write_coordinate_backed_candidate_selection(
+    options: &ScienceOptions,
+    matches: &[IndexMatch],
+) -> Result<bool, String> {
+    remove_run_subdir_if_exists(&options.run_dir, "structure_candidates")?;
+    for relative in [
+        "structure_viewer.json",
+        "structure_viewer.pdb",
+        "structure_viewer.cif",
+        "structure_viewer.mmcif",
+    ] {
+        remove_file_if_exists(&options.run_dir.join(relative))?;
+    }
+    let mut candidates = Vec::<CoordinateBackedCandidate>::new();
+    for hint in known_structure_hints(&options.run_dir.join("known_database_matches.tsv"))? {
         for pdb_id in &hint.pdb_ids {
-            if let Some(path) = find_structure_coordinate_file(&options.science_store, pdb_id) {
-                let rank = known_hint_rank(&hint);
-                let score = coordinate_hint_score(&path, &hint);
-                candidates.push((rank, score, hint.clone(), pdb_id.clone(), path));
-            }
+            let Some(coordinate_path) =
+                find_structure_coordinate_file(&options.science_store, pdb_id)
+            else {
+                continue;
+            };
+            candidates.push(CoordinateBackedCandidate {
+                selected: SelectedComplexCandidate {
+                    identity_namespace: canonical_target_namespace(
+                        "BindingDB",
+                        "BindingDB",
+                        &hint.target_id,
+                    ),
+                    candidate_id: candidate_id_for(
+                        &hint.input_id,
+                        &hint.record_id,
+                        &canonical_target_namespace("BindingDB", "BindingDB", &hint.target_id),
+                        &hint.target_id,
+                    ),
+                    input_id: hint.input_id.clone(),
+                    record_id: hint.record_id.clone(),
+                    target_id: hint.target_id.clone(),
+                    target_name: hint.target_name.clone(),
+                    organism: hint.organism.clone(),
+                    target_class: hint.target_class.clone(),
+                    source: "BindingDB".to_string(),
+                    pdb_id: pdb_id.clone(),
+                    evidence: hint.evidence.clone(),
+                },
+                coordinate_path: coordinate_path.clone(),
+                priority: known_hint_rank(&hint),
+                score: coordinate_hint_score(&coordinate_path, &hint),
+            });
+        }
+    }
+    for item in matches {
+        for pdb_id in structure_coordinate_ids(item) {
+            let Some(coordinate_path) =
+                find_structure_coordinate_file(&options.science_store, &pdb_id)
+            else {
+                continue;
+            };
+            candidates.push(CoordinateBackedCandidate {
+                selected: SelectedComplexCandidate {
+                    identity_namespace: canonical_target_namespace(
+                        &item.source,
+                        &item.source,
+                        &item.target_id,
+                    ),
+                    candidate_id: candidate_id_for(
+                        &item.input_id,
+                        &item.record_id,
+                        &canonical_target_namespace(&item.source, &item.source, &item.target_id),
+                        &item.target_id,
+                    ),
+                    input_id: item.input_id.clone(),
+                    record_id: item.record_id.clone(),
+                    target_id: item.target_id.clone(),
+                    target_name: item.target_name.clone(),
+                    organism: item.organism.clone(),
+                    target_class: item.target_class.clone(),
+                    source: item.source.clone(),
+                    pdb_id,
+                    evidence: item.evidence.clone(),
+                },
+                coordinate_path,
+                priority: 0,
+                score: item.match_score,
+            });
         }
     }
     candidates.sort_by(|left, right| {
         right
-            .0
-            .cmp(&left.0)
-            .then_with(|| right.1.total_cmp(&left.1))
-            .then_with(|| right.2.match_score.total_cmp(&left.2.match_score))
-            .then_with(|| left.2.target_id.cmp(&right.2.target_id))
-            .then_with(|| left.3.cmp(&right.3))
+            .priority
+            .cmp(&left.priority)
+            .then_with(|| right.score.total_cmp(&left.score))
+            .then_with(|| left.selected.candidate_id.cmp(&right.selected.candidate_id))
+            .then_with(|| left.selected.pdb_id.cmp(&right.selected.pdb_id))
     });
-    for (_, _, hint, pdb_id, path) in candidates {
-        if let Some(artifact) = write_coordinate_viewer_artifact(&options.run_dir, &path) {
-            write_structure_viewer_status(
-                options,
-                "ready",
-                &hint.target_id,
-                &pdb_id,
-                &artifact,
-                &relative_display(&options.science_store, &path),
-                "coordinate artifact resolved from BindingDB ligand-target PDB evidence",
-            )?;
-            write_selected_complex_candidate(
-                options,
-                &SelectedComplexCandidate {
-                    candidate_id: format!("target_{}", safe_id(&hint.target_id)),
-                    input_id: hint.input_id,
-                    target_id: hint.target_id,
-                    target_name: hint.target_name,
-                    organism: hint.organism,
-                    target_class: hint.target_class,
-                    source: "BindingDB".to_string(),
-                    pdb_id,
-                    evidence: hint.evidence,
-                },
-            )?;
-            return Ok(true);
+
+    let mut selected_rows = Vec::new();
+    let mut seen = BTreeSet::new();
+    for candidate in candidates {
+        if selected_rows.len() == COMPLEX_CANDIDATE_TOP_N
+            || !seen.insert(candidate.selected.candidate_id.clone())
+        {
+            continue;
         }
+        let Some(artifact) = write_candidate_coordinate_artifact(
+            &options.run_dir,
+            &candidate.selected.candidate_id,
+            &candidate.coordinate_path,
+        ) else {
+            continue;
+        };
+        let Some(coordinate_sha256) = sha256_file_hex(&options.run_dir.join(&artifact)) else {
+            continue;
+        };
+        if selected_rows.is_empty()
+            && write_coordinate_viewer_artifact(&options.run_dir, &candidate.coordinate_path)
+                .is_none()
+        {
+            return Err("primary_structure_viewer_artifact_write_failed".to_string());
+        }
+        selected_rows.push((candidate.selected, artifact, coordinate_sha256));
     }
-    Ok(false)
+    write_selected_complex_candidates(options, &selected_rows)?;
+    write_structure_viewer_status_rows(options, &selected_rows)?;
+    Ok(!selected_rows.is_empty())
 }
 
 fn known_structure_hints(path: &Path) -> Result<Vec<KnownStructureHint>, String> {
@@ -5166,6 +6394,11 @@ fn known_structure_hints(path: &Path) -> Result<Vec<KnownStructureHint>, String>
         }
         let hint = KnownStructureHint {
             input_id: cols[0].clone(),
+            record_id: cols
+                .get(13)
+                .filter(|value| !value.trim().is_empty())
+                .cloned()
+                .unwrap_or_else(|| "record_1".to_string()),
             target_id: cols[2].clone(),
             target_name: cols[3].clone(),
             organism: cols[4].clone(),
@@ -5174,7 +6407,7 @@ fn known_structure_hints(path: &Path) -> Result<Vec<KnownStructureHint>, String>
             evidence: cols[8].clone(),
             pdb_ids,
         };
-        let key = format!("{}\t{}", hint.input_id, hint.target_id);
+        let key = format!("{}\t{}\t{}", hint.input_id, hint.record_id, hint.target_id);
         match by_target.get(&key) {
             Some(existing) if known_hint_rank(existing) >= known_hint_rank(&hint) => {}
             _ => {
@@ -5184,72 +6417,6 @@ fn known_structure_hints(path: &Path) -> Result<Vec<KnownStructureHint>, String>
     }
     Ok(by_target.into_values().collect())
 }
-fn write_structure_viewer_from_matches(
-    options: &ScienceOptions,
-    matches: &[IndexMatch],
-) -> Result<bool, String> {
-    let mut ordered = matches.iter().collect::<Vec<_>>();
-    ordered.sort_by(|left, right| right.match_score.total_cmp(&left.match_score));
-    let mut first_target = String::new();
-    let mut first_pdb_id = String::new();
-    let mut first_expected_path = String::new();
-    for item in ordered {
-        if first_target.is_empty() {
-            first_target = item.target_id.clone();
-        }
-        for pdb_id in structure_coordinate_ids(item) {
-            if first_pdb_id.is_empty() {
-                first_pdb_id = pdb_id.clone();
-                first_expected_path =
-                    expected_structure_coordinate_paths(&options.science_store, &pdb_id);
-            }
-            if let Some(path) = find_structure_coordinate_file(&options.science_store, &pdb_id)
-                && let Some(artifact) = write_coordinate_viewer_artifact(&options.run_dir, &path)
-            {
-                write_structure_viewer_status(
-                    options,
-                    "ready",
-                    &item.target_id,
-                    &pdb_id,
-                    &artifact,
-                    &relative_display(&options.science_store, &path),
-                    "coordinate artifact resolved from local structure database",
-                )?;
-                write_selected_complex_candidate(
-                    options,
-                    &SelectedComplexCandidate {
-                        candidate_id: format!("target_{}", safe_id(&item.target_id)),
-                        input_id: item.input_id.clone(),
-                        target_id: item.target_id.clone(),
-                        target_name: item.target_name.clone(),
-                        organism: item.organism.clone(),
-                        target_class: item.target_class.clone(),
-                        source: item.source.clone(),
-                        pdb_id,
-                        evidence: item.evidence.clone(),
-                    },
-                )?;
-                return Ok(true);
-            }
-        }
-    }
-    let reason = if first_target.is_empty() {
-        "no structure interaction match rows for this run"
-    } else {
-        "matched structure rows did not have a local coordinate artifact"
-    };
-    write_structure_viewer_status(
-        options,
-        "not_ready",
-        &first_target,
-        &first_pdb_id,
-        "",
-        &first_expected_path,
-        reason,
-    )?;
-    Ok(false)
-}
-
 fn bindingdb_complex_pdb_ids(value: &str) -> Vec<String> {
     let mut ids = BTreeSet::new();
     for part in value.split(';') {
@@ -5276,17 +6443,61 @@ fn known_hint_rank(hint: &KnownStructureHint) -> i64 {
 }
 
 fn activity_nm_from_evidence(value: &str) -> Option<f64> {
-    for marker in ["Ki (nM)=", "IC50 (nM)=", "Kd (nM)=", "EC50 (nM)="] {
-        if let Some(index) = value.find(marker) {
-            let tail = &value[index + marker.len()..];
+    let declared_relation = value
+        .split(';')
+        .find_map(|part| part.trim().strip_prefix("relation="))
+        .map(str::trim);
+    if declared_relation.is_some_and(|relation| relation != "=") {
+        return None;
+    }
+    for part in value.split(';').map(str::trim) {
+        for activity in ["Ki", "IC50", "Kd", "EC50"] {
+            let Some(mut tail) = part.strip_prefix(activity).map(str::trim_start) else {
+                continue;
+            };
+            let mut unit = "nM";
+            if let Some(without_open) = tail.strip_prefix('(') {
+                let Some(close) = without_open.find(')') else {
+                    continue;
+                };
+                unit = without_open[..close].trim();
+                tail = without_open[close + 1..].trim_start();
+            }
+            let Some(without_equals) = tail.strip_prefix('=') else {
+                continue;
+            };
+            tail = without_equals.trim_start();
+            if tail
+                .chars()
+                .next()
+                .is_some_and(|ch| matches!(ch, '=' | '<' | '>' | '~'))
+            {
+                return None;
+            }
             let number = tail
                 .chars()
-                .skip_while(|ch| matches!(ch, '<' | '>' | '=' | '~' | ' '))
                 .take_while(|ch| ch.is_ascii_digit() || matches!(*ch, '.' | 'e' | 'E' | '+' | '-'))
                 .collect::<String>();
-            if let Ok(parsed) = number.parse::<f64>() {
-                return Some(parsed);
+            let parsed = number.parse::<f64>().ok()?;
+            let suffix = tail[number.len()..].trim_start();
+            if !suffix.is_empty() {
+                unit = suffix
+                    .split_whitespace()
+                    .next()
+                    .unwrap_or(unit)
+                    .trim_matches(|ch: char| !ch.is_alphabetic() && ch != 'µ' && ch != 'μ');
             }
+            let multiplier = match unit.to_ascii_lowercase().as_str() {
+                "pm" => 0.001,
+                "nm" | "" => 1.0,
+                "um" => 1_000.0,
+                "mm" => 1_000_000.0,
+                "m" => 1_000_000_000.0,
+                _ if matches!(unit, "µM" | "μM") => 1_000.0,
+                _ => return None,
+            };
+            let normalized = parsed * multiplier;
+            return normalized.is_finite().then_some(normalized);
         }
     }
     None
@@ -5358,24 +6569,35 @@ fn pdb_ids_from_text_in_order(value: &str) -> Vec<String> {
     ids
 }
 
-fn write_selected_complex_candidate(
+fn write_selected_complex_candidates(
     options: &ScienceOptions,
-    selected: &SelectedComplexCandidate,
+    rows: &[(SelectedComplexCandidate, String, String)],
 ) -> Result<(), String> {
-    write_text(
-        &options.run_dir.join("complex_candidate_selection.tsv"),
-        &format!(
-            "candidate_id\tinput_id\ttarget_id\ttarget_name\torganism\ttarget_class\tsource\tpdb_id\tevidence\n{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\n",
+    let mut text = String::from(
+        "candidate_id\tidentity_namespace\tinput_id\trecord_id\ttarget_id\ttarget_name\torganism\ttarget_class\tsource\tpdb_id\tevidence\tselection_rank\treceptor_artifact\tcoordinate_sha256\n",
+    );
+    for (index, (selected, artifact, coordinate_sha256)) in rows.iter().enumerate() {
+        text.push_str(&format!(
+            "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\n",
             clean_cell(&selected.candidate_id),
+            clean_cell(&selected.identity_namespace),
             clean_cell(&selected.input_id),
+            clean_cell(&selected.record_id),
             clean_cell(&selected.target_id),
             clean_cell(&selected.target_name),
             clean_cell(&selected.organism),
             clean_cell(&selected.target_class),
             clean_cell(&selected.source),
             clean_cell(&selected.pdb_id),
-            clean_cell(&selected.evidence)
-        ),
+            clean_cell(&selected.evidence),
+            index + 1,
+            clean_cell(artifact),
+            coordinate_sha256,
+        ));
+    }
+    write_text(
+        &options.run_dir.join("complex_candidate_selection.tsv"),
+        &text,
     )
 }
 
@@ -5386,31 +6608,57 @@ fn append_selected_structure_match(
     if !match_path.exists() || !selected_path.exists() {
         return Ok(false);
     }
-    let selected = read_text(selected_path)?;
-    let Some(line) = selected.lines().nth(1) else {
-        return Ok(false);
-    };
-    let cols = split_tsv(line);
-    if cols.len() < 9 {
-        return Ok(false);
-    }
+    let selected_rows = read_simple_tsv_rows(selected_path)?;
     let mut text = read_text(match_path)?;
-    if text.contains(&format!("\t{}\t", cols[2])) {
-        return Ok(false);
+    let existing = read_simple_tsv_rows(match_path)?
+        .into_iter()
+        .map(|row| {
+            format!(
+                "{}\u{1f}{}\u{1f}{}",
+                row.get("input_id").map(String::as_str).unwrap_or(""),
+                row.get("record_id")
+                    .map(String::as_str)
+                    .unwrap_or("record_1"),
+                row.get("target_id").map(String::as_str).unwrap_or("")
+            )
+        })
+        .collect::<BTreeSet<_>>();
+    let mut appended = false;
+    for row in selected_rows {
+        let input_id = row.get("input_id").map(String::as_str).unwrap_or("");
+        let record_id = row.get("record_id").map(String::as_str).unwrap_or("");
+        let target_id = row.get("target_id").map(String::as_str).unwrap_or("");
+        let key = format!("{input_id}\u{1f}{record_id}\u{1f}{target_id}");
+        if input_id.is_empty()
+            || record_id.is_empty()
+            || target_id.is_empty()
+            || existing.contains(&key)
+        {
+            continue;
+        }
+        let source = row.get("source").map(String::as_str).unwrap_or("");
+        let pdb_id = row.get("pdb_id").map(String::as_str).unwrap_or("");
+        let evidence = row.get("evidence").map(String::as_str).unwrap_or("");
+        text.push_str(&format!(
+            "{}\t{}\t{}\t{}\t{}\t{}\t1.0000\t{}\t{}\t{}\t{}\t{}\n",
+            clean_cell(input_id),
+            clean_cell(source),
+            clean_cell(target_id),
+            clean_cell(row.get("target_name").map(String::as_str).unwrap_or("")),
+            clean_cell(row.get("organism").map(String::as_str).unwrap_or("")),
+            clean_cell(row.get("target_class").map(String::as_str).unwrap_or("")),
+            clean_cell(&format!("coordinate_backed pdb_id={pdb_id}")),
+            clean_cell(evidence),
+            clean_cell(source),
+            clean_cell(input_id),
+            clean_cell(record_id),
+        ));
+        appended = true;
     }
-    text.push_str(&format!(
-        "{}\t{}\t{}\t{}\t{}\t{}\t1.0000\t{}\t{}\n",
-        clean_cell(&cols[1]),
-        clean_cell(&cols[6]),
-        clean_cell(&cols[2]),
-        clean_cell(&cols[3]),
-        clean_cell(&cols[4]),
-        clean_cell(&cols[5]),
-        clean_cell(&format!("bindingdb_pdb_coordinate pdb_id={}", cols[7])),
-        clean_cell(&cols[8])
-    ));
-    write_text(match_path, &text)?;
-    Ok(true)
+    if appended {
+        write_text(match_path, &text)?;
+    }
+    Ok(appended)
 }
 
 fn append_selected_structure_summary(
@@ -5420,52 +6668,64 @@ fn append_selected_structure_summary(
     if !selection_path.exists() || !selected_path.exists() {
         return Ok(false);
     }
-    let selected = read_text(selected_path)?;
-    let Some(line) = selected.lines().nth(1) else {
-        return Ok(false);
-    };
-    let cols = split_tsv(line);
-    if cols.len() < 9 {
-        return Ok(false);
-    }
+    let selected_rows = read_simple_tsv_rows(selected_path)?;
     let mut text = read_text(selection_path)?;
-    if text.contains(&format!("{}\t", cols[0])) {
-        return Ok(false);
+    let existing = read_simple_tsv_rows(selection_path)?
+        .into_iter()
+        .filter_map(|row| row.get("candidate_id").cloned())
+        .collect::<BTreeSet<_>>();
+    let mut appended = false;
+    for row in selected_rows {
+        let candidate_id = row.get("candidate_id").map(String::as_str).unwrap_or("");
+        if candidate_id.is_empty() || existing.contains(candidate_id) {
+            continue;
+        }
+        let source = row.get("source").map(String::as_str).unwrap_or("");
+        let pdb_id = row.get("pdb_id").map(String::as_str).unwrap_or("");
+        let evidence = row.get("evidence").map(String::as_str).unwrap_or("");
+        text.push_str(&format!(
+            "{}\t1.0000\t{}\t{}\t{}\t{}\t\t\t\t{}\n",
+            clean_cell(candidate_id),
+            clean_cell(&format!("{source} pdb_id={pdb_id}")),
+            "coordinate_backed",
+            clean_cell(row.get("target_class").map(String::as_str).unwrap_or("")),
+            clean_cell(evidence),
+            clean_cell(evidence),
+        ));
+        appended = true;
     }
-    text.push_str(&format!(
-        "{}\t1.0000\t{}\t{}\t{}\t{}\t\t\t\t{}\n",
-        clean_cell(&cols[0]),
-        clean_cell(&format!("{} pdb_id={}", cols[6], cols[7])),
-        "bindingdb_pdb_coordinate",
-        clean_cell(&cols[5]),
-        clean_cell(&cols[8]),
-        clean_cell(&cols[8])
-    ));
-    write_text(selection_path, &text)?;
-    Ok(true)
+    if appended {
+        write_text(selection_path, &text)?;
+    }
+    Ok(appended)
 }
 
-fn write_structure_viewer_status(
+fn write_structure_viewer_status_rows(
     options: &ScienceOptions,
-    status: &str,
-    target_id: &str,
-    pdb_id: &str,
-    artifact: &str,
-    expected_path: &str,
-    reason: &str,
+    rows: &[(SelectedComplexCandidate, String, String)],
 ) -> Result<(), String> {
-    write_text(
-        &options.run_dir.join("structure_viewer_status.tsv"),
-        &format!(
-            "status\ttarget_id\tpdb_id\tartifact\texpected_path\treason\n{}\t{}\t{}\t{}\t{}\t{}\n",
-            clean_cell(status),
-            clean_cell(target_id),
-            clean_cell(pdb_id),
+    let mut text = String::from(
+        "status\ttarget_id\tpdb_id\tartifact\texpected_path\treason\tcandidate_id\tinput_id\trecord_id\tselection_rank\tcoordinate_sha256\n",
+    );
+    if rows.is_empty() {
+        text.push_str("not_ready\t\t\t\t\tno coordinate-backed candidate for this run\t\t\t\t\t\n");
+    }
+    for (index, (selected, artifact, coordinate_sha256)) in rows.iter().enumerate() {
+        text.push_str(&format!(
+            "ready\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\n",
+            clean_cell(&selected.target_id),
+            clean_cell(&selected.pdb_id),
             clean_cell(artifact),
-            clean_cell(expected_path),
-            clean_cell(reason)
-        ),
-    )
+            clean_cell(artifact),
+            "coordinate artifact bound to selected candidate",
+            clean_cell(&selected.candidate_id),
+            clean_cell(&selected.input_id),
+            clean_cell(&selected.record_id),
+            index + 1,
+            coordinate_sha256,
+        ));
+    }
+    write_text(&options.run_dir.join("structure_viewer_status.tsv"), &text)
 }
 
 fn structure_coordinate_ids(item: &IndexMatch) -> Vec<String> {
@@ -5495,15 +6755,6 @@ fn find_structure_coordinate_file(science_store: &Path, pdb_id: &str) -> Option<
     structure_coordinate_candidate_paths(science_store, pdb_id)
         .into_iter()
         .find(|path| path.exists())
-}
-
-fn expected_structure_coordinate_paths(science_store: &Path, pdb_id: &str) -> String {
-    structure_coordinate_candidate_paths(science_store, pdb_id)
-        .into_iter()
-        .take(4)
-        .map(|path| relative_display(science_store, &path))
-        .collect::<Vec<_>>()
-        .join(";")
 }
 
 fn structure_coordinate_candidate_paths(science_store: &Path, pdb_id: &str) -> Vec<PathBuf> {
@@ -5550,6 +6801,74 @@ fn write_coordinate_viewer_artifact(run_dir: &Path, source: &Path) -> Option<Str
     };
     write_text(&run_dir.join(artifact), &text).ok()?;
     Some(artifact.to_string())
+}
+
+fn write_candidate_coordinate_artifact(
+    run_dir: &Path,
+    candidate_id: &str,
+    source: &Path,
+) -> Option<String> {
+    let text = read_maybe_gz_text(source).ok()?;
+    let lower = lower_file_name(source);
+    let extension = if lower.contains(".json") {
+        if !text.contains("\"atoms\"") {
+            return None;
+        }
+        "json"
+    } else if lower.contains(".pdb") || lower.contains(".ent") {
+        if !coordinate_text_has_atoms(&text) {
+            return None;
+        }
+        "pdb"
+    } else {
+        if !coordinate_text_has_atoms(&text) {
+            return None;
+        }
+        "cif"
+    };
+    let relative = PathBuf::from("structure_candidates")
+        .join(safe_id(candidate_id))
+        .join(format!("receptor.{extension}"));
+    let path = run_dir.join(&relative);
+    ensure_dir(path.parent()?).ok()?;
+    write_text(&path, &text).ok()?;
+    Some(relative_display(run_dir, &path))
+}
+
+fn read_index_matches(path: &Path) -> Result<Vec<IndexMatch>, String> {
+    if !path.is_file() {
+        return Ok(Vec::new());
+    }
+    let rows = read_simple_tsv_rows(path)?;
+    Ok(rows
+        .into_iter()
+        .filter_map(|row| {
+            let input_id = row.get("input_id")?.trim().to_string();
+            let target_id = row.get("target_id")?.trim().to_string();
+            if input_id.is_empty() || target_id.is_empty() {
+                return None;
+            }
+            Some(IndexMatch {
+                input_id,
+                record_id: row
+                    .get("record_id")
+                    .filter(|value| !value.trim().is_empty())
+                    .cloned()
+                    .unwrap_or_else(|| "record_1".to_string()),
+                source: row.get("source").cloned().unwrap_or_default(),
+                target_id,
+                target_name: row.get("target_name").cloned().unwrap_or_default(),
+                organism: row.get("organism").cloned().unwrap_or_default(),
+                target_class: row.get("target_class").cloned().unwrap_or_default(),
+                match_score: row
+                    .get("match_score")
+                    .and_then(|value| value.parse::<f64>().ok())
+                    .unwrap_or_default(),
+                matched_features: row.get("matched_features").cloned().unwrap_or_default(),
+                evidence: row.get("evidence").cloned().unwrap_or_default(),
+            })
+        })
+        .collect())
 }
 
 fn read_maybe_gz_text(path: &Path) -> Result<String, String> {
@@ -5617,25 +6936,36 @@ fn write_md_summary_from_metric_artifacts(
     }
     let mut text = String::from(md_summary_header());
     for (candidate, metrics) in rows {
-        let rmsd = metrics.get("rmsd").cloned().unwrap_or_default();
-        let rmsf = metrics.get("rmsf").cloned().unwrap_or_default();
-        let drift = metrics.get("ligand_drift").cloned().unwrap_or_default();
+        let required = [
+            "rmsd",
+            "rmsf",
+            "ligand_drift",
+            "hydrogen_bond_occupancy",
+            "contact_occupancy",
+        ];
+        if required.iter().any(|field| {
+            metrics
+                .get(*field)
+                .and_then(|value| value.trim().parse::<f64>().ok())
+                .is_none_or(|value| !value.is_finite())
+        }) {
+            return Err(format!("md_metric_set_incomplete_or_invalid:{candidate}"));
+        }
+        let rmsd = metrics.get("rmsd").expect("validated metric");
+        let rmsf = metrics.get("rmsf").expect("validated metric");
+        let drift = metrics.get("ligand_drift").expect("validated metric");
         let hbond = metrics
             .get("hydrogen_bond_occupancy")
-            .cloned()
-            .unwrap_or_default();
-        let contact = metrics
-            .get("contact_occupancy")
-            .cloned()
-            .unwrap_or_default();
+            .expect("validated metric");
+        let contact = metrics.get("contact_occupancy").expect("validated metric");
         text.push_str(&format!(
             "{}\t{}\t{}\t{}\t{}\t{}\t\t\tmetric_artifacts\t\n",
             clean_cell(&candidate),
-            clean_cell(&rmsd),
-            clean_cell(&rmsf),
-            clean_cell(&drift),
-            clean_cell(&hbond),
-            clean_cell(&contact)
+            clean_cell(rmsd),
+            clean_cell(rmsf),
+            clean_cell(drift),
+            clean_cell(hbond),
+            clean_cell(contact)
         ));
     }
     write_text(out_path, &text)?;
@@ -5659,7 +6989,7 @@ fn read_metric_values(
         for row in read_simple_tsv_rows(&path)? {
             let candidate =
                 first_metric_value(&row, &["candidate_id", "candidate", "target_id", "id"])
-                    .unwrap_or("current_run");
+                    .ok_or_else(|| format!("md_metric_candidate_missing:{file_name}"))?;
             let value =
                 first_metric_value(&row, &["value", "mean", "average", "summary", "occupancy"])
                     .or_else(|| {
@@ -5688,11 +7018,13 @@ struct CurrentMdWorkerArtifacts {
     reason: String,
 }
 
+#[derive(Clone, Debug)]
 struct CurrentMdRunFacts {
     run_id: String,
     candidate_id: String,
     candidate_digest: String,
     input_id: String,
+    record_id: String,
     input_digest: String,
     source_digest: String,
 }
@@ -5702,13 +7034,83 @@ struct CurrentMdSummary {
     candidate_id: Option<String>,
 }
 
+#[derive(Clone, Debug)]
+struct VerifiedMdFacts {
+    candidate_id: String,
+    platform: String,
+    protocol: String,
+    state: String,
+    trajectory: String,
+    telemetry: Option<String>,
+    gpu_observed: bool,
+    force_field: Option<String>,
+    solvent_model: Option<String>,
+    nonbonded_method: Option<String>,
+}
+
+#[derive(Clone, Debug)]
+struct VerifiedPeptideConformerFacts {
+    candidate_id: String,
+    conformer_count: usize,
+    manifest: String,
+}
+
+#[derive(Clone, Debug, Default)]
+struct VerifiedIndexedMdComputations {
+    complex: Vec<VerifiedMdFacts>,
+    peptide: Vec<VerifiedPeptideConformerFacts>,
+    not_ready_reasons: Vec<String>,
+}
+
+#[derive(Clone, Debug)]
+struct ValidatedCandidateIndexEntry {
+    facts: CurrentMdRunFacts,
+    job_id: String,
+    invocation_id: String,
+    status: String,
+    reason: String,
+    manifest: String,
+    artifact_provenance: String,
+}
+
 fn materialize_current_md_summary(options: &ScienceOptions) -> Result<CurrentMdSummary, String> {
+    if options
+        .run_dir
+        .join("tool_outputs/md_manifest_index.json")
+        .is_file()
+    {
+        return materialize_indexed_md_summary(options);
+    }
     let md_path = options.run_dir.join("md_summary.tsv");
     let binding = current_md_worker_artifacts(options)?;
-    let ready = binding.status == "PASS"
+    if binding.status == "PASS"
+        && current_md_method(options).as_deref() != Some("openmm_receptor_ligand_complex_dynamics")
+    {
+        write_text(&md_path, md_summary_header())?;
+        write_md_summary_status(
+            options,
+            "not_applicable",
+            "worker method is not receptor-ligand complex molecular dynamics",
+        )?;
+        return Ok(CurrentMdSummary {
+            ready: false,
+            candidate_id: None,
+        });
+    }
+    let produced = binding.status == "PASS"
         && ((binding.artifacts.contains("tool_outputs/md_summary.tsv")
             && copy_tool_output_if_available(options, "md_summary.tsv", &md_path)?)
             || write_md_summary_from_metric_artifacts(options, &md_path, &binding.artifacts)?);
+    let ready = if produced {
+        let candidate_id = binding
+            .candidate_id
+            .as_deref()
+            .ok_or_else(|| "md_summary_candidate_missing".to_string())?;
+        validate_md_summary_semantics(options, &md_path, candidate_id, &binding.artifacts)?;
+        true
+    } else {
+        false
+    };
     if ready {
         write_md_summary_status(
             options,
@@ -5742,6 +7144,1106 @@ fn materialize_current_md_summary(options: &ScienceOptions) -> Result<CurrentMdS
         ready,
         candidate_id: ready.then_some(binding.candidate_id).flatten(),
     })
+}
+
+fn materialize_indexed_md_summary(options: &ScienceOptions) -> Result<CurrentMdSummary, String> {
+    let verified = verified_indexed_md_computations(options)?;
+    let completed_ids = verified
+        .complex
+        .iter()
+        .map(|facts| facts.candidate_id.clone())
+        .collect::<BTreeSet<_>>();
+    let md_path = options.run_dir.join("md_summary.tsv");
+    if completed_ids.is_empty() {
+        write_text(&md_path, md_summary_header())?;
+        let (status, reason) = if verified.peptide.is_empty() {
+            ("not_ready", verified.not_ready_reasons.join(";"))
+        } else {
+            (
+                "not_applicable",
+                format!(
+                    "{} peptide conformer ensemble(s) completed without receptor-ligand MD",
+                    verified.peptide.len()
+                ),
+            )
+        };
+        write_md_summary_status(options, status, &reason)?;
+        return Ok(CurrentMdSummary {
+            ready: false,
+            candidate_id: None,
+        });
+    }
+    let source = options.run_dir.join("tool_outputs/md_summary.tsv");
+    if !source.is_file() {
+        return Err("md_summary_missing_for_completed_candidates".to_string());
+    }
+    let summary_rows = read_simple_tsv_rows(&source)?;
+    let summary_ids = summary_rows
+        .iter()
+        .filter_map(|row| row.get("candidate_id").cloned())
+        .collect::<BTreeSet<_>>();
+    if summary_rows.len() != summary_ids.len() || summary_ids != completed_ids {
+        return Err("md_summary_completed_candidate_mismatch".to_string());
+    }
+    let scores = read_md_scores(&source)?;
+    if scores.keys().cloned().collect::<BTreeSet<_>>() != completed_ids {
+        return Err("md_summary_score_candidate_mismatch".to_string());
+    }
+    write_text(&md_path, &read_text(&source)?)?;
+    write_md_summary_status(
+        options,
+        "ready",
+        "candidate-bound MD summaries verified through manifest index",
+    )?;
+    Ok(CurrentMdSummary {
+        ready: true,
+        candidate_id: (completed_ids.len() == 1)
+            .then(|| completed_ids.into_iter().next())
+            .flatten(),
+    })
+}
+
+fn validated_candidate_manifest_index(
+    options: &ScienceOptions,
+    kind: &str,
+    base_task: &WorkerTask<'_>,
+) -> Result<Vec<ValidatedCandidateIndexEntry>, String> {
+    let schema_version = format!("genoligand_{kind}_manifest_index_v1");
+    let index_path = options
+        .run_dir
+        .join(format!("tool_outputs/{kind}_manifest_index.json"));
+    let index = read_json_value_if_file(&index_path)
+        .ok_or_else(|| format!("{kind}_manifest_index_invalid"))?;
+    if index.get("schema_version").and_then(Value::as_str) != Some(&schema_version)
+        || index.get("run_id").and_then(Value::as_str)
+            != Some(infer_run_id(&options.run_dir).as_str())
+    {
+        return Err(format!("{kind}_manifest_index_identity_mismatch"));
+    }
+    let selected_rows = selected_candidate_rows(options)?;
+    let mut selected = BTreeMap::new();
+    for row in selected_rows {
+        let facts = selected_candidate_run_facts(options, &row)?;
+        if selected
+            .insert(facts.candidate_id.clone(), (facts, row))
+            .is_some()
+        {
+            return Err("selected_candidate_identity_duplicate".to_string());
+        }
+    }
+    let entries = index
+        .get("entries")
+        .and_then(Value::as_array)
+        .ok_or_else(|| format!("{kind}_manifest_index_entries_invalid"))?;
+    let mut seen = BTreeSet::new();
+    let mut validated = Vec::new();
+    for entry in entries {
+        let candidate_id = entry
+            .get("candidate_id")
+            .and_then(Value::as_str)
+            .filter(|value| !value.trim().is_empty())
+            .ok_or_else(|| format!("{kind}_manifest_index_candidate_missing"))?;
+        let (facts, selected_row) = selected
+            .get(candidate_id)
+            .ok_or_else(|| format!("{kind}_manifest_index_candidate_mismatch:{candidate_id}"))?;
+        if !seen.insert(candidate_id.to_string()) {
+            return Err(format!(
+                "{kind}_manifest_index_candidate_duplicate:{candidate_id}"
+            ));
+        }
+        for (field, expected) in [
+            ("input_id", facts.input_id.as_str()),
+            ("record_id", facts.record_id.as_str()),
+            ("candidate_digest", facts.candidate_digest.as_str()),
+            ("input_digest", facts.input_digest.as_str()),
+            ("source_digest", facts.source_digest.as_str()),
+        ] {
+            if entry.get(field).and_then(Value::as_str) != Some(expected) {
+                return Err(format!(
+                    "{kind}_manifest_index_selection_mismatch:{candidate_id}:{field}"
+                ));
+            }
+        }
+        let job_id = entry
+            .get("job_id")
+            .and_then(Value::as_str)
+            .filter(|value| !value.trim().is_empty())
+            .ok_or_else(|| format!("{kind}_manifest_index_job_missing:{candidate_id}"))?
+            .to_string();
+        if job_id != candidate_worker_job_id(base_task.job_id, candidate_id) {
+            return Err(format!("{kind}_manifest_index_job_mismatch:{candidate_id}"));
+        }
+        let invocation_id = entry
+            .get("invocation_id")
+            .and_then(Value::as_str)
+            .filter(|value| !value.trim().is_empty())
+            .ok_or_else(|| format!("{kind}_manifest_index_invocation_missing:{candidate_id}"))?
+            .to_string();
+        let status = entry
+            .get("status")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string();
+        if !matches!(status.as_str(), "completed" | "not_ready" | "failed") {
+            return Err(format!(
+                "{kind}_manifest_index_status_invalid:{candidate_id}:{status}"
+            ));
+        }
+        let reason = entry
+            .get("reason")
+            .and_then(Value::as_str)
+            .filter(|value| !value.trim().is_empty())
+            .ok_or_else(|| format!("{kind}_manifest_index_reason_missing:{candidate_id}"))?
+            .to_string();
+        let task = WorkerTask {
+            job_id: &job_id,
+            worker: base_task.worker,
+            module: base_task.module,
+            stage: base_task.stage,
+        };
+        let job_path = options
+            .run_dir
+            .join("worker_jobs")
+            .join(format!("{job_id}.json"));
+        let result_path = options
+            .run_dir
+            .join("worker_results")
+            .join(format!("{job_id}.json"));
+        let job = read_json_value_if_file(&job_path)
+            .ok_or_else(|| format!("{kind}_candidate_job_invalid:{candidate_id}"))?;
+        if !validate_candidate_worker_job(&job, &task, options)
+            || !job_run_identity_matches(&job, options)
+            || job.get("invocation_id").and_then(Value::as_str) != Some(invocation_id.as_str())
+        {
+            return Err(format!(
+                "{kind}_candidate_job_binding_invalid:{candidate_id}"
+            ));
+        }
+        for (field, expected) in [
+            ("run_id", facts.run_id.as_str()),
+            ("candidate_id", facts.candidate_id.as_str()),
+            ("candidate_digest", facts.candidate_digest.as_str()),
+            ("input_id", facts.input_id.as_str()),
+            ("record_id", facts.record_id.as_str()),
+            ("input_digest", facts.input_digest.as_str()),
+            ("source_digest", facts.source_digest.as_str()),
+        ] {
+            if job.get(field).and_then(Value::as_str) != Some(expected) {
+                return Err(format!(
+                    "{kind}_candidate_job_identity_mismatch:{candidate_id}:{field}"
+                ));
+            }
+        }
+        if kind == "docking" {
+            for (field, selected_field) in [
+                ("receptor_artifact", "receptor_artifact"),
+                ("receptor_digest", "coordinate_sha256"),
+            ] {
+                if job.get(field).and_then(Value::as_str)
+                    != selected_row.get(selected_field).map(String::as_str)
+                {
+                    return Err(format!(
+                        "docking_candidate_receptor_mismatch:{candidate_id}:{field}"
+                    ));
+                }
+            }
+        }
+        let result = read_json_value_if_file(&result_path)
+            .ok_or_else(|| format!("{kind}_candidate_result_invalid:{candidate_id}"))?;
+        if !validate_candidate_worker_result(&result, &job, &task) {
+            return Err(format!(
+                "{kind}_candidate_result_binding_invalid:{candidate_id}"
+            ));
+        }
+        let result_status = result
+            .get("execution_status")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        let normalized_result_status = if result_status == "not_applicable" {
+            "not_ready"
+        } else {
+            result_status
+        };
+        if normalized_result_status != status
+            || result.get("reason").and_then(Value::as_str) != Some(reason.as_str())
+        {
+            return Err(format!(
+                "{kind}_candidate_result_status_mismatch:{candidate_id}"
+            ));
+        }
+        let manifest = entry
+            .get("manifest")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string();
+        let artifact_provenance = entry
+            .get("artifact_provenance")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string();
+        let result_manifest = result
+            .get("manifest")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        let result_provenance = result
+            .get("artifact_provenance")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        if (!result_manifest.is_empty() && result_manifest != manifest)
+            || (!result_provenance.is_empty() && result_provenance != artifact_provenance)
+            || (status == "completed" && manifest.is_empty())
+            || (kind == "md"
+                && matches!(status.as_str(), "completed" | "not_ready")
+                && artifact_provenance.is_empty())
+        {
+            return Err(format!(
+                "{kind}_candidate_artifact_index_mismatch:{candidate_id}"
+            ));
+        }
+        validated.push(ValidatedCandidateIndexEntry {
+            facts: facts.clone(),
+            job_id,
+            invocation_id,
+            status,
+            reason,
+            manifest,
+            artifact_provenance,
+        });
+    }
+    if seen != selected.keys().cloned().collect::<BTreeSet<_>>() {
+        return Err(format!("{kind}_manifest_index_incomplete"));
+    }
+    Ok(validated)
+}
+
+fn validated_md_artifact_provenance(
+    options: &ScienceOptions,
+    entry: &ValidatedCandidateIndexEntry,
+) -> Result<BTreeSet<String>, String> {
+    let provenance_relative =
+        current_run_artifact_relative(&options.run_dir, &entry.artifact_provenance)
+            .ok_or_else(|| format!("md_provenance_invalid:{}", entry.facts.candidate_id))?;
+    let provenance = read_json_value_if_file(&options.run_dir.join(&provenance_relative))
+        .ok_or_else(|| format!("md_provenance_invalid:{}", entry.facts.candidate_id))?;
+    if provenance.get("schema_version").and_then(Value::as_str)
+        != Some(MD_PROVENANCE_SCHEMA_VERSION)
+    {
+        return Err(format!(
+            "md_provenance_schema_mismatch:{}",
+            entry.facts.candidate_id
+        ));
+    }
+    for (field, expected) in [
+        ("run_id", entry.facts.run_id.as_str()),
+        ("job_id", entry.job_id.as_str()),
+        ("invocation_id", entry.invocation_id.as_str()),
+        ("candidate_id", entry.facts.candidate_id.as_str()),
+        ("candidate_digest", entry.facts.candidate_digest.as_str()),
+        ("input_id", entry.facts.input_id.as_str()),
+        ("record_id", entry.facts.record_id.as_str()),
+        ("input_digest", entry.facts.input_digest.as_str()),
+        ("source_digest", entry.facts.source_digest.as_str()),
+    ] {
+        if provenance.get(field).and_then(Value::as_str) != Some(expected) {
+            return Err(format!(
+                "md_provenance_identity_mismatch:{}:{field}",
+                entry.facts.candidate_id
+            ));
+        }
+    }
+    let parameters_digest = provenance
+        .get("parameters_digest")
+        .and_then(Value::as_str)
+        .filter(|value| valid_sha256_hex(value))
+        .ok_or_else(|| {
+            format!(
+                "md_provenance_parameters_invalid:{}",
+                entry.facts.candidate_id
+            )
+        })?;
+    let tool_name = provenance
+        .get("tool_name")
+        .and_then(Value::as_str)
+        .filter(|value| !value.trim().is_empty())
+        .ok_or_else(|| format!("md_provenance_tool_invalid:{}", entry.facts.candidate_id))?;
+    let tool_version = provenance
+        .get("tool_version")
+        .and_then(Value::as_str)
+        .filter(|value| !value.trim().is_empty())
+        .ok_or_else(|| format!("md_provenance_tool_invalid:{}", entry.facts.candidate_id))?;
+    let rows = provenance
+        .get("artifacts")
+        .and_then(Value::as_array)
+        .filter(|rows| !rows.is_empty())
+        .ok_or_else(|| {
+            format!(
+                "md_provenance_artifacts_missing:{}",
+                entry.facts.candidate_id
+            )
+        })?;
+    let mut artifacts = BTreeSet::new();
+    for row in rows {
+        for (field, expected) in [
+            ("run_id", entry.facts.run_id.as_str()),
+            ("job_id", entry.job_id.as_str()),
+            ("invocation_id", entry.invocation_id.as_str()),
+            ("candidate_id", entry.facts.candidate_id.as_str()),
+            ("candidate_digest", entry.facts.candidate_digest.as_str()),
+            ("input_id", entry.facts.input_id.as_str()),
+            ("record_id", entry.facts.record_id.as_str()),
+            ("input_digest", entry.facts.input_digest.as_str()),
+            ("source_digest", entry.facts.source_digest.as_str()),
+            ("parameters_digest", parameters_digest),
+            ("tool_name", tool_name),
+            ("tool_version", tool_version),
+        ] {
+            if row.get(field).and_then(Value::as_str) != Some(expected) {
+                return Err(format!(
+                    "md_provenance_artifact_identity_mismatch:{}:{field}",
+                    entry.facts.candidate_id
+                ));
+            }
+        }
+        let artifact = row
+            .get("artifact_path")
+            .and_then(Value::as_str)
+            .and_then(|path| current_run_artifact_relative(&options.run_dir, path))
+            .ok_or_else(|| {
+                format!(
+                    "md_provenance_artifact_invalid:{}",
+                    entry.facts.candidate_id
+                )
+            })?;
+        let expected_digest = row
+            .get("artifact_sha256")
+            .and_then(Value::as_str)
+            .filter(|value| valid_sha256_hex(value))
+            .ok_or_else(|| {
+                format!(
+                    "md_provenance_artifact_digest_missing:{}",
+                    entry.facts.candidate_id
+                )
+            })?;
+        let actual_digest = sha256_file_hex(&options.run_dir.join(&artifact)).ok_or_else(|| {
+            format!(
+                "md_provenance_artifact_unreadable:{}:{artifact}",
+                entry.facts.candidate_id
+            )
+        })?;
+        if !actual_digest.eq_ignore_ascii_case(expected_digest) {
+            return Err(format!(
+                "md_provenance_artifact_digest_mismatch:{}:{artifact}",
+                entry.facts.candidate_id
+            ));
+        }
+        if !artifacts.insert(artifact.clone()) {
+            return Err(format!(
+                "md_provenance_artifact_duplicate:{}:{artifact}",
+                entry.facts.candidate_id
+            ));
+        }
+    }
+    Ok(artifacts)
+}
+
+fn artifact_named(
+    artifacts: &BTreeSet<String>,
+    name: &str,
+    candidate_id: &str,
+) -> Result<String, String> {
+    let matches = artifacts
+        .iter()
+        .filter(|path| Path::new(path).file_name().and_then(|value| value.to_str()) == Some(name))
+        .cloned()
+        .collect::<Vec<_>>();
+    if matches.len() != 1 {
+        return Err(format!(
+            "md_artifact_name_binding_invalid:{candidate_id}:{name}"
+        ));
+    }
+    Ok(matches[0].clone())
+}
+
+fn finite_md_value(
+    row: &BTreeMap<String, String>,
+    field: &str,
+    candidate_id: &str,
+) -> Result<f64, String> {
+    row.get(field)
+        .and_then(|value| value.trim().parse::<f64>().ok())
+        .filter(|value| value.is_finite())
+        .ok_or_else(|| format!("md_metric_value_invalid:{candidate_id}:{field}"))
+}
+
+fn verify_complex_md_entry(
+    options: &ScienceOptions,
+    entry: &ValidatedCandidateIndexEntry,
+    manifest: &Value,
+    artifacts: &BTreeSet<String>,
+) -> Result<VerifiedMdFacts, String> {
+    let candidate_id = entry.facts.candidate_id.as_str();
+    let required_names = [
+        "md_summary.tsv",
+        "md_rmsd.tsv",
+        "md_rmsf.tsv",
+        "md_ligand_drift.tsv",
+        "md_contacts.tsv",
+        "md_hbonds.tsv",
+        "ligand_placement.tsv",
+        "md_trajectory.tsv",
+        "md_state.tsv",
+        "md_protocol.tsv",
+        "gpu_telemetry.tsv",
+        "gpu_telemetry_status.tsv",
+        "complex_md_manifest.json",
+        "md_run_manifest.json",
+    ];
+    let mut paths = BTreeMap::new();
+    for name in required_names {
+        paths.insert(name, artifact_named(artifacts, name, candidate_id)?);
+    }
+    let manifest_relative = current_run_artifact_relative(&options.run_dir, &entry.manifest)
+        .ok_or_else(|| format!("md_manifest_invalid:{candidate_id}"))?;
+    if paths.get("md_run_manifest.json") != Some(&manifest_relative) {
+        return Err(format!("md_manifest_provenance_unbound:{candidate_id}"));
+    }
+    let output_parent = Path::new(&manifest_relative).parent();
+    if artifacts
+        .iter()
+        .any(|path| Path::new(path).parent() != output_parent)
+    {
+        return Err(format!(
+            "md_artifact_invocation_directory_mismatch:{candidate_id}"
+        ));
+    }
+    for (field, name) in [
+        ("trajectory", "md_trajectory.tsv"),
+        ("state_artifact", "md_state.tsv"),
+        ("protocol_artifact", "md_protocol.tsv"),
+        ("ligand_coordinate", "ligand_placement.tsv"),
+        ("complex_manifest", "complex_md_manifest.json"),
+        ("gpu_telemetry_artifact", "gpu_telemetry.tsv"),
+        ("gpu_telemetry_status_artifact", "gpu_telemetry_status.tsv"),
+    ] {
+        if manifest.get(field).and_then(Value::as_str) != paths.get(name).map(String::as_str) {
+            return Err(format!(
+                "md_manifest_artifact_mismatch:{candidate_id}:{field}"
+            ));
+        }
+    }
+    let expected_metrics = [
+        "md_summary.tsv",
+        "md_rmsd.tsv",
+        "md_rmsf.tsv",
+        "md_ligand_drift.tsv",
+        "md_contacts.tsv",
+        "md_hbonds.tsv",
+    ]
+    .into_iter()
+    .map(|name| paths[name].clone())
+    .collect::<BTreeSet<_>>();
+    let manifest_metrics = manifest
+        .get("metric_artifacts")
+        .and_then(Value::as_array)
+        .map(|rows| {
+            rows.iter()
+                .filter_map(Value::as_str)
+                .map(str::to_string)
+                .collect::<BTreeSet<_>>()
+        })
+        .unwrap_or_default();
+    if manifest_metrics != expected_metrics {
+        return Err(format!("md_metric_artifact_set_mismatch:{candidate_id}"));
+    }
+    let summary_rows = read_simple_tsv_rows(&options.run_dir.join(&paths["md_summary.tsv"]))?;
+    if summary_rows.len() != 1
+        || summary_rows[0].get("candidate_id").map(String::as_str) != Some(candidate_id)
+    {
+        return Err(format!("md_summary_candidate_mismatch:{candidate_id}"));
+    }
+    let summary = &summary_rows[0];
+    let mut values = BTreeMap::new();
+    for field in [
+        "rmsd",
+        "rmsf",
+        "ligand_drift",
+        "hydrogen_bond_occupancy",
+        "contact_occupancy",
+        "interaction_persistence",
+        "md_stability_score",
+    ] {
+        let value = finite_md_value(summary, field, candidate_id)?;
+        if value < 0.0
+            || (matches!(
+                field,
+                "hydrogen_bond_occupancy"
+                    | "contact_occupancy"
+                    | "interaction_persistence"
+                    | "md_stability_score"
+            ) && value > 1.0)
+        {
+            return Err(format!(
+                "md_metric_value_out_of_range:{candidate_id}:{field}"
+            ));
+        }
+        values.insert(field, value);
+    }
+    for (name, metric, unit) in [
+        ("md_rmsd.tsv", "rmsd", "angstrom"),
+        ("md_rmsf.tsv", "rmsf", "angstrom"),
+        ("md_ligand_drift.tsv", "ligand_drift", "angstrom"),
+        ("md_contacts.tsv", "contact_occupancy", "fraction"),
+        ("md_hbonds.tsv", "hydrogen_bond_occupancy", "fraction"),
+    ] {
+        let rows = read_simple_tsv_rows(&options.run_dir.join(&paths[name]))?;
+        if rows.len() != 1
+            || rows[0].get("candidate_id").map(String::as_str) != Some(candidate_id)
+            || rows[0].get("input_id").map(String::as_str) != Some(entry.facts.input_id.as_str())
+            || rows[0].get("metric").map(String::as_str) != Some(metric)
+            || rows[0].get("unit").map(String::as_str) != Some(unit)
+        {
+            return Err(format!("md_metric_binding_invalid:{candidate_id}:{name}"));
+        }
+        let artifact_value = finite_md_value(&rows[0], "value", candidate_id)?;
+        if (artifact_value - values[metric]).abs() > 1e-6 {
+            return Err(format!(
+                "md_metric_summary_mismatch:{candidate_id}:{metric}"
+            ));
+        }
+    }
+    let recomputed = clamp_score(
+        clamp_score(1.0 - values["rmsd"] / 4.0) * 0.30
+            + clamp_score(1.0 - values["ligand_drift"] / 3.0) * 0.25
+            + values["contact_occupancy"] * 0.20
+            + values["hydrogen_bond_occupancy"] * 0.10
+            + values["interaction_persistence"] * 0.15,
+    );
+    if (recomputed - values["md_stability_score"]).abs() > 1e-4 {
+        return Err(format!("md_stability_score_mismatch:{candidate_id}"));
+    }
+    let protocol_rows = read_simple_tsv_rows(&options.run_dir.join(&paths["md_protocol.tsv"]))?;
+    let mut protocol = BTreeMap::new();
+    for row in protocol_rows {
+        if row.get("candidate_id").map(String::as_str) != Some(candidate_id)
+            || row.get("input_id").map(String::as_str) != Some(entry.facts.input_id.as_str())
+        {
+            return Err(format!("md_protocol_binding_invalid:{candidate_id}"));
+        }
+        let key = format!(
+            "{}:{}",
+            row.get("stage").map(String::as_str).unwrap_or_default(),
+            row.get("parameter").map(String::as_str).unwrap_or_default()
+        );
+        if protocol.insert(key, row).is_some() {
+            return Err(format!("md_protocol_parameter_duplicate:{candidate_id}"));
+        }
+    }
+    for (key, unit) in [
+        ("platform:openmm_platform", ""),
+        ("integrator:time_step", "ps"),
+        ("production:total_steps", "steps"),
+        ("output:frame_count", "frames"),
+        ("output:state_rows", "rows"),
+    ] {
+        if protocol
+            .get(key)
+            .and_then(|row| row.get("unit"))
+            .map(String::as_str)
+            != Some(unit)
+        {
+            return Err(format!(
+                "md_protocol_parameter_invalid:{candidate_id}:{key}"
+            ));
+        }
+    }
+    let total_steps = protocol["production:total_steps"]
+        .get("value")
+        .and_then(|value| value.parse::<u64>().ok())
+        .filter(|value| *value > 0)
+        .ok_or_else(|| format!("md_protocol_steps_invalid:{candidate_id}"))?;
+    let frame_count = protocol["output:frame_count"]
+        .get("value")
+        .and_then(|value| value.parse::<usize>().ok())
+        .filter(|value| *value >= 2)
+        .ok_or_else(|| format!("md_protocol_frame_count_invalid:{candidate_id}"))?;
+    let state_count = protocol["output:state_rows"]
+        .get("value")
+        .and_then(|value| value.parse::<usize>().ok())
+        .filter(|value| *value >= 2)
+        .ok_or_else(|| format!("md_protocol_state_count_invalid:{candidate_id}"))?;
+    if manifest.get("frame_count").and_then(Value::as_u64) != Some(frame_count as u64)
+        || manifest.get("state_row_count").and_then(Value::as_u64) != Some(state_count as u64)
+    {
+        return Err(format!(
+            "md_manifest_sampling_count_mismatch:{candidate_id}"
+        ));
+    }
+    let state_rows = read_simple_tsv_rows(&options.run_dir.join(&paths["md_state.tsv"]))?;
+    if state_rows.len() != state_count {
+        return Err(format!("md_state_row_count_mismatch:{candidate_id}"));
+    }
+    let max_step = state_rows
+        .iter()
+        .map(|row| {
+            if row.get("candidate_id").map(String::as_str) != Some(candidate_id)
+                || row.get("input_id").map(String::as_str) != Some(entry.facts.input_id.as_str())
+            {
+                return Err(format!("md_state_binding_invalid:{candidate_id}"));
+            }
+            for field in [
+                "time_ps",
+                "potential_energy_kj_mol",
+                "kinetic_energy_kj_mol",
+                "total_energy_kj_mol",
+                "temperature_estimate_K",
+            ] {
+                finite_md_value(row, field, candidate_id)?;
+            }
+            row.get("step")
+                .and_then(|value| value.parse::<u64>().ok())
+                .ok_or_else(|| format!("md_state_step_invalid:{candidate_id}"))
+        })
+        .collect::<Result<Vec<_>, _>>()?
+        .into_iter()
+        .max()
+        .unwrap_or_default();
+    if max_step < total_steps {
+        return Err(format!("md_state_steps_incomplete:{candidate_id}"));
+    }
+    let trajectory_rows = read_simple_tsv_rows(&options.run_dir.join(&paths["md_trajectory.tsv"]))?;
+    let mut frames = BTreeSet::new();
+    for row in trajectory_rows {
+        if row.get("candidate_id").map(String::as_str) != Some(candidate_id) {
+            return Err(format!("md_trajectory_binding_invalid:{candidate_id}"));
+        }
+        let frame = row
+            .get("frame")
+            .and_then(|value| value.parse::<usize>().ok())
+            .ok_or_else(|| format!("md_trajectory_frame_invalid:{candidate_id}"))?;
+        frames.insert(frame);
+    }
+    if frames.len() != frame_count {
+        return Err(format!("md_trajectory_frame_count_mismatch:{candidate_id}"));
+    }
+    let platform = manifest
+        .get("platform")
+        .and_then(Value::as_str)
+        .filter(|value| !value.trim().is_empty())
+        .ok_or_else(|| format!("verified_md_platform_missing:{candidate_id}"))?
+        .to_string();
+    let system = manifest.get("system").and_then(Value::as_object);
+    let force_field = system.and_then(|system| {
+        let fields = ["protein_forcefield", "small_molecule_forcefield"]
+            .into_iter()
+            .filter_map(|key| {
+                system
+                    .get(key)
+                    .and_then(Value::as_str)
+                    .filter(|value| !value.trim().is_empty())
+                    .map(|value| format!("{key}={value}"))
+            })
+            .collect::<Vec<_>>();
+        (!fields.is_empty()).then(|| fields.join(","))
+    });
+    Ok(VerifiedMdFacts {
+        candidate_id: candidate_id.to_string(),
+        platform,
+        protocol: paths["md_protocol.tsv"].clone(),
+        state: paths["md_state.tsv"].clone(),
+        trajectory: paths["md_trajectory.tsv"].clone(),
+        telemetry: Some(paths["gpu_telemetry.tsv"].clone()),
+        gpu_observed: manifest
+            .get("gpu_observed")
+            .and_then(Value::as_bool)
+            .unwrap_or(false),
+        force_field,
+        solvent_model: system
+            .and_then(|value| value.get("solvent_mode"))
+            .and_then(Value::as_str)
+            .map(str::to_string),
+        nonbonded_method: system
+            .and_then(|value| value.get("nonbonded_method"))
+            .and_then(Value::as_str)
+            .map(str::to_string),
+    })
+}
+
+fn verify_peptide_conformer_entry(
+    options: &ScienceOptions,
+    entry: &ValidatedCandidateIndexEntry,
+    manifest: &Value,
+    artifacts: &BTreeSet<String>,
+) -> Result<VerifiedPeptideConformerFacts, String> {
+    let candidate_id = entry.facts.candidate_id.as_str();
+    if manifest
+        .get("artifact_schema_version")
+        .and_then(Value::as_str)
+        != Some("genoligand_peptide_conformer_v1")
+        || manifest.get("method_class").and_then(Value::as_str) != Some("conformer_ensemble")
+        || manifest.get("has_receptor").and_then(Value::as_bool) != Some(false)
+        || manifest.get("uses_openmm").and_then(Value::as_bool) != Some(false)
+        || manifest.get("md_score").and_then(Value::as_f64) != Some(0.0)
+    {
+        return Err(format!("peptide_conformer_method_invalid:{candidate_id}"));
+    }
+    let summary = artifact_named(artifacts, "peptide_conformer_summary.tsv", candidate_id)?;
+    let metrics = artifact_named(artifacts, "peptide_conformer_metrics.tsv", candidate_id)?;
+    let coordinates = artifact_named(artifacts, "peptide_conformer_coordinates.tsv", candidate_id)?;
+    let ensemble = artifact_named(artifacts, "peptide_conformer_ensemble.tsv", candidate_id)?;
+    let run_manifest = artifact_named(artifacts, "md_run_manifest.json", candidate_id)?;
+    if current_run_artifact_relative(&options.run_dir, &entry.manifest).as_deref()
+        != Some(run_manifest.as_str())
+        || manifest.get("coordinate_artifact").and_then(Value::as_str) != Some(coordinates.as_str())
+        || manifest.get("ensemble_artifact").and_then(Value::as_str) != Some(ensemble.as_str())
+    {
+        return Err(format!("peptide_conformer_manifest_unbound:{candidate_id}"));
+    }
+    let metric_artifacts = manifest
+        .get("metric_artifacts")
+        .and_then(Value::as_array)
+        .map(|rows| {
+            rows.iter()
+                .filter_map(Value::as_str)
+                .map(str::to_string)
+                .collect::<BTreeSet<_>>()
+        })
+        .unwrap_or_default();
+    if metric_artifacts != BTreeSet::from([summary.clone(), metrics.clone()])
+        || artifacts.iter().any(|path| {
+            Path::new(path).file_name().and_then(|value| value.to_str()) == Some("md_summary.tsv")
+        })
+    {
+        return Err(format!(
+            "peptide_conformer_artifact_set_invalid:{candidate_id}"
+        ));
+    }
+    let summary_rows = read_simple_tsv_rows(&options.run_dir.join(&summary))?;
+    if summary_rows.len() != 1
+        || summary_rows[0].get("candidate_id").map(String::as_str) != Some(candidate_id)
+        || summary_rows[0].get("input_id").map(String::as_str)
+            != Some(entry.facts.input_id.as_str())
+        || summary_rows[0].get("method").map(String::as_str)
+            != Some("rdkit_peptide_conformer_ensemble")
+        || summary_rows[0].get("has_receptor").map(String::as_str) != Some("false")
+        || summary_rows[0].get("uses_openmm").map(String::as_str) != Some("false")
+    {
+        return Err(format!("peptide_conformer_summary_invalid:{candidate_id}"));
+    }
+    let conformer_count = summary_rows[0]
+        .get("conformer_count")
+        .and_then(|value| value.parse::<usize>().ok())
+        .filter(|value| *value > 0)
+        .ok_or_else(|| format!("peptide_conformer_count_invalid:{candidate_id}"))?;
+    if manifest.get("conformer_count").and_then(Value::as_u64) != Some(conformer_count as u64) {
+        return Err(format!("peptide_conformer_count_mismatch:{candidate_id}"));
+    }
+    let metric_rows = read_simple_tsv_rows(&options.run_dir.join(metrics))?;
+    let metric_names = metric_rows
+        .iter()
+        .map(|row| {
+            if row.get("candidate_id").map(String::as_str) != Some(candidate_id)
+                || row.get("input_id").map(String::as_str) != Some(entry.facts.input_id.as_str())
+                || row.get("unit").map(String::as_str) != Some("angstrom")
+                || finite_md_value(row, "value", candidate_id)? < 0.0
+            {
+                return Err(format!("peptide_conformer_metric_invalid:{candidate_id}"));
+            }
+            Ok(row.get("metric").cloned().unwrap_or_default())
+        })
+        .collect::<Result<BTreeSet<_>, String>>()?;
+    if metric_names
+        != BTreeSet::from([
+            "mean_centroid_drift_angstrom".to_string(),
+            "mean_heavy_atom_rmsd_angstrom".to_string(),
+            "mean_heavy_atom_rmsf_angstrom".to_string(),
+        ])
+    {
+        return Err(format!(
+            "peptide_conformer_metric_set_invalid:{candidate_id}"
+        ));
+    }
+    let frames = read_simple_tsv_rows(&options.run_dir.join(ensemble))?
+        .into_iter()
+        .filter(|row| row.get("candidate_id").map(String::as_str) == Some(candidate_id))
+        .filter_map(|row| row.get("frame").cloned())
+        .collect::<BTreeSet<_>>();
+    if frames.len() != conformer_count {
+        return Err(format!(
+            "peptide_conformer_frame_count_mismatch:{candidate_id}"
+        ));
+    }
+    Ok(VerifiedPeptideConformerFacts {
+        candidate_id: candidate_id.to_string(),
+        conformer_count,
+        manifest: run_manifest,
+    })
+}
+
+fn verified_indexed_md_computations(
+    options: &ScienceOptions,
+) -> Result<VerifiedIndexedMdComputations, String> {
+    let entries = validated_candidate_manifest_index(options, "md", &SCIENTIFIC_WORKER_TASKS[0])?;
+    let mut verified = VerifiedIndexedMdComputations::default();
+    for entry in entries {
+        if entry.status != "completed" {
+            verified
+                .not_ready_reasons
+                .push(format!("{}:{}", entry.facts.candidate_id, entry.reason));
+            if !entry.artifact_provenance.is_empty() {
+                validated_md_artifact_provenance(options, &entry)?;
+            }
+            continue;
+        }
+        let artifacts = validated_md_artifact_provenance(options, &entry)?;
+        let manifest_relative = current_run_artifact_relative(&options.run_dir, &entry.manifest)
+            .ok_or_else(|| format!("md_manifest_invalid:{}", entry.facts.candidate_id))?;
+        if !artifacts.contains(&manifest_relative) {
+            return Err(format!(
+                "md_manifest_not_bound_by_provenance:{}",
+                entry.facts.candidate_id
+            ));
+        }
+        let manifest = read_json_value_if_file(&options.run_dir.join(&manifest_relative))
+            .ok_or_else(|| format!("md_manifest_invalid:{}", entry.facts.candidate_id))?;
+        for (field, expected) in [
+            ("run_id", entry.facts.run_id.as_str()),
+            ("job_id", entry.job_id.as_str()),
+            ("invocation_id", entry.invocation_id.as_str()),
+            ("candidate_id", entry.facts.candidate_id.as_str()),
+            ("candidate_digest", entry.facts.candidate_digest.as_str()),
+            ("input_id", entry.facts.input_id.as_str()),
+            ("record_id", entry.facts.record_id.as_str()),
+            ("input_digest", entry.facts.input_digest.as_str()),
+            ("source_digest", entry.facts.source_digest.as_str()),
+        ] {
+            if manifest.get(field).and_then(Value::as_str) != Some(expected) {
+                return Err(format!(
+                    "md_manifest_identity_mismatch:{}:{field}",
+                    entry.facts.candidate_id
+                ));
+            }
+        }
+        if manifest.get("artifact_provenance").and_then(Value::as_str)
+            != Some(entry.artifact_provenance.as_str())
+        {
+            return Err(format!(
+                "md_manifest_provenance_mismatch:{}",
+                entry.facts.candidate_id
+            ));
+        }
+        match manifest.get("method").and_then(Value::as_str) {
+            Some("openmm_receptor_ligand_complex_dynamics") => verified.complex.push(
+                verify_complex_md_entry(options, &entry, &manifest, &artifacts)?,
+            ),
+            Some("rdkit_peptide_conformer_ensemble") => verified.peptide.push(
+                verify_peptide_conformer_entry(options, &entry, &manifest, &artifacts)?,
+            ),
+            _ => {
+                return Err(format!(
+                    "md_manifest_method_invalid:{}",
+                    entry.facts.candidate_id
+                ));
+            }
+        }
+    }
+    verified
+        .complex
+        .sort_by(|left, right| left.candidate_id.cmp(&right.candidate_id));
+    verified
+        .peptide
+        .sort_by(|left, right| left.candidate_id.cmp(&right.candidate_id));
+    Ok(verified)
+}
+
+fn current_md_method(options: &ScienceOptions) -> Option<String> {
+    read_json_value_if_file(&options.run_dir.join("tool_outputs/md_run_manifest.json")).and_then(
+        |value| {
+            value
+                .get("method")
+                .and_then(Value::as_str)
+                .map(str::to_string)
+        },
+    )
+}
+
+fn verified_current_md_facts(options: &ScienceOptions) -> Result<Vec<VerifiedMdFacts>, String> {
+    if options
+        .run_dir
+        .join("tool_outputs/md_manifest_index.json")
+        .is_file()
+    {
+        return Ok(verified_indexed_md_computations(options)?.complex);
+    }
+    let binding = current_md_worker_artifacts(options)?;
+    if binding.status != "PASS" {
+        return Ok(Vec::new());
+    }
+    if current_md_method(options).as_deref() != Some("openmm_receptor_ligand_complex_dynamics") {
+        return Ok(Vec::new());
+    }
+    let candidate_id = binding
+        .candidate_id
+        .as_deref()
+        .ok_or_else(|| "verified_md_candidate_missing".to_string())?;
+    let summary_path = options.run_dir.join("md_summary.tsv");
+    validate_md_summary_semantics(options, &summary_path, candidate_id, &binding.artifacts)?;
+    let manifest_path = options.run_dir.join("tool_outputs/md_run_manifest.json");
+    let manifest = read_json_value_if_file(&manifest_path)
+        .ok_or_else(|| "verified_md_manifest_missing".to_string())?;
+    if manifest.get("candidate_id").and_then(Value::as_str) != Some(candidate_id) {
+        return Err("verified_md_manifest_candidate_mismatch".to_string());
+    }
+    let required_artifact = |field: &str| -> Result<String, String> {
+        let path = manifest
+            .get(field)
+            .and_then(Value::as_str)
+            .filter(|value| !value.trim().is_empty())
+            .ok_or_else(|| format!("verified_md_manifest_field_missing:{field}"))?;
+        let relative = current_run_artifact_relative(&options.run_dir, path)
+            .ok_or_else(|| format!("verified_md_manifest_artifact_invalid:{field}"))?;
+        if !binding.artifacts.contains(&relative) {
+            return Err(format!("verified_md_manifest_artifact_unbound:{field}"));
+        }
+        Ok(relative)
+    };
+    let platform = manifest
+        .get("platform")
+        .and_then(Value::as_str)
+        .filter(|value| !value.trim().is_empty())
+        .ok_or_else(|| "verified_md_platform_missing".to_string())?
+        .to_string();
+    let telemetry = manifest
+        .get("gpu_telemetry_artifact")
+        .and_then(Value::as_str)
+        .filter(|value| !value.trim().is_empty())
+        .map(|path| {
+            current_run_artifact_relative(&options.run_dir, path)
+                .ok_or_else(|| "verified_md_telemetry_invalid".to_string())
+        })
+        .transpose()?;
+    if telemetry
+        .as_ref()
+        .is_some_and(|relative| !binding.artifacts.contains(relative))
+    {
+        return Err("verified_md_telemetry_unbound".to_string());
+    }
+    Ok(vec![VerifiedMdFacts {
+        candidate_id: candidate_id.to_string(),
+        platform,
+        protocol: required_artifact("protocol_artifact")?,
+        state: required_artifact("state_artifact")?,
+        trajectory: required_artifact("trajectory")?,
+        telemetry,
+        gpu_observed: manifest
+            .get("gpu_observed")
+            .and_then(Value::as_bool)
+            .unwrap_or(false),
+        force_field: manifest
+            .get("force_field")
+            .and_then(Value::as_str)
+            .map(str::to_string),
+        solvent_model: manifest
+            .get("solvent_model")
+            .and_then(Value::as_str)
+            .map(str::to_string),
+        nonbonded_method: manifest
+            .get("nonbonded_method")
+            .and_then(Value::as_str)
+            .map(str::to_string),
+    }])
+}
+
+fn validate_md_summary_semantics(
+    options: &ScienceOptions,
+    summary_path: &Path,
+    candidate_id: &str,
+    artifacts: &BTreeSet<String>,
+) -> Result<(), String> {
+    for required in [
+        "tool_outputs/md_rmsd.tsv",
+        "tool_outputs/md_rmsf.tsv",
+        "tool_outputs/md_ligand_drift.tsv",
+        "tool_outputs/md_contacts.tsv",
+        "tool_outputs/md_hbonds.tsv",
+        "tool_outputs/md_protocol.tsv",
+        "tool_outputs/md_state.tsv",
+        "tool_outputs/md_trajectory.tsv",
+    ] {
+        if !artifacts.contains(required) {
+            return Err(format!("md_required_artifact_missing:{required}"));
+        }
+    }
+    let rows = read_simple_tsv_rows(summary_path)?;
+    if rows.len() != 1 || rows[0].get("candidate_id").map(String::as_str) != Some(candidate_id) {
+        return Err("md_summary_candidate_mismatch".to_string());
+    }
+    for field in [
+        "rmsd",
+        "rmsf",
+        "ligand_drift",
+        "hydrogen_bond_occupancy",
+        "contact_occupancy",
+        "interaction_persistence",
+        "md_stability_score",
+    ] {
+        let value = rows[0]
+            .get(field)
+            .and_then(|value| value.trim().parse::<f64>().ok())
+            .filter(|value| value.is_finite())
+            .ok_or_else(|| format!("md_summary_metric_invalid:{field}"))?;
+        if value < 0.0
+            || (matches!(
+                field,
+                "hydrogen_bond_occupancy"
+                    | "contact_occupancy"
+                    | "interaction_persistence"
+                    | "md_stability_score"
+            ) && value > 1.0)
+        {
+            return Err(format!("md_summary_metric_out_of_range:{field}"));
+        }
+    }
+    for relative in [
+        "tool_outputs/md_rmsd.tsv",
+        "tool_outputs/md_rmsf.tsv",
+        "tool_outputs/md_ligand_drift.tsv",
+        "tool_outputs/md_contacts.tsv",
+        "tool_outputs/md_hbonds.tsv",
+    ] {
+        let rows = read_simple_tsv_rows(&options.run_dir.join(relative))?;
+        if rows.is_empty()
+            || rows
+                .iter()
+                .any(|row| row.get("candidate_id").map(String::as_str) != Some(candidate_id))
+        {
+            return Err(format!("md_metric_candidate_mismatch:{relative}"));
+        }
+    }
+    let protocol = read_simple_tsv_rows(&options.run_dir.join("tool_outputs/md_protocol.tsv"))?;
+    let total_steps = protocol
+        .iter()
+        .filter(|row| {
+            matches!(
+                row.get("parameter").map(String::as_str),
+                Some("total_steps") | Some("steps")
+            )
+        })
+        .filter_map(|row| row.get("value"))
+        .filter_map(|value| value.trim().parse::<u64>().ok())
+        .max()
+        .unwrap_or_default();
+    if total_steps == 0 {
+        return Err("md_protocol_zero_steps".to_string());
+    }
+    for relative in [
+        "tool_outputs/md_state.tsv",
+        "tool_outputs/md_trajectory.tsv",
+    ] {
+        if rows_in_tsv(&options.run_dir.join(relative))? < 2 {
+            return Err(format!("md_artifact_insufficient_frames:{relative}"));
+        }
+    }
+    Ok(())
 }
 
 fn current_md_worker_artifacts(
@@ -5979,7 +8481,14 @@ fn current_md_run_facts(options: &ScienceOptions) -> Result<CurrentMdRunFacts, S
     if candidate_rows.len() != 1 {
         return Err("candidate_manifest_mismatch".to_string());
     }
-    let candidate = candidate_rows[0]
+    selected_candidate_run_facts(options, &candidate_rows[0])
+}
+
+fn selected_candidate_run_facts(
+    options: &ScienceOptions,
+    candidate_row: &BTreeMap<String, String>,
+) -> Result<CurrentMdRunFacts, String> {
+    let candidate = candidate_row
         .iter()
         .map(|(key, value)| (key.clone(), value.trim().to_string()))
         .collect::<BTreeMap<_, _>>();
@@ -5995,6 +8504,12 @@ fn current_md_run_facts(options: &ScienceOptions) -> Result<CurrentMdRunFacts, S
         .filter(|value| !value.trim().is_empty())
         .ok_or_else(|| "candidate_manifest_mismatch".to_string())?
         .to_string();
+    let record_id = candidate
+        .get("record_id")
+        .map(String::as_str)
+        .filter(|value| !value.trim().is_empty())
+        .ok_or_else(|| "candidate_manifest_mismatch".to_string())?
+        .to_string();
     let candidate_digest = canonical_json_sha256(&json!(candidate));
 
     let input_rows = read_simple_tsv_rows(&options.run_dir.join("input_conversion_manifest.tsv"))?;
@@ -6002,6 +8517,7 @@ fn current_md_run_facts(options: &ScienceOptions) -> Result<CurrentMdRunFacts, S
         .iter()
         .filter(|row| {
             row.get("input_id").map(String::as_str) == Some(input_id.as_str())
+                && row.get("record_id").map(String::as_str) == Some(record_id.as_str())
                 && row.get("conversion_status").map(String::as_str) == Some("converted")
                 && matches!(
                     row.get("canonical_kind").map(String::as_str),
@@ -6028,7 +8544,7 @@ fn current_md_run_facts(options: &ScienceOptions) -> Result<CurrentMdRunFacts, S
         .ok_or_else(|| "input_manifest_mismatch".to_string())?;
     let input_digest = canonical_json_sha256(&json!({
         "input_id": input_id,
-        "record_id": input.get("record_id").map(String::as_str).unwrap_or(""),
+        "record_id": record_id,
         "canonical_kind": input.get("canonical_kind").map(String::as_str).unwrap_or(""),
         "canonical_value": canonical_value,
         "source_content_sha256": source_digest,
@@ -6038,6 +8554,7 @@ fn current_md_run_facts(options: &ScienceOptions) -> Result<CurrentMdRunFacts, S
         candidate_id,
         candidate_digest,
         input_id,
+        record_id,
         input_digest,
         source_digest,
     })
@@ -6117,7 +8634,11 @@ fn current_run_artifact_relative(run_dir: &Path, artifact: &str) -> Option<Strin
         return None;
     }
     let root = run_dir.canonicalize().ok()?;
-    let path = PathBuf::from(artifact);
+    let path = if cfg!(windows) {
+        wsl_path_to_windows(artifact).unwrap_or_else(|| PathBuf::from(artifact))
+    } else {
+        PathBuf::from(artifact)
+    };
     let candidate = if path.is_absolute() {
         path
     } else {
@@ -6274,8 +8795,8 @@ fn copy_tool_output_or_header(
 struct AuthenticityViolation {
     artifact: String,
     line_number: usize,
-    marker: &'static str,
-    reason: &'static str,
+    marker: String,
+    reason: String,
 }
 
 fn ensure_final_artifacts_authentic(
@@ -6298,39 +8819,299 @@ fn final_artifact_authenticity_violations(
     artifacts: &[&str],
 ) -> Result<Vec<AuthenticityViolation>, String> {
     let mut violations = Vec::new();
+    let current_inputs = current_run_input_identities(options)?;
     for artifact in artifacts {
         let path = options.run_dir.join(artifact);
         if !path.exists() || !path.is_file() {
+            violations.push(AuthenticityViolation {
+                artifact: (*artifact).to_string(),
+                line_number: 0,
+                marker: "missing_required_artifact".to_string(),
+                reason: "required_current_run_artifact_missing".to_string(),
+            });
             continue;
         }
         let text = read_text(&path)?;
-        let skip_header = artifact.ends_with(".tsv");
-        for (index, line) in text.lines().enumerate() {
-            if skip_header && index == 0 {
-                continue;
-            }
-            if line.trim().is_empty() {
-                continue;
-            }
-            if let Some((marker, reason)) = authenticity_marker(line) {
+        if matches!(
+            *artifact,
+            "known_database_matches.tsv"
+                | "metagenome_potential_matches.tsv"
+                | "structure_interaction_matches.tsv"
+                | "tool_outputs/mmseqs_alignment_matches.tsv"
+                | "tool_outputs/foldseek_structure_matches.tsv"
+                | "target_candidate_ranking.tsv"
+        ) {
+            validate_current_run_tsv_provenance(
+                options,
+                artifact,
+                &text,
+                &current_inputs,
+                &mut violations,
+            );
+        } else if *artifact == "candidate_detail.json" {
+            validate_candidate_detail_provenance(artifact, &text, &current_inputs, &mut violations);
+        } else if *artifact == "docking_summary.tsv" {
+            if let Err(reason) = read_docking_scores(options, &path) {
                 violations.push(AuthenticityViolation {
                     artifact: (*artifact).to_string(),
-                    line_number: index + 1,
-                    marker,
+                    line_number: 0,
+                    marker: "invalid_docking_provenance".to_string(),
                     reason,
                 });
+            }
+        } else if *artifact == "md_summary.tsv" {
+            match verified_current_md_facts(options) {
+                Ok(facts) => {
+                    let summary_ids = read_simple_tsv_rows(&path)
+                        .unwrap_or_default()
+                        .into_iter()
+                        .filter_map(|row| row.get("candidate_id").cloned())
+                        .collect::<BTreeSet<_>>();
+                    let verified_ids = facts
+                        .into_iter()
+                        .map(|facts| facts.candidate_id)
+                        .collect::<BTreeSet<_>>();
+                    if summary_ids != verified_ids {
+                        violations.push(AuthenticityViolation {
+                            artifact: (*artifact).to_string(),
+                            line_number: 0,
+                            marker: "invalid_md_provenance".to_string(),
+                            reason: "md_summary_verified_candidate_set_mismatch".to_string(),
+                        });
+                    }
+                }
+                Err(reason) => violations.push(AuthenticityViolation {
+                    artifact: (*artifact).to_string(),
+                    line_number: 0,
+                    marker: "invalid_md_provenance".to_string(),
+                    reason,
+                }),
             }
         }
     }
     Ok(violations)
 }
 
-fn authenticity_marker(line: &str) -> Option<(&'static str, &'static str)> {
-    let lower = line.to_ascii_lowercase();
-    AUTHENTICITY_FORBIDDEN_MARKERS
-        .iter()
-        .copied()
-        .find(|(marker, _)| lower.contains(marker))
+fn current_run_input_identities(
+    options: &ScienceOptions,
+) -> Result<BTreeSet<(String, String)>, String> {
+    let rows = read_simple_tsv_rows(&options.run_dir.join("input_normalized_manifest.tsv"))?;
+    Ok(rows
+        .into_iter()
+        .filter_map(|row| {
+            let input_id = row.get("input_id")?.trim();
+            let record_id = row
+                .get("record_id")
+                .map(String::as_str)
+                .unwrap_or("record_1")
+                .trim();
+            (!input_id.is_empty() && !record_id.is_empty())
+                .then(|| (input_id.to_string(), record_id.to_string()))
+        })
+        .collect())
+}
+
+fn validate_current_run_tsv_provenance(
+    options: &ScienceOptions,
+    artifact: &str,
+    text: &str,
+    current_inputs: &BTreeSet<(String, String)>,
+    violations: &mut Vec<AuthenticityViolation>,
+) {
+    let mut lines = text.lines();
+    let headers = split_tsv(lines.next().unwrap_or_default());
+    let input_idx = find_header(&headers, &["input_id"]);
+    let record_idx = find_header(&headers, &["record_id"]);
+    let target_idx = find_header(&headers, &["target_id"]);
+    let source_idx = find_header(&headers, &["source", "source_database_id"]);
+    let evidence_idx = find_header(&headers, &["evidence", "evidence_summary"]);
+    let candidate_idx = find_header(&headers, &["candidate_id"]);
+    let query_idx = find_header(&headers, &["current_run_query_id", "query_digest"]);
+    let source_provenance_idx = find_header(
+        &headers,
+        &[
+            "source_digest",
+            "source_row_provenance",
+            "source_database_id",
+        ],
+    );
+    let expected_run_id = infer_run_id(&options.run_dir);
+    let expected_pipeline_invocation = current_pipeline_invocation_id(options).unwrap_or_default();
+    let mut missing_headers = Vec::new();
+    if input_idx.is_none() {
+        missing_headers.push("input_id");
+    }
+    if record_idx.is_none() {
+        missing_headers.push("record_id");
+    }
+    if target_idx.is_none() {
+        missing_headers.push("target_id");
+    }
+    if artifact == "target_candidate_ranking.tsv" && candidate_idx.is_none() {
+        missing_headers.push("candidate_id");
+    }
+    if !missing_headers.is_empty() {
+        violations.push(AuthenticityViolation {
+            artifact: artifact.to_string(),
+            line_number: 1,
+            marker: "provenance_schema_missing".to_string(),
+            reason: missing_headers.join(","),
+        });
+        return;
+    }
+    for (offset, line) in lines.enumerate() {
+        if line.trim().is_empty() {
+            continue;
+        }
+        let cols = split_tsv(line);
+        let input_id = cell(&cols, input_idx);
+        let record_id = {
+            let value = cell(&cols, record_idx);
+            if value.is_empty() {
+                "record_1".to_string()
+            } else {
+                value
+            }
+        };
+        let mut reasons = Vec::new();
+        if !current_inputs.contains(&(input_id.clone(), record_id.clone())) {
+            reasons.push("input_or_record_not_in_current_run");
+        }
+        if cell(&cols, target_idx).trim().is_empty() {
+            reasons.push("missing_target_id");
+        }
+        if artifact != "target_candidate_ranking.tsv" && cell(&cols, source_idx).trim().is_empty() {
+            reasons.push("missing_source_identity");
+        }
+        if cell(&cols, evidence_idx).trim().is_empty() {
+            reasons.push("missing_evidence_identity");
+        }
+        if artifact == "target_candidate_ranking.tsv"
+            && cell(&cols, candidate_idx).trim().is_empty()
+        {
+            reasons.push("missing_candidate_identity");
+        }
+        if matches!(
+            artifact,
+            "known_database_matches.tsv"
+                | "metagenome_potential_matches.tsv"
+                | "tool_outputs/mmseqs_alignment_matches.tsv"
+                | "tool_outputs/foldseek_structure_matches.tsv"
+        ) {
+            let query = cell(&cols, query_idx);
+            let digest = query.strip_prefix("query_").unwrap_or(&query);
+            if !valid_sha256_hex(digest) {
+                reasons.push("invalid_query_identity");
+            }
+        }
+        if matches!(
+            artifact,
+            "known_database_matches.tsv"
+                | "metagenome_potential_matches.tsv"
+                | "structure_interaction_matches.tsv"
+        ) {
+            let provenance = cell(&cols, source_provenance_idx);
+            let evidence = cell(&cols, evidence_idx);
+            let bound_field = |name: &str| {
+                first_nonempty(&[
+                    evidence_field(&evidence, &[name]),
+                    evidence_field(&provenance, &[name]),
+                ])
+            };
+            let source_id = bound_field("source_id");
+            let source_path = bound_field("source_path");
+            let source_digest = bound_field("source_digest");
+            let run_id = bound_field("run_id");
+            let pipeline_invocation_id = bound_field("pipeline_invocation_id");
+            match canonical_source_binding(&options.science_store, &source_id, &source_digest) {
+                Ok(binding)
+                    if binding.source_id == source_id
+                        && binding.source_path == source_path
+                        && binding.source_digest == source_digest => {}
+                Ok(_) => reasons.push("source_manifest_binding_mismatch"),
+                Err(_) => reasons.push("source_manifest_binding_missing"),
+            }
+            if run_id != expected_run_id {
+                reasons.push("run_id_not_current");
+            }
+            if expected_pipeline_invocation.is_empty()
+                || pipeline_invocation_id != expected_pipeline_invocation
+            {
+                reasons.push("pipeline_invocation_not_current");
+            }
+        }
+        if !reasons.is_empty() {
+            violations.push(AuthenticityViolation {
+                artifact: artifact.to_string(),
+                line_number: offset + 2,
+                marker: "missing_positive_provenance".to_string(),
+                reason: reasons.join(";"),
+            });
+        }
+    }
+}
+
+fn validate_candidate_detail_provenance(
+    artifact: &str,
+    text: &str,
+    current_inputs: &BTreeSet<(String, String)>,
+    violations: &mut Vec<AuthenticityViolation>,
+) {
+    let value: Value = match serde_json::from_str(text.trim_start_matches('\u{feff}')) {
+        Ok(value) => value,
+        Err(err) => {
+            violations.push(AuthenticityViolation {
+                artifact: artifact.to_string(),
+                line_number: 0,
+                marker: "invalid_json".to_string(),
+                reason: err.to_string(),
+            });
+            return;
+        }
+    };
+    for (index, candidate) in value
+        .get("candidates")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .enumerate()
+    {
+        let input_id = candidate
+            .get("input_id")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        let record_id = candidate
+            .get("record_id")
+            .and_then(Value::as_str)
+            .unwrap_or("record_1");
+        let target_id = candidate
+            .get("target_id")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        let namespace = candidate
+            .get("identity_namespace")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        let candidate_id = candidate
+            .get("candidate_id")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        let expected_id = candidate_id_for(input_id, record_id, namespace, target_id);
+        if !current_inputs.contains(&(input_id.to_string(), record_id.to_string()))
+            || input_id.is_empty()
+            || record_id.is_empty()
+            || target_id.is_empty()
+            || namespace.is_empty()
+            || candidate_id != expected_id
+        {
+            violations.push(AuthenticityViolation {
+                artifact: artifact.to_string(),
+                line_number: index + 1,
+                marker: "missing_positive_provenance".to_string(),
+                reason: "candidate_identity_not_bound_to_current_input_record_target".to_string(),
+            });
+        }
+    }
 }
 
 fn write_authenticity_gate_report(
@@ -6339,15 +9120,17 @@ fn write_authenticity_gate_report(
 ) -> Result<(), String> {
     let mut text = String::from("artifact\tstatus\tline_number\tmarker\treason\n");
     if violations.is_empty() {
-        text.push_str("final_run_artifacts\tpassed\t0\t\tno_forbidden_fixture_sample_smoke_static_fallback_demo_markers\n");
+        text.push_str(
+            "final_run_artifacts\tpassed\t0\tpositive_provenance\tall final rows bind to current run input, record, source and validated scientific artifacts\n",
+        );
     } else {
         for violation in violations {
             text.push_str(&format!(
                 "{}\tblocked\t{}\t{}\t{}\n",
                 clean_cell(&violation.artifact),
                 violation.line_number,
-                clean_cell(violation.marker),
-                clean_cell(violation.reason)
+                clean_cell(&violation.marker),
+                clean_cell(&violation.reason)
             ));
         }
     }
@@ -6361,8 +9144,6 @@ fn rank_targets(options: &ScienceOptions) -> Result<String, String> {
             "known_database_matches.tsv",
             "metagenome_potential_matches.tsv",
             "structure_interaction_matches.tsv",
-            "tool_outputs/mmseqs_alignment_matches.tsv",
-            "tool_outputs/foldseek_structure_matches.tsv",
             "docking_summary.tsv",
             "md_summary.tsv",
         ],
@@ -6385,10 +9166,7 @@ fn rank_targets(options: &ScienceOptions) -> Result<String, String> {
     )?;
     let mut candidates = by_target.into_values().collect::<Vec<_>>();
     assign_collision_free_candidate_ids(&mut candidates);
-    apply_docking_scores(
-        &mut candidates,
-        &options.run_dir.join("docking_summary.tsv"),
-    )?;
+    apply_docking_scores(&mut candidates, options)?;
     apply_md_scores(&mut candidates, options)?;
     for candidate in &mut candidates {
         candidate.final_score = (candidate.known_score * KNOWN_SCORE_WEIGHT
@@ -6400,11 +9178,11 @@ fn rank_targets(options: &ScienceOptions) -> Result<String, String> {
     }
     candidates.sort_by(|left, right| right.final_score.total_cmp(&left.final_score));
     let mut text = String::from(
-        "rank\tcandidate_id\ttarget_id\ttarget_name\tcandidate_scope\torganism\tfinal_score\tknown_database_score\tmetagenome_score\tstructure_score\tdocking_score\tmd_score\tevidence_summary\tstatus\n",
+        "rank\tcandidate_id\ttarget_id\ttarget_name\tcandidate_scope\torganism\tfinal_score\tknown_database_score\tmetagenome_score\tstructure_score\tdocking_score\tmd_score\tevidence_summary\tstatus\tinput_id\trecord_id\tidentity_namespace\n",
     );
     for (index, candidate) in candidates.iter().enumerate() {
         text.push_str(&format!(
-            "{}\t{}\t{}\t{}\t{}\t{}\t{:.4}\t{:.4}\t{:.4}\t{:.4}\t{:.4}\t{:.4}\t{}\tcomputed_prediction\n",
+            "{}\t{}\t{}\t{}\t{}\t{}\t{:.4}\t{:.4}\t{:.4}\t{:.4}\t{:.4}\t{:.4}\t{}\tcomputed_prediction\t{}\t{}\t{}\n",
             index + 1,
             candidate.candidate_id,
             candidate.target_id,
@@ -6417,7 +9195,10 @@ fn rank_targets(options: &ScienceOptions) -> Result<String, String> {
             candidate.structure_score,
             candidate.docking_score,
             candidate.dynamics_score,
-            clean_cell(&candidate.evidence)
+            clean_cell(&candidate.evidence),
+            clean_cell(&candidate.input_id),
+            clean_cell(&candidate.record_id),
+            clean_cell(&candidate.identity_namespace)
         ));
     }
     write_text(&options.run_dir.join("target_candidate_ranking.tsv"), &text)?;
@@ -6428,8 +9209,12 @@ fn rank_targets(options: &ScienceOptions) -> Result<String, String> {
     ))
 }
 
-fn apply_docking_scores(candidates: &mut [Candidate], path: &Path) -> Result<(), String> {
-    let docking_scores = read_docking_scores(path)?;
+fn apply_docking_scores(
+    candidates: &mut [Candidate],
+    options: &ScienceOptions,
+) -> Result<(), String> {
+    let docking_scores =
+        read_docking_scores(options, &options.run_dir.join("docking_summary.tsv"))?;
     if docking_scores.is_empty() {
         return Ok(());
     }
@@ -6442,11 +9227,14 @@ fn apply_docking_scores(candidates: &mut [Candidate], path: &Path) -> Result<(),
     Ok(())
 }
 
-fn read_docking_scores(path: &Path) -> Result<BTreeMap<String, f64>, String> {
+fn read_docking_scores(
+    options: &ScienceOptions,
+    path: &Path,
+) -> Result<BTreeMap<String, f64>, String> {
     if !path.exists() {
         return Ok(BTreeMap::new());
     }
-    let run_dir = path.parent().unwrap_or_else(|| Path::new(""));
+    let manifests = validated_docking_manifests(options)?;
     let text = read_text(path)?;
     let mut lines = text.lines();
     let Some(header) = lines.next() else {
@@ -6459,6 +9247,7 @@ fn read_docking_scores(path: &Path) -> Result<BTreeMap<String, f64>, String> {
     let engine_idx = find_header(&headers, &["docking_engine", "engine"]);
     let notes_idx = find_header(&headers, &["notes", "pose", "artifact"]);
     let mut scores = BTreeMap::new();
+    let mut completed_rows = BTreeSet::new();
     for line in lines {
         let cols = split_tsv(line);
         let candidate_id = cell(&cols, candidate_idx);
@@ -6467,33 +9256,303 @@ fn read_docking_scores(path: &Path) -> Result<BTreeMap<String, f64>, String> {
         if candidate_id.is_empty() || status != "completed" || !engine.contains("vina") {
             continue;
         }
-        if !docking_pose_artifact_ready(run_dir, &cell(&cols, notes_idx)) {
-            continue;
+        if !completed_rows.insert(candidate_id.clone()) {
+            return Err(format!(
+                "docking_summary_candidate_duplicate:{candidate_id}"
+            ));
+        }
+        let manifest = manifests
+            .get(&candidate_id)
+            .ok_or_else(|| format!("docking_manifest_missing_for_candidate:{candidate_id}"))?;
+        let pose = docking_pose_from_notes(&cell(&cols, notes_idx))
+            .ok_or_else(|| format!("docking_pose_missing_for_candidate:{candidate_id}"))?;
+        let pose_relative = current_run_artifact_relative(&options.run_dir, &pose)
+            .ok_or_else(|| format!("docking_pose_outside_current_run:{candidate_id}"))?;
+        if !manifest.contains(&pose_relative) {
+            return Err(format!(
+                "docking_pose_not_bound_by_manifest:{candidate_id}:{pose_relative}"
+            ));
         }
         if let Some(score) = docking_score_from_affinity(&cell(&cols, score_idx)) {
             scores.insert(candidate_id, score);
+        } else {
+            return Err(format!("docking_score_invalid:{candidate_id}"));
         }
+    }
+    if completed_rows != manifests.keys().cloned().collect::<BTreeSet<_>>() {
+        return Err("docking_summary_manifest_candidate_mismatch".to_string());
     }
     Ok(scores)
 }
 
-fn docking_pose_artifact_ready(run_dir: &Path, notes: &str) -> bool {
+fn docking_pose_from_notes(notes: &str) -> Option<String> {
     for key in ["pose", "pose_sdf", "docking_pose", "docking_pose_sdf"] {
         let value = evidence_field(notes, &[key]);
-        if value.is_empty() {
-            continue;
-        }
-        let path = Path::new(&value);
-        let artifact = if path.is_absolute() {
-            path.to_path_buf()
-        } else {
-            run_dir.join(path)
-        };
-        if artifact.exists() && artifact.is_file() {
-            return true;
+        if !value.trim().is_empty() {
+            return Some(value);
         }
     }
-    false
+    None
+}
+
+fn validated_docking_manifests(
+    options: &ScienceOptions,
+) -> Result<BTreeMap<String, BTreeSet<String>>, String> {
+    if options
+        .run_dir
+        .join("tool_outputs/docking_manifest_index.json")
+        .is_file()
+    {
+        return validated_indexed_docking_manifests(options);
+    }
+    let manifest_path = options.run_dir.join("tool_outputs/docking_manifest.json");
+    if !manifest_path.is_file() {
+        return Ok(BTreeMap::new());
+    }
+    let text = read_text(&manifest_path)?;
+    let manifest: Value = serde_json::from_str(text.trim_start_matches('\u{feff}'))
+        .map_err(|err| format!("docking_manifest_parse_failed:{err}"))?;
+    if manifest.get("status").and_then(Value::as_str) != Some("completed") {
+        return Err("docking_manifest_not_completed".to_string());
+    }
+    let candidate_id = manifest
+        .get("candidate_id")
+        .and_then(Value::as_str)
+        .filter(|value| !value.trim().is_empty())
+        .ok_or_else(|| "docking_manifest_candidate_missing".to_string())?;
+    let input_id = manifest
+        .get("input_id")
+        .and_then(Value::as_str)
+        .filter(|value| !value.trim().is_empty())
+        .ok_or_else(|| "docking_manifest_input_missing".to_string())?;
+    let invocation_id = manifest
+        .get("invocation_id")
+        .and_then(Value::as_str)
+        .filter(|value| !value.trim().is_empty())
+        .ok_or_else(|| "docking_manifest_invocation_missing".to_string())?;
+    let expected_invocation = read_text(&options.run_dir.join(WORKER_INVOCATION_FILE))?
+        .trim()
+        .to_string();
+    if invocation_id != expected_invocation {
+        return Err("docking_manifest_invocation_mismatch".to_string());
+    }
+    let current_inputs = current_run_input_identities(options)?;
+    if !current_inputs
+        .iter()
+        .any(|(current, _)| current == input_id)
+    {
+        return Err("docking_manifest_input_not_in_current_run".to_string());
+    }
+    let artifacts = manifest
+        .get("artifacts")
+        .and_then(Value::as_array)
+        .filter(|rows| !rows.is_empty())
+        .ok_or_else(|| "docking_manifest_artifacts_missing".to_string())?;
+    let mut verified = BTreeSet::new();
+    for artifact in artifacts {
+        let path = artifact
+            .get("path")
+            .and_then(Value::as_str)
+            .filter(|value| !value.trim().is_empty())
+            .ok_or_else(|| "docking_manifest_artifact_path_missing".to_string())?;
+        let expected_digest = artifact
+            .get("sha256")
+            .and_then(Value::as_str)
+            .filter(|value| valid_sha256_hex(value))
+            .ok_or_else(|| "docking_manifest_artifact_digest_missing".to_string())?;
+        let relative = current_run_artifact_relative(&options.run_dir, path)
+            .ok_or_else(|| format!("docking_manifest_artifact_outside_run:{path}"))?;
+        let actual = sha256_file_hex(&options.run_dir.join(&relative))
+            .ok_or_else(|| format!("docking_manifest_artifact_unreadable:{relative}"))?;
+        if !actual.eq_ignore_ascii_case(expected_digest) {
+            return Err(format!(
+                "docking_manifest_artifact_digest_mismatch:{relative}"
+            ));
+        }
+        if !verified.insert(relative.clone()) {
+            return Err(format!("docking_manifest_duplicate_artifact:{relative}"));
+        }
+    }
+    Ok(BTreeMap::from([(candidate_id.to_string(), verified)]))
+}
+
+fn validated_indexed_docking_manifests(
+    options: &ScienceOptions,
+) -> Result<BTreeMap<String, BTreeSet<String>>, String> {
+    let entries = validated_candidate_manifest_index(options, "docking", &DOCKING_WORKER_TASK)?;
+    let selected = selected_candidate_rows(options)?
+        .into_iter()
+        .filter_map(|row| row.get("candidate_id").cloned().map(|id| (id, row)))
+        .collect::<BTreeMap<_, _>>();
+    let expected_artifact_names = BTreeSet::from([
+        "ligand_pdbqt",
+        "ligand_sdf",
+        "log",
+        "pose",
+        "pose_sdf",
+        "receptor_coordinate",
+        "receptor_pdb",
+        "receptor_pdbqt",
+    ]);
+    let mut manifests = BTreeMap::new();
+    for entry in entries {
+        if entry.status != "completed" {
+            continue;
+        }
+        let candidate_id = entry.facts.candidate_id.as_str();
+        let manifest_relative = current_run_artifact_relative(&options.run_dir, &entry.manifest)
+            .ok_or_else(|| format!("docking_manifest_invalid:{candidate_id}"))?;
+        let manifest = read_json_value_if_file(&options.run_dir.join(&manifest_relative))
+            .ok_or_else(|| format!("docking_manifest_invalid:{candidate_id}"))?;
+        if manifest
+            .get("artifact_schema_version")
+            .and_then(Value::as_str)
+            != Some("genoligand_docking_artifacts_v1")
+            || manifest.get("status").and_then(Value::as_str) != Some("completed")
+            || manifest.get("method").and_then(Value::as_str) != Some("autodock_vina")
+        {
+            return Err(format!("docking_manifest_schema_invalid:{candidate_id}"));
+        }
+        for (field, expected) in [
+            ("run_id", entry.facts.run_id.as_str()),
+            ("job_id", entry.job_id.as_str()),
+            ("invocation_id", entry.invocation_id.as_str()),
+            ("candidate_id", entry.facts.candidate_id.as_str()),
+            ("candidate_digest", entry.facts.candidate_digest.as_str()),
+            ("input_id", entry.facts.input_id.as_str()),
+            ("record_id", entry.facts.record_id.as_str()),
+            ("input_digest", entry.facts.input_digest.as_str()),
+            ("source_content_sha256", entry.facts.source_digest.as_str()),
+        ] {
+            if manifest.get(field).and_then(Value::as_str) != Some(expected) {
+                return Err(format!(
+                    "docking_manifest_identity_mismatch:{candidate_id}:{field}"
+                ));
+            }
+        }
+        if manifest.get("ligand_record_id").and_then(Value::as_str)
+            != Some(entry.facts.record_id.as_str())
+        {
+            return Err(format!("docking_manifest_record_mismatch:{candidate_id}"));
+        }
+        let selected_row = selected
+            .get(candidate_id)
+            .ok_or_else(|| format!("docking_selection_missing:{candidate_id}"))?;
+        let receptor_artifact = selected_row
+            .get("receptor_artifact")
+            .map(String::as_str)
+            .unwrap_or_default();
+        let receptor_digest = selected_row
+            .get("coordinate_sha256")
+            .map(String::as_str)
+            .unwrap_or_default();
+        if !valid_sha256_hex(receptor_digest)
+            || manifest.get("receptor_digest").and_then(Value::as_str) != Some(receptor_digest)
+            || manifest.get("receptor_sha256").and_then(Value::as_str) != Some(receptor_digest)
+            || manifest
+                .get("receptor_coordinate")
+                .and_then(Value::as_str)
+                .and_then(|path| current_run_artifact_relative(&options.run_dir, path))
+                .as_deref()
+                != Some(receptor_artifact)
+        {
+            return Err(format!("docking_manifest_receptor_mismatch:{candidate_id}"));
+        }
+        let rows = manifest
+            .get("artifacts")
+            .and_then(Value::as_array)
+            .filter(|rows| !rows.is_empty())
+            .ok_or_else(|| format!("docking_manifest_artifacts_missing:{candidate_id}"))?;
+        let invocation_parent = Path::new(&manifest_relative)
+            .parent()
+            .ok_or_else(|| format!("docking_manifest_parent_missing:{candidate_id}"))?;
+        let mut artifact_names = BTreeSet::new();
+        let mut artifacts = BTreeSet::new();
+        let mut named_paths = BTreeMap::new();
+        for row in rows {
+            let artifact_name = row
+                .get("artifact_name")
+                .and_then(Value::as_str)
+                .filter(|value| !value.trim().is_empty())
+                .ok_or_else(|| format!("docking_artifact_name_missing:{candidate_id}"))?;
+            if !artifact_names.insert(artifact_name) {
+                return Err(format!(
+                    "docking_artifact_name_duplicate:{candidate_id}:{artifact_name}"
+                ));
+            }
+            for (field, expected) in [
+                ("run_id", entry.facts.run_id.as_str()),
+                ("job_id", entry.job_id.as_str()),
+                ("invocation_id", entry.invocation_id.as_str()),
+                ("candidate_id", entry.facts.candidate_id.as_str()),
+                ("candidate_digest", entry.facts.candidate_digest.as_str()),
+                ("input_id", entry.facts.input_id.as_str()),
+                ("record_id", entry.facts.record_id.as_str()),
+                ("input_digest", entry.facts.input_digest.as_str()),
+                ("source_digest", entry.facts.source_digest.as_str()),
+            ] {
+                if row.get(field).and_then(Value::as_str) != Some(expected) {
+                    return Err(format!(
+                        "docking_artifact_identity_mismatch:{candidate_id}:{artifact_name}:{field}"
+                    ));
+                }
+            }
+            let relative = row
+                .get("artifact_path")
+                .and_then(Value::as_str)
+                .and_then(|path| current_run_artifact_relative(&options.run_dir, path))
+                .ok_or_else(|| {
+                    format!("docking_artifact_path_invalid:{candidate_id}:{artifact_name}")
+                })?;
+            let expected_digest = row
+                .get("artifact_sha256")
+                .and_then(Value::as_str)
+                .filter(|value| valid_sha256_hex(value))
+                .ok_or_else(|| {
+                    format!("docking_artifact_digest_missing:{candidate_id}:{artifact_name}")
+                })?;
+            let actual_digest =
+                sha256_file_hex(&options.run_dir.join(&relative)).ok_or_else(|| {
+                    format!("docking_artifact_unreadable:{candidate_id}:{artifact_name}")
+                })?;
+            if !actual_digest.eq_ignore_ascii_case(expected_digest)
+                || (artifact_name == "receptor_coordinate"
+                    && (relative != receptor_artifact
+                        || row.get("receptor_digest").and_then(Value::as_str)
+                            != Some(receptor_digest)))
+                || (artifact_name != "receptor_coordinate"
+                    && Path::new(&relative).parent() != Some(invocation_parent))
+                || !artifacts.insert(relative.clone())
+            {
+                return Err(format!(
+                    "docking_artifact_binding_invalid:{candidate_id}:{artifact_name}"
+                ));
+            }
+            named_paths.insert(artifact_name, relative);
+        }
+        if artifact_names != expected_artifact_names {
+            return Err(format!("docking_artifact_set_mismatch:{candidate_id}"));
+        }
+        for field in [
+            "receptor_pdb",
+            "receptor_pdbqt",
+            "ligand_sdf",
+            "ligand_pdbqt",
+            "pose",
+            "pose_sdf",
+            "log",
+        ] {
+            if manifest.get(field).and_then(Value::as_str)
+                != named_paths.get(field).map(String::as_str)
+            {
+                return Err(format!(
+                    "docking_manifest_artifact_mismatch:{candidate_id}:{field}"
+                ));
+            }
+        }
+        manifests.insert(candidate_id.to_string(), artifacts);
+    }
+    Ok(manifests)
 }
 
 fn docking_score_from_affinity(value: &str) -> Option<f64> {
@@ -6513,6 +9572,29 @@ fn docking_score_from_affinity(value: &str) -> Option<f64> {
 fn apply_md_scores(candidates: &mut [Candidate], options: &ScienceOptions) -> Result<(), String> {
     let current_summary = materialize_current_md_summary(options)?;
     if !current_summary.ready {
+        return Ok(());
+    }
+    if options
+        .run_dir
+        .join("tool_outputs/md_manifest_index.json")
+        .is_file()
+    {
+        let completed =
+            candidate_index_statuses(&options.run_dir.join("tool_outputs/md_manifest_index.json"))
+                .into_iter()
+                .filter_map(|(candidate_id, status)| {
+                    (status == "completed").then_some(candidate_id)
+                })
+                .collect::<BTreeSet<_>>();
+        let md_scores = read_md_scores(&options.run_dir.join("md_summary.tsv"))?;
+        for candidate in candidates {
+            if completed.contains(&candidate.candidate_id)
+                && let Some(score) = md_scores.get(&candidate.candidate_id)
+            {
+                candidate.dynamics_score = *score;
+                append_evidence_once(&mut candidate.evidence, "MD:manifest_bound_stability_score");
+            }
+        }
         return Ok(());
     }
     let Some(bound_candidate_id) = current_summary.candidate_id else {
@@ -6746,7 +9828,7 @@ fn build_evidence(options: &ScienceOptions) -> Result<String, String> {
     )?;
     write_score_decomposition(options)?;
     write_artifact_source_map(options)?;
-    let files = [
+    let mut files = vec![
         "run_context.json",
         "authenticity_gate.tsv",
         "artifact_source_map.tsv",
@@ -6784,12 +9866,54 @@ fn build_evidence(options: &ScienceOptions) -> Result<String, String> {
         "target_candidate_ranking.tsv",
         "score_decomposition.tsv",
         "candidate_detail.json",
-    ];
+    ]
+    .into_iter()
+    .map(str::to_string)
+    .collect::<Vec<_>>();
+    if options
+        .run_dir
+        .join("tool_outputs/docking_manifest_index.json")
+        .is_file()
+    {
+        files.push("tool_outputs/docking_manifest_index.json".to_string());
+        let manifests = validated_indexed_docking_manifests(options)?;
+        for artifacts in manifests.values() {
+            for artifact in artifacts {
+                files.push(artifact.clone());
+            }
+        }
+        for entry in validated_candidate_manifest_index(options, "docking", &DOCKING_WORKER_TASK)? {
+            if !entry.manifest.is_empty() {
+                files.push(entry.manifest);
+            }
+        }
+    }
+    if options
+        .run_dir
+        .join("tool_outputs/md_manifest_index.json")
+        .is_file()
+    {
+        files.push("tool_outputs/md_manifest_index.json".to_string());
+        for entry in validated_candidate_manifest_index(options, "md", &SCIENTIFIC_WORKER_TASKS[0])?
+        {
+            if !entry.manifest.is_empty() {
+                files.push(entry.manifest.clone());
+            }
+            if !entry.artifact_provenance.is_empty() {
+                for artifact in validated_md_artifact_provenance(options, &entry)? {
+                    files.push(artifact);
+                }
+                files.push(entry.artifact_provenance);
+            }
+        }
+    }
+    files.sort_unstable();
+    files.dedup();
     let mut text = String::from("claim_id\tevidence_artifact\towner\tstatus\tnotes\n");
     for file in files {
-        let path = options.run_dir.join(file);
+        let path = options.run_dir.join(&file);
         if path.exists() {
-            let status = artifact_evidence_status(file, &path)?;
+            let status = artifact_evidence_status(options, &file, &path)?;
             text.push_str(&format!(
                 "{}\t{file}\tGenoLigand\t{}\t{};content_id:{}\n",
                 file.trim_end_matches(".tsv"),
@@ -6808,7 +9932,11 @@ struct ArtifactEvidenceStatus {
     notes: String,
 }
 
-fn artifact_evidence_status(file: &str, path: &Path) -> Result<ArtifactEvidenceStatus, String> {
+fn artifact_evidence_status(
+    options: &ScienceOptions,
+    file: &str,
+    path: &Path,
+) -> Result<ArtifactEvidenceStatus, String> {
     let rows = if file.ends_with(".tsv") {
         rows_in_tsv(path)?
     } else {
@@ -6948,10 +10076,14 @@ fn artifact_evidence_status(file: &str, path: &Path) -> Result<ArtifactEvidenceS
             }
         }
         "docking_summary.tsv" => {
-            if rows > 0 {
-                ("available", format!("{rows} docking rows"))
+            let verified = rows > 0 && !read_docking_scores(options, path)?.is_empty();
+            if verified {
+                ("available", format!("{rows} verified docking rows"))
             } else {
-                ("not_generated", "no docking rows".to_string())
+                (
+                    "not_generated",
+                    "no current-run docking rows with verified pose provenance".to_string(),
+                )
             }
         }
         "tool_outputs/docking_manifest.json" => (
@@ -6963,15 +10095,32 @@ fn artifact_evidence_status(file: &str, path: &Path) -> Result<ArtifactEvidenceS
             "AutoDock Vina docking pose SDF recorded".to_string(),
         ),
         "md_summary.tsv" => {
-            if rows > 0 {
+            let facts = verified_current_md_facts(options)?;
+            if !facts.is_empty() {
+                let candidates = facts
+                    .iter()
+                    .map(|facts| facts.candidate_id.as_str())
+                    .collect::<Vec<_>>()
+                    .join(",");
+                let platforms = facts
+                    .iter()
+                    .map(|facts| facts.platform.as_str())
+                    .collect::<BTreeSet<_>>()
+                    .into_iter()
+                    .collect::<Vec<_>>()
+                    .join(",");
                 (
                     "available",
                     format!(
-                        "{rows} OpenMM complex MD rows from current run metrics; md_stability_score feeds md_score and final_score with weight {MD_SCORE_WEIGHT:.2}; receptor-ligand force-field system evidence"
+                        "{rows} verified OpenMM complex MD rows for {candidates}; platform {platforms}; md_stability_score feeds md_score and final_score with weight {MD_SCORE_WEIGHT:.2}"
                     ),
                 )
             } else {
-                ("not_generated", "no dynamics rows".to_string())
+                (
+                    "not_generated",
+                    "no current-run receptor-ligand MD artifacts with complete provenance"
+                        .to_string(),
+                )
             }
         }
         "tool_outputs/md_protocol.tsv" => {
@@ -7140,85 +10289,111 @@ fn report_md_score_summary(
     options: &ScienceOptions,
     candidates: &[Candidate],
 ) -> Result<String, String> {
-    let md_path = options.run_dir.join("md_summary.tsv");
-    let md_rows = rows_in_tsv(&md_path).unwrap_or(0);
-    let ranked_md = candidates
-        .iter()
-        .filter(|candidate| candidate.dynamics_score > 0.0)
-        .count();
-    if md_rows == 0 {
-        return Ok(
-            "## \u{52a8}\u{529b}\u{5b66}\u{8bc4}\u{5206}\n\n\u{5f53}\u{524d}\u{8fd0}\u{884c}\u{6ca1}\u{6709}\u{53ef}\u{7528}\u{7684} MD Summary \u{884c}\u{ff0c}md_score \u{4fdd}\u{6301} 0.0000\u{ff0c}\u{5bf9} final_score \u{8d21}\u{732e}\u{4e3a} 0\u{3002}\n\n".to_string(),
-        );
-    }
-    let platform =
-        read_md_manifest_field(options, "platform").unwrap_or_else(|| "unknown".to_string());
-    let trajectory = read_md_manifest_field(options, "trajectory")
-        .unwrap_or_else(|| "tool_outputs/md_trajectory.tsv".to_string());
-    let protocol = read_md_manifest_field(options, "protocol_artifact")
-        .unwrap_or_else(|| "tool_outputs/md_protocol.tsv".to_string());
-    let state = read_md_manifest_field(options, "state_artifact")
-        .unwrap_or_else(|| "tool_outputs/md_state.tsv".to_string());
-    let telemetry = read_md_manifest_field(options, "gpu_telemetry_artifact")
-        .unwrap_or_else(|| "tool_outputs/gpu_telemetry.tsv".to_string());
-    let gpu_observed = if read_md_manifest_bool(options, "gpu_observed").unwrap_or(false) {
-        "\u{5df2}\u{89c2}\u{6d4b}"
+    let complex = verified_current_md_facts(options)?;
+    let peptide = if options
+        .run_dir
+        .join("tool_outputs/md_manifest_index.json")
+        .is_file()
+    {
+        verified_indexed_md_computations(options)?.peptide
     } else {
-        "\u{672a}\u{89c2}\u{6d4b}"
+        Vec::new()
     };
-    Ok(format!(
-        "## \u{52a8}\u{529b}\u{5b66}\u{8bc4}\u{5206}\n\n- \u{6765}\u{6e90}\u{ff1a}md_summary.tsv \u{4e2d}\u{7684} md_stability_score\u{ff0c}\u{7531} tool_outputs/md_rmsd.tsv\u{3001}tool_outputs/md_rmsf.tsv\u{3001}tool_outputs/md_ligand_drift.tsv\u{3001}tool_outputs/md_contacts.tsv \u{548c} tool_outputs/md_hbonds.tsv \u{7b49}\u{5f53}\u{524d}\u{8fd0}\u{884c}\u{8f68}\u{8ff9}\u{6307}\u{6807}\u{6c47}\u{603b}\u{5f97}\u{5230}\u{3002}\n- \u{7528}\u{9014}\u{ff1a}\u{5199}\u{5165} Candidate Ranking \u{7684} md_score\u{ff0c}\u{5e76}\u{4ee5} {MD_SCORE_WEIGHT:.2} \u{6743}\u{91cd}\u{53c2}\u{4e0e} final_score\u{ff1b}\u{672c}\u{8fd0}\u{884c} {ranked_md} \u{4e2a}\u{5019}\u{9009}\u{6709} MD \u{5206}\u{6570}\u{3002}\n- \u{4f7f}\u{7528}\u{8bf4}\u{660e}\u{ff1a}\u{5f53}\u{524d} MD \u{4f7f}\u{7528}\u{5f53}\u{524d} run \u{7684} receptor-ligand complex\u{3001}\u{914d}\u{4f53}\u{5bf9}\u{63a5}\u{4f4d}\u{59ff}\u{3001}OpenFF/RDKit \u{914d}\u{4f53}\u{53c2}\u{6570}\u{3001}OpenMM \u{86cb}\u{767d}\u{529b}\u{573a}\u{3001}\u{663e}\u{5f0f}\u{6eb6}\u{5242}\u{548c} PME\u{ff1b}\u{534f}\u{8bae}\u{3001}\u{72b6}\u{6001}\u{5e8f}\u{5217}\u{548c} CUDA \u{89c2}\u{6d4b}\u{8bc1}\u{636e}\u{7531}\u{5f53}\u{524d}\u{8fd0}\u{884c}\u{4ea7}\u{7269}\u{8bb0}\u{5f55}\u{3002}\n- \u{8fd0}\u{884c}\u{8bb0}\u{5f55}\u{ff1a}OpenMM \u{5e73}\u{53f0} {platform}\u{ff0c}CUDA GPU {gpu_observed}\u{ff0c}\u{534f}\u{8bae}\u{4ea7}\u{7269} {protocol}\u{ff0c}\u{72b6}\u{6001}\u{5e8f}\u{5217} {state}\u{ff0c}\u{76d1}\u{6d4b}\u{4ea7}\u{7269} {telemetry}\u{ff0c}\u{8f68}\u{8ff9}\u{4ea7}\u{7269} {trajectory}\u{3002}\n\n"
-    ))
-}
-
-fn read_md_manifest_field(options: &ScienceOptions, field: &str) -> Option<String> {
-    read_text(&options.run_dir.join("tool_outputs/md_run_manifest.json"))
-        .ok()
-        .and_then(|text| serde_json::from_str::<Value>(text.trim_start_matches('\u{feff}')).ok())
-        .and_then(|value| {
-            value
-                .get(field)
-                .and_then(Value::as_str)
-                .map(ToOwned::to_owned)
-        })
-}
-
-fn read_md_manifest_bool(options: &ScienceOptions, field: &str) -> Option<bool> {
-    read_text(&options.run_dir.join("tool_outputs/md_run_manifest.json"))
-        .ok()
-        .and_then(|text| serde_json::from_str::<Value>(text.trim_start_matches('\u{feff}')).ok())
-        .and_then(|value| value.get(field).and_then(Value::as_bool))
+    let mut text = String::from("## \u{52a8}\u{529b}\u{5b66}\u{8bc4}\u{5206}\n\n");
+    if complex.is_empty() {
+        text.push_str("\u{5f53}\u{524d}\u{8fd0}\u{884c}\u{6ca1}\u{6709}\u{901a}\u{8fc7}\u{5019}\u{9009}\u{3001}\u{8f93}\u{5165}\u{548c}\u{4ea7}\u{7269}\u{7ed1}\u{5b9a}\u{6821}\u{9a8c}\u{7684} receptor-ligand complex MD \u{8bc1}\u{636e}\u{ff0c}md_score \u{4fdd}\u{6301} 0.0000\u{ff0c}\u{5bf9} final_score \u{8d21}\u{732e}\u{4e3a} 0\u{3002}\n\n");
+    } else {
+        let verified_ids = complex
+            .iter()
+            .map(|facts| facts.candidate_id.as_str())
+            .collect::<BTreeSet<_>>();
+        let ranked_md = candidates
+            .iter()
+            .filter(|candidate| {
+                verified_ids.contains(candidate.candidate_id.as_str())
+                    && candidate.dynamics_score > 0.0
+            })
+            .count();
+        text.push_str(&format!(
+            "md_summary.tsv \u{4e2d}\u{7684} md_stability_score \u{5df2}\u{901a}\u{8fc7}\u{9010}\u{5019}\u{9009}\u{4ea7}\u{7269}\u{6821}\u{9a8c}\u{ff0c}\u{5171} {} \u{4e2a} receptor-ligand complex MD\u{ff1b}{ranked_md} \u{4e2a}\u{5019}\u{9009}\u{4ee5} {MD_SCORE_WEIGHT:.2} \u{6743}\u{91cd}\u{53c2}\u{4e0e} final_score\u{3002}\n\n",
+            complex.len()
+        ));
+        for facts in &complex {
+            let gpu_observed = if facts.gpu_observed {
+                "\u{5df2}\u{89c2}\u{6d4b}"
+            } else {
+                "\u{672a}\u{89c2}\u{6d4b}"
+            };
+            let telemetry = facts
+                .telemetry
+                .as_deref()
+                .unwrap_or("\u{8fd0}\u{884c}\u{6e05}\u{5355}\u{672a}\u{8bb0}\u{5f55}");
+            let model_fields = [
+                facts
+                    .force_field
+                    .as_deref()
+                    .map(|value| format!("force_field={value}")),
+                facts
+                    .solvent_model
+                    .as_deref()
+                    .map(|value| format!("solvent_model={value}")),
+                facts
+                    .nonbonded_method
+                    .as_deref()
+                    .map(|value| format!("nonbonded_method={value}")),
+            ]
+            .into_iter()
+            .flatten()
+            .collect::<Vec<_>>()
+            .join(", ");
+            text.push_str(&format!(
+                "- \u{5019}\u{9009} {}\u{ff1a}OpenMM \u{5e73}\u{53f0} {}\u{ff0c}GPU {}\u{ff0c}\u{6a21}\u{578b} {}\u{ff0c}\u{534f}\u{8bae} {}\u{ff0c}\u{72b6}\u{6001} {}\u{ff0c}\u{76d1}\u{6d4b} {}\u{ff0c}\u{8f68}\u{8ff9} {}\u{3002}\n",
+                facts.candidate_id,
+                facts.platform,
+                gpu_observed,
+                if model_fields.is_empty() {"\u{6e05}\u{5355}\u{672a}\u{8bb0}\u{5f55}"} else {&model_fields},
+                facts.protocol,
+                facts.state,
+                telemetry,
+                facts.trajectory,
+            ));
+        }
+        text.push('\n');
+    }
+    if !peptide.is_empty() {
+        text.push_str("### \u{591a}\u{80bd}\u{6784}\u{8c61}\u{96c6}\n\n");
+        for facts in peptide {
+            text.push_str(&format!(
+                "- \u{5019}\u{9009} {}\u{ff1a}RDKit peptide conformer ensemble\u{ff0c}\u{6784}\u{8c61}\u{6570} {}\u{ff0c}has_receptor=false\u{ff0c}uses_openmm=false\u{ff0c}md_score=0.0000\u{ff0c}\u{4ea7}\u{7269}\u{6e05}\u{5355} {}\u{3002}\n",
+                facts.candidate_id, facts.conformer_count, facts.manifest
+            ));
+        }
+        text.push('\n');
+    }
+    Ok(text)
 }
 
 fn report_source_summary(options: &ScienceOptions, candidate_count: usize) -> String {
     let project_id = clean_cell(&infer_project_id(&options.run_dir));
     let run_id = clean_cell(&infer_run_id(&options.run_dir));
+    let policy_digest = ranking_policy_digest();
     let input_status = if options.input_manifest.exists() {
         "\u{5df2}\u{8bfb}\u{53d6}\u{5f53}\u{524d}\u{9879}\u{76ee}\u{8f93}\u{5165}"
     } else {
         "\u{672a}\u{8bfb}\u{53d6}\u{5230}\u{5f53}\u{524d}\u{9879}\u{76ee}\u{8f93}\u{5165}"
     };
-    let required = [
-        options.science_store.join("science_store_manifest.tsv"),
-        options.science_store.join("indexes/known_targets.tsv"),
-        options.science_store.join("indexes/metagenome_targets.tsv"),
-        options.science_store.join("indexes/structure_targets.tsv"),
-        options.science_store.join("indexes/tool_versions.tsv"),
-    ];
-    let install_ready = read_text(&options.science_store.join("install_status.json"))
-        .ok()
-        .and_then(|text| serde_json::from_str::<Value>(text.trim_start_matches('\u{feff}')).ok())
-        .and_then(|value| {
-            value
-                .get("status")
-                .and_then(Value::as_str)
-                .map(|status| status == "ready")
-        })
-        .unwrap_or(false);
-    let database_status = if install_ready && required.iter().all(|path| path.exists()) {
-        "\u{79d1}\u{5b66}\u{8d44}\u{6e90}\u{5df2}\u{5c31}\u{7eea}"
-    } else {
-        "\u{79d1}\u{5b66}\u{8d44}\u{6e90}\u{9700}\u{8981}\u{68c0}\u{67e5}\u{6216}\u{4fee}\u{590d}"
+    let database_status = match evaluate_science_store_readiness(&options.science_store) {
+        Ok(readiness) if readiness.ready => {
+            "\u{79d1}\u{5b66}\u{8d44}\u{6e90}\u{5df2}\u{5c31}\u{7eea}".to_string()
+        }
+        Ok(readiness) => format!(
+            "\u{79d1}\u{5b66}\u{8d44}\u{6e90}\u{9700}\u{8981}\u{4fee}\u{590d}\u{ff1a}{}",
+            readiness_blocker_details(&readiness)
+        ),
+        Err(reason) => format!(
+            "\u{79d1}\u{5b66}\u{8d44}\u{6e90}\u{5c31}\u{7eea}\u{5224}\u{5b9a}\u{5931}\u{8d25}\u{ff1a}{}",
+            clean_cell(&reason)
+        ),
     };
     let output_status = if candidate_count > 0 {
         format!(
@@ -7228,7 +10403,7 @@ fn report_source_summary(options: &ScienceOptions, candidate_count: usize) -> St
         "\u{5f53}\u{524d}\u{8fd0}\u{884c}\u{6ca1}\u{6709}\u{53ef}\u{5c55}\u{793a}\u{7684}\u{5019}\u{9009}\u{5047}\u{8bbe}".to_string()
     };
     format!(
-        "## \u{7ed3}\u{679c}\u{6765}\u{6e90}\n\n- \u{9879}\u{76ee}\u{7f16}\u{53f7}\u{ff1a}{project_id}\n- \u{8fd0}\u{884c}\u{7f16}\u{53f7}\u{ff1a}{run_id}\n- \u{8f93}\u{5165}\u{ff1a}{input_status}\n- \u{6570}\u{636e}\u{5e93}\u{ff1a}{database_status}\n- \u{8f93}\u{51fa}\u{6750}\u{6599}\u{ff1a}{output_status}\n\n",
+        "## \u{7ed3}\u{679c}\u{6765}\u{6e90}\n\n- \u{9879}\u{76ee}\u{7f16}\u{53f7}\u{ff1a}{project_id}\n- \u{8fd0}\u{884c}\u{7f16}\u{53f7}\u{ff1a}{run_id}\n- \u{8f93}\u{5165}\u{ff1a}{input_status}\n- \u{6570}\u{636e}\u{5e93}\u{ff1a}{database_status}\n- \u{6392}\u{5e8f}\u{7b56}\u{7565}\u{ff1a}{RANKING_POLICY_VERSION}\u{ff0c}digest={policy_digest}\n- \u{8f93}\u{51fa}\u{6750}\u{6599}\u{ff1a}{output_status}\n\n",
     )
 }
 
@@ -7247,6 +10422,22 @@ fn report_scope_label(value: &str) -> &'static str {
         _ => "\u{8ba1}\u{7b97}\u{5019}\u{9009}",
     }
 }
+
+fn ranking_policy_value() -> Value {
+    json!({
+        "schema_version": RANKING_POLICY_VERSION,
+        "known_database_weight": KNOWN_SCORE_WEIGHT,
+        "metagenome_weight": METAGENOME_SCORE_WEIGHT,
+        "structure_weight": STRUCTURE_SCORE_WEIGHT,
+        "docking_weight": DOCKING_SCORE_WEIGHT,
+        "md_weight": MD_SCORE_WEIGHT,
+    })
+}
+
+fn ranking_policy_digest() -> String {
+    canonical_json_sha256(&ranking_policy_value())
+}
+
 fn write_run_context(
     options: &ScienceOptions,
     state: &str,
@@ -7254,15 +10445,22 @@ fn write_run_context(
 ) -> Result<(), String> {
     let project_id = infer_project_id(&options.run_dir);
     let run_id = infer_run_id(&options.run_dir);
+    let pipeline_invocation_id = read_text(&options.run_dir.join(PIPELINE_INVOCATION_FILE))
+        .unwrap_or_default()
+        .trim()
+        .to_string();
     let input_status = file_context(&options.input_manifest);
     let known_index = options.science_store.join("indexes/known_targets.tsv");
     let metagenome_index = options.science_store.join("indexes/metagenome_targets.tsv");
     let structure_index = options.science_store.join("indexes/structure_targets.tsv");
     let tool_versions = options.science_store.join("indexes/tool_versions.tsv");
+    let ranking_policy = ranking_policy_value();
+    let ranking_policy_digest = ranking_policy_digest();
     let context = json!({
         "state": state,
         "project_id": project_id,
         "run_id": run_id,
+        "pipeline_invocation_id": pipeline_invocation_id,
         "workspace_root": options.workspace_root.display().to_string(),
         "science_store": options.science_store.display().to_string(),
         "run_dir": options.run_dir.display().to_string(),
@@ -7273,6 +10471,8 @@ fn write_run_context(
             "structure_targets": file_context(&structure_index),
             "tool_versions": file_context(&tool_versions)
         },
+        "ranking_policy": ranking_policy,
+        "ranking_policy_digest": &ranking_policy_digest,
         "blockers": blockers,
     });
     write_text(
@@ -7284,6 +10484,7 @@ fn write_run_context(
         ("state", state.to_string()),
         ("project_id", project_id),
         ("run_id", run_id),
+        ("pipeline_invocation_id", pipeline_invocation_id),
         (
             "workspace_root",
             options.workspace_root.display().to_string(),
@@ -7304,6 +10505,8 @@ fn write_run_context(
             structure_index.display().to_string(),
         ),
         ("tool_versions", tool_versions.display().to_string()),
+        ("ranking_policy_version", RANKING_POLICY_VERSION.to_string()),
+        ("ranking_policy_digest", ranking_policy_digest),
         ("blockers", blockers.join(";")),
     ] {
         text.push_str(&format!("{field}\t{}\n", clean_cell(&value)));
@@ -7351,42 +10554,82 @@ fn write_candidate_detail(
 ) -> Result<(), String> {
     let project_id = infer_project_id(&options.run_dir);
     let run_id = infer_run_id(&options.run_dir);
-    let md_available = rows_in_tsv(&options.run_dir.join("md_summary.tsv")).unwrap_or(0) > 0;
+    let mut computation_artifacts = BTreeMap::<String, Vec<String>>::new();
+    for facts in verified_current_md_facts(options)? {
+        let parent = Path::new(&facts.protocol)
+            .parent()
+            .map(Path::to_path_buf)
+            .unwrap_or_default();
+        let mut artifacts = vec![
+            "md_summary.tsv".to_string(),
+            "tool_outputs/md_manifest_index.json".to_string(),
+        ];
+        for name in [
+            "complex_md_manifest.json",
+            "ligand_placement.tsv",
+            "md_run_manifest.json",
+            "md_protocol.tsv",
+            "md_state.tsv",
+            "gpu_telemetry.tsv",
+            "gpu_telemetry_status.tsv",
+            "md_trajectory.tsv",
+            "md_summary.tsv",
+            "md_rmsd.tsv",
+            "md_rmsf.tsv",
+            "md_ligand_drift.tsv",
+            "md_contacts.tsv",
+            "md_hbonds.tsv",
+        ] {
+            artifacts.push(parent.join(name).to_string_lossy().replace('\\', "/"));
+        }
+        computation_artifacts.insert(facts.candidate_id, artifacts);
+    }
+    if options
+        .run_dir
+        .join("tool_outputs/md_manifest_index.json")
+        .is_file()
+    {
+        for facts in verified_indexed_md_computations(options)?.peptide {
+            let parent = Path::new(&facts.manifest)
+                .parent()
+                .map(Path::to_path_buf)
+                .unwrap_or_default();
+            let mut artifacts = vec!["tool_outputs/md_manifest_index.json".to_string()];
+            for name in [
+                "md_run_manifest.json",
+                "peptide_conformer_summary.tsv",
+                "peptide_conformer_metrics.tsv",
+                "peptide_conformer_coordinates.tsv",
+                "peptide_conformer_ensemble.tsv",
+            ] {
+                artifacts.push(parent.join(name).to_string_lossy().replace('\\', "/"));
+            }
+            computation_artifacts.insert(facts.candidate_id, artifacts);
+        }
+    }
     let rows = candidates
         .iter()
         .map(|candidate| {
             let mut source_artifacts = vec![
-                "input_conversion_manifest.tsv",
-                "input_normalized_manifest.tsv",
-                "feature_manifest.tsv",
-                "known_database_matches.tsv",
-                "metagenome_potential_matches.tsv",
-                "structure_interaction_matches.tsv",
-                "complex_candidate_selection.tsv",
-                "target_candidate_ranking.tsv",
-                "score_decomposition.tsv",
-                "evidence_ledger.tsv",
+                "input_conversion_manifest.tsv".to_string(),
+                "input_normalized_manifest.tsv".to_string(),
+                "feature_manifest.tsv".to_string(),
+                "known_database_matches.tsv".to_string(),
+                "metagenome_potential_matches.tsv".to_string(),
+                "structure_interaction_matches.tsv".to_string(),
+                "complex_candidate_selection.tsv".to_string(),
+                "target_candidate_ranking.tsv".to_string(),
+                "score_decomposition.tsv".to_string(),
+                "evidence_ledger.tsv".to_string(),
             ];
-            if md_available && candidate.dynamics_score > 0.0 {
-                source_artifacts.extend([
-                    "md_summary.tsv",
-                    "tool_outputs/complex_md_manifest.json",
-                    "tool_outputs/ligand_placement.tsv",
-                    "tool_outputs/md_run_manifest.json",
-                    "tool_outputs/md_protocol.tsv",
-                    "tool_outputs/md_state.tsv",
-                    "tool_outputs/gpu_telemetry.tsv",
-                    "tool_outputs/gpu_telemetry_status.tsv",
-                    "tool_outputs/md_trajectory.tsv",
-                    "tool_outputs/md_rmsd.tsv",
-                    "tool_outputs/md_rmsf.tsv",
-                    "tool_outputs/md_ligand_drift.tsv",
-                    "tool_outputs/md_contacts.tsv",
-                    "tool_outputs/md_hbonds.tsv",
-                ]);
+            if let Some(artifacts) = computation_artifacts.get(&candidate.candidate_id) {
+                source_artifacts.extend(artifacts.iter().cloned());
             }
             json!({
                 "candidate_id": candidate.candidate_id,
+                "input_id": candidate.input_id,
+                "record_id": candidate.record_id,
+                "identity_namespace": candidate.identity_namespace,
                 "target_id": candidate.target_id,
                 "target_name": candidate.target_name,
                 "candidate_scope": candidate.candidate_scope,
@@ -7639,12 +10882,40 @@ fn artifact_source_status(path: &Path) -> Result<&'static str, String> {
 
 fn write_score_decomposition(options: &ScienceOptions) -> Result<(), String> {
     let candidates = read_candidates(&options.run_dir.join("target_candidate_ranking.tsv"))?;
-    let mut text = String::from("candidate_id\tcomponent\tvalue\towner\n");
+    let coordinate_candidates = selected_candidate_rows(options)?
+        .into_iter()
+        .filter_map(|row| row.get("candidate_id").cloned())
+        .collect::<BTreeSet<_>>();
+    let docking_outcomes = candidate_index_statuses(
+        &options
+            .run_dir
+            .join("tool_outputs/docking_manifest_index.json"),
+    );
+    let md_outcomes =
+        candidate_index_statuses(&options.run_dir.join("tool_outputs/md_manifest_index.json"));
+    let policy_digest = ranking_policy_digest();
+    let mut text =
+        String::from("candidate_id\tcomponent\tvalue\towner\tpolicy_version\tpolicy_digest\n");
     for candidate in candidates {
-        for (component, value) in [
+        let mut components = vec![
             ("known_database_score", candidate.known_score),
+            ("known_database_score_weight", KNOWN_SCORE_WEIGHT),
+            (
+                "known_database_score_contribution",
+                candidate.known_score * KNOWN_SCORE_WEIGHT,
+            ),
             ("metagenome_score", candidate.metagenome_score),
+            ("metagenome_score_weight", METAGENOME_SCORE_WEIGHT),
+            (
+                "metagenome_score_contribution",
+                candidate.metagenome_score * METAGENOME_SCORE_WEIGHT,
+            ),
             ("structure_score", candidate.structure_score),
+            ("structure_score_weight", STRUCTURE_SCORE_WEIGHT),
+            (
+                "structure_score_contribution",
+                candidate.structure_score * STRUCTURE_SCORE_WEIGHT,
+            ),
             ("docking_score", candidate.docking_score),
             ("docking_score_weight", DOCKING_SCORE_WEIGHT),
             (
@@ -7658,14 +10929,82 @@ fn write_score_decomposition(options: &ScienceOptions) -> Result<(), String> {
                 candidate.dynamics_score * MD_SCORE_WEIGHT,
             ),
             ("final_score", candidate.final_score),
-        ] {
+        ];
+        components.extend([
+            (
+                "coordinate_backed_candidate",
+                if coordinate_candidates.contains(&candidate.candidate_id) {
+                    1.0
+                } else {
+                    0.0
+                },
+            ),
+            (
+                "docking_outcome_present",
+                if docking_outcomes.contains_key(&candidate.candidate_id) {
+                    1.0
+                } else {
+                    0.0
+                },
+            ),
+            (
+                "docking_completed",
+                if docking_outcomes
+                    .get(&candidate.candidate_id)
+                    .map(String::as_str)
+                    == Some("completed")
+                {
+                    1.0
+                } else {
+                    0.0
+                },
+            ),
+            (
+                "md_outcome_present",
+                if md_outcomes.contains_key(&candidate.candidate_id) {
+                    1.0
+                } else {
+                    0.0
+                },
+            ),
+            (
+                "md_completed",
+                if md_outcomes.get(&candidate.candidate_id).map(String::as_str) == Some("completed")
+                {
+                    1.0
+                } else {
+                    0.0
+                },
+            ),
+        ]);
+        for (component, value) in components {
             text.push_str(&format!(
-                "{}\t{component}\t{value:.4}\tGenoLigand\n",
-                candidate.candidate_id
+                "{}\t{component}\t{value:.4}\tGenoLigand\t{}\t{}\n",
+                candidate.candidate_id, RANKING_POLICY_VERSION, policy_digest
             ));
         }
     }
     write_text(&options.run_dir.join("score_decomposition.tsv"), &text)
+}
+
+fn candidate_index_statuses(path: &Path) -> BTreeMap<String, String> {
+    let Some(index) = read_json_value_if_file(path) else {
+        return BTreeMap::new();
+    };
+    index
+        .get("entries")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|entry| {
+            let candidate_id = entry.get("candidate_id")?.as_str()?.trim();
+            let status = entry.get("status")?.as_str()?.trim();
+            if candidate_id.is_empty() || status.is_empty() {
+                return None;
+            }
+            Some((candidate_id.to_string(), status.to_string()))
+        })
+        .collect()
 }
 
 fn read_conversion_provenance(
@@ -8525,7 +11864,19 @@ fn typed_feature_rows(input: &NormalizedInput) -> Vec<FeatureRow> {
             peptide_or_protein_features("protein_sequence", &input.primary_value)
         }
         InputKind::Complex => complex_features(&input.primary_value),
-        InputKind::GenomeOrMetagenome => genome_or_metagenome_features(&input.primary_value),
+        InputKind::GenomeOrMetagenome => {
+            let mut rows = genome_or_metagenome_features(&input.primary_value);
+            for row in &mut rows {
+                if row.name == "translated_orf_identity" {
+                    row.value = row.value.replacen(
+                        "record=record_1;",
+                        &format!("record={};", input.record_id),
+                        1,
+                    );
+                }
+            }
+            rows
+        }
     }
 }
 
@@ -9149,39 +12500,68 @@ fn candidate_metadata_quality(
     quality
 }
 
-fn candidate_identity_suffix(namespace: &str, target_id: &str) -> String {
+fn looks_like_uniprot_accession(target_id: &str) -> bool {
+    let value = target_id.trim();
+    matches!(value.len(), 6 | 10)
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_uppercase() || byte.is_ascii_digit())
+        && value
+            .bytes()
+            .next()
+            .is_some_and(|byte| byte.is_ascii_alphabetic())
+        && value.bytes().any(|byte| byte.is_ascii_digit())
+}
+
+fn canonical_target_namespace(raw_namespace: &str, source: &str, target_id: &str) -> String {
+    if looks_like_uniprot_accession(target_id) {
+        return "uniprot".to_string();
+    }
+    let raw = raw_namespace.trim();
+    if !raw.is_empty() {
+        return raw.to_ascii_lowercase();
+    }
+    source.trim().to_ascii_lowercase()
+}
+
+fn candidate_identity_suffix(
+    input_id: &str,
+    record_id: &str,
+    namespace: &str,
+    target_id: &str,
+) -> String {
     let mut hasher = Sha256::new();
+    hasher.update(input_id.as_bytes());
+    hasher.update([0]);
+    hasher.update(record_id.as_bytes());
+    hasher.update([0]);
     hasher.update(namespace.as_bytes());
     hasher.update([0]);
     hasher.update(target_id.as_bytes());
     hasher
         .finalize()
         .iter()
-        .take(6)
+        .take(8)
         .map(|byte| format!("{byte:02x}"))
         .collect()
 }
 
+fn candidate_id_for(input_id: &str, record_id: &str, namespace: &str, target_id: &str) -> String {
+    format!(
+        "target_{}_{}",
+        safe_id(target_id),
+        candidate_identity_suffix(input_id, record_id, namespace, target_id)
+    )
+}
+
 fn assign_collision_free_candidate_ids(candidates: &mut [Candidate]) {
-    let mut base_counts = BTreeMap::<String, usize>::new();
-    for candidate in candidates.iter() {
-        *base_counts
-            .entry(format!("target_{}", safe_id(&candidate.target_id)))
-            .or_default() += 1;
-    }
     for candidate in candidates {
-        let sanitized = safe_id(&candidate.target_id);
-        let base = format!("target_{sanitized}");
-        let changed_by_sanitization = sanitized != candidate.target_id;
-        candidate.candidate_id =
-            if changed_by_sanitization || base_counts.get(&base).copied().unwrap_or_default() > 1 {
-                format!(
-                    "{base}_{}",
-                    candidate_identity_suffix(&candidate.identity_namespace, &candidate.target_id)
-                )
-            } else {
-                base
-            };
+        candidate.candidate_id = candidate_id_for(
+            &candidate.input_id,
+            &candidate.record_id,
+            &candidate.identity_namespace,
+            &candidate.target_id,
+        );
     }
 }
 
@@ -9197,6 +12577,8 @@ fn merge_match_file(
     let mut lines = text.lines();
     let headers = split_tsv(lines.next().unwrap_or_default());
     let source_database_idx = find_header(&headers, &["source_database_id"]);
+    let input_idx = find_header(&headers, &["input_id"]);
+    let record_idx = find_header(&headers, &["record_id"]);
     for line in lines {
         let cols = split_tsv(line);
         if cols.len() < 9 {
@@ -9208,9 +12590,21 @@ fn merge_match_file(
         }
         let source = cols[1].clone();
         let evidence = cols[8].clone();
-        let namespace = match_namespace(&source, &evidence, &cols, source_database_idx);
+        let raw_namespace = match_namespace(&source, &evidence, &cols, source_database_idx);
+        let namespace = canonical_target_namespace(&raw_namespace, &source, &target_id);
+        let input_id = cell(&cols, input_idx);
+        let record_id = {
+            let value = cell(&cols, record_idx);
+            if value.trim().is_empty() {
+                "record_1".to_string()
+            } else {
+                value
+            }
+        };
         let identity_key = format!(
-            "{}\u{1f}{}",
+            "{}\u{1f}{}\u{1f}{}\u{1f}{}",
+            input_id,
+            record_id,
             namespace.trim().to_ascii_lowercase(),
             target_id
         );
@@ -9218,7 +12612,9 @@ fn merge_match_file(
         let metadata_quality =
             candidate_metadata_quality(&target_id, &cols[3], &cols[4], &cols[5], &evidence);
         let entry = by_target.entry(identity_key).or_insert(Candidate {
-            candidate_id: format!("target_{}", safe_id(&target_id)),
+            candidate_id: candidate_id_for(&input_id, &record_id, &namespace, &target_id),
+            input_id,
+            record_id,
             identity_namespace: namespace,
             target_id,
             target_name: cols[3].clone(),
@@ -9326,7 +12722,9 @@ fn read_candidates(path: &Path) -> Result<Vec<Candidate>, String> {
         }
         out.push(Candidate {
             candidate_id: cols[1].clone(),
-            identity_namespace: String::new(),
+            input_id: cols.get(14).cloned().unwrap_or_default(),
+            record_id: cols.get(15).cloned().unwrap_or_default(),
+            identity_namespace: cols.get(16).cloned().unwrap_or_default(),
             target_id: cols[2].clone(),
             target_name: cols[3].clone(),
             candidate_scope: cols[4].clone(),
@@ -9547,18 +12945,6 @@ fn temporary_data_path(root: &Path, label: &str, extension: &str) -> PathBuf {
         sequence,
         safe_id(extension)
     ))
-}
-
-fn append_file_to_writer<W: Write>(
-    path: &Path,
-    writer: &mut W,
-    context: &str,
-) -> Result<(), String> {
-    let mut file = fs::File::open(path)
-        .map_err(|err| format!("{context}_open_failed:{}:{err}", path.display()))?;
-    std::io::copy(&mut file, writer)
-        .map(|_| ())
-        .map_err(|err| format!("{context}_copy_failed:{}:{err}", path.display()))
 }
 
 fn preferred_python_command() -> Vec<String> {

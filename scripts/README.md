@@ -7,7 +7,12 @@ Allowed entrypoint groups:
 - `scripts/setup/`: installer internals used by `install.ps1`, `install.sh`, and the WebUI repair action.
 - `scripts/databases/`: database preparation, validation, indexing, migration, and repair.
 - `scripts/validation/`: repository, artifact, and release contract checks.
-- `scripts/cleanup/`: cleanup inventory, cleanup plan, and cleanup execution support.
+
+The release-cleanliness entrypoint is
+`tests/clean_release/check_clean_release.py`. Pass `--workspace-root`,
+`--science-store`, and `--runtime-dir` to validate repository transients,
+science-store partial/staging state, and stale runtime acceptance state in one
+inspection gate.
 
 Controlled wrapper groups:
 

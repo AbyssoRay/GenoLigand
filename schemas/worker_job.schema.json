@@ -10,6 +10,8 @@
     "job_id",
     "worker",
     "stage",
+    "run_id",
+    "invocation_id",
     "rust_owned_decision_logic",
     "decision_owner",
     "input_manifest",
@@ -21,13 +23,97 @@
     "schema_version": { "const": "genoligand_worker_current_v2" },
     "pipeline_mode": { "const": "genoligand_scientific_pipeline" },
     "job_id": { "type": "string", "minLength": 1 },
-    "worker": { "type": "string", "minLength": 1 },
+    "worker": {
+      "enum": ["mmseqs_alignment", "foldseek_alignment", "docking", "md_summary"]
+    },
     "stage": { "type": "string", "minLength": 1 },
+    "run_id": { "type": "string", "minLength": 1 },
+    "invocation_id": { "type": "string", "minLength": 1 },
     "rust_owned_decision_logic": { "const": true },
     "decision_owner": { "const": "GenoLigand Rust core" },
     "input_manifest": { "type": "string", "minLength": 1 },
     "run_dir": { "type": "string", "minLength": 1 },
     "science_store": { "type": "string", "minLength": 1 },
-    "expected_result_schema": { "const": "genoligand_worker_current_v2" }
-  }
+    "expected_result_schema": { "const": "genoligand_worker_current_v2" },
+    "candidate_id": { "type": "string", "minLength": 1 },
+    "candidate_digest": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$"
+    },
+    "input_id": { "type": "string", "minLength": 1 },
+    "record_id": { "type": "string", "minLength": 1 },
+    "identity_namespace": { "type": "string", "minLength": 1 },
+    "candidate_selection": { "type": "string", "minLength": 1 },
+    "receptor_artifact": { "type": "string", "minLength": 1 },
+    "input_digest": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$"
+    },
+    "source_digest": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$"
+    },
+    "receptor_digest": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$"
+    },
+    "docking_manifest": { "type": "string", "minLength": 1 },
+    "docking_manifest_digest": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$"
+    },
+    "docking_job_id": { "type": "string", "minLength": 1 },
+    "docking_invocation_id": { "type": "string", "minLength": 1 },
+    "platform_policy": { "enum": ["required", "preferred", "disabled"] }
+  },
+  "dependentRequired": {
+    "docking_manifest": [
+      "docking_manifest_digest",
+      "docking_job_id",
+      "docking_invocation_id"
+    ]
+  },
+  "allOf": [
+    {
+      "if": {
+        "properties": { "worker": { "const": "docking" } },
+        "required": ["worker"]
+      },
+      "then": {
+        "required": [
+          "candidate_id",
+          "candidate_digest",
+          "identity_namespace",
+          "candidate_selection",
+          "input_id",
+          "record_id",
+          "input_digest",
+          "source_digest",
+          "receptor_artifact",
+          "receptor_digest"
+        ]
+      }
+    },
+    {
+      "if": {
+        "properties": { "worker": { "const": "md_summary" } },
+        "required": ["worker"]
+      },
+      "then": {
+        "required": [
+          "candidate_id",
+          "candidate_digest",
+          "identity_namespace",
+          "candidate_selection",
+          "input_id",
+          "record_id",
+          "input_digest",
+          "source_digest",
+          "receptor_artifact",
+          "receptor_digest",
+          "platform_policy"
+        ]
+      }
+    }
+  ]
 }

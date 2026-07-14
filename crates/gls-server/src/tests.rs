@@ -980,18 +980,78 @@ fn setup_progress_marks_stale_running_state_as_repairable() {
 
 #[test]
 fn user_health_hides_backend_service_name() {
-    let payload = user_health_json();
+    let root = std::env::temp_dir().join(format!("genoligand-user-health-{}", now_millis()));
+    let payload = user_health_json(&server_options(root.clone()));
     let text = payload.to_string();
 
     assert_eq!(payload["status"], "ready");
     assert_eq!(payload["application"], PRODUCT_NAME);
+    assert_eq!(payload["version"], PRODUCT_VERSION);
+    assert_eq!(payload["commit"], PRODUCT_COMMIT);
+    assert_eq!(payload["build_id"], PRODUCT_COMMIT);
+    assert!(payload["runtime"].is_object());
+    assert_eq!(
+        payload["science_store_readiness"]["schema_version"],
+        "genoligand_science_store_readiness_v1"
+    );
+    assert!(payload["science_store_readiness"]["ready"].is_boolean());
+    assert!(payload["science_store_readiness"]["blockers"].is_array());
     assert!(!text.contains("gls-server"));
     assert!(!text.contains("route"));
     assert!(!text.contains("debug"));
+    fs::remove_dir_all(root).ok();
 }
 
 #[test]
-fn user_setup_status_hides_runtime_and_internal_status_codes() {
+fn health_and_setup_expose_canonical_readiness_blocker_evidence_and_repair() {
+    let root = std::env::temp_dir().join(format!("genoligand-canonical-readiness-{}", now_millis()));
+    let options = server_options(root.clone());
+    let store = science_store_path(&options);
+    fs::create_dir_all(&store).expect("science store");
+    fs::write(
+        store.join("science_store_readiness.json"),
+        json!({
+            "schema_version": "genoligand_science_store_readiness_v1",
+            "status": "needs_repair",
+            "ready": false,
+            "generated_at": 1,
+            "evidence_manifest": [],
+            "evidence_digest": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+            "sources": [{"logical_source": "rcsb_ligand_bound", "status": "needs_repair"}],
+            "indexes": [{"index": "structure_targets", "readiness_status": "incomplete"}],
+            "blockers": [{
+                "code": "rcsb_scope_incomplete",
+                "component": "rcsb",
+                "evidence": "ready=7 scope=9",
+                "repair_action": "sync_rcsb_ligand_bound_scope"
+            }],
+            "repair_actions": ["sync_rcsb_ligand_bound_scope"]
+        })
+        .to_string(),
+    )
+    .expect("canonical readiness");
+
+    let health = user_health_json(&options);
+    let setup = user_setup_status_json(&options);
+    for readiness in [
+        &health["science_store_readiness"],
+        &setup["readiness"],
+    ] {
+        assert_eq!(readiness["status"], "needs_repair");
+        assert_eq!(readiness["blockers"][0], "rcsb_scope_incomplete");
+        assert_eq!(readiness["blocker_details"][0]["evidence"], "ready=7 scope=9");
+        assert_eq!(
+            readiness["blocker_details"][0]["repair_action"],
+            "sync_rcsb_ligand_bound_scope"
+        );
+        assert_eq!(readiness["sources"][0]["logical_source"], "rcsb_ligand_bound");
+        assert_eq!(readiness["indexes"][0]["index"], "structure_targets");
+    }
+    fs::remove_dir_all(root).ok();
+}
+
+#[test]
+fn user_setup_status_exposes_authoritative_readiness_without_runtime_controls() {
     let root = std::env::temp_dir().join(format!("genoligand-user-setup-status-{}", now_millis()));
     let options = server_options(root.clone());
     let payload = user_setup_status_json(&options);
@@ -1002,7 +1062,12 @@ fn user_setup_status_hides_runtime_and_internal_status_codes() {
     assert!(payload.get("status").is_none());
     assert!(payload.get("runtime").is_none());
     assert!(payload.get("can_run_repair").is_none());
-    assert!(!text.contains("needs_repair"));
+    assert_eq!(
+        payload["readiness"]["schema_version"],
+        "genoligand_science_store_readiness_v1"
+    );
+    assert!(payload["readiness"]["ready"].is_boolean());
+    assert!(payload["readiness"]["blockers"].is_array());
     assert!(!text.contains("runtime"));
     assert!(!text.contains("can_run_repair"));
 
@@ -1292,7 +1357,7 @@ fn user_input_inspection_parses_error_after_colon_record_id() {
     let response = inspect_user_input_json(&options, &body);
 
     assert_eq!(response["usable"], false);
-    assert_eq!(response["inputs"][1]["record_id"], "sample:chain");
+    assert_eq!(response["inputs"][1]["record_id"], "sample:chain__record_2");
     assert_eq!(response["error"], "invalid_peptide_sequence");
     fs::remove_dir_all(&root).ok();
 }

@@ -14,6 +14,14 @@ fn run() -> Result<(), String> {
         println!("{}", help());
         return Ok(());
     }
+    if args.len() == 1 && matches!(args[0].as_str(), "--version" | "-V") {
+        println!(
+            "gls-server {} commit {}",
+            env!("CARGO_PKG_VERSION"),
+            env!("GENOLIGAND_BUILD_COMMIT")
+        );
+        return Ok(());
+    }
     let mut host = "127.0.0.1".to_string();
     let mut port = 19090u16;
     let mut artifact_dir = PathBuf::from("outputs/webui_runtime");

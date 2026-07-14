@@ -19,32 +19,32 @@ async function boot() {
 }
 
 async function refreshAll() {
-  try {
-    state.alert = "";
-    let projectList;
-    [
-      state.health,
-      state.inputCapabilities,
-      state.databases,
-      state.diagnostics,
-      state.setup,
-      state.setupPlan,
-      state.setupProgress,
-      state.workspaceSummary,
-      projectList,
-    ] = await Promise.all([
-      api("/api/user/health"),
-      loadInputCapabilities(),
-      api("/api/user/databases"),
-      api("/api/user/diagnostics"),
-      api("/api/user/setup/status"),
-      api("/api/user/setup/install-plan"),
-      api("/api/user/setup/progress"),
-      api("/api/user/workspace-summary"),
-      api("/api/user/projects"),
-    ]);
-    state.projects = projectList.projects || [];
-    if (state.run?.run_id) {
+  state.alert = "";
+  const requests = [
+    ["health", "服务状态", () => api("/api/user/health")],
+    ["inputCapabilities", "输入能力", loadInputCapabilities],
+    ["databases", "数据库状态", () => api("/api/user/databases")],
+    ["diagnostics", "诊断状态", () => api("/api/user/diagnostics")],
+    ["setup", "安装状态", () => api("/api/user/setup/status")],
+    ["setupPlan", "安装计划", () => api("/api/user/setup/install-plan")],
+    ["setupProgress", "安装进度", () => api("/api/user/setup/progress")],
+    ["workspaceSummary", "工作台摘要", () => api("/api/user/workspace-summary")],
+    ["projects", "项目列表", () => api("/api/user/projects")],
+  ];
+  const settled = await Promise.allSettled(requests.map(([, , load]) => load()));
+  const failures = [];
+  settled.forEach((result, index) => {
+    const [key, label] = requests[index];
+    if (result.status === "fulfilled") {
+      if (key === "projects") state.projects = result.value.projects || [];
+      else state[key] = result.value;
+      return;
+    }
+    failures.push({ key, label, error: result.reason });
+    if (key === "health") state.health = null;
+  });
+  if (state.run?.run_id) {
+    try {
       state.run = await api(`/api/user/runs/${state.run.run_id}`);
       await loadRunData();
       if (state.run?.state === "running") {
@@ -52,9 +52,15 @@ async function refreshAll() {
       } else {
         stopRunProgressPolling();
       }
+    } catch (error) {
+      failures.push({ key: "run", label: "当前运行", error });
     }
-  } catch (error) {
-    state.alert = `无法连接本机服务：${error.message}`;
+  }
+  const healthFailure = failures.find((failure) => failure.key === "health");
+  if (healthFailure) {
+    state.alert = `无法连接本机服务：${healthFailure.error?.message || "请求失败"}`;
+  } else if (failures.length) {
+    state.alert = `部分信息未刷新：${failures.map((failure) => failure.label).join("、")}`;
   }
   render();
 }
@@ -77,7 +83,11 @@ function render() {
 function renderShellStatus() {
   const health = document.querySelector("[data-health]");
   const ready = state.health?.status === "ready";
-  health.textContent = ready ? "服务就绪" : "服务未连接";
+  const version = state.health?.version || "";
+  const build = state.health?.build_id?.slice(0, 8) || "";
+  health.textContent = ready
+    ? ["服务就绪", version, build].filter(Boolean).join(" · ")
+    : "服务未连接";
   health.className = `status-pill ${ready ? "ready" : "blocked"}`;
   document.querySelector("[data-project-pill]").textContent = state.project
     ? state.project.project_name || "当前项目"

@@ -1,16 +1,2 @@
-# GenoLigand schema-bound scientific worker runtime, CUDA OpenMM profile.
-numpy
-pandas
-rdkit
-openbabel-wheel
-openmm
-openmmforcefields
-pdbfixer
-openff-toolkit
-git+https://github.com/openforcefield/openff-interchange.git
-xmltodict
-python-constraint
-lxml
-mdtraj
-MDAnalysis
-jsonschema
+# GenoLigand worker profile: CUDA 12, CPython 3.12.
+# The installer applies the matching runtime and CUDA 12 artifacts from requirements-workers.lock.txt.

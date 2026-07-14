@@ -2,9 +2,10 @@ name: genoligand-workers
 channels:
   - conda-forge
 dependencies:
-  - python>=3.10,<3.13
-  - numpy
-  - pandas
+  - python=3.12
+  - numpy=2.2.6
+  - pandas=2.2.3
+  - pyarrow=24.0.0
   - rdkit
   - openbabel
   - openmm
@@ -16,7 +17,5 @@ dependencies:
   - lxml
   - mdtraj
   - mdanalysis
-  - jsonschema
+  - jsonschema=4.26.0
   - pip
-  - pip:
-      - git+https://github.com/openforcefield/openff-interchange.git

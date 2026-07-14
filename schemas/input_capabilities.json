@@ -1,0 +1,111 @@
+{
+  "schema_version": "genoligand_input_capabilities_v1",
+  "input_types": [
+    {
+      "kind": "small_molecule",
+      "field": "small_molecule",
+      "aliases": ["small-molecule", "molecule", "ligand", "smiles", "inchi", "cas"],
+      "title": "小分子",
+      "label": "名称、CAS、SMILES、InChI 或结构文件",
+      "placeholder": "例如 CCO、InChI=1S/...、64-17-5，或 .sdf/.mol/.mol2 文件路径",
+      "minimum": "至少一个可解析的小分子记录",
+      "text": {
+        "supported": true,
+        "forms": ["name", "cas", "smiles", "inchi"]
+      },
+      "file": {
+        "supported": true,
+        "extensions": ["sdf", "mol", "mol2"]
+      },
+      "constraints": {
+        "minimum_records": 1,
+        "all_records_must_convert": true
+      }
+    },
+    {
+      "kind": "peptide",
+      "field": "peptide",
+      "aliases": [],
+      "title": "多肽",
+      "label": "氨基酸序列、FASTA 或坐标文件",
+      "placeholder": "例如 IKVAV、>peptide...，或 .fasta/.fa/.faa/.pdb/.cif 文件路径",
+      "minimum": "至少一个标准氨基酸序列或有效结构",
+      "text": {
+        "supported": true,
+        "forms": ["amino_acid_sequence", "fasta"]
+      },
+      "file": {
+        "supported": true,
+        "extensions": ["fasta", "fa", "faa", "pdb", "cif", "mmcif", "ent"]
+      },
+      "constraints": {
+        "minimum_records": 1,
+        "all_records_must_convert": true
+      }
+    },
+    {
+      "kind": "protein_ligand",
+      "field": "protein_ligand",
+      "aliases": ["protein"],
+      "title": "蛋白配体",
+      "label": "蛋白氨基酸序列、FASTA 或坐标文件",
+      "placeholder": "例如 MKTAYI...、>protein...，或 .fasta/.fa/.faa/.pdb/.cif 文件路径",
+      "minimum": "至少一个标准氨基酸序列或有效结构",
+      "text": {
+        "supported": true,
+        "forms": ["amino_acid_sequence", "fasta"]
+      },
+      "file": {
+        "supported": true,
+        "extensions": ["fasta", "fa", "faa", "pdb", "cif", "mmcif", "ent"]
+      },
+      "constraints": {
+        "minimum_records": 1,
+        "all_records_must_convert": true
+      }
+    },
+    {
+      "kind": "complex",
+      "field": "complex",
+      "aliases": [],
+      "title": "复合物",
+      "label": "复合物描述或三维坐标文件",
+      "placeholder": "描述复合物，或填写 .pdb/.cif/.mmcif/.ent 文件路径",
+      "minimum": "至少一个有效描述或含原子的坐标结构",
+      "text": {
+        "supported": true,
+        "forms": ["complex_description"]
+      },
+      "file": {
+        "supported": true,
+        "extensions": ["pdb", "cif", "mmcif", "ent"]
+      },
+      "constraints": {
+        "minimum_records": 1,
+        "all_records_must_convert": true
+      }
+    },
+    {
+      "kind": "genome_or_metagenome",
+      "field": "genome_or_metagenome",
+      "aliases": ["genome", "metagenome", "nucleotide"],
+      "title": "基因组或宏基因组",
+      "label": "核酸/蛋白序列、FASTA、FASTQ 或 GenBank 文件",
+      "placeholder": "例如 ATGCGT...、>contig...，或 .fasta/.fa/.fna/.faa/.fastq/.fq/.gb/.gbk 文件路径",
+      "minimum": "至少一个可解析的序列记录",
+      "text": {
+        "supported": true,
+        "forms": ["nucleotide_sequence", "amino_acid_sequence", "fasta"]
+      },
+      "file": {
+        "supported": true,
+        "extensions": ["fasta", "fa", "fna", "faa", "fastq", "fq", "gb", "gbk", "gff", "gtf", "vcf"]
+      },
+      "constraints": {
+        "minimum_records": 1,
+        "all_records_must_convert": true,
+        "reference_required_extensions": ["gff", "gtf", "vcf"]
+      }
+    }
+  ]
+}

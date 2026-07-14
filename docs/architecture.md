@@ -11,14 +11,13 @@ GenoLigand 的产品职责是从用户输入的物质、序列或结构出发，
 | `scripts/setup/` | 安装、环境准备、工具与数据库准备的内部实现 | 普通用户主入口文案 |
 | `scripts/databases/` | 数据库下载、校验、索引和迁移辅助 | 科学结果解释、候选排序 |
 | `scripts/validation/` | 静态检查、发布检查、契约验证 | 产品主流程执行 |
-| `scripts/cleanup/` | 清理候选识别、清理执行和发布前清洁检查 | 科学计算或报告渲染 |
 | `scripts/md/`、`scripts/structure/`、`scripts/plm/`、`scripts/similarity/` | 受控 worker/adapter 包装层 | WebUI、Nextflow 或用户直接调用的主流程入口 |
 | `configs/` | 静态规则、资源目录声明、adapter 注册表 | 本机数据库版本、hash、索引产物 |
 | `schemas/` | Rust、WebUI、Python worker、项目包之间的数据契约 | 运行产物、示例结果 |
 | `webui/` | 普通科研用户界面 | 开发者验收面板、内置候选、固定结果 |
 | `workflows/` | Nextflow 调度入口 | 直接调用科学脚本或拥有科学语义 |
 | `docs/` | 用户文档、架构文档、后续计划归档 | 本机运行状态 |
-| `tests/` | 安装、真实性、WebUI、端到端和干净发布防回归检查 | 生产数据存放 |
+| `tests/` | 安装、真实性、WebUI、端到端和干净发布防回归检查；`tests/clean_release/check_clean_release.py` 是统一清洁门禁 | 生产数据存放或清理执行 |
 
 ## 产品规则
 
@@ -33,4 +32,4 @@ GenoLigand 的产品职责是从用户输入的物质、序列或结构出发，
 
 ## 发布边界
 
-仓库只保存代码、配置规则、schema、文档和测试。安装后生成的数据库 manifest、工具版本、hash、索引和运行产物进入用户 science store 或项目运行目录，不写入仓库配置目录。发布前必须通过 clean release 检查，确认根目录没有运行产物、缓存、旧验收目录、测试截图或临时文件。
+仓库只保存代码、配置规则、schema、文档和测试。安装后生成的数据库 manifest、工具版本、hash、索引和运行产物进入用户 science store 或项目运行目录，不写入仓库配置目录。发布前必须执行 `python tests/clean_release/check_clean_release.py --workspace-root <repo> --science-store <store> --runtime-dir <runtime>`，确认仓库没有构建与运行缓存，science store 没有无身份 partial 或旧 staging，runtime 没有失效 PID 或旧验收项目。门禁按 manifest 引用关系分类候选，并保留有效下载源、MMseqs/Foldseek 数据库及力场文件。

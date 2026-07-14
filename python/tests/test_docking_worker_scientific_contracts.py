@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import hashlib
 import sys
 import tempfile
 import types
@@ -17,6 +18,7 @@ from genoligand_workers.docking_worker import (
     choose_search_box,
     clear_previous_docking_outputs,
     derive_docking_seed,
+    docking_output_dir,
     main,
     prepare_receptor_for_docking,
     resolve_docking_binding,
@@ -29,11 +31,12 @@ class DockingBindingContractTests(unittest.TestCase):
     def test_selected_candidate_binds_ligand_input_and_receptor(self) -> None:
         with tempfile.TemporaryDirectory(prefix="genoligand_docking_binding_") as tmp:
             run_dir = Path(tmp)
+            receptor_digest = hashlib.sha256(b"ATOM\n").hexdigest()
             (run_dir / "complex_candidate_selection.tsv").write_text(
                 "candidate_id\tinput_id\ttarget_id\ttarget_name\torganism\ttarget_class\t"
-                "source\tpdb_id\tevidence\n"
+                "source\tpdb_id\tevidence\trecord_id\treceptor_artifact\tcoordinate_sha256\n"
                 "candidate_2\tinput_2\tTARGET_2\tTarget 2\tHomo sapiens\tprotein\t"
-                "BindingDB\t2XYZ\tligand_code=LIG\n",
+                f"BindingDB\t2XYZ\tligand_code=LIG\trecord_2\tstructure_viewer.pdb\t{receptor_digest}\n",
                 encoding="utf-8",
             )
             (run_dir / "input_conversion_manifest.tsv").write_text(
@@ -48,10 +51,12 @@ class DockingBindingContractTests(unittest.TestCase):
                 "input_1\tligand_smiles=WRONG\tligand_smiles=WRONG\n",
                 encoding="utf-8",
             )
-            (run_dir / "structure_viewer.pdb").write_text("ATOM\n", encoding="utf-8")
+            (run_dir / "structure_viewer.pdb").write_bytes(b"ATOM\n")
             (run_dir / "structure_viewer_status.tsv").write_text(
-                "status\ttarget_id\tpdb_id\tartifact\texpected_path\treason\n"
-                "ready\tTARGET_2\t2XYZ\tstructure_viewer.pdb\tstore/2xyz.cif\tselected\n",
+                "status\tcandidate_id\tinput_id\trecord_id\ttarget_id\tpdb_id\tartifact\t"
+                "coordinate_sha256\texpected_path\treason\n"
+                f"ready\tcandidate_2\tinput_2\trecord_2\tTARGET_2\t2XYZ\tstructure_viewer.pdb\t"
+                f"{receptor_digest}\tstore/2xyz.cif\tselected\n",
                 encoding="utf-8",
             )
 
@@ -64,6 +69,45 @@ class DockingBindingContractTests(unittest.TestCase):
             self.assertEqual(binding.ligand_smiles, "C[C@@H](O)N")
             self.assertEqual(binding.source_content_sha256, "b" * 64)
             self.assertEqual(binding.receptor_coordinate, run_dir / "structure_viewer.pdb")
+
+    def test_explicit_candidate_job_selects_one_row_from_top_n_without_cross_binding(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="genoligand_docking_topn_") as tmp:
+            run_dir = Path(tmp)
+            receptor_digest = hashlib.sha256(b"ATOM\n").hexdigest()
+            (run_dir / "complex_candidate_selection.tsv").write_text(
+                "candidate_id\tinput_id\trecord_id\ttarget_id\tpdb_id\treceptor_artifact\t"
+                "coordinate_sha256\n"
+                f"candidate_1\tinput_1\trecord_1\tTARGET_2\t2XYZ\t1ABC.pdb\t{receptor_digest}\n"
+                f"candidate_2\tinput_2\trecord_2\tTARGET_2\t2XYZ\t2XYZ.pdb\t{receptor_digest}\n",
+                encoding="utf-8",
+            )
+            (run_dir / "input_conversion_manifest.tsv").write_text(
+                "input_id\trecord_id\tcanonical_kind\tcanonical_value\tconversion_status\tcontent_sha256\n"
+                f"input_1\trecord_1\tsmall_molecule\tCCO\tconverted\t{'a' * 64}\n"
+                f"input_2\trecord_2\tsmall_molecule\tCCC\tconverted\t{'b' * 64}\n",
+                encoding="utf-8",
+            )
+            for pdb_id in ("1ABC", "2XYZ"):
+                (run_dir / f"{pdb_id}.pdb").write_bytes(b"ATOM\n")
+            (run_dir / "structure_viewer_status.tsv").write_text(
+                "status\tcandidate_id\tinput_id\trecord_id\ttarget_id\tpdb_id\tartifact\t"
+                "coordinate_sha256\n"
+                f"ready\tcandidate_1\tinput_1\trecord_1\tTARGET_2\t2XYZ\t1ABC.pdb\t{receptor_digest}\n"
+                f"ready\tcandidate_2\tinput_2\trecord_2\tTARGET_2\t2XYZ\t2XYZ.pdb\t{receptor_digest}\n",
+                encoding="utf-8",
+            )
+
+            binding = resolve_docking_binding(
+                run_dir, "candidate_2", "input_2", "record_2"
+            )
+
+            self.assertEqual(binding.candidate_id, "candidate_2")
+            self.assertEqual(binding.input_id, "input_2")
+            self.assertEqual(binding.ligand_record_id, "record_2")
+            self.assertEqual(binding.target_id, "TARGET_2")
+            self.assertEqual(binding.receptor_coordinate, run_dir / "2XYZ.pdb")
+            self.assertEqual(len(binding.candidate_digest), 64)
+            self.assertEqual(len(binding.input_digest), 64)
 
 
 class DockingPocketContractTests(unittest.TestCase):
@@ -402,7 +446,12 @@ class DockingWorkerOutputContractTests(unittest.TestCase):
             self.assertEqual(result, "docking=not_ready;reason=no_trusted_binding_pocket")
             which.assert_not_called()
             manifest = json.loads(
-                (run_dir / "tool_outputs/docking_manifest.json").read_text(encoding="utf-8")
+                (
+                    docking_output_dir(run_dir, "candidate_2", "invocation-current")
+                    / "docking_manifest.json"
+                ).read_text(
+                    encoding="utf-8"
+                )
             )
             self.assertEqual(manifest["status"], "not_ready")
             self.assertEqual(manifest["execution_state"], "blocked")
@@ -478,13 +527,22 @@ class DockingWorkerOutputContractTests(unittest.TestCase):
                 result = run_docking_job(job)
 
             manifest = json.loads(
-                (run_dir / "tool_outputs/docking_manifest.json").read_text(encoding="utf-8")
+                (
+                    docking_output_dir(run_dir, "candidate_2", "invocation-current")
+                    / "docking_manifest.json"
+                ).read_text(
+                    encoding="utf-8"
+                )
             )
             vina_command = next(command for command, label in commands if label == "vina")
             seed = manifest["seed"]
             self.assertIn("AutoDock Vina docking completed", result)
             self.assertEqual(manifest["status"], "completed")
+            self.assertEqual(
+                manifest["artifact_schema_version"], "genoligand_docking_artifacts_v1"
+            )
             self.assertEqual(manifest["job_id"], "docking_vina")
+            self.assertEqual(manifest["run_id"], run_dir.name)
             self.assertEqual(manifest["invocation_id"], "invocation-current")
             self.assertEqual(manifest["candidate_id"], "candidate_2")
             self.assertEqual(manifest["input_id"], "input_2")
@@ -504,27 +562,57 @@ class DockingWorkerOutputContractTests(unittest.TestCase):
             )
             self.assertEqual(len(manifest["seed_provenance"]["seed_digest"]), 64)
             self.assertEqual(ligand_writer.call_args.kwargs["seed"], seed)
+            self.assertEqual(
+                {row["artifact_name"] for row in manifest["artifacts"]},
+                {
+                    "receptor_coordinate",
+                    "receptor_pdb",
+                    "receptor_pdbqt",
+                    "ligand_sdf",
+                    "ligand_pdbqt",
+                    "pose",
+                    "pose_sdf",
+                    "log",
+                },
+            )
+            self.assertEqual(len(manifest["artifacts"]), 8)
+            for row in manifest["artifacts"]:
+                self.assertEqual(row["run_id"], run_dir.name)
+                self.assertEqual(row["candidate_id"], "candidate_2")
+                self.assertEqual(row["input_id"], "input_2")
+                self.assertEqual(row["record_id"], "record_2")
+                self.assertEqual(len(row["artifact_sha256"]), 64)
 
     @staticmethod
     def job(run_dir: Path) -> dict[str, object]:
+        binding = resolve_docking_binding(run_dir)
         return {
             "schema_version": "genoligand_worker_current_v2",
             "pipeline_mode": "genoligand_scientific_pipeline",
             "job_id": "docking_vina",
-            "worker": "docking_vina",
+            "worker": "docking",
             "stage": "structure_evaluate",
+            "run_id": run_dir.name,
             "invocation_id": "invocation-current",
             "run_dir": str(run_dir),
             "input_manifest": str(run_dir / "input.json"),
+            "candidate_id": binding.candidate_id,
+            "candidate_digest": binding.candidate_digest,
+            "input_id": binding.input_id,
+            "record_id": binding.ligand_record_id,
+            "input_digest": binding.input_digest,
+            "source_digest": binding.source_content_sha256,
+            "receptor_digest": binding.receptor_digest,
         }
 
     @staticmethod
     def write_binding_fixture(run_dir: Path) -> None:
+        receptor_digest = hashlib.sha256(b"ATOM\n").hexdigest()
         (run_dir / "complex_candidate_selection.tsv").write_text(
             "candidate_id\tinput_id\ttarget_id\ttarget_name\torganism\ttarget_class\t"
-            "source\tpdb_id\tevidence\n"
+            "source\tpdb_id\tevidence\trecord_id\treceptor_artifact\tcoordinate_sha256\n"
             "candidate_2\tinput_2\tTARGET_2\tTarget 2\tHomo sapiens\tprotein\t"
-            "BindingDB\t2XYZ\tligand_code=LIG\n",
+            f"BindingDB\t2XYZ\tligand_code=LIG\trecord_2\tstructure_viewer.pdb\t{receptor_digest}\n",
             encoding="utf-8",
         )
         (run_dir / "input_conversion_manifest.tsv").write_text(
@@ -533,10 +621,12 @@ class DockingWorkerOutputContractTests(unittest.TestCase):
             f"input_2\trecord_2\tsmall_molecule\tC[C@@H](O)N\tconverted\t{'b' * 64}\n",
             encoding="utf-8",
         )
-        (run_dir / "structure_viewer.pdb").write_text("ATOM\n", encoding="utf-8")
+        (run_dir / "structure_viewer.pdb").write_bytes(b"ATOM\n")
         (run_dir / "structure_viewer_status.tsv").write_text(
-            "status\ttarget_id\tpdb_id\tartifact\texpected_path\treason\n"
-            "ready\tTARGET_2\t2XYZ\tstructure_viewer.pdb\tstore/2xyz.cif\tselected\n",
+            "status\tcandidate_id\tinput_id\trecord_id\ttarget_id\tpdb_id\tartifact\t"
+            "coordinate_sha256\texpected_path\treason\n"
+            f"ready\tcandidate_2\tinput_2\trecord_2\tTARGET_2\t2XYZ\tstructure_viewer.pdb\t"
+            f"{receptor_digest}\tstore/2xyz.cif\tselected\n",
             encoding="utf-8",
         )
 
@@ -547,10 +637,18 @@ class DockingWorkerOutputContractTests(unittest.TestCase):
             run_dir.mkdir()
             self.write_binding_fixture(run_dir)
             outside = root / "outside.pdb"
-            outside.write_text("ATOM\n", encoding="utf-8")
+            outside.write_bytes(b"ATOM\n")
+            selection = run_dir / "complex_candidate_selection.tsv"
+            selection.write_text(
+                selection.read_text(encoding="utf-8").replace("structure_viewer.pdb", str(outside)),
+                encoding="utf-8",
+            )
+            receptor_digest = hashlib.sha256(outside.read_bytes()).hexdigest()
             (run_dir / "structure_viewer_status.tsv").write_text(
-                "status\ttarget_id\tpdb_id\tartifact\texpected_path\treason\n"
-                f"ready\tTARGET_2\t2XYZ\t{outside}\tstore/2xyz.cif\tselected\n",
+                "status\tcandidate_id\tinput_id\trecord_id\ttarget_id\tpdb_id\tartifact\t"
+                "coordinate_sha256\texpected_path\treason\n"
+                f"ready\tcandidate_2\tinput_2\trecord_2\tTARGET_2\t2XYZ\t{outside}\t"
+                f"{receptor_digest}\tstore/2xyz.cif\tselected\n",
                 encoding="utf-8",
             )
 

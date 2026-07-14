@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import gzip
 import http.server
 import importlib.util
 import inspect
@@ -56,6 +57,16 @@ def write_database_fixture(prefix: Path, *, empty_dbtype: bool = False, with_ind
         write_database_index_fixture(prefix)
 
 
+def write_rcsb_scope_fixture(installer, store: Path, payload: str) -> Path:
+    root = store / "downloads/rcsb/mmcif"
+    coordinate = root / "ab/1abc.cif.gz"
+    coordinate.parent.mkdir(parents=True, exist_ok=True)
+    with gzip.open(coordinate, "wt", encoding="utf-8") as handle:
+        handle.write(f"data_1abc\n_entry.id 1ABC\n#\n{payload}\n")
+    installer.write_rcsb_scope_manifest(store, root, {"1ABC"})
+    return root
+
+
 def write_ready_alignment_manifests(
     installer,
     store: Path,
@@ -65,10 +76,7 @@ def write_ready_alignment_manifests(
     mmseqs_source.parent.mkdir(parents=True, exist_ok=True)
     if not mmseqs_source.exists():
         mmseqs_source.write_bytes(b">target\nAAAA\n")
-    foldseek_source = store / "downloads/rcsb/mmcif"
-    foldseek_source.mkdir(parents=True, exist_ok=True)
-    if not (foldseek_source / "1abc.cif").exists():
-        (foldseek_source / "1abc.cif").write_text("structure\n", encoding="utf-8")
+    foldseek_source = write_rcsb_scope_fixture(installer, store, "structure")
     specs = [
         (
             "mmseqs",
@@ -89,11 +97,56 @@ def write_ready_alignment_manifests(
         write_database_fixture(db_path)
         summary = installer.resource_payload_summary(source)
         manifest.parent.mkdir(parents=True, exist_ok=True)
+        scope_digest = ""
+        if _tool == "foldseek":
+            scope_digest = str(
+                installer.read_json_object(store / "downloads/rcsb/ligand_bound_pdb_scope.json").get(
+                    "scope_digest", ""
+                )
+            )
         manifest.write_text(
-            "source_id\tsource_path\tsource_digest\tsource_files\tsource_bytes\tbuilder_version\tdb_path\tstatus\tnotes\n"
-            f"{source_id}\t{installer.relative_path(store, source)}\t{summary['sha256']}\t{summary['file_count']}\t{summary['bytes']}\ttest-builder-1\t{installer.relative_path(store, db_path)}\tready\talready_available\n",
+            "source_id\tmanifest_schema_version\tsource_namespace\tsource_class\tsource_path\tsource_digest\tsource_files\tsource_bytes\tbuilder_version\tscope_digest\tdb_path\tstatus\tnotes\n"
+            f"{source_id}\t{installer.ALIGNMENT_MANIFEST_SCHEMA_VERSION}\t{'MGnify' if _tool == 'mmseqs' else 'RCSB'}\t{'metagenome' if _tool == 'mmseqs' else 'structure'}\t{installer.relative_path(store, source)}\t{summary['sha256']}\t{summary['file_count']}\t{summary['bytes']}\ttest-builder-1\t{scope_digest}\t{installer.relative_path(store, db_path)}\tready\talready_available\n",
             encoding="utf-8",
         )
+
+
+def write_ready_store_contract(installer, store: Path) -> None:
+    (store / "indexes").mkdir(parents=True, exist_ok=True)
+    (store / "install_status.json").write_text('{"status":"ready","missing_components":[]}\n', encoding="utf-8")
+    source_rows = "\n".join(
+        f"{source_id}\t{source_id}\tready\t{repair}"
+        for source_id, repair in installer.REQUIRED_LOGICAL_SOURCES.items()
+    )
+    (store / "source_requirements.tsv").write_text(
+        f"source_id\tlogical_source\tstatus\trepair_action\n{source_rows}\n",
+        encoding="utf-8",
+    )
+    manifest_dir = store / "manifests"
+    manifest_dir.mkdir(parents=True, exist_ok=True)
+    source_manifest_rows = "\n".join(
+        f"{source_id}\tready\t{'a' * 64}\tfixture-release\tfixture_domain_validation"
+        for source_id in installer.REQUIRED_LOGICAL_SOURCES
+    )
+    (manifest_dir / "source_file_manifest.tsv").write_text(
+        "source_id\tstatus\tsha256\trelease_identity\ttrust_source\n" + source_manifest_rows + "\n",
+        encoding="utf-8",
+    )
+    for rel in [
+        "indexes/known_targets.tsv",
+        "indexes/metagenome_targets.tsv",
+        "indexes/structure_targets.tsv",
+    ]:
+        (store / rel).write_text("id\tstatus\nitem\tready\n", encoding="utf-8")
+    tools = "\n".join(f"{tool}\tready" for tool in sorted(installer.REQUIRED_TOOL_IDS))
+    (store / "indexes/tool_versions.tsv").write_text(f"tool\tstatus\n{tools}\n", encoding="utf-8")
+    (store / "index_build_manifest.tsv").write_text(
+        "index\tinput_path\tstatus\trows\toutput_path\tnotes\n"
+        "known_targets\tdownloads/known.tsv\tused\t50000\tindexes/known_targets.tsv\tfull_index\n"
+        "metagenome_targets\tdownloads/metagenome.tsv\tused\t50000\tindexes/metagenome_targets.tsv\tfull_index\n"
+        "structure_targets\tdownloads/structure.tsv\tused\t50000\tindexes/structure_targets.tsv\tfull_index\n",
+        encoding="utf-8",
+    )
 
 
 @contextmanager
@@ -307,9 +360,9 @@ def check_external_sync_closure(installer) -> None:
         store = root / "science_store"
         plan = root / "source_sync_plan.tsv"
         plan.write_text(
-            "source_id\tsource_label\tsync_method\ttarget_rel_path\tready_marker\n"
-            "complete\tComplete\tdirect\tdownloads/complete\tdownloads/complete/marker.dat\n"
-            "partial\tPartial\tdirect\tdownloads/partial\tdownloads/partial/marker.dat\n",
+            "source_id\tsource_label\tsync_method\ttarget_rel_path\tready_marker\trelease_or_date\ttrust_source\n"
+            "complete\tComplete\tdirect\tdownloads/complete\tdownloads/complete/marker.dat\tfixture-v1\tfixture_digest\n"
+            "partial\tPartial\tdirect\tdownloads/partial\tdownloads/partial/marker.dat\tfixture-v1\tfixture_digest\n",
             encoding="utf-8",
         )
         complete_marker = store / "downloads/complete/marker.dat"
@@ -321,9 +374,9 @@ def check_external_sync_closure(installer) -> None:
         manifest = store / "external_sync_execution_manifest.tsv"
         plan_rows = installer.read_tsv(plan)
         manifest.write_text(
-            "source_id\tsource_label\ttarget_rel_path\tstatus\tbytes\tsha256\tplan_digest\tnotes\n"
-            f"complete\tComplete\tdownloads/complete\tready\t{complete_marker.stat().st_size}\t{installer.sha256_file(complete_marker)}\t{installer.external_plan_digest(plan_rows[0])}\tcompleted\n"
-            f"partial\tPartial\tdownloads/partial\tfailed\t0\t\t{installer.external_plan_digest(plan_rows[1])}\tmissing_required_object\n",
+            "source_id\tsource_label\ttarget_rel_path\tstatus\tbytes\tsha256\tplan_digest\trelease_identity\ttrust_source\tnotes\n"
+            f"complete\tComplete\tdownloads/complete\tready\t{complete_marker.stat().st_size}\t{installer.sha256_file(complete_marker)}\t{installer.external_plan_digest(plan_rows[0])}\tfixture-v1\tfixture_digest\tcompleted\n"
+            f"partial\tPartial\tdownloads/partial\tfailed\t0\t\t{installer.external_plan_digest(plan_rows[1])}\tfixture-v1\tfixture_digest\tmissing_required_object\n",
             encoding="utf-8",
         )
         result = installer.sync_external_sources(plan, store, True)
@@ -436,11 +489,9 @@ def check_alignment_source_digest_rebuild(installer, tool: str) -> None:
             source.write_text(">old\nAAAA\n", encoding="utf-8")
             source_id = "metagenome_source"
         else:
-            source = store / "downloads/rcsb/mmcif"
+            source = write_rcsb_scope_fixture(installer, store, "old structure")
             manifest = store / "indexes/foldseek/foldseek_target_databases.tsv"
             db_path = store / "indexes/foldseek/rcsb_mmcif/target"
-            source.mkdir(parents=True)
-            (source / "1abc.cif").write_text("old structure\n", encoding="utf-8")
             source_id = "rcsb_mmcif"
         write_database_fixture(db_path)
         old_summary = installer.resource_payload_summary(source)
@@ -453,7 +504,7 @@ def check_alignment_source_digest_rebuild(installer, tool: str) -> None:
         if source.is_file():
             source.write_text(">new\nCCCC\n", encoding="utf-8")
         else:
-            (source / "1abc.cif").write_text("new structure\n", encoding="utf-8")
+            write_rcsb_scope_fixture(installer, store, "new structure")
         calls: list[list[str]] = []
         original_run_command = installer.run_command
         original_which = installer.shutil.which
@@ -538,9 +589,7 @@ def check_alignment_rebuild_failure_preserves_previous(installer, tool: str) -> 
             db_path = store / "indexes/mmseqs/metagenome_source/target"
             source_id = "metagenome_source"
         else:
-            source = store / "downloads/rcsb/mmcif"
-            source.mkdir(parents=True)
-            (source / "1abc.cif").write_text("old structure\n", encoding="utf-8")
+            source = write_rcsb_scope_fixture(installer, store, "old structure")
             manifest = store / "indexes/foldseek/foldseek_target_databases.tsv"
             db_path = store / "indexes/foldseek/rcsb_mmcif/target"
             source_id = "rcsb_mmcif"
@@ -556,7 +605,7 @@ def check_alignment_rebuild_failure_preserves_previous(installer, tool: str) -> 
         if source.is_file():
             source.write_text(">new\nCCCC\n", encoding="utf-8")
         else:
-            (source / "1abc.cif").write_text("new structure\n", encoding="utf-8")
+            write_rcsb_scope_fixture(installer, store, "new structure")
         original_run_command = installer.run_command
         original_which = installer.shutil.which
 
@@ -702,10 +751,10 @@ def check_resource_summary_cache(installer) -> None:
             changed_directory = installer.resource_payload_summary(directory, cache=cache)
         finally:
             installer.sha256_file_with_progress = original_hash
-        expected_directory_calls += 5
+        expected_directory_calls += 1
         require(
             changed_directory["sha256"] != first_directory["sha256"] and calls == expected_directory_calls,
-            "directory cache must invalidate when any same-size source changes with restored mtime",
+            "directory cache must rehash only the changed source when metadata proves the remaining files unchanged",
         )
 
         uncacheable = Path(tmp) / "uncacheable-source.dat"
@@ -843,21 +892,21 @@ def check_download_integrity_contracts(installer) -> None:
     with tempfile.TemporaryDirectory() as tmp:
         root = Path(tmp)
         store = root / "science_store"
-        source = root / "fresh.bin"
-        source.write_bytes(b"fresh-observed-content")
-        destination = store / "downloads/source.bin"
+        source = root / "fresh.tsv"
+        source.write_text("id\tvalue\n1\tfresh\n", encoding="utf-8")
+        destination = store / "downloads/source.tsv"
         destination.parent.mkdir(parents=True)
         destination.write_bytes(b"stale-content")
         catalog = root / "source_catalog.tsv"
         catalog.write_text(
-            "source_id\turl\tlocal_path\tsha256\trelease_or_date\n"
-            f"observed\t{source}\tdownloads/source.bin\t\tfixture-v2\n",
+            "source_id\turl\tlocal_path\tsha256\trelease_or_date\trelease_identity\ttrust_source\tmedia_type\tcompression\tmin_records\n"
+            f"observed\t{source}\tdownloads/source.tsv\t\tfixture-v2\tfixture-v2\tfixture_domain_validation\ttsv\tnone\t1\n",
             encoding="utf-8",
         )
         manifest = store / "download_execution_manifest.tsv"
         manifest.write_text(
             "source_id\turl\tlocal_path\tstatus\tbytes\tsha256\tobserved_bytes\tobserved_sha256\tsource_version\tcompleted_at\tnotes\n"
-            f"observed\t{source}\tdownloads/source.bin\tready\t{source.stat().st_size}\t{installer.sha256_file(source)}\t{source.stat().st_size}\t{installer.sha256_file(source)}\tfixture-v2\t1\tcompleted\n",
+            f"observed\t{source}\tdownloads/source.tsv\tready\t{source.stat().st_size}\t{installer.sha256_file(source)}\t{source.stat().st_size}\t{installer.sha256_file(source)}\tfixture-v2\t1\tcompleted\n",
             encoding="utf-8",
         )
         result = installer.prepare_downloads(catalog, store)
@@ -868,7 +917,7 @@ def check_download_integrity_contracts(installer) -> None:
         require(int(manifest_row["observed_bytes"]) == source.stat().st_size, "successful no-SHA download must pin observed bytes")
         require(manifest_row["source_version"] == "fixture-v2", "download manifest must retain the source version")
         require(int(manifest_row["completed_at"]) > 0, "successful download must record completion time")
-        source.write_bytes(b"changed-observed-content")
+        source.write_text("id\tvalue\n1\tchanged\n", encoding="utf-8")
         refreshed = installer.prepare_downloads(catalog, store)
         require(refreshed["status"] == "ready", "changed local no-SHA source must be refreshed")
         require(destination.read_bytes() == source.read_bytes(), "observed reuse must compare the current local source content")
@@ -1057,6 +1106,8 @@ def main() -> int:
                 return installer.subprocess.CompletedProcess(command, 0, "", "")
             if command[0] == "python3":
                 return installer.subprocess.CompletedProcess(command, 0, "wsl_gpu=true;wsl_libcuda=true", "")
+            if command[1] == "-c" and "'supported'" in command[2]:
+                return installer.subprocess.CompletedProcess(command, 0, '{"supported":true,"version":[3,12]}', "")
             if command[1] == "-c" and "payload" in command[2]:
                 payload = '{"openmm_ready":true,"version":"8.5.2","platforms":["Reference","CPU","CUDA"],"cuda_ready":true,"plugin_dir":"/plugins","failure_reason":""}'
                 return installer.subprocess.CompletedProcess(command, 0, payload, "")
@@ -1074,16 +1125,7 @@ def main() -> int:
     with tempfile.TemporaryDirectory() as tmp:
         tmp_path = Path(tmp)
         store = tmp_path / "science_store"
-        (store / "indexes").mkdir(parents=True)
-        (store / "install_status.json").write_text('{"status":"ready","missing_components":[]}\n', encoding="utf-8")
-        (store / "source_requirements.tsv").write_text("source_id\tstatus\nknown_database\tready\n", encoding="utf-8")
-        for rel in [
-            "indexes/known_targets.tsv",
-            "indexes/metagenome_targets.tsv",
-            "indexes/structure_targets.tsv",
-            "indexes/tool_versions.tsv",
-        ]:
-            (store / rel).write_text("id\tstatus\nitem\tready\n", encoding="utf-8")
+        write_ready_store_contract(installer, store)
         write_ready_alignment_manifests(installer, store)
         with fake_database_tools(installer):
             require(installer.existing_science_indexes_ready(store), "ready installed indexes must be reused")
@@ -1120,16 +1162,7 @@ def main() -> int:
     with tempfile.TemporaryDirectory() as tmp:
         tmp_path = Path(tmp)
         store = tmp_path / "science_store"
-        (store / "indexes").mkdir(parents=True)
-        (store / "install_status.json").write_text('{"status":"ready","missing_components":[]}\n', encoding="utf-8")
-        (store / "source_requirements.tsv").write_text("source_id\tstatus\nknown_database\tready\n", encoding="utf-8")
-        for rel in [
-            "indexes/known_targets.tsv",
-            "indexes/metagenome_targets.tsv",
-            "indexes/structure_targets.tsv",
-            "indexes/tool_versions.tsv",
-        ]:
-            (store / rel).write_text("id\tstatus\nitem\tready\n", encoding="utf-8")
+        write_ready_store_contract(installer, store)
         large_size = installer.DEFAULT_PARTIAL_INDEX_LARGE_SOURCE_BYTES + 1
         write_large_placeholder(store / "downloads/bindingdb/bindingdb_all.tsv.zip", large_size)
         write_large_placeholder(store / "downloads/chembl/chembl_sqlite.tar.gz", large_size)
@@ -1171,16 +1204,7 @@ def main() -> int:
     with tempfile.TemporaryDirectory() as tmp:
         tmp_path = Path(tmp)
         store = tmp_path / "science_store"
-        (store / "indexes").mkdir(parents=True)
-        (store / "install_status.json").write_text('{"status":"ready","missing_components":[]}\n', encoding="utf-8")
-        (store / "source_requirements.tsv").write_text("source_id\tstatus\nknown_database\tready\n", encoding="utf-8")
-        for rel in [
-            "indexes/known_targets.tsv",
-            "indexes/metagenome_targets.tsv",
-            "indexes/structure_targets.tsv",
-            "indexes/tool_versions.tsv",
-        ]:
-            (store / rel).write_text("id\tstatus\nitem\tready\n", encoding="utf-8")
+        write_ready_store_contract(installer, store)
         write_large_placeholder(store / "downloads/bindingdb/bindingdb_all.tsv.zip", 590_000_000)
         write_ready_alignment_manifests(installer, store, "downloads/metagenome/mgnify/mgy_clusters.fa.gz")
         (store / "index_build_manifest.tsv").write_text(
