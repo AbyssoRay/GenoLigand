@@ -6758,11 +6758,11 @@ fn match_structure_interactions(options: &ScienceOptions) -> Result<Vec<IndexMat
         matches.append(&mut input_matches);
     }
     let mut out = String::from(
-        "input_id\tsource\ttarget_id\ttarget_name\torganism\ttarget_class\tmatch_score\tmatched_features\tevidence\trecord_id\n",
+        "input_id\tsource\ttarget_id\ttarget_name\torganism\ttarget_class\tmatch_score\tmatched_features\tevidence\tsource_database_id\tcurrent_run_query_id\trecord_id\n",
     );
     for item in &matches {
         out.push_str(&format!(
-            "{}\t{}\t{}\t{}\t{}\t{}\t{:.4}\t{}\t{}\t{}\n",
+            "{}\t{}\t{}\t{}\t{}\t{}\t{:.4}\t{}\t{}\t{}\t{}\t{}\n",
             item.input_id,
             clean_cell(&item.source),
             clean_cell(&item.target_id),
@@ -6772,6 +6772,8 @@ fn match_structure_interactions(options: &ScienceOptions) -> Result<Vec<IndexMat
             item.match_score,
             clean_cell(&item.matched_features),
             clean_cell(&item.evidence),
+            clean_cell(&item.source),
+            clean_cell(&item.input_id),
             clean_cell(&item.record_id),
         ));
     }
@@ -9985,11 +9987,12 @@ fn current_run_artifact_relative(run_dir: &Path, artifact: &str) -> Option<Strin
     if artifact.trim().is_empty() {
         return None;
     }
+    let artifact = artifact.replace('\\', "/");
     let root = run_dir.canonicalize().ok()?;
     let path = if cfg!(windows) {
-        wsl_path_to_windows(artifact).unwrap_or_else(|| PathBuf::from(artifact))
+        wsl_path_to_windows(&artifact).unwrap_or_else(|| PathBuf::from(&artifact))
     } else {
-        PathBuf::from(artifact)
+        PathBuf::from(&artifact)
     };
     let candidate = if path.is_absolute() {
         path
@@ -10792,7 +10795,7 @@ fn validated_indexed_docking_manifests(
             .ok_or_else(|| format!("docking_selection_missing:{candidate_id}"))?;
         let receptor_artifact = selected_row
             .get("receptor_artifact")
-            .map(String::as_str)
+            .map(|value| value.replace('\\', "/"))
             .unwrap_or_default();
         let receptor_digest = selected_row
             .get("coordinate_sha256")
@@ -10806,7 +10809,7 @@ fn validated_indexed_docking_manifests(
                 .and_then(Value::as_str)
                 .and_then(|path| current_run_artifact_relative(&options.run_dir, path))
                 .as_deref()
-                != Some(receptor_artifact)
+                != Some(receptor_artifact.as_str())
         {
             return Err(format!("docking_manifest_receptor_mismatch:{candidate_id}"));
         }

@@ -3709,9 +3709,14 @@ fn structure_matching_uses_ligand_identity_from_known_search() {
     .expect("features");
     run_science_command(ScienceCommand::StructureEvaluate, &options).expect("structure");
     let matches = read_text(&run.join("structure_interaction_matches.tsv")).expect("matches");
+    let columns = matches.lines().map(split_tsv).collect::<Vec<_>>();
 
     assert!(matches.contains("2H4N"));
     assert!(matches.contains("azm"));
+    assert!(columns.iter().all(|row| row.len() == 12));
+    assert_eq!(columns[0][9], "source_database_id");
+    assert_eq!(columns[0][10], "current_run_query_id");
+    assert_eq!(columns[1][11], "record_1");
     fs::remove_dir_all(&root).expect("cleanup temp root");
     assert!(!root.exists());
 }
@@ -8307,6 +8312,43 @@ fn refresh_md_provenance_digest(
             .expect("provenance artifact row");
         row["artifact_sha256"] = json!(digest);
     })
+}
+
+#[test]
+fn indexed_artifact_docking_accepts_windows_selection_separator() {
+    let root = temp_root("indexed_docking_windows_separator");
+    let options = indexed_fixture_options(&root);
+    let mut rows = write_indexed_fixture_selection(
+        &options,
+        &[(
+            "candidate_A",
+            "input_1",
+            "record_1",
+            "small_molecule",
+            "CCO",
+        )],
+    )
+    .expect("indexed selection");
+    let receptor = rows[0]
+        .get("receptor_artifact")
+        .expect("receptor artifact")
+        .clone();
+    let windows_receptor = receptor.replace('/', "\\");
+    rows[0].insert("receptor_artifact".to_string(), windows_receptor.clone());
+    let selection_path = options.run_dir.join("complex_candidate_selection.tsv");
+    let selection = read_text(&selection_path)
+        .expect("selection")
+        .replace(&receptor, &windows_receptor);
+    write_text(&selection_path, &selection).expect("windows selection path");
+    write_indexed_docking_fixture(&options, &rows[0]).expect("docking fixture");
+
+    let scores = read_docking_scores(
+        &options,
+        &options.run_dir.join("tool_outputs/docking_summary.tsv"),
+    )
+    .expect("portable receptor path");
+    assert!(scores.contains_key("candidate_A"));
+    fs::remove_dir_all(&root).expect("cleanup fixture");
 }
 
 #[test]
