@@ -3672,6 +3672,36 @@ fn bindingdb_complex_pdb_parser_ignores_target_chain_structures() {
 }
 
 #[test]
+fn legacy_structure_match_schema_is_migrated_without_changing_identity() {
+    let root = temp_root("legacy_structure_match_schema");
+    let run = root.join("run");
+    let options = ScienceOptions {
+        workspace_root: root.clone(),
+        science_store: root.join("science_store"),
+        input_manifest: root.join("input.json"),
+        run_dir: run.clone(),
+    };
+    write_text(
+        &run.join("structure_interaction_matches.tsv"),
+        "input_id\tsource\ttarget_id\ttarget_name\torganism\ttarget_class\tmatch_score\tmatched_features\tevidence\trecord_id\ninput_1\tBindingDB\tQ1\tTarget 1\tHomo sapiens\tknown_human_protein\t1.0000\tcoordinate\tbound evidence\trecord_1\ninput_2\tBindingDB\tQ2\tTarget 2\tHomo sapiens\tknown_human_protein\t1.0000\tcoordinate\tbound evidence\tBindingDB\tinput_2\trecord_2\n",
+    )
+    .expect("legacy structure matches");
+
+    assert!(normalize_legacy_structure_match_schema(&options).expect("migration"));
+    let text = read_text(&run.join("structure_interaction_matches.tsv")).expect("matches");
+    let rows = text.lines().map(split_tsv).collect::<Vec<_>>();
+    assert!(rows.iter().all(|row| row.len() == 12));
+    assert_eq!(rows[1][9], "BindingDB");
+    assert_eq!(rows[1][10], "input_1");
+    assert_eq!(rows[1][11], "record_1");
+    assert_eq!(rows[2][9], "BindingDB");
+    assert_eq!(rows[2][10], "input_2");
+    assert_eq!(rows[2][11], "record_2");
+    assert!(!normalize_legacy_structure_match_schema(&options).expect("idempotent migration"));
+    fs::remove_dir_all(&root).expect("cleanup temp root");
+}
+
+#[test]
 fn structure_matching_uses_ligand_identity_from_known_search() {
     let root = temp_root("structure_uses_known_ligand_identity");
     install_not_applicable_worker_fixtures(&root).expect("worker fixtures");
@@ -3987,16 +4017,41 @@ fn md_summary_score_participates_in_ranking_and_report() {
         )],
     )
     .expect("indexed selection");
-    write_indexed_docking_fixture(&options, &rows[0]).expect("indexed docking fixture");
+    let docking_fixture =
+        write_indexed_docking_fixture(&options, &rows[0]).expect("indexed docking fixture");
     let docking =
         read_text(&run.join("tool_outputs/docking_summary.tsv")).expect("indexed docking summary");
     write_text(&run.join("docking_summary.tsv"), &docking).expect("publish docking summary");
-    write_indexed_md_fixture(&options, &rows[0], false).expect("indexed MD fixture");
+    let md_fixture =
+        write_indexed_md_fixture(&options, &rows[0], false).expect("indexed MD fixture");
     materialize_indexed_md_summary(&options).expect("publish indexed MD summary");
+    let invocation_id = read_text(&run.join(PIPELINE_INVOCATION_FILE))
+        .expect("pipeline invocation")
+        .trim()
+        .to_string();
+    write_text(&run.join("run_state.txt"), "failed\n").expect("failed state");
+    write_text(&run.join("current_stage.txt"), "target_rank\n").expect("failed stage");
+    write_text(&run.join("last_successful_stage.txt"), "dynamics_screen\n")
+        .expect("last successful stage");
+    write_text(
+        &run.join("failure_reason.txt"),
+        &format!(
+            "schema_version=genoligand_pipeline_failure_v1\nstate=failed\nerror_code=authenticity_gate_failed\nstage=target_rank\ninvocation_id={invocation_id}\nlast_successful_stage=dynamics_screen\nreason=authenticity_gate_failed:fixture\n"
+        ),
+    )
+    .expect("failure reason");
+    let preserved = [
+        run.join(&docking_fixture.manifest),
+        run.join(&md_fixture.manifest),
+        run.join("tool_outputs/docking_manifest_index.json"),
+        run.join("tool_outputs/md_manifest_index.json"),
+    ]
+    .map(|path| {
+        let digest = sha256_file_hex(&path).expect("preserved artifact digest");
+        (path, digest)
+    });
 
-    rank_targets(&options).expect("rank");
-    build_evidence(&options).expect("evidence");
-    render_report(&options).expect("report");
+    let finalized = finalize_pipeline(&options).expect("pipeline finalize");
 
     let ranking = read_text(&run.join("target_candidate_ranking.tsv")).expect("ranking");
     let detail = read_text(&run.join("candidate_detail.json")).expect("detail");
@@ -4005,6 +4060,23 @@ fn md_summary_score_participates_in_ranking_and_report() {
     let report = read_text(&run.join("research_report.md")).expect("report");
     let source_map = read_text(&run.join("artifact_source_map.tsv")).expect("source map");
 
+    assert!(finalized.contains(&format!("pipeline_invocation_id={invocation_id}")));
+    assert_eq!(
+        read_text(&run.join(PIPELINE_INVOCATION_FILE))
+            .expect("final invocation")
+            .trim(),
+        invocation_id
+    );
+    assert_eq!(
+        read_text(&run.join("run_state.txt"))
+            .expect("final state")
+            .trim(),
+        "completed"
+    );
+    assert!(!run.join("failure_reason.txt").exists());
+    for (path, digest) in preserved {
+        assert_eq!(sha256_file_hex(&path).as_deref(), Some(digest.as_str()));
+    }
     assert!(ranking.contains(&candidate_id));
     assert!(ranking.contains("0.6050\t1.0000\t0.0000\t0.0000\t0.6667\t0.7167"));
     for fact in [

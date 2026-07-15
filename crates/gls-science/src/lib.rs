@@ -448,6 +448,7 @@ pub enum ScienceCommand {
     TargetRank,
     EvidenceBuild,
     ReportRender,
+    PipelineFinalize,
     PipelineRun,
 }
 
@@ -464,6 +465,7 @@ impl ScienceCommand {
             ("target", "rank") => Ok(Self::TargetRank),
             ("evidence", "build") => Ok(Self::EvidenceBuild),
             ("report", "render") => Ok(Self::ReportRender),
+            ("pipeline", "finalize") => Ok(Self::PipelineFinalize),
             ("pipeline", "run") => Ok(Self::PipelineRun),
             _ => Err(format!("unknown_science_command:{group}:{command}")),
         }
@@ -921,6 +923,7 @@ pub fn run_science_command(
         ScienceCommand::TargetRank => rank_targets(options),
         ScienceCommand::EvidenceBuild => build_evidence(options),
         ScienceCommand::ReportRender => render_report(options),
+        ScienceCommand::PipelineFinalize => finalize_pipeline(options),
         ScienceCommand::PipelineRun => run_pipeline(options),
         ScienceCommand::PrepareScienceStore => Err("use_run_store_command".to_string()),
     }
@@ -3417,6 +3420,124 @@ fn run_pipeline(options: &ScienceOptions) -> Result<String, String> {
         "pipeline_completed\trun_dir={}",
         options.run_dir.display()
     ))
+}
+
+fn finalize_pipeline(options: &ScienceOptions) -> Result<String, String> {
+    ensure_dir(&options.run_dir)?;
+    let invocation_id = current_pipeline_invocation_id(options)?;
+    let state = read_text(&options.run_dir.join("run_state.txt"))?
+        .trim()
+        .to_string();
+    if !matches!(state.as_str(), "failed" | "resumable") {
+        return Err(format!("pipeline_finalize_state_invalid:{state}"));
+    }
+    let last_successful = read_text(&options.run_dir.join("last_successful_stage.txt"))?
+        .trim()
+        .to_string();
+    if last_successful != "dynamics_screen" {
+        return Err(format!(
+            "pipeline_finalize_last_successful_stage_invalid:{last_successful}"
+        ));
+    }
+    let current_stage = read_text(&options.run_dir.join("current_stage.txt"))?
+        .trim()
+        .to_string();
+    if current_stage != "target_rank" {
+        return Err(format!(
+            "pipeline_finalize_current_stage_invalid:{current_stage}"
+        ));
+    }
+    let failure = read_text(&options.run_dir.join("failure_reason.txt"))?;
+    if !failure.lines().any(|line| line == "stage=target_rank")
+        || !failure
+            .lines()
+            .any(|line| line == "error_code=authenticity_gate_failed")
+        || !failure
+            .lines()
+            .any(|line| line == format!("invocation_id={invocation_id}"))
+    {
+        return Err("pipeline_finalize_failure_identity_invalid".to_string());
+    }
+    let migrated = normalize_legacy_structure_match_schema(options)?;
+    run_pipeline_stage(options, &invocation_id, "target_rank", || {
+        rank_targets(options)
+    })?;
+    run_pipeline_stage(options, &invocation_id, "evidence_build", || {
+        build_evidence(options)
+    })?;
+    run_pipeline_stage(options, &invocation_id, "report_render", || {
+        render_report(options)
+    })?;
+    write_artifact_source_map(options)?;
+    if !pipeline_invocation_is_current(options, &invocation_id) {
+        return Err("pipeline_invocation_superseded".to_string());
+    }
+    let failure_path = options.run_dir.join("failure_reason.txt");
+    if failure_path.is_file() {
+        fs::remove_file(&failure_path)
+            .map_err(|err| format!("remove_file_failed:{}:{err}", failure_path.display()))?;
+    }
+    write_text(&options.run_dir.join("run_state.txt"), "completed\n")?;
+    write_run_context(options, "completed", &[])?;
+    Ok(format!(
+        "pipeline_finalized\trun_dir={}\tpipeline_invocation_id={invocation_id}\tlegacy_structure_schema_migrated={migrated}",
+        options.run_dir.display()
+    ))
+}
+
+fn normalize_legacy_structure_match_schema(options: &ScienceOptions) -> Result<bool, String> {
+    let path = options.run_dir.join("structure_interaction_matches.tsv");
+    let text = read_text(&path)?;
+    let mut lines = text.lines();
+    let header = lines.next().unwrap_or_default();
+    let legacy_header = "input_id\tsource\ttarget_id\ttarget_name\torganism\ttarget_class\tmatch_score\tmatched_features\tevidence\trecord_id";
+    let current_header = "input_id\tsource\ttarget_id\ttarget_name\torganism\ttarget_class\tmatch_score\tmatched_features\tevidence\tsource_database_id\tcurrent_run_query_id\trecord_id";
+    if header != legacy_header {
+        let headers = split_tsv(header);
+        if !["input_id", "source", "target_id", "evidence", "record_id"]
+            .into_iter()
+            .all(|required| headers.iter().any(|header| header == required))
+        {
+            return Err("structure_match_schema_header_invalid".to_string());
+        }
+        for (offset, line) in lines.enumerate() {
+            if !line.trim().is_empty() && split_tsv(line).len() != headers.len() {
+                return Err(format!(
+                    "structure_match_schema_width_invalid:{}",
+                    offset + 2
+                ));
+            }
+        }
+        return Ok(false);
+    }
+    let mut normalized = String::from(current_header);
+    normalized.push('\n');
+    for (offset, line) in lines.enumerate() {
+        if line.trim().is_empty() {
+            continue;
+        }
+        let cols = split_tsv(line);
+        let row = match cols.len() {
+            10 => {
+                let mut row = cols[..9].to_vec();
+                row.push(cols[1].clone());
+                row.push(cols[0].clone());
+                row.push(cols[9].clone());
+                row
+            }
+            12 => cols,
+            _ => {
+                return Err(format!(
+                    "structure_match_schema_width_invalid:{}",
+                    offset + 2
+                ));
+            }
+        };
+        normalized.push_str(&row.join("\t"));
+        normalized.push('\n');
+    }
+    write_text(&path, &normalized)?;
+    Ok(true)
 }
 
 fn run_pipeline_stage<F>(

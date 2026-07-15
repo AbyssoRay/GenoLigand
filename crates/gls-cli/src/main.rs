@@ -183,6 +183,7 @@ usage:
   gls-cli target rank --workspace-root PATH --science-store PATH --input-manifest PATH --run-dir PATH
   gls-cli evidence build --workspace-root PATH --science-store PATH --input-manifest PATH --run-dir PATH
   gls-cli report render --workspace-root PATH --science-store PATH --input-manifest PATH --run-dir PATH
+  gls-cli pipeline finalize --workspace-root PATH --science-store PATH --input-manifest PATH --run-dir PATH
   gls-cli pipeline run --workspace-root PATH --science-store PATH --input-manifest PATH --run-dir PATH
 ";
 
@@ -190,7 +191,7 @@ usage:
 mod tests {
     use super::*;
 
-    const SCIENCE_COMMANDS: [ScienceCommand; 10] = [
+    const SCIENCE_COMMANDS: [ScienceCommand; 11] = [
         ScienceCommand::InputNormalize,
         ScienceCommand::FeaturesCompute,
         ScienceCommand::DatabaseMatchKnown,
@@ -200,6 +201,7 @@ mod tests {
         ScienceCommand::TargetRank,
         ScienceCommand::EvidenceBuild,
         ScienceCommand::ReportRender,
+        ScienceCommand::PipelineFinalize,
         ScienceCommand::PipelineRun,
     ];
 
