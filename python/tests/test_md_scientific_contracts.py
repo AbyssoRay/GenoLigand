@@ -1,11 +1,13 @@
 from __future__ import annotations
 
 import math
+import tempfile
 import unittest
 from pathlib import Path
 
 import numpy as np
-from openmm import app
+from openmm import Vec3, app, unit
+from rdkit import Chem
 
 from genoligand_workers import md_summary_worker as worker
 
@@ -101,6 +103,125 @@ def complex_fixture(
 
 
 class MdScientificContractTests(unittest.TestCase):
+    def write_receptor(self, root: Path, chains: list[tuple[str, float]], *, zinc: bool = False) -> Path:
+        topology = app.Topology()
+        positions = []
+        for chain_id, x in chains:
+            chain = topology.addChain(chain_id)
+            residue = topology.addResidue("ALA", chain, id="1")
+            topology.addAtom("CA", app.Element.getBySymbol("C"), residue)
+            positions.append(Vec3(x, 0.0, 0.0))
+        if zinc:
+            chain = topology.addChain("Z")
+            residue = topology.addResidue("ZN", chain, id="401")
+            topology.addAtom("ZN", app.Element.getBySymbol("Zn"), residue)
+            positions.append(Vec3(2.0, 0.0, 0.0))
+        path = root / "receptor.pdb"
+        with path.open("w", encoding="utf-8") as handle:
+            app.PDBFile.writeFile(topology, unit.Quantity(positions, unit.angstrom), handle, keepIds=True)
+        return path
+
+    def ligand_at(self, x: float) -> object:
+        mol = Chem.MolFromSmiles("C")
+        conformer = Chem.Conformer(1)
+        conformer.SetAtomPosition(0, (x, 0.0, 0.0))
+        mol.AddConformer(conformer)
+        return mol
+
+    def test_pose_heavy_atom_chain_selection_requires_exactly_one_contact_chain(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            path = self.write_receptor(root, [("B", 20.0), ("A", 0.0)])
+            selected = worker.select_receptor_chain_from_pose(path, self.ligand_at(2.0), unit)
+            self.assertEqual(selected["selected_chain_id"], "A")
+            self.assertEqual(selected["selected_chain_ordinal"], 1)
+            self.assertEqual(selected["original_protein_chain_count"], 2)
+            self.assertEqual(selected["retained_protein_chain_count"], 1)
+
+            reordered_path = self.write_receptor(root, [("A", 0.0), ("B", 20.0)])
+            reordered = worker.select_receptor_chain_from_pose(reordered_path, self.ligand_at(2.0), unit)
+            self.assertEqual(reordered["selected_chain_id"], "A")
+            self.assertEqual(reordered["selected_chain_ordinal"], 0)
+            self.assertEqual(
+                reordered["selected_chain_coordinate_sha256"],
+                selected["selected_chain_coordinate_sha256"],
+            )
+
+            with self.assertRaisesRegex(ValueError, "no_receptor_chain_within_pose_contact_cutoff"):
+                worker.select_receptor_chain_from_pose(reordered_path, self.ligand_at(10.0), unit)
+
+            ambiguous = self.write_receptor(root, [("A", 0.0), ("B", 8.0)])
+            with self.assertRaisesRegex(ValueError, "ambiguous_receptor_chain_contacts:A,B"):
+                worker.select_receptor_chain_from_pose(ambiguous, self.ligand_at(4.0), unit)
+
+    def test_receptor_metals_are_structured_before_pdbfixer_can_remove_them(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            path = self.write_receptor(Path(temp), [("A", 0.0)], zinc=True)
+            self.assertEqual(
+                worker.receptor_metal_components(path, unit),
+                [
+                    {
+                        "identity": "Z:ZN:401:ZN:1:ZN",
+                        "element": "ZN",
+                        "atom_name": "ZN",
+                        "atom_index": 1,
+                        "chain_id": "Z",
+                        "chain_ordinal": 1,
+                        "residue_name": "ZN",
+                        "residue_id": "401",
+                    }
+                ],
+            )
+
+    def test_openmm_finite_gate_reports_the_exact_stage(self) -> None:
+        class Quantity:
+            def __init__(self, value: object) -> None:
+                self.value = value
+
+            def value_in_unit(self, _unit: object) -> object:
+                return self.value
+
+        class State:
+            def getPositions(self, asNumpy: bool = False) -> Quantity:
+                return Quantity(np.asarray([[math.nan, 0.0, 0.0]]))
+
+            def getPotentialEnergy(self) -> Quantity:
+                return Quantity(0.0)
+
+            def getForces(self, asNumpy: bool = False) -> Quantity:
+                return Quantity(np.asarray([[0.0, 0.0, 0.0]]))
+
+        class Context:
+            def getState(self, **_kwargs: object) -> State:
+                return State()
+
+        with self.assertRaisesRegex(ValueError, "openmm_non_finite_state:post_minimization"):
+            worker.assert_openmm_state_finite(Context(), unit, "post_minimization")
+
+        class Integrator:
+            def step(self, _steps: int) -> None:
+                raise RuntimeError("Particle coordinate is NaN")
+
+        with self.assertRaisesRegex(
+            ValueError,
+            "openmm_integration_failed:production_segment_7:Particle coordinate is NaN",
+        ):
+            worker.integrate_openmm(Integrator(), 1000, "production_segment_7")
+
+        class Minimizer:
+            @staticmethod
+            def minimize(*_args: object, **_kwargs: object) -> None:
+                raise RuntimeError("Particle coordinate is NaN")
+
+        class OpenMM:
+            LocalEnergyMinimizer = Minimizer
+
+        with self.assertRaisesRegex(
+            ValueError,
+            "openmm_minimization_failed:post_minimization:Particle coordinate is NaN",
+        ):
+            worker.minimize_openmm(OpenMM(), object(), unit, 200)
+
     def test_complex_metrics_share_a_pbc_corrected_receptor_reference_frame(self) -> None:
         mol, receptor, reference, role_ranges = complex_fixture()
         angle = math.radians(73.0)

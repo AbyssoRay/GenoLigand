@@ -42,6 +42,13 @@ COMPLEX_MD_METRIC_UNITS = {
 RMSD_SCORE_SCALE_ANGSTROM = 4.0
 LIGAND_DRIFT_SCORE_SCALE_ANGSTROM = 3.0
 CONTACT_CUTOFF_ANGSTROM = 4.5
+RECEPTOR_CHAIN_SELECTION_VERSION = "pose_heavy_atom_contact_v1"
+RECEPTOR_CHAIN_CONTACT_CUTOFF_ANGSTROM = 4.5
+STANDARD_PROTEIN_RESIDUES = {
+    "ALA", "ARG", "ASN", "ASP", "CYS", "GLN", "GLU", "GLY", "HIS", "ILE",
+    "LEU", "LYS", "MET", "PHE", "PRO", "SER", "THR", "TRP", "TYR", "VAL",
+}
+UNSUPPORTED_METAL_ELEMENTS = {"CA", "CO", "CU", "FE", "MG", "MN", "NI", "ZN"}
 HBOND_DISTANCE_CUTOFF_NM = 0.25
 HBOND_ANGLE_CUTOFF_DEGREES = 120.0
 MD_JOB_ID = "md_summary_ligand_dynamics"
@@ -68,6 +75,7 @@ MD_OWNED_ARTIFACTS = (
     "peptide_conformer_ensemble.tsv",
     "peptide_conformer_metrics.tsv",
     "peptide_conformer_summary.tsv",
+    "receptor_prepared.pdb",
 )
 DOCKING_ARTIFACT_FIELDS = (
     "receptor_coordinate",
@@ -90,6 +98,7 @@ class ReceptorCoordinate:
     positions_angstrom: Any
     preparation: str
     risk_flags: list[str]
+    model_metadata: dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass
@@ -260,23 +269,6 @@ def run_md_summary_job(job: dict[str, Any]) -> WorkerExecution:
     import openmm
     from openmm import unit
 
-    try:
-        assert receptor_path is not None
-        receptor = load_receptor_coordinate(receptor_path, unit)
-    except Exception as exc:  # noqa: BLE001 - not-ready artifact is the contract for unusable coordinates
-        reason = "receptor_coordinate_preparation_failed"
-        write_md_not_ready(
-            run_dir,
-            f"receptor coordinate preparation failed: {safe_note(str(exc))}",
-            [reason],
-            binding=binding,
-        )
-        return md_execution("not_ready", reason, openmm_version_text(openmm, "not_ready", reason), True)
-    if not receptor.atoms:
-        reason = "receptor_coordinate_parse_failed"
-        write_md_not_ready(run_dir, reason, [reason], binding=binding)
-        return md_execution("not_ready", reason, openmm_version_text(openmm, "not_ready", reason), True)
-
     assert binding.docking_pose_sdf is not None
     assert binding.docking_ligand_sdf is not None
     assert binding.docking_ligand_pdbqt is not None
@@ -296,6 +288,74 @@ def run_md_summary_job(job: dict[str, Any]) -> WorkerExecution:
             [reason],
             binding=binding,
         )
+        return md_execution("not_ready", reason, openmm_version_text(openmm, "not_ready", reason), True)
+
+    try:
+        assert receptor_path is not None
+        metal_components = receptor_metal_components(receptor_path, unit)
+        if metal_components:
+            reason = "unsupported_metal_parameterization"
+            details = {
+                "metal_components": metal_components,
+                "source_receptor_coordinate": relative_run_artifact(binding, receptor_path),
+                "source_receptor_sha256": sha256_file(receptor_path),
+            }
+            write_md_not_ready(
+                run_dir,
+                reason,
+                [reason, *(f"metal_component:{row['identity']}" for row in metal_components)],
+                details=details,
+                binding=binding,
+            )
+            return md_execution("not_ready", reason, openmm_version_text(openmm, "not_ready", reason), True)
+        chain_selection = select_receptor_chain_from_pose(receptor_path, mol, unit)
+        chain_selection["source_receptor_sha256"] = sha256_file(receptor_path)
+        chain_selection["docking_pose_sha256"] = sha256_file(binding.docking_pose_sdf)
+        selection_binding = {
+            key: chain_selection[key]
+            for key in (
+                "source_receptor_sha256",
+                "docking_pose_sha256",
+                "receptor_chain_selection_algorithm",
+                "receptor_chain_atom_policy",
+                "receptor_chain_contact_cutoff_angstrom",
+                "selected_chain_id",
+                "selected_chain_signature_sha256",
+                "selected_chain_coordinate_sha256",
+            )
+        }
+        chain_selection["receptor_chain_selection_digest"] = hashlib.sha256(
+            json.dumps(selection_binding, sort_keys=True, separators=(",", ":")).encode("utf-8")
+        ).hexdigest()
+        receptor = load_receptor_coordinate(
+            receptor_path,
+            unit,
+            selected_chain_ordinal=int(chain_selection["selected_chain_ordinal"]),
+        )
+        receptor.model_metadata.update(chain_selection)
+        receptor.model_metadata["source_receptor_coordinate"] = relative_run_artifact(binding, receptor_path)
+        receptor.model_metadata["source_receptor_sha256"] = sha256_file(receptor_path)
+        receptor = write_invocation_prepared_receptor(receptor, binding.output_dir / "receptor_prepared.pdb")
+    except Exception as exc:  # noqa: BLE001 - not-ready artifact is the contract for unusable coordinates
+        message = safe_note(str(exc))
+        stable_reasons = (
+            "no_receptor_chain_within_pose_contact_cutoff",
+            "ambiguous_receptor_chain_contacts",
+            "docking_pose_heavy_atom_coordinates_invalid",
+            "selected_receptor_chain_ordinal_invalid",
+        )
+        reason = next((code for code in stable_reasons if message.startswith(code)), "receptor_coordinate_preparation_failed")
+        write_md_not_ready(
+            run_dir,
+            reason,
+            [reason],
+            details={"error": message},
+            binding=binding,
+        )
+        return md_execution("not_ready", reason, openmm_version_text(openmm, "not_ready", reason), True)
+    if not receptor.atoms:
+        reason = "receptor_coordinate_parse_failed"
+        write_md_not_ready(run_dir, reason, [reason], binding=binding)
         return md_execution("not_ready", reason, openmm_version_text(openmm, "not_ready", reason), True)
 
     timestep_ps = env_float("GENOLIGAND_MD_TIMESTEP_PS", DEFAULT_TIMESTEP_PS)
@@ -362,13 +422,16 @@ def run_md_summary_job(job: dict[str, Any]) -> WorkerExecution:
         return md_execution("not_ready", reason, openmm_version_text(openmm, "not_ready", reason), True)
     sample_gpu_telemetry(gpu_telemetry, "after_openmm_context")
     context.setPositions(context_positions)
+    assert_openmm_state_finite(context, unit, "set_positions")
     sample_gpu_telemetry(gpu_telemetry, "after_positions_set")
     pre_minimization_energy = potential_energy_kj_mol(context, unit)
-    openmm.LocalEnergyMinimizer.minimize(
+    minimize_openmm(
+        openmm,
         context,
-        tolerance=10 * unit.kilojoule_per_mole / unit.nanometer,
-        maxIterations=env_int("GENOLIGAND_MD_MINIMIZATION_ITERATIONS", DEFAULT_MINIMIZATION_ITERATIONS),
+        unit,
+        env_int("GENOLIGAND_MD_MINIMIZATION_ITERATIONS", DEFAULT_MINIMIZATION_ITERATIONS),
     )
+    assert_openmm_state_finite(context, unit, "post_minimization")
     post_minimization_energy = potential_energy_kj_mol(context, unit)
     sample_gpu_telemetry(gpu_telemetry, "after_minimization")
     context.setVelocitiesToTemperature(300 * unit.kelvin, SIMULATION_SEED)
@@ -380,7 +443,8 @@ def run_md_summary_job(job: dict[str, Any]) -> WorkerExecution:
             label_prefix="equilibration_poll",
             interval_seconds=telemetry_poll_seconds,
         ):
-            integrator.step(equilibration_steps)
+            integrate_openmm(integrator, equilibration_steps, "equilibration")
+        assert_openmm_state_finite(context, unit, "equilibration")
         total_step += equilibration_steps
     sample_gpu_telemetry(gpu_telemetry, "after_equilibration")
 
@@ -409,7 +473,7 @@ def run_md_summary_job(job: dict[str, Any]) -> WorkerExecution:
         interval_seconds=telemetry_poll_seconds,
     ):
         for segment in range(production_segments):
-            integrator.step(production_steps_per_segment)
+            integrate_openmm(integrator, production_steps_per_segment, f"production_segment_{segment + 1}")
             total_step += production_steps_per_segment
             frame, state_row, periodic_box = current_state_snapshot(
                 context,
@@ -1424,6 +1488,44 @@ def validate_complex_md_semantics(
             raise MdProvenanceError("md_protocol_parameter_missing")
         if row.get("unit", "") != unit:
             raise MdProvenanceError("md_protocol_unit_invalid")
+    system = manifest.get("system")
+    if isinstance(system, dict) and system.get("receptor_chain_selection_digest"):
+        prepared_relative = md_artifact_relative(binding, "receptor_prepared.pdb")
+        if manifest.get("receptor_coordinate") != prepared_relative:
+            raise MdProvenanceError("md_prepared_receptor_path_mismatch")
+        prepared_path = resolve_run_artifact(binding.run_dir, prepared_relative)
+        prepared_sha256 = str(system.get("prepared_receptor_sha256", "")).lower()
+        if not valid_sha256(prepared_sha256) or sha256_file(prepared_path) != prepared_sha256:
+            raise MdProvenanceError("md_prepared_receptor_sha256_mismatch")
+        protocol_fields = {
+            "receptor_chain_selection_algorithm": "receptor_chain_selection_algorithm",
+            "receptor_chain_atom_policy": "receptor_chain_atom_policy",
+            "selected_chain_id": "selected_chain_id",
+            "selected_chain_ordinal": "selected_chain_ordinal",
+            "selected_chain_signature_sha256": "selected_chain_signature_sha256",
+            "selected_chain_coordinate_sha256": "selected_chain_coordinate_sha256",
+            "receptor_chain_selection_digest": "receptor_chain_selection_digest",
+        }
+        for parameter, field_name in protocol_fields.items():
+            row = protocol.get(("input", parameter))
+            if row is None or row.get("value") != str(system.get(field_name, "")):
+                raise MdProvenanceError(f"md_receptor_selection_protocol_mismatch:{parameter}")
+        complex_manifest = read_json_object(md_artifact_path(binding, "complex_md_manifest.json"))
+        if (
+            complex_manifest.get("receptor_coordinate") != prepared_relative
+            or not isinstance(complex_manifest.get("system"), dict)
+            or complex_manifest["system"].get("receptor_chain_selection_digest")
+            != system.get("receptor_chain_selection_digest")
+        ):
+            raise MdProvenanceError("md_receptor_selection_manifest_mismatch")
+        provenance = read_json_object(md_artifact_path(binding, MD_PROVENANCE_ARTIFACT))
+        prepared_rows = [
+            row
+            for row in provenance.get("artifacts", [])
+            if isinstance(row, dict) and row.get("artifact_path") == prepared_relative
+        ]
+        if len(prepared_rows) != 1 or prepared_rows[0].get("artifact_sha256") != prepared_sha256:
+            raise MdProvenanceError("md_prepared_receptor_provenance_mismatch")
     timestep = finite_float(protocol[("integrator", "time_step")].get("value"), "md_timestep_invalid")
     production_steps = int(
         finite_float(protocol[("production", "total_steps")].get("value"), "md_production_steps_invalid")
@@ -1902,21 +2004,150 @@ def conformer_positions(mol: Any, conformer_id: int, np: Any) -> Any:
     )
 
 
-def load_receptor_coordinate(path: Path, unit: Any) -> ReceptorCoordinate:
+def read_receptor_structure(path: Path, app: Any) -> Any:
+    return app.PDBFile(str(path)) if path.suffix.lower() in {".pdb", ".ent"} else app.PDBxFile(str(path))
+
+
+def chain_signature(chain: Any) -> str:
+    residues = [
+        [residue.name.upper(), str(residue.id), [atom.name for atom in residue.atoms() if getattr(atom, "element", None) is not None]]
+        for residue in chain.residues()
+        if residue.name.upper() in STANDARD_PROTEIN_RESIDUES
+    ]
+    return hashlib.sha256(json.dumps(residues, separators=(",", ":")).encode("utf-8")).hexdigest()
+
+
+def receptor_metal_components(path: Path, unit: Any) -> list[dict[str, Any]]:
+    from openmm import app
+
+    structure = read_receptor_structure(path, app)
+    components: list[dict[str, Any]] = []
+    for chain_ordinal, chain in enumerate(structure.topology.chains()):
+        for residue in chain.residues():
+            for atom in residue.atoms():
+                if (
+                    getattr(atom, "element", None) is None
+                    or atom.element.symbol.upper() not in UNSUPPORTED_METAL_ELEMENTS
+                ):
+                    continue
+                element = atom.element.symbol.upper()
+                components.append(
+                    {
+                        "identity": f"{chain.id}:{residue.name}:{residue.id}:{atom.name}:{atom.index}:{element}",
+                        "element": element,
+                        "atom_name": atom.name,
+                        "atom_index": atom.index,
+                        "chain_id": str(chain.id),
+                        "chain_ordinal": chain_ordinal,
+                        "residue_name": residue.name,
+                        "residue_id": str(residue.id),
+                    }
+                )
+    return sorted(components, key=lambda row: (row["chain_ordinal"], row["atom_index"], row["identity"]))
+
+
+def select_receptor_chain_from_pose(path: Path, mol: Any, unit: Any) -> dict[str, Any]:
+    import numpy as np
+    from openmm import app
+
+    structure = read_receptor_structure(path, app)
+    positions = np.asarray(structure.positions.value_in_unit(unit.angstrom), dtype=float)
+    conformer = mol.GetConformer()
+    ligand_positions = np.asarray(
+        [
+            [
+                conformer.GetAtomPosition(atom.GetIdx()).x,
+                conformer.GetAtomPosition(atom.GetIdx()).y,
+                conformer.GetAtomPosition(atom.GetIdx()).z,
+            ]
+            for atom in mol.GetAtoms()
+            if atom.GetAtomicNum() > 1
+        ],
+        dtype=float,
+    )
+    if ligand_positions.size == 0 or not np.isfinite(ligand_positions).all():
+        raise ValueError("docking_pose_heavy_atom_coordinates_invalid")
+    protein_chains: list[tuple[int, Any, float]] = []
+    for chain_ordinal, chain in enumerate(structure.topology.chains()):
+        heavy_indices = [
+            atom.index
+            for residue in chain.residues()
+            if residue.name.upper() in STANDARD_PROTEIN_RESIDUES
+            for atom in residue.atoms()
+            if getattr(atom, "element", None) is not None and atom.element.symbol.upper() != "H"
+        ]
+        if not heavy_indices:
+            continue
+        chain_positions = positions[heavy_indices]
+        minimum = float(
+            np.sqrt(((chain_positions[:, None, :] - ligand_positions[None, :, :]) ** 2).sum(axis=2)).min()
+        )
+        protein_chains.append((chain_ordinal, chain, minimum))
+    eligible = [row for row in protein_chains if row[2] <= RECEPTOR_CHAIN_CONTACT_CUTOFF_ANGSTROM]
+    if not eligible:
+        raise ValueError("no_receptor_chain_within_pose_contact_cutoff")
+    if len(eligible) != 1:
+        identities = ",".join(str(row[1].id) for row in sorted(eligible, key=lambda row: row[0]))
+        raise ValueError(f"ambiguous_receptor_chain_contacts:{identities}")
+    selected_ordinal, selected_chain, minimum = eligible[0]
+    coordinate_rows = []
+    for residue in selected_chain.residues():
+        if residue.name.upper() not in STANDARD_PROTEIN_RESIDUES:
+            continue
+        for atom in residue.atoms():
+            if getattr(atom, "element", None) is None or atom.element.symbol.upper() == "H":
+                continue
+            coord = positions[atom.index]
+            coordinate_rows.append(
+                [
+                    residue.name.upper(),
+                    str(residue.id),
+                    atom.name,
+                    atom.element.symbol.upper(),
+                    *(f"{float(value):.4f}" for value in coord),
+                ]
+            )
+    coordinate_digest = hashlib.sha256(
+        json.dumps(coordinate_rows, separators=(",", ":")).encode("utf-8")
+    ).hexdigest()
+    return {
+        "receptor_chain_selection_algorithm": RECEPTOR_CHAIN_SELECTION_VERSION,
+        "receptor_chain_atom_policy": "protein_and_ligand_heavy_atoms",
+        "receptor_chain_contact_cutoff_angstrom": RECEPTOR_CHAIN_CONTACT_CUTOFF_ANGSTROM,
+        "original_protein_chain_count": len(protein_chains),
+        "retained_protein_chain_count": 1,
+        "selected_chain_id": str(selected_chain.id),
+        "selected_chain_ordinal": selected_ordinal,
+        "selected_chain_signature_sha256": chain_signature(selected_chain),
+        "selected_chain_coordinate_sha256": coordinate_digest,
+        "selected_chain_minimum_distance_angstrom": minimum,
+    }
+
+
+def load_receptor_coordinate(path: Path, unit: Any, *, selected_chain_ordinal: int | None = None) -> ReceptorCoordinate:
     try:
-        return load_receptor_with_pdbfixer(path, unit)
+        return load_receptor_with_pdbfixer(path, unit, selected_chain_ordinal=selected_chain_ordinal)
     except Exception as pdbfixer_error:  # noqa: BLE001 - fallback keeps real coordinate provenance
-        receptor = load_receptor_with_openmm_app(path, unit)
+        receptor = load_receptor_with_openmm_app(path, unit, selected_chain_ordinal=selected_chain_ordinal)
         receptor.risk_flags.append(f"pdbfixer_failed:{safe_note(str(pdbfixer_error))}")
         return receptor
 
 
-def load_receptor_with_pdbfixer(path: Path, unit: Any) -> ReceptorCoordinate:
+def load_receptor_with_pdbfixer(
+    path: Path,
+    unit: Any,
+    *,
+    selected_chain_ordinal: int | None = None,
+) -> ReceptorCoordinate:
     import numpy as np
-    from openmm import app
     from pdbfixer import PDBFixer
 
     fixer = PDBFixer(filename=str(path))
+    if selected_chain_ordinal is not None:
+        chain_count = len(list(fixer.topology.chains()))
+        if selected_chain_ordinal < 0 or selected_chain_ordinal >= chain_count:
+            raise ValueError("selected_receptor_chain_ordinal_invalid")
+        fixer.removeChains([index for index in range(chain_count) if index != selected_chain_ordinal])
     fixer.findMissingResidues()
     fixer.findNonstandardResidues()
     fixer.replaceNonstandardResidues()
@@ -1925,10 +2156,6 @@ def load_receptor_with_pdbfixer(path: Path, unit: Any) -> ReceptorCoordinate:
     fixer.addMissingAtoms()
     fixer.addMissingHydrogens(7.0)
     atoms, positions = atoms_from_topology(fixer.topology, fixer.positions, unit)
-    prepared = path.parent / "tool_outputs" / "receptor_prepared.pdb"
-    prepared.parent.mkdir(parents=True, exist_ok=True)
-    with prepared.open("w", encoding="utf-8") as handle:
-        app.PDBFile.writeFile(fixer.topology, fixer.positions, handle)
     return ReceptorCoordinate(
         path=path,
         topology=fixer.topology,
@@ -1940,19 +2167,29 @@ def load_receptor_with_pdbfixer(path: Path, unit: Any) -> ReceptorCoordinate:
     )
 
 
-def load_receptor_with_openmm_app(path: Path, unit: Any) -> ReceptorCoordinate:
+def load_receptor_with_openmm_app(
+    path: Path,
+    unit: Any,
+    *,
+    selected_chain_ordinal: int | None = None,
+) -> ReceptorCoordinate:
     import numpy as np
     from openmm import app
 
-    lower = path.name.lower()
-    if lower.endswith(".pdb") or lower.endswith(".ent"):
-        structure = app.PDBFile(str(path))
-    else:
-        structure = app.PDBxFile(str(path))
+    structure = read_receptor_structure(path, app)
     modeller = app.Modeller(structure.topology, structure.positions)
-    waters = [residue for residue in modeller.topology.residues() if residue.name.upper() in {"HOH", "WAT", "DOD"}]
-    if waters:
-        modeller.delete(waters)
+    if selected_chain_ordinal is not None:
+        chains = list(modeller.topology.chains())
+        if selected_chain_ordinal < 0 or selected_chain_ordinal >= len(chains):
+            raise ValueError("selected_receptor_chain_ordinal_invalid")
+        modeller.delete([chain for index, chain in enumerate(chains) if index != selected_chain_ordinal])
+    nonprotein = [
+        residue
+        for residue in modeller.topology.residues()
+        if residue.name.upper() not in STANDARD_PROTEIN_RESIDUES
+    ]
+    if nonprotein:
+        modeller.delete(nonprotein)
     atoms, positions = atoms_from_topology(modeller.topology, modeller.positions, unit)
     return ReceptorCoordinate(
         path=path,
@@ -1963,6 +2200,18 @@ def load_receptor_with_openmm_app(path: Path, unit: Any) -> ReceptorCoordinate:
         preparation="openmm_coordinate_parse",
         risk_flags=["pdbfixer_not_applied"],
     )
+
+
+def write_invocation_prepared_receptor(receptor: ReceptorCoordinate, path: Path) -> ReceptorCoordinate:
+    from openmm import app
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("w", encoding="utf-8") as handle:
+        app.PDBFile.writeFile(receptor.topology, receptor.positions, handle)
+    receptor.path = path
+    receptor.preparation = f"{receptor.preparation};pose_contact_chain_selected"
+    receptor.model_metadata["prepared_receptor_sha256"] = sha256_file(path)
+    return receptor
 
 
 def atoms_from_topology(topology: Any, positions: Any, unit: Any) -> tuple[list[dict[str, str]], list[list[float]]]:
@@ -2178,6 +2427,7 @@ def build_complex_system(
         removeCMMotion=True,
     )
     metadata = {
+        **receptor.model_metadata,
         "protein_forcefield": protein_forcefield,
         "water_forcefield": water_forcefield,
         "small_molecule_forcefield": forcefield_name,
@@ -2215,7 +2465,9 @@ def current_state_snapshot(
     stage: str,
     periodic: bool,
 ) -> tuple[Any, list[str], Any | None]:
-    state = context.getState(getPositions=True, getEnergy=True, enforcePeriodicBox=periodic)
+    import numpy as np
+
+    state = context.getState(getPositions=True, getEnergy=True, getForces=True, enforcePeriodicBox=periodic)
     positions = state.getPositions(asNumpy=True).value_in_unit(unit.angstrom)
     periodic_box = (
         state.getPeriodicBoxVectors(asNumpy=True).value_in_unit(unit.angstrom)
@@ -2224,6 +2476,14 @@ def current_state_snapshot(
     )
     potential = float(state.getPotentialEnergy().value_in_unit(unit.kilojoule_per_mole))
     kinetic = float(state.getKineticEnergy().value_in_unit(unit.kilojoule_per_mole))
+    forces = state.getForces(asNumpy=True).value_in_unit(unit.kilojoule_per_mole / unit.nanometer)
+    if (
+        not np.isfinite(positions).all()
+        or not np.isfinite(forces).all()
+        or not math.isfinite(potential)
+        or not math.isfinite(kinetic)
+    ):
+        raise ValueError(f"openmm_non_finite_state:{stage}")
     total = potential + kinetic
     temperature = temperature_estimate_kelvin(kinetic, particle_count)
     return (
@@ -2253,6 +2513,35 @@ def temperature_estimate_kelvin(kinetic_energy_kj_mol: float, particle_count: in
 def potential_energy_kj_mol(context: Any, unit: Any) -> float:
     state = context.getState(getEnergy=True)
     return float(state.getPotentialEnergy().value_in_unit(unit.kilojoule_per_mole))
+
+
+def assert_openmm_state_finite(context: Any, unit: Any, stage: str) -> None:
+    import numpy as np
+
+    state = context.getState(getPositions=True, getEnergy=True, getForces=True)
+    positions = state.getPositions(asNumpy=True).value_in_unit(unit.angstrom)
+    potential = float(state.getPotentialEnergy().value_in_unit(unit.kilojoule_per_mole))
+    forces = state.getForces(asNumpy=True).value_in_unit(unit.kilojoule_per_mole / unit.nanometer)
+    if not np.isfinite(positions).all() or not np.isfinite(forces).all() or not math.isfinite(potential):
+        raise ValueError(f"openmm_non_finite_state:{stage}")
+
+
+def integrate_openmm(integrator: Any, steps: int, stage: str) -> None:
+    try:
+        integrator.step(steps)
+    except Exception as exc:  # noqa: BLE001 - preserve the exact integration stage in worker evidence
+        raise ValueError(f"openmm_integration_failed:{stage}:{safe_note(str(exc))}") from exc
+
+
+def minimize_openmm(openmm: Any, context: Any, unit: Any, max_iterations: int) -> None:
+    try:
+        openmm.LocalEnergyMinimizer.minimize(
+            context,
+            tolerance=10 * unit.kilojoule_per_mole / unit.nanometer,
+            maxIterations=max_iterations,
+        )
+    except Exception as exc:  # noqa: BLE001 - preserve the exact minimization stage in worker evidence
+        raise ValueError(f"openmm_minimization_failed:post_minimization:{safe_note(str(exc))}") from exc
 
 
 class GpuTelemetryMonitor:
@@ -2491,6 +2780,17 @@ def build_md_protocol_rows(
         [candidate_id, input_id, "input", "ligand_placement", placement_method, "", "docking_pose_sdf"],
         [candidate_id, input_id, "input", "ligand_atom_count", str(mol.GetNumAtoms()), "atoms", "rdkit"],
         [candidate_id, input_id, "input", "receptor_atom_count", str(len(receptor.atoms)), "atoms", "pdbfixer_or_coordinate_parser"],
+        [candidate_id, input_id, "input", "receptor_chain_selection_algorithm", str(model_metadata.get("receptor_chain_selection_algorithm", "")), "", "GenoLigand"],
+        [candidate_id, input_id, "input", "receptor_chain_atom_policy", str(model_metadata.get("receptor_chain_atom_policy", "")), "", "GenoLigand"],
+        [candidate_id, input_id, "input", "receptor_chain_contact_cutoff", str(model_metadata.get("receptor_chain_contact_cutoff_angstrom", "")), "angstrom", "GenoLigand"],
+        [candidate_id, input_id, "input", "original_protein_chain_count", str(model_metadata.get("original_protein_chain_count", "")), "chains", "structure_coordinate"],
+        [candidate_id, input_id, "input", "retained_protein_chain_count", str(model_metadata.get("retained_protein_chain_count", "")), "chains", "receptor_prepared.pdb"],
+        [candidate_id, input_id, "input", "selected_chain_id", str(model_metadata.get("selected_chain_id", "")), "", "structure_coordinate"],
+        [candidate_id, input_id, "input", "selected_chain_ordinal", str(model_metadata.get("selected_chain_ordinal", "")), "", "structure_coordinate"],
+        [candidate_id, input_id, "input", "selected_chain_signature_sha256", str(model_metadata.get("selected_chain_signature_sha256", "")), "", "structure_coordinate"],
+        [candidate_id, input_id, "input", "selected_chain_coordinate_sha256", str(model_metadata.get("selected_chain_coordinate_sha256", "")), "", "structure_coordinate"],
+        [candidate_id, input_id, "input", "selected_chain_minimum_distance", str(model_metadata.get("selected_chain_minimum_distance_angstrom", "")), "angstrom", "docking_pose_sdf"],
+        [candidate_id, input_id, "input", "receptor_chain_selection_digest", str(model_metadata.get("receptor_chain_selection_digest", "")), "", "GenoLigand"],
         [candidate_id, input_id, "parameterization", "ligand_parameterization", parameterization, "", "OpenFF/RDKit"],
         [candidate_id, input_id, "parameterization", "protein_forcefield", str(model_metadata.get("protein_forcefield", "")), "", "OpenMM"],
         [candidate_id, input_id, "parameterization", "small_molecule_forcefield", str(model_metadata.get("small_molecule_forcefield", "")), "", "OpenFF"],
@@ -2782,12 +3082,14 @@ def write_md_not_ready(
     reason: str,
     risk_flags: list[str],
     *,
+    details: dict[str, Any] | None = None,
     binding: MdInvocationBinding,
 ) -> None:
     if run_dir.resolve(strict=True) != binding.run_dir:
         raise MdProvenanceError("md_output_run_dir_mismatch")
     tool_outputs = binding.output_dir
     tool_outputs.mkdir(parents=True, exist_ok=True)
+    details = details or {}
     not_ready_path = tool_outputs / "md_not_ready.tsv"
     run_manifest_path = tool_outputs / "md_run_manifest.json"
     write_tsv(
@@ -2802,6 +3104,7 @@ def write_md_not_ready(
             "method": "not_ready",
             "reason": reason,
             "risk_flags": risk_flags,
+            "details": details,
             "metric_artifacts": [],
             "ligand_coordinate": "",
             "ligand_placement_manifest": "",
@@ -2819,7 +3122,7 @@ def write_md_not_ready(
         [not_ready_path, run_manifest_path],
         tool_name="md_summary",
         tool_version="not_ready",
-        parameters={"reason": reason, "risk_flags": risk_flags},
+        parameters={"reason": reason, "risk_flags": risk_flags, "details": details},
     )
     upsert_md_manifest_index(
         binding,
@@ -3020,6 +3323,7 @@ def write_md_artifacts(
     provenance_path = write_md_artifact_provenance(
         binding,
         [
+            receptor.path,
             summary_path,
             *metric_paths,
             ligand_placement_path,
