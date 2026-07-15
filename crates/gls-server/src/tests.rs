@@ -872,8 +872,13 @@ fn webui_uses_structure_index_requirement_id() {
 #[test]
 fn visual_result_sections_use_clear_not_ready_language() {
     let app = web_asset_text("pages/results.js");
+    let common = web_asset_text("components/common.js");
     assert!(app.contains("三维查看未就绪"));
     assert!(app.contains("轨迹图未就绪"));
+    assert!(app.contains("protocol.candidate_count"));
+    assert!(app.contains("stateTrace.candidate_count"));
+    assert!(common.contains("trajectory_status"));
+    assert!(common.contains("轨迹数据"));
     assert!(!app.contains("未接入可用输出"));
 
     let structure = user_structure_row(
@@ -889,7 +894,7 @@ fn visual_result_sections_use_clear_not_ready_language() {
     let md = user_md_row(&json!({"candidate_id":"C1"}), &BTreeMap::new());
     assert_eq!(structure["viewer_status"], "三维查看未就绪");
     assert_eq!(ready_structure["viewer_status"], "三维查看已就绪");
-    assert_eq!(md["trajectory_status"], "轨迹图未就绪");
+    assert_eq!(md["trajectory_status"], "轨迹数据未就绪");
 }
 
 #[test]
@@ -2991,6 +2996,106 @@ fn md_endpoint_builds_chart_rows_from_current_run_summaries() {
     assert!(text.contains("score_decomposition.tsv"));
     assert!(text.contains("gpu_telemetry_status.tsv"));
     assert!(!text.contains(&root.display().to_string()));
+
+    fs::remove_dir_all(&root).ok();
+}
+
+#[test]
+fn md_endpoint_reads_candidate_scoped_openmm_artifacts() {
+    let root = std::env::temp_dir().join(format!("genoligand-md-scoped-{}", now_millis()));
+    let options = server_options(root.clone());
+    let run_dir = projects_root(&options)
+        .join("project-1")
+        .join("runs")
+        .join("run-1");
+    fs::create_dir_all(&run_dir).expect("create run dir");
+    fs::write(run_dir.join("run_state.txt"), "completed\n").expect("state");
+    fs::write(
+        run_dir.join("md_summary.tsv"),
+        "candidate_id\trmsd\tmd_stability_score\nC1\t1.2\t0.8\nC2\t1.1\t0.9\n",
+    )
+    .expect("md summary");
+
+    let mut entries = Vec::new();
+    for candidate_id in ["C1", "C2"] {
+        let artifact_dir = run_dir
+            .join("tool_outputs")
+            .join("md")
+            .join(candidate_id)
+            .join("invocation-1");
+        fs::create_dir_all(&artifact_dir).expect("candidate MD artifact dir");
+        let prefix = format!("tool_outputs/md/{candidate_id}/invocation-1");
+        fs::write(
+            artifact_dir.join("md_protocol.tsv"),
+            format!(
+                "candidate_id\tinput_id\tstage\tparameter\tvalue\tunit\tsource\n{candidate_id}\tI1\tplatform\topenmm_platform\tCUDA\t\tOpenMM\n{candidate_id}\tI1\tintegrator\ttime_step\t0.0020\tps\tOpenMM\n{candidate_id}\tI1\tproduction\ttotal_time\t100.0000\tps\tOpenMM\n"
+            ),
+        )
+        .expect("protocol");
+        fs::write(
+            artifact_dir.join("md_state.tsv"),
+            format!(
+                "candidate_id\tinput_id\tframe\tstep\ttime_ps\tstage\tpotential_energy_kj_mol\tkinetic_energy_kj_mol\ttotal_energy_kj_mol\ttemperature_estimate_K\tsource\n{candidate_id}\tI1\t0\t0\t0.0000\tminimized\t-1.0000\t0.0000\t-1.0000\t0.0000\tOpenMM Context state\n{candidate_id}\tI1\t50\t60000\t120.0000\tproduction\t-2.0000\t1.0000\t-1.0000\t300.0000\tOpenMM Context state\n"
+            ),
+        )
+        .expect("state");
+        fs::write(
+            artifact_dir.join("md_trajectory.tsv"),
+            format!(
+                "candidate_id\tframe\tatom_index\trole\telement\tresidue\tx\ty\tz\n{candidate_id}\t0\t0\tligand\tC\tLIG\t0.0\t0.0\t0.0\n"
+            ),
+        )
+        .expect("trajectory");
+        fs::write(
+            artifact_dir.join("gpu_telemetry_status.tsv"),
+            "cuda_platform\tnvidia_smi_available\tgpu_observed\tproduction_sample_count\tproduction_max_utilization_gpu_percent\tobservation_basis\tfailure_reason\nCUDA\ttrue\ttrue\t2\t70.0000\tcurrent_pid\t\n",
+        )
+        .expect("gpu status");
+        let manifest_rel = format!("{prefix}/md_run_manifest.json");
+        fs::write(
+            artifact_dir.join("md_run_manifest.json"),
+            json!({
+                "candidate_id": candidate_id,
+                "method": "openmm_receptor_ligand_complex_dynamics",
+                "platform": "CUDA",
+                "frame_count": 51,
+                "protocol_artifact": format!("{prefix}/md_protocol.tsv"),
+                "state_artifact": format!("{prefix}/md_state.tsv"),
+                "trajectory": format!("{prefix}/md_trajectory.tsv"),
+                "gpu_telemetry_status_artifact": format!("{prefix}/gpu_telemetry_status.tsv")
+            })
+            .to_string(),
+        )
+        .expect("manifest");
+        entries.push(json!({
+            "candidate_id": candidate_id,
+            "manifest": manifest_rel,
+            "status": "completed"
+        }));
+    }
+    fs::write(
+        run_dir.join("tool_outputs/md_manifest_index.json"),
+        json!({"entries": entries}).to_string(),
+    )
+    .expect("manifest index");
+    write_passed_authenticity_gate(&run_dir);
+
+    let payload = md_endpoint_json(&options, "run-1");
+    assert_eq!(payload["protocol"]["ready"], true);
+    assert_eq!(payload["protocol"]["platform"], "CUDA");
+    assert_eq!(payload["protocol"]["candidate_count"], 2);
+    assert_eq!(payload["state_trace"]["ready"], true);
+    assert_eq!(payload["state_trace"]["candidate_count"], 2);
+    assert_eq!(payload["state_trace"]["row_count"], 4);
+    assert_eq!(payload["cuda_monitoring"]["ready"], true);
+    assert_eq!(payload["cuda_monitoring"]["candidate_count"], 2);
+    assert_eq!(payload["cuda_monitoring"]["production_sample_count"], "4");
+    let rows = payload["md_rows"].as_array().expect("MD rows");
+    assert_eq!(rows.len(), 2);
+    assert!(rows.iter().all(|row| row["trajectory_ready"] == true));
+    assert!(rows.iter().all(|row| row["trajectory_frame_count"] == 51));
+    assert!(rows.iter().all(|row| row["trajectory_status"] == "轨迹数据已就绪（51 帧）"));
+    assert!(!payload.to_string().contains(&root.display().to_string()));
 
     fs::remove_dir_all(&root).ok();
 }

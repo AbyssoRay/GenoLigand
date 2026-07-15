@@ -8,7 +8,7 @@ use std::fs::{self, OpenOptions};
 use std::hash::{BuildHasher, Hasher};
 use std::io::{BufRead, BufReader, Read, Seek, SeekFrom, Write};
 use std::net::{TcpListener, TcpStream};
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::process::{Child, Command, ExitStatus, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
@@ -2420,16 +2420,23 @@ fn user_structure_rows_paged(run_dir: &Path, viewer: &Value, query: &ResultQuery
 
 fn user_md_rows(run_dir: &Path) -> Vec<Value> {
     let targets = candidate_target_lookup(run_dir);
+    let trajectories = md_trajectory_lookup(run_dir);
     read_tsv_rows(&run_dir.join("md_summary.tsv"))
         .into_iter()
-        .map(|row| user_md_row(&row, &targets))
+        .map(|row| {
+            let trajectory = trajectories.get(row_text(&row, "candidate_id"));
+            user_md_row_with_trajectory(&row, &targets, trajectory)
+        })
         .collect()
 }
 
 fn user_md_rows_paged(run_dir: &Path, query: &ResultQuery) -> PagedRows {
     let targets = candidate_target_lookup(run_dir);
-    read_tsv_rows_page(&run_dir.join("md_summary.tsv"), query)
-        .map(|row| user_md_row(&row, &targets))
+    let trajectories = md_trajectory_lookup(run_dir);
+    read_tsv_rows_page(&run_dir.join("md_summary.tsv"), query).map(|row| {
+        let trajectory = trajectories.get(row_text(&row, "candidate_id"));
+        user_md_row_with_trajectory(&row, &targets, trajectory)
+    })
 }
 
 fn user_genome_rows_paged(run_dir: &Path, query: &ResultQuery) -> PagedRows {
@@ -2667,12 +2674,17 @@ fn md_protocol_payload(run_dir: Option<&Path>) -> Value {
     let Some(run_dir) = run_dir else {
         return json!({"ready":false,"reason":"等待运行完成后读取 MD 运行协议"});
     };
-    let rows = read_tsv_rows(&run_dir.join("tool_outputs/md_protocol.tsv"));
+    let artifacts = md_artifact_paths(run_dir, "protocol_artifact", "tool_outputs/md_protocol.tsv");
+    let rows = artifacts
+        .iter()
+        .flat_map(|path| read_tsv_rows(path))
+        .collect::<Vec<_>>();
     if rows.is_empty() {
         return json!({"ready":false,"reason":"当前运行没有 MD 运行协议输出"});
     }
     json!({
         "ready": true,
+        "candidate_count": artifacts.len(),
         "platform": protocol_value(&rows, "platform", "openmm_platform"),
         "integrator": protocol_value(&rows, "integrator", "integrator"),
         "time_step": protocol_value_with_unit(&rows, "integrator", "time_step"),
@@ -2681,7 +2693,7 @@ fn md_protocol_payload(run_dir: Option<&Path>) -> Value {
         "production_steps": protocol_value_with_unit(&rows, "production", "total_steps"),
         "frame_count": protocol_value_with_unit(&rows, "output", "frame_count"),
         "state_rows": protocol_value_with_unit(&rows, "output", "state_rows"),
-        "artifact": "tool_outputs/md_protocol.tsv"
+        "artifact": if run_dir.join("tool_outputs/md_manifest_index.json").is_file() { "tool_outputs/md_manifest_index.json" } else { "tool_outputs/md_protocol.tsv" }
     })
 }
 
@@ -2689,19 +2701,33 @@ fn md_state_payload(run_dir: Option<&Path>) -> Value {
     let Some(run_dir) = run_dir else {
         return json!({"ready":false,"reason":"等待运行完成后读取 MD 状态序列"});
     };
-    let rows = read_tsv_rows(&run_dir.join("tool_outputs/md_state.tsv"));
-    let Some(last) = rows.last() else {
+    let artifacts = md_artifact_paths(run_dir, "state_artifact", "tool_outputs/md_state.tsv");
+    let rows = artifacts
+        .iter()
+        .flat_map(|path| read_tsv_rows(path))
+        .collect::<Vec<_>>();
+    let Some(last) = rows.iter().max_by(|left, right| {
+        row_text(left, "time_ps")
+            .parse::<f64>()
+            .unwrap_or(f64::NEG_INFINITY)
+            .total_cmp(
+                &row_text(right, "time_ps")
+                    .parse::<f64>()
+                    .unwrap_or(f64::NEG_INFINITY),
+            )
+    }) else {
         return json!({"ready":false,"reason":"当前运行没有 MD 状态序列输出"});
     };
     json!({
         "ready": true,
+        "candidate_count": artifacts.len(),
         "row_count": rows.len(),
         "last_stage": row_text(last, "stage"),
         "last_step": row_text(last, "step"),
         "last_time_ps": row_text(last, "time_ps"),
         "last_temperature_K": row_text(last, "temperature_estimate_K"),
         "last_total_energy_kj_mol": row_text(last, "total_energy_kj_mol"),
-        "artifact": "tool_outputs/md_state.tsv"
+        "artifact": if run_dir.join("tool_outputs/md_manifest_index.json").is_file() { "tool_outputs/md_manifest_index.json" } else { "tool_outputs/md_state.tsv" }
     })
 }
 
@@ -2709,25 +2735,132 @@ fn md_cuda_monitoring_payload(run_dir: Option<&Path>) -> Value {
     let Some(run_dir) = run_dir else {
         return json!({"ready":false,"reason":"等待运行完成后读取 CUDA 监测输出"});
     };
-    let rows = read_tsv_rows(&run_dir.join("tool_outputs/gpu_telemetry_status.tsv"));
+    let artifacts = md_artifact_paths(
+        run_dir,
+        "gpu_telemetry_status_artifact",
+        "tool_outputs/gpu_telemetry_status.tsv",
+    );
+    let rows = artifacts
+        .iter()
+        .flat_map(|path| read_tsv_rows(path))
+        .collect::<Vec<_>>();
     let Some(row) = rows.first() else {
         return json!({"ready":false,"reason":"当前运行没有 CUDA 监测状态输出"});
     };
     let platform = row_text(row, "cuda_platform");
-    let gpu_observed = row_text(row, "gpu_observed") == "true";
-    let nvidia_smi_available = row_text(row, "nvidia_smi_available") == "true";
+    let gpu_observed = rows
+        .iter()
+        .all(|row| row_text(row, "gpu_observed") == "true");
+    let nvidia_smi_available = rows
+        .iter()
+        .all(|row| row_text(row, "nvidia_smi_available") == "true");
     json!({
-        "ready": platform == "CUDA" && gpu_observed,
+        "ready": rows.iter().all(|row| row_text(row, "cuda_platform") == "CUDA") && gpu_observed,
+        "candidate_count": artifacts.len(),
         "platform": platform,
         "nvidia_smi_available": nvidia_smi_available,
         "gpu_observed": gpu_observed,
-        "production_sample_count": row_text(row, "production_sample_count"),
-        "production_max_utilization_gpu_percent": row_text(row, "production_max_utilization_gpu_percent"),
+        "production_sample_count": sum_integer_field(&rows, "production_sample_count"),
+        "production_max_utilization_gpu_percent": max_number_field(&rows, "production_max_utilization_gpu_percent"),
         "production_max_memory_delta_mb": row_text(row, "production_max_memory_delta_mb"),
         "observation_basis": row_text(row, "observation_basis"),
         "failure_reason": row_text(row, "failure_reason"),
-        "artifact": "tool_outputs/gpu_telemetry_status.tsv"
+        "artifact": if run_dir.join("tool_outputs/md_manifest_index.json").is_file() { "tool_outputs/md_manifest_index.json" } else { "tool_outputs/gpu_telemetry_status.tsv" }
     })
+}
+
+fn md_artifact_paths(run_dir: &Path, field: &str, fallback: &str) -> Vec<PathBuf> {
+    let paths = md_run_manifests(run_dir)
+        .iter()
+        .filter_map(|manifest| manifest.get(field).and_then(Value::as_str))
+        .filter_map(|relative| run_relative_file(run_dir, relative))
+        .collect::<Vec<_>>();
+    if !paths.is_empty() {
+        return paths;
+    }
+    let fallback = run_dir.join(fallback);
+    if fallback.is_file() {
+        vec![fallback]
+    } else {
+        Vec::new()
+    }
+}
+
+fn md_run_manifests(run_dir: &Path) -> Vec<Value> {
+    read_json_or(
+        &run_dir.join("tool_outputs/md_manifest_index.json"),
+        json!({}),
+    )["entries"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter(|entry| entry.get("status").and_then(Value::as_str) == Some("completed"))
+        .filter_map(|entry| {
+            let candidate_id = entry.get("candidate_id").and_then(Value::as_str)?;
+            let manifest_path =
+                run_relative_file(run_dir, entry.get("manifest").and_then(Value::as_str)?)?;
+            let manifest = read_json_or(&manifest_path, json!({}));
+            (manifest.get("candidate_id").and_then(Value::as_str) == Some(candidate_id)
+                && manifest.get("method").and_then(Value::as_str)
+                    == Some("openmm_receptor_ligand_complex_dynamics"))
+            .then_some(manifest)
+        })
+        .collect()
+}
+
+fn run_relative_file(run_dir: &Path, relative: &str) -> Option<PathBuf> {
+    let relative = Path::new(relative.trim());
+    if relative.as_os_str().is_empty()
+        || relative.is_absolute()
+        || relative
+            .components()
+            .any(|component| !matches!(component, Component::Normal(_)))
+    {
+        return None;
+    }
+    let path = run_dir.join(relative);
+    path.is_file().then_some(path)
+}
+
+fn md_trajectory_lookup(run_dir: &Path) -> BTreeMap<String, Value> {
+    md_run_manifests(run_dir)
+        .into_iter()
+        .filter_map(|manifest| {
+            let candidate_id = manifest.get("candidate_id")?.as_str()?.to_string();
+            let trajectory = manifest.get("trajectory")?.as_str()?;
+            let ready = run_relative_file(run_dir, trajectory)
+                .and_then(|path| fs::metadata(path).ok())
+                .is_some_and(|metadata| metadata.len() > 0);
+            let frame_count = manifest.get("frame_count").and_then(Value::as_u64);
+            Some((
+                candidate_id,
+                json!({"ready": ready, "frame_count": frame_count}),
+            ))
+        })
+        .collect()
+}
+
+fn sum_integer_field(rows: &[Value], key: &str) -> String {
+    let values = rows
+        .iter()
+        .filter_map(|row| row_text(row, key).parse::<u64>().ok())
+        .collect::<Vec<_>>();
+    if values.is_empty() {
+        String::new()
+    } else {
+        values.iter().sum::<u64>().to_string()
+    }
+}
+
+fn max_number_field(rows: &[Value], key: &str) -> String {
+    rows.iter()
+        .filter_map(|row| {
+            let text = row_text(row, key);
+            text.parse::<f64>().ok().map(|value| (value, text))
+        })
+        .max_by(|left, right| left.0.total_cmp(&right.0))
+        .map(|(_, text)| text.to_string())
+        .unwrap_or_default()
 }
 
 fn protocol_value(rows: &[Value], stage: &str, parameter: &str) -> String {
@@ -2964,7 +3097,16 @@ fn structure_viewer_status_text(viewer: &Value) -> &'static str {
     }
 }
 
+#[cfg(test)]
 fn user_md_row(row: &Value, targets: &BTreeMap<String, (String, String)>) -> Value {
+    user_md_row_with_trajectory(row, targets, None)
+}
+
+fn user_md_row_with_trajectory(
+    row: &Value,
+    targets: &BTreeMap<String, (String, String)>,
+    trajectory: Option<&Value>,
+) -> Value {
     let candidate_id = row_text(row, "candidate_id");
     let (fallback_target_id, fallback_target_name) = targets
         .get(candidate_id)
@@ -2984,6 +3126,18 @@ fn user_md_row(row: &Value, targets: &BTreeMap<String, (String, String)>) -> Val
         hydrogen_bond_occupancy,
         interaction_persistence,
     );
+    let trajectory_ready = trajectory
+        .and_then(|value| value.get("ready"))
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let trajectory_frame_count = trajectory
+        .and_then(|value| value.get("frame_count"))
+        .and_then(Value::as_u64);
+    let trajectory_status = match (trajectory_ready, trajectory_frame_count) {
+        (true, Some(count)) => format!("轨迹数据已就绪（{count} 帧）"),
+        (true, None) => "轨迹数据已就绪".to_string(),
+        _ => "轨迹数据未就绪".to_string(),
+    };
     json!({
         "candidate_id": candidate_id,
         "target_id": target_id,
@@ -3001,7 +3155,9 @@ fn user_md_row(row: &Value, targets: &BTreeMap<String, (String, String)>) -> Val
         } else {
             "\u{5df2}\u{751f}\u{6210}\u{52a8}\u{529b}\u{5b66}\u{6458}\u{8981}"
         },
-        "trajectory_status": "\u{8f68}\u{8ff9}\u{56fe}\u{672a}\u{5c31}\u{7eea}",
+        "trajectory_ready": trajectory_ready,
+        "trajectory_frame_count": trajectory_frame_count,
+        "trajectory_status": trajectory_status,
         "result_source": "\u{52a8}\u{529b}\u{5b66}\u{6458}\u{8981}\u{8f93}\u{51fa}"
     })
 }

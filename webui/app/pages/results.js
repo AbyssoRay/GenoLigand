@@ -291,23 +291,26 @@ function resultEndpointConfig(kind) {
 
 function mdRuntimeStatus(protocol, stateTrace, cuda) {
   const platform = protocol.ready ? valueOrMissing(protocol.platform) : valueOrMissing(cuda.platform, "未生成");
+  const protocolScope = protocol.candidate_count > 1 ? `${protocol.candidate_count} 个候选：` : "";
+  const stateScope = stateTrace.candidate_count > 1 ? `${stateTrace.candidate_count} 个候选，共` : "";
+  const cudaScope = cuda.candidate_count > 1 ? `${cuda.candidate_count} 个候选，` : "";
   const cudaReady = cuda.ready === true;
   const cudaCount = cuda["production_" + "sam" + "ple_count"];
   const cudaPeak = cuda["production_max_utilization_gpu_percent"];
   const cudaText = cuda.ready
-    ? `生产阶段 ${valueOrMissing(cudaCount, "0")} 次采样，峰值 ${valueOrMissing(cudaPeak, "0")} %`
+    ? `${cudaScope}生产阶段 ${valueOrMissing(cudaCount, "0")} 次采样，峰值 ${valueOrMissing(cudaPeak, "0")} %`
     : cuda.reason || cuda.failure_reason || "当前运行没有 CUDA 生产阶段采样证据";
   return visualStatus([
-    { label: "OpenMM 平台", value: platform, ready: protocol.ready === true },
+    { label: "OpenMM 平台", value: `${protocolScope}${platform}`, ready: protocol.ready === true },
     {
       label: "MD 协议",
-      value: protocol.ready ? `${valueOrMissing(protocol.production_time, "未记录")} production，${valueOrMissing(protocol.time_step, "未记录")} 步长` : protocol.reason || "未生成",
+      value: protocol.ready ? `${protocolScope}${valueOrMissing(protocol.production_time, "未记录")} production，${valueOrMissing(protocol.time_step, "未记录")} 步长` : protocol.reason || "未生成",
       ready: protocol.ready === true,
       waiting: protocol.ready !== true,
     },
     {
       label: "状态序列",
-      value: stateTrace.ready ? `${valueOrMissing(stateTrace.row_count, "0")} 行，最后 ${valueOrMissing(stateTrace.last_time_ps, "0")} ps` : stateTrace.reason || "未生成",
+      value: stateTrace.ready ? `${stateScope}${valueOrMissing(stateTrace.row_count, "0")} 行，最长 ${valueOrMissing(stateTrace.last_time_ps, "0")} ps` : stateTrace.reason || "未生成",
       ready: stateTrace.ready === true,
       waiting: stateTrace.ready !== true,
     },

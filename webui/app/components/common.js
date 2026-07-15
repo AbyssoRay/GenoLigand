@@ -101,7 +101,7 @@ function columnsFor(kind) {
       { key: "interaction_persistence", label: "相互作用持续性" },
       { key: "summary", label: "摘要" },
       { key: "status", label: "状态" },
-      { key: "trajectory_status", label: "轨迹图" },
+      { key: "trajectory_status", label: "轨迹数据" },
       { key: "result_source", label: "输出材料" },
     ];
   }
