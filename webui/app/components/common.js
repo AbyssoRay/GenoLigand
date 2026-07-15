@@ -156,16 +156,6 @@ function runStateClass(value) {
   return "waiting";
 }
 
-function friendlyRequirement(item) {
-  return {
-    science_store: "科学仓库",
-    known_database: "已知蛋白索引",
-    metagenome: "宏基因组索引",
-    structure_index: "结构索引",
-    tools: "计算工具",
-  }[item] || item;
-}
-
 function friendlyArtifact(name) {
   return {
     structure_patch: "结构与口袋摘要",

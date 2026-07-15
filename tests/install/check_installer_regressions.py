@@ -25,7 +25,7 @@ INSTALLER = ROOT / "scripts/setup/install_complete_scientific.py"
 
 
 def load_installer():
-    spec = importlib.util.spec_from_file_location("current_installer_remediations", INSTALLER)
+    spec = importlib.util.spec_from_file_location("installer_regressions", INSTALLER)
     if spec is None or spec.loader is None:
         raise RuntimeError("installer module could not be loaded")
     module = importlib.util.module_from_spec(spec)
@@ -347,7 +347,7 @@ def interrupting_resumable_server(content: bytes, cutoff: int):
         thread.join(timeout=5)
 
 
-class CurrentInstallerRemediations(unittest.TestCase):
+class InstallerRegressionTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls) -> None:
         cls.installer = load_installer()
@@ -2169,7 +2169,7 @@ class CurrentInstallerRemediations(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             runtime = root / "runtime"
-            inherited = os.pathsep.join([str(root / "system-bin"), str(root / "codex-cache")])
+            inherited = os.pathsep.join([str(root / "system-bin"), str(root / "inherited-cache")])
             additions = [str(root / "worker-wrappers"), str(root / "cuda-bin")]
             science_env = {"PATH": os.pathsep.join([*additions, inherited])}
             with mock.patch.dict(os.environ, {"PATH": inherited}, clear=False):
@@ -2187,7 +2187,7 @@ class CurrentInstallerRemediations(unittest.TestCase):
             payload = json.loads((runtime / "launch_environment.json").read_text(encoding="utf-8"))
             self.assertEqual(payload["path_prepend"], [str(runtime / "bin"), *additions])
             launcher = (runtime / "run-genoligand-webui.py").read_text(encoding="utf-8")
-            self.assertNotIn(str(root / "codex-cache"), launcher)
+            self.assertNotIn(str(root / "inherited-cache"), launcher)
 
     def test_openff_requires_fixed_digest_xml_and_loader(self) -> None:
         installer = self.installer

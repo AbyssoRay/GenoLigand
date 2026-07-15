@@ -35,7 +35,7 @@
 /tools/*.tar.gz
 /tools/*.tgz
 
-# Temporary directories and generated reviews
+# Temporary directories and frontend test output
 /tmp/
 /temp/
 /.cache/
@@ -45,8 +45,6 @@
 /webui/playwright-report/
 /webui/test-results/
 /webui/node_modules/
-/genoligand_webui_*_review_packet.docx
-/genoligand_webui_*_review_packet.pdf
 
 # Python bytecode and local environments
 __pycache__/
@@ -70,7 +68,6 @@ __pycache__/
 core.*
 
 # Editor and OS metadata
-.codex/
 .vscode/*
 !.vscode/settings.json
 !.vscode/extensions.json
@@ -134,5 +131,3 @@ $RECYCLE.BIN/
 ~$*.pptx
 ~$*.xls
 ~$*.xlsx
-
-AGENTS.md

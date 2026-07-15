@@ -38,7 +38,7 @@ class RuntimeBuildIdentityContracts(unittest.TestCase):
     def workspace(self, parent: Path) -> Path:
         root = parent / "repo"
         (root / "src").mkdir(parents=True)
-        (root / ".gitignore").write_text("target/\nwork/\n.codex/\n", encoding="utf-8")
+        (root / ".gitignore").write_text("target/\nwork/\n", encoding="utf-8")
         (root / "Cargo.toml").write_text(
             '[workspace]\nmembers = []\n\n[workspace.package]\nversion = "1.2.3"\n',
             encoding="utf-8",
@@ -113,9 +113,6 @@ class RuntimeBuildIdentityContracts(unittest.TestCase):
             (root / "target/cache/output.bin").write_bytes(b"ignored")
             (root / "work").mkdir()
             (root / "work/evidence.json").write_text("{}\n", encoding="utf-8")
-            (root / ".codex").mkdir()
-            (root / ".codex/session.json").write_text("{}\n", encoding="utf-8")
-
             commit = self.git(root, "rev-parse", "HEAD")
             source = self.fake_build(root)
             smoke = {

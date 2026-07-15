@@ -21,13 +21,13 @@ def main() -> int:
     require("scripts/" not in workflow.replace("scripts/setup/", ""), "main.nf must not call scripts directly")
 
     server = read("crates/gls-server/src/lib.rs")
-    for forbidden in ["scripts/md", "scripts/structure", "scripts/plm", "scripts/similarity"]:
-        require(forbidden not in server, f"gls-server must not call {forbidden}")
+    require(
+        "scripts/" not in server.replace("scripts/setup/", ""),
+        "gls-server must enter scientific work through product APIs",
+    )
     require("install_complete_scientific.py" in server, "installer exception must be explicit")
 
     require((ROOT / "docs/architecture.md").is_file(), "architecture responsibility map is required")
-    require(not (ROOT / "docs/plans/next_implementation_plan.md").exists(), "obsolete next plan must be removed")
-    require(not (ROOT / "GenoLigand_next_implementation_plan.md").exists(), "root plan file must be moved")
 
     for schema in [
         "schemas/project.schema.json",

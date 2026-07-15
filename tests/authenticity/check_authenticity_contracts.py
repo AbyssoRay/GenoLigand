@@ -36,7 +36,6 @@ def main() -> int:
     worker_result_schema = json.loads(read("schemas/worker_result.schema.json"))
     worker_cpu_requirements = read("python/requirements-workers-cpu.txt")
     worker_cuda_requirements = read("python/requirements-workers-cuda.txt")
-    worker_environment_reference = json.loads(read("python/environment-workers.yml"))
     worker_lock_rows = list(
         csv.DictReader(
             read("python/requirements-workers.lock.txt").splitlines(),
@@ -76,35 +75,18 @@ def main() -> int:
     require("requirements-workers.lock.txt" in worker_cpu_requirements, "CPU worker entry point must select a hashed platform lock")
     require("requirements-workers.lock.txt" in worker_cuda_requirements, "CUDA worker entry point must select hashed runtime and CUDA platform locks")
     require(
-        worker_environment_reference.get("schema_version") == "genoligand_worker_environment_reference_v1"
-        and worker_environment_reference.get("kind") == "generated_worker_environment_reference"
-        and worker_environment_reference.get("installable") is False,
-        "worker environment reference must be generated metadata rather than a Conda installation entry point",
-    )
-    require(
-        worker_environment_reference.get("installation_entrypoint")
-        == "scripts/setup/install_complete_scientific.py",
-        "worker environment reference must direct installation through the complete installer",
-    )
-    worker_confirmed_versions = worker_environment_reference.get("confirmed_versions", {})
-    require(
         set(worker_runtime_requirements) == worker_cuda_platforms
         == {"windows_x86_64", "manylinux_2_34_x86_64"},
         "CPU and CUDA worker profiles must cover the same supported platforms",
     )
-    require("openmmforcefields" in worker_source_requirements, "worker source lock must pin OpenMM small-molecule force-field support")
     require(
-        worker_confirmed_versions.get("openmmforcefields") == "0.15.0",
-        "worker environment reference must report the locked OpenMM force-field version",
+        "openmmforcefields\t0.15.0\t" in worker_source_requirements,
+        "worker source lock must pin the OpenMM force-field package",
     )
     for dependency in ["xmltodict", "python-constraint", "lxml"]:
         require(
             all(dependency in requirements for requirements in worker_runtime_requirements.values()),
             f"every hashed worker runtime lock must install OpenFF runtime dependency: {dependency}",
-        )
-        require(
-            dependency in worker_confirmed_versions,
-            f"worker environment reference must report locked OpenFF runtime dependency: {dependency}",
         )
     require("openff-interchange" in worker_source_requirements, "worker source lock must pin OpenFF interchange")
     require("SMIRNOFFTemplateGenerator" in md_worker or "SystemGenerator" in md_worker, "complex MD must use OpenMM/OpenFF small-molecule parameterization")

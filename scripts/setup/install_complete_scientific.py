@@ -1033,8 +1033,6 @@ def tool_path_entries(workspace_root: Path, extra_entries: Sequence[Path] | None
     if os.name == "nt":
         entries.extend(
             [
-                Path("D:/user/codex/tools"),
-                Path("D:/user/codex/tools/bin"),
                 Path("D:/GenoLigandTools/bin"),
             ]
         )
@@ -4996,7 +4994,7 @@ def prepare_downloads(
                         "sha256": "",
                         "release_identity": release_identity,
                         "trust_source": trust_source,
-                        "notes": "source_id_url_local_path_and_auditable_trust_required",
+                        "notes": "source_identity_and_domain_validation_required",
                     }
                 )
                 continue

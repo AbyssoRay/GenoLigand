@@ -18,7 +18,7 @@ INSTALLER_PATH = ROOT / "scripts/setup/install_complete_scientific.py"
 
 
 def load_installer_module():
-    spec = importlib.util.spec_from_file_location("installer_runtime_audit", INSTALLER_PATH)
+    spec = importlib.util.spec_from_file_location("installer_runtime_contracts", INSTALLER_PATH)
     if spec is None or spec.loader is None:
         raise RuntimeError("installer module could not be loaded")
     module = importlib.util.module_from_spec(spec)
@@ -26,7 +26,7 @@ def load_installer_module():
     return module
 
 
-class InstallerRuntimeAuditContracts(unittest.TestCase):
+class InstallerRuntimeContracts(unittest.TestCase):
     @classmethod
     def setUpClass(cls) -> None:
         cls.installer = load_installer_module()
@@ -337,7 +337,7 @@ class InstallerRuntimeAuditContracts(unittest.TestCase):
             installer, "worker_source_locks", return_value=[]
         ), mock.patch.object(installer.uuid, "uuid4", return_value=mock.Mock(hex="fixed")):
             result = installer.install_locked_sources_wsl(
-                "GenoLigandPhase08",
+                "GenoLigandTools",
                 "/home/test/.venv/bin/python",
                 "/home/test",
             )
@@ -403,8 +403,8 @@ class InstallerRuntimeAuditContracts(unittest.TestCase):
 
     def test_wsl_selection_probes_all_non_reserved_distributions(self) -> None:
         installer = self.installer
-        names = ["Ubuntu-24.04", "Debian", "GenoLigandPhase08"]
-        usable = {"Debian": True, "GenoLigandPhase08": True}
+        names = ["Ubuntu-24.04", "Debian", "GenoLigandTools"]
+        usable = {"Debian": True, "GenoLigandTools": True}
         probes: list[str] = []
 
         def capability_probe(name: str) -> bool:

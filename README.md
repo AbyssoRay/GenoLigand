@@ -35,7 +35,7 @@ GenoLigand 输出的是计算预测结果。报告应表达候选假设、证据
 
 ## 开发结构
 
-仓库职责边界见 [docs/architecture.md](docs/architecture.md)。Nextflow 只调度 `gls-cli`，Rust 拥有主流程、候选排序、证据链和报告语义，Python worker 只执行 schema 约束的科学计算 primitive。
+仓库职责见 [docs/architecture.md](docs/architecture.md)。Nextflow 调度 `gls-cli`，Rust 负责主流程、候选排序、证据链和报告语义，Python worker 执行 schema 约束的科学计算任务。
 
 常用开发检查：
 

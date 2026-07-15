@@ -123,18 +123,18 @@ fn worker_environment_uses_installed_launch_environment() {
 
 #[test]
 fn python_probe_script_arg_uses_wsl_path_for_wsl_wrapper() {
-    let script = PathBuf::from(r"D:\Project\rust\GenoLigand\work\probe.py");
+    let script = PathBuf::from(r"D:\workspace\GenoLigand\work\probe.py");
 
     assert_eq!(
         python_probe_script_arg(
             r"D:\runtime\python-worker-env\genoligand-wsl-python.cmd",
             &script
         ),
-        "/mnt/d/Project/rust/GenoLigand/work/probe.py"
+        "/mnt/d/workspace/GenoLigand/work/probe.py"
     );
     assert_eq!(
         python_probe_script_arg(r"D:\runtime\python-worker-env\python.cmd", &script),
-        r"D:\Project\rust\GenoLigand\work\probe.py"
+        r"D:\workspace\GenoLigand\work\probe.py"
     );
 }
 

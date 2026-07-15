@@ -23,7 +23,7 @@ GenoLigand 从用户输入的物质、序列或结构出发，计算相互作用
 ## 准备并启动
 
 ```powershell
-cd D:\Project\rust\GenoLigand
+Set-Location -LiteralPath 'C:\path\to\GenoLigand'
 python scripts\setup\install_complete_scientific.py --start-webui
 ```
 

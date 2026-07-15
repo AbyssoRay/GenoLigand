@@ -16,10 +16,10 @@ ROOT = Path(__file__).resolve().parents[2]
 FORBIDDEN_WORKSPACE_ROOTS = (
     "outputs",
     ".genoligand",
-    "acceptance_artifacts_phase_0_8_5_integrated_chain_rust_cleanup_strict",
 )
+FORBIDDEN_WORKSPACE_ROOT_PREFIXES = ("acceptance_artifacts",)
 WORKSPACE_GENERATED_DIRS = {"target", "work"}
-SKIPPED_WORKSPACE_TREES = {".git", ".codex", ".superpowers"}
+SKIPPED_WORKSPACE_TREES = {".git"}
 PATH_FIELDS = {
     "canonical",
     "db_path",
@@ -66,6 +66,9 @@ def workspace_issues(workspace_root: Path) -> set[Issue]:
     for name in FORBIDDEN_WORKSPACE_ROOTS:
         path = workspace_root / name
         if path.exists():
+            add_issue(issues, "workspace_generated_root", path)
+    for path in workspace_root.iterdir():
+        if path.is_dir() and path.name.casefold().startswith(FORBIDDEN_WORKSPACE_ROOT_PREFIXES):
             add_issue(issues, "workspace_generated_root", path)
 
     for current, directories, files in os.walk(workspace_root):
@@ -405,6 +408,7 @@ def self_test() -> int:
             raise AssertionError("clean fixture produced cleanup candidates")
 
         (workspace / "target").mkdir()
+        (workspace / "acceptance_artifacts-run").mkdir()
         (workspace / "pkg/work").mkdir(parents=True)
         (workspace / "pkg/__pycache__").mkdir(parents=True)
         (workspace / "C\uf03a/Users/fixture/run").mkdir(parents=True)

@@ -5600,9 +5600,8 @@ mod tests {
     }
 
     #[test]
-    fn audit_project_ids_are_uuids_and_drafts_are_visible() {
-        let root =
-            std::env::temp_dir().join(format!("genoligand-audit-project-id-{}", now_millis()));
+    fn project_ids_are_uuids_and_drafts_are_visible() {
+        let root = std::env::temp_dir().join(format!("genoligand-project-id-{}", now_millis()));
         let options = server_options(root.clone());
 
         let first = create_project_record(&options).expect("first project");
@@ -5636,13 +5635,12 @@ mod tests {
     }
 
     #[test]
-    fn audit_saved_inputs_are_reloadable_and_mark_input_ready() {
-        let root =
-            std::env::temp_dir().join(format!("genoligand-audit-input-ready-{}", now_millis()));
+    fn saved_inputs_are_reloadable_and_mark_input_ready() {
+        let root = std::env::temp_dir().join(format!("genoligand-input-ready-{}", now_millis()));
         let options = server_options(root.clone());
         let project = create_project_record(&options).expect("project");
         let project_id = project["project_id"].as_str().expect("project id");
-        let manifest = r#"{"inputs":[{"field":"project_name","value":"Audit project"},{"field":"small_molecule","value":"CCO"}],"files":[]}"#;
+        let manifest = r#"{"inputs":[{"field":"project_name","value":"Input reload project"},{"field":"small_molecule","value":"CCO"}],"files":[]}"#;
 
         let saved = write_input_manifest(&options, project_id, manifest);
         let (status, _, body) = route(
@@ -5710,9 +5708,8 @@ mod tests {
     }
 
     #[test]
-    fn audit_save_rejects_changes_while_run_is_active() {
-        let root =
-            std::env::temp_dir().join(format!("genoligand-audit-save-lock-{}", now_millis()));
+    fn save_rejects_changes_while_run_is_active() {
+        let root = std::env::temp_dir().join(format!("genoligand-save-lock-{}", now_millis()));
         let options = server_options(root.clone());
         let project_id = "project-save-lock";
         let project = project_dir(&options, project_id);
@@ -5744,8 +5741,8 @@ mod tests {
     }
 
     #[test]
-    fn audit_run_completion_uses_compare_and_set() {
-        let root = std::env::temp_dir().join(format!("genoligand-audit-run-cas-{}", now_millis()));
+    fn run_completion_uses_compare_and_set() {
+        let root = std::env::temp_dir().join(format!("genoligand-run-cas-{}", now_millis()));
         let run_dir = root.join("projects/project-1/runs/run-1");
         fs::create_dir_all(&run_dir).expect("run dir");
         fs::write(run_dir.join("run_state.txt"), "running\n").expect("running state");
@@ -5784,9 +5781,8 @@ mod tests {
     }
 
     #[test]
-    fn audit_running_process_streams_logs_and_cancel_stops_child() {
-        let root =
-            std::env::temp_dir().join(format!("genoligand-audit-stream-cancel-{}", now_millis()));
+    fn running_process_streams_logs_and_cancel_stops_child() {
+        let root = std::env::temp_dir().join(format!("genoligand-stream-cancel-{}", now_millis()));
         let options = server_options(root.clone());
         let project = project_dir(&options, "project-stream");
         let run_dir = project.join("runs").join("run-stream");
@@ -5823,11 +5819,9 @@ mod tests {
     }
 
     #[test]
-    fn audit_cancel_without_registered_child_fails_closed() {
-        let root = std::env::temp_dir().join(format!(
-            "genoligand-audit-cancel-missing-handle-{}",
-            now_millis()
-        ));
+    fn cancel_without_registered_child_fails_closed() {
+        let root =
+            std::env::temp_dir().join(format!("genoligand-cancel-missing-handle-{}", now_millis()));
         let options = server_options(root.clone());
         let run_dir = project_dir(&options, "project-missing-handle")
             .join("runs")
@@ -5846,9 +5840,8 @@ mod tests {
     }
 
     #[test]
-    fn audit_run_logs_are_bounded_on_disk_and_in_api() {
-        let root =
-            std::env::temp_dir().join(format!("genoligand-audit-bounded-log-{}", now_millis()));
+    fn run_logs_are_bounded_on_disk_and_in_api() {
+        let root = std::env::temp_dir().join(format!("genoligand-bounded-log-{}", now_millis()));
         let options = server_options(root.clone());
         let run_dir = project_dir(&options, "project-log")
             .join("runs")
@@ -5878,9 +5871,8 @@ mod tests {
     }
 
     #[test]
-    fn audit_delete_stops_registered_process_before_removing_project() {
-        let root =
-            std::env::temp_dir().join(format!("genoligand-audit-delete-run-{}", now_millis()));
+    fn delete_stops_registered_process_before_removing_project() {
+        let root = std::env::temp_dir().join(format!("genoligand-delete-run-{}", now_millis()));
         let options = server_options(root.clone());
         let project_id = "project-delete-run";
         let project = project_dir(&options, project_id);
@@ -5904,9 +5896,8 @@ mod tests {
     }
 
     #[test]
-    fn audit_duplicate_historical_run_ids_fail_closed() {
-        let root =
-            std::env::temp_dir().join(format!("genoligand-audit-run-lookup-{}", now_millis()));
+    fn duplicate_historical_run_ids_fail_closed() {
+        let root = std::env::temp_dir().join(format!("genoligand-run-lookup-{}", now_millis()));
         let options = server_options(root.clone());
         for project_id in ["project-a", "project-b"] {
             let run_dir = project_dir(&options, project_id)
@@ -5942,10 +5933,8 @@ mod tests {
     where
         F: FnOnce(&Path),
     {
-        let root = std::env::temp_dir().join(format!(
-            "genoligand-audit-authenticity-{label}-{}",
-            now_millis()
-        ));
+        let root =
+            std::env::temp_dir().join(format!("genoligand-authenticity-{label}-{}", now_millis()));
         let options = server_options(root.clone());
         let run_id = format!("run-{label}");
         let run_dir = project_dir(&options, &format!("project-{label}"))
@@ -5992,19 +5981,19 @@ mod tests {
     }
 
     #[test]
-    fn audit_authenticity_gate_missing_fails_closed() {
+    fn authenticity_gate_missing_fails_closed() {
         assert_authenticity_gate_denies_results("missing", |_| {});
     }
 
     #[test]
-    fn audit_authenticity_gate_read_failure_fails_closed() {
+    fn authenticity_gate_read_failure_fails_closed() {
         assert_authenticity_gate_denies_results("unreadable", |gate| {
             fs::create_dir(gate).expect("unreadable gate path");
         });
     }
 
     #[test]
-    fn audit_authenticity_gate_non_allowed_status_fails_closed() {
+    fn authenticity_gate_non_allowed_status_fails_closed() {
         assert_authenticity_gate_denies_results("not-allowed", |gate| {
             fs::write(
                 gate,
@@ -6015,11 +6004,9 @@ mod tests {
     }
 
     #[test]
-    fn audit_authenticity_gate_passed_allows_results() {
-        let root = std::env::temp_dir().join(format!(
-            "genoligand-audit-authenticity-passed-{}",
-            now_millis()
-        ));
+    fn authenticity_gate_passed_allows_results() {
+        let root =
+            std::env::temp_dir().join(format!("genoligand-authenticity-passed-{}", now_millis()));
         let options = server_options(root.clone());
         let run_dir = project_dir(&options, "project-passed")
             .join("runs")
@@ -6048,9 +6035,9 @@ mod tests {
     }
 
     #[test]
-    fn audit_setup_progress_reconciles_historical_ready_with_live_status() {
+    fn setup_progress_reconciles_historical_ready_with_live_status() {
         let root =
-            std::env::temp_dir().join(format!("genoligand-audit-setup-reconcile-{}", now_millis()));
+            std::env::temp_dir().join(format!("genoligand-setup-reconcile-{}", now_millis()));
         let options = server_options(root.clone());
         let store = science_store_path(&options);
         fs::create_dir_all(&store).expect("store");

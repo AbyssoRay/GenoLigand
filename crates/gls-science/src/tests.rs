@@ -292,19 +292,19 @@ fn wsl_python_wrapper_uses_wsl_paths_for_worker_inputs() {
         return;
     }
     let candidate = vec![r"C:\Users\tester\genoligand-wsl-python.cmd".to_string()];
-    let python_root = PathBuf::from(r"D:\Project\rust\GenoLigand\python");
-    let job = r"D:\user\codex\run\worker_job.json";
+    let python_root = PathBuf::from(r"D:\workspace\GenoLigand\python");
+    let job = r"D:\workspace\GenoLigand\run\worker_job.json";
 
     let pythonpath =
         worker_pythonpath_env_from_paths(&candidate, vec![python_root]).expect("pythonpath");
 
     assert_eq!(
         pythonpath.to_string_lossy(),
-        "/mnt/d/Project/rust/GenoLigand/python"
+        "/mnt/d/workspace/GenoLigand/python"
     );
     assert_eq!(
         python_script_arg(&candidate, job),
-        "/mnt/d/user/codex/run/worker_job.json"
+        "/mnt/d/workspace/GenoLigand/run/worker_job.json"
     );
     assert!(
         wsl_env_with_pythonpath()

@@ -2,10 +2,6 @@
   return filledInputs().length > 0;
 }
 
-function hasUsableInput() {
-  return usableInputs().length > 0;
-}
-
 function inputsReadyToSave() {
   const filled = filledInputs();
   return (
@@ -135,16 +131,6 @@ function sourceReady(key) {
   if (key === "tools") return required.some((row) => row.id === "tools" && row.ready);
   if (key === "structure") return sourceReady("structure_index") && sourceReady("tools");
   return false;
-}
-
-function storeStatusRows() {
-  const required = state.databases?.required || [];
-  if (!required.length) return `<div class="empty">尚未读取到科学仓库状态。</div>`;
-  return required
-    .map((row) =>
-      metricRow(row.label || friendlyRequirement(row.id), row.ready ? "就绪" : "需要安装或修复")
-    )
-    .join("");
 }
 
 function preflightGroups() {

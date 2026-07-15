@@ -25,7 +25,7 @@ python scripts\setup\install_complete_scientific.py
 ## 启动 WebUI
 
 ```powershell
-cd D:\Project\rust\GenoLigand
+Set-Location -LiteralPath 'C:\path\to\GenoLigand'
 python scripts\setup\install_complete_scientific.py --start-webui
 ```
 

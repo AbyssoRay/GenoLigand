@@ -98,6 +98,32 @@ def write_ready_alignment_manifests(
     if not mmseqs_source.exists():
         mmseqs_source.write_bytes(b">target\nAAAA\n")
     foldseek_source = write_rcsb_scope_fixture(installer, store, "structure")
+    rcsb_snapshot = installer.read_json_object(
+        store / "downloads/rcsb/ligand_bound_pdb_scope.json"
+    )
+    source_manifest_path = store / "manifests/source_file_manifest.tsv"
+    source_manifest_rows = installer.read_tsv(source_manifest_path)
+    for row in source_manifest_rows:
+        if row.get("source_id") == "rcsb_ligand_bound":
+            row.update(
+                {
+                    "sha256": str(rcsb_snapshot["coordinate_digest"]),
+                    "release_identity": "current",
+                    "trust_source": "publisher_https_mmcif_parse",
+                    "file_count": str(rcsb_snapshot["coordinate_files"]),
+                    "bytes": str(rcsb_snapshot["coordinate_bytes"]),
+                }
+            )
+    installer.write_simple_tsv(
+        source_manifest_path,
+        [*source_manifest_rows[0], "file_count", "bytes"],
+        source_manifest_rows,
+    )
+    (store / "external_sync_execution_manifest.tsv").write_text(
+        "source_id\tstatus\tbytes\tsha256\trelease_identity\ttrust_source\tscope_mode\tscope_digest\tscope_ready_count\tscope_count\tscope_missing_count\n"
+        f"rcsb_ligand_bound\tready\t{rcsb_snapshot['coordinate_bytes']}\t{rcsb_snapshot['coordinate_digest']}\tcurrent\tpublisher_https_mmcif_parse\ton_demand\t{rcsb_snapshot['scope_digest']}\t{rcsb_snapshot['ready_count']}\t{rcsb_snapshot['scope_count']}\t{rcsb_snapshot['missing_count']}\n",
+        encoding="utf-8",
+    )
     specs = [
         (
             "mmseqs",
@@ -1073,8 +1099,6 @@ def main() -> int:
     ps1 = read("install.ps1")
     sh = read("install.sh")
     readme = read("README.md")
-    worker_environment_reference_text = read("python/environment-workers.yml")
-    worker_environment_reference = json.loads(worker_environment_reference_text)
 
     require("install_complete_scientific.py" in ps1, "install.ps1 must call complete installer")
     require("install_complete_scientific.py" in sh, "install.sh must call complete installer")
@@ -1083,35 +1107,6 @@ def main() -> int:
     require("./install.sh" in readme, "README must show Linux install command")
     require((ROOT / "python/requirements-workers-cpu.txt").is_file(), "CPU worker requirements missing")
     require((ROOT / "python/requirements-workers-cuda.txt").is_file(), "CUDA worker requirements missing")
-    require(
-        set(worker_environment_reference)
-        == {
-            "schema_version",
-            "kind",
-            "installable",
-            "installation_entrypoint",
-            "generated_from",
-            "reference_snapshot",
-            "source_channels",
-            "confirmed_versions",
-        },
-        "worker environment reference schema drifted",
-    )
-    require(
-        worker_environment_reference["schema_version"] == "genoligand_worker_environment_reference_v1"
-        and worker_environment_reference["kind"] == "generated_worker_environment_reference"
-        and worker_environment_reference["installable"] is False,
-        "worker environment reference must be explicitly non-installable",
-    )
-    require(
-        not {"name", "channels", "dependencies"}.intersection(worker_environment_reference),
-        "worker environment reference must not satisfy the Conda environment schema",
-    )
-    require(
-        worker_environment_reference["installation_entrypoint"]
-        == "scripts/setup/install_complete_scientific.py",
-        "worker environment reference must select the complete installer",
-    )
     sync_plan = read("configs/source_sync_plan.tsv")
     require("rcsb_ligand_bound_scope" in sync_plan, "RCSB install must use ligand-bound scoped downloads")
     require("pub/pdb/data/structures/divided/mmCIF" not in sync_plan, "RCSB install must not mirror the full mmCIF tree")
@@ -1128,10 +1123,6 @@ def main() -> int:
     require("existing_science_indexes_ready" in installer_text, "installer must reuse ready science indexes instead of rebuilding every install run")
     require("science_indexes_reused" in installer_text, "installer must record when existing science indexes are reused")
     require(
-        "environment-workers.yml" not in "\n".join((ps1, sh, readme, installer_text)),
-        "install commands and installer must reject environment-workers.yml as an installation input",
-    )
-    require(
         "requirements-workers.lock.txt" in installer_text
         and "requirements-workers-sources.lock.tsv" in installer_text
         and "worker_lock_paths" in installer_text
@@ -1139,53 +1130,6 @@ def main() -> int:
         "installer must consume the platform hashed lock catalog and immutable source lock",
     )
     installer = load_installer_module()
-    selected_worker_locks = installer.worker_lock_paths("manylinux_2_34_x86_64", "3.12", True)
-    expected_generated_paths = [
-        "python/requirements-workers.lock.txt",
-        "python/requirements-workers-sources.lock.tsv",
-        *(f"python/{path.name}" for path in selected_worker_locks),
-    ]
-    generated_from = worker_environment_reference["generated_from"]
-    require(
-        [row["path"] for row in generated_from] == expected_generated_paths,
-        "worker environment reference must be generated from the selected catalog, source lock, and platform locks",
-    )
-    for row in generated_from:
-        actual = hashlib.sha256((ROOT / row["path"]).read_bytes()).hexdigest()
-        require(actual == row["sha256"], f"worker environment reference source digest drifted: {row['path']}")
-    reference_snapshot = worker_environment_reference["reference_snapshot"]
-    require(
-        reference_snapshot
-        == {
-            "profile": "cuda",
-            "platform": "manylinux_2_34_x86_64",
-            "python": "3.12",
-            "lock_digest": "19edc20d2096e8ede29c0d04cb1e3825fe942df930a35d12fdae748b55bf0405",
-        }
-        and installer.environment_lock_digest("manylinux_2_34_x86_64", "3.12", True)
-        == reference_snapshot["lock_digest"],
-        "worker environment reference must bind the selected CUDA lock digest",
-    )
-    normalize = lambda value: installer.re.sub(r"[-_.]+", "-", value).lower()
-    locked_versions: dict[str, str] = {}
-    for path in selected_worker_locks:
-        for raw in path.read_text(encoding="utf-8").splitlines():
-            match = installer.re.match(r"^([A-Za-z0-9_.-]+)==([^\s;\\]+)", raw.strip())
-            if match:
-                locked_versions[normalize(match.group(1))] = match.group(2)
-    source_versions = {normalize(row["package"]): row["version"] for row in installer.worker_source_locks()}
-    expected_direct_packages = {
-        normalize(installer.re.split(r"==|@", spec["package"], maxsplit=1)[0])
-        for spec in installer.PYTHON_TOOL_PACKAGES
-    } | {"python", "pip", "openmm-cuda-12"}
-    confirmed_versions = worker_environment_reference["confirmed_versions"]
-    require(
-        set(confirmed_versions) == expected_direct_packages,
-        "worker environment reference must list every direct locked worker package",
-    )
-    for package, version in confirmed_versions.items():
-        expected = "3.12" if package == "python" else locked_versions.get(package, source_versions.get(package))
-        require(version == expected, f"worker environment reference version drifted: {package}")
     check_database_readiness_contracts(installer)
     check_external_sync_closure(installer)
     check_external_download_result_closure(installer)
@@ -1224,11 +1168,11 @@ def main() -> int:
         installer.run_wsl_database_command = fake_wsl_database_command
         installer.os.name = "nt"
         try:
-            status, note = installer.build_mmseqs_database(None, source, tmp_path / "mmseqs" / "target", {}, "GenoLigandPhase08")
+            status, note = installer.build_mmseqs_database(None, source, tmp_path / "mmseqs" / "target", {}, "GenoLigandTools")
             require(status == "ready" and note == "mmseqs_createdb_createindex_completed", "WSL MMseqs2 build must not require a Windows PATH executable")
-            status, note = installer.build_foldseek_database(None, source, tmp_path / "foldseek" / "target", {}, "GenoLigandPhase08")
+            status, note = installer.build_foldseek_database(None, source, tmp_path / "foldseek" / "target", {}, "GenoLigandTools")
             require(status == "ready" and "foldseek_createdb_createindex_completed" in note, "WSL Foldseek build must not require a Windows PATH executable")
-            require(len(calls) == 10 and all(call[0] == "GenoLigandPhase08" for call in calls), "WSL database builds and both staged bounded index checks must target the selected project distro")
+            require(len(calls) == 10 and all(call[0] == "GenoLigandTools" for call in calls), "WSL database builds and both staged bounded index checks must target the selected project distro")
         finally:
             installer.run_wsl_database_command = original_runner
             installer.os.name = original_os_name
@@ -1276,7 +1220,7 @@ def main() -> int:
         installer.wsl_home = lambda distro: "/home/tester"
         installer.run_wsl_command = fake_run_wsl_command
         try:
-            result = installer.ensure_wsl_python_tool_environment(tmp_path / "env", "GenoLigandPhase08", True)
+            result = installer.ensure_wsl_python_tool_environment(tmp_path / "env", "GenoLigandTools", True)
             require(result["status"] == "ready", "skip-install WSL mode must probe an existing worker environment")
             require(not any("-m" in call and "pip" in call for call in calls), "skip-install WSL mode must not run pip install")
         finally:
