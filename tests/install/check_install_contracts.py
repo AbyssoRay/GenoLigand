@@ -7,10 +7,11 @@ import importlib.util
 import inspect
 import json
 import os
+import sqlite3
 import sys
 import tempfile
 import threading
-from contextlib import contextmanager
+from contextlib import closing, contextmanager
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -57,13 +58,33 @@ def write_database_fixture(prefix: Path, *, empty_dbtype: bool = False, with_ind
         write_database_index_fixture(prefix)
 
 
+def write_foldseek_database_fixture(prefix: Path, *, with_index: bool = True) -> None:
+    prefix.parent.mkdir(parents=True, exist_ok=True)
+    prefix.write_bytes(b"database-payload")
+    Path(f"{prefix}.dbtype").write_bytes(b"\x00\x00\x00\x00")
+    Path(f"{prefix}.index").write_text("0\t0\t8\n1\t8\t8\n", encoding="ascii")
+    Path(f"{prefix}.lookup").write_text(
+        "0\t1abc_A\t0\n1\t1abc_B\t0\n",
+        encoding="ascii",
+    )
+    Path(f"{prefix}.source").write_text("0\t1abc_MODEL_1\n", encoding="ascii")
+    if with_index:
+        write_database_index_fixture(prefix)
+
+
 def write_rcsb_scope_fixture(installer, store: Path, payload: str) -> Path:
     root = store / "downloads/rcsb/mmcif"
     coordinate = root / "ab/1abc.cif.gz"
     coordinate.parent.mkdir(parents=True, exist_ok=True)
     with gzip.open(coordinate, "wt", encoding="utf-8") as handle:
-        handle.write(f"data_1abc\n_entry.id 1ABC\n#\n{payload}\n")
-    installer.write_rcsb_scope_manifest(store, root, {"1ABC"})
+        handle.write(
+            "data_1abc\n_entry.id 1ABC\nloop_\n"
+            "_atom_site.group_PDB\n_atom_site.Cartn_x\n_atom_site.Cartn_y\n_atom_site.Cartn_z\n"
+            f"ATOM 1.0 2.0 3.0\n#\n{payload}\n"
+        )
+    (store / "downloads/rcsb/ligand_bound_pdb_ids.txt").write_text("1ABC\n", encoding="utf-8")
+    snapshot = installer.write_rcsb_scope_manifest(store, root, {"1ABC"})
+    installer.write_rcsb_on_demand_policy(store, snapshot)
     return root
 
 
@@ -131,6 +152,37 @@ def write_ready_store_contract(installer, store: Path) -> None:
     (manifest_dir / "source_file_manifest.tsv").write_text(
         "source_id\tstatus\tsha256\trelease_identity\ttrust_source\n" + source_manifest_rows + "\n",
         encoding="utf-8",
+    )
+    chembl_database = store / "downloads/chembl/chembl_query.sqlite"
+    chembl_database.parent.mkdir(parents=True, exist_ok=True)
+    with closing(sqlite3.connect(chembl_database)) as connection:
+        connection.executescript(
+            """
+            CREATE TABLE genoligand_onsite_activity (
+                canonical_isomeric_smiles TEXT, target_id TEXT, source_target_id TEXT,
+                target_name TEXT, organism TEXT, compound_name TEXT, standard_type TEXT,
+                standard_relation TEXT, standard_value REAL, standard_units TEXT,
+                source_release TEXT, source_digest TEXT
+            );
+            INSERT INTO genoligand_onsite_activity VALUES
+                ('CCO', 'P12345', 'CHEMBL_T1', 'Target', 'Homo sapiens', 'Compound',
+                 'IC50', '=', 1.0, 'nM', 'fixture-release', 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa');
+            CREATE INDEX idx_genoligand_onsite_activity_smiles
+                ON genoligand_onsite_activity(canonical_isomeric_smiles);
+            """
+        )
+    installer.write_json_atomic(
+        chembl_database.with_suffix(".manifest.json"),
+        {
+            "schema_version": "genoligand_chembl_query_database_v1",
+            "status": "ready",
+            "source_digest": "a" * 64,
+            "source_release": "fixture-release",
+            "table": "genoligand_onsite_activity",
+            "rows": 1,
+            "database_bytes": chembl_database.stat().st_size,
+            "database_sha256": installer.sha256_file(chembl_database),
+        },
     )
     for rel in [
         "indexes/known_targets.tsv",
@@ -464,7 +516,10 @@ def check_external_download_result_closure(installer) -> None:
             rcsb_target.mkdir()
             (rcsb_target / "old.cif.gz").write_bytes(b"old")
             rcsb = installer.sync_rcsb_ligand_bound_scope(
-                {"source_url": "https://fixture/{pdb_id}.cif.gz"}, rcsb_target, root
+                {"source_url": "https://fixture/{pdb_id}.cif.gz"},
+                rcsb_target,
+                root,
+                rcsb_mode="complete",
             )
         finally:
             installer.extract_html_links = original_extract
@@ -512,7 +567,10 @@ def check_alignment_source_digest_rebuild(installer, tool: str) -> None:
         def fake_run_command(command, env=None):
             calls.append(command)
             if command[1] == "createdb":
-                write_database_fixture(Path(command[3]), with_index=False)
+                if tool == "foldseek":
+                    write_foldseek_database_fixture(Path(command[3]), with_index=False)
+                else:
+                    write_database_fixture(Path(command[3]), with_index=False)
             elif command[1] == "createindex":
                 write_database_index_fixture(Path(command[2]))
             stdout = "test-builder-1\n" if command[1] == "version" else ""
@@ -701,6 +759,9 @@ def check_resource_summary_cache(installer) -> None:
             return original_hash(path, progress)
 
         installer.sha256_file_with_progress = counted_hash
+        token = "fixture-change-token-v1"
+        original_change_token = installer.file_change_token
+        installer.file_change_token = lambda _path, _stat: token
         try:
             source_token = installer.file_change_token(source, source.stat())
             first = installer.resource_payload_summary(source, cache=cache)
@@ -710,12 +771,14 @@ def check_resource_summary_cache(installer) -> None:
             original_stat = source.stat()
             source.write_bytes(b"other-content")
             os.utime(source, ns=(original_stat.st_atime_ns, original_stat.st_mtime_ns))
+            token = "fixture-change-token-v2"
             changed_token = installer.file_change_token(source, source.stat())
             if source_token:
                 require(changed_token and changed_token != source_token, "source change token must detect restored-mtime writes")
             changed = installer.resource_payload_summary(source, cache=cache)
         finally:
             installer.sha256_file_with_progress = original_hash
+            installer.file_change_token = original_change_token
         expected_calls += 1
         require(
             changed["sha256"] != first["sha256"] and calls == expected_calls,
@@ -728,6 +791,9 @@ def check_resource_summary_cache(installer) -> None:
         for index, path in enumerate(files):
             path.write_bytes(f"content-{index}".encode("ascii"))
         installer.sha256_file_with_progress = counted_hash
+        directory_token_versions = {str(path): "fixture-directory-token-v1" for path in files}
+        original_change_token = installer.file_change_token
+        installer.file_change_token = lambda path, _stat: directory_token_versions[str(path)]
         try:
             directory_start_calls = calls
             directory_tokens = [installer.file_change_token(path, path.stat()) for path in files]
@@ -742,6 +808,7 @@ def check_resource_summary_cache(installer) -> None:
             original_stat = files[1].stat()
             files[1].write_bytes(b"changed-1")
             os.utime(files[1], ns=(original_stat.st_atime_ns, original_stat.st_mtime_ns))
+            directory_token_versions[str(files[1])] = "fixture-directory-token-v2"
             changed_directory_token = installer.file_change_token(files[1], files[1].stat())
             if directory_cacheable:
                 require(
@@ -751,6 +818,7 @@ def check_resource_summary_cache(installer) -> None:
             changed_directory = installer.resource_payload_summary(directory, cache=cache)
         finally:
             installer.sha256_file_with_progress = original_hash
+            installer.file_change_token = original_change_token
         expected_directory_calls += 1
         require(
             changed_directory["sha256"] != first_directory["sha256"] and calls == expected_directory_calls,
@@ -1005,6 +1073,8 @@ def main() -> int:
     ps1 = read("install.ps1")
     sh = read("install.sh")
     readme = read("README.md")
+    worker_environment_reference_text = read("python/environment-workers.yml")
+    worker_environment_reference = json.loads(worker_environment_reference_text)
 
     require("install_complete_scientific.py" in ps1, "install.ps1 must call complete installer")
     require("install_complete_scientific.py" in sh, "install.sh must call complete installer")
@@ -1013,7 +1083,35 @@ def main() -> int:
     require("./install.sh" in readme, "README must show Linux install command")
     require((ROOT / "python/requirements-workers-cpu.txt").is_file(), "CPU worker requirements missing")
     require((ROOT / "python/requirements-workers-cuda.txt").is_file(), "CUDA worker requirements missing")
-    require((ROOT / "python/environment-workers.yml").is_file(), "worker conda environment missing")
+    require(
+        set(worker_environment_reference)
+        == {
+            "schema_version",
+            "kind",
+            "installable",
+            "installation_entrypoint",
+            "generated_from",
+            "reference_snapshot",
+            "source_channels",
+            "confirmed_versions",
+        },
+        "worker environment reference schema drifted",
+    )
+    require(
+        worker_environment_reference["schema_version"] == "genoligand_worker_environment_reference_v1"
+        and worker_environment_reference["kind"] == "generated_worker_environment_reference"
+        and worker_environment_reference["installable"] is False,
+        "worker environment reference must be explicitly non-installable",
+    )
+    require(
+        not {"name", "channels", "dependencies"}.intersection(worker_environment_reference),
+        "worker environment reference must not satisfy the Conda environment schema",
+    )
+    require(
+        worker_environment_reference["installation_entrypoint"]
+        == "scripts/setup/install_complete_scientific.py",
+        "worker environment reference must select the complete installer",
+    )
     sync_plan = read("configs/source_sync_plan.tsv")
     require("rcsb_ligand_bound_scope" in sync_plan, "RCSB install must use ligand-bound scoped downloads")
     require("pub/pdb/data/structures/divided/mmCIF" not in sync_plan, "RCSB install must not mirror the full mmCIF tree")
@@ -1029,7 +1127,65 @@ def main() -> int:
     require("getattr(xmltodict, '__version__', 'installed')" in installer_text, "xmltodict probe must not require a __version__ attribute")
     require("existing_science_indexes_ready" in installer_text, "installer must reuse ready science indexes instead of rebuilding every install run")
     require("science_indexes_reused" in installer_text, "installer must record when existing science indexes are reused")
+    require(
+        "environment-workers.yml" not in "\n".join((ps1, sh, readme, installer_text)),
+        "install commands and installer must reject environment-workers.yml as an installation input",
+    )
+    require(
+        "requirements-workers.lock.txt" in installer_text
+        and "requirements-workers-sources.lock.tsv" in installer_text
+        and "worker_lock_paths" in installer_text
+        and "--require-hashes" in installer_text,
+        "installer must consume the platform hashed lock catalog and immutable source lock",
+    )
     installer = load_installer_module()
+    selected_worker_locks = installer.worker_lock_paths("manylinux_2_34_x86_64", "3.12", True)
+    expected_generated_paths = [
+        "python/requirements-workers.lock.txt",
+        "python/requirements-workers-sources.lock.tsv",
+        *(f"python/{path.name}" for path in selected_worker_locks),
+    ]
+    generated_from = worker_environment_reference["generated_from"]
+    require(
+        [row["path"] for row in generated_from] == expected_generated_paths,
+        "worker environment reference must be generated from the selected catalog, source lock, and platform locks",
+    )
+    for row in generated_from:
+        actual = hashlib.sha256((ROOT / row["path"]).read_bytes()).hexdigest()
+        require(actual == row["sha256"], f"worker environment reference source digest drifted: {row['path']}")
+    reference_snapshot = worker_environment_reference["reference_snapshot"]
+    require(
+        reference_snapshot
+        == {
+            "profile": "cuda",
+            "platform": "manylinux_2_34_x86_64",
+            "python": "3.12",
+            "lock_digest": "19edc20d2096e8ede29c0d04cb1e3825fe942df930a35d12fdae748b55bf0405",
+        }
+        and installer.environment_lock_digest("manylinux_2_34_x86_64", "3.12", True)
+        == reference_snapshot["lock_digest"],
+        "worker environment reference must bind the selected CUDA lock digest",
+    )
+    normalize = lambda value: installer.re.sub(r"[-_.]+", "-", value).lower()
+    locked_versions: dict[str, str] = {}
+    for path in selected_worker_locks:
+        for raw in path.read_text(encoding="utf-8").splitlines():
+            match = installer.re.match(r"^([A-Za-z0-9_.-]+)==([^\s;\\]+)", raw.strip())
+            if match:
+                locked_versions[normalize(match.group(1))] = match.group(2)
+    source_versions = {normalize(row["package"]): row["version"] for row in installer.worker_source_locks()}
+    expected_direct_packages = {
+        normalize(installer.re.split(r"==|@", spec["package"], maxsplit=1)[0])
+        for spec in installer.PYTHON_TOOL_PACKAGES
+    } | {"python", "pip", "openmm-cuda-12"}
+    confirmed_versions = worker_environment_reference["confirmed_versions"]
+    require(
+        set(confirmed_versions) == expected_direct_packages,
+        "worker environment reference must list every direct locked worker package",
+    )
+    for package, version in confirmed_versions.items():
+        expected = "3.12" if package == "python" else locked_versions.get(package, source_versions.get(package))
+        require(version == expected, f"worker environment reference version drifted: {package}")
     check_database_readiness_contracts(installer)
     check_external_sync_closure(installer)
     check_external_download_result_closure(installer)
@@ -1053,12 +1209,16 @@ def main() -> int:
         original_runner = installer.run_wsl_database_command
         original_os_name = installer.os.name
 
+        def native_path(value: str) -> Path:
+            match = installer.re.fullmatch(r"/mnt/([a-zA-Z])/(.*)", value)
+            return Path(f"{match.group(1).upper()}:/{match.group(2)}") if match else Path(value)
+
         def fake_wsl_database_command(distro, command):
             calls.append((distro, command))
             if command[1] == "createdb":
-                write_database_fixture(tmp_path / command[0] / "target", with_index=False)
+                write_database_fixture(native_path(command[3]), with_index=False)
             elif command[1] == "createindex":
-                write_database_index_fixture(tmp_path / command[0] / "target")
+                write_database_index_fixture(native_path(command[2]))
             return installer.subprocess.CompletedProcess(command, 0, "", "")
 
         installer.run_wsl_database_command = fake_wsl_database_command
@@ -1067,8 +1227,8 @@ def main() -> int:
             status, note = installer.build_mmseqs_database(None, source, tmp_path / "mmseqs" / "target", {}, "GenoLigandPhase08")
             require(status == "ready" and note == "mmseqs_createdb_createindex_completed", "WSL MMseqs2 build must not require a Windows PATH executable")
             status, note = installer.build_foldseek_database(None, source, tmp_path / "foldseek" / "target", {}, "GenoLigandPhase08")
-            require(status == "ready" and note == "foldseek_createdb_createindex_completed", "WSL Foldseek build must not require a Windows PATH executable")
-            require(len(calls) == 8 and all(call[0] == "GenoLigandPhase08" for call in calls), "WSL database builds and bounded index checks must target the selected project distro")
+            require(status == "ready" and "foldseek_createdb_createindex_completed" in note, "WSL Foldseek build must not require a Windows PATH executable")
+            require(len(calls) == 10 and all(call[0] == "GenoLigandPhase08" for call in calls), "WSL database builds and both staged bounded index checks must target the selected project distro")
         finally:
             installer.run_wsl_database_command = original_runner
             installer.os.name = original_os_name

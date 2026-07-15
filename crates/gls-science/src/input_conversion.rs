@@ -141,7 +141,7 @@ pub(super) fn convert_inputs_from_manifest(
 ) -> Result<Vec<ConvertedInput>, String> {
     let mut conversions = Vec::new();
     for_each_converted_input(options, |conversion| {
-        conversions.push(conversion.clone());
+        conversions.push(conversion);
         Ok(())
     })?;
     Ok(conversions)
@@ -152,22 +152,22 @@ pub(super) fn for_each_converted_input<F>(
     mut emit: F,
 ) -> Result<(), String>
 where
-    F: FnMut(&ConvertedInput) -> Result<(), String>,
+    F: FnMut(ConvertedInput) -> Result<(), String>,
 {
     let raw_inputs = extract_raw_inputs(&options.input_manifest)?;
     for raw in &raw_inputs {
         if let Some(reason) = raw.validation_error {
-            emit(&failed_manifest_input(raw, reason))?;
+            emit(failed_manifest_input(raw, reason))?;
             continue;
         }
         if let Err(reason) = for_each_resolved_input(raw, options, |record| {
-            emit(&convert_resolved_input(&record, options))
+            emit(convert_resolved_input(&record, options))
                 .map_err(|err| format!("input_conversion_emit_failed:{err}"))
         }) {
             if let Some(err) = reason.strip_prefix("input_conversion_emit_failed:") {
                 return Err(err.to_string());
             }
-            emit(&failed_resolution(raw, &reason))?;
+            emit(failed_resolution(raw, &reason))?;
         }
     }
     Ok(())

@@ -207,6 +207,7 @@ def run_mmseqs_alignment(run_dir: Path, science_store: Path) -> WorkerExecution:
                 "-a",
                 "--search-type",
                 batch.search_type,
+                *mmseqs_prefilter_options(target),
                 "--threads",
                 os.environ.get("GENOLIGAND_ALIGNMENT_THREADS", "1"),
             ]
@@ -309,6 +310,7 @@ def run_foldseek_alignment(run_dir: Path, science_store: Path) -> WorkerExecutio
     query_db = out_dir / "foldseek_query_db"
     timeout = int(os.environ.get("GENOLIGAND_ALIGNMENT_TIMEOUT_SECONDS", "900"))
     run_command([foldseek, "createdb", str(query.path), str(query_db)], timeout, "foldseek_createdb")
+    native_query_names = foldseek_lookup_names(query_db)
     rows: list[str] = []
     outcomes: list[WorkerOutcome] = []
     for index, target in enumerate(targets, start=1):
@@ -346,7 +348,13 @@ def run_foldseek_alignment(run_dir: Path, science_store: Path) -> WorkerExecutio
             reason = safe_note(first_line(completed.stderr or completed.stdout)) or "foldseek_convertalis_failed"
             outcomes.append(WorkerOutcome("failed", reason, True, target.database_id, 0))
             continue
-        target_rows = foldseek_rows(raw, target, query, foldseek_version)
+        target_rows = foldseek_rows(
+            raw,
+            target,
+            query,
+            foldseek_version,
+            native_query_names,
+        )
         rows.extend(target_rows)
         outcomes.append(
             WorkerOutcome("completed", "search_completed", True, target.database_id, len(target_rows))
@@ -699,6 +707,12 @@ def mmseqs_database_ready(prefix: Path) -> bool:
         return False
 
 
+def mmseqs_prefilter_options(target: TargetDatabase) -> list[str]:
+    if target.source_class == "metagenome":
+        return ["--prefilter-mode", "1"]
+    return []
+
+
 def write_fasta(path: Path, rows: list[SequenceInput]) -> None:
     text = "".join(
         f">{record.query_id}\n{record.sequence}\n"
@@ -819,6 +833,7 @@ def foldseek_rows(
     target_database: FoldseekTargetDatabase,
     query_identity: StructureQuery,
     foldseek_version: str,
+    native_query_names: set[str],
 ) -> list[str]:
     if not path.exists():
         return []
@@ -829,7 +844,7 @@ def foldseek_rows(
             if len(cols) < 6:
                 raise ValueError("foldseek_alignment_row_invalid")
             query, target, pident, tm_score, evalue, bits = cols[:6]
-            if query != query_identity.query_id:
+            if query not in native_query_names:
                 raise ValueError(f"foldseek_query_identity_mismatch:{safe_note(query)}")
             try:
                 identity_value = float(pident)
@@ -868,25 +883,33 @@ def foldseek_rows(
     return rows
 
 
+def foldseek_lookup_names(database: Path) -> set[str]:
+    lookup = next(
+        (
+            candidate
+            for candidate in (Path(f"{database}.lookup"), Path(f"{database}.source"))
+            if candidate.is_file() and candidate.stat().st_size > 0
+        ),
+        None,
+    )
+    if lookup is None:
+        raise ValueError("foldseek_query_lookup_missing")
+    names: set[str] = set()
+    with lookup.open("r", encoding="utf-8", errors="strict") as handle:
+        for line in handle:
+            columns = line.rstrip("\r\n").split("\t")
+            if len(columns) < 2 or not columns[0].isdigit() or not columns[1].strip():
+                raise ValueError("foldseek_query_lookup_invalid")
+            names.add(columns[1].strip())
+    if not names:
+        raise ValueError("foldseek_query_lookup_missing")
+    return names
+
+
 def structure_query(run_dir: Path) -> StructureQuery | None:
-    query_path = None
-    for rel in [
-        "structure_viewer.cif",
-        "structure_viewer.mmcif",
-        "structure_viewer.pdb",
-        "tool_outputs/structure_viewer.cif",
-        "tool_outputs/structure_viewer.mmcif",
-        "tool_outputs/structure_viewer.pdb",
-    ]:
-        path = run_dir / rel
-        if path.exists() and path.stat().st_size > 0:
-            query_path = path.resolve()
-            break
-    if query_path is None:
-        return None
     manifest = run_dir / "input_conversion_manifest.tsv"
     if not manifest.is_file():
-        raise ValueError("foldseek_query_identity_missing")
+        return None
     with manifest.open("r", encoding="utf-8-sig", newline="") as handle:
         candidates = [
             row
@@ -896,10 +919,20 @@ def structure_query(run_dir: Path) -> StructureQuery | None:
             and str(row.get("input_id", "")).strip()
             and str(row.get("record_id", "")).strip()
         ]
+    if not candidates:
+        return None
     if len(candidates) != 1:
         raise ValueError("foldseek_query_identity_missing")
-    query_digest = sha256_path(query_path)
     row = candidates[0]
+    declared_digest = str(row.get("content_sha256", "")).strip().lower()
+    if not valid_digest(declared_digest):
+        raise ValueError("foldseek_query_digest_invalid")
+    query_path = structure_query_path(run_dir, row)
+    if not query_path.is_file() or query_path.stat().st_size <= 0:
+        raise ValueError("foldseek_query_path_missing")
+    query_digest = sha256_path(query_path)
+    if query_digest != declared_digest:
+        raise ValueError("foldseek_query_digest_mismatch")
     return StructureQuery(
         query_path,
         str(row.get("input_id", "")).strip(),
@@ -907,6 +940,36 @@ def structure_query(run_dir: Path) -> StructureQuery | None:
         f"query_{query_digest}",
         query_digest,
     )
+
+
+def structure_query_path(run_dir: Path, row: dict[str, str]) -> Path:
+    artifact_value = str(row.get("artifact", "")).strip()
+    source_value = str(row.get("source_path", "")).strip()
+    if artifact_value:
+        artifact = runtime_path(artifact_value)
+        artifact = artifact if artifact.is_absolute() else run_dir / artifact
+        artifact = artifact.resolve()
+        try:
+            artifact.relative_to(run_dir.resolve())
+        except ValueError as exc:
+            raise ValueError("foldseek_query_artifact_outside_run") from exc
+        if not artifact.is_file():
+            raise ValueError("foldseek_query_path_missing")
+        if source_value:
+            source = runtime_path(source_value)
+            if not source.is_absolute():
+                raise ValueError("foldseek_query_source_path_not_absolute")
+            if source.is_file() and sha256_path(source) != sha256_path(artifact):
+                raise ValueError("foldseek_query_path_content_mismatch")
+        return artifact
+    if not source_value:
+        raise ValueError("foldseek_query_path_missing")
+    source = runtime_path(source_value)
+    if not source.is_absolute():
+        raise ValueError("foldseek_query_source_path_not_absolute")
+    if not source.is_file():
+        raise ValueError("foldseek_query_path_missing")
+    return source.resolve()
 
 
 def valid_digest(value: str) -> bool:

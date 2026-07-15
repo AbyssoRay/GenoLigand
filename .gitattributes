@@ -1,0 +1,3 @@
+# Digest-bound worker lock artifacts must have identical bytes on every checkout.
+python/requirements-workers*.lock.txt text eol=lf
+python/requirements-workers-sources.lock.tsv text eol=lf

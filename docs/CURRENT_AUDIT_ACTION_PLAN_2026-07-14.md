@@ -18,18 +18,25 @@
 2. 每个候选、分数、结构摘要、动力学摘要、证据链和报告条目都能追溯到 project、run、invocation、input、record、database、candidate 和 artifact。
 3. 缺少输入、数据库、工具、索引或有效产物时，系统写出准确的 blocked 或 failed 终态并返回非零退出码，不产生完成标记和科学结论。
 4. Rust 负责主流程、状态、排序、证据链和报告语义；Python worker 执行受 Schema 约束的科学计算 primitive；WebUI 和 gls-server 通过正式 API 使用同一契约。
-5. 科学仓库的 ready 结论同时证明来源闭包、全量可查询索引、Schema、摘要、构建版本和真实 smoke query，投影 TSV 的存在不能替代持久数据库。
+5. 科学仓库的 ready 结论同时证明来源闭包、常驻缓存或可验证的按需补全策略、Schema、摘要、构建版本和真实 smoke query；ready 证据必须明确常驻覆盖率，投影 TSV 的存在不能替代持久数据库。
 6. 当前源码、发布 runtime、安装状态、数据库清单和用户界面必须属于同一版本并通过真实本地端到端验收。
+
+### 1.1 2026-07-15 RCSB 范围决策
+
+- RCSB 默认安装模式改为 `on-demand`，保留文件系统中 126397 个完整本地坐标，不再为发布门禁下载全部 153757 个结构。
+- 旧进度文件记录的 126425 不代表文件系统事实；现场 20 个 `.part` 共 9437184 B 均缺少身份 sidecar，其中 14 个为空文件，不能续传，最终清理时删除。
+- 真实任务命中本地缺失的 PDB ID 时，从 RCSB 固定官方地址按需获取；下载必须通过 gzip、条目身份、atom_site、摘要和原子发布校验，并写入当前 run 的取证清单。
+- `complete` 模式继续保留，供显式要求全量镜像时使用；它不再是当前发布完成条件。
 
 ## 2. 审查与动态验证基线
 
 ### 2.1 已通过的静态与单元验证
 
 - cargo fmt --all -- --check：通过。
-- cargo clippy --workspace --all-targets --all-features -- -D warnings：通过。
-- cargo test --workspace --all-features：gls-cli 4 项、gls-science 135 项、gls-server 101 项全部通过。
-- 当前 WSL 项目环境执行 Python worker 测试：53 项通过。
-- Python 语法检查 77 个文件、Node 语法检查 13 个文件：通过。
+- cargo clippy --workspace --all-targets -- -D warnings：通过，0 warning。
+- cargo test --workspace -- --test-threads=1：gls-cli 6 项、gls-science 171 项、gls-server 103 项，共 280/280 通过。
+- 当前 WSL 项目环境执行 Python worker 测试：70/70 通过。
+- 修复后 Python/installer 集中门禁 18/18 通过；76 个改动 Python 文件编译通过，130 个唯一 unittest 和 12 个脚本门禁通过。
 - repository、production schema、authenticity、clean release、pipeline、installer、Nextflow、WebUI 静态契约检查：通过。
 
 这些结果证明现有测试基线稳定。动态复现同时确认现有测试没有覆盖真实 API 路由、生产 payload、现场旧清单、跨输入候选身份、外部产物注入和真实安装闭包。
@@ -152,23 +159,25 @@
 
 **解决思路**
 
-- scope manifest、下载结果、结构投影、source file manifest 和 Foldseek source digest 使用同一个不可变 scope snapshot。
-- manifest 生成时排除 .part、quarantine、零字节和不可解析坐标。
-- 每个 scope ID 都有完整且可解压/解析的坐标文件，Foldseek DB 摘要与该集合一致后才能 ready。
+- `on-demand` 与 `complete` 使用显式模式字段；scope manifest、下载结果、结构投影、source file manifest 和 Foldseek source digest 使用同一个不可变缓存快照。
+- manifest 生成时排除 `.part`、quarantine、零字节和不可解析坐标；受身份保护的 `.part` 作为可续传状态单独记录。
+- `on-demand` 模式发布固定官方 URL、缓存路径、单次请求上限和内容验证策略。Foldseek 清单绑定已经索引的坐标子集并报告覆盖率，不能把子集写成全量。
+- 实际候选引用缺失 PDB ID 时自动下载、验证并原子写入缓存；`complete` 模式仍要求所有 scope 坐标与 Foldseek 摘要闭合。
 
 **验收标准**
 
-1. scope manifest 行数等于推导 scope 数。
-2. ready_count + missing_count = scope_count。
-3. 人工加入 .part 后状态立即为 needs_repair，该文件不会进入 source_file_manifest。
-4. Foldseek manifest 的 source_digest、source_files、source_bytes 与完整坐标集合一致。
-5. 缺失 131633 条的现场状态不能显示 ready。
+1. scope manifest 行数等于推导 scope 数，且 `cached_ready_count + missing_count = scope_count`。
+2. `on-demand` ready 同时给出缓存覆盖率、固定官方 URL、验证策略和按需补全能力；不得出现 full/complete 字样。
+3. `.part` 不进入 source_file_manifest；身份匹配的 partial 可续传，身份变化时不得拼接。
+4. Foldseek manifest 的 source digest、文件数和字节数与其实际索引子集一致，并通过真实查询；新增按需坐标明确标记索引刷新需求。
+5. 删除一个候选所需的本地坐标后运行真实选择路径，会自动补回正确 PDB、写入摘要与来源证据，并达到 ready；错误 gzip、错误条目和 404 不得发布。
+6. 显式 `complete` 模式仍要求 `ready_count = scope_count`，缺失时保持 needs_repair。
 
 ### GL-CURRENT-005 安装前缺少下载、迁移和重建的磁盘容量预检
 
 **问题与证据**
 
-- D 盘当前空闲 127.187 GiB；完成已确认清理后约 142.496 GiB。
+- 停止 RCSB 批量下载后的现场快照为：D 盘空闲 22.49 GiB，C 盘空闲 127.316 GiB；剩余 scope 改由运行时按需补齐。
 - 现有 MGnify MMseqs DB 为 182.042 GiB。
 - 旧五列 manifest 会使 alignment_source_manifest_matches 返回 false，随后创建 staging 原子重建。
 - external_sync_execution_manifest.tsv 缺少当前代码要求的 plan_digest，下一次安装会重新同步。
@@ -176,17 +185,19 @@
 
 **解决思路**
 
-- 在任何下载、解压或 staging 创建前生成 dry-run：下载、复用、迁移、重建、峰值临时空间和安全余量逐项计费。
+- 在任何下载、解压或 staging 创建前生成 dry-run：下载、复用、迁移、重建、目标卷、scratch 卷、峰值临时空间和安全余量逐项计费。
 - 将 MGnify 产品目标固定为 cluster representatives 或全蛋白分片；当前已确定的代表序列路线应收紧 include pattern。
 - manifest 迁移先执行真实 DB probe 和来源身份校验，避免有证据的现有 DB 被无条件重建。
+- RCSB `on-demand` 模式的剩余 scope 下载预算为 0；ChEMBL 源 SQLite 和 Foldseek 重建使用 C 盘 scratch，D 盘只承担经过校验的最终发布文件。
 
 **验收标准**
 
 1. dry-run 输出每个项目的 action、download_bytes、staging_bytes、reclaimable_bytes、required_peak_bytes 和 available_bytes。
 2. 空间不足时在写入第一个字节前终止。
-3. 当前 127 GiB 空闲环境不会启动 182 GiB 以上的 staging build。
+3. 当前 D 盘 22.49 GiB 空闲环境不会启动 182 GiB 以上的 staging build；需要大 scratch 的步骤明确转到 C 盘并单独验算容量。
 4. 重建失败后旧 DB 可继续使用，不留下 .rebuild-*、.previous-*、重复 DB 和新增 partial。
 5. MGnify 下载集合与已选定的数据库范围完全一致。
+6. 跨卷计划分别报告 scratch/target 的 available、staging 和 required peak，不把两个卷错误相加。
 
 ### GL-CURRENT-006 发布 runtime 与当前源码版本脱节
 
@@ -790,6 +801,7 @@
 - 已确认无 install lock、安装器、下载器、MMseqs 或 Foldseek 进程。
 - 已删除 26 个 .part、36 个 0.9.6-0.9.8 安装日志、7 个历史索引 tmp 和 14 个空 RCSB 分桶目录。
 - 已释放 5121250300 B。
+- 2026-07-15 最终前盘点又发现 20 个无身份 RCSB `.part` 共 9437184 B；有效续传身份数为 0，最终清理时全部删除。
 
 **问题与证据**
 
@@ -801,12 +813,12 @@
 
 **解决思路**
 
-- 删除已确认不参与当前下载和运行的 .part、旧安装日志、索引 tmp 和空分桶目录。
+- 删除已确认不参与当前下载和运行的 `.part`、旧安装日志、索引 tmp 和空分桶目录；只有身份匹配且状态明确的 partial 才允许保留，本次现场保留数为 0。
 - 完成 GL-CURRENT-028 后通过受控中断测试重新生成并验证可续传 partial。
 
 **验收标准**
 
-1. 当前残留 .part、install_0_9_*.log 和历史 tmp 清零。
+1. 无身份或身份过期的 `.part`、`install_0_9_*.log` 和历史 tmp 清零；保留项逐个具有 URL、ETag/长度身份和续传用途。
 2. 本轮释放 5121250300 B。
 3. MMseqs/Foldseek smoke query 保持通过。
 4. 后续产生的 partial 都有资源身份、长度和可验证续传状态。
@@ -868,43 +880,45 @@
 - 已在两个验收服务退出后删除 target/work，释放 11057515266 B。
 - 本轮已确认清理合计释放约 15.31 GiB。
 
-## 10. 实施与验收台账（待最终结果填充）
+## 10. 实施与验收台账（2026-07-14 当前状态）
 
-本表依据 2026-07-14 当前工作树、现有回归测试与验收脚本建立静态映射。表中“当前实施映射”表示已经出现对应实现或测试入口；所有案例在最终命令、真实运行或现场证据写回前均保持待验收状态。
+本表保留 34 个案例的逐项映射。“验收证据”记录本轮已经实际执行并确认的结果；science store、最终 runtime、正式 API、浏览器和真实产物攻击仍处于现场执行中，完成现场动作后再更新案例结论。
 
-| 案例 | 当前实施映射 | 建议的一条最终验证命令或证据 | 仍需闭合的明确事项 |
+已确认的横向基线：Rust 格式检查与 clippy 通过，Rust 测试共 280/280 通过；Python/installer 集中门禁 18/18 通过，worker 70/70、current installer 42/42、runtime audit 15/15、runtime failure 6/6 通过；Nextflow 的 completed、blocked、missing-state、CLI-failure 四条路径通过；server API、PLINDER published index、runtime provenance attacks 三个驱动的轻量自检通过。
+
+| 案例 | 已实施内容 | 本轮验收证据 | 剩余现场动作 |
 |---|---|---|---|
-| GL-CURRENT-001 | `schemas/input_capabilities.json`；`crates/gls-science/src/input_conversion.rs`；`crates/gls-server/src/lib.rs`；`webui/app/app.js`；`webui/app/core/actions.js`；`tests/webui/check_state_and_paging_contracts.py` | `cargo test -p gls-server input_capabilities_route_exposes_the_runtime_input_contract` | 待用最终发布 server 在全新浏览器验证该 API 返回 200、五类能力与保存校验一致、辅助请求故障不覆盖健康状态，控制台无启动 404 和未处理异常。 |
-| GL-CURRENT-002 | `scripts/setup/install_complete_scientific.py` 的 readiness v1；`crates/gls-science/src/lib.rs` 的 `ScienceStoreReadiness`；`crates/gls-server/src/lib.rs` 的 setup/health/database 输出；`tests/install/check_current_installer_remediations.py` | `python tests/install/check_current_installer_remediations.py CurrentInstallerRemediations.test_readiness_is_serialized_and_empty_manifests_block` | 待在现场 science store 处理所有真实 blocker，并核对安装器、CLI、API、报告和 WebUI 对同一 readiness JSON、同一稳定 blocker code 给出一致结论。 |
-| GL-CURRENT-003 | `scripts/setup/install_complete_scientific.py` 的 alignment manifest v2 与迁移探针；`python/genoligand_workers/alignment_worker.py`；`python/tests/test_alignment_worker.py`；安装修复回归 | `python tests/install/check_current_installer_remediations.py CurrentInstallerRemediations.test_alignment_manifest_schema_and_legacy_probe_migration` | 待迁移或重建现场 6 个 ready MMseqs DB，用当前 worker 对已知序列与宏基因组短序列逐库 smoke，并验证失败时 last-good 与正式 manifest 不变。 |
-| GL-CURRENT-004 | `scripts/setup/install_complete_scientific.py` 的 RCSB scope snapshot、坐标清单与 Foldseek 来源绑定；`configs/source_catalog.tsv`；`configs/source_sync_plan.tsv`；安装修复回归 | `python tests/install/check_current_installer_remediations.py CurrentInstallerRemediations.test_rcsb_scope_excludes_partial_and_binds_coordinate_snapshot` | 待现场完成 scope 全量闭包，使 scope、ready、missing、可解析坐标和 Foldseek 摘要一致；当前大规模缺失必须在同步、索引和真实 smoke 后再改为 ready。 |
-| GL-CURRENT-005 | `scripts/setup/install_complete_scientific.py` 的容量计划与 `--dry-run` 提前退出；`tests/install/check_current_installer_remediations.py` | `python tests/install/check_current_installer_remediations.py CurrentInstallerRemediations.test_capacity_preflight_blocks_before_large_staging` | 待在当前 D 盘现场运行 dry-run，保存逐项字节预算，并证明容量不足时在下载、解压和 staging 创建前退出；同时验证 MGnify 选择范围符合代表序列路线。 |
-| GL-CURRENT-006 | `crates/gls-cli/build.rs`；`crates/gls-server/build.rs`；两端版本/commit 输出；server health 的 runtime identity；安装器 runtime manifest 与发布校验；WebUI build id 展示 | `python tests/install/check_current_installer_remediations.py CurrentInstallerRemediations.test_runtime_manifest_and_install_ready_require_both_binaries` | 待最终提交形成后重新 release build、发布并重启正式入口，核对两个二进制的版本、commit、SHA-256、manifest digest、health 响应和实际进程路径完全一致。 |
-| GL-CURRENT-007 | `crates/gls-science/src/lib.rs` 的 blocked outcome；`crates/gls-cli/src/main.rs` 的退出码映射；`crates/gls-cli/tests/pipeline_exit_codes.rs`；`workflows/main.nf` | `cargo test -p gls-cli --test pipeline_exit_codes` | 待用最终发布 CLI 真实执行 completed、blocked、failed，并在真实 Nextflow 中确认非 completed 不发布 done marker，稳定退出码与状态文件一致。 |
-| GL-CURRENT-008 | `crates/gls-science/src/lib.rs` 的 pipeline invocation、阶段包装、failed 原子终态、last-successful-stage 与 compare-and-set；`crates/gls-science/src/tests.rs` | `cargo test -p gls-science pipeline_stage_error_writes_failed_terminal_state` | 待对输入、数据库、worker、排序、报告各注入一次真实失败，并验证 UI 刷新、修复动作、无完成标记以及旧 invocation 延迟回调无法覆盖新状态。 |
-| GL-CURRENT-009 | 前述全部实现；`tests/nextflow/run_nextflow_e2e.py`；WebUI、CLI、worker、science store 与 runtime 的正式入口 | 证据：同一最终 commit/runtime/store 生成的五类输入运行目录、浏览器截图/控制台记录、CLI 退出码矩阵、Nextflow completed/blocked 日志和导出文件 | 待执行最终 release gate：五类输入、known/metagenome/Foldseek、top-N docking/MD、报告/导出，以及 completed、blocked、failed、cancelled 四种真实状态全部闭合。 |
-| GL-CURRENT-010 | `crates/gls-science/src/input_conversion.rs` 的逐 record 身份；`crates/gls-science/src/lib.rs` 的 `CandidateIdentity`、canonical namespace 和 candidate digest；`crates/gls-science/src/tests.rs` | `cargo test -p gls-science candidate_identity -- --test-threads=1` | 待用两个输入命中同一靶点、同 record 多来源和 multi-record SDF 的真实流程验证独立/合并边界，并确认每条 record 都能继续进入 docking/MD。 |
-| GL-CURRENT-011 | `crates/gls-science/src/lib.rs` 的 indexed docking manifest/index/selection/result 验证；`crates/gls-science/src/tests.rs` 的外部、篡改、跨候选和旧 invocation 攻击回归 | `cargo test -p gls-science indexed_artifact_docking -- --test-threads=1` | 待用真实 Vina 产物执行同样四类攻击，确认拒绝原因精确、最终分数不受污染，合法当前 invocation 仍可完成。 |
-| GL-CURRENT-012 | `python/genoligand_workers/docking_worker.py` 的完整 artifact 清单与 SHA-256；`python/genoligand_workers/md_summary_worker.py` 的精确 docking binding；`python/tests/test_md_artifact_provenance.py`；Rust indexed 攻击测试 | `python -m unittest discover -s python/tests -p test_md_artifact_provenance.py` | 待执行真实 Vina→MD 链，在 Context 创建前篡改每类 docking 产物各一次，证明失败后无 MD 分数、轨迹和报告事实，未篡改链可复算。 |
-| GL-CURRENT-013 | `python/genoligand_workers/md_summary_worker.py` 的指标/协议/平台产物；`crates/gls-science/src/lib.rs` 的 indexed MD semantic validator；`python/tests/test_md_semantic_validation.py`；Rust 伪造回归 | `python -m unittest discover -s python/tests -p test_md_semantic_validation.py` | 待用真实 complex MD 检查五类指标、单位、候选、帧数、步数、state、trajectory 和重算分数，并确认排名、报告、API/WebUI 消费同一个验证结果。 |
-| GL-CURRENT-014 | `crates/gls-science/src/lib.rs` 的 `VerifiedMdFacts`、动态 evidence ledger 和基于事实的报告生成；`crates/gls-science/src/tests.rs` | `cargo test -p gls-science indexed_artifact_md -- --test-threads=1` | 待从真实 MD manifest 生成最终报告，逐句回查 method、platform、system、protocol、trajectory 与 artifact SHA；伪行、旧行和部分指标不得产生计算描述。 |
-| GL-CURRENT-015 | `python/genoligand_workers/md_summary_worker.py` 的 peptide conformer artifact/schema；Rust 的 peptide/complex 分流与报告语义；Python/Rust 回归 | `cargo test -p gls-science indexed_artifact_peptide_conformer_never_becomes_md_score_or_openmm_claim` | 待各跑一次真实肽构象集合和小分子 complex MD，核对肽报告无 MD score、OpenMM、PME、溶剂、CUDA 声称，小分子报告保留实际平台事实。 |
-| GL-CURRENT-016 | `crates/gls-science/src/lib.rs` 的正向当前运行 provenance proof 与 artifact 必需性；indexed artifact 攻击回归；`tests/authenticity/check_authenticity_contracts.py` | `python tests/authenticity/check_authenticity_contracts.py` | 待对最终候选、decomposition、报告和 evidence ledger 做全图遍历，证明每行可回到当前 input/source/query/candidate/artifact；合法名称含旧诊断关键词时仍通过。 |
-| GL-CURRENT-017 | `python/genoligand_workers/alignment_worker.py` 的权威清单、多库执行、companion/provenance 校验和 TM-score；Rust Foldseek 行校验与评分；`python/tests/test_alignment_worker.py` | `python -m unittest discover -s python/tests -p test_alignment_worker.py` | 待在现场对清单中全部必需 Foldseek DB 执行当前 query smoke，保存逐库 outcome，并验证空库、孤儿库、缺 provenance 库不会被 fallback 接受。 |
-| GL-CURRENT-018 | `schemas/worker_job.schema.json`；`schemas/worker_result.schema.json`；`python/genoligand_workers/worker_io.py`；`tests/architecture/check_worker_schema_contracts.py` | `python tests/architecture/check_worker_schema_contracts.py` | 当前架构脚本仍自行构造 payload；待直接捕获 Rust/Python 生产序列化的 MMseqs、Foldseek、docking、MD 成功/失败/fallback job/result 再交给标准 Draft 2020-12 validator。 |
-| GL-CURRENT-019 | `scripts/setup/install_complete_scientific.py` 的 `chembl_query.sqlite` 发布；`crates/gls-science/src/lib.rs` 的只读索引查询与 provenance；Rust/安装回归 | `cargo test -p gls-science chembl -- --test-threads=1` | 待在现场发布库上记录可重复查询计划、时延、峰值内存和临时磁盘阈值，确认运行期不解压 archive、不执行全表 RDKit UDF，release/digest 变化会失效。 |
-| GL-CURRENT-020 | `crates/gls-science/src/lib.rs` 的 relation/bound 保留与 censored 非定量通道；`crates/gls-science/src/tests.rs` 的 censored 与结构优先级回归 | `cargo test -p gls-science censored -- --test-threads=1` | 待补齐并实测 ChEMBL 与 BindingDB 的 `=`、`>`、`<`、约等、正反方向和单位换算组合，确认结构选择不把 bound 当 exact potency。 |
-| GL-CURRENT-021 | Rust top-N selection、逐候选 job/invocation/index/outcome 与排名回并；docking/MD worker 的 candidate selection 绑定；worker Schema；`coordinate_top_n_uses_independent_docking_and_md_jobs` | `cargo test -p gls-science coordinate_top_n_uses_independent_docking_and_md_jobs -- --test-threads=1` | 待用至少 3 个可对接候选跑真实 top-N，检查每候选独立目录、成功或精确失败原因、无跨候选复用，decomposition 与实际证据一致。 |
-| GL-CURRENT-022 | `scripts/setup/install_complete_scientific.py` 的固定 OpenFF URL/digest、XML 与 loader 验证、last-good 发布；安装修复回归 | `python tests/install/check_current_installer_remediations.py CurrentInstallerRemediations.test_openff_requires_fixed_digest_xml_and_loader` | 待使用固定 2.2.1 正式文件在目标 worker 环境真实加载，再分别验证伪文件、截断 XML、digest 不符不会替换 last-good。 |
-| GL-CURRENT-023 | Rust MD job 的 `platform_policy`；`schemas/worker_job.schema.json`；`worker_io.py`；`md_summary_worker.py` 的真实 Context 选择；`test_md_semantic_validation.py` | `python python/tests/test_md_semantic_validation.py MdSemanticValidationTests.test_platform_policy_uses_real_context_creation_and_honors_cpu_mode` | 待在本机实际 CPU/CUDA 环境执行 disabled、preferred、required 三种策略，保存 Context、device/driver/properties 证据，并验证 required 失败在 preflight 阻塞。 |
-| GL-CURRENT-024 | `python/environment-workers.yml`；CPU/CUDA requirements；平台锁文件与 source lock；安装器 Python 版本 gate、依赖闭包和 worker smoke；安装修复回归 | `python tests/install/check_current_installer_remediations.py CurrentInstallerRemediations.test_worker_environment_is_pinned_complete_and_version_gated` | 待在全新受支持 Python 环境连续安装两次，核对全部 wheel/VCS 来源、版本与 hash 相同，并真实完成 PLINDER parquet→canonical；Python 3.14 必须选到受支持解释器。 |
-| GL-CURRENT-025 | `scripts/setup/install_complete_scientific.py` 的 invocation fingerprint cache、持久缓存与 atomic writer；`tests/install/check_current_installer_remediations.py` | `python tests/install/check_current_installer_remediations.py CurrentInstallerRemediations.test_manifest_writes_are_atomic_and_fingerprint_cache_persists` | 待对现场 79 GB MGnify 无变化 repair 记录内容 hash 次数为 0、变化后最多 1；还需在三类 manifest 各注入一次中断，证明 last-good 完整且 attempt 可诊断。 |
-| GL-CURRENT-026 | `configs/source_catalog.tsv`；`configs/source_sync_plan.tsv`；安装器 payload 媒体/压缩/Schema/记录数验证与 trust/release 字段；source lock；安装修复回归 | `python tests/install/check_current_installer_remediations.py CurrentInstallerRemediations.test_first_download_domain_validation_and_auditable_trust` | 待逐个远程来源核对官方 checksum/不可变 release 或领域验证证据，加入资源版本变化的失效测试，并用真实首次下载证明 HTML、错误压缩和版本错配均失败。 |
-| GL-CURRENT-027 | `crates/gls-science/src/input_conversion.rs` 的 BufRead 流式解析、批量写入与失败清理；`crates/gls-science/src/tests.rs` 的 FASTA/FASTQ/GenBank、多批次和坏记录回归 | `cargo test -p gls-science sequence_conversion_manifest_streams_across_write_batches -- --test-threads=1` | 待用 GB 级 synthetic FASTA/FASTQ/GenBank 测量峰值 RSS，证明受 batch 上限约束；中途坏记录后 normalized/spool/pending 不进入下游且错误行号准确。 |
-| GL-CURRENT-028 | `scripts/setup/install_complete_scientific.py` 的 remote identity、Range/If-Range、partial identity 与完成清理；本地 HTTP 中断回归 | `python tests/install/check_current_installer_remediations.py CurrentInstallerRemediations.test_trusted_http_identity_resumes_from_existing_offset` | 待补资源 ETag/长度变化时拒绝拼接的回归，并对真实大源执行一次受控中断续传，核对最终长度/hash、Range 偏移以及 `.part`、identity、quarantine 清零。 |
-| GL-CURRENT-029 | 已删除 `configs/target_ranking.yml`；`crates/gls-science/src/lib.rs` 固定单一 ranking policy、版本与 digest，并写入 run context、decomposition 和报告 | `cargo test -p gls-science target_ranking -- --test-threads=1` | 待增加/确认 policy 内容与 digest 的直接回归，并在真实运行中核对 run context、每条 decomposition 和报告引用完全相同的版本、权重与摘要。 |
-| GL-CURRENT-030 | `.nextflow-version`；`nextflow.config` 的可配置资源和 4 CPU/8 GB profile；`workflows/main.nf` 的外部 store、状态/done gate 与 provenance；静态及真实 E2E 脚本 | 在选定的项目 WSL 环境执行 `python tests/nextflow/run_nextflow_e2e.py` | 待用固定 Nextflow 版本完成最终 completed、blocked、missing-state、CLI-failure 四条真实 workflow，保存配置 digest/provenance，并确认 science store 未复制到 task work。 |
-| GL-CURRENT-031 | `.gitignore` 与 `tests/clean_release/check_clean_release.py` 提供发布清洁门；此前清理记录已写入本计划 | 证据：最终测试退出后进程命令行不指向 `target/work`，两目录和误生成验收目录均不存在，`git status --short` 不增加运行产物 | 当前测试已重新生成构建缓存，且 git status 显示一个位于 `crates/gls-science` 下的错误绝对路径编码 `run` 目录；待定位是否会复生并在最终复验后统一清除。 |
-| GL-CURRENT-032 | 已有 Git GC/FSCK 历史记录；本案例最终动作依赖最终提交与 push | `git fsck --full` | 待最终提交推送后再次执行安全 GC、fsck、对象统计和 `main`/`origin/main` 一致性核对，并记录最终 `.git` 大小与完整工作树。 |
-| GL-CURRENT-033 | 已完成的 `.part`、旧日志、索引 tmp、空目录清理记录；安装器新增受身份保护的续传逻辑 | 证据：最终 D 盘清单中无无身份 `.part`、旧 staging/previous、重复 DB 和错误 ready，随后 MMseqs/Foldseek smoke 均通过 | 待 science store 修复与受控续传测试结束后重新盘点，清除本轮新产生的 attempt/staging/partial，并确认有效下载源和 last-good DB 全部保留。 |
-| GL-CURRENT-034 | 已删除 `openff_worker.py`、`openmm_worker.py`、`pdbfixer_worker.py`、`trajectory_worker.py`；`tests/architecture/check_worker_registry_contracts.py` | `python tests/architecture/check_worker_registry_contracts.py` | 待运行完整 Python、安装、架构与真实 worker E2E，并检查最终 runtime manifest、wrapper 与文档没有四个已删除模块的 entrypoint 或导入引用。 |
+| GL-CURRENT-001 | `schemas/input_capabilities.json`、server 能力接口、WebUI 保存校验与 API 验收驱动已接通。 | Rust 264 项测试通过；`run_server_api_acceptance.py --self-test` 通过，并校验生产形态 job/result 的 Draft 2020-12 Schema。 | 执行中：用最终 release server 和全新浏览器验证五类能力、保存结果、健康状态、启动请求及控制台。 |
+| GL-CURRENT-002 | readiness v1 已贯通安装器、CLI、server health/database 与报告消费。 | 当前安装器修复回归 23 项通过；相关 Rust 回归包含在 264 项通过结果中。 | 执行中：修复现场 science store blocker，并核对各入口读取同一 readiness JSON 与稳定 blocker code。 |
+| GL-CURRENT-003 | alignment manifest v2、旧 manifest 迁移探针、worker companion/provenance 校验已实现。 | 安装器 23 项与 Python 62 项测试通过。 | 执行中：迁移或重建现场 6 个 MMseqs DB，逐库运行已知序列和宏基因组短序列 smoke，并验证 last-good 保护。 |
+| GL-CURRENT-004 | RCSB scope snapshot、坐标清单、Foldseek 来源绑定和 partial 排除已实现。 | 安装器 23 项测试通过，覆盖 scope、coordinate snapshot 与来源绑定回归。 | 执行中：完成现场 RCSB scope、坐标与 Foldseek 索引闭包，再以真实查询确认 ready。 |
+| GL-CURRENT-005 | 容量预算与 `--dry-run` 提前阻断已进入当前安装器。 | 安装器 23 项测试通过，包含 staging 前容量阻断。 | 执行中：在 D 盘保存真实逐项字节预算，验证不足容量下没有下载、解压和 staging 副作用，并确认 MGnify 范围。 |
+| GL-CURRENT-006 | CLI/server build identity、runtime manifest、SHA-256 校验、health identity 与 WebUI build id 已实现。 | Rust fmt、clippy、264 项测试及安装器 23 项测试通过。 | 执行中：最终提交后 release build、发布并重启正式入口，核对 commit、二进制摘要、manifest、health 与进程路径。 |
+| GL-CURRENT-007 | blocked outcome、CLI 稳定退出码、状态文件与 Nextflow done gate 已实现。 | Rust 264 项测试通过；Nextflow completed、blocked、missing-state、CLI-failure 四条路径通过。 | 执行中：用最终 release CLI/runtime 重放 completed、blocked、failed，并归档退出码、状态文件与 done marker 证据。 |
+| GL-CURRENT-008 | invocation 绑定、阶段错误包装、failed 原子终态、last-successful-stage 与 compare-and-set 已实现。 | Rust 264 项测试通过；Nextflow missing-state 与 CLI-failure 真实路径通过。 | 执行中：对最终 runtime 的输入、数据库、worker、排序、报告分别注入故障，并在浏览器核对刷新、修复动作和旧回调隔离。 |
+| GL-CURRENT-009 | 五类输入、CLI/worker/science store、Nextflow、API 与 WebUI 的验收入口已经形成。 | Rust 264、Python 62、安装器 23 项通过；Nextflow 四路径与 server API 驱动自检通过。 | 执行中：在同一最终 commit/runtime/store 下完成五类输入、检索、top-N、docking/MD、报告、导出和浏览器全链验收。 |
+| GL-CURRENT-010 | 逐 record 身份、canonical namespace、candidate digest 与多记录转换已实现。 | Rust 264 项测试通过，包含 candidate identity、多批次及多记录回归。 | 执行中：用同靶点多输入、多来源 record 和 multi-record SDF 跑真实流程，核对独立/合并边界及 docking/MD 延续。 |
+| GL-CURRENT-011 | indexed docking manifest/index/selection/result 校验和四类攻击拒绝已实现。 | Rust 264 项测试通过；`check_runtime_provenance_attacks.py --self-test` 通过。 | 执行中：对最终 completed run 的真实 Vina 产物执行外部 pose、内容篡改、跨候选 manifest、旧 invocation 四案。 |
+| GL-CURRENT-012 | docking worker 完整 artifact 摘要与 MD 对 docking provenance 的精确绑定已实现。 | Python 62 项与 Rust 264 项测试通过；攻击驱动自检通过。 | 执行中：执行真实 Vina→MD 链并逐类篡改 docking 产物，核对 Context 前拒绝、无 MD/报告完成产物及合法链复算。 |
+| GL-CURRENT-013 | MD 指标、协议、平台产物及 indexed semantic validator 已实现。 | Python 62 项与 Rust 264 项测试通过；攻击驱动自检覆盖 MD artifact、单位、候选、score 伪造契约。 | 执行中：在真实 OpenMM completed run 执行四类伪造，并回查指标、单位、帧数、步数、state、trajectory 与重算分数。 |
+| GL-CURRENT-014 | `VerifiedMdFacts`、动态 evidence ledger 与基于验证事实的报告生成已实现。 | Rust 264 项测试通过；攻击驱动自检通过。 | 执行中：从真实 MD manifest 生成最终报告，逐句回查方法、平台、system、protocol、trajectory 和 artifact SHA。 |
+| GL-CURRENT-015 | peptide conformer 与 complex MD 已分流，报告语义按真实计算类型生成。 | Python 62 项和 Rust 264 项测试通过。 | 执行中：分别运行真实肽构象集合与小分子 complex MD，核对肽报告和小分子平台事实。 |
+| GL-CURRENT-016 | 当前 invocation 的正向 provenance proof、artifact 必需性和 indexed authenticity gate 已实现。 | Rust 264 项测试通过；runtime provenance attacks 驱动自检通过。 | 执行中：遍历最终候选、decomposition、报告和 evidence ledger 的全图 provenance，并执行真实产物攻击。 |
+| GL-CURRENT-017 | alignment worker 的权威清单、多库执行、companion/provenance 校验、TM-score 与 Rust Foldseek 行校验已实现。 | Python 62 项和 Rust 264 项测试通过。 | 执行中：对现场全部必需 Foldseek DB 运行当前 query，归档逐库 outcome，并验证空库、孤儿库和缺 provenance 库拒绝。 |
+| GL-CURRENT-018 | worker job/result Schema、Python I/O 校验和 API 验收驱动的生产形态 payload 验证已实现。 | `run_server_api_acceptance.py --self-test` 通过，真实 job/result 样本由 Draft 2020-12 validator 校验并汇总覆盖。 | 执行中：从最终 runtime 捕获 MMseqs、Foldseek、docking、MD 的成功、失败和 fallback job/result，再完成 API 现场读回。 |
+| GL-CURRENT-019 | `chembl_query.sqlite` 发布、只读索引查询与 release/digest provenance 已实现。 | Rust 264 项和安装器 23 项测试通过。 | 执行中：在现场发布库记录查询计划、时延、峰值 RSS、临时磁盘，并确认运行期无 archive 解压和全表 RDKit UDF。 |
+| GL-CURRENT-020 | relation/bound 保留、censored 非定量通道与结构优先级规则已实现。 | Rust 264 项测试通过，包含 censored 与结构选择回归。 | 执行中：用现场 ChEMBL/BindingDB 覆盖 `=`、`>`、`<`、约等、方向与单位组合，核对 bound 不进入 exact potency。 |
+| GL-CURRENT-021 | top-N 独立候选 job/invocation/index/outcome、worker candidate binding 与排名回并已实现。 | Rust 264 项测试通过，包含多候选独立 docking/MD job 回归。 | 执行中：用至少 3 个真实候选跑 top-N，核对独立目录、逐候选结果、无跨候选复用及 decomposition。 |
+| GL-CURRENT-022 | 固定 OpenFF 2.2.1 来源/digest、XML/loader 校验与 last-good 发布已实现。 | 安装器 23 项测试通过，覆盖伪文件、截断 XML 和 digest 拒绝。 | 执行中：在目标 worker 环境加载正式文件，保存 loader 结果并验证失败尝试不替换 last-good。 |
+| GL-CURRENT-023 | MD job `platform_policy`、Schema 约束与真实 OpenMM Context 平台选择已实现。 | Python 62 项和 Rust 264 项测试通过。 | 执行中：在本机 CPU/CUDA 环境运行 disabled、preferred、required，保存 Context、设备、驱动与 properties，并验证 required 预检阻断。 |
+| GL-CURRENT-024 | worker 环境锁、Python 版本 gate、依赖闭包、source lock 与安装 smoke 已实现。 | 安装器 23 项测试通过；`check_plinder_published_index.py --self-test` 通过。 | 执行中：在全新受支持 Python 环境重复安装并核对来源/版本/hash，再对现场 published PLINDER parquet→canonical→query 运行验收。 |
+| GL-CURRENT-025 | invocation fingerprint cache、跨进程持久缓存和 manifest 原子写入已实现。 | 安装器 23 项测试通过，覆盖持久缓存与 atomic writer。 | 执行中：对现场 MGnify repair 记录 hash 次数，并在三类 manifest 注入中断，核对 last-good 与 attempt 诊断。 |
+| GL-CURRENT-026 | source catalog/sync plan、媒体/压缩/Schema/记录数验证、trust/release 字段和 source lock 已实现。 | 安装器 23 项测试通过，覆盖首次下载领域验证和可审计信任。 | 执行中：逐来源核对官方 checksum 或不可变 release，并用真实首次下载验证 HTML、错误压缩和版本错配拒绝。 |
+| GL-CURRENT-027 | BufRead 流式解析、批量写入、失败清理及 1 GiB RSS 验收驱动已实现。 | 三案通过，RSS 上限 268,435,456 B：FASTA 1,073,745,058 B/260,898 records/99,028,992 B；FASTQ 1,073,748,103 B/130,783/54,435,840 B；GenBank 1,073,742,694 B/260,076/100,122,624 B。 | 执行中：用最终 release CLI 重放三案，并注入中途坏记录，核对错误行号及 normalized/spool/pending 不进入下游。 |
+| GL-CURRENT-028 | remote identity、Range/If-Range、partial identity、ETag/长度变化拒绝与完成清理已实现。 | 安装器 23 项测试通过，覆盖同身份续传和身份变化拒绝拼接。 | 执行中：对真实大源执行受控中断续传，核对 Range 偏移、最终长度/hash 以及 `.part`、identity、quarantine 清零。 |
+| GL-CURRENT-029 | 单一固定 ranking policy、版本与 digest 已写入 run context、decomposition 和报告。 | Rust 264 项测试通过，包含 policy 内容、版本与 digest 回归。 | 执行中：在真实运行中逐项核对 run context、decomposition 和报告引用同一权重、版本与摘要。 |
+| GL-CURRENT-030 | 固定 Nextflow 版本、可配置资源、4 CPU/8 GB profile、外部 store、状态/done gate 与 provenance 已实现。 | `run_nextflow_e2e.py` 的 completed、blocked、missing-state、CLI-failure 四条路径通过。 | 执行中：以最终 release runtime 固化配置 digest、完整日志和 provenance，并复核 science store 未复制到 task work。 |
+| GL-CURRENT-031 | `.gitignore`、clean release 门禁和安全清理规则已存在。 | Rust fmt、clippy、264 项测试、Python 62 项与安装器 23 项通过后已形成最终清理输入清单。 | 执行中：全部现场验收结束后停止相关进程，清除 `target/work`、误生成 run、缓存与临时证据，再运行 clean release 门禁。 |
+| GL-CURRENT-032 | Git GC/FSCK、对象统计和远端一致性验收步骤已定义。 | 当前工作树修改仍在汇总，最终 Git 验收按第 8 节出口执行。 | 执行中：完成全部修复后提交并 push，再执行安全 GC、`git fsck --full`、对象统计及 `main`/`origin/main` 一致性核对。 |
+| GL-CURRENT-033 | 已有旧 `.part`、日志、index tmp、空目录清理记录；安装器新增受身份保护的续传。 | 第 9 节已记录约 15.31 GiB 清理结果；安装器 23 项回归通过。 | 执行中：science store 修复和续传验收结束后重新盘点 D 盘，清除新 attempt/staging/partial，保留有效源与 last-good DB。 |
+| GL-CURRENT-034 | 四个旧 worker 模块已删除，worker registry 契约检查入口已存在。 | Python 62 项测试通过，当前 worker 代码与调用链按现有模块运行。 | 执行中：运行最终安装、架构与真实 worker E2E，核对 runtime manifest、wrapper、文档和发布目录无旧 entrypoint、导入及缓存副本。 |

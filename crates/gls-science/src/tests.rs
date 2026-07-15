@@ -1,6 +1,174 @@
 use super::input_conversion::{ConvertedInput, INPUT_MANIFEST_WRITE_BATCH_SIZE};
 use super::*;
-use std::time::{SystemTime, UNIX_EPOCH};
+use flate2::{Compression, write::GzEncoder};
+use std::net::{SocketAddr, TcpListener, TcpStream};
+use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
+use std::sync::{Arc, Mutex};
+use std::thread::{self, JoinHandle};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+#[derive(Clone)]
+struct TestHttpResponse {
+    status: u16,
+    content_type: &'static str,
+    body: Vec<u8>,
+}
+
+struct TestHttpServer {
+    address: SocketAddr,
+    base_url: String,
+    requests: Arc<Mutex<Vec<String>>>,
+    stop: Arc<AtomicBool>,
+    thread: Option<JoinHandle<()>>,
+}
+
+impl TestHttpServer {
+    fn start(routes: BTreeMap<String, TestHttpResponse>) -> Self {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind test HTTP server");
+        listener
+            .set_nonblocking(true)
+            .expect("nonblocking test HTTP server");
+        let address = listener.local_addr().expect("test HTTP address");
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let stop = Arc::new(AtomicBool::new(false));
+        let thread_requests = Arc::clone(&requests);
+        let thread_stop = Arc::clone(&stop);
+        let thread = thread::spawn(move || {
+            while !thread_stop.load(AtomicOrdering::SeqCst) {
+                match listener.accept() {
+                    Ok((stream, _)) => {
+                        if thread_stop.load(AtomicOrdering::SeqCst) {
+                            break;
+                        }
+                        serve_test_http_request(stream, &routes, &thread_requests);
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        thread::sleep(Duration::from_millis(5));
+                    }
+                    Err(_) => break,
+                }
+            }
+        });
+        Self {
+            address,
+            base_url: format!("http://{address}"),
+            requests,
+            stop,
+            thread: Some(thread),
+        }
+    }
+
+    fn requests(&self) -> Vec<String> {
+        self.requests.lock().expect("test requests lock").clone()
+    }
+}
+
+impl Drop for TestHttpServer {
+    fn drop(&mut self) {
+        self.stop.store(true, AtomicOrdering::SeqCst);
+        let _ = TcpStream::connect(self.address);
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
+    }
+}
+
+fn serve_test_http_request(
+    mut stream: TcpStream,
+    routes: &BTreeMap<String, TestHttpResponse>,
+    requests: &Arc<Mutex<Vec<String>>>,
+) {
+    stream
+        .set_nonblocking(false)
+        .expect("blocking test HTTP stream");
+    stream
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .expect("test HTTP read timeout");
+    let mut reader = BufReader::new(stream.try_clone().expect("clone test HTTP stream"));
+    let mut request_line = String::new();
+    reader
+        .read_line(&mut request_line)
+        .expect("read test HTTP request line");
+    let path = request_line
+        .split_whitespace()
+        .nth(1)
+        .unwrap_or("/")
+        .to_string();
+    loop {
+        let mut line = String::new();
+        if reader.read_line(&mut line).unwrap_or_default() == 0 || line == "\r\n" {
+            break;
+        }
+    }
+    requests
+        .lock()
+        .expect("test requests lock")
+        .push(path.clone());
+    let fallback = TestHttpResponse {
+        status: 404,
+        content_type: "text/plain",
+        body: b"not found".to_vec(),
+    };
+    let response = routes.get(&path).unwrap_or(&fallback);
+    let reason = if response.status == 200 {
+        "OK"
+    } else if response.status == 404 {
+        "Not Found"
+    } else {
+        "Error"
+    };
+    write!(
+        stream,
+        "HTTP/1.1 {} {}\r\nContent-Type: {}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+        response.status,
+        reason,
+        response.content_type,
+        response.body.len(),
+    )
+    .expect("write test HTTP headers");
+    stream
+        .write_all(&response.body)
+        .expect("write test HTTP body");
+}
+
+fn test_gzip_bytes(text: &str) -> Vec<u8> {
+    let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
+    encoder.write_all(text.as_bytes()).expect("write test gzip");
+    encoder.finish().expect("finish test gzip")
+}
+
+fn test_rcsb_mmcif(pdb_id: &str) -> String {
+    format!(
+        "data_{pdb_id}\n_entry.id {pdb_id}\nloop_\n_atom_site.group_PDB\n_atom_site.id\n_atom_site.type_symbol\n_atom_site.label_atom_id\n_atom_site.Cartn_x\n_atom_site.Cartn_y\n_atom_site.Cartn_z\nATOM 1 N N 1.0 2.0 3.0\n#\n"
+    )
+}
+
+fn test_rcsb_pdb(pdb_id: &str) -> String {
+    format!(
+        "{:<62}{pdb_id}\n{}",
+        "HEADER    TEST STRUCTURE",
+        minimal_pdb_block()
+    )
+}
+
+fn write_test_rcsb_on_demand_policy(store: &Path) {
+    write_text(
+        &store.join("downloads/rcsb/on_demand_policy.json"),
+        &(json!({
+            "schema_version": RCSB_ON_DEMAND_POLICY_SCHEMA_VERSION,
+            "status": "ready",
+            "mode": "on_demand",
+            "official_base_url": RCSB_OFFICIAL_DOWNLOAD_BASE_URL,
+            "coordinate_template": RCSB_OFFICIAL_COORDINATE_TEMPLATE,
+            "cache_root": RCSB_ON_DEMAND_CACHE_ROOT,
+            "max_fetches_per_run": RCSB_ON_DEMAND_FETCH_LIMIT,
+            "validation": RCSB_ON_DEMAND_VALIDATION,
+        })
+        .to_string()
+            + "\n"),
+    )
+    .expect("write RCSB on-demand policy");
+}
 
 #[test]
 fn openmm_cuda_ready_follows_probe_detail_flag() {
@@ -1476,9 +1644,9 @@ fn file_input_reads_fasta_records_and_hashes_content() {
     assert_eq!(rows.len(), 2);
     assert_eq!(rows[0][0], "input_1");
     assert_eq!(rows[0][1], "alpha__record_1");
-    assert_eq!(rows[0][5], "MKTAYI");
+    assert!(rows[0][5].is_empty());
     assert_eq!(rows[1][1], "beta__record_2");
-    assert_eq!(rows[1][5], "ACDEFG");
+    assert!(rows[1][5].is_empty());
     for (row, sequence) in rows.iter().zip(["MKTAYI", "ACDEFG"]) {
         assert_eq!(row[9], "file");
         assert_eq!(row[10], fasta.display().to_string());
@@ -1487,7 +1655,12 @@ fn file_input_reads_fasta_records_and_hashes_content() {
             format!("{:x}", Sha256::digest(sequence.as_bytes())),
             "each FASTA record must carry its own canonical content digest"
         );
+        assert!(row[13].starts_with("input_sequence_spool.bin#offset="));
     }
+    let restored = read_normalized_inputs(&run.join("input_normalized_manifest.tsv"))
+        .expect("restore normalized sequences");
+    assert_eq!(restored[0].primary_value, "MKTAYI");
+    assert_eq!(restored[1].primary_value, "ACDEFG");
     fs::remove_dir_all(root).expect("cleanup");
 }
 
@@ -1549,6 +1722,46 @@ fn sequence_parse_failure_discards_partial_records_and_reports_the_source_line()
     assert!(!run.join("input_normalized_manifest.tsv").exists());
     assert!(!run.join("input_conversion_manifest.tsv.pending").exists());
     assert!(!run.join("input_normalized_manifest.tsv.pending").exists());
+    assert!(!run.join("input_sequence_spool.bin").exists());
+    assert!(!run.join("input_sequence_spool.bin.pending").exists());
+    fs::remove_dir_all(root).expect("cleanup");
+}
+
+#[test]
+fn rerun_failure_or_inline_input_removes_published_sequence_spool() {
+    let root = temp_root("sequence_spool_rerun_cleanup");
+    let fasta = root.join("query.fasta");
+    let input = root.join("input.json");
+    let run = root.join("run");
+    write_text(&fasta, ">accepted\nMKTAYI\n").expect("fasta");
+    write_text(
+        &input,
+        &format!(
+            r#"{{"inputs":[{{"field":"protein_ligand","value":{}}}],"files":[]}}"#,
+            serde_json::to_string(&fasta.display().to_string()).expect("path JSON")
+        ),
+    )
+    .expect("input");
+    let options = science_options(&root, &input, &run);
+
+    run_science_command(ScienceCommand::InputNormalize, &options).expect("initial normalize");
+    assert!(run.join("input_sequence_spool.bin").is_file());
+
+    write_text(&fasta, ">accepted\nMKTAYI\n>broken\n").expect("broken fasta");
+    run_science_command(ScienceCommand::InputNormalize, &options)
+        .expect_err("broken rerun must fail");
+    assert!(!run.join("input_normalized_manifest.tsv").exists());
+    assert!(!run.join("input_sequence_spool.bin").exists());
+    assert!(!run.join("input_sequence_spool.bin.pending").exists());
+
+    write_text(
+        &input,
+        r#"{"inputs":[{"field":"small_molecule","value":"CCO"}],"files":[]}"#,
+    )
+    .expect("inline input");
+    run_science_command(ScienceCommand::InputNormalize, &options).expect("inline normalize");
+    assert!(!run.join("input_sequence_spool.bin").exists());
+    assert!(!run.join("input_sequence_spool.bin.pending").exists());
     fs::remove_dir_all(root).expect("cleanup");
 }
 
@@ -1556,9 +1769,10 @@ fn sequence_parse_failure_discards_partial_records_and_reports_the_source_line()
 fn sequence_conversion_manifest_streams_across_write_batches() {
     let root = temp_root("streaming_fasta_batches");
     let fasta = root.join("many.fasta");
+    let sequence = "MKTAYI".repeat(128);
     let mut source = String::new();
     for index in 0..(INPUT_MANIFEST_WRITE_BATCH_SIZE * 2 + 3) {
-        source.push_str(&format!(">record_{index}\nMKTAYI\n"));
+        source.push_str(&format!(">record_{index}\n{sequence}\n"));
     }
     write_text(&fasta, &source).expect("fasta");
     let input = root.join("input.json");
@@ -1578,8 +1792,16 @@ fn sequence_conversion_manifest_streams_across_write_batches() {
     )
     .expect("normalize");
     let rows = conversion_rows(&run);
+    let conversion = read_text(&run.join("input_conversion_manifest.tsv")).expect("conversion");
+    let normalized = read_text(&run.join("input_normalized_manifest.tsv")).expect("normalized");
+    let normalized_rows = normalized
+        .lines()
+        .skip(1)
+        .map(split_tsv)
+        .collect::<Vec<_>>();
 
     assert_eq!(rows.len(), INPUT_MANIFEST_WRITE_BATCH_SIZE * 2 + 3);
+    assert_eq!(normalized_rows.len(), rows.len());
     assert_eq!(
         rows.first().map(|row| row[1].as_str()),
         Some("record_0__record_1")
@@ -1589,6 +1811,35 @@ fn sequence_conversion_manifest_streams_across_write_batches() {
         Some("record_514__record_515")
     );
     assert!(rows.iter().all(|row| row[11].len() == 64));
+    assert!(rows.iter().all(|row| row[5].is_empty()));
+    assert!(
+        rows.iter()
+            .all(|row| row[13].starts_with("input_sequence_spool.bin#offset="))
+    );
+    assert!(normalized_rows.iter().all(|row| row[2].is_empty()));
+    assert!(
+        normalized_rows
+            .iter()
+            .all(|row| row[4].split_whitespace().count() <= 17)
+    );
+    assert!(!conversion.contains(&sequence));
+    assert!(!normalized.contains(&sequence));
+    assert_eq!(
+        fs::metadata(run.join("input_sequence_spool.bin"))
+            .expect("sequence spool")
+            .len(),
+        (sequence.len() * rows.len()) as u64
+    );
+    let restored = read_normalized_inputs(&run.join("input_normalized_manifest.tsv"))
+        .expect("restore normalized sequences");
+    assert_eq!(
+        restored
+            .first()
+            .expect("first restored sequence")
+            .primary_value,
+        sequence
+    );
+    assert!(!run.join("input_sequence_spool.bin.pending").exists());
     fs::remove_dir_all(root).expect("cleanup");
 }
 
@@ -1734,10 +1985,16 @@ fn sequence_file_formats_are_resolved_from_content() {
         let rows = conversion_rows(&run);
         assert_eq!(rows.len(), 1, "extension {extension}");
         assert_eq!(rows[0][1], *record_id, "extension {extension}");
-        assert_eq!(rows[0][5], *expected, "extension {extension}");
+        assert!(rows[0][5].is_empty(), "extension {extension}");
         assert_eq!(rows[0][8], *extension, "extension {extension}");
         assert_eq!(rows[0][9], "file", "extension {extension}");
         assert_eq!(rows[0][10], source.display().to_string());
+        let restored = read_normalized_inputs(&run.join("input_normalized_manifest.tsv"))
+            .expect("restore normalized sequence");
+        assert_eq!(
+            restored[0].primary_value, *expected,
+            "extension {extension}"
+        );
     }
     fs::remove_dir_all(root).expect("cleanup");
 }
@@ -1823,7 +2080,8 @@ fn persisted_file_path_is_resolved_with_provenance() {
     let rows = conversion_rows(&run);
     assert_eq!(rows.len(), 1);
     assert_eq!(rows[0][1], "persisted__record_1");
-    assert_eq!(rows[0][5], "MKTAYI");
+    assert!(rows[0][5].is_empty());
+    assert!(rows[0][13].starts_with("input_sequence_spool.bin#offset="));
     assert_eq!(rows[0][10], fasta.display().to_string());
     fs::remove_dir_all(root).expect("cleanup");
 }
@@ -1859,7 +2117,12 @@ fn relative_file_path_prefers_manifest_directory_over_process_cwd() {
         ScienceCommand::InputNormalize,
         &science_options(&root, &input, &run),
     )
-    .and_then(|_| read_text(&run.join("input_conversion_manifest.tsv")));
+    .and_then(|_| {
+        let manifest = read_text(&run.join("input_conversion_manifest.tsv"))?;
+        let rows = conversion_rows(&run);
+        let restored = read_normalized_inputs(&run.join("input_normalized_manifest.tsv"))?;
+        Ok((manifest, rows, restored))
+    });
 
     let work_dir = fs::canonicalize(current_dir.join("work")).expect("work directory");
     let shadow_path = fs::canonicalize(&process_shadow).expect("shadow path");
@@ -1867,11 +2130,22 @@ fn relative_file_path_prefers_manifest_directory_over_process_cwd() {
     fs::remove_file(&shadow_path).expect("cleanup process shadow");
     fs::remove_dir_all(&root).expect("cleanup fixture");
 
-    let manifest = outcome.expect("normalize relative input");
+    let (manifest, rows, restored) = outcome.expect("normalize relative input");
     assert!(manifest.contains("manifest-dir"));
-    assert!(manifest.contains("\tMKTAYI\tconverted\t"));
+    assert!(!manifest.contains("MKTAYI"));
     assert!(!manifest.contains("process-cwd"));
-    assert!(!manifest.contains("\tACDEFG\tconverted\t"));
+    assert!(!manifest.contains("ACDEFG"));
+    assert_eq!(rows.len(), 1);
+    assert!(rows[0][5].is_empty());
+    assert!(rows[0][13].starts_with("input_sequence_spool.bin#offset="));
+    assert_eq!(rows[0][10], manifest_source.display().to_string());
+    assert_eq!(restored.len(), 1);
+    assert_eq!(restored[0].record_id, "manifest-dir__record_1");
+    assert_eq!(restored[0].primary_value, "MKTAYI");
+    assert_eq!(
+        restored[0].source_path,
+        manifest_source.display().to_string()
+    );
 }
 
 #[test]
@@ -2786,6 +3060,132 @@ fn known_matching_uses_published_chembl_query_index_and_ignores_archive() {
 }
 
 #[test]
+fn chembl_runtime_rejects_missing_database_and_manifest_size_mismatch() {
+    let root = temp_root("chembl_runtime_contract");
+    let store = root.join("science_store");
+    let run = root.join("run");
+    let input = root.join("input.json");
+    write_text(
+        &store.join("indexes/known_targets.tsv"),
+        "source\ttarget_id\ttarget_name\torganism\ttarget_class\tligand_tokens\tsequence_tokens\tstructure_tokens\tevidence\n",
+    )
+    .expect("empty known index");
+    let query_index = store.join("downloads/chembl/chembl_query.sqlite");
+    write_published_chembl_query_sqlite(&query_index).expect("published ChEMBL query index");
+    write_test_source_manifest(&store, &["chembl"]).expect("ChEMBL source manifest");
+    write_text(
+        &input,
+        "{\"inputs\":[{\"field\":\"small_molecule\",\"value\":\"CCO\"}],\"files\":[]}\n",
+    )
+    .expect("input");
+    let options = ScienceOptions {
+        workspace_root: root.clone(),
+        science_store: store.clone(),
+        input_manifest: input,
+        run_dir: run.clone(),
+    };
+    run_science_command(ScienceCommand::InputNormalize, &options).expect("normalize");
+    run_science_command(ScienceCommand::FeaturesCompute, &options).expect("features");
+    write_test_science_store_readiness(&store, &[]).expect("readiness with ChEMBL manifest");
+
+    fs::remove_file(&query_index).expect("remove published database");
+    let missing = run_science_command(ScienceCommand::DatabaseMatchKnown, &options)
+        .expect_err("missing published ChEMBL database must fail");
+    assert!(
+        missing.contains("chembl_query_contract_missing"),
+        "{missing}"
+    );
+
+    write_published_chembl_query_sqlite(&query_index).expect("restore published database");
+    let manifest_path = query_index.with_extension("manifest.json");
+    let mut manifest =
+        serde_json::from_str::<Value>(&read_text(&manifest_path).expect("published manifest"))
+            .expect("manifest JSON");
+    manifest["database_bytes"] =
+        json!(fs::metadata(&query_index).expect("database metadata").len() + 1);
+    write_text(&manifest_path, &format!("{manifest}\n")).expect("tampered manifest");
+    write_test_science_store_readiness(&store, &[]).expect("readiness bound to tampered manifest");
+    let mismatch = run_science_command(ScienceCommand::DatabaseMatchKnown, &options)
+        .expect_err("manifest database byte mismatch must fail");
+    assert!(
+        mismatch.contains("chembl_query_manifest_contract_invalid"),
+        "{mismatch}"
+    );
+    fs::remove_dir_all(&root).expect("cleanup temp root");
+    assert!(!root.exists());
+}
+
+#[test]
+fn p1_integrity_chembl_runtime_hash_cache_detects_same_size_tamper_and_reuses_digest() {
+    let root = temp_root("chembl_runtime_hash_cache");
+    let store = root.join("science_store");
+    let database = store.join("downloads/chembl/chembl_query.sqlite");
+    let manifest = database.with_extension("manifest.json");
+    write_published_chembl_query_sqlite(&database).expect("published ChEMBL query index");
+    write_test_source_manifest(&store, &["chembl"]).expect("ChEMBL source manifest");
+    reset_chembl_query_database_hash_count(&database);
+    clear_chembl_query_process_hash_cache(&database);
+
+    validate_chembl_query_runtime_contract(&store, &database, &manifest)
+        .expect("first validation hashes database");
+    assert_eq!(chembl_query_database_hash_count(&database), 1);
+    let manifest_text = read_text(&manifest).expect("manifest");
+    let manifest_sha256 = sha256_bytes_hex(manifest_text.as_bytes());
+    let initial_identity =
+        chembl_query_hash_identity(&database, &manifest_sha256).expect("initial identity");
+    let cache_path =
+        chembl_query_hash_cache_path(&database, &initial_identity).expect("cache path");
+    let cache_modified = fs::metadata(&cache_path)
+        .and_then(|metadata| metadata.modified())
+        .expect("cache modified time");
+
+    validate_chembl_query_runtime_contract(&store, &database, &manifest)
+        .expect("process cache hit");
+    assert_eq!(chembl_query_database_hash_count(&database), 1);
+    clear_chembl_query_process_hash_cache(&database);
+    validate_chembl_query_runtime_contract(&store, &database, &manifest)
+        .expect("persistent cache hit");
+    assert_eq!(chembl_query_database_hash_count(&database), 1);
+    assert_eq!(
+        fs::metadata(&cache_path)
+            .and_then(|metadata| metadata.modified())
+            .expect("cache modified time after hits"),
+        cache_modified
+    );
+
+    let original = fs::read(&database).expect("original database bytes");
+    let mut tampered = original.clone();
+    let offset = tampered.len() / 2;
+    tampered[offset] ^= 0x01;
+    thread::sleep(Duration::from_millis(2));
+    fs::write(&database, &tampered).expect("same-size tamper");
+    assert_eq!(
+        fs::metadata(&database).expect("tampered metadata").len(),
+        original.len() as u64
+    );
+    assert_ne!(
+        chembl_query_hash_identity(&database, &manifest_sha256).expect("tampered identity"),
+        initial_identity
+    );
+    let error = validate_chembl_query_runtime_contract(&store, &database, &manifest)
+        .expect_err("tampered database must fail");
+    assert_eq!(error, "database_sha256_mismatch");
+    assert_eq!(chembl_query_database_hash_count(&database), 2);
+
+    thread::sleep(Duration::from_millis(2));
+    fs::write(&database, &original).expect("restore database");
+    validate_chembl_query_runtime_contract(&store, &database, &manifest)
+        .expect("restored database must pass");
+    assert_eq!(chembl_query_database_hash_count(&database), 3);
+    validate_chembl_query_runtime_contract(&store, &database, &manifest)
+        .expect("restored process cache hit");
+    assert_eq!(chembl_query_database_hash_count(&database), 3);
+
+    clear_chembl_query_process_hash_cache(&database);
+    fs::remove_dir_all(&root).expect("cleanup temp root");
+}
+
+#[test]
 fn chembl_onsite_preserves_exact_relation_and_has_no_shared_row_cap() {
     let root = temp_root("chembl_relation_and_unbounded_targets");
     let store = root.join("science_store");
@@ -3227,8 +3627,7 @@ fn known_matching_deduplicates_onsite_hits_and_downweights_token_noise() {
         "Ligand SMILES\tBindingDB Ligand Name\tTarget Name\tTarget Source Organism According to Curator or DataSource\tKi (nM)\tPDB ID(s) for Ligand-Target Complex\tLigand HET ID in PDB\tUniProt (SwissProt) Primary ID of Target Chain 1\tBindingDB MonomerID\nCC(=O)Nc1nnc(s1)S(=O)(=O)N\tAcetazolamide, AZM\tCarbonic anhydrase 2\tHomo sapiens\t900\t2H4N\tAZM\tP00918\t10880\nCC(=O)Nc1nnc(s1)S(=O)(=O)N\tAcetazolamide, AZM\tCarbonic anhydrase 2\tHomo sapiens\t12\t2H4N\tAZM\tP00918\t10880\n",
     )
     .expect("bindingdb zip");
-    write_test_source_manifest(&store, &["bindingdb", "chembl"])
-        .expect("known source manifest");
+    write_test_source_manifest(&store, &["bindingdb", "chembl"]).expect("known source manifest");
     let options = ScienceOptions {
         workspace_root: root.clone(),
         science_store: store,
@@ -3278,6 +3677,9 @@ fn structure_matching_uses_ligand_identity_from_known_search() {
     install_not_applicable_worker_fixtures(&root).expect("worker fixtures");
     let store = root.join("science_store");
     write_test_source_manifest(&store, &["rcsb_ligand_bound"]).expect("source manifest");
+    write_test_rcsb_on_demand_policy(&store);
+    let cached = rcsb_coordinate_cache_path(&store, "2H4N");
+    write_gzip(&cached, &test_rcsb_mmcif("2H4N")).expect("cached coordinate");
     let run = root.join("run");
     let input = root.join("input.json");
     ensure_dir(&store.join("indexes")).expect("indexes");
@@ -4262,7 +4664,7 @@ fn structure_evaluate_writes_viewer_from_real_coordinate_file() {
         .expect("structure index");
     write_text(
             &store.join("downloads/rcsb/mmcif/0g/10gs.cif"),
-            "ATOM 1 N N . GLY A 1 1 ? 11.104 13.207 2.100 1.00 20.00 ? 1 GLY A N 1\nATOM 2 C CA . GLY A 1 1 ? 12.456 13.607 2.500 1.00 20.00 ? 1 GLY A CA 1\n",
+            "data_10GS\nATOM 1 N N . GLY A 1 1 ? 11.104 13.207 2.100 1.00 20.00 ? 1 GLY A N 1\nATOM 2 C CA . GLY A 1 1 ? 12.456 13.607 2.500 1.00 20.00 ? 1 GLY A CA 1\n",
         )
         .expect("coordinate cif");
     let options = ScienceOptions {
@@ -4313,12 +4715,12 @@ fn structure_evaluate_prefers_bindingdb_pdb_candidate_over_token_noise() {
     .expect("structure index");
     write_text(
         &store.join("downloads/rcsb/mmcif/12/112m.cif"),
-        "_struct.title 'UNRELATED MYOGLOBIN COORDINATE'\nATOM 1 N N . GLY A 1 1 ? 1.0 1.0 1.0 1.00 20.00 ? 1 GLY A N 1\n",
+        "data_112M\n_struct.title 'UNRELATED MYOGLOBIN COORDINATE'\nATOM 1 N N . GLY A 1 1 ? 1.0 1.0 1.0 1.00 20.00 ? 1 GLY A N 1\n",
     )
     .expect("noise coordinate");
     write_text(
         &store.join("downloads/rcsb/mmcif/h4/2h4n.cif"),
-        "_struct.title 'HUMAN CARBONIC ANHYDRASE II COMPLEXED WITH ACETAZOLAMIDE'\nATOM 1 N N . GLY A 1 1 ? 2.0 2.0 2.0 1.00 20.00 ? 1 GLY A N 1\n",
+        "data_2H4N\n_struct.title 'HUMAN CARBONIC ANHYDRASE II COMPLEXED WITH ACETAZOLAMIDE'\nATOM 1 N N . GLY A 1 1 ? 2.0 2.0 2.0 1.00 20.00 ? 1 GLY A N 1\n",
     )
     .expect("target coordinate");
     write_text(
@@ -4381,7 +4783,7 @@ fn structure_evaluate_reads_canonical_index_rows_beyond_source_sampling_limit() 
     write_text(&store.join("indexes/structure_targets.tsv"), &index).expect("structure index");
     write_text(
         &store.join("downloads/rcsb/mmcif/ik/1ikv.cif"),
-        "ATOM 1 N N . GLY A 1 1 ? 11.104 13.207 2.100 1.00 20.00 ? 1 GLY A N 1\nATOM 2 C CA . GLY A 1 1 ? 12.456 13.607 2.500 1.00 20.00 ? 1 GLY A CA 1\n",
+        "data_1IKV\nATOM 1 N N . GLY A 1 1 ? 11.104 13.207 2.100 1.00 20.00 ? 1 GLY A N 1\nATOM 2 C CA . GLY A 1 1 ? 12.456 13.607 2.500 1.00 20.00 ? 1 GLY A CA 1\n",
     )
     .expect("coordinate cif");
     let options = ScienceOptions {
@@ -4883,6 +5285,54 @@ fn readiness_evidence_digest_matches_python_contract() {
 }
 
 #[test]
+fn runtime_readiness_evidence_binds_small_manifests_without_large_database_hashes() {
+    let root = temp_root("chembl_readiness_evidence");
+    let store = root.join("science_store");
+    let chembl_dir = store.join("downloads/chembl");
+    let rcsb_index_dir = store.join("indexes/foldseek/rcsb_mmcif");
+    ensure_dir(&chembl_dir).expect("ChEMBL directory");
+    ensure_dir(&rcsb_index_dir).expect("RCSB index directory");
+    write_text(
+        &chembl_dir.join("chembl_query.sqlite"),
+        "large-database-sentinel\n",
+    )
+    .expect("database sentinel");
+    write_text(
+        &chembl_dir.join("chembl_query.manifest.json"),
+        "{\"status\":\"ready\"}\n",
+    )
+    .expect("query manifest");
+    write_text(
+        &rcsb_index_dir.join("indexed_pdb_ids.tsv"),
+        "pdb_id\n1ABC\n",
+    )
+    .expect("indexed PDB identifiers");
+
+    let (evidence, _) = science_readiness_evidence(&store).expect("readiness evidence");
+    assert!(
+        evidence
+            .iter()
+            .any(|row| row.path == CHEMBL_QUERY_MANIFEST_REL_PATH)
+    );
+    assert!(
+        evidence
+            .iter()
+            .any(|row| row.path == RCSB_INDEXED_PDB_IDS_REL_PATH)
+    );
+    assert!(!evidence.iter().any(|row| row.path.ends_with(".sqlite")));
+
+    write_test_science_store_readiness(&store, &[]).expect("canonical readiness");
+    write_text(
+        &chembl_dir.join("chembl_query.manifest.json"),
+        "{\"status\":\"changed\"}\n",
+    )
+    .expect("changed query manifest");
+    let stale = evaluate_science_store_readiness(&store).expect("stale readiness");
+    assert_eq!(stale.blockers, ["science_store_readiness_stale"]);
+    fs::remove_dir_all(&root).expect("cleanup temp root");
+}
+
+#[test]
 fn shared_store_readiness_and_pipeline_reject_legacy_5000_row_projection() {
     let root = temp_root("legacy_5000_projection");
     let store = create_temporary_test_store(&root).expect("test store");
@@ -5348,6 +5798,42 @@ fn prepare_science_store_builds_known_index_from_chembl_sqlite_archive() {
 }
 
 #[test]
+fn on_demand_prepare_reuses_published_chembl_query_without_archive_reparse() {
+    let root = temp_root("reuse_published_chembl_query");
+    let store = root.join("science_store");
+    let chembl_dir = store.join("downloads/chembl");
+    let source_sqlite = root.join("chembl_source.sqlite");
+    write_chembl_sqlite(&source_sqlite).expect("write ChEMBL source sqlite");
+    write_tar_gzip_file(
+        &chembl_dir.join("chembl_sqlite.tar.gz"),
+        "chembl_36/chembl_36_sqlite/chembl_36.db",
+        &source_sqlite,
+    )
+    .expect("write ChEMBL archive");
+    write_published_chembl_query_sqlite(&chembl_dir.join("chembl_query.sqlite"))
+        .expect("write published ChEMBL query database");
+    write_text(
+        &chembl_dir.join("chembl_query.manifest.json"),
+        "{\"status\":\"ready\"}\n",
+    )
+    .expect("write published ChEMBL manifest");
+    let options = StoreOptions {
+        workspace_root: root.clone(),
+        science_store: store.clone(),
+    };
+
+    run_store_command(ScienceCommand::PrepareScienceStore, &options).expect("prepare store");
+
+    let build_manifest =
+        read_text(&store.join("index_build_manifest.tsv")).expect("build manifest");
+    let known = read_text(&store.join("indexes/known_targets.tsv")).expect("known index");
+    assert!(build_manifest.contains("published_chembl_query_used_by_onsite_matcher"));
+    assert!(!build_manifest.contains("chembl_sqlite_archive_rows"));
+    assert!(!known.contains("CHEMBL_T1"));
+    fs::remove_dir_all(&root).expect("cleanup temp root");
+}
+
+#[test]
 fn chembl_installer_archive_uses_unique_streamed_temporary_sqlite_and_one_source_query() {
     let root = temp_root("chembl_archive_unique_temp");
     let source_sqlite = root.join("chembl_source.sqlite");
@@ -5418,11 +5904,11 @@ fn prepare_science_store_builds_known_index_from_bindingdb_activity_tsv() {
 fn prepare_science_store_builds_structure_index_from_downloaded_sources() {
     let root = temp_root("build_structure_index");
     let store = root.join("science_store");
-    write_text(
+    write_gzip(
         &store.join("downloads/rcsb/mmcif/ab/1abc.cif.gz"),
-        "structure file marker",
+        &test_rcsb_mmcif("1ABC"),
     )
-    .expect("write rcsb structure marker");
+    .expect("write rcsb structure");
     write_gzip(
         &store.join("downloads/biolip2/BioLiP.txt.gz"),
         "1ABC\tA\tA\t1\tATP\tadenosine triphosphate\n",
@@ -5719,12 +6205,90 @@ fn candidate_metadata_prefers_informative_human_rows() {
 }
 
 #[test]
-fn candidate_identity_merges_same_input_record_uniprot_across_sources() {
-    let root = temp_root("candidate_uniprot_merge");
+fn chembl_canonical_target_runtime_merges_same_input_record_across_sources() {
+    let root = temp_root("chembl_canonical_target_merge");
+    let query = root.join("queries.tsv");
+    write_text(
+        &query,
+        "input_id\trecord_id\tquery\ninput_1\trecord_a\tCCO\n",
+    )
+    .expect("query");
+
+    let chembl = root.join("chembl_query.sqlite");
+    write_published_chembl_query_sqlite(&chembl).expect("ChEMBL query database");
+    update_published_chembl_target_identity(&chembl, "CCO", "P00918", "CHEMBL205")
+        .expect("canonical ChEMBL target identity");
+    let chembl_result = root.join("chembl.tsv");
+    run_python_script(
+        chembl_onsite_query_script(),
+        &[
+            chembl.display().to_string(),
+            query.display().to_string(),
+            chembl_result.display().to_string(),
+            "run_canonical_target".to_string(),
+            "chembl_canonical_target".to_string(),
+        ],
+        "chembl_canonical_target_query",
+    )
+    .expect("ChEMBL query");
+    let chembl_rows = read_text(&chembl_result).expect("ChEMBL rows");
+    let chembl_cols = split_tsv(chembl_rows.trim());
+    assert_eq!(chembl_cols[2], "P00918");
+    assert!(chembl_cols[7].contains("source_target_id=CHEMBL205"));
+    assert!(chembl_cols[8].contains("source_target_id=CHEMBL205"));
+    assert!(chembl_cols[9].contains("source_database_id=CHEMBL205"));
+
+    let bindingdb = root.join("bindingdb.zip");
+    write_zip(
+        &bindingdb,
+        "bindingdb.tsv",
+        "Ligand SMILES\tBindingDB Ligand Name\tTarget Name\tTarget Source Organism According to Curator or DataSource\tKi (nM)\tUniProt (SwissProt) Primary ID of Target Chain 1\nCCO\tacetaldehyde\tCarbonic anhydrase 2\tHomo sapiens\t12\tP00918\n",
+    )
+    .expect("BindingDB zip");
+    let bindingdb_result = root.join("bindingdb.tsv");
+    run_python_script(
+        bindingdb_onsite_query_script(),
+        &[
+            bindingdb.display().to_string(),
+            query.display().to_string(),
+            bindingdb_result.display().to_string(),
+            test_source_digest("bindingdb"),
+            "bindingdb-test-release".to_string(),
+            "run_canonical_target".to_string(),
+            "bindingdb_canonical_target".to_string(),
+        ],
+        "bindingdb_canonical_target_query",
+    )
+    .expect("BindingDB query");
+    let bindingdb_rows = read_text(&bindingdb_result).expect("BindingDB rows");
+
     let matches = root.join("matches.tsv");
     write_text(
         &matches,
-        "input_id\tsource\ttarget_id\ttarget_name\torganism\ttarget_class\tmatch_score\tmatched_features\tevidence\trecord_id\ninput_1\tChEMBL\tP00918\tCAH2\tHomo sapiens\tknown_human_protein\t0.8\tligand\tchembl_onsite_activity_row\trecord_a\ninput_1\tBindingDB\tP00918\tCarbonic anhydrase 2\tHomo sapiens\tknown_human_protein\t0.9\tligand\tbindingdb_onsite_activity_row\trecord_a\ninput_2\tUniProt\tP00918\tCarbonic anhydrase 2\tHomo sapiens\tknown_human_protein\t0.7\tsequence\tmmseqs_alignment\trecord_a\n",
+        &format!(
+            "input_id\tsource\ttarget_id\ttarget_name\torganism\ttarget_class\tmatch_score\tmatched_features\tevidence\tsource_row_provenance\tactivity_value\tligand_identity\tcurrent_run_query_id\trecord_id\n{chembl_rows}{bindingdb_rows}"
+        ),
+    )
+    .expect("combined matches");
+    let mut candidates = BTreeMap::new();
+    merge_match_file(&matches, "known_database", &mut candidates).expect("merge matches");
+    let candidates = candidates.into_values().collect::<Vec<_>>();
+
+    assert_eq!(candidates.len(), 1);
+    assert_eq!(candidates[0].target_id, "P00918");
+    assert_eq!(candidates[0].identity_namespace, "uniprot");
+    assert!(candidates[0].evidence.contains("ChEMBL"));
+    assert!(candidates[0].evidence.contains("BindingDB"));
+    fs::remove_dir_all(&root).expect("cleanup temp root");
+}
+
+#[test]
+fn chembl_canonical_target_keeps_different_records_isolated() {
+    let root = temp_root("chembl_canonical_target_record_isolation");
+    let matches = root.join("matches.tsv");
+    write_text(
+        &matches,
+        "input_id\tsource\ttarget_id\ttarget_name\torganism\ttarget_class\tmatch_score\tmatched_features\tevidence\trecord_id\ninput_1\tChEMBL\tP00918\tCAH2\tHomo sapiens\tknown_human_protein\t0.8\tligand\tchembl_onsite_activity_row;source_target_id=CHEMBL205\trecord_a\ninput_1\tBindingDB\tP00918\tCarbonic anhydrase 2\tHomo sapiens\tknown_human_protein\t0.9\tligand\tbindingdb_onsite_activity_row\trecord_b\n",
     )
     .expect("matches");
 
@@ -5734,14 +6298,70 @@ fn candidate_identity_merges_same_input_record_uniprot_across_sources() {
     assign_collision_free_candidate_ids(&mut candidates);
 
     assert_eq!(candidates.len(), 2);
-    let input_one = candidates
-        .iter()
-        .find(|candidate| candidate.input_id == "input_1")
-        .expect("input one");
-    assert!(input_one.evidence.contains("ChEMBL"));
-    assert!(input_one.evidence.contains("BindingDB"));
-    assert_eq!(input_one.identity_namespace, "uniprot");
+    assert_eq!(
+        candidates
+            .iter()
+            .map(|candidate| candidate.record_id.as_str())
+            .collect::<BTreeSet<_>>(),
+        BTreeSet::from(["record_a", "record_b"])
+    );
     assert_ne!(candidates[0].candidate_id, candidates[1].candidate_id);
+    fs::remove_dir_all(&root).expect("cleanup temp root");
+}
+
+#[test]
+fn chembl_canonical_target_multicomponent_fallback_does_not_merge() {
+    let root = temp_root("chembl_canonical_target_multicomponent");
+    let matches = root.join("matches.tsv");
+    write_text(
+        &matches,
+        "input_id\tsource\ttarget_id\ttarget_name\torganism\ttarget_class\tmatch_score\tmatched_features\tevidence\trecord_id\ninput_1\tChEMBL\tCHEMBL_COMPLEX_1\tCA complex\tHomo sapiens\tknown_human_protein\t0.8\tligand\tchembl_onsite_activity_row;source_target_id=CHEMBL_COMPLEX_1\trecord_a\ninput_1\tBindingDB\tP00918\tCarbonic anhydrase 2\tHomo sapiens\tknown_human_protein\t0.9\tligand\tbindingdb_onsite_activity_row\trecord_a\n",
+    )
+    .expect("matches");
+
+    let mut candidates = BTreeMap::new();
+    merge_match_file(&matches, "known_database", &mut candidates).expect("merge matches");
+    let candidates = candidates.into_values().collect::<Vec<_>>();
+
+    assert_eq!(candidates.len(), 2);
+    let fallback = candidates
+        .iter()
+        .find(|candidate| candidate.target_id == "CHEMBL_COMPLEX_1")
+        .expect("multi-component fallback candidate");
+    assert_eq!(fallback.identity_namespace, "chembl");
+    assert!(candidates.iter().any(|candidate| {
+        candidate.target_id == "P00918" && candidate.identity_namespace == "uniprot"
+    }));
+    fs::remove_dir_all(&root).expect("cleanup temp root");
+}
+
+#[test]
+fn chembl_canonical_target_rejects_legacy_query_schema() {
+    let root = temp_root("chembl_canonical_target_legacy_schema");
+    let database = root.join("legacy.sqlite");
+    write_legacy_published_chembl_query_sqlite(&database).expect("legacy database");
+    let query = root.join("queries.tsv");
+    write_text(
+        &query,
+        "input_id\trecord_id\tquery\ninput_1\trecord_a\tCCO\n",
+    )
+    .expect("query");
+    let error = run_python_script(
+        chembl_onsite_query_script(),
+        &[
+            database.display().to_string(),
+            query.display().to_string(),
+            root.join("result.tsv").display().to_string(),
+            "run_legacy_schema".to_string(),
+            "chembl_legacy_schema".to_string(),
+        ],
+        "chembl_canonical_target_legacy_schema",
+    )
+    .expect_err("legacy schema must be rejected");
+    assert!(
+        error.contains("chembl_query_legacy_11_column_schema_rejected"),
+        "{error}"
+    );
     fs::remove_dir_all(&root).expect("cleanup temp root");
 }
 
@@ -5931,6 +6551,31 @@ fn write_alignment_database_fixture(
     )
 }
 
+fn write_published_chembl_query_manifest(path: &Path) -> Result<(), String> {
+    let database_bytes = fs::metadata(path)
+        .map_err(|err| format!("published ChEMBL fixture metadata failed: {err}"))?
+        .len();
+    let database_sha256 = sha256_file_hex(path)
+        .ok_or_else(|| "published ChEMBL fixture digest failed".to_string())?;
+    write_text(
+        &path.with_extension("manifest.json"),
+        &format!(
+            "{}\n",
+            json!({
+                "schema_version": CHEMBL_QUERY_MANIFEST_SCHEMA_VERSION,
+                "status": "ready",
+                "database": path.display().to_string(),
+                "database_bytes": database_bytes,
+                "database_sha256": database_sha256,
+                "rows": 1,
+                "table": "genoligand_onsite_activity",
+                "source_release": "chembl-test-release",
+                "source_digest": test_source_digest("chembl"),
+            })
+        ),
+    )
+}
+
 fn write_published_chembl_query_sqlite(path: &Path) -> Result<(), String> {
     if let Some(parent) = path.parent() {
         ensure_dir(parent)?;
@@ -5950,6 +6595,7 @@ connection.executescript("""
 CREATE TABLE genoligand_onsite_activity (
     canonical_isomeric_smiles TEXT NOT NULL,
     target_id TEXT NOT NULL,
+    source_target_id TEXT NOT NULL,
     target_name TEXT NOT NULL,
     organism TEXT NOT NULL,
     compound_name TEXT NOT NULL,
@@ -5964,10 +6610,10 @@ CREATE INDEX idx_genoligand_onsite_activity_smiles
 ON genoligand_onsite_activity(canonical_isomeric_smiles);
 """)
 connection.executemany(
-    "INSERT INTO genoligand_onsite_activity VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+    "INSERT INTO genoligand_onsite_activity VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
     [
-        ("CCO", "CHEMBL_T1", "Cyclin-dependent kinase 2", "Homo sapiens", "compound one", "IC50", "=", 42.0, "nM", source_release, source_digest),
-        ("CCN", "CHEMBL_T1", "Cyclin-dependent kinase 2", "Homo sapiens", "compound two", "Ki", "=", 12.0, "nM", source_release, source_digest),
+        ("CCO", "CHEMBL_T1", "CHEMBL_T1", "Cyclin-dependent kinase 2", "Homo sapiens", "compound one", "IC50", "=", 42.0, "nM", source_release, source_digest),
+        ("CCN", "CHEMBL_T1", "CHEMBL_T1", "Cyclin-dependent kinase 2", "Homo sapiens", "compound two", "Ki", "=", 12.0, "nM", source_release, source_digest),
     ],
 )
 connection.commit()
@@ -5979,8 +6625,76 @@ connection.close()
             "chembl-test-release".to_string(),
         ],
         "published_chembl_query_fixture",
-    )
-    .map(|_| ())
+    )?;
+    write_published_chembl_query_manifest(path)
+}
+
+fn update_published_chembl_target_identity(
+    path: &Path,
+    smiles: &str,
+    target_id: &str,
+    source_target_id: &str,
+) -> Result<(), String> {
+    run_python_script(
+        r#"
+import sqlite3
+import sys
+
+connection = sqlite3.connect(sys.argv[1])
+cursor = connection.execute(
+    "UPDATE genoligand_onsite_activity SET target_id = ?, source_target_id = ? WHERE canonical_isomeric_smiles = ?",
+    (sys.argv[3], sys.argv[4], sys.argv[2]),
+)
+if cursor.rowcount != 1:
+    raise RuntimeError("unexpected fixture target count")
+connection.commit()
+connection.close()
+"#,
+        &[
+            path.display().to_string(),
+            smiles.to_string(),
+            target_id.to_string(),
+            source_target_id.to_string(),
+        ],
+        "published_chembl_target_identity_fixture",
+    )?;
+    write_published_chembl_query_manifest(path)
+}
+
+fn write_legacy_published_chembl_query_sqlite(path: &Path) -> Result<(), String> {
+    if let Some(parent) = path.parent() {
+        ensure_dir(parent)?;
+    }
+    run_python_script(
+        r#"
+import sqlite3
+import sys
+
+connection = sqlite3.connect(sys.argv[1])
+connection.executescript("""
+CREATE TABLE genoligand_onsite_activity (
+    canonical_isomeric_smiles TEXT NOT NULL,
+    target_id TEXT NOT NULL,
+    target_name TEXT NOT NULL,
+    organism TEXT NOT NULL,
+    compound_name TEXT NOT NULL,
+    standard_type TEXT NOT NULL,
+    standard_relation TEXT NOT NULL,
+    standard_value REAL NOT NULL,
+    standard_units TEXT NOT NULL,
+    source_release TEXT NOT NULL,
+    source_digest TEXT NOT NULL
+);
+CREATE INDEX idx_genoligand_onsite_activity_smiles
+ON genoligand_onsite_activity(canonical_isomeric_smiles);
+""")
+connection.commit()
+connection.close()
+"#,
+        &[path.display().to_string()],
+        "legacy_published_chembl_query_fixture",
+    )?;
+    write_published_chembl_query_manifest(path)
 }
 
 fn write_chembl_sqlite(path: &Path) -> Result<(), String> {
@@ -6075,14 +6789,15 @@ connection = sqlite3.connect(sys.argv[1])
 activities = []
 for group in ("CCO", "CCN"):
     for index in range(target_count):
-        activities.append((group, f"CHEMBL_{group}_{index}", f"{group} target {index}", "Homo sapiens", group, "Ki", "=", float(index + 1), "nM", source_release, source_digest))
+        target_id = f"CHEMBL_{group}_{index}"
+        activities.append((group, target_id, target_id, f"{group} target {index}", "Homo sapiens", group, "Ki", "=", float(index + 1), "nM", source_release, source_digest))
 activities.extend([
-    ("CCO", "CHEMBL_RELATION_BEST", "Relation best target", "Homo sapiens", "ethanol", "IC50", ">", 1.0, "nM", source_release, source_digest),
-    ("CCO", "CHEMBL_RELATION_BEST", "Relation best target", "Homo sapiens", "ethanol", "IC50", "=", 100.0, "nM", source_release, source_digest),
-    ("CCO", "CHEMBL_RELATION_CENSORED", "Censored relation target", "Homo sapiens", "ethanol", "Ki", "<", 10.0, "nM", source_release, source_digest),
+    ("CCO", "CHEMBL_RELATION_BEST", "CHEMBL_RELATION_BEST", "Relation best target", "Homo sapiens", "ethanol", "IC50", ">", 1.0, "nM", source_release, source_digest),
+    ("CCO", "CHEMBL_RELATION_BEST", "CHEMBL_RELATION_BEST", "Relation best target", "Homo sapiens", "ethanol", "IC50", "=", 100.0, "nM", source_release, source_digest),
+    ("CCO", "CHEMBL_RELATION_CENSORED", "CHEMBL_RELATION_CENSORED", "Censored relation target", "Homo sapiens", "ethanol", "Ki", "<", 10.0, "nM", source_release, source_digest),
 ])
 connection.executemany(
-    "INSERT INTO genoligand_onsite_activity VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+    "INSERT INTO genoligand_onsite_activity VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
     activities,
 )
 connection.commit()
@@ -6095,8 +6810,8 @@ connection.close()
             "chembl-test-release".to_string(),
         ],
         "published_chembl_many_fixture",
-    )
-    .map(|_| ())
+    )?;
+    write_published_chembl_query_manifest(path)
 }
 
 fn add_published_chembl_activity_rows(
@@ -6130,9 +6845,9 @@ source_release = sys.argv[4]
 for row in rows:
     target_id = row["target_id"]
     connection.execute(
-        "INSERT INTO genoligand_onsite_activity VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        "INSERT INTO genoligand_onsite_activity VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         (
-            row["smiles"], target_id, f"Target {target_id}", "Homo sapiens",
+            row["smiles"], target_id, target_id, f"Target {target_id}", "Homo sapiens",
             f"Compound {target_id}", "IC50", row["relation"], row["value"], "nM",
             source_release, source_digest,
         ),
@@ -6149,7 +6864,8 @@ connection.close()
         "published_chembl_activity_fixture",
     );
     let _ = fs::remove_file(payload_path);
-    result.map(|_| ())
+    result?;
+    write_published_chembl_query_manifest(path)
 }
 
 fn temp_root(label: &str) -> PathBuf {
@@ -6225,7 +6941,7 @@ fn coordinate_top_n_uses_independent_docking_and_md_jobs() {
         write_text(
             &coordinate,
             &format!(
-                "_struct.title 'TARGET {target_id}'\nATOM 1 N N . GLY A 1 1 ? 1.0 1.0 1.0 1.00 20.00 ? 1 GLY A N 1\n"
+                "data_{pdb_id}\n_struct.title 'TARGET {target_id}'\nATOM 1 N N . GLY A 1 1 ? 1.0 1.0 1.0 1.00 20.00 ? 1 GLY A N 1\n"
             ),
         )
         .expect("coordinate");
@@ -6304,6 +7020,481 @@ fn coordinate_top_n_uses_independent_docking_and_md_jobs() {
         );
         assert!(decomposition.contains(&format!("{candidate_id}\tmd_outcome_present\t1.0000")));
     }
+    fs::remove_dir_all(&root).expect("cleanup temp root");
+}
+
+#[test]
+fn p1_integrity_coordinate_cache_requires_matching_mmcif_or_pdb_identity() {
+    let root = temp_root("coordinate_cache_identity");
+    let correct_mmcif = root.join("1abc.cif");
+    let entry_only_mmcif = root.join("1abc.mmcif");
+    let wrong_mmcif = root.join("wrong.cif");
+    let missing_mmcif = root.join("missing.cif");
+    let conflicting_mmcif = root.join("conflicting.cif");
+    let correct_pdb = root.join("1abc.pdb");
+    let correct_ent = root.join("pdb1abc.ent");
+    let wrong_pdb = root.join("wrong.pdb");
+    let missing_pdb = root.join("missing.pdb");
+    write_text(&correct_mmcif, &test_rcsb_mmcif("1ABC")).expect("correct mmCIF");
+    write_text(
+        &entry_only_mmcif,
+        "_entry.id\n'1ABC'\nATOM 1 N N 1.0 2.0 3.0\n",
+    )
+    .expect("entry-only mmCIF");
+    write_text(&wrong_mmcif, &test_rcsb_mmcif("9ZZZ")).expect("wrong mmCIF");
+    write_text(&missing_mmcif, "ATOM 1 N N 1.0 2.0 3.0\n").expect("missing mmCIF");
+    write_text(
+        &conflicting_mmcif,
+        "data_1ABC\n_entry.id 9ZZZ\nATOM 1 N N 1.0 2.0 3.0\n",
+    )
+    .expect("conflicting mmCIF");
+    write_text(&correct_pdb, &test_rcsb_pdb("1ABC")).expect("correct PDB");
+    write_text(&correct_ent, &test_rcsb_pdb("1ABC")).expect("correct ENT");
+    write_text(&wrong_pdb, &test_rcsb_pdb("9ZZZ")).expect("wrong PDB");
+    write_text(&missing_pdb, minimal_pdb_block()).expect("missing PDB header");
+
+    assert!(coordinate_file_matches_pdb(&correct_mmcif, "1ABC"));
+    assert!(coordinate_file_matches_pdb(&entry_only_mmcif, "1ABC"));
+    assert!(!coordinate_file_matches_pdb(&wrong_mmcif, "1ABC"));
+    assert!(!coordinate_file_matches_pdb(&missing_mmcif, "1ABC"));
+    assert!(!coordinate_file_matches_pdb(&conflicting_mmcif, "1ABC"));
+    assert!(coordinate_file_matches_pdb(&correct_pdb, "1ABC"));
+    assert!(coordinate_file_matches_pdb(&correct_ent, "1ABC"));
+    assert!(!coordinate_file_matches_pdb(&wrong_pdb, "1ABC"));
+    assert!(!coordinate_file_matches_pdb(&missing_pdb, "1ABC"));
+    fs::remove_dir_all(&root).expect("cleanup temp root");
+}
+
+#[test]
+fn p1_integrity_invalid_coordinate_cache_fetches_or_stays_out_of_downstream() {
+    let root = temp_root("invalid_coordinate_cache_downstream_gate");
+    let run = root.join("run");
+    let store = root.join("science_store");
+    let options = ScienceOptions {
+        workspace_root: root.clone(),
+        science_store: store.clone(),
+        input_manifest: root.join("input.json"),
+        run_dir: run.clone(),
+    };
+    write_test_rcsb_on_demand_policy(&store);
+    write_text(
+        &run.join("known_database_matches.tsv"),
+        "input_id\tsource\ttarget_id\ttarget_name\torganism\ttarget_class\tmatch_score\tmatched_features\tevidence\tprovenance\tactivity\tstructure\tstructure_source\trecord_id\ninput_1\tBindingDB\tP00001\tTarget one\tHomo sapiens\tenzyme\t1.0\tligand_code=LIG;pdb_ids=1ABC\tbindingdb_onsite_activity_row;Ki (nM)=10;pdb_ids=1ABC\t\t\t\t\trecord_1\ninput_2\tBindingDB\tP00002\tTarget two\tHomo sapiens\tenzyme\t0.9\tligand_code=LIG;pdb_ids=2BBB\tbindingdb_onsite_activity_row;Ki (nM)=20;pdb_ids=2BBB\t\t\t\t\trecord_1\n",
+    )
+    .expect("known matches");
+    write_gzip(
+        &rcsb_coordinate_cache_path(&store, "1ABC"),
+        &test_rcsb_mmcif("9ZZZ"),
+    )
+    .expect("wrong cached identity");
+    write_gzip(
+        &rcsb_coordinate_cache_path(&store, "2BBB"),
+        "ATOM 1 N N 1.0 2.0 3.0\n",
+    )
+    .expect("missing cached identity");
+    let server = TestHttpServer::start(BTreeMap::from([
+        (
+            "/1ABC.cif.gz".to_string(),
+            TestHttpResponse {
+                status: 200,
+                content_type: "application/gzip",
+                body: test_gzip_bytes(&test_rcsb_mmcif("1ABC")),
+            },
+        ),
+        (
+            "/2BBB.cif.gz".to_string(),
+            TestHttpResponse {
+                status: 404,
+                content_type: "text/plain",
+                body: b"missing".to_vec(),
+            },
+        ),
+    ]));
+
+    assert!(
+        write_coordinate_backed_candidate_selection_with_base_url(&options, &[], &server.base_url)
+            .expect("identity-gated selection")
+    );
+
+    let audit = read_text(&run.join(RCSB_ON_DEMAND_FETCH_MANIFEST)).expect("fetch audit");
+    assert!(audit.contains("1ABC\tfetched\t"));
+    assert!(audit.contains("2BBB\tnot_found\t"));
+    let selection = read_text(&run.join("complex_candidate_selection.tsv")).expect("selection");
+    assert!(selection.contains("\t1ABC\t"));
+    assert!(!selection.contains("\t2BBB\t"));
+    let viewer = read_text(&run.join("structure_viewer.cif")).expect("viewer");
+    assert!(viewer.contains("data_1ABC"));
+    assert!(!viewer.contains("data_9ZZZ"));
+    fs::remove_dir_all(&root).expect("cleanup temp root");
+}
+
+#[test]
+fn p1_integrity_structure_index_excludes_wrong_or_missing_cached_identity() {
+    let root = temp_root("structure_index_identity_gate");
+    let store = root.join("science_store");
+    write_gzip(
+        &store.join("downloads/rcsb/mmcif/cc/3ccc.cif.gz"),
+        &test_rcsb_mmcif("3CCC"),
+    )
+    .expect("correct cached coordinate");
+    write_gzip(
+        &store.join("downloads/rcsb/mmcif/dd/4ddd.cif.gz"),
+        &test_rcsb_mmcif("9ZZZ"),
+    )
+    .expect("wrong cached coordinate");
+    write_gzip(
+        &store.join("downloads/rcsb/mmcif/ee/5eee.cif.gz"),
+        "ATOM 1 N N 1.0 2.0 3.0\n",
+    )
+    .expect("identity-free cached coordinate");
+    let options = StoreOptions {
+        workspace_root: root.clone(),
+        science_store: store.clone(),
+    };
+
+    run_store_command(ScienceCommand::PrepareScienceStore, &options).expect("prepare store");
+    let structure =
+        read_text(&store.join("indexes/structure_targets.tsv")).expect("structure index");
+    assert!(structure.contains("\t3CCC\t"));
+    assert!(!structure.contains("\t4DDD\t"));
+    assert!(!structure.contains("\t5EEE\t"));
+    fs::remove_dir_all(&root).expect("cleanup temp root");
+}
+
+#[test]
+fn rcsb_on_demand_selection_fetches_valid_coordinate_and_publishes_audit() {
+    let root = temp_root("rcsb_on_demand_selection_success");
+    let run = root.join("run");
+    let store = root.join("science_store");
+    let options = ScienceOptions {
+        workspace_root: root.clone(),
+        science_store: store.clone(),
+        input_manifest: root.join("input.json"),
+        run_dir: run.clone(),
+    };
+    write_test_rcsb_on_demand_policy(&store);
+    write_text(
+        &run.join("known_database_matches.tsv"),
+        "input_id\tsource\ttarget_id\ttarget_name\torganism\ttarget_class\tmatch_score\tmatched_features\tevidence\tprovenance\tactivity\tstructure\tstructure_source\trecord_id\ninput_1\tBindingDB\tP00001\tTarget one\tHomo sapiens\tenzyme\t1.0\tligand_code=LIG;pdb_ids=1ABC\tbindingdb_onsite_activity_row;Ki (nM)=10;pdb_ids=1ABC\t\t\t\t\trecord_1\n",
+    )
+    .expect("known matches");
+    let cache_dir = store.join("downloads/rcsb/mmcif/ab");
+    write_text(&cache_dir.join(".1abc.old.cif.gz.part"), "stale").expect("stale part");
+    write_text(&cache_dir.join(".1abc.old.cif.gz.part.identity.json"), "{}")
+        .expect("stale identity");
+    let server = TestHttpServer::start(BTreeMap::from([(
+        "/1ABC.cif.gz".to_string(),
+        TestHttpResponse {
+            status: 200,
+            content_type: "application/gzip",
+            body: test_gzip_bytes(&test_rcsb_mmcif("1ABC")),
+        },
+    )]));
+
+    assert!(
+        write_coordinate_backed_candidate_selection_with_base_url(&options, &[], &server.base_url,)
+            .expect("on-demand selection")
+    );
+
+    let coordinate = rcsb_coordinate_cache_path(&store, "1ABC");
+    assert!(coordinate_file_matches_pdb(&coordinate, "1ABC"));
+    assert_eq!(server.requests(), ["/1ABC.cif.gz"]);
+    let audit = read_text(&run.join(RCSB_ON_DEMAND_FETCH_MANIFEST)).expect("fetch audit");
+    assert!(audit.contains("1ABC\tfetched\t"));
+    assert!(audit.contains("validated_and_atomically_published"));
+    let selection = read_text(&run.join("complex_candidate_selection.tsv")).expect("selection");
+    assert!(selection.contains("rcsb_fetch_manifest=rcsb_on_demand_fetch.tsv"));
+    assert!(selection.contains("rcsb_fetch_status=fetched"));
+    assert!(
+        fs::read_dir(&cache_dir)
+            .expect("cache directory")
+            .filter_map(Result::ok)
+            .all(|entry| {
+                let name = entry.file_name().to_string_lossy().to_string();
+                !name.contains(".part") && !name.contains("identity") && !name.ends_with(".lock")
+            })
+    );
+    fs::remove_dir_all(&root).expect("cleanup temp root");
+}
+
+#[test]
+fn rcsb_on_demand_selection_continues_after_404() {
+    let root = temp_root("rcsb_on_demand_404_then_success");
+    let run = root.join("run");
+    let store = root.join("science_store");
+    let options = ScienceOptions {
+        workspace_root: root.clone(),
+        science_store: store.clone(),
+        input_manifest: root.join("input.json"),
+        run_dir: run.clone(),
+    };
+    write_test_rcsb_on_demand_policy(&store);
+    write_text(
+        &run.join("known_database_matches.tsv"),
+        "input_id\tsource\ttarget_id\ttarget_name\torganism\ttarget_class\tmatch_score\tmatched_features\tevidence\tprovenance\tactivity\tstructure\tstructure_source\trecord_id\ninput_1\tBindingDB\tP00002\tTarget two\tHomo sapiens\tenzyme\t1.0\tligand_code=LIG;pdb_ids=1AAA,2BBB\tbindingdb_onsite_activity_row;Ki (nM)=10;pdb_ids=1AAA,2BBB\t\t\t\t\trecord_1\n",
+    )
+    .expect("known matches");
+    let server = TestHttpServer::start(BTreeMap::from([
+        (
+            "/1AAA.cif.gz".to_string(),
+            TestHttpResponse {
+                status: 404,
+                content_type: "text/plain",
+                body: b"missing".to_vec(),
+            },
+        ),
+        (
+            "/2BBB.cif.gz".to_string(),
+            TestHttpResponse {
+                status: 200,
+                content_type: "application/gzip",
+                body: test_gzip_bytes(&test_rcsb_mmcif("2BBB")),
+            },
+        ),
+    ]));
+
+    assert!(
+        write_coordinate_backed_candidate_selection_with_base_url(&options, &[], &server.base_url,)
+            .expect("404 fallback selection")
+    );
+
+    assert_eq!(server.requests(), ["/1AAA.cif.gz", "/2BBB.cif.gz"]);
+    let audit = read_text(&run.join(RCSB_ON_DEMAND_FETCH_MANIFEST)).expect("fetch audit");
+    assert!(audit.contains("1AAA\tnot_found\t"));
+    assert!(audit.contains("2BBB\tfetched\t"));
+    let selection = read_text(&run.join("complex_candidate_selection.tsv")).expect("selection");
+    assert!(selection.contains("\t2BBB\t"));
+    fs::remove_dir_all(&root).expect("cleanup temp root");
+}
+
+#[test]
+fn rcsb_on_demand_rejects_bad_gzip_and_wrong_entry_without_replacing_cache() {
+    let root = temp_root("rcsb_on_demand_invalid_payloads");
+    let run = root.join("run");
+    let store = root.join("science_store");
+    let options = ScienceOptions {
+        workspace_root: root.clone(),
+        science_store: store.clone(),
+        input_manifest: root.join("input.json"),
+        run_dir: run.clone(),
+    };
+    write_test_rcsb_on_demand_policy(&store);
+    write_text(
+        &run.join("known_database_matches.tsv"),
+        "input_id\tsource\ttarget_id\ttarget_name\torganism\ttarget_class\tmatch_score\tmatched_features\tevidence\tprovenance\tactivity\tstructure\tstructure_source\trecord_id\ninput_1\tBindingDB\tP00003\tTarget three\tHomo sapiens\tenzyme\t1.0\tligand_code=LIG;pdb_ids=1AAA,2BBB,3CCC\tbindingdb_onsite_activity_row;Ki (nM)=10;pdb_ids=1AAA,2BBB,3CCC\t\t\t\t\trecord_1\n",
+    )
+    .expect("known matches");
+    let invalid_cached = rcsb_coordinate_cache_path(&store, "2BBB");
+    write_text(&invalid_cached, "invalid cached sentinel").expect("invalid cached coordinate");
+    let server = TestHttpServer::start(BTreeMap::from([
+        (
+            "/1AAA.cif.gz".to_string(),
+            TestHttpResponse {
+                status: 200,
+                content_type: "application/gzip",
+                body: b"<html>upstream error</html>".to_vec(),
+            },
+        ),
+        (
+            "/2BBB.cif.gz".to_string(),
+            TestHttpResponse {
+                status: 200,
+                content_type: "application/gzip",
+                body: test_gzip_bytes(&test_rcsb_mmcif("9ZZZ")),
+            },
+        ),
+        (
+            "/3CCC.cif.gz".to_string(),
+            TestHttpResponse {
+                status: 200,
+                content_type: "application/gzip",
+                body: test_gzip_bytes(&test_rcsb_mmcif("3CCC")),
+            },
+        ),
+    ]));
+
+    assert!(
+        write_coordinate_backed_candidate_selection_with_base_url(&options, &[], &server.base_url,)
+            .expect("invalid payload fallback selection")
+    );
+
+    assert_eq!(
+        read_text(&invalid_cached).expect("unchanged invalid cache"),
+        "invalid cached sentinel"
+    );
+    let audit = read_text(&run.join(RCSB_ON_DEMAND_FETCH_MANIFEST)).expect("fetch audit");
+    assert!(audit.contains("1AAA\tfailed\t"));
+    assert!(audit.contains("gzip_validation_failed"));
+    assert!(audit.contains("2BBB\tfailed\t"));
+    assert!(audit.contains("pdb_entry_id_mismatch"));
+    assert!(audit.contains("3CCC\tfetched\t"));
+    fs::remove_dir_all(&root).expect("cleanup temp root");
+}
+
+#[test]
+fn rcsb_on_demand_reuses_cache_without_network_and_serializes_same_id_fetches() {
+    let root = temp_root("rcsb_on_demand_reuse_and_concurrency");
+    let run = root.join("run");
+    let store = root.join("science_store");
+    let options = ScienceOptions {
+        workspace_root: root.clone(),
+        science_store: store.clone(),
+        input_manifest: root.join("input.json"),
+        run_dir: run.clone(),
+    };
+    write_test_rcsb_on_demand_policy(&store);
+    write_text(
+        &run.join("known_database_matches.tsv"),
+        "input_id\tsource\ttarget_id\ttarget_name\torganism\ttarget_class\tmatch_score\tmatched_features\tevidence\tprovenance\tactivity\tstructure\tstructure_source\trecord_id\ninput_1\tBindingDB\tP00004\tTarget four\tHomo sapiens\tenzyme\t1.0\tligand_code=LIG;pdb_ids=4DDD\tbindingdb_onsite_activity_row;Ki (nM)=10;pdb_ids=4DDD\t\t\t\t\trecord_1\n",
+    )
+    .expect("known matches");
+    let cached = rcsb_coordinate_cache_path(&store, "4DDD");
+    write_gzip(&cached, &test_rcsb_mmcif("4DDD")).expect("cached coordinate");
+    let cached_server = TestHttpServer::start(BTreeMap::new());
+
+    for _ in 0..2 {
+        assert!(
+            write_coordinate_backed_candidate_selection_with_base_url(
+                &options,
+                &[],
+                &cached_server.base_url,
+            )
+            .expect("cached selection")
+        );
+    }
+    assert!(cached_server.requests().is_empty());
+    assert!(
+        read_text(&run.join(RCSB_ON_DEMAND_FETCH_MANIFEST))
+            .expect("cached fetch audit")
+            .contains("4DDD\treused\t")
+    );
+
+    let concurrent_store = root.join("concurrent_store");
+    let concurrent_server = TestHttpServer::start(BTreeMap::from([(
+        "/5EEE.cif.gz".to_string(),
+        TestHttpResponse {
+            status: 200,
+            content_type: "application/gzip",
+            body: test_gzip_bytes(&test_rcsb_mmcif("5EEE")),
+        },
+    )]));
+    let mut workers = Vec::new();
+    for _ in 0..2 {
+        let worker_store = concurrent_store.clone();
+        let base_url = concurrent_server.base_url.clone();
+        workers.push(thread::spawn(move || {
+            let python = vec!["python".to_string()];
+            fetch_rcsb_coordinate_with_python(&worker_store, "5EEE", &base_url, Some(&python))
+        }));
+    }
+    let results = workers
+        .into_iter()
+        .map(|worker| worker.join().expect("join concurrent fetch"))
+        .collect::<Vec<_>>();
+    assert!(
+        results
+            .iter()
+            .all(|result| matches!(result.status.as_str(), "fetched" | "reused"))
+    );
+    assert_eq!(concurrent_server.requests(), ["/5EEE.cif.gz"]);
+    let concurrent_coordinate = rcsb_coordinate_cache_path(&concurrent_store, "5EEE");
+    assert!(coordinate_file_matches_pdb(&concurrent_coordinate, "5EEE"));
+    let python = vec!["python".to_string()];
+    let repeated = fetch_rcsb_coordinate_with_python(
+        &concurrent_store,
+        "5EEE",
+        &concurrent_server.base_url,
+        Some(&python),
+    );
+    assert_eq!(repeated.status, "reused");
+    assert_eq!(concurrent_server.requests(), ["/5EEE.cif.gz"]);
+    fs::remove_dir_all(&root).expect("cleanup temp root");
+}
+
+#[test]
+fn rcsb_on_demand_stops_at_declared_request_limit() {
+    let root = temp_root("rcsb_on_demand_request_limit");
+    let run = root.join("run");
+    let store = root.join("science_store");
+    let options = ScienceOptions {
+        workspace_root: root.clone(),
+        science_store: store.clone(),
+        input_manifest: root.join("input.json"),
+        run_dir: run.clone(),
+    };
+    write_test_rcsb_on_demand_policy(&store);
+    let mut known = String::from(
+        "input_id\tsource\ttarget_id\ttarget_name\torganism\ttarget_class\tmatch_score\tmatched_features\tevidence\tprovenance\tactivity\tstructure\tstructure_source\trecord_id\n",
+    );
+    for index in 0..(RCSB_ON_DEMAND_FETCH_LIMIT + 1) {
+        let pdb_id = format!("1A{index:02}");
+        known.push_str(&format!(
+            "input_1\tBindingDB\tP{index:05}\tTarget {index}\tHomo sapiens\tenzyme\t1.0\tligand_code=LIG;pdb_ids={pdb_id}\tbindingdb_onsite_activity_row;Ki (nM)={};pdb_ids={pdb_id}\t\t\t\t\trecord_1\n",
+            index + 1,
+        ));
+    }
+    write_text(&run.join("known_database_matches.tsv"), &known).expect("known matches");
+    let server = TestHttpServer::start(BTreeMap::new());
+
+    assert!(
+        !write_coordinate_backed_candidate_selection_with_base_url(
+            &options,
+            &[],
+            &server.base_url,
+        )
+        .expect("bounded on-demand selection")
+    );
+
+    assert_eq!(server.requests().len(), RCSB_ON_DEMAND_FETCH_LIMIT);
+    let audit = read_text(&run.join(RCSB_ON_DEMAND_FETCH_MANIFEST)).expect("fetch audit");
+    assert_eq!(
+        audit
+            .lines()
+            .skip(1)
+            .filter(|line| line.contains("\tnot_found\t"))
+            .count(),
+        RCSB_ON_DEMAND_FETCH_LIMIT
+    );
+    assert!(audit.contains("\tskipped\t"));
+    assert!(audit.contains("max_fetches_per_run_reached"));
+    fs::remove_dir_all(&root).expect("cleanup temp root");
+}
+
+#[test]
+fn rcsb_on_demand_rejects_unofficial_policy_before_network() {
+    let root = temp_root("rcsb_on_demand_policy_gate");
+    let run = root.join("run");
+    let store = root.join("science_store");
+    let options = ScienceOptions {
+        workspace_root: root.clone(),
+        science_store: store.clone(),
+        input_manifest: root.join("input.json"),
+        run_dir: run.clone(),
+    };
+    write_test_rcsb_on_demand_policy(&store);
+    let policy_path = store.join("downloads/rcsb/on_demand_policy.json");
+    let policy = read_text(&policy_path)
+        .expect("policy")
+        .replace(RCSB_OFFICIAL_DOWNLOAD_BASE_URL, "https://example.invalid");
+    write_text(&policy_path, &policy).expect("tampered policy");
+    write_text(
+        &run.join("known_database_matches.tsv"),
+        "input_id\tsource\ttarget_id\ttarget_name\torganism\ttarget_class\tmatch_score\tmatched_features\tevidence\tprovenance\tactivity\tstructure\tstructure_source\trecord_id\ninput_1\tBindingDB\tP00006\tTarget six\tHomo sapiens\tenzyme\t1.0\tligand_code=LIG;pdb_ids=6FFF\tbindingdb_onsite_activity_row;Ki (nM)=10;pdb_ids=6FFF\t\t\t\t\trecord_1\n",
+    )
+    .expect("known matches");
+    let server = TestHttpServer::start(BTreeMap::new());
+
+    let error =
+        write_coordinate_backed_candidate_selection_with_base_url(&options, &[], &server.base_url)
+            .expect_err("unofficial policy must fail closed");
+
+    assert!(error.contains("rcsb_on_demand_policy_invalid:official_base_url"));
+    assert!(server.requests().is_empty());
+    assert!(
+        read_text(&run.join(RCSB_ON_DEMAND_FETCH_MANIFEST))
+            .expect("policy failure audit")
+            .contains("rcsb_on_demand_policy_invalid:official_base_url")
+    );
     fs::remove_dir_all(&root).expect("cleanup temp root");
 }
 

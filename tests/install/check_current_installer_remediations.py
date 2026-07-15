@@ -13,6 +13,7 @@ import tarfile
 import tempfile
 import threading
 import unittest
+import urllib.error
 import zipfile
 from contextlib import closing, contextmanager
 from pathlib import Path
@@ -32,15 +33,60 @@ def load_installer():
     return module
 
 
+def rcsb_mmcif_text(pdb_id: str) -> str:
+    return (
+        f"data_{pdb_id.lower()}\n"
+        f"_entry.id {pdb_id.upper()}\n"
+        "loop_\n"
+        "_atom_site.group_PDB\n"
+        "_atom_site.Cartn_x\n"
+        "_atom_site.Cartn_y\n"
+        "_atom_site.Cartn_z\n"
+        "ATOM 1.0 2.0 3.0\n#\n"
+    )
+
+
+def create_database_directory_fixture(prefix: Path, payload: bytes, entries: int = 1) -> None:
+    prefix.parent.mkdir(parents=True, exist_ok=True)
+    prefix.write_bytes(payload)
+    Path(f"{prefix}.dbtype").write_bytes(b"\x00\x00\x00\x00")
+    Path(f"{prefix}.index").write_text(
+        "".join(f"{key}\t{key}\t1\n" for key in range(entries)),
+        encoding="ascii",
+    )
+    Path(f"{prefix}.lookup").write_text(
+        "".join(f"{key}\tentry_{key}\t0\n" for key in range(entries)),
+        encoding="ascii",
+    )
+
+
+def directory_bytes(root: Path) -> dict[str, bytes]:
+    return {
+        path.relative_to(root).as_posix(): path.read_bytes()
+        for path in sorted(root.rglob("*"))
+        if path.is_file()
+    }
+
+
+def run_database_publish_crash_child(root: Path, stage: str) -> int:
+    installer = load_installer()
+    os.environ["GENOLIGAND_TEST_DATABASE_PUBLISH_HARD_EXIT_STAGE"] = stage
+    installer.publish_database_directory(
+        root / ".database.rebuild-fixture/target",
+        root / "database/target",
+    )
+    return 4
+
+
 def bindingdb_catalog_row(**overrides: str) -> dict[str, str]:
     row = {
         "source_id": "bindingdb",
-        "url": "https://www.bindingdb.org/rwd/bind/downloads/BindingDB_All_202606_tsv.zip",
+        "url": "https://www.bindingdb.org/rwd/bind/downloads/BindingDB_All_202607_tsv.zip",
         "local_path": "downloads/bindingdb/bindingdb_all.tsv.zip",
-        "sha256": "",
-        "release_or_date": "2026-06",
-        "release_identity": "BindingDB_All_202606_tsv",
-        "trust_source": "publisher_immutable_release_domain_validation",
+        "sha256": "f89c851bae81657c5509ccc13586676861b6ef9ae2e8424d57c393faaf9a9ed9",
+        "release_or_date": "2026-07",
+        "release_identity": "BindingDB_All_202607_tsv",
+        "trust_source": "publisher_md5_verified_sha256_immutable_release_domain_validation",
         "media_type": "bindingdb_tsv",
         "compression": "zip",
         "min_records": "2",
@@ -48,6 +94,130 @@ def bindingdb_catalog_row(**overrides: str) -> dict[str, str]:
     }
     row.update(overrides)
     return row
+
+
+def create_chembl_fixture(root: Path) -> tuple[Path, Path, Path, Path, Path]:
+    store = root / "science_store"
+    chembl_dir = store / "downloads/chembl"
+    chembl_dir.mkdir(parents=True)
+    source_db = root / "chembl_37.db"
+    with closing(sqlite3.connect(source_db)) as connection:
+        connection.executescript(
+            """
+            CREATE TABLE activities (assay_id INTEGER, molregno INTEGER, standard_type TEXT,
+                standard_relation TEXT, standard_value REAL, standard_units TEXT);
+            CREATE TABLE assays (assay_id INTEGER, tid INTEGER);
+            CREATE TABLE target_dictionary (tid INTEGER, chembl_id TEXT, pref_name TEXT, organism TEXT);
+            CREATE TABLE molecule_dictionary (molregno INTEGER, pref_name TEXT);
+            CREATE TABLE compound_structures (molregno INTEGER, canonical_smiles TEXT);
+            CREATE TABLE target_components (tid INTEGER, component_id INTEGER);
+            CREATE TABLE component_sequences (component_id INTEGER, accession TEXT);
+            INSERT INTO activities VALUES
+                (1, 1, 'IC50', '=', 7.0, 'nM'),
+                (2, 2, 'Ki', '<', 8.0, NULL),
+                (1, 3, 'Kd', '=', 9.0, ''),
+                (1, 4, 'AC50', '=', 10.0, 'nM'),
+                (1, 5, 'IC50', '=', 11.0, 'uM'),
+                (1, 6, 'IC50', '=', NULL, 'nM');
+            INSERT INTO assays VALUES (1, 1), (2, 2);
+            INSERT INTO target_dictionary VALUES
+                (1, 'CHEMBL_T1', 'Target 1', 'Homo sapiens'),
+                (2, 'CHEMBL_T2', 'Target 2', 'Homo sapiens');
+            INSERT INTO molecule_dictionary VALUES
+                (1, 'Compound 1'), (2, 'Compound 2'), (3, 'Compound 3'),
+                (4, 'Compound 4'), (5, 'Compound 5'), (6, 'Compound 6');
+            INSERT INTO compound_structures VALUES
+                (1, 'CCO'), (2, 'CCN'), (3, 'CCC'), (4, 'CCCl'), (5, 'CCBr'),
+                (6, 'CCF');
+            INSERT INTO target_components VALUES (1, 10), (1, 11), (2, 20), (2, 21);
+            INSERT INTO component_sequences VALUES
+                (10, 'P12345'), (11, 'P12345'), (20, 'P22222'), (21, 'P33333');
+            """
+        )
+    archive = chembl_dir / "chembl_sqlite.tar.gz"
+    with tarfile.open(archive, "w:gz") as handle:
+        handle.add(source_db, arcname="chembl_37/chembl_37.db")
+    catalog = root / "source_catalog.tsv"
+    catalog.write_text(
+        "source_id\trelease_identity\trelease_or_date\nchembl\tCHEMBL37\tCHEMBL37\n",
+        encoding="utf-8",
+    )
+    return store, chembl_dir, source_db, archive, catalog
+
+
+def create_previous_chembl_query(database: Path) -> Path:
+    with closing(sqlite3.connect(database)) as connection:
+        connection.executescript(
+            """
+            CREATE TABLE genoligand_onsite_activity (
+                canonical_isomeric_smiles TEXT, target_id TEXT, source_target_id TEXT,
+                target_name TEXT, organism TEXT, compound_name TEXT, standard_type TEXT,
+                standard_relation TEXT, standard_value REAL, standard_units TEXT,
+                source_release TEXT, source_digest TEXT
+            );
+            INSERT INTO genoligand_onsite_activity VALUES
+                ('OLD', 'OLD_TARGET', 'OLD_SOURCE_TARGET', 'Old target', '', 'Old compound',
+                 'IC50', '=', 1.0, 'nM', 'CHEMBL36', 'old-digest');
+            CREATE INDEX idx_genoligand_onsite_activity_smiles
+                ON genoligand_onsite_activity(canonical_isomeric_smiles);
+            CREATE INDEX idx_genoligand_onsite_activity_target
+                ON genoligand_onsite_activity(target_id);
+            """
+        )
+    manifest = database.with_suffix(".manifest.json")
+    manifest.write_text(
+        json.dumps(
+            {
+                "status": "ready",
+                "table": "genoligand_onsite_activity",
+                "source_release": "CHEMBL36",
+                "source_digest": "old-digest",
+            },
+            sort_keys=True,
+        ),
+        encoding="utf-8",
+    )
+    return manifest
+
+
+def run_chembl_crash_child(root: Path, failpoint: int) -> int:
+    installer = load_installer()
+    store = root / "science_store"
+    database = store / "downloads/chembl/chembl_query.sqlite"
+    manifest = database.with_suffix(".manifest.json")
+    transaction = installer.chembl_query_transaction_path(database)
+    scratch = root / "scratch"
+    real_replace = installer.os.replace
+    replaced = 0
+
+    def crash_after_publish_replace(source: str | Path, target: str | Path) -> None:
+        nonlocal replaced
+        source_path = Path(source).resolve()
+        target_path = Path(target).resolve()
+        real_replace(source, target)
+        payload = installer.read_json_object(transaction)
+        paths = installer.chembl_transaction_paths(database, manifest, payload, scratch)
+        if paths is None:
+            return
+        publish_replaces = {
+            (paths["live_database"].resolve(), paths["backup_database"].resolve()),
+            (paths["live_manifest"].resolve(), paths["backup_manifest"].resolve()),
+            (paths["staging_database"].resolve(), paths["live_database"].resolve()),
+            (paths["staging_manifest"].resolve(), paths["live_manifest"].resolve()),
+        }
+        if (source_path, target_path) in publish_replaces:
+            replaced += 1
+            if replaced == failpoint:
+                os._exit(80 + failpoint)
+
+    installer.os.replace = crash_after_publish_replace
+    installer.publish_chembl_query_database(
+        store,
+        root / "source_catalog.tsv",
+        {},
+        scratch_dir=scratch,
+    )
+    return 4
 
 
 def create_sparse_file(path: Path, size: int) -> None:
@@ -182,6 +352,152 @@ class CurrentInstallerRemediations(unittest.TestCase):
     def setUpClass(cls) -> None:
         cls.installer = load_installer()
 
+    @staticmethod
+    def windows_share_error(code: int = 5) -> PermissionError:
+        err = PermissionError(13, f"injected Windows sharing error {code}")
+        err.winerror = code
+        return err
+
+    def test_json_atomic_retries_windows_sharing_error_with_same_temporary(self) -> None:
+        installer = self.installer
+        with tempfile.TemporaryDirectory() as tmp:
+            target = Path(tmp) / "install_progress.json"
+            real_replace = installer.os.replace
+            sources: list[Path] = []
+
+            def replace_after_three_conflicts(source: Path, destination: Path) -> None:
+                sources.append(Path(source))
+                if len(sources) <= 3:
+                    raise self.windows_share_error(5)
+                real_replace(source, destination)
+
+            with mock.patch.object(
+                installer.os,
+                "replace",
+                side_effect=replace_after_three_conflicts,
+            ), mock.patch.object(installer.time, "sleep") as sleeper, mock.patch.object(
+                installer,
+                "fsync_directory_if_supported",
+            ) as directory_sync, mock.patch.object(
+                installer,
+                "windows_atomic_replace_retryable",
+                side_effect=lambda err: getattr(err, "winerror", None)
+                in installer.WINDOWS_ATOMIC_REPLACE_RETRY_CODES,
+            ):
+                installer.write_json_atomic(target, {"status": "ready", "sequence": 1})
+
+            self.assertEqual(len(sources), 4)
+            self.assertEqual(len(set(sources)), 1, "replace retries must retain one written temporary")
+            self.assertEqual(
+                [call.args[0] for call in sleeper.call_args_list],
+                list(installer.ATOMIC_REPLACE_RETRY_DELAYS[:3]),
+            )
+            directory_sync.assert_called_once_with(target.parent)
+            self.assertEqual(json.loads(target.read_text(encoding="utf-8"))["sequence"], 1)
+            self.assertFalse(list(target.parent.glob(f".{target.name}.*.tmp")))
+
+    def test_json_atomic_persistent_sharing_error_keeps_last_good_and_attempt(self) -> None:
+        installer = self.installer
+        with tempfile.TemporaryDirectory() as tmp:
+            target = Path(tmp) / "install_progress.json"
+            target.write_text('{"status":"last-good"}\n', encoding="utf-8")
+            last_good = target.read_bytes()
+            error = self.windows_share_error(32)
+            with mock.patch.object(installer.os, "replace", side_effect=error) as replace, mock.patch.object(
+                installer.time,
+                "sleep",
+            ) as sleeper, mock.patch.object(
+                installer,
+                "windows_atomic_replace_retryable",
+                side_effect=lambda err: getattr(err, "winerror", None)
+                in installer.WINDOWS_ATOMIC_REPLACE_RETRY_CODES,
+            ):
+                with self.assertRaises(PermissionError) as raised:
+                    installer.write_json_atomic(target, {"status": "new"})
+
+            self.assertIs(raised.exception, error)
+            self.assertEqual(replace.call_count, len(installer.ATOMIC_REPLACE_RETRY_DELAYS) + 1)
+            self.assertEqual(sleeper.call_count, len(installer.ATOMIC_REPLACE_RETRY_DELAYS))
+            self.assertEqual(target.read_bytes(), last_good)
+            attempt = json.loads(Path(f"{target}.attempt.json").read_text(encoding="utf-8"))
+            self.assertEqual(attempt["status"], "failed")
+            self.assertEqual(attempt["winerror"], 32)
+            self.assertEqual(attempt["replace_attempts"], replace.call_count)
+            self.assertFalse(list(target.parent.glob(f".{target.name}.*.tmp")))
+
+    def test_json_atomic_does_not_retry_non_sharing_error(self) -> None:
+        installer = self.installer
+        with tempfile.TemporaryDirectory() as tmp:
+            target = Path(tmp) / "install_progress.json"
+            target.write_text('{"status":"last-good"}\n', encoding="utf-8")
+            error = OSError(22, "injected invalid argument")
+            error.winerror = 87
+            with mock.patch.object(installer.os, "replace", side_effect=error) as replace, mock.patch.object(
+                installer.time,
+                "sleep",
+            ) as sleeper:
+                with self.assertRaises(OSError) as raised:
+                    installer.write_json_atomic(target, {"status": "new"})
+
+            self.assertIs(raised.exception, error)
+            self.assertEqual(replace.call_count, 1)
+            sleeper.assert_not_called()
+            self.assertEqual(json.loads(target.read_text(encoding="utf-8"))["status"], "last-good")
+
+    def test_json_atomic_serializes_same_target_and_publishes_complete_json(self) -> None:
+        installer = self.installer
+        with tempfile.TemporaryDirectory() as tmp:
+            target = Path(tmp) / "install_progress.json"
+            real_replace = installer.os.replace
+            workers = 8
+            barrier = threading.Barrier(workers)
+            guard = threading.Lock()
+            active = 0
+            maximum_active = 0
+            sources: list[Path] = []
+            failures: list[BaseException] = []
+
+            def observed_replace(source: Path, destination: Path) -> None:
+                nonlocal active, maximum_active
+                with guard:
+                    active += 1
+                    maximum_active = max(maximum_active, active)
+                    sources.append(Path(source))
+                threading.Event().wait(0.005)
+                try:
+                    real_replace(source, destination)
+                finally:
+                    with guard:
+                        active -= 1
+
+            def writer(sequence: int) -> None:
+                try:
+                    barrier.wait()
+                    installer.write_json_atomic(
+                        target,
+                        {"status": "ready", "sequence": sequence, "payload": "x" * 1024},
+                    )
+                except BaseException as err:  # preserve worker assertion evidence
+                    failures.append(err)
+
+            with mock.patch.object(installer.os, "replace", side_effect=observed_replace):
+                threads = [threading.Thread(target=writer, args=(sequence,)) for sequence in range(workers)]
+                for thread in threads:
+                    thread.start()
+                for thread in threads:
+                    thread.join(timeout=5)
+
+            self.assertFalse(failures)
+            self.assertTrue(all(not thread.is_alive() for thread in threads))
+            self.assertEqual(maximum_active, 1, "same target replace calls must be serialized")
+            self.assertEqual(len(sources), workers)
+            self.assertEqual(len(set(sources)), workers, "each writer must use its own temporary")
+            final = json.loads(target.read_text(encoding="utf-8"))
+            self.assertEqual(final["status"], "ready")
+            self.assertIn(final["sequence"], range(workers))
+            self.assertEqual(final["payload"], "x" * 1024)
+            self.assertFalse(list(target.parent.glob(f".{target.name}.*.tmp")))
+
     def test_readiness_is_serialized_and_empty_manifests_block(self) -> None:
         installer = self.installer
         with tempfile.TemporaryDirectory() as tmp:
@@ -261,12 +577,12 @@ class CurrentInstallerRemediations(unittest.TestCase):
             self.assertIn("source_required:bindingdb", codes)
 
             with (manifest_dir / "source_file_manifest.tsv").open("a", encoding="utf-8", newline="") as handle:
-                handle.write(f"bindingdb\tready\t{'b' * 64}\tBindingDB_All_202606_tsv\tfixture_domain_validation\n")
+                handle.write(f"bindingdb\tready\t{'b' * 64}\tBindingDB_All_202607_tsv\tfixture_domain_validation\n")
             result = installer.evaluate_installer_science_store_readiness(store, persist=False)
             bindingdb = next(item for item in result["sources"] if item["logical_source"] == "bindingdb")
             self.assertEqual(bindingdb["source_manifest_status"], "ready")
             self.assertEqual(bindingdb["source_digest"], "b" * 64)
-            self.assertEqual(bindingdb["release_identity"], "BindingDB_All_202606_tsv")
+            self.assertEqual(bindingdb["release_identity"], "BindingDB_All_202607_tsv")
 
     def test_alignment_manifest_schema_and_legacy_probe_migration(self) -> None:
         installer = self.installer
@@ -277,6 +593,18 @@ class CurrentInstallerRemediations(unittest.TestCase):
             source.parent.mkdir(parents=True)
             db.parent.mkdir(parents=True)
             source.write_text(">id\nAAAA\n", encoding="utf-8")
+            header = db.with_name("target_h")
+            for path, payload in (
+                (db, b"sequence-db"),
+                (Path(f"{db}.dbtype"), b"\x00\x00\x00\x01"),
+                (Path(f"{db}.index"), b"0\t0\t11\n"),
+                (Path(f"{db}.lookup"), b"0\tid\t0\n"),
+                (Path(f"{db}.source"), b"0\tsource.fa\n"),
+                (header, b"\x00id\n"),
+                (Path(f"{header}.dbtype"), b"\x00\x00\x00\x01"),
+                (Path(f"{header}.index"), b"0\t0\t4\n"),
+            ):
+                path.write_bytes(payload)
             legacy = {
                 "source_id": "source",
                 "source_path": "downloads/source.fa",
@@ -285,9 +613,15 @@ class CurrentInstallerRemediations(unittest.TestCase):
             }
             summary = installer.resource_payload_summary(source)
             with mock.patch.object(installer, "database_prefix_ready", return_value=True):
-                self.assertFalse(
+                self.assertTrue(
                     installer.legacy_alignment_manifest_can_migrate(
                         "mmseqs", legacy, store, source, db, "mmseqs", {}, None, summary, "builder-1"
+                    )
+                )
+                partial = {**legacy, "source_digest": summary["sha256"]}
+                self.assertFalse(
+                    installer.legacy_alignment_manifest_can_migrate(
+                        "mmseqs", partial, store, source, db, "mmseqs", {}, None, summary, "builder-1"
                     )
                 )
                 legacy.update(
@@ -303,12 +637,486 @@ class CurrentInstallerRemediations(unittest.TestCase):
                         "mmseqs", legacy, store, source, db, "mmseqs", {}, None, summary, "builder-1"
                     )
                 )
+                Path(f"{db}.source").write_text("0\tsource.fa\n1\tother.fa\n", encoding="utf-8")
+                self.assertFalse(
+                    installer.legacy_alignment_manifest_can_migrate(
+                        "mmseqs", legacy, store, source, db, "mmseqs", {}, None, summary, "builder-1"
+                    )
+                )
+                Path(f"{db}.source").write_text("0\tsource.fa\n", encoding="utf-8")
+                Path(f"{header}.index").unlink()
+                self.assertFalse(
+                    installer.legacy_alignment_manifest_can_migrate(
+                        "mmseqs", legacy, store, source, db, "mmseqs", {}, None, summary, "builder-1"
+                    )
+                )
+                Path(f"{header}.index").write_bytes(b"0\t0\t4\n")
+                self.assertFalse(
+                    installer.legacy_alignment_manifest_can_migrate(
+                        "mmseqs",
+                        {**legacy, "source_path": "downloads/other.fa"},
+                        store,
+                        source,
+                        db,
+                        "mmseqs",
+                        {},
+                        None,
+                        summary,
+                        "builder-1",
+                    )
+                )
+            with mock.patch.object(installer, "database_prefix_ready", return_value=False):
+                self.assertFalse(
+                    installer.legacy_alignment_manifest_can_migrate(
+                        "mmseqs", legacy, store, source, db, "mmseqs", {}, None, summary, "builder-1"
+                    )
+                )
             fields = installer.alignment_source_manifest_fields(
                 summary, "builder-1"
             )
             self.assertEqual(fields["manifest_schema_version"], installer.ALIGNMENT_MANIFEST_SCHEMA_VERSION)
             for name in ("source_digest", "source_files", "source_bytes", "builder_version"):
                 self.assertTrue(fields[name])
+
+    def test_capacity_reuses_strict_legacy_migration_and_ambiguous_rebuild_preserves_database(self) -> None:
+        installer = self.installer
+        with tempfile.TemporaryDirectory() as tmp:
+            store = Path(tmp)
+            source = store / "downloads/uniprot/uniprot_human_reviewed.fasta.gz"
+            source.parent.mkdir(parents=True)
+            source.write_bytes(b">id\nAAAA\n")
+            source_id = "uniprot_uniprot_human_reviewed.fasta"
+            db = store / f"indexes/mmseqs/{source_id}/target"
+            db.parent.mkdir(parents=True)
+            db.write_bytes(b"last-good-createdb")
+            manifest = store / "indexes/mmseqs/mmseqs_target_databases.tsv"
+            installer.write_simple_tsv(
+                manifest,
+                ["source_id", "source_path", "db_path", "status", "notes"],
+                [
+                    {
+                        "source_id": source_id,
+                        "source_path": "downloads/uniprot/uniprot_human_reviewed.fasta.gz",
+                        "db_path": f"indexes/mmseqs/{source_id}/target",
+                        "status": "ready",
+                        "notes": "already_available",
+                    }
+                ],
+            )
+
+            with mock.patch.object(
+                installer, "legacy_alignment_manifest_can_migrate", return_value=True
+            ) as predicate, mock.patch.object(
+                installer, "database_builder_version", return_value="builder-1"
+            ):
+                plan = installer.installation_capacity_plan(
+                    store,
+                    store / "missing-catalog.tsv",
+                    store / "missing-sync.tsv",
+                    available_bytes=installer.DISK_SAFETY_MARGIN_BYTES * 4,
+                )
+            item = next(row for row in plan["items"] if row["component"] == f"alignment:{source_id}")
+            self.assertEqual(item["action"], "migrate_after_probe")
+            self.assertEqual(item["staging_bytes"], 0)
+            self.assertEqual(predicate.call_args.args[:5], ("mmseqs", mock.ANY, store, source, db))
+
+            last_good = db.read_bytes()
+            with mock.patch.object(
+                installer, "legacy_alignment_manifest_can_migrate", return_value=False
+            ), mock.patch.object(
+                installer, "database_builder_version", return_value="builder-1"
+            ), mock.patch.object(
+                installer, "build_mmseqs_database", return_value=("failed", "ambiguous_legacy_binding")
+            ) as rebuild:
+                rows = installer.build_mmseqs_target_databases(store, {}, None)
+            self.assertTrue(rebuild.call_args.kwargs["force_rebuild"])
+            self.assertEqual(rows[0]["status"], "failed")
+            self.assertEqual(db.read_bytes(), last_good)
+
+    def test_foldseek_on_demand_migrates_valid_legacy_subset_and_rejects_bad_bindings(self) -> None:
+        installer = self.installer
+        with tempfile.TemporaryDirectory() as tmp:
+            store = Path(tmp) / "science_store"
+            coordinate_root = store / "downloads/rcsb/mmcif"
+            scope = {"1ABC", "2DEF", "3GHI"}
+            explicit_scope = store / "downloads/rcsb/ligand_bound_pdb_ids.txt"
+            explicit_scope.parent.mkdir(parents=True, exist_ok=True)
+            explicit_scope.write_text("\n".join(sorted(scope)) + "\n", encoding="utf-8")
+            for pdb_id in sorted(scope):
+                coordinate = coordinate_root / pdb_id[1:3].lower() / f"{pdb_id.lower()}.cif.gz"
+                coordinate.parent.mkdir(parents=True, exist_ok=True)
+                with gzip.open(coordinate, "wt", encoding="utf-8") as handle:
+                    handle.write(rcsb_mmcif_text(pdb_id))
+            snapshot = installer.write_rcsb_scope_manifest(
+                store,
+                coordinate_root,
+                scope,
+                scope_mode="on-demand",
+            )
+            installer.write_rcsb_on_demand_policy(store, snapshot)
+            db = store / "indexes/foldseek/rcsb_mmcif/target"
+            create_database_directory_fixture(db, b"last-good-foldseek", entries=4)
+            listing = Path(f"{db}.source")
+            lookup = Path(f"{db}.lookup")
+            index = Path(f"{db}.index")
+            source_text = "0\t1abc_MODEL_1\n1\t2def_MODEL_1\n"
+            lookup_text = (
+                "0\t1abc_A\t0\n"
+                "1\t1abc_B\t0\n"
+                "2\t2def_A\t1\n"
+                "3\t2def_B\t1\n"
+            )
+            index_text = "".join(f"{key}\t{key}\t1\n" for key in range(4))
+            listing.write_text(source_text, encoding="utf-8")
+            lookup.write_text(lookup_text, encoding="utf-8")
+            index.write_text(index_text, encoding="ascii")
+            with mock.patch.object(
+                installer, "database_prefix_ready", return_value=True
+            ), mock.patch.object(
+                installer,
+                "build_foldseek_database",
+                side_effect=AssertionError("valid legacy subset must not rebuild"),
+            ):
+                rows = installer.build_foldseek_target_database(
+                    store,
+                    {},
+                    None,
+                    rcsb_mode="on-demand",
+                )
+            row = rows[0]
+            self.assertEqual(row["status"], "ready")
+            self.assertEqual(row["manifest_schema_version"], installer.ALIGNMENT_MANIFEST_SCHEMA_VERSION)
+            self.assertEqual(row["scope_status"], "ready_partial_on_demand")
+            self.assertEqual(row["scope_mode"], "on_demand")
+            self.assertEqual(row["indexed_pdb_count"], "2")
+            self.assertEqual(row["indexed_entries"], "4")
+            self.assertEqual(row["refresh_needed"], "true")
+            self.assertRegex(row["source_digest"], r"^[0-9a-f]{64}$")
+            self.assertRegex(row["indexed_source_listing_sha256"], r"^[0-9a-f]{64}$")
+            self.assertRegex(row["indexed_mapping_sha256"], r"^[0-9a-f]{64}$")
+            validated = store / row["indexed_validated_ids_manifest"]
+            validated_rows = installer.read_tsv(validated)
+            self.assertEqual([item["pdb_id"] for item in validated_rows], ["1ABC", "2DEF"])
+            self.assertTrue(all(item["sha256"] == installer.sha256_file(store / item["coordinate_rel_path"])
+                                for item in validated_rows))
+
+            with mock.patch.object(
+                installer, "database_prefix_ready", return_value=True
+            ), mock.patch.object(
+                installer,
+                "resource_payload_summary",
+                side_effect=AssertionError("validated partial manifest must bypass the full coordinate tree digest"),
+            ), mock.patch.object(
+                installer,
+                "build_foldseek_database",
+                side_effect=AssertionError("validated partial database must be reused"),
+            ):
+                reused = installer.build_foldseek_target_database(
+                    store,
+                    {},
+                    None,
+                    rcsb_mode="on-demand",
+                )[0]
+            self.assertEqual(reused["status"], "ready")
+            self.assertIn("manifest_database_probe_reused", reused["notes"])
+
+            def validate_partial(candidate: dict[str, str] | None = None) -> dict[str, object]:
+                return installer.foldseek_partial_manifest_validation(
+                    store,
+                    candidate or row,
+                    db,
+                    probe_database=False,
+                )
+
+            coordinate = coordinate_root / "ab/1abc.cif.gz"
+            original_coordinate = coordinate.read_bytes()
+            same_size_replacement = bytearray(original_coordinate)
+            same_size_replacement[-1] ^= 1
+            coordinate.write_bytes(same_size_replacement)
+            self.assertEqual(coordinate.stat().st_size, len(original_coordinate))
+            self.assertEqual(
+                validate_partial()["reason"],
+                "foldseek_partial_coordinate_binding_invalid:1ABC",
+            )
+            coordinate.write_bytes(original_coordinate)
+
+            lookup.write_text(lookup_text.replace("1abc_A\t0", "1abc_A\t9"), encoding="utf-8")
+            self.assertIn("foldseek_lookup_source_key_missing", validate_partial()["reason"])
+            lookup.write_text(lookup_text.replace("2def_A\t1", "2def_A\t0"), encoding="utf-8")
+            self.assertIn("foldseek_lookup_source_identity_mismatch", validate_partial()["reason"])
+            lookup.write_text(
+                "0\t1abc_A\t0\n1\t1abc_B\t0\n2\t1abc_C\t0\n3\t1abc_D\t0\n",
+                encoding="utf-8",
+            )
+            self.assertIn("foldseek_source_unreferenced", validate_partial()["reason"])
+            lookup.write_text(lookup_text.replace("1abc_A", "1abc_Z"), encoding="utf-8")
+            self.assertEqual(validate_partial()["reason"], "foldseek_partial_mapping_digest_mismatch")
+            lookup.write_text(lookup_text, encoding="utf-8")
+            index.write_text(index_text.replace("3\t3\t1", "4\t3\t1"), encoding="ascii")
+            self.assertIn("foldseek_index_lookup_key_mismatch", validate_partial()["reason"])
+            index.write_text(index_text, encoding="ascii")
+
+            listing.write_text(source_text.replace("2def", "3ghi"), encoding="utf-8")
+            lookup.write_text(lookup_text.replace("2def", "3ghi"), encoding="utf-8")
+            changed_mapping = installer.foldseek_database_mapping_summary(db)
+            forged_mapping_row = {
+                **row,
+                "indexed_source_listing_sha256": installer.sha256_file(listing),
+                "indexed_mapping_sha256": str(changed_mapping["mapping_sha256"]),
+            }
+            self.assertEqual(
+                validate_partial(forged_mapping_row)["reason"],
+                "foldseek_partial_source_validated_ids_mismatch",
+            )
+            listing.write_text(source_text, encoding="utf-8")
+            lookup.write_text(lookup_text, encoding="utf-8")
+
+            scope_manifest = store / "downloads/rcsb/ligand_bound_pdb_scope.tsv"
+            scope_text = scope_manifest.read_text(encoding="utf-8")
+            scope_manifest.write_text(
+                scope_text.replace(validated_rows[0]["sha256"], "0" * 64, 1),
+                encoding="utf-8",
+            )
+            self.assertEqual(
+                validate_partial()["reason"],
+                "foldseek_partial_coordinate_binding_invalid:1ABC",
+            )
+            scope_manifest.write_text(scope_text, encoding="utf-8")
+
+            (coordinate_root / "de/2def.cif.gz").unlink()
+            with mock.patch.object(installer, "database_prefix_ready", return_value=True):
+                missing = installer.foldseek_legacy_partial_migration(
+                    store,
+                    db,
+                    None,
+                    {},
+                    None,
+                    snapshot,
+                    db.parent / "missing-evidence.tsv",
+                )
+            self.assertEqual(missing["reason"], "legacy_foldseek_indexed_coordinate_invalid:2DEF")
+            listing.write_text("0\tnot-a-pdb-model\n", encoding="utf-8")
+            malformed = installer.foldseek_legacy_partial_migration(
+                store,
+                db,
+                None,
+                {},
+                None,
+                snapshot,
+                db.parent / "bad-evidence.tsv",
+            )
+            self.assertIn("foldseek_source_pdb_id_invalid", malformed["reason"])
+
+    def test_foldseek_cross_volume_publish_trims_index_and_preserves_previous_on_failure(self) -> None:
+        installer = self.installer
+
+        def create_artifacts(
+            _command: str | None,
+            _source: Path,
+            prefix: Path,
+            _env: dict[str, str] | None,
+            _wsl_distro: str | None,
+        ) -> tuple[str, str]:
+            prefix.parent.mkdir(parents=True, exist_ok=True)
+            prefix.write_bytes(b"new-foldseek-core")
+            Path(f"{prefix}.dbtype").write_bytes(b"\x00\x00\x00\x00")
+            Path(f"{prefix}.index").write_bytes(b"0\t0\t4\n")
+            Path(f"{prefix}.lookup").write_bytes(b"0\tfixture\n")
+            Path(f"{prefix}.source").write_bytes(b"0\t1abc_MODEL_1\n")
+            Path(f"{prefix}.idx").write_bytes(b"x" * 400)
+            Path(f"{prefix}.idx.dbtype").write_bytes(b"\x00\x00\x00\x00")
+            Path(f"{prefix}.idx.index").write_bytes(b"x" * 400)
+            return "ready", "fixture_createdb_createindex_completed"
+
+        cases = [
+            ("cross_volume_success", 1 << 50, [True, True], False, "ready", True),
+            (
+                "compact_after_index_trim",
+                installer.DISK_SAFETY_MARGIN_BYTES + 512,
+                [True, True, True],
+                False,
+                "ready",
+                False,
+            ),
+            ("copy_failure", 1 << 50, [True], True, "failed", None),
+            ("target_probe_failure", 1 << 50, [True, False], False, "failed", None),
+        ]
+        for name, target_free, probes, copy_failure, expected_status, expect_index in cases:
+            with self.subTest(name=name), tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                source = root / "source/mmcif"
+                source.mkdir(parents=True)
+                (source / "1abc.cif.gz").write_bytes(b"coordinate")
+                db = root / "science_store/indexes/foldseek/rcsb_mmcif/target"
+                db.parent.mkdir(parents=True)
+                db.write_bytes(b"last-good-foldseek")
+                scratch = root / "scratch-volume"
+                scratch.mkdir()
+                real_copy = installer.copy_foldseek_database_with_capacity_guard
+
+                def disk_usage(path: Path):
+                    resolved = Path(path).resolve()
+                    free = (1 << 50) if scratch.resolve() == resolved or scratch.resolve() in resolved.parents else target_free
+                    return mock.Mock(free=free)
+
+                copy_patch = (
+                    mock.patch.object(
+                        installer,
+                        "copy_foldseek_database_with_capacity_guard",
+                        side_effect=OSError("fixture copy failure"),
+                    )
+                    if copy_failure
+                    else mock.patch.object(
+                        installer,
+                        "copy_foldseek_database_with_capacity_guard",
+                        wraps=real_copy,
+                    )
+                )
+                with mock.patch.object(
+                    installer,
+                    "foldseek_staging_estimate",
+                    return_value={
+                        "source_files": 1,
+                        "source_bytes": 10,
+                        "scratch_staging_bytes": 1,
+                        "target_staging_bytes": 1,
+                    },
+                ), mock.patch.object(
+                    installer.shutil, "disk_usage", side_effect=disk_usage
+                ), mock.patch.object(
+                    installer,
+                    "create_foldseek_database_artifacts",
+                    side_effect=create_artifacts,
+                ), mock.patch.object(
+                    installer, "database_prefix_ready", side_effect=probes
+                ), mock.patch.object(
+                    installer, "same_storage_volume", return_value=False
+                ), copy_patch:
+                    result = installer.rebuild_foldseek_database(
+                        None,
+                        source,
+                        db,
+                        {},
+                        None,
+                        scratch_dir=scratch,
+                    )
+                self.assertEqual(result[0], expected_status)
+                if expected_status == "ready":
+                    self.assertEqual(db.read_bytes(), b"new-foldseek-core")
+                    self.assertEqual(Path(f"{db}.idx").exists(), expect_index)
+                    self.assertIn("cross_volume_scratch", result[1])
+                else:
+                    self.assertEqual(db.read_bytes(), b"last-good-foldseek")
+                self.assertEqual(list(scratch.glob("foldseek-rcsb-rebuild-*")), [])
+                self.assertEqual(list(db.parent.parent.glob(".rcsb_mmcif.rebuild-*")), [])
+                self.assertEqual(list(db.parent.parent.glob(".rcsb_mmcif.previous-*")), [])
+
+    def test_database_directory_hard_interruptions_reconcile_without_losing_last_good(self) -> None:
+        installer = self.installer
+        for stage, expected in (
+            ("after_descriptor", b"old-database"),
+            ("after_backup", b"old-database"),
+            ("after_live", b"new-database"),
+        ):
+            with self.subTest(stage=stage), tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                live = root / "database/target"
+                staged = root / ".database.rebuild-fixture/target"
+                create_database_directory_fixture(live, b"old-database")
+                create_database_directory_fixture(staged, b"new-database")
+                completed = subprocess.run(
+                    [
+                        sys.executable,
+                        str(Path(__file__).resolve()),
+                        "--database-publish-crash-child",
+                        str(root),
+                        stage,
+                    ],
+                    cwd=ROOT,
+                    capture_output=True,
+                    text=True,
+                    encoding="utf-8",
+                    errors="replace",
+                    timeout=30,
+                    check=False,
+                )
+                self.assertEqual(completed.returncode, 97, completed.stdout + completed.stderr)
+                recovery = installer.reconcile_database_directory_publish(live)
+                self.assertEqual(recovery["status"], "ready", recovery)
+                self.assertEqual(live.read_bytes(), expected)
+                self.assertFalse(installer.database_directory_transaction_path(live).exists())
+                self.assertEqual(list(root.glob(".database.rebuild-*")), [])
+                self.assertEqual(list(root.glob(".database.previous-*")), [])
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            live = root / "database/target"
+            backups = [root / f".database.previous-{suffix}/target" for suffix in ("a", "b")]
+            for index, candidate in enumerate(backups):
+                create_database_directory_fixture(candidate, f"old-{index}".encode("ascii"))
+            preserved = {candidate.parent: directory_bytes(candidate.parent) for candidate in backups}
+            recovery = installer.reconcile_database_directory_publish(live)
+            self.assertEqual(recovery["status"], "needs_repair")
+            self.assertIn("ambiguous", recovery["reason"])
+            self.assertFalse(live.exists())
+            self.assertEqual(
+                {candidate.parent: directory_bytes(candidate.parent) for candidate in backups},
+                preserved,
+            )
+
+    def test_foldseek_capacity_and_main_order_use_shared_scratch_before_chembl_and_cli(self) -> None:
+        installer = self.installer
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            store = root / "science_store"
+            source = store / "downloads/rcsb/mmcif/ab/1abc.cif.gz"
+            source.parent.mkdir(parents=True)
+            source.write_bytes(b"coordinate")
+            db = store / "indexes/foldseek/rcsb_mmcif/target"
+            db.parent.mkdir(parents=True)
+            db.write_bytes(b"legacy-database")
+            Path(f"{db}.source").write_text("0\t1abc_MODEL_1\n", encoding="utf-8")
+            scratch = root / "scratch"
+            with mock.patch.object(installer, "same_storage_volume", return_value=False):
+                plan = installer.installation_capacity_plan(
+                    store,
+                    root / "missing-catalog.tsv",
+                    root / "missing-sync.tsv",
+                    available_bytes=installer.DISK_SAFETY_MARGIN_BYTES * 3,
+                    scratch_dir=scratch,
+                    scratch_available_bytes=installer.DISK_SAFETY_MARGIN_BYTES * 3,
+                    rcsb_mode="on-demand",
+                )
+            item = next(row for row in plan["items"] if row["component"] == "alignment:rcsb_mmcif")
+            self.assertEqual(item["action"], "migrate_partial_on_demand_after_probe")
+            self.assertEqual(item["target_staging_bytes"], 0)
+            self.assertEqual(item["scratch_staging_bytes"], 0)
+            self.assertFalse(item["scratch_target_same_volume"])
+
+        source_text = INSTALLER.read_text(encoding="utf-8")
+        main_text = source_text[source_text.index("def main() -> int:") :]
+        alignment_position = main_text.index("alignment_database_result = build_persistent_alignment_databases")
+        chembl_position = main_text.index("chembl_query_result = (", alignment_position)
+        cli_position = main_text.index("completed = run_command(command, env=command_env)", chembl_position)
+        self.assertLess(alignment_position, chembl_position)
+        self.assertLess(chembl_position, cli_position)
+        self.assertNotIn("tarfile.open", main_text[chembl_position:cli_position])
+        self.assertNotIn("chembl_sqlite.tar.gz", main_text[chembl_position:cli_position])
+        self.assertIn('parser.add_argument("--rcsb-mode", choices=["on-demand", "complete"], default="on-demand")', main_text)
+        self.assertIn("scratch_dir=scratch_dir", main_text[alignment_position:chembl_position])
+
+        with tempfile.TemporaryDirectory() as tmp, mock.patch.dict(
+            os.environ,
+            {"LOCALAPPDATA": str(Path(tmp) / "local"), "GENOLIGAND_SCRATCH_DIR": ""},
+        ):
+            self.assertIn(
+                'return Path(local) / "GenoLigand" / "installer-scratch"',
+                source_text,
+            )
+            explicit = Path(tmp) / "explicit-scratch"
+            with mock.patch.dict(os.environ, {"GENOLIGAND_SCRATCH_DIR": str(explicit)}):
+                self.assertEqual(installer.default_installer_scratch_dir(), explicit)
+        self.assertIn("else default_installer_scratch_dir().resolve()", main_text)
 
     def test_rcsb_scope_excludes_partial_and_binds_coordinate_snapshot(self) -> None:
         installer = self.installer
@@ -318,9 +1126,14 @@ class CurrentInstallerRemediations(unittest.TestCase):
             coordinate = root / "ab/1abc.cif.gz"
             coordinate.parent.mkdir(parents=True)
             with gzip.open(coordinate, "wt", encoding="utf-8") as handle:
-                handle.write("data_1abc\n_entry.id 1ABC\n")
+                handle.write(rcsb_mmcif_text("1ABC"))
+            (store / "downloads/rcsb/ligand_bound_pdb_ids.txt").write_text(
+                "1ABC\n2DEF\n",
+                encoding="utf-8",
+            )
             (root / "ab/1abc.cif.gz.part").write_bytes(b"partial")
             snapshot = installer.write_rcsb_scope_manifest(store, root, {"1ABC", "2DEF"})
+            installer.write_rcsb_on_demand_policy(store, snapshot)
             self.assertEqual(snapshot["scope_count"], 2)
             self.assertEqual(snapshot["ready_count"], 1)
             self.assertEqual(snapshot["missing_count"], 1)
@@ -333,8 +1146,295 @@ class CurrentInstallerRemediations(unittest.TestCase):
             rows = installer.read_tsv(store / "downloads/rcsb/ligand_bound_pdb_scope.tsv")
             self.assertEqual(len(rows), 2)
             self.assertFalse(any(row["coordinate_rel_path"].endswith(".part") for row in rows))
+            added = root / "gh/3ghi.cif.gz"
+            added.parent.mkdir(parents=True)
+            with gzip.open(added, "wt", encoding="utf-8") as handle:
+                handle.write(rcsb_mmcif_text("3GHI"))
             readiness = installer.evaluate_installer_science_store_readiness(store, persist=False)
-            self.assertIn("rcsb_partial_present", {item["code"] for item in readiness["blockers"]})
+            self.assertNotIn("rcsb_partial_present", {item["code"] for item in readiness["blockers"]})
+            self.assertIn("rcsb_partial_download_obsolete", {item["code"] for item in readiness["advisories"]})
+            self.assertNotIn("rcsb_partial_download_preserved", {item["code"] for item in readiness["advisories"]})
+            self.assertNotIn("rcsb_scope_incomplete", {item["code"] for item in readiness["blockers"]})
+            self.assertTrue(readiness["rcsb_refresh_needed"])
+            self.assertIn("rcsb_foldseek_refresh_needed", {item["code"] for item in readiness["advisories"]})
+
+    def test_rcsb_on_demand_replaces_stale_scope_from_validated_files_and_discards_untrusted_parts(self) -> None:
+        installer = self.installer
+        with tempfile.TemporaryDirectory() as tmp:
+            store = Path(tmp) / "science_store"
+            target = store / "downloads/rcsb/mmcif"
+            scope_ids = {"1ABC", "2DEF", "3GHI"}
+            explicit = store / "downloads/rcsb/ligand_bound_pdb_ids.txt"
+            explicit.parent.mkdir(parents=True)
+            explicit.write_text("\n".join(sorted(scope_ids)) + "\n", encoding="utf-8")
+            for pdb_id in ("1ABC", "2DEF"):
+                coordinate = target / pdb_id[1:3].lower() / f"{pdb_id.lower()}.cif.gz"
+                coordinate.parent.mkdir(parents=True, exist_ok=True)
+                with gzip.open(coordinate, "wt", encoding="utf-8") as handle:
+                    handle.write(rcsb_mmcif_text(pdb_id))
+
+            stale_manifest = store / "downloads/rcsb/ligand_bound_pdb_scope.tsv"
+            stale_manifest.write_text("pdb_id\tstatus\n4OC1\tready\n", encoding="utf-8")
+            installer.write_json_atomic(
+                stale_manifest.with_suffix(".json"),
+                {
+                    "schema_version": "genoligand_rcsb_scope_snapshot_v1",
+                    "scope_mode": "on_demand",
+                    "scope_count": 1,
+                    "scope_digest": installer.rcsb_scope_digest({"4OC1"}),
+                    "ready_count": 1,
+                },
+            )
+            installer.write_json_atomic(
+                store / "install_progress.json",
+                {"bytes_downloaded": 126425, "bytes_total": 153757, "status": "paused"},
+            )
+            obsolete = target / "gh/3ghi.cif.gz.part"
+            obsolete.parent.mkdir(parents=True, exist_ok=True)
+            obsolete.write_bytes(b"untrusted-partial")
+            resumable = target / "jk/4jkl.cif.gz.part"
+            resumable.parent.mkdir(parents=True, exist_ok=True)
+            resumable.write_bytes(b"trusted-partial")
+            installer.write_json_atomic(
+                installer.partial_identity_path(resumable),
+                {
+                    "trusted": True,
+                    "identity_digest": "a" * 64,
+                    "url": "https://files.rcsb.org/download/4JKL.cif.gz",
+                    "content_length": resumable.stat().st_size + 100,
+                },
+            )
+
+            result = installer.sync_rcsb_ligand_bound_scope(
+                {"source_url": "https://files.rcsb.org/download/{pdb_id}.cif.gz"},
+                target,
+                store,
+                rcsb_mode="on-demand",
+            )
+            self.assertEqual(result["status"], "ready")
+            self.assertEqual(result["scope_count"], 3)
+            self.assertEqual(result["ready_count"], 2)
+            self.assertEqual(result["missing_count"], 1)
+            self.assertEqual(result["obsolete_partial_count_removed"], 1)
+            self.assertEqual(result["resumable_partial_count"], 1)
+            self.assertFalse(obsolete.exists())
+            self.assertTrue(resumable.exists())
+            self.assertEqual(
+                {row["pdb_id"] for row in installer.read_tsv(stale_manifest)},
+                scope_ids,
+            )
+            snapshot = installer.read_json_object(stale_manifest.with_suffix(".json"))
+            self.assertTrue(installer.rcsb_scope_snapshot_matches_current_sources(store, snapshot))
+            self.assertEqual(snapshot["scope_digest"], installer.rcsb_scope_digest(scope_ids))
+            self.assertTrue((store / "downloads/rcsb/on_demand_policy.json").is_file())
+
+    def test_rcsb_sync_keeps_submission_window_bounded(self) -> None:
+        installer = self.installer
+        scope = {f"{index % 10}{index:03X}" for index in range(25)}
+        observed_pending: list[int] = []
+        real_wait = installer.concurrent.futures.wait
+
+        def tracked_wait(futures, **kwargs):
+            observed_pending.append(len(futures))
+            return real_wait(futures, **kwargs)
+
+        snapshot = {
+            "scope_count": len(scope),
+            "ready_count": len(scope),
+            "missing_count": 0,
+            "coordinate_bytes": len(scope),
+            "coordinate_digest": "a" * 64,
+        }
+        with tempfile.TemporaryDirectory() as tmp, mock.patch.dict(
+            os.environ, {"GENOLIGAND_RCSB_DOWNLOAD_WORKERS": "3"}
+        ), mock.patch.object(
+            installer, "ligand_bound_pdb_scope", return_value=scope
+        ), mock.patch.object(
+            installer, "valid_rcsb_coordinate", return_value=False
+        ), mock.patch.object(
+            installer, "copy_or_download", return_value={"status": "ready"}
+        ), mock.patch.object(
+            installer, "write_rcsb_scope_manifest", return_value=snapshot
+        ), mock.patch.object(
+            installer.concurrent.futures, "wait", side_effect=tracked_wait
+        ):
+            result = installer.sync_rcsb_ligand_bound_scope(
+                {"source_url": "https://fixture/{pdb_id}.cif.gz"},
+                Path(tmp) / "coordinates",
+                Path(tmp),
+                rcsb_mode="complete",
+            )
+
+        self.assertEqual(result["status"], "ready")
+        self.assertGreater(len(observed_pending), 1)
+        self.assertLessEqual(max(observed_pending), 6)
+
+    def test_rcsb_on_demand_keeps_partial_cache_ready_with_zero_bulk_download(self) -> None:
+        installer = self.installer
+        with tempfile.TemporaryDirectory() as tmp:
+            store = Path(tmp) / "science_store"
+            target = store / "downloads/rcsb/mmcif"
+            coordinate = target / "ab/1abc.cif.gz"
+            coordinate.parent.mkdir(parents=True)
+            with gzip.open(coordinate, "wt", encoding="utf-8") as handle:
+                handle.write(rcsb_mmcif_text("1ABC"))
+            scope = {"1ABC", "2DEF"}
+            plan = Path(tmp) / "source_sync_plan.tsv"
+            installer.write_simple_tsv(
+                plan,
+                [
+                    "source_id",
+                    "source_label",
+                    "sync_method",
+                    "source_url",
+                    "target_rel_path",
+                    "ready_marker",
+                    "release_or_date",
+                    "trust_source",
+                ],
+                [
+                    {
+                        "source_id": "rcsb_ligand_bound",
+                        "source_label": "RCSB ligand-bound structures",
+                        "sync_method": "rcsb_ligand_bound_scope",
+                        "source_url": "https://files.rcsb.org/download/{pdb_id}.cif.gz",
+                        "target_rel_path": "downloads/rcsb/mmcif",
+                        "ready_marker": "downloads/rcsb/mmcif",
+                        "release_or_date": "current",
+                        "trust_source": "publisher_https_mmcif_parse",
+                    }
+                ],
+            )
+            with mock.patch.object(
+                installer, "ligand_bound_pdb_scope", return_value=scope
+            ), mock.patch.object(
+                installer,
+                "copy_or_download",
+                side_effect=AssertionError("on-demand mode must not bulk-download missing scope"),
+            ):
+                result = installer.sync_external_sources(
+                    plan,
+                    store,
+                    True,
+                    rcsb_mode="on-demand",
+                )
+                estimate = installer.rcsb_capacity_estimate(
+                    {"source_url": "https://files.rcsb.org/download/{pdb_id}.cif.gz"},
+                    target,
+                    store,
+                    resolve_remote=True,
+                    rcsb_mode="on-demand",
+                )
+            self.assertEqual(result["status"], "ready")
+            execution = installer.read_tsv(store / "external_sync_execution_manifest.tsv")[0]
+            self.assertEqual(execution["status"], "ready")
+            self.assertEqual(execution["scope_mode"], "on_demand")
+            self.assertEqual(execution["scope_ready_count"], "1")
+            self.assertEqual(execution["scope_count"], "2")
+            self.assertEqual(execution["scope_missing_count"], "1")
+            self.assertIn("partial_on_demand", execution["notes"])
+            self.assertEqual(estimate["download_bytes"], 0)
+            self.assertEqual(estimate["action"], "reuse_partial_scope_on_demand")
+            policy = json.loads(
+                (store / "downloads/rcsb/on_demand_policy.json").read_text(encoding="utf-8")
+            )
+            self.assertEqual(
+                policy,
+                {
+                    "schema_version": "genoligand_rcsb_on_demand_policy_v1",
+                    "status": "ready",
+                    "mode": "on_demand",
+                    "official_base_url": "https://files.rcsb.org/download",
+                    "coordinate_template": "https://files.rcsb.org/download/{pdb_id}.cif.gz",
+                    "cache_root": "downloads/rcsb/mmcif",
+                    "max_fetches_per_run": 12,
+                    "validation": "gzip_mmcif_entry_and_atom_site",
+                    "cached_ready_count": 1,
+                    "scope_count": 2,
+                },
+            )
+
+    def test_https_head_and_range_get_share_one_tls_context_across_workers(self) -> None:
+        installer = self.installer
+
+        class FakeContext:
+            options = 0
+
+        context = FakeContext()
+        calls: list[tuple[str, str | None, object]] = []
+        calls_lock = threading.Lock()
+
+        def fake_urlopen(request, *, timeout: int, context: object):
+            del timeout
+            with calls_lock:
+                calls.append((request.get_method(), request.get_header("Range"), context))
+            return object()
+
+        def request(index: int) -> None:
+            if index % 2 == 0:
+                value = installer.urllib.request.Request(
+                    f"https://fixture.invalid/{index}", method="HEAD"
+                )
+            else:
+                value = installer.urllib.request.Request(
+                    f"https://fixture.invalid/{index}",
+                    headers={"Range": "bytes=128-"},
+                )
+            installer.urlopen_with_compatible_tls(value, timeout=5)
+
+        installer._COMPATIBLE_TLS_CONTEXT = None
+        try:
+            with mock.patch.object(
+                installer.ssl, "create_default_context", return_value=context
+            ) as create_context, mock.patch.object(
+                installer.urllib.request, "urlopen", side_effect=fake_urlopen
+            ):
+                with installer.concurrent.futures.ThreadPoolExecutor(max_workers=20) as pool:
+                    list(pool.map(request, range(200)))
+            self.assertEqual(create_context.call_count, 1)
+            self.assertEqual(len(calls), 200)
+            self.assertTrue(any(method == "HEAD" for method, _, _ in calls))
+            self.assertTrue(any(method == "GET" and byte_range == "bytes=128-" for method, byte_range, _ in calls))
+            self.assertTrue(all(used_context is context for _, _, used_context in calls))
+        finally:
+            installer._COMPATIBLE_TLS_CONTEXT = None
+
+    def test_remote_size_falls_back_to_content_range_and_rejects_unknown_total(self) -> None:
+        installer = self.installer
+
+        class RangeResponse:
+            status = 206
+
+            def __init__(self, content_range: str):
+                self.headers = {"Content-Range": content_range, "Content-Length": "1"}
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, _exc_type, _exc, _traceback):
+                return False
+
+        observed: list[str | None] = []
+
+        def open_range(request, timeout: int):
+            del timeout
+            observed.append(request.get_header("Range"))
+            return RangeResponse("bytes 0-0/987654")
+
+        with mock.patch.object(
+            installer, "remote_resource_identity", return_value={}
+        ), mock.patch.object(installer, "urlopen_with_compatible_tls", side_effect=open_range):
+            self.assertEqual(installer.remote_resource_size("https://fixture.invalid/data"), 987654)
+        self.assertEqual(observed, ["bytes=0-0"])
+
+        with mock.patch.object(
+            installer, "remote_resource_identity", return_value={}
+        ), mock.patch.object(
+            installer,
+            "urlopen_with_compatible_tls",
+            return_value=RangeResponse("bytes 0-0/*"),
+        ):
+            self.assertEqual(installer.remote_resource_size("https://fixture.invalid/error"), 0)
 
     def test_capacity_preflight_blocks_before_large_staging(self) -> None:
         installer = self.installer
@@ -393,6 +1493,7 @@ class CurrentInstallerRemediations(unittest.TestCase):
                     target,
                     store,
                     resolve_remote=True,
+                    rcsb_mode="complete",
                 )
 
             self.assertEqual(estimate["missing_objects"], 2)
@@ -436,6 +1537,216 @@ class CurrentInstallerRemediations(unittest.TestCase):
             mgnify_estimate = installer.publisher_inventory_capacity(mgnify_objects, mgnify)
             self.assertEqual(mgnify_estimate["action"], "download_publisher_identity_changed")
             self.assertEqual(mgnify_estimate["download_bytes"], len(current_payload))
+
+    def test_publisher_inventory_retries_and_reuses_only_exact_release_cache(self) -> None:
+        installer = self.installer
+        row = next(
+            item
+            for item in installer.read_tsv(ROOT / "configs/source_sync_plan.tsv")
+            if item["source_id"] == "metagenome_potential"
+        )
+        payloads = {
+            "LICENSE": b"license",
+            "README.txt": b"readme",
+            "md5sum.txt": b"checksums",
+            "mgy_clusters.fa.gz": b"clusters",
+        }
+        objects = [
+            {
+                "relative_path": name,
+                "size": len(payload),
+                "digest_algorithm": "sha256",
+                "digest": hashlib.sha256(payload).hexdigest(),
+                "media_url": f"https://publisher.invalid/2024_04/{name}",
+            }
+            for name, payload in payloads.items()
+        ]
+        with tempfile.TemporaryDirectory() as tmp:
+            store = Path(tmp)
+            calls = 0
+
+            def transient_then_ready(_row: dict[str, str]) -> list[dict[str, object]]:
+                nonlocal calls
+                calls += 1
+                if calls < 3:
+                    raise urllib.error.URLError("TLS EOF")
+                return objects
+
+            with mock.patch.object(installer.time, "sleep"):
+                fetched = installer.publisher_inventory_with_cache(row, store, transient_then_ready)
+            self.assertEqual(fetched["source"], "remote")
+            self.assertEqual(fetched["attempts"], 3)
+            self.assertEqual(fetched["items"], objects)
+            self.assertTrue((store / "manifests/publisher_inventory_cache.json").is_file())
+
+            with mock.patch.object(installer.time, "sleep"):
+                cached = installer.publisher_inventory_with_cache(
+                    row,
+                    store,
+                    mock.Mock(side_effect=urllib.error.URLError("TLS EOF")),
+                )
+            self.assertEqual(cached["source"], "cache")
+            self.assertEqual(cached["attempts"], installer.PUBLISHER_INVENTORY_ATTEMPTS)
+            self.assertEqual(cached["items"], objects)
+            self.assertIn("TLS EOF", cached["error"])
+
+            changed = {
+                **row,
+                "source_url": row["source_url"].replace("2024_04", "2025_01"),
+                "checksum_url": row["checksum_url"].replace("2024_04", "2025_01"),
+                "release_or_date": "MGnify Proteins 2025_01 cluster representatives",
+            }
+            with mock.patch.object(installer.time, "sleep"):
+                unavailable = installer.publisher_inventory_with_cache(
+                    changed,
+                    store,
+                    mock.Mock(side_effect=urllib.error.URLError("TLS EOF")),
+                )
+            self.assertEqual(unavailable["source"], "unavailable")
+            self.assertEqual(unavailable["items"], [])
+            self.assertTrue(unavailable["error"])
+
+    def test_unchecksummed_html_capacity_uses_complete_https_sizes_and_rejects_bad_pages(self) -> None:
+        installer = self.installer
+        row = next(
+            item
+            for item in installer.read_tsv(ROOT / "configs/source_sync_plan.tsv")
+            if item["source_id"] == "biolip2"
+        )
+        names = [
+            "BioLiP.txt.gz",
+            "BioLiP_nr.txt.gz",
+            "peptide.fasta.gz",
+            "peptide_nr.fasta.gz",
+            "protein.fasta.gz",
+            "protein_nr.fasta.gz",
+        ]
+        objects = [
+            {
+                "relative_path": name,
+                "size": index * 100,
+                "digest_algorithm": "",
+                "digest": "",
+                "media_url": f"https://zhanggroup.org/BioLiP/data/{name}",
+            }
+            for index, name in enumerate(names, start=1)
+        ]
+
+        def plan_for(items: list[dict[str, object]]) -> tuple[dict[str, object], Path]:
+            temporary = tempfile.TemporaryDirectory()
+            self.addCleanup(temporary.cleanup)
+            store = Path(temporary.name)
+            sync_plan = store / "sync.tsv"
+            installer.write_simple_tsv(sync_plan, list(row), [row])
+            with mock.patch.object(installer, "html_links_inventory", return_value=items), mock.patch.object(
+                installer.time, "sleep"
+            ):
+                plan = installer.installation_capacity_plan(
+                    store,
+                    store / "missing-catalog.tsv",
+                    sync_plan,
+                    available_bytes=installer.DISK_SAFETY_MARGIN_BYTES + sum(int(item["size"]) for item in objects) + 1,
+                    resolve_remote=True,
+                )
+            return plan, store
+
+        ready_plan, ready_store = plan_for(objects)
+        ready_item = next(item for item in ready_plan["items"] if item["component"] == "biolip2")
+        self.assertEqual(ready_plan["status"], "ready")
+        self.assertEqual(ready_item["download_bytes"], sum(int(item["size"]) for item in objects))
+        self.assertEqual(ready_item["inventory_source"], "remote_capacity")
+        self.assertFalse((ready_store / "manifests/publisher_inventory_cache.json").exists())
+
+        wrong_page = [
+            {
+                "relative_path": "error.html",
+                "size": 512,
+                "digest_algorithm": "",
+                "digest": "",
+                "media_url": "https://zhanggroup.org/error.html",
+            }
+        ]
+        for name, items in (("missing_link", objects[:-1]), ("wrong_html", wrong_page)):
+            with self.subTest(name=name):
+                blocked_plan, blocked_store = plan_for(items)
+                blocked_item = next(
+                    item for item in blocked_plan["items"] if item["component"] == "biolip2"
+                )
+                self.assertEqual(blocked_plan["status"], "blocked")
+                self.assertIsNone(blocked_item["download_bytes"])
+                self.assertIn("biolip2", blocked_plan["unresolved_components"])
+                self.assertFalse((blocked_store / "manifests/publisher_inventory_cache.json").exists())
+
+    def test_capacity_preflight_early_exits_are_terminal_and_replace_legacy_ready(self) -> None:
+        installer = self.installer
+        cases: list[tuple[str, object, int, str, str]] = [
+            (
+                "blocked",
+                {
+                    "schema_version": "genoligand_installation_capacity_plan_v1",
+                    "status": "blocked",
+                    "required_peak_bytes": 10,
+                    "available_bytes": 20,
+                    "unresolved_components": ["metagenome_potential"],
+                },
+                2,
+                "blocked",
+                "blocked",
+            ),
+            (
+                "failed",
+                RuntimeError("publisher TLS EOF"),
+                2,
+                "failed",
+                "failed",
+            ),
+            (
+                "dry_run_ready",
+                {
+                    "schema_version": "genoligand_installation_capacity_plan_v1",
+                    "status": "ready",
+                    "required_peak_bytes": 10,
+                    "available_bytes": 20,
+                    "unresolved_components": [],
+                },
+                0,
+                "ready",
+                "capacity_ready",
+            ),
+        ]
+        for name, outcome, expected_code, progress_status, install_status in cases:
+            with self.subTest(name=name), tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                store = root / "science_store"
+                store.mkdir()
+                (store / "install_status.json").write_text(
+                    '{"status":"ready","legacy_marker":"stale"}\n', encoding="utf-8"
+                )
+                args = [
+                    str(INSTALLER),
+                    "--workspace-root",
+                    str(ROOT),
+                    "--science-store",
+                    str(store),
+                    "--runtime-dir",
+                    str(root / "runtime"),
+                    "--dry-run",
+                ]
+                effect = outcome if isinstance(outcome, BaseException) else None
+                with mock.patch.object(sys, "argv", args), mock.patch.object(
+                    installer,
+                    "installation_capacity_plan",
+                    side_effect=effect,
+                    return_value=None if effect else outcome,
+                ):
+                    self.assertEqual(installer.main(), expected_code)
+                progress = json.loads((store / "install_progress.json").read_text(encoding="utf-8"))
+                status = json.loads((store / "install_status.json").read_text(encoding="utf-8"))
+                self.assertEqual(progress["status"], progress_status)
+                self.assertEqual(progress["stage"], "容量预检")
+                self.assertEqual(status["status"], install_status)
+                self.assertNotIn("legacy_marker", status)
+                self.assertFalse(status.get("install_ready", True))
 
     def test_plinder_capacity_resolves_gcs_scope_instead_of_remaining_unresolved(self) -> None:
         installer = self.installer
@@ -505,6 +1816,31 @@ class CurrentInstallerRemediations(unittest.TestCase):
                 "science_store_readiness": {"status": "ready"},
             }
             self.assertFalse(installer.install_ready(payload))
+
+    def test_runtime_launcher_persists_only_science_path_additions(self) -> None:
+        installer = self.installer
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            runtime = root / "runtime"
+            inherited = os.pathsep.join([str(root / "system-bin"), str(root / "codex-cache")])
+            additions = [str(root / "worker-wrappers"), str(root / "cuda-bin")]
+            science_env = {"PATH": os.pathsep.join([*additions, inherited])}
+            with mock.patch.dict(os.environ, {"PATH": inherited}, clear=False):
+                installer.write_runtime_launch_environment(
+                    runtime,
+                    root / "science-store",
+                    root / "workspace",
+                    "127.0.0.1",
+                    "19090",
+                    [str(runtime / "bin" / "gls-cli")],
+                    [str(runtime / "bin" / "gls-server")],
+                    str(runtime / "python"),
+                    science_env,
+                )
+            payload = json.loads((runtime / "launch_environment.json").read_text(encoding="utf-8"))
+            self.assertEqual(payload["path_prepend"], [str(runtime / "bin"), *additions])
+            launcher = (runtime / "run-genoligand-webui.py").read_text(encoding="utf-8")
+            self.assertNotIn(str(root / "codex-cache"), launcher)
 
     def test_openff_requires_fixed_digest_xml_and_loader(self) -> None:
         installer = self.installer
@@ -740,6 +2076,15 @@ class CurrentInstallerRemediations(unittest.TestCase):
         installer = self.installer
         catalog = installer.read_tsv(ROOT / "configs/source_catalog.tsv")
         external = installer.read_tsv(ROOT / "configs/source_sync_plan.tsv")
+        bindingdb = next(row for row in catalog if row["source_id"] == "bindingdb")
+        self.assertEqual(
+            bindingdb["sha256"],
+            "f89c851bae81657c5509ccc13586676861b6ef9ae2e8424d57c393faaf9a9ed9",
+        )
+        self.assertEqual(
+            bindingdb["trust_source"],
+            "publisher_md5_verified_sha256_immutable_release_domain_validation",
+        )
         expected = {
             "chembl",
             "bindingdb",
@@ -866,8 +2211,44 @@ class CurrentInstallerRemediations(unittest.TestCase):
 
             coordinate = root / "1abc.cif.gz"
             with gzip.open(coordinate, "wt", encoding="utf-8") as handle:
-                handle.write("data_1abc\n_entry.id 1ABC\n#\n")
+                handle.write(rcsb_mmcif_text("1ABC"))
             self.assertEqual(installer.rcsb_coordinate_validation(coordinate, "1ABC")["status"], "ready")
+
+            no_atom_site = root / "no-atom-site.cif.gz"
+            with gzip.open(no_atom_site, "wt", encoding="utf-8") as handle:
+                handle.write("data_1abc\n_entry.id 1ABC\n#\n")
+            self.assertEqual(
+                installer.rcsb_coordinate_validation(no_atom_site, "1ABC")["reason"],
+                "atom_site_coordinates_missing",
+            )
+
+            partial = root / "1abc.cif.gz.part"
+            with gzip.open(partial, "wt", encoding="utf-8") as handle:
+                handle.write(rcsb_mmcif_text("1ABC"))
+            self.assertEqual(installer.rcsb_coordinate_validation(partial, "1ABC")["status"], "ready")
+
+            empty_partial = root / "empty.cif.gz.part"
+            empty_partial.touch()
+            self.assertEqual(
+                installer.rcsb_coordinate_validation(empty_partial, "1ABC")["reason"],
+                "coordinate_missing_or_partial",
+            )
+
+            bad_partial = root / "bad.cif.gz.part"
+            bad_partial.write_bytes(b"not-gzip")
+            self.assertTrue(
+                installer.rcsb_coordinate_validation(bad_partial, "1ABC")["reason"].startswith(
+                    "mmcif_parse_failed:"
+                )
+            )
+
+            mismatch_partial = root / "mismatch.cif.gz.part"
+            with gzip.open(mismatch_partial, "wt", encoding="utf-8") as handle:
+                handle.write(rcsb_mmcif_text("2ABC"))
+            self.assertEqual(
+                installer.rcsb_coordinate_validation(mismatch_partial, "1ABC")["reason"],
+                "mmcif_id_mismatch:2ABC",
+            )
 
     def test_hashed_install_command_and_manifest_trust_binding(self) -> None:
         installer = self.installer
@@ -927,46 +2308,359 @@ class CurrentInstallerRemediations(unittest.TestCase):
         installer = self.installer
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
-            store = root / "science_store"
-            chembl_dir = store / "downloads/chembl"
-            chembl_dir.mkdir(parents=True)
-            source_db = root / "chembl_37.db"
-            with closing(sqlite3.connect(source_db)) as connection:
-                connection.executescript(
-                    """
-                    CREATE TABLE activities (assay_id INTEGER, molregno INTEGER, standard_type TEXT,
-                        standard_relation TEXT, standard_value REAL, standard_units TEXT);
-                    CREATE TABLE assays (assay_id INTEGER, tid INTEGER);
-                    CREATE TABLE target_dictionary (tid INTEGER, chembl_id TEXT, pref_name TEXT, organism TEXT);
-                    CREATE TABLE molecule_dictionary (molregno INTEGER, pref_name TEXT);
-                    CREATE TABLE compound_structures (molregno INTEGER, canonical_smiles TEXT);
-                    INSERT INTO activities VALUES (1, 1, 'IC50', '=', 7.0, 'nM');
-                    INSERT INTO assays VALUES (1, 1);
-                    INSERT INTO target_dictionary VALUES (1, 'CHEMBL_T1', 'Target', 'Homo sapiens');
-                    INSERT INTO molecule_dictionary VALUES (1, 'Compound');
-                    INSERT INTO compound_structures VALUES (1, 'CCO');
-                    """
+            store, chembl_dir, source_db, _archive, catalog = create_chembl_fixture(root)
+            scratch = root / "scratch"
+            source_before = installer.sha256_file(source_db)
+            with mock.patch.object(
+                installer.shutil,
+                "copy2",
+                side_effect=AssertionError("the source database must not be copied into the target database"),
+            ):
+                result = installer.publish_chembl_query_database(
+                    store,
+                    catalog,
+                    {},
+                    scratch_dir=scratch,
                 )
-            archive = chembl_dir / "chembl_sqlite.tar.gz"
-            with tarfile.open(archive, "w:gz") as handle:
-                handle.add(source_db, arcname="chembl_37/chembl_37.db")
-            catalog = root / "source_catalog.tsv"
-            catalog.write_text(
-                "source_id\trelease_identity\trelease_or_date\nchembl\tCHEMBL37\tCHEMBL37\n",
-                encoding="utf-8",
-            )
-            result = installer.publish_chembl_query_database(store, catalog, {})
             self.assertEqual(result["status"], "ready")
+            self.assertEqual(installer.sha256_file(source_db), source_before)
             query_db = chembl_dir / "chembl_query.sqlite"
             with closing(sqlite3.connect(f"file:{query_db.as_posix()}?mode=ro", uri=True)) as connection:
-                row = connection.execute(
-                    "SELECT canonical_isomeric_smiles,target_id,source_release "
-                    "FROM genoligand_onsite_activity"
-                ).fetchone()
-            self.assertEqual(row, ("CCO", "CHEMBL_T1", "CHEMBL37"))
+                table_info = list(connection.execute("PRAGMA table_info(genoligand_onsite_activity)"))
+                columns = [str(row[1]) for row in table_info]
+                index_names = {
+                    str(row[1])
+                    for row in connection.execute("PRAGMA index_list(genoligand_onsite_activity)")
+                }
+                rows = set(
+                    connection.execute(
+                        "SELECT canonical_isomeric_smiles,target_id,source_target_id,standard_type,"
+                        "standard_units,source_release,source_digest FROM genoligand_onsite_activity"
+                    )
+                )
+                smiles_plan = " ".join(
+                    str(row[-1])
+                    for row in connection.execute(
+                        "EXPLAIN QUERY PLAN SELECT * FROM genoligand_onsite_activity "
+                        "WHERE canonical_isomeric_smiles = ?",
+                        ("CCO",),
+                    )
+                )
+            self.assertEqual(
+                columns,
+                [
+                    "canonical_isomeric_smiles",
+                    "target_id",
+                    "source_target_id",
+                    "target_name",
+                    "organism",
+                    "compound_name",
+                    "standard_type",
+                    "standard_relation",
+                    "standard_value",
+                    "standard_units",
+                    "source_release",
+                    "source_digest",
+                ],
+            )
+            digest = result["source_digest"]
+            self.assertEqual(
+                rows,
+                {
+                    ("CCO", "P12345", "CHEMBL_T1", "IC50", "nM", "CHEMBL37", digest),
+                    ("CCC", "P12345", "CHEMBL_T1", "Kd", "", "CHEMBL37", digest),
+                    ("CCN", "CHEMBL_T2", "CHEMBL_T2", "Ki", "", "CHEMBL37", digest),
+                },
+            )
+            defaults = {str(row[1]): row[4] for row in table_info}
+            self.assertIsNotNone(defaults["source_release"])
+            self.assertIsNotNone(defaults["source_digest"])
+            self.assertIn("idx_genoligand_onsite_activity_smiles", smiles_plan)
+            self.assertEqual(index_names, {"idx_genoligand_onsite_activity_smiles"})
+            self.assertEqual(
+                result["indexes"],
+                ["idx_genoligand_onsite_activity_smiles"],
+            )
             self.assertTrue(installer.chembl_query_database_ready(
                 query_db, query_db.with_suffix(".manifest.json"), result["source_digest"], "CHEMBL37"
             ))
+            published_manifest = json.loads(query_db.with_suffix(".manifest.json").read_text(encoding="utf-8"))
+            self.assertEqual(published_manifest["schema_version"], "genoligand_chembl_query_database_v1")
+            self.assertEqual(published_manifest["database_bytes"], query_db.stat().st_size)
+            self.assertEqual(published_manifest["database_sha256"], installer.sha256_file(query_db))
+            self.assertEqual(published_manifest["rows"], 3)
+            self.assertEqual(list(scratch.glob("chembl-query-rebuild-*")), [])
+            self.assertEqual(list(chembl_dir.glob(".*.rebuild-*")), [])
+            self.assertEqual(list(chembl_dir.glob(".*.backup-*")), [])
+            query_db.chmod(0o666)
+            with query_db.open("ab") as handle:
+                handle.write(b"tampered")
+            self.assertFalse(installer.chembl_query_database_ready(
+                query_db, query_db.with_suffix(".manifest.json"), result["source_digest"], "CHEMBL37"
+            ))
+
+    def test_chembl_hard_interruptions_reconcile_every_publish_replace(self) -> None:
+        installer = self.installer
+        scenarios = [("upgrade", failpoint) for failpoint in range(1, 5)] + [
+            ("first_install", failpoint) for failpoint in range(1, 3)
+        ]
+        for scenario, failpoint in scenarios:
+            with self.subTest(scenario=scenario, failpoint=failpoint), tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                store, chembl_dir, _source_db, _archive, catalog = create_chembl_fixture(root)
+                query_db = chembl_dir / "chembl_query.sqlite"
+                if scenario == "upgrade":
+                    create_previous_chembl_query(query_db)
+                completed = subprocess.run(
+                    [
+                        sys.executable,
+                        str(Path(__file__).resolve()),
+                        "--chembl-crash-child",
+                        str(root),
+                        str(failpoint),
+                    ],
+                    cwd=ROOT,
+                    capture_output=True,
+                    text=True,
+                    encoding="utf-8",
+                    errors="replace",
+                    timeout=30,
+                    check=False,
+                )
+                self.assertNotEqual(completed.returncode, 0, completed.stdout + completed.stderr)
+                transaction = installer.chembl_query_transaction_path(query_db)
+                self.assertTrue(transaction.is_file())
+                recovered = installer.publish_chembl_query_database(
+                    store,
+                    catalog,
+                    {},
+                    scratch_dir=root / "scratch",
+                )
+                self.assertEqual(recovered["status"], "ready", recovered)
+                manifest = query_db.with_suffix(".manifest.json")
+                self.assertTrue(installer.chembl_query_database_ready(
+                    query_db,
+                    manifest,
+                    recovered["source_digest"],
+                    "CHEMBL37",
+                ))
+                self.assertFalse(transaction.exists())
+                self.assertEqual(list(chembl_dir.glob(".*.rebuild-*")), [])
+                self.assertEqual(list(chembl_dir.glob(".*.backup-*")), [])
+                self.assertEqual(list((root / "scratch").glob("chembl-query-rebuild-*")), [])
+                query_db.chmod(0o666)
+
+    def test_chembl_ambiguous_transaction_preserves_all_recovery_evidence(self) -> None:
+        installer = self.installer
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            _store, chembl_dir, _source_db, _archive, _catalog = create_chembl_fixture(root)
+            completed = subprocess.run(
+                [
+                    sys.executable,
+                    str(Path(__file__).resolve()),
+                    "--chembl-crash-child",
+                    str(root),
+                    "1",
+                ],
+                cwd=ROOT,
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                timeout=30,
+                check=False,
+            )
+            self.assertNotEqual(completed.returncode, 0, completed.stdout + completed.stderr)
+            query_db = chembl_dir / "chembl_query.sqlite"
+            manifest = query_db.with_suffix(".manifest.json")
+            transaction = installer.chembl_query_transaction_path(query_db)
+            payload = installer.read_json_object(transaction)
+            paths = installer.chembl_transaction_paths(query_db, manifest, payload, root / "scratch")
+            self.assertIsNotNone(paths)
+            assert paths is not None
+            with paths["staging_manifest"].open("ab") as handle:
+                handle.write(b"tampered")
+            preserved = {
+                path: path.read_bytes()
+                for path in paths.values()
+                if path.is_file()
+            }
+            preserved[transaction] = transaction.read_bytes()
+            recovery = installer.reconcile_chembl_query_transaction(
+                query_db,
+                manifest,
+                root / "scratch",
+            )
+            self.assertEqual(recovery["status"], "needs_repair")
+            self.assertIn("ambiguous", recovery["reason"])
+            for path, content in preserved.items():
+                self.assertTrue(path.is_file(), path)
+                self.assertEqual(path.read_bytes(), content, path)
+
+    def test_readiness_binds_chembl_database_and_manifest_identity(self) -> None:
+        installer = self.installer
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            store, chembl_dir, _source_db, _archive, catalog = create_chembl_fixture(root)
+            summary_cache = {}
+            published = installer.publish_chembl_query_database(
+                store,
+                catalog,
+                summary_cache,
+                scratch_dir=root / "scratch",
+            )
+            self.assertEqual(published["status"], "ready")
+            manifest_dir = store / "manifests"
+            manifest_dir.mkdir(parents=True)
+            (manifest_dir / "source_file_manifest.tsv").write_text(
+                "source_id\tstatus\tsha256\trelease_identity\ttrust_source\n"
+                f"chembl\tready\t{published['source_digest']}\tCHEMBL37\tfixture_domain_validation\n",
+                encoding="utf-8",
+            )
+            with mock.patch.object(
+                installer,
+                "sha256_file_with_progress",
+                side_effect=AssertionError("unchanged ChEMBL database must use the persistent fingerprint cache"),
+            ):
+                readiness = installer.evaluate_installer_science_store_readiness(
+                    store,
+                    persist=False,
+                    summary_cache=summary_cache,
+                )
+            codes = {item["code"] for item in readiness["blockers"]}
+            self.assertNotIn("chembl_query_database_not_ready", codes)
+            evidence_paths = {item["path"] for item in readiness["evidence_manifest"]}
+            self.assertIn("downloads/chembl/chembl_query.manifest.json", evidence_paths)
+            self.assertNotIn("downloads/chembl/chembl_query.sqlite", evidence_paths)
+            query_db = chembl_dir / "chembl_query.sqlite"
+            query_db.chmod(0o666)
+            with query_db.open("ab") as handle:
+                handle.write(b"tampered")
+            readiness = installer.evaluate_installer_science_store_readiness(
+                store,
+                persist=False,
+                summary_cache=summary_cache,
+            )
+            self.assertIn(
+                "chembl_query_database_not_ready",
+                {item["code"] for item in readiness["blockers"]},
+            )
+
+    def test_chembl_capacity_keeps_scratch_and_target_volumes_independent(self) -> None:
+        installer = self.installer
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            store, _chembl_dir, source_db, archive, _catalog = create_chembl_fixture(root)
+            scratch = root / "separate-scratch-volume"
+            scratch_required = source_db.stat().st_size + installer.DISK_SAFETY_MARGIN_BYTES
+            target_staging = installer.chembl_query_target_staging_bytes(
+                source_db.stat().st_size,
+                archive.stat().st_size,
+            )
+            target_required = target_staging + installer.DISK_SAFETY_MARGIN_BYTES
+
+            def capacity(target_available: int, scratch_available: int) -> dict[str, object]:
+                with mock.patch.object(installer, "same_storage_volume", return_value=False):
+                    return installer.installation_capacity_plan(
+                        store,
+                        root / "missing-catalog.tsv",
+                        root / "missing-sync.tsv",
+                        available_bytes=target_available,
+                        scratch_dir=scratch,
+                        scratch_available_bytes=scratch_available,
+                    )
+
+            scratch_blocked = capacity(target_required, scratch_required - 1)
+            self.assertEqual(scratch_blocked["status"], "blocked")
+            self.assertEqual(scratch_blocked["capacity_failures"], ["scratch"])
+            target_blocked = capacity(target_required - 1, scratch_required)
+            self.assertEqual(target_blocked["status"], "blocked")
+            self.assertEqual(target_blocked["capacity_failures"], ["target"])
+            ready = capacity(target_required, scratch_required)
+            self.assertEqual(ready["status"], "ready")
+            self.assertEqual(ready["required_peak_bytes"], target_required)
+            self.assertEqual(ready["target_available_bytes"], target_required)
+            self.assertEqual(ready["scratch_available_bytes"], scratch_required)
+            self.assertFalse(ready["scratch_target_same_volume"])
+            item = next(row for row in ready["items"] if row["component"] == "chembl_query_database")
+            self.assertEqual(item["scratch_staging_bytes"], source_db.stat().st_size)
+            self.assertEqual(item["target_staging_bytes"], target_staging)
+            source = INSTALLER.read_text(encoding="utf-8")
+            self.assertIn('parser.add_argument("--scratch-dir")', source)
+            self.assertGreaterEqual(source.count("scratch_dir=scratch_dir"), 2)
+
+    def test_chembl_publish_failure_restores_previous_database_and_cleans_staging(self) -> None:
+        installer = self.installer
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            store, chembl_dir, _source_db, _archive, catalog = create_chembl_fixture(root)
+            query_db = chembl_dir / "chembl_query.sqlite"
+            manifest = create_previous_chembl_query(query_db)
+            old_database = query_db.read_bytes()
+            old_manifest = manifest.read_text(encoding="utf-8")
+            scratch = root / "scratch"
+            real_replace = installer.os.replace
+
+            def fail_database_publish(source: str | Path, target: str | Path) -> None:
+                source_path = Path(source)
+                target_path = Path(target)
+                if target_path == query_db and source_path.name.startswith(f".{query_db.name}.rebuild-"):
+                    raise OSError("fixture publish failure")
+                real_replace(source, target)
+
+            with mock.patch.object(installer.os, "replace", side_effect=fail_database_publish):
+                result = installer.publish_chembl_query_database(
+                    store,
+                    catalog,
+                    {},
+                    scratch_dir=scratch,
+                )
+            self.assertEqual(result["status"], "needs_repair")
+            self.assertEqual(query_db.read_bytes(), old_database)
+            self.assertEqual(manifest.read_text(encoding="utf-8"), old_manifest)
+            self.assertEqual(list(scratch.glob("chembl-query-rebuild-*")), [])
+            self.assertEqual(list(chembl_dir.glob(".*.rebuild-*")), [])
+            self.assertEqual(list(chembl_dir.glob(".*.backup-*")), [])
+            query_db.chmod(0o666)
+
+    def test_chembl_runtime_disk_guard_preserves_previous_database(self) -> None:
+        installer = self.installer
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            store, chembl_dir, source_db, archive, catalog = create_chembl_fixture(root)
+            query_db = chembl_dir / "chembl_query.sqlite"
+            manifest = create_previous_chembl_query(query_db)
+            old_database = query_db.read_bytes()
+            old_manifest = manifest.read_text(encoding="utf-8")
+            target_budget = installer.chembl_query_target_staging_bytes(
+                source_db.stat().st_size,
+                archive.stat().st_size,
+            )
+            high_free = source_db.stat().st_size + target_budget + installer.DISK_SAFETY_MARGIN_BYTES + 1
+            calls = 0
+
+            def shrinking_disk(_path: Path):
+                nonlocal calls
+                calls += 1
+                free = high_free if calls <= 2 else installer.DISK_SAFETY_MARGIN_BYTES
+                return mock.Mock(free=free)
+
+            scratch = root / "scratch"
+            with mock.patch.object(installer.shutil, "disk_usage", side_effect=shrinking_disk):
+                result = installer.publish_chembl_query_database(
+                    store,
+                    catalog,
+                    {},
+                    scratch_dir=scratch,
+                )
+            self.assertEqual(result["status"], "needs_repair")
+            self.assertIn("chembl_target_disk_safety_margin_reached", result["reason"])
+            self.assertEqual(query_db.read_bytes(), old_database)
+            self.assertEqual(manifest.read_text(encoding="utf-8"), old_manifest)
+            self.assertEqual(list(scratch.glob("chembl-query-rebuild-*")), [])
+            self.assertEqual(list(chembl_dir.glob(".*.rebuild-*")), [])
+            query_db.chmod(0o666)
 
     def test_trusted_http_identity_resumes_from_existing_offset(self) -> None:
         installer = self.installer
@@ -1023,4 +2717,8 @@ class CurrentInstallerRemediations(unittest.TestCase):
 
 
 if __name__ == "__main__":
+    if len(sys.argv) == 4 and sys.argv[1] == "--chembl-crash-child":
+        raise SystemExit(run_chembl_crash_child(Path(sys.argv[2]).resolve(), int(sys.argv[3])))
+    if len(sys.argv) == 4 and sys.argv[1] == "--database-publish-crash-child":
+        raise SystemExit(run_database_publish_crash_child(Path(sys.argv[2]).resolve(), sys.argv[3]))
     unittest.main(testRunner=unittest.TextTestRunner(stream=sys.stdout, verbosity=2))

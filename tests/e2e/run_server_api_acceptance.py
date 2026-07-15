@@ -16,8 +16,15 @@ from pathlib import Path
 from typing import Any
 
 
+ROOT = Path(__file__).resolve().parents[2]
 SCHEMA_VERSION = "genoligand_server_api_acceptance_v1"
 TERMINAL_STATES = {"completed", "blocked", "failed", "cancelled"}
+REQUIRED_WORKERS = {
+    "mmseqs_alignment",
+    "foldseek_alignment",
+    "docking",
+    "md_summary",
+}
 REQUIRED_INPUT_KINDS = {
     "small_molecule",
     "peptide",
@@ -52,6 +59,7 @@ class InputCase:
     label: str
     expected_kind: str
     manifest: dict[str, Any]
+    acceptance_profile: str = ""
 
 
 class ApiClient:
@@ -115,6 +123,46 @@ def file_manifest(project_name: str, field: str, path: Path) -> dict[str, Any]:
 
 def write_input_fixtures(root: Path) -> list[InputCase]:
     root.mkdir(parents=True, exist_ok=True)
+    acetazolamide_sdf = root / "acetazolamide-multirecord.sdf"
+    acetazolamide_block = """Acetazolamide
+  GenoLigand
+
+ 13 13  0  0  0  0  0  0  0  0999 V2000
+    0.0000    0.0000    0.0000 C   0  0  0  0  0  0  0  0  0  0  0  0
+    1.5000    0.0000    0.0000 C   0  0  0  0  0  0  0  0  0  0  0  0
+    2.8000    0.0000    0.0000 O   0  0  0  0  0  0  0  0  0  0  0  0
+    1.5000    1.5000    0.0000 N   0  0  0  0  0  0  0  0  0  0  0  0
+    2.8000    2.0000    0.0000 C   0  0  0  0  0  0  0  0  0  0  0  0
+    3.9000    1.2000    0.0000 N   0  0  0  0  0  0  0  0  0  0  0  0
+    5.0000    2.0000    0.0000 N   0  0  0  0  0  0  0  0  0  0  0  0
+    4.6000    3.3000    0.0000 C   0  0  0  0  0  0  0  0  0  0  0  0
+    3.2000    3.3000    0.0000 S   0  0  0  0  0  0  0  0  0  0  0  0
+    5.7000    4.2000    0.0000 S   0  0  0  0  0  0  0  0  0  0  0  0
+    7.0000    3.5000    0.0000 O   0  0  0  0  0  0  0  0  0  0  0  0
+    5.7000    5.7000    0.0000 O   0  0  0  0  0  0  0  0  0  0  0  0
+    4.4000    4.9000    0.0000 N   0  0  0  0  0  0  0  0  0  0  0  0
+  1  2  1  0  0  0  0
+  2  3  2  0  0  0  0
+  2  4  1  0  0  0  0
+  4  5  1  0  0  0  0
+  5  6  4  0  0  0  0
+  6  7  4  0  0  0  0
+  7  8  4  0  0  0  0
+  8  9  4  0  0  0  0
+  9  5  4  0  0  0  0
+  8 10  1  0  0  0  0
+ 10 11  2  0  0  0  0
+ 10 12  2  0  0  0  0
+ 10 13  1  0  0  0  0
+M  END
+"""
+    acetazolamide_sdf.write_text(
+        acetazolamide_block.replace("Acetazolamide\n", "Acetazolamide record 1\n", 1)
+        + "$$$$\n"
+        + acetazolamide_block.replace("Acetazolamide\n", "Acetazolamide record 2\n", 1)
+        + "$$$$\n",
+        encoding="utf-8",
+    )
     fasta = root / "protein.fasta"
     fasta.write_text(
         ">protein_1\nMKTAYIAKQRQISFVKSHFSRQDILDLWQ\n", encoding="utf-8"
@@ -142,10 +190,20 @@ def write_input_fixtures(root: Path) -> list[InputCase]:
             {
                 "inputs": [
                     {"field": "project_name", "value": "验收-SMILES"},
-                    {"field": "small_molecule", "value": "CCO"},
+                    {
+                        "field": "small_molecule",
+                        "value": "CC(=O)Nc1nnc(s1)S(=O)(=O)N",
+                    },
                 ],
-                "files": [],
+                "files": [
+                    {
+                        "field": "small_molecule",
+                        "name": acetazolamide_sdf.name,
+                        "persisted_path": str(acetazolamide_sdf.resolve()),
+                    }
+                ],
             },
+            "candidate_identity_and_complex_md",
         ),
         InputCase(
             "peptide",
@@ -160,6 +218,7 @@ def write_input_fixtures(root: Path) -> list[InputCase]:
                 ],
                 "files": [],
             },
+            "peptide_conformer",
         ),
         InputCase(
             "fasta",
@@ -280,6 +339,49 @@ def valid_sha256(value: object) -> bool:
     return len(text) == 64 and set(text) <= HEX_SHA256
 
 
+def valid_git_commit(value: object) -> bool:
+    text = str(value).strip().lower()
+    return len(text) == 40 and set(text) <= HEX_SHA256
+
+
+def validate_input_capabilities(payload: dict[str, Any]) -> None:
+    require(
+        payload.get("schema_version") == "genoligand_input_capabilities_v1",
+        f"input capability schema mismatch: {payload}",
+    )
+    rows = payload.get("input_types")
+    require(isinstance(rows, list), f"input capability rows are invalid: {payload}")
+    by_kind = {
+        str(row.get("kind", "")): row
+        for row in rows
+        if isinstance(row, dict) and str(row.get("kind", ""))
+    }
+    require(
+        len(by_kind) == len(rows) and set(by_kind) == REQUIRED_INPUT_KINDS,
+        f"input capability kinds differ: {sorted(by_kind)}",
+    )
+    required_forms = {
+        "small_molecule": ("text", "forms", "smiles"),
+        "peptide": ("text", "forms", "amino_acid_sequence"),
+        "protein_ligand": ("file", "extensions", "fasta"),
+        "complex": ("file", "extensions", "pdb"),
+        "genome_or_metagenome": ("file", "extensions", "fastq"),
+    }
+    for kind, (section, field, expected) in required_forms.items():
+        values = by_kind[kind].get(section, {}).get(field, [])
+        require(
+            isinstance(values, list) and expected in values,
+            f"input capability {kind} omits {expected}",
+        )
+    genome_extensions = by_kind["genome_or_metagenome"].get("file", {}).get(
+        "extensions", []
+    )
+    require(
+        isinstance(genome_extensions, list) and "gb" in genome_extensions,
+        "input capability genome_or_metagenome omits gb",
+    )
+
+
 def parse_tsv(text: str, label: str) -> list[dict[str, str]]:
     reader = csv.DictReader(io.StringIO(text), delimiter="\t")
     require(reader.fieldnames is not None, f"{label} header is missing")
@@ -292,6 +394,157 @@ def parse_tsv(text: str, label: str) -> list[dict[str, str]]:
 def read_tsv(path: Path) -> list[dict[str, str]]:
     require(path.is_file(), f"TSV artifact is missing: {path}")
     return parse_tsv(path.read_text(encoding="utf-8-sig"), str(path))
+
+
+def load_json_file(path: Path, label: str) -> dict[str, Any]:
+    require(path.is_file(), f"{label} is missing: {path}")
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8-sig"))
+    except (UnicodeError, json.JSONDecodeError) as error:
+        raise AssertionError(f"{label} is invalid JSON: {path}: {error}") from error
+    require(isinstance(payload, dict), f"{label} must be a JSON object: {path}")
+    return payload
+
+
+def draft_2020_12_validator(schema_name: str) -> Any:
+    try:
+        from jsonschema import Draft202012Validator
+    except ImportError as error:
+        raise AssertionError(
+            "jsonschema with Draft 2020-12 support is required for worker artifact acceptance"
+        ) from error
+    schema = load_json_file(ROOT / "schemas" / schema_name, f"published {schema_name}")
+    require(
+        schema.get("$schema") == "https://json-schema.org/draft/2020-12/schema",
+        f"{schema_name} does not publish Draft 2020-12",
+    )
+    Draft202012Validator.check_schema(schema)
+    return Draft202012Validator(schema)
+
+
+def validate_schema(validator: Any, payload: dict[str, Any], label: str) -> None:
+    errors = sorted(
+        validator.iter_errors(payload),
+        key=lambda error: "/".join(str(part) for part in error.absolute_path),
+    )
+    require(
+        not errors,
+        f"{label} violates the published schema: "
+        + "; ".join(
+            f"{error.json_path}: {error.message}" for error in errors
+        ),
+    )
+
+
+def validate_worker_contract_artifacts(run_dir: Path) -> dict[str, Any]:
+    job_dir = run_dir / "worker_jobs"
+    result_dir = run_dir / "worker_results"
+    require(job_dir.is_dir(), f"completed run worker_jobs directory is missing: {run_dir}")
+    require(result_dir.is_dir(), f"completed run worker_results directory is missing: {run_dir}")
+    job_files = sorted(job_dir.glob("*.json"))
+    result_files = sorted(result_dir.glob("*.json"))
+    require(job_files, f"completed run has no real worker job files: {run_dir}")
+    require(result_files, f"completed run has no real worker result files: {run_dir}")
+
+    job_validator = draft_2020_12_validator("worker_job.schema.json")
+    result_validator = draft_2020_12_validator("worker_result.schema.json")
+    jobs: dict[str, dict[str, Any]] = {}
+    results: dict[str, dict[str, Any]] = {}
+    for path in job_files:
+        payload = load_json_file(path, "worker job")
+        validate_schema(job_validator, payload, f"real worker job {path.name}")
+        job_id = str(payload.get("job_id", ""))
+        require(path.stem == job_id, f"worker job filename does not match job_id: {path.name}")
+        require(job_id not in jobs, f"duplicate worker job_id: {job_id}")
+        require(payload.get("run_id") == run_dir.name, f"worker job run_id mismatch: {path.name}")
+        jobs[job_id] = payload
+    for path in result_files:
+        payload = load_json_file(path, "worker result")
+        validate_schema(result_validator, payload, f"real worker result {path.name}")
+        job_id = str(payload.get("job_id", ""))
+        require(path.stem == job_id, f"worker result filename does not match job_id: {path.name}")
+        require(job_id not in results, f"duplicate worker result job_id: {job_id}")
+        require(payload.get("run_id") == run_dir.name, f"worker result run_id mismatch: {path.name}")
+        results[job_id] = payload
+    require(
+        set(jobs) == set(results),
+        "real worker job/result file sets differ: "
+        f"jobs_only={sorted(set(jobs) - set(results))},"
+        f"results_only={sorted(set(results) - set(jobs))}",
+    )
+
+    coverage: dict[str, dict[str, Any]] = {}
+    for job_id, job in jobs.items():
+        result = results[job_id]
+        for field in ("job_id", "worker", "run_id", "invocation_id"):
+            require(
+                result.get(field) == job.get(field),
+                f"real worker job/result {field} mismatch: {job_id}",
+            )
+        for field in (
+            "candidate_id",
+            "candidate_digest",
+            "input_id",
+            "record_id",
+            "input_digest",
+            "source_digest",
+            "receptor_digest",
+        ):
+            if field in job or field in result:
+                require(
+                    result.get(field) == job.get(field),
+                    f"real worker job/result {field} binding mismatch: {job_id}",
+                )
+        for field in ("candidate_id", "input_id", "input_digest"):
+            expected = f"expected_{field}"
+            if expected in result:
+                require(
+                    result[expected] == job.get(field),
+                    f"real worker result {expected} binding mismatch: {job_id}",
+                )
+        worker = str(job["worker"])
+        require(worker in REQUIRED_WORKERS, f"unexpected real worker type: {worker}")
+        stats = coverage.setdefault(
+            worker,
+            {
+                "jobs": 0,
+                "results": 0,
+                "result_statuses": {},
+                "execution_statuses": {},
+                "contract_variants": {},
+            },
+        )
+        stats["jobs"] += 1
+        stats["results"] += 1
+        for key, source_field in (
+            ("result_statuses", "status"),
+            ("execution_statuses", "execution_status"),
+        ):
+            value = str(result[source_field])
+            stats[key][value] = int(stats[key].get(value, 0)) + 1
+        execution_status = str(result["execution_status"])
+        if str(result["engine_version"]).startswith("worker unavailable:"):
+            variant = "rust_fallback_failure"
+        elif execution_status == "failed":
+            variant = "python_failure"
+        else:
+            variant = f"python_{execution_status}"
+        stats["contract_variants"][variant] = (
+            int(stats["contract_variants"].get(variant, 0)) + 1
+        )
+    return {
+        "job_files": len(job_files),
+        "result_files": len(result_files),
+        "workers": coverage,
+    }
+
+
+def optional_worker_contract_artifacts(run_dir: Path) -> dict[str, Any]:
+    jobs = list((run_dir / "worker_jobs").glob("*.json"))
+    results = list((run_dir / "worker_results").glob("*.json"))
+    if not jobs and not results:
+        return {"job_files": 0, "result_files": 0, "workers": {}}
+    return validate_worker_contract_artifacts(run_dir)
 
 
 def require_fields(row: dict[str, Any], fields: tuple[str, ...], label: str) -> None:
@@ -365,6 +618,16 @@ def sha256_file(path: Path) -> str:
         for chunk in iter(lambda: handle.read(1024 * 1024), b""):
             digest.update(chunk)
     return digest.hexdigest()
+
+
+def canonical_json_sha256(value: object) -> str:
+    payload = json.dumps(
+        value,
+        ensure_ascii=True,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    return hashlib.sha256(payload).hexdigest()
 
 
 def json_artifact(run_dir: Path, value: object, label: str) -> dict[str, Any]:
@@ -493,6 +756,256 @@ def validate_candidate_outcomes(run_dir: Path, candidate_ids: set[str]) -> dict[
     }
 
 
+def manifest_index_entries(run_dir: Path, kind: str) -> list[dict[str, Any]]:
+    payload = load_json_file(
+        run_dir / "tool_outputs" / f"{kind}_manifest_index.json",
+        f"{kind} manifest index",
+    )
+    rows = payload.get("entries")
+    require(isinstance(rows, list), f"{kind} manifest index entries are invalid")
+    require(all(isinstance(row, dict) for row in rows), f"{kind} manifest index row is invalid")
+    return rows
+
+
+def validate_candidate_identity_continuation(run_dir: Path) -> dict[str, Any]:
+    conversion = read_tsv(run_dir / "input_conversion_manifest.tsv")
+    sdf_rows = [
+        row
+        for row in conversion
+        if row.get("format", "").lower() == "sdf"
+        and row.get("conversion_status") == "converted"
+    ]
+    sdf_identities = {
+        (row.get("input_id", ""), row.get("record_id", "")) for row in sdf_rows
+    }
+    require(
+        len(sdf_rows) == 2
+        and len(sdf_identities) == 2
+        and len({input_id for input_id, _ in sdf_identities}) == 1,
+        f"multi-record SDF did not preserve two records: {sdf_rows}",
+    )
+
+    known = read_tsv(run_dir / "known_database_matches.tsv")
+    ranking = read_tsv(run_dir / "target_candidate_ranking.tsv")
+    require(
+        len({row.get("candidate_id", "") for row in ranking}) == len(ranking),
+        "candidate ranking contains duplicate candidate ids",
+    )
+    sources_by_identity_target: dict[tuple[str, str, str], set[str]] = {}
+    identities_by_target: dict[str, set[tuple[str, str]]] = {}
+    for row in known:
+        input_id = row.get("input_id", "")
+        record_id = row.get("record_id", "")
+        target_id = row.get("target_id", "")
+        source = row.get("source", "").lower()
+        if not input_id or not record_id or not target_id:
+            continue
+        source_class = (
+            "chembl"
+            if "chembl" in source
+            else "bindingdb"
+            if "bindingdb" in source
+            else source
+        )
+        sources_by_identity_target.setdefault(
+            (input_id, record_id, target_id), set()
+        ).add(source_class)
+        identities_by_target.setdefault(target_id, set()).add((input_id, record_id))
+
+    multi_source = sorted(
+        (
+            (identity_target, sources)
+            for identity_target, sources in sources_by_identity_target.items()
+            if {"chembl", "bindingdb"} <= sources
+        ),
+        key=lambda item: item[0],
+    )
+    require(multi_source, "no real input record merged ChEMBL and BindingDB evidence")
+    (source_input, source_record, source_target), source_names = multi_source[0]
+    merged = [
+        row
+        for row in ranking
+        if (
+            row.get("input_id"),
+            row.get("record_id"),
+            row.get("target_id"),
+        )
+        == (source_input, source_record, source_target)
+    ]
+    require(
+        len(merged) == 1,
+        "same-record multi-source evidence did not merge into one candidate",
+    )
+
+    target_id, target_identities = next(
+        (
+            (target, identities)
+            for target, identities in sorted(identities_by_target.items())
+            if len({input_id for input_id, _ in identities}) >= 2
+        ),
+        ("", set()),
+    )
+    require(target_id, "no target was independently retained for two project inputs")
+    same_target_candidates = [
+        row
+        for row in ranking
+        if row.get("target_id") == target_id
+        and (row.get("input_id", ""), row.get("record_id", "")) in target_identities
+    ]
+    by_identity: dict[tuple[str, str], list[dict[str, str]]] = {}
+    for row in same_target_candidates:
+        by_identity.setdefault(
+            (row.get("input_id", ""), row.get("record_id", "")), []
+        ).append(row)
+    require(
+        all(len(by_identity.get(identity, [])) == 1 for identity in target_identities)
+        and len({rows[0]["candidate_id"] for rows in by_identity.values()})
+        == len(target_identities),
+        "same target across project inputs did not retain distinct candidate identities",
+    )
+
+    ranked_identities = {
+        (row.get("input_id", ""), row.get("record_id", "")) for row in ranking
+    }
+    selected_rows = read_tsv(run_dir / "complex_candidate_selection.tsv")
+    selected_identities = {
+        (row.get("input_id", ""), row.get("record_id", "")) for row in selected_rows
+    }
+    require(sdf_identities <= ranked_identities, "an SDF record did not reach candidate ranking")
+    require(sdf_identities <= selected_identities, "an SDF record did not reach top-N selection")
+    selected_candidates = {
+        row.get("candidate_id", "")
+        for row in selected_rows
+        if (row.get("input_id", ""), row.get("record_id", "")) in sdf_identities
+    }
+    for kind in ("docking", "md"):
+        indexed = {str(row.get("candidate_id", "")) for row in manifest_index_entries(run_dir, kind)}
+        require(
+            selected_candidates <= indexed,
+            f"an SDF record did not reach the {kind} worker outcome index",
+        )
+    return {
+        "same_record_multi_source": {
+            "input_id": source_input,
+            "record_id": source_record,
+            "target_id": source_target,
+            "sources": sorted(source_names),
+            "candidate_id": merged[0]["candidate_id"],
+        },
+        "same_target_project_inputs": {
+            "target_id": target_id,
+            "input_records": len(target_identities),
+            "candidate_ids": sorted(rows[0]["candidate_id"] for rows in by_identity.values()),
+        },
+        "multi_record_sdf": {
+            "records": sorted(f"{input_id}:{record_id}" for input_id, record_id in sdf_identities),
+            "selected_candidates": sorted(selected_candidates),
+            "continued_through": ["candidate_ranking", "top_n", "docking", "md"],
+        },
+    }
+
+
+def completed_md_manifests(run_dir: Path) -> list[tuple[dict[str, Any], dict[str, Any]]]:
+    completed = []
+    for entry in manifest_index_entries(run_dir, "md"):
+        if entry.get("status") != "completed":
+            continue
+        completed.append(
+            (
+                entry,
+                json_artifact(
+                    run_dir,
+                    entry.get("manifest"),
+                    f"completed MD manifest:{entry.get('candidate_id', '')}",
+                ),
+            )
+        )
+    require(completed, "input case has no completed MD semantic artifact")
+    return completed
+
+
+def validate_md_case_semantics(run_dir: Path, profile: str) -> dict[str, Any]:
+    completed = completed_md_manifests(run_dir)
+    if profile == "peptide_conformer":
+        for entry, manifest in completed:
+            require(
+                manifest.get("artifact_schema_version")
+                == "genoligand_peptide_conformer_v1"
+                and manifest.get("method") == "rdkit_peptide_conformer_ensemble"
+                and manifest.get("method_class") == "conformer_ensemble"
+                and manifest.get("platform") == "RDKit"
+                and manifest.get("has_receptor") is False
+                and manifest.get("uses_openmm") is False
+                and float(manifest.get("md_score", -1)) == 0.0,
+                f"peptide MD semantics are invalid: {entry.get('candidate_id')}",
+            )
+            require(int(manifest.get("conformer_count", 0)) > 0, "peptide conformer count is empty")
+            run_artifact(run_dir, manifest.get("coordinate_artifact"), "peptide coordinates")
+            run_artifact(run_dir, manifest.get("ensemble_artifact"), "peptide ensemble")
+            metrics = manifest.get("metric_artifacts")
+            require(isinstance(metrics, list) and len(metrics) >= 2, "peptide metrics are incomplete")
+            for path in metrics:
+                run_artifact(run_dir, path, "peptide metric")
+        require(not read_tsv(run_dir / "md_summary.tsv"), "peptide conformers entered complex MD scores")
+        report = (run_dir / "research_report.md").read_text(encoding="utf-8-sig")
+        require("OpenMM" not in report, "peptide report claims OpenMM complex dynamics")
+        return {
+            "method": "rdkit_peptide_conformer_ensemble",
+            "completed_candidates": len(completed),
+            "uses_openmm": False,
+            "md_score": 0.0,
+        }
+
+    require(profile == "candidate_identity_and_complex_md", f"unknown MD profile: {profile}")
+    facts = []
+    for entry, manifest in completed:
+        if manifest.get("method") != "openmm_receptor_ligand_complex_dynamics":
+            continue
+        platform = str(manifest.get("platform", ""))
+        system = manifest.get("system")
+        require(platform in {"CPU", "CUDA", "Reference"}, f"OpenMM platform is invalid: {platform}")
+        require(
+            isinstance(system, dict)
+            and str(system.get("solvent_mode", ""))
+            and str(system.get("nonbonded_method", ""))
+            and int(system.get("total_atom_count", 0)) > 0,
+            "complex OpenMM system facts are incomplete",
+        )
+        require(
+            int(manifest.get("frame_count", 0)) > 0
+            and int(manifest.get("state_row_count", 0)) > 0,
+            "complex OpenMM trajectory facts are incomplete",
+        )
+        for field in (
+            "receptor_coordinate",
+            "ligand_coordinate",
+            "complex_manifest",
+            "protocol_artifact",
+            "state_artifact",
+            "trajectory",
+        ):
+            run_artifact(run_dir, manifest.get(field), f"complex OpenMM {field}")
+        provenance = json_artifact(
+            run_dir,
+            entry.get("artifact_provenance"),
+            f"complex OpenMM provenance:{entry.get('candidate_id', '')}",
+        )
+        require(provenance.get("tool_name") == "OpenMM", "complex MD provenance tool is not OpenMM")
+        facts.append(
+            {
+                "candidate_id": entry.get("candidate_id"),
+                "platform": platform,
+                "solvent_mode": system["solvent_mode"],
+                "nonbonded_method": system["nonbonded_method"],
+                "total_atom_count": system["total_atom_count"],
+                "frame_count": manifest["frame_count"],
+                "state_row_count": manifest["state_row_count"],
+            }
+        )
+    require(facts, "small-molecule case has no completed complex OpenMM calculation")
+    return {"method": "openmm_receptor_ligand_complex_dynamics", "facts": facts}
+
+
 def result_page(client: ApiClient, run_id: str, endpoint: str, row_key: str, page: int, page_size: int) -> tuple[list[dict[str, Any]], dict[str, Any]]:
     query = urllib.parse.urlencode({"page": page, "page_size": page_size})
     payload = client.json(
@@ -570,7 +1083,39 @@ def validate_report_trace(
     require(context.get("project_id") == project_id, "run context project identity mismatch")
     require(context.get("run_id") == run_id, "run context run identity mismatch")
     require(context.get("pipeline_invocation_id") == invocation, "run context invocation mismatch")
-    require(valid_sha256(context.get("ranking_policy_digest")), "ranking policy digest is invalid")
+    policy = context.get("ranking_policy")
+    require(isinstance(policy, dict), "run context ranking policy is missing")
+    policy_version = str(policy.get("schema_version", "")).strip()
+    policy_digest = str(context.get("ranking_policy_digest", "")).strip().lower()
+    require(policy_version, "ranking policy version is missing")
+    require(valid_sha256(policy_digest), "ranking policy digest is invalid")
+    require(
+        canonical_json_sha256(policy) == policy_digest,
+        "ranking policy digest does not match the policy payload",
+    )
+    context_rows = {
+        row.get("field", ""): row.get("value", "")
+        for row in read_tsv(run_dir / "run_context.tsv")
+    }
+    require(
+        context_rows.get("ranking_policy_version") == policy_version
+        and context_rows.get("ranking_policy_digest") == policy_digest,
+        "JSON and TSV run contexts use different ranking policies",
+    )
+    decomposition = read_tsv(run_dir / "score_decomposition.tsv")
+    require(decomposition, "score decomposition is empty")
+    require(
+        all(
+            row.get("policy_version") == policy_version
+            and row.get("policy_digest") == policy_digest
+            for row in decomposition
+        ),
+        "score decomposition uses a different ranking policy",
+    )
+    require(
+        policy_version in report_text and policy_digest in report_text,
+        "report omits the bound ranking policy",
+    )
     require(project_id in report_text and run_id in report_text, "report omits current run identity")
     first_target = str(candidates[0].get("target_id", "")).strip()
     require(first_target and first_target in report_text, "report top candidate differs from candidate API")
@@ -655,6 +1200,11 @@ def validate_terminal_run(
         "GET", f"/api/user/runs/{urllib.parse.quote(run_id)}/download/research_report"
     )
     scientific_outcomes: dict[str, Any] = {}
+    worker_contracts: dict[str, Any] = {
+        "job_files": 0,
+        "result_files": 0,
+        "workers": {},
+    }
     if expected == "completed":
         require(candidate_count > 0, "completed run has no candidate rows")
         require(evidence_count > 0, "completed run has no evidence rows")
@@ -681,6 +1231,7 @@ def validate_terminal_run(
             client, run_id, "evidence", evidence_rows, EVIDENCE_EXPORT_FIELDS
         )
         search = validate_search_outcomes(run_dir)
+        worker_contracts = validate_worker_contract_artifacts(run_dir)
         candidate_outcomes = validate_candidate_outcomes(
             run_dir,
             {
@@ -694,6 +1245,7 @@ def validate_terminal_run(
         )
         scientific_outcomes = {
             "search": search,
+            "worker_contracts": worker_contracts,
             "top_n": candidate_outcomes,
             "pipeline_invocation_id": invocation,
             "candidate_export_rows": candidate_export_rows,
@@ -703,10 +1255,13 @@ def validate_terminal_run(
         require(not report_visible, f"{expected} run exposes a report")
         require(download_status == 404, f"{expected} report download returned {download_status}")
         require(candidate_count == 0 and evidence_count == 0, f"{expected} run exposes results")
+        if expected == "failed":
+            worker_contracts = optional_worker_contract_artifacts(run_dir)
 
     return {
         "project_id": project_id,
         "run_id": run_id,
+        "run_dir": str(run_dir),
         "state": expected,
         "failure_reason": failure_reason,
         "candidate_count": candidate_count,
@@ -714,6 +1269,7 @@ def validate_terminal_run(
         "report_file": report_path.is_file(),
         "report_visible": report_visible,
         "done_marker": False,
+        "worker_contracts": worker_contracts,
         "scientific_outcomes": scientific_outcomes,
     }
 
@@ -733,6 +1289,18 @@ def run_completed_input_case(
     result = validate_terminal_run(client, artifact_dir, project_id, run_id, "completed")
     result["input_case"] = case.label
     result["canonical_kind"] = case.expected_kind
+    if case.acceptance_profile:
+        run_dir = Path(result["run_dir"])
+        contracts: dict[str, Any] = {
+            "md_semantics": validate_md_case_semantics(
+                run_dir, case.acceptance_profile
+            )
+        }
+        if case.acceptance_profile == "candidate_identity_and_complex_md":
+            contracts["candidate_identity"] = validate_candidate_identity_continuation(
+                run_dir
+            )
+        result["case_contracts"] = contracts
     return result
 
 
@@ -761,6 +1329,68 @@ def validate_completed_aggregate(completed: list[dict[str, Any]]) -> dict[str, A
     md_completed = sum(int(row.get("md_completed", 0)) for row in top_n)
     require(docking_completed > 0, "aggregate acceptance has no completed docking outcome")
     require(md_completed > 0, "aggregate acceptance has no completed MD outcome")
+    worker_coverage = {
+        worker: {
+            "jobs": 0,
+            "results": 0,
+            "result_statuses": {},
+            "execution_statuses": {},
+            "contract_variants": {},
+        }
+        for worker in sorted(REQUIRED_WORKERS)
+    }
+    for row in completed:
+        observed = (
+            row.get("scientific_outcomes", {})
+            .get("worker_contracts", {})
+            .get("workers", {})
+        )
+        require(isinstance(observed, dict), "completed run worker coverage is missing")
+        for worker, stats in observed.items():
+            require(
+                worker in worker_coverage and isinstance(stats, dict),
+                f"invalid worker coverage: {worker}",
+            )
+            aggregate = worker_coverage[worker]
+            aggregate["jobs"] += int(stats.get("jobs", 0))
+            aggregate["results"] += int(stats.get("results", 0))
+            for key in ("result_statuses", "execution_statuses", "contract_variants"):
+                values = stats.get(key, {})
+                require(isinstance(values, dict), f"invalid {worker} {key} coverage")
+                for value, count in values.items():
+                    name = str(value)
+                    aggregate[key][name] = int(aggregate[key].get(name, 0)) + int(count)
+    require(
+        all(stats["jobs"] > 0 and stats["results"] > 0 for stats in worker_coverage.values()),
+        f"real worker Schema coverage is incomplete: {worker_coverage}",
+    )
+    require(
+        all(
+            int(stats["result_statuses"].get("PASS", 0)) > 0
+            and int(stats["execution_statuses"].get("completed", 0)) > 0
+            for stats in worker_coverage.values()
+        ),
+        f"real worker completed execution coverage is incomplete: {worker_coverage}",
+    )
+    provenance_runs = [
+        row
+        for row in completed
+        if int(row.get("scientific_outcomes", {}).get("top_n", {}).get("docking_completed", 0))
+        >= 2
+        and int(row.get("scientific_outcomes", {}).get("top_n", {}).get("md_completed", 0))
+        >= 1
+    ]
+    require(
+        provenance_runs,
+        "no completed run contains at least two Vina outcomes and one OpenMM outcome",
+    )
+    provenance_run = max(
+        provenance_runs,
+        key=lambda row: (
+            int(row["scientific_outcomes"]["top_n"]["docking_completed"]),
+            int(row["scientific_outcomes"]["top_n"]["md_completed"]),
+        ),
+    )
     return {
         "canonical_kinds": sorted(kinds),
         "format_cases": sorted(REQUIRED_FORMAT_CASES),
@@ -768,6 +1398,51 @@ def validate_completed_aggregate(completed: list[dict[str, Any]]) -> dict[str, A
         "max_top_n": max(int(row.get("selected", 0)) for row in top_n),
         "docking_completed": docking_completed,
         "md_completed": md_completed,
+        "worker_schema_coverage": worker_coverage,
+        "runtime_provenance_attack_run": {
+            "project_id": provenance_run["project_id"],
+            "run_id": provenance_run["run_id"],
+            "run_dir": provenance_run["run_dir"],
+            "input_case": provenance_run["input_case"],
+            "docking_completed": provenance_run["scientific_outcomes"]["top_n"][
+                "docking_completed"
+            ],
+            "md_completed": provenance_run["scientific_outcomes"]["top_n"][
+                "md_completed"
+            ],
+        },
+    }
+
+
+def summarize_worker_failure_and_fallback(
+    runs: list[dict[str, Any]],
+) -> dict[str, Any]:
+    observed = {"python_failure": 0, "rust_fallback_failure": 0}
+    for run in runs:
+        contracts = run.get("worker_contracts", {})
+        workers = contracts.get("workers", {}) if isinstance(contracts, dict) else {}
+        if not isinstance(workers, dict):
+            continue
+        for stats in workers.values():
+            variants = stats.get("contract_variants", {}) if isinstance(stats, dict) else {}
+            if not isinstance(variants, dict):
+                continue
+            for name in observed:
+                observed[name] += int(variants.get(name, 0))
+    missing = [name for name, count in observed.items() if count == 0]
+    return {
+        "observed_real_job_results": observed,
+        "missing_real_variants": missing,
+        "schema_and_binding_validation": "executed_for_every_observed_job_result",
+        "api_generation_status": (
+            "complete"
+            if not missing
+            else "server_api_has_no_per_run_worker_fault_injection"
+        ),
+        "generation_note": (
+            "A Python worker failure and Rust worker-unavailable fallback require "
+            "process-level worker fault injection; the current user API exposes no such control."
+        ),
     }
 
 
@@ -829,6 +1504,273 @@ def write_evidence(path: Path, value: dict[str, Any]) -> None:
     pending.replace(path)
 
 
+def write_worker_contract_self_test(run_dir: Path) -> None:
+    job_dir = run_dir / "worker_jobs"
+    result_dir = run_dir / "worker_results"
+    job_dir.mkdir(parents=True)
+    result_dir.mkdir(parents=True)
+    digest = "a" * 64
+    for worker in sorted(REQUIRED_WORKERS):
+        job_id = f"{worker}_self_test"
+        invocation_id = f"invocation-{worker}"
+        job: dict[str, Any] = {
+            "schema_version": "genoligand_worker_current_v2",
+            "pipeline_mode": "genoligand_scientific_pipeline",
+            "job_id": job_id,
+            "worker": worker,
+            "stage": "self_test",
+            "run_id": run_dir.name,
+            "invocation_id": invocation_id,
+            "rust_owned_decision_logic": True,
+            "decision_owner": "GenoLigand Rust core",
+            "input_manifest": str(run_dir / "input.json"),
+            "run_dir": str(run_dir),
+            "science_store": str(run_dir / "science_store"),
+            "expected_result_schema": "genoligand_worker_current_v2",
+        }
+        if worker in {"docking", "md_summary"}:
+            job.update(
+                {
+                    "candidate_id": "candidate-self-test",
+                    "candidate_digest": digest,
+                    "identity_namespace": "self-test",
+                    "candidate_selection": "rank=1",
+                    "input_id": "input-self-test",
+                    "record_id": "record-self-test",
+                    "input_digest": digest,
+                    "source_digest": digest,
+                    "receptor_artifact": str(run_dir / "receptor.pdb"),
+                    "receptor_digest": digest,
+                }
+            )
+        if worker == "md_summary":
+            job["platform_policy"] = "required"
+        result = {
+            "schema_version": "genoligand_worker_current_v2",
+            "job_id": job_id,
+            "worker": worker,
+            "run_id": run_dir.name,
+            "invocation_id": invocation_id,
+            "status": "FAIL",
+            "engine_version": "self-test",
+            "execution_status": "failed",
+            "reason": "self_test",
+            "outcomes": [
+                {
+                    "status": "failed",
+                    "reason": "self_test",
+                    "required": True,
+                    "database_id": worker,
+                    "row_count": 0,
+                }
+            ],
+            "python_owns_final_score": False,
+            "python_owns_report_semantics": False,
+            "primitive_execution_only": True,
+        }
+        for field in (
+            "candidate_id",
+            "candidate_digest",
+            "input_id",
+            "record_id",
+            "input_digest",
+            "source_digest",
+            "receptor_digest",
+        ):
+            if field in job:
+                result[field] = job[field]
+        (job_dir / f"{job_id}.json").write_text(
+            json.dumps(job, ensure_ascii=False, indent=2) + "\n", encoding="utf-8"
+        )
+        (result_dir / f"{job_id}.json").write_text(
+            json.dumps(result, ensure_ascii=False, indent=2) + "\n", encoding="utf-8"
+        )
+        if worker == "mmseqs_alignment":
+            fallback_job = dict(job)
+            fallback_job["job_id"] = f"{worker}_rust_fallback_self_test"
+            fallback_job["invocation_id"] = f"invocation-{worker}-rust-fallback"
+            fallback_result = dict(result)
+            fallback_result["job_id"] = fallback_job["job_id"]
+            fallback_result["invocation_id"] = fallback_job["invocation_id"]
+            fallback_result["engine_version"] = "worker unavailable: self_test"
+            fallback_result["reason"] = "self_test_worker_unavailable"
+            (job_dir / f"{fallback_job['job_id']}.json").write_text(
+                json.dumps(fallback_job, ensure_ascii=False, indent=2) + "\n",
+                encoding="utf-8",
+            )
+            (result_dir / f"{fallback_result['job_id']}.json").write_text(
+                json.dumps(fallback_result, ensure_ascii=False, indent=2) + "\n",
+                encoding="utf-8",
+            )
+
+
+def write_case_contract_self_test(root: Path) -> None:
+    identity = root / "identity-contracts"
+    tool_outputs = identity / "tool_outputs"
+    tool_outputs.mkdir(parents=True)
+    (identity / "input_conversion_manifest.tsv").write_text(
+        "input_id\trecord_id\tformat\tconversion_status\n"
+        "input_2\trecord_1\tplain_text\tconverted\n"
+        "input_3\tazm_1\tsdf\tconverted\n"
+        "input_3\tazm_2\tsdf\tconverted\n",
+        encoding="utf-8",
+    )
+    known_rows = []
+    for input_id, record_id in (
+        ("input_2", "record_1"),
+        ("input_3", "azm_1"),
+        ("input_3", "azm_2"),
+    ):
+        for source in ("ChEMBL", "BindingDB"):
+            known_rows.append(
+                f"{input_id}\t{source}\tP00918\tCA2\tHomo sapiens\tenzyme\t1.0\tligand\tbound\t{record_id}"
+            )
+    (identity / "known_database_matches.tsv").write_text(
+        "input_id\tsource\ttarget_id\ttarget_name\torganism\ttarget_class\tmatch_score\tmatched_features\tevidence\trecord_id\n"
+        + "\n".join(known_rows)
+        + "\n",
+        encoding="utf-8",
+    )
+    ranking_rows = [
+        ("candidate_1", "input_2", "record_1"),
+        ("candidate_2", "input_3", "azm_1"),
+        ("candidate_3", "input_3", "azm_2"),
+    ]
+    (identity / "target_candidate_ranking.tsv").write_text(
+        "candidate_id\ttarget_id\tinput_id\trecord_id\n"
+        + "".join(
+            f"{candidate}\tP00918\t{input_id}\t{record_id}\n"
+            for candidate, input_id, record_id in ranking_rows
+        ),
+        encoding="utf-8",
+    )
+    (identity / "complex_candidate_selection.tsv").write_text(
+        "candidate_id\tinput_id\trecord_id\n"
+        "candidate_2\tinput_3\tazm_1\n"
+        "candidate_3\tinput_3\tazm_2\n",
+        encoding="utf-8",
+    )
+    indexed = {
+        "entries": [
+            {"candidate_id": "candidate_2"},
+            {"candidate_id": "candidate_3"},
+        ]
+    }
+    for kind in ("docking", "md"):
+        (tool_outputs / f"{kind}_manifest_index.json").write_text(
+            json.dumps(indexed) + "\n", encoding="utf-8"
+        )
+    identity_result = validate_candidate_identity_continuation(identity)
+    require(
+        identity_result["same_target_project_inputs"]["input_records"] == 3
+        and len(identity_result["multi_record_sdf"]["selected_candidates"]) == 2,
+        "candidate identity continuation self-test changed",
+    )
+
+    peptide = root / "peptide-contracts"
+    (peptide / "tool_outputs").mkdir(parents=True)
+    for name in (
+        "peptide_conformer_coordinates.tsv",
+        "peptide_conformer_ensemble.tsv",
+        "peptide_conformer_summary.tsv",
+        "peptide_conformer_metrics.tsv",
+    ):
+        (peptide / "tool_outputs" / name).write_text("fixture\n", encoding="utf-8")
+    (peptide / "md_summary.tsv").write_text("candidate_id\tmd_stability_score\n", encoding="utf-8")
+    (peptide / "research_report.md").write_text("RDKit conformer ensemble\n", encoding="utf-8")
+    peptide_manifest = {
+        "artifact_schema_version": "genoligand_peptide_conformer_v1",
+        "method": "rdkit_peptide_conformer_ensemble",
+        "method_class": "conformer_ensemble",
+        "platform": "RDKit",
+        "has_receptor": False,
+        "uses_openmm": False,
+        "md_score": 0.0,
+        "conformer_count": 2,
+        "coordinate_artifact": "tool_outputs/peptide_conformer_coordinates.tsv",
+        "ensemble_artifact": "tool_outputs/peptide_conformer_ensemble.tsv",
+        "metric_artifacts": [
+            "tool_outputs/peptide_conformer_summary.tsv",
+            "tool_outputs/peptide_conformer_metrics.tsv",
+        ],
+    }
+    (peptide / "tool_outputs" / "peptide_manifest.json").write_text(
+        json.dumps(peptide_manifest) + "\n", encoding="utf-8"
+    )
+    (peptide / "tool_outputs" / "md_manifest_index.json").write_text(
+        json.dumps(
+            {
+                "entries": [
+                    {
+                        "candidate_id": "peptide_candidate",
+                        "status": "completed",
+                        "manifest": "tool_outputs/peptide_manifest.json",
+                    }
+                ]
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    peptide_result = validate_md_case_semantics(peptide, "peptide_conformer")
+    require(peptide_result["uses_openmm"] is False, "peptide semantics self-test changed")
+
+    complex_run = root / "complex-contracts"
+    (complex_run / "tool_outputs").mkdir(parents=True)
+    for name in (
+        "receptor.pdb",
+        "ligand.tsv",
+        "complex.json",
+        "protocol.tsv",
+        "state.tsv",
+        "trajectory.tsv",
+    ):
+        (complex_run / "tool_outputs" / name).write_text("fixture\n", encoding="utf-8")
+    complex_manifest = {
+        "method": "openmm_receptor_ligand_complex_dynamics",
+        "platform": "CPU",
+        "system": {
+            "solvent_mode": "explicit",
+            "nonbonded_method": "PME",
+            "total_atom_count": 10,
+        },
+        "frame_count": 2,
+        "state_row_count": 2,
+        "receptor_coordinate": "tool_outputs/receptor.pdb",
+        "ligand_coordinate": "tool_outputs/ligand.tsv",
+        "complex_manifest": "tool_outputs/complex.json",
+        "protocol_artifact": "tool_outputs/protocol.tsv",
+        "state_artifact": "tool_outputs/state.tsv",
+        "trajectory": "tool_outputs/trajectory.tsv",
+    }
+    (complex_run / "tool_outputs" / "complex_manifest.json").write_text(
+        json.dumps(complex_manifest) + "\n", encoding="utf-8"
+    )
+    (complex_run / "tool_outputs" / "provenance.json").write_text(
+        json.dumps({"tool_name": "OpenMM"}) + "\n", encoding="utf-8"
+    )
+    (complex_run / "tool_outputs" / "md_manifest_index.json").write_text(
+        json.dumps(
+            {
+                "entries": [
+                    {
+                        "candidate_id": "complex_candidate",
+                        "status": "completed",
+                        "manifest": "tool_outputs/complex_manifest.json",
+                        "artifact_provenance": "tool_outputs/provenance.json",
+                    }
+                ]
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    complex_result = validate_md_case_semantics(
+        complex_run, "candidate_identity_and_complex_md"
+    )
+    require(len(complex_result["facts"]) == 1, "complex MD semantics self-test changed")
+
+
 def self_test() -> int:
     with tempfile.TemporaryDirectory(prefix="genoligand-api-acceptance-self-test-") as tmp:
         root = Path(tmp)
@@ -840,12 +1782,67 @@ def self_test() -> int:
         for case in cases:
             require(isinstance(case.manifest.get("inputs"), list), f"{case.label} inputs missing")
             require(isinstance(case.manifest.get("files"), list), f"{case.label} files missing")
+        small_molecule = cases[0]
+        require(
+            small_molecule.acceptance_profile == "candidate_identity_and_complex_md"
+            and len(small_molecule.manifest["inputs"]) == 2
+            and len(small_molecule.manifest["files"]) == 1,
+            "small-molecule identity fixture changed",
+        )
+        sdf_path = Path(small_molecule.manifest["files"][0]["persisted_path"])
+        require(
+            sdf_path.read_text(encoding="utf-8").count("$$$$") == 2,
+            "multi-record SDF fixture changed",
+        )
+        require(
+            cases[1].acceptance_profile == "peptide_conformer",
+            "peptide semantic profile changed",
+        )
         require(parse_tsv("candidate_id\tscore\nC1\t1\n", "self-test") == [{"candidate_id": "C1", "score": "1"}], "TSV parser changed")
+        require(
+            canonical_json_sha256(
+                {
+                    "schema_version": "genoligand_target_ranking_v1",
+                    "known_database_weight": 0.5,
+                    "metagenome_weight": 0.25,
+                    "structure_weight": 0.1,
+                    "docking_weight": 0.05,
+                    "md_weight": 0.1,
+                }
+            )
+            == "aacee02f2226d92881a901dd96d3cf040694d2530ad62e1028e7f590fa7f713d",
+            "ranking policy canonical digest changed",
+        )
         for state in TERMINAL_STATES:
             run = root / state
             run.mkdir()
             (run / "run_state.txt").write_text(state + "\n", encoding="utf-8")
             require(read_trimmed(run / "run_state.txt") == state, f"state read failed: {state}")
+        completed = root / "completed-worker-contracts"
+        completed.mkdir()
+        write_worker_contract_self_test(completed)
+        worker_contracts = validate_worker_contract_artifacts(completed)
+        require(
+            set(worker_contracts["workers"]) == REQUIRED_WORKERS,
+            "worker schema self-test coverage changed",
+        )
+        require(
+            worker_contracts["workers"]["mmseqs_alignment"]["jobs"] == 2
+            and worker_contracts["workers"]["mmseqs_alignment"]["results"] == 2
+            and all(
+                stats["jobs"] == 1 and stats["results"] == 1
+                for worker, stats in worker_contracts["workers"].items()
+                if worker != "mmseqs_alignment"
+            ),
+            "worker schema self-test file counts changed",
+        )
+        variants = worker_contracts["workers"]["mmseqs_alignment"]["contract_variants"]
+        require(
+            variants.get("python_failure") == 1
+            and variants.get("rust_fallback_failure") == 1,
+            "worker failure/fallback classification changed",
+        )
+        write_case_contract_self_test(root)
     print("server_api_acceptance_self_test\tPASS")
     return 0
 
@@ -867,6 +1864,8 @@ def main() -> int:
         return self_test()
 
     require(args.artifact_dir is not None, "--artifact-dir is required")
+    require(bool(str(args.expected_version or "").strip()), "--expected-version is required")
+    require(valid_git_commit(args.expected_commit), "--expected-commit must be a 40-character Git commit")
     artifact_dir = args.artifact_dir.resolve()
     require(artifact_dir.is_dir(), f"artifact directory does not exist: {artifact_dir}")
     fixture_root = (
@@ -880,15 +1879,31 @@ def main() -> int:
     health = client.json("GET", "/api/user/health")
     require(health.get("status") == "ready", f"server health failed: {health}")
     readiness = health.get("science_store_readiness")
-    require(isinstance(readiness, dict) and readiness.get("ready") is True, f"science store is not ready: {readiness}")
-    if args.expected_version:
-        require(health.get("version") == args.expected_version, f"version mismatch: {health}")
-    if args.expected_commit:
-        require(health.get("commit") == args.expected_commit, f"commit mismatch: {health}")
+    require(
+        isinstance(readiness, dict)
+        and readiness.get("schema_version") == "genoligand_science_store_readiness_v1"
+        and readiness.get("status") == "ready"
+        and readiness.get("ready") is True
+        and readiness.get("blockers") == []
+        and valid_sha256(readiness.get("evidence_digest")),
+        f"science store is not ready: {readiness}",
+    )
+    require(health.get("version") == args.expected_version, f"version mismatch: {health}")
+    require(
+        health.get("commit") == args.expected_commit
+        and health.get("build_id") == args.expected_commit,
+        f"commit mismatch: {health}",
+    )
+    runtime = health.get("runtime")
+    require(
+        isinstance(runtime, dict)
+        and runtime.get("status") == "verified"
+        and runtime.get("commit") == args.expected_commit
+        and valid_sha256(runtime.get("manifest_digest")),
+        f"runtime binary identity is not verified: {runtime}",
+    )
     capabilities = client.json("GET", "/api/user/inputs/capabilities")
-    capability_text = json.dumps(capabilities, ensure_ascii=False)
-    for expected in (*sorted(REQUIRED_INPUT_KINDS), "fasta", "fastq", "gb", "pdb"):
-        require(expected in capability_text, f"input capability missing: {expected}")
+    validate_input_capabilities(capabilities)
 
     completed = [
         run_completed_input_case(
@@ -920,6 +1935,9 @@ def main() -> int:
             args.poll_interval_seconds,
         ),
     }
+    aggregate["worker_failure_and_fallback"] = summarize_worker_failure_and_fallback(
+        [*completed, *states.values()]
+    )
     evidence = {
         "schema_version": SCHEMA_VERSION,
         "base_url": args.base_url,

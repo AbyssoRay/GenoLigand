@@ -4,11 +4,12 @@ use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
 use std::env;
 use std::ffi::OsString;
-use std::fs;
-use std::io::{BufRead, BufReader, BufWriter, Read, Write};
+use std::fs::{self, OpenOptions};
+use std::io::{BufRead, BufReader, BufWriter, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Mutex, OnceLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 use zip::ZipArchive;
 
@@ -35,6 +36,11 @@ const DOCKING_SCORE_WEIGHT: f64 = 0.05;
 const MD_SCORE_WEIGHT: f64 = 0.10;
 const RANKING_POLICY_VERSION: &str = "genoligand_target_ranking_v1";
 const SCIENCE_READINESS_SCHEMA_VERSION: &str = "genoligand_science_store_readiness_v1";
+const CHEMBL_QUERY_MANIFEST_SCHEMA_VERSION: &str = "genoligand_chembl_query_database_v1";
+const CHEMBL_QUERY_MANIFEST_REL_PATH: &str = "downloads/chembl/chembl_query.manifest.json";
+const CHEMBL_QUERY_HASH_CACHE_SCHEMA_VERSION: &str = "genoligand_chembl_query_sha256_cache_v1";
+const CHEMBL_QUERY_HASH_CACHE_DIR: &str = ".chembl_query.sha256_cache";
+const RCSB_INDEXED_PDB_IDS_REL_PATH: &str = "indexes/foldseek/rcsb_mmcif/indexed_pdb_ids.tsv";
 const SCIENCE_READINESS_EVIDENCE_PATHS: &[&str] = &[
     "source_requirements.tsv",
     "manifests/source_file_manifest.tsv",
@@ -48,12 +54,20 @@ const SCIENCE_READINESS_EVIDENCE_PATHS: &[&str] = &[
     "indexes/tool_versions.tsv",
     "indexes/mmseqs/mmseqs_target_databases.tsv",
     "indexes/foldseek/foldseek_target_databases.tsv",
+    RCSB_INDEXED_PDB_IDS_REL_PATH,
+    CHEMBL_QUERY_MANIFEST_REL_PATH,
     "downloads/rcsb/ligand_bound_pdb_scope.json",
     "downloads/rcsb/ligand_bound_pdb_scope.tsv",
+    "downloads/rcsb/on_demand_policy.json",
 ];
 static PYTHON_SCRIPT_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 static WORKER_INVOCATION_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 static PIPELINE_INVOCATION_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+static CHEMBL_QUERY_HASH_CACHE_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+static CHEMBL_QUERY_PROCESS_HASH_CACHE: OnceLock<Mutex<BTreeMap<String, (String, String)>>> =
+    OnceLock::new();
+#[cfg(test)]
+static CHEMBL_QUERY_TEST_HASH_COUNTS: OnceLock<Mutex<BTreeMap<String, u64>>> = OnceLock::new();
 const WORKER_INVOCATION_FILE: &str = "worker_invocation_id.txt";
 const PIPELINE_INVOCATION_FILE: &str = "pipeline_invocation_id.txt";
 
@@ -496,6 +510,8 @@ struct NormalizedInput {
 
 const NORMALIZED_INPUT_HEADER: &str = "input_id\tinput_kind\tprimary_value\tfile_count\tfeature_tokens\trecord_id\tsource_kind\tsource_path\tcontent_sha256\tstatus\tstructure_atom_count\tstructure_chain_count\tstructure_residue_count";
 const FEATURE_MANIFEST_HEADER: &str = "input_id\tinput_kind\tfeature_family\tfeature_name\tfeature_value\tfeature_source\tfeature_token\trecord_id";
+const INPUT_SEQUENCE_SPOOL_FILE: &str = "input_sequence_spool.bin";
+const INPUT_SEQUENCE_SPOOL_PENDING_FILE: &str = "input_sequence_spool.bin.pending";
 
 #[derive(Clone, Copy, Debug)]
 struct WorkerTask<'a> {
@@ -535,6 +551,13 @@ const DOCKING_WORKER_TASK: WorkerTask<'static> = WorkerTask {
 
 const REPORT_CANDIDATE_LIMIT: usize = 50;
 const COMPLEX_CANDIDATE_TOP_N: usize = 3;
+const RCSB_ON_DEMAND_POLICY_SCHEMA_VERSION: &str = "genoligand_rcsb_on_demand_policy_v1";
+const RCSB_OFFICIAL_DOWNLOAD_BASE_URL: &str = "https://files.rcsb.org/download";
+const RCSB_OFFICIAL_COORDINATE_TEMPLATE: &str = "https://files.rcsb.org/download/{pdb_id}.cif.gz";
+const RCSB_ON_DEMAND_CACHE_ROOT: &str = "downloads/rcsb/mmcif";
+const RCSB_ON_DEMAND_VALIDATION: &str = "gzip_mmcif_entry_and_atom_site";
+const RCSB_ON_DEMAND_FETCH_LIMIT: usize = 12;
+const RCSB_ON_DEMAND_FETCH_MANIFEST: &str = "rcsb_on_demand_fetch.tsv";
 
 #[derive(Clone, Debug)]
 struct ComputedFeatureInput {
@@ -550,6 +573,7 @@ struct ConversionProvenance {
     source_kind: String,
     source_path: String,
     content_sha256: String,
+    artifact: String,
 }
 
 #[derive(Clone, Debug)]
@@ -648,6 +672,32 @@ struct CoordinateBackedCandidate {
     coordinate_path: PathBuf,
     priority: i64,
     score: f64,
+}
+
+#[derive(Clone, Debug)]
+struct CoordinateCandidateRequest {
+    selected: SelectedComplexCandidate,
+    priority: i64,
+    score: f64,
+}
+
+#[derive(Clone, Debug)]
+struct RcsbFetchResult {
+    status: String,
+    path: PathBuf,
+    sha256: String,
+    reason: String,
+}
+
+#[derive(Clone, Debug)]
+struct RcsbFetchAuditRow {
+    pdb_id: String,
+    status: String,
+    url: String,
+    path: String,
+    bytes: u64,
+    sha256: String,
+    reason: String,
 }
 
 #[derive(Clone, Debug)]
@@ -1434,14 +1484,27 @@ fn build_store_indexes(
         )?;
     }
     let chembl_dir = options.science_store.join("downloads/chembl");
-    for path in discover_chembl_sqlite_sources(&chembl_dir)? {
-        append_canonical_rows(
-            "known_targets",
-            &options.science_store,
-            &path,
-            &mut known_rows,
-            &mut manifest,
-        )?;
+    let published_chembl_query = chembl_dir.join("chembl_query.sqlite");
+    let published_chembl_manifest = published_chembl_query.with_extension("manifest.json");
+    if published_chembl_query.is_file() && published_chembl_manifest.is_file() {
+        manifest.push_str(&format!(
+            "known_targets\t{}\tready\t0\t{}\tpublished_chembl_query_used_by_onsite_matcher\n",
+            relative_display(&options.science_store, &published_chembl_query),
+            relative_display(&options.science_store, &published_chembl_query),
+        ));
+    } else {
+        for path in discover_chembl_sqlite_sources(&chembl_dir)? {
+            if path == published_chembl_query {
+                continue;
+            }
+            append_canonical_rows(
+                "known_targets",
+                &options.science_store,
+                &path,
+                &mut known_rows,
+                &mut manifest,
+            )?;
+        }
     }
     let uniprot_dir = options.science_store.join("downloads/uniprot");
     for path in discover_sequence_files(&uniprot_dir)? {
@@ -1620,6 +1683,14 @@ fn build_structure_index_rows(
     rows: &mut StoreRowSpool,
 ) -> Result<(), String> {
     for path in discover_structure_files(&options.science_store.join("downloads/rcsb/mmcif"))? {
+        let pdb_id = path
+            .file_name()
+            .and_then(|value| value.to_str())
+            .map(structure_id_from_file_name)
+            .unwrap_or_default();
+        if !is_pdb_id(&pdb_id) || !coordinate_file_identity_matches_pdb(&path, &pdb_id) {
+            continue;
+        }
         let built = structure_file_row("RCSB", &path);
         rows.append(std::slice::from_ref(&built))?;
         append_built_row_count(
@@ -3435,16 +3506,73 @@ fn readiness_blocker_details(readiness: &ScienceStoreReadiness) -> String {
         .join(";")
 }
 
+fn normalization_tokens(kind: InputKind, value: &str) -> BTreeSet<String> {
+    match kind {
+        InputKind::Peptide | InputKind::ProteinLigand | InputKind::GenomeOrMetagenome => {
+            compact_sequence_tokens(value)
+        }
+        InputKind::SmallMolecule | InputKind::Complex => tokenize(value),
+    }
+}
+
+fn is_file_sequence_conversion(input: &input_conversion::ConvertedInput) -> bool {
+    input.source_kind == "file"
+        && input.conversion_status == "converted"
+        && matches!(
+            input.canonical_kind,
+            Some(InputKind::Peptide | InputKind::ProteinLigand | InputKind::GenomeOrMetagenome)
+        )
+        && matches!(
+            input.format.as_str(),
+            "fasta" | "fa" | "faa" | "fna" | "fastq" | "fq" | "gb" | "gbk"
+        )
+}
+
+fn spool_sequence_conversion<W: Write>(
+    writer: &mut W,
+    offset: &mut u64,
+    input: &mut input_conversion::ConvertedInput,
+) -> Result<(), String> {
+    let length = u64::try_from(input.canonical_value.len())
+        .map_err(|_| "input_sequence_spool_length_overflow".to_string())?;
+    writer
+        .write_all(input.canonical_value.as_bytes())
+        .map_err(|err| format!("input_sequence_spool_write_failed:{err}"))?;
+    input.artifact = format!(
+        "{INPUT_SEQUENCE_SPOOL_FILE}#offset={}&length={length}",
+        *offset
+    );
+    *offset = offset
+        .checked_add(length)
+        .ok_or_else(|| "input_sequence_spool_offset_overflow".to_string())?;
+    input.canonical_value.clear();
+    Ok(())
+}
+
 fn normalize_input(options: &ScienceOptions) -> Result<String, String> {
     ensure_dir(&options.run_dir)?;
     let conversion_path = options.run_dir.join("input_conversion_manifest.tsv");
     let normalized_path = options.run_dir.join("input_normalized_manifest.tsv");
+    let sequence_spool_path = options.run_dir.join(INPUT_SEQUENCE_SPOOL_FILE);
+    let sequence_spool_pending = options.run_dir.join(INPUT_SEQUENCE_SPOOL_PENDING_FILE);
     let conversion_pending = options
         .run_dir
         .join("input_conversion_manifest.tsv.pending");
     let normalized_pending = options
         .run_dir
         .join("input_normalized_manifest.tsv.pending");
+    if sequence_spool_pending.exists() {
+        fs::remove_file(&sequence_spool_pending).map_err(|err| {
+            format!(
+                "input_sequence_spool_cleanup_failed:{}:{err}",
+                sequence_spool_pending.display()
+            )
+        })?;
+    }
+    let mut sequence_spool_writer = BufWriter::new(
+        fs::File::create(&sequence_spool_pending)
+            .map_err(|err| format!("input_sequence_spool_write_failed:{err}"))?,
+    );
     let mut conversion_writer = BufWriter::new(
         fs::File::create(&conversion_pending)
             .map_err(|err| format!("input_conversion_manifest_write_failed:{err}"))?,
@@ -3460,19 +3588,25 @@ fn normalize_input(options: &ScienceOptions) -> Result<String, String> {
     let mut failed = None::<(String, String)>;
     let mut normalized_rows = 0usize;
     let mut row_count = 0usize;
-    let conversion_result = for_each_converted_input(options, |input| {
-        write_input_conversion_row(&mut conversion_writer, input)
+    let mut spooled_rows = 0usize;
+    let mut spool_offset = 0u64;
+    let conversion_result = for_each_converted_input(options, |mut input| {
+        let normalized = input
+            .canonical_kind
+            .map(|kind| (kind, normalization_tokens(kind, &input.canonical_value)));
+        if is_file_sequence_conversion(&input) {
+            spooled_rows += 1;
+            spool_sequence_conversion(&mut sequence_spool_writer, &mut spool_offset, &mut input)?;
+        }
+        write_input_conversion_row(&mut conversion_writer, &input)
             .map_err(|err| format!("input_conversion_manifest_write_failed:{err}"))?;
         row_count += 1;
         if input.conversion_status == "failed" {
             if failed.is_none() {
                 failed = Some((input.input_id.clone(), clean_cell(&input.reason)));
             }
-        } else if let Some(kind) = input.canonical_kind {
-            let tokens = tokenize(&input.canonical_value)
-                .into_iter()
-                .collect::<Vec<_>>()
-                .join(" ");
+        } else if let Some((kind, tokens)) = normalized {
+            let tokens = tokens.into_iter().collect::<Vec<_>>().join(" ");
             writeln!(
                 normalized_writer,
                 "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\tnormalized\t{}\t{}\t{}",
@@ -3499,14 +3633,21 @@ fn normalize_input(options: &ScienceOptions) -> Result<String, String> {
             normalized_writer
                 .flush()
                 .map_err(|err| format!("input_normalized_manifest_write_failed:{err}"))?;
+            sequence_spool_writer
+                .flush()
+                .map_err(|err| format!("input_sequence_spool_write_failed:{err}"))?;
         }
         Ok(())
     });
     if let Err(err) = conversion_result {
         drop(conversion_writer);
         drop(normalized_writer);
+        drop(sequence_spool_writer);
         let _ = fs::remove_file(&conversion_pending);
         let _ = fs::remove_file(&normalized_pending);
+        let _ = fs::remove_file(&normalized_path);
+        let _ = fs::remove_file(&sequence_spool_pending);
+        let _ = fs::remove_file(&sequence_spool_path);
         return Err(err);
     }
     conversion_writer
@@ -3515,8 +3656,12 @@ fn normalize_input(options: &ScienceOptions) -> Result<String, String> {
     normalized_writer
         .flush()
         .map_err(|err| format!("input_normalized_manifest_write_failed:{err}"))?;
+    sequence_spool_writer
+        .flush()
+        .map_err(|err| format!("input_sequence_spool_write_failed:{err}"))?;
     drop(conversion_writer);
     drop(normalized_writer);
+    drop(sequence_spool_writer);
     publish_pending_file(&conversion_pending, &conversion_path)?;
     write_json_manifest(
         &options.run_dir.join("input_conversion_manifest.json"),
@@ -3526,16 +3671,30 @@ fn normalize_input(options: &ScienceOptions) -> Result<String, String> {
     if let Some((input_id, reason)) = failed {
         let _ = fs::remove_file(&normalized_pending);
         let _ = fs::remove_file(&normalized_path);
+        let _ = fs::remove_file(&sequence_spool_pending);
+        let _ = fs::remove_file(&sequence_spool_path);
         write_artifact_source_map(options)?;
         return Err(format!("input_conversion_failed:{input_id}:{reason}"));
     }
     if normalized_rows == 0 {
         let _ = fs::remove_file(&normalized_pending);
         let _ = fs::remove_file(&normalized_path);
+        let _ = fs::remove_file(&sequence_spool_pending);
+        let _ = fs::remove_file(&sequence_spool_path);
         write_artifact_source_map(options)?;
         return Err("missing_input".to_string());
     }
-    publish_pending_file(&normalized_pending, &normalized_path)?;
+    if spooled_rows == 0 {
+        let _ = fs::remove_file(&sequence_spool_pending);
+        let _ = fs::remove_file(&sequence_spool_path);
+    } else if let Err(err) = publish_pending_file(&sequence_spool_pending, &sequence_spool_path) {
+        let _ = fs::remove_file(&normalized_pending);
+        return Err(err);
+    }
+    if let Err(err) = publish_pending_file(&normalized_pending, &normalized_path) {
+        let _ = fs::remove_file(&sequence_spool_path);
+        return Err(err);
+    }
     write_json_manifest(
         &options.run_dir.join("input_normalized_manifest.json"),
         "input_normalized_manifest.tsv",
@@ -3708,6 +3867,337 @@ fn known_database_match_score(input: &ComputedFeatureInput, row: &StoreRow) -> f
     }
 }
 
+fn readiness_requires_chembl_query(science_store: &Path) -> bool {
+    read_text(&science_store.join("science_store_readiness.json"))
+        .ok()
+        .and_then(|text| serde_json::from_str::<Value>(text.trim_start_matches('\u{feff}')).ok())
+        .and_then(|value| {
+            value
+                .get("evidence_manifest")
+                .and_then(Value::as_array)
+                .cloned()
+        })
+        .is_some_and(|rows| {
+            rows.iter().any(|row| {
+                row.get("path").and_then(Value::as_str) == Some(CHEMBL_QUERY_MANIFEST_REL_PATH)
+            })
+        })
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct ChemblQueryHashIdentity {
+    manifest_sha256: String,
+    database_path: String,
+    database_bytes: u64,
+    database_modified_identity: String,
+    cache_key: String,
+}
+
+fn sha256_bytes_hex(bytes: &[u8]) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(bytes);
+    hasher
+        .finalize()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
+}
+
+fn chembl_query_modified_identity(metadata: &fs::Metadata) -> Result<String, String> {
+    let modified = metadata
+        .modified()
+        .map_err(|err| format!("chembl_query_database_modified_time_unavailable:{err}"))?;
+    Ok(match modified.duration_since(UNIX_EPOCH) {
+        Ok(duration) => format!(
+            "after_epoch:{}:{:09}",
+            duration.as_secs(),
+            duration.subsec_nanos()
+        ),
+        Err(error) => {
+            let duration = error.duration();
+            format!(
+                "before_epoch:{}:{:09}",
+                duration.as_secs(),
+                duration.subsec_nanos()
+            )
+        }
+    })
+}
+
+fn chembl_query_hash_identity(
+    database: &Path,
+    manifest_sha256: &str,
+) -> Result<ChemblQueryHashIdentity, String> {
+    let canonical = database
+        .canonicalize()
+        .map_err(|err| format!("chembl_query_database_canonicalize_failed:{err}"))?;
+    let metadata = fs::metadata(&canonical)
+        .map_err(|err| format!("chembl_query_database_metadata_failed:{err}"))?;
+    let database_path = canonical.to_string_lossy().to_string();
+    let database_bytes = metadata.len();
+    let database_modified_identity = chembl_query_modified_identity(&metadata)?;
+    let cache_key = canonical_json_sha256(&json!({
+        "schema_version": CHEMBL_QUERY_HASH_CACHE_SCHEMA_VERSION,
+        "manifest_sha256": manifest_sha256,
+        "database_path": database_path,
+        "database_bytes": database_bytes,
+        "database_modified_identity": database_modified_identity,
+    }));
+    Ok(ChemblQueryHashIdentity {
+        manifest_sha256: manifest_sha256.to_string(),
+        database_path,
+        database_bytes,
+        database_modified_identity,
+        cache_key,
+    })
+}
+
+fn chembl_query_hash_cache_path(
+    database: &Path,
+    identity: &ChemblQueryHashIdentity,
+) -> Result<PathBuf, String> {
+    let parent = database
+        .parent()
+        .ok_or_else(|| "chembl_query_database_parent_missing".to_string())?;
+    Ok(parent
+        .join(CHEMBL_QUERY_HASH_CACHE_DIR)
+        .join(format!("{}.json", identity.cache_key)))
+}
+
+fn read_chembl_query_hash_cache(
+    database: &Path,
+    identity: &ChemblQueryHashIdentity,
+) -> Option<String> {
+    let path = chembl_query_hash_cache_path(database, identity).ok()?;
+    let text = fs::read_to_string(path).ok()?;
+    let value = serde_json::from_str::<Value>(text.trim_start_matches('\u{feff}')).ok()?;
+    let digest = value.get("database_sha256")?.as_str()?;
+    if value.get("schema_version").and_then(Value::as_str)
+        != Some(CHEMBL_QUERY_HASH_CACHE_SCHEMA_VERSION)
+        || value.get("cache_key").and_then(Value::as_str) != Some(identity.cache_key.as_str())
+        || value.get("manifest_sha256").and_then(Value::as_str)
+            != Some(identity.manifest_sha256.as_str())
+        || value.get("database_path").and_then(Value::as_str)
+            != Some(identity.database_path.as_str())
+        || value.get("database_bytes").and_then(Value::as_u64) != Some(identity.database_bytes)
+        || value
+            .get("database_modified_identity")
+            .and_then(Value::as_str)
+            != Some(identity.database_modified_identity.as_str())
+        || !valid_sha256_hex(digest)
+    {
+        return None;
+    }
+    Some(digest.to_ascii_lowercase())
+}
+
+fn write_chembl_query_hash_cache(
+    database: &Path,
+    identity: &ChemblQueryHashIdentity,
+    database_sha256: &str,
+) -> Result<(), String> {
+    if read_chembl_query_hash_cache(database, identity).as_deref() == Some(database_sha256) {
+        return Ok(());
+    }
+    let path = chembl_query_hash_cache_path(database, identity)?;
+    let parent = path
+        .parent()
+        .ok_or_else(|| "chembl_query_hash_cache_parent_missing".to_string())?;
+    ensure_dir(parent)?;
+    let sequence = CHEMBL_QUERY_HASH_CACHE_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+    let pending = parent.join(format!(
+        ".{}.{}.{}.pending",
+        identity.cache_key,
+        std::process::id(),
+        sequence
+    ));
+    let payload = json!({
+        "schema_version": CHEMBL_QUERY_HASH_CACHE_SCHEMA_VERSION,
+        "cache_key": identity.cache_key,
+        "manifest_sha256": identity.manifest_sha256,
+        "database_path": identity.database_path,
+        "database_bytes": identity.database_bytes,
+        "database_modified_identity": identity.database_modified_identity,
+        "database_sha256": database_sha256,
+    })
+    .to_string()
+        + "\n";
+    let mut file = OpenOptions::new()
+        .create_new(true)
+        .write(true)
+        .open(&pending)
+        .map_err(|err| format!("chembl_query_hash_cache_create_failed:{err}"))?;
+    if let Err(error) = file
+        .write_all(payload.as_bytes())
+        .and_then(|_| file.sync_all())
+    {
+        let _ = fs::remove_file(&pending);
+        return Err(format!("chembl_query_hash_cache_write_failed:{error}"));
+    }
+    drop(file);
+    if path.exists() {
+        if read_chembl_query_hash_cache(database, identity).as_deref() == Some(database_sha256) {
+            let _ = fs::remove_file(&pending);
+            return Ok(());
+        }
+        fs::remove_file(&path)
+            .map_err(|err| format!("chembl_query_hash_cache_remove_invalid_failed:{err}"))?;
+    }
+    if let Err(error) = fs::rename(&pending, &path) {
+        if read_chembl_query_hash_cache(database, identity).as_deref() == Some(database_sha256) {
+            let _ = fs::remove_file(&pending);
+            return Ok(());
+        }
+        let _ = fs::remove_file(&pending);
+        return Err(format!("chembl_query_hash_cache_publish_failed:{error}"));
+    }
+    Ok(())
+}
+
+fn chembl_query_process_hash_cache() -> &'static Mutex<BTreeMap<String, (String, String)>> {
+    CHEMBL_QUERY_PROCESS_HASH_CACHE.get_or_init(|| Mutex::new(BTreeMap::new()))
+}
+
+#[cfg(test)]
+fn record_chembl_query_database_hash(database_path: &str) {
+    let counts = CHEMBL_QUERY_TEST_HASH_COUNTS.get_or_init(|| Mutex::new(BTreeMap::new()));
+    let mut counts = counts
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    *counts.entry(database_path.to_string()).or_default() += 1;
+}
+
+#[cfg(test)]
+fn reset_chembl_query_database_hash_count(database: &Path) {
+    let database_path = database
+        .canonicalize()
+        .unwrap_or_else(|_| database.to_path_buf())
+        .to_string_lossy()
+        .to_string();
+    let counts = CHEMBL_QUERY_TEST_HASH_COUNTS.get_or_init(|| Mutex::new(BTreeMap::new()));
+    counts
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .remove(&database_path);
+}
+
+#[cfg(test)]
+fn chembl_query_database_hash_count(database: &Path) -> u64 {
+    let database_path = database
+        .canonicalize()
+        .unwrap_or_else(|_| database.to_path_buf())
+        .to_string_lossy()
+        .to_string();
+    let counts = CHEMBL_QUERY_TEST_HASH_COUNTS.get_or_init(|| Mutex::new(BTreeMap::new()));
+    counts
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .get(&database_path)
+        .copied()
+        .unwrap_or_default()
+}
+
+#[cfg(test)]
+fn clear_chembl_query_process_hash_cache(database: &Path) {
+    let database_path = database
+        .canonicalize()
+        .unwrap_or_else(|_| database.to_path_buf())
+        .to_string_lossy()
+        .to_string();
+    chembl_query_process_hash_cache()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .remove(&database_path);
+}
+
+fn chembl_query_database_sha256(database: &Path, manifest_sha256: &str) -> Result<String, String> {
+    for _ in 0..3 {
+        let identity = chembl_query_hash_identity(database, manifest_sha256)?;
+        let process_hit = chembl_query_process_hash_cache()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .get(&identity.database_path)
+            .filter(|(cache_key, _)| cache_key == &identity.cache_key)
+            .map(|(_, digest)| digest.clone());
+        if let Some(digest) = process_hit {
+            if chembl_query_hash_identity(database, manifest_sha256)? == identity {
+                return Ok(digest);
+            }
+            continue;
+        }
+        if let Some(digest) = read_chembl_query_hash_cache(database, &identity) {
+            if chembl_query_hash_identity(database, manifest_sha256)? != identity {
+                continue;
+            }
+            chembl_query_process_hash_cache()
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .insert(
+                    identity.database_path.clone(),
+                    (identity.cache_key.clone(), digest.clone()),
+                );
+            return Ok(digest);
+        }
+        #[cfg(test)]
+        record_chembl_query_database_hash(&identity.database_path);
+        let digest = sha256_file_hex(database)
+            .ok_or_else(|| "chembl_query_database_sha256_read_failed".to_string())?;
+        if chembl_query_hash_identity(database, manifest_sha256)? != identity {
+            continue;
+        }
+        let _ = write_chembl_query_hash_cache(database, &identity, &digest);
+        chembl_query_process_hash_cache()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .insert(
+                identity.database_path.clone(),
+                (identity.cache_key.clone(), digest.clone()),
+            );
+        return Ok(digest);
+    }
+    Err("chembl_query_database_changed_during_sha256".to_string())
+}
+
+fn validate_chembl_query_runtime_contract(
+    science_store: &Path,
+    database: &Path,
+    manifest: &Path,
+) -> Result<(), String> {
+    let text = read_text(manifest)
+        .map_err(|err| format!("chembl_query_manifest_contract_invalid:read_failed:{err}"))?;
+    let value = serde_json::from_str::<Value>(text.trim_start_matches('\u{feff}'))
+        .map_err(|err| format!("chembl_query_manifest_contract_invalid:json:{err}"))?;
+    let (source_digest, source_release) = science_store_source_identity(science_store, "chembl")?;
+    let database_bytes = fs::metadata(database)
+        .map_err(|err| format!("chembl_query_manifest_contract_invalid:database_metadata:{err}"))?
+        .len();
+    let expected_database_sha256 = value
+        .get("database_sha256")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    let valid = value.get("schema_version").and_then(Value::as_str)
+        == Some(CHEMBL_QUERY_MANIFEST_SCHEMA_VERSION)
+        && value.get("status").and_then(Value::as_str) == Some("ready")
+        && value.get("table").and_then(Value::as_str) == Some("genoligand_onsite_activity")
+        && value
+            .get("rows")
+            .and_then(Value::as_u64)
+            .is_some_and(|rows| rows > 0)
+        && value.get("database_bytes").and_then(Value::as_u64) == Some(database_bytes)
+        && valid_sha256_hex(expected_database_sha256)
+        && value.get("source_digest").and_then(Value::as_str) == Some(source_digest.as_str())
+        && value.get("source_release").and_then(Value::as_str) == Some(source_release.as_str());
+    if !valid {
+        return Err("chembl_query_manifest_contract_invalid:fixed_fields_or_identity".to_string());
+    }
+    let manifest_sha256 = sha256_bytes_hex(text.as_bytes());
+    let actual_database_sha256 = chembl_query_database_sha256(database, &manifest_sha256)?;
+    if !actual_database_sha256.eq_ignore_ascii_case(expected_database_sha256) {
+        return Err("database_sha256_mismatch".to_string());
+    }
+    Ok(())
+}
+
 fn append_chembl_onsite_matches<W: Write>(
     options: &ScienceOptions,
     inputs: &[NormalizedInput],
@@ -3723,9 +4213,21 @@ fn append_chembl_onsite_matches<W: Write>(
     let source = options
         .science_store
         .join("downloads/chembl/chembl_query.sqlite");
-    if !source.is_file() {
+    let manifest = options.science_store.join(CHEMBL_QUERY_MANIFEST_REL_PATH);
+    if !source.is_file() || !manifest.is_file() {
+        if source.exists()
+            || manifest.exists()
+            || readiness_requires_chembl_query(&options.science_store)
+        {
+            return Err(format!(
+                "chembl_query_contract_missing:database={}:manifest={}",
+                source.display(),
+                manifest.display()
+            ));
+        }
         return Ok(());
     }
+    validate_chembl_query_runtime_contract(&options.science_store, &source, &manifest)?;
     ensure_dir(&options.run_dir)?;
     let query_path = options.run_dir.join("chembl_onsite_queries.tsv");
     let mut queries = String::from("input_id\trecord_id\tquery\n");
@@ -3858,7 +4360,7 @@ for input_id, record_id, canonical in queries:
 
 placeholders = ",".join("?" for _ in query_by_smiles)
 sql = f"""
-SELECT canonical_isomeric_smiles, target_id, target_name, organism, compound_name,
+SELECT canonical_isomeric_smiles, target_id, source_target_id, target_name, organism, compound_name,
        standard_type, standard_relation, standard_value, standard_units,
        source_release, source_digest
 FROM genoligand_onsite_activity
@@ -3867,7 +4369,7 @@ WHERE canonical_isomeric_smiles IN ({placeholders})
   AND (standard_units = '' OR standard_units = 'nM')
 """
 
-uri = Path(database_path).resolve().as_uri() + "?mode=ro"
+uri = Path(database_path).resolve().as_uri() + "?mode=ro&immutable=1"
 connection = sqlite3.connect(uri, uri=True)
 best = {}
 try:
@@ -3875,11 +4377,15 @@ try:
         row[1]
         for row in connection.execute("PRAGMA table_info(genoligand_onsite_activity)")
     }
-    required = {
+    legacy_required = {
         "canonical_isomeric_smiles", "target_id", "target_name", "organism",
         "compound_name", "standard_type", "standard_relation", "standard_value",
         "standard_units", "source_release", "source_digest",
     }
+    if "source_target_id" not in columns and columns == legacy_required:
+        print("chembl_query_legacy_11_column_schema_rejected", file=sys.stderr)
+        raise SystemExit(1)
+    required = legacy_required | {"source_target_id"}
     if not required.issubset(columns):
         raise RuntimeError("chembl_query_table_schema_invalid")
     indexed = False
@@ -3904,12 +4410,13 @@ try:
 
     for row in connection.execute(sql, list(query_by_smiles.keys())):
         (
-            canonical, target_id, target_name, organism, compound_name,
+            canonical, target_id, source_target_id, target_name, organism, compound_name,
             standard_type, relation, value, units, source_release, source_digest,
         ) = [clean(item) for item in row]
         if (
             not canonical
             or not target_id
+            or not source_target_id
             or not source_release
             or len(source_digest) != 64
             or any(ch not in "0123456789abcdefABCDEF" for ch in source_digest)
@@ -3922,16 +4429,18 @@ try:
             query_digest = hashlib.sha256(
                 "\0".join([
                     run_id, invocation_id, input_id, record_id, canonical,
-                    source_release, source_digest,
+                    target_id, source_target_id, source_release, source_digest,
                 ]).encode("utf-8")
             ).hexdigest()
             matched = (
                 f"canonical_smiles={canonical};compound_name={compound_name};"
+                f"source_target_id={source_target_id};"
                 f"source_release={source_release};source_digest={source_digest}"
             )
             evidence = (
                 f"chembl_onsite_activity_row;{activity};relation={relation};"
                 f"quantitative={'true' if relation == '=' else 'false'};"
+                f"source_target_id={source_target_id};"
                 f"source_release={source_release};source_digest={source_digest};"
                 f"query_digest={query_digest};run_id={run_id};invocation_id={invocation_id}"
             )
@@ -3947,6 +4456,8 @@ try:
                 evidence,
                 (
                     "chembl_onsite_activity_row;"
+                    f"source_database_id={source_target_id};"
+                    f"source_target_id={source_target_id};"
                     f"source_release={source_release};source_digest={source_digest}"
                 ),
                 activity,
@@ -6255,6 +6766,35 @@ fn write_coordinate_backed_candidate_selection(
     options: &ScienceOptions,
     matches: &[IndexMatch],
 ) -> Result<bool, String> {
+    write_coordinate_backed_candidate_selection_impl(
+        options,
+        matches,
+        RCSB_OFFICIAL_DOWNLOAD_BASE_URL,
+        None,
+    )
+}
+
+#[cfg(test)]
+fn write_coordinate_backed_candidate_selection_with_base_url(
+    options: &ScienceOptions,
+    matches: &[IndexMatch],
+    fetch_base_url: &str,
+) -> Result<bool, String> {
+    let python = vec!["python".to_string()];
+    write_coordinate_backed_candidate_selection_impl(
+        options,
+        matches,
+        fetch_base_url,
+        Some(&python),
+    )
+}
+
+fn write_coordinate_backed_candidate_selection_impl(
+    options: &ScienceOptions,
+    matches: &[IndexMatch],
+    fetch_base_url: &str,
+    python_command: Option<&[String]>,
+) -> Result<bool, String> {
     remove_run_subdir_if_exists(&options.run_dir, "structure_candidates")?;
     for relative in [
         "structure_viewer.json",
@@ -6264,80 +6804,102 @@ fn write_coordinate_backed_candidate_selection(
     ] {
         remove_file_if_exists(&options.run_dir.join(relative))?;
     }
-    let mut candidates = Vec::<CoordinateBackedCandidate>::new();
+    let mut local_candidates = Vec::<CoordinateBackedCandidate>::new();
+    let mut missing_candidates = Vec::<CoordinateCandidateRequest>::new();
     for hint in known_structure_hints(&options.run_dir.join("known_database_matches.tsv"))? {
         for pdb_id in &hint.pdb_ids {
-            let Some(coordinate_path) =
-                find_structure_coordinate_file(&options.science_store, pdb_id)
-            else {
-                continue;
+            let selected = SelectedComplexCandidate {
+                identity_namespace: canonical_target_namespace(
+                    "BindingDB",
+                    "BindingDB",
+                    &hint.target_id,
+                ),
+                candidate_id: candidate_id_for(
+                    &hint.input_id,
+                    &hint.record_id,
+                    &canonical_target_namespace("BindingDB", "BindingDB", &hint.target_id),
+                    &hint.target_id,
+                ),
+                input_id: hint.input_id.clone(),
+                record_id: hint.record_id.clone(),
+                target_id: hint.target_id.clone(),
+                target_name: hint.target_name.clone(),
+                organism: hint.organism.clone(),
+                target_class: hint.target_class.clone(),
+                source: "BindingDB".to_string(),
+                pdb_id: pdb_id.clone(),
+                evidence: hint.evidence.clone(),
             };
-            candidates.push(CoordinateBackedCandidate {
-                selected: SelectedComplexCandidate {
-                    identity_namespace: canonical_target_namespace(
-                        "BindingDB",
-                        "BindingDB",
-                        &hint.target_id,
-                    ),
-                    candidate_id: candidate_id_for(
-                        &hint.input_id,
-                        &hint.record_id,
-                        &canonical_target_namespace("BindingDB", "BindingDB", &hint.target_id),
-                        &hint.target_id,
-                    ),
-                    input_id: hint.input_id.clone(),
-                    record_id: hint.record_id.clone(),
-                    target_id: hint.target_id.clone(),
-                    target_name: hint.target_name.clone(),
-                    organism: hint.organism.clone(),
-                    target_class: hint.target_class.clone(),
-                    source: "BindingDB".to_string(),
-                    pdb_id: pdb_id.clone(),
-                    evidence: hint.evidence.clone(),
-                },
-                coordinate_path: coordinate_path.clone(),
-                priority: known_hint_rank(&hint),
-                score: coordinate_hint_score(&coordinate_path, &hint),
-            });
+            let priority = known_hint_rank(&hint);
+            if let Some(coordinate_path) =
+                find_structure_coordinate_file(&options.science_store, pdb_id)
+            {
+                local_candidates.push(CoordinateBackedCandidate {
+                    selected,
+                    score: coordinate_hint_score(&coordinate_path, &hint),
+                    coordinate_path,
+                    priority,
+                });
+            } else {
+                missing_candidates.push(CoordinateCandidateRequest {
+                    selected,
+                    priority,
+                    score: hint.match_score,
+                });
+            }
         }
     }
     for item in matches {
         for pdb_id in structure_coordinate_ids(item) {
-            let Some(coordinate_path) =
-                find_structure_coordinate_file(&options.science_store, &pdb_id)
-            else {
-                continue;
+            let selected = SelectedComplexCandidate {
+                identity_namespace: canonical_target_namespace(
+                    &item.source,
+                    &item.source,
+                    &item.target_id,
+                ),
+                candidate_id: candidate_id_for(
+                    &item.input_id,
+                    &item.record_id,
+                    &canonical_target_namespace(&item.source, &item.source, &item.target_id),
+                    &item.target_id,
+                ),
+                input_id: item.input_id.clone(),
+                record_id: item.record_id.clone(),
+                target_id: item.target_id.clone(),
+                target_name: item.target_name.clone(),
+                organism: item.organism.clone(),
+                target_class: item.target_class.clone(),
+                source: item.source.clone(),
+                pdb_id: pdb_id.clone(),
+                evidence: item.evidence.clone(),
             };
-            candidates.push(CoordinateBackedCandidate {
-                selected: SelectedComplexCandidate {
-                    identity_namespace: canonical_target_namespace(
-                        &item.source,
-                        &item.source,
-                        &item.target_id,
-                    ),
-                    candidate_id: candidate_id_for(
-                        &item.input_id,
-                        &item.record_id,
-                        &canonical_target_namespace(&item.source, &item.source, &item.target_id),
-                        &item.target_id,
-                    ),
-                    input_id: item.input_id.clone(),
-                    record_id: item.record_id.clone(),
-                    target_id: item.target_id.clone(),
-                    target_name: item.target_name.clone(),
-                    organism: item.organism.clone(),
-                    target_class: item.target_class.clone(),
-                    source: item.source.clone(),
-                    pdb_id,
-                    evidence: item.evidence.clone(),
-                },
-                coordinate_path,
-                priority: 0,
-                score: item.match_score,
-            });
+            if let Some(coordinate_path) =
+                find_structure_coordinate_file(&options.science_store, &pdb_id)
+            {
+                local_candidates.push(CoordinateBackedCandidate {
+                    selected,
+                    coordinate_path,
+                    priority: 0,
+                    score: item.match_score,
+                });
+            } else {
+                missing_candidates.push(CoordinateCandidateRequest {
+                    selected,
+                    priority: 0,
+                    score: item.match_score,
+                });
+            }
         }
     }
-    candidates.sort_by(|left, right| {
+    local_candidates.sort_by(|left, right| {
+        right
+            .priority
+            .cmp(&left.priority)
+            .then_with(|| right.score.total_cmp(&left.score))
+            .then_with(|| left.selected.candidate_id.cmp(&right.selected.candidate_id))
+            .then_with(|| left.selected.pdb_id.cmp(&right.selected.pdb_id))
+    });
+    missing_candidates.sort_by(|left, right| {
         right
             .priority
             .cmp(&left.priority)
@@ -6348,33 +6910,536 @@ fn write_coordinate_backed_candidate_selection(
 
     let mut selected_rows = Vec::new();
     let mut seen = BTreeSet::new();
-    for candidate in candidates {
-        if selected_rows.len() == COMPLEX_CANDIDATE_TOP_N
-            || !seen.insert(candidate.selected.candidate_id.clone())
-        {
+    let mut audited_pdb_ids = BTreeSet::new();
+    let mut audit_rows = Vec::new();
+    for candidate in local_candidates {
+        if selected_rows.len() == COMPLEX_CANDIDATE_TOP_N {
+            break;
+        }
+        if seen.contains(&candidate.selected.candidate_id) {
             continue;
         }
-        let Some(artifact) = write_candidate_coordinate_artifact(
-            &options.run_dir,
-            &candidate.selected.candidate_id,
+        let pdb_id = candidate.selected.pdb_id.clone();
+        let source_sha256 = sha256_file_hex(&candidate.coordinate_path).unwrap_or_default();
+        if !select_coordinate_backed_candidate(
+            options,
+            candidate.selected,
             &candidate.coordinate_path,
-        ) else {
+            "reused",
+            &source_sha256,
+            &mut selected_rows,
+            &mut seen,
+        )? {
             continue;
-        };
-        let Some(coordinate_sha256) = sha256_file_hex(&options.run_dir.join(&artifact)) else {
-            continue;
-        };
-        if selected_rows.is_empty()
-            && write_coordinate_viewer_artifact(&options.run_dir, &candidate.coordinate_path)
-                .is_none()
-        {
-            return Err("primary_structure_viewer_artifact_write_failed".to_string());
         }
-        selected_rows.push((candidate.selected, artifact, coordinate_sha256));
+        if audited_pdb_ids.insert(pdb_id.clone()) {
+            audit_rows.push(rcsb_fetch_audit_row(
+                &options.science_store,
+                &pdb_id,
+                "reused",
+                fetch_base_url,
+                &candidate.coordinate_path,
+                &source_sha256,
+                "valid_cached_coordinate_reused",
+            ));
+        }
     }
+
+    let mut fetch_results = BTreeMap::<String, RcsbFetchResult>::new();
+    let mut fetch_count = 0usize;
+    let mut policy_validated = false;
+    for request in missing_candidates {
+        if selected_rows.len() == COMPLEX_CANDIDATE_TOP_N {
+            break;
+        }
+        if seen.contains(&request.selected.candidate_id) {
+            continue;
+        }
+        let pdb_id = request.selected.pdb_id.clone();
+        let result =
+            if let Some(path) = find_structure_coordinate_file(&options.science_store, &pdb_id) {
+                RcsbFetchResult {
+                    status: "reused".to_string(),
+                    sha256: sha256_file_hex(&path).unwrap_or_default(),
+                    reason: "valid_coordinate_published_by_concurrent_run".to_string(),
+                    path,
+                }
+            } else if let Some(result) = fetch_results.get(&pdb_id) {
+                result.clone()
+            } else {
+                if fetch_count == RCSB_ON_DEMAND_FETCH_LIMIT {
+                    audit_rows.push(rcsb_fetch_audit_row(
+                        &options.science_store,
+                        &pdb_id,
+                        "skipped",
+                        fetch_base_url,
+                        &rcsb_coordinate_cache_path(&options.science_store, &pdb_id),
+                        "",
+                        "max_fetches_per_run_reached",
+                    ));
+                    break;
+                }
+                if !policy_validated {
+                    if let Err(error) = validate_rcsb_on_demand_policy(&options.science_store) {
+                        audit_rows.push(rcsb_fetch_audit_row(
+                            &options.science_store,
+                            &pdb_id,
+                            "failed",
+                            fetch_base_url,
+                            &rcsb_coordinate_cache_path(&options.science_store, &pdb_id),
+                            "",
+                            &error,
+                        ));
+                        write_rcsb_fetch_audit(options, &audit_rows)?;
+                        return Err(error);
+                    }
+                    policy_validated = true;
+                }
+                fetch_count += 1;
+                let result = fetch_rcsb_coordinate_with_python(
+                    &options.science_store,
+                    &pdb_id,
+                    fetch_base_url,
+                    python_command,
+                );
+                fetch_results.insert(pdb_id.clone(), result.clone());
+                result
+            };
+        if audited_pdb_ids.insert(pdb_id.clone()) {
+            audit_rows.push(rcsb_fetch_audit_row(
+                &options.science_store,
+                &pdb_id,
+                &result.status,
+                fetch_base_url,
+                &result.path,
+                &result.sha256,
+                &result.reason,
+            ));
+        }
+        if !matches!(result.status.as_str(), "fetched" | "reused") {
+            continue;
+        }
+        select_coordinate_backed_candidate(
+            options,
+            request.selected,
+            &result.path,
+            &result.status,
+            &result.sha256,
+            &mut selected_rows,
+            &mut seen,
+        )?;
+    }
+    write_rcsb_fetch_audit(options, &audit_rows)?;
     write_selected_complex_candidates(options, &selected_rows)?;
     write_structure_viewer_status_rows(options, &selected_rows)?;
     Ok(!selected_rows.is_empty())
+}
+
+fn select_coordinate_backed_candidate(
+    options: &ScienceOptions,
+    mut selected: SelectedComplexCandidate,
+    coordinate_path: &Path,
+    fetch_status: &str,
+    source_sha256: &str,
+    selected_rows: &mut Vec<(SelectedComplexCandidate, String, String)>,
+    seen: &mut BTreeSet<String>,
+) -> Result<bool, String> {
+    if !coordinate_file_matches_pdb(coordinate_path, &selected.pdb_id) {
+        return Ok(false);
+    }
+    let Some(artifact) = write_candidate_coordinate_artifact(
+        &options.run_dir,
+        &selected.candidate_id,
+        coordinate_path,
+    ) else {
+        return Ok(false);
+    };
+    let Some(coordinate_sha256) = sha256_file_hex(&options.run_dir.join(&artifact)) else {
+        return Ok(false);
+    };
+    if selected_rows.is_empty()
+        && write_coordinate_viewer_artifact(&options.run_dir, coordinate_path).is_none()
+    {
+        return Err("primary_structure_viewer_artifact_write_failed".to_string());
+    }
+    let binding = format!(
+        "rcsb_fetch_manifest={RCSB_ON_DEMAND_FETCH_MANIFEST};rcsb_fetch_pdb_id={};rcsb_fetch_status={};rcsb_source_sha256={}",
+        selected.pdb_id, fetch_status, source_sha256,
+    );
+    if !selected.evidence.is_empty() {
+        selected.evidence.push(';');
+    }
+    selected.evidence.push_str(&binding);
+    seen.insert(selected.candidate_id.clone());
+    selected_rows.push((selected, artifact, coordinate_sha256));
+    Ok(true)
+}
+
+fn rcsb_coordinate_url(base_url: &str, pdb_id: &str) -> String {
+    format!(
+        "{}/{}.cif.gz",
+        base_url.trim_end_matches('/'),
+        pdb_id.to_ascii_uppercase()
+    )
+}
+
+fn rcsb_coordinate_cache_path(science_store: &Path, pdb_id: &str) -> PathBuf {
+    let lower = pdb_id.to_ascii_lowercase();
+    let split = if lower.len() >= 3 { &lower[1..3] } else { "" };
+    science_store
+        .join(RCSB_ON_DEMAND_CACHE_ROOT)
+        .join(split)
+        .join(format!("{lower}.cif.gz"))
+}
+
+fn rcsb_fetch_audit_row(
+    science_store: &Path,
+    pdb_id: &str,
+    status: &str,
+    base_url: &str,
+    path: &Path,
+    sha256: &str,
+    reason: &str,
+) -> RcsbFetchAuditRow {
+    RcsbFetchAuditRow {
+        pdb_id: pdb_id.to_ascii_uppercase(),
+        status: status.to_string(),
+        url: rcsb_coordinate_url(base_url, pdb_id),
+        path: relative_display(science_store, path),
+        bytes: fs::metadata(path)
+            .map(|value| value.len())
+            .unwrap_or_default(),
+        sha256: sha256.to_string(),
+        reason: reason.to_string(),
+    }
+}
+
+fn write_rcsb_fetch_audit(
+    options: &ScienceOptions,
+    rows: &[RcsbFetchAuditRow],
+) -> Result<(), String> {
+    let mut text = String::from("pdb_id\tstatus\turl\tpath\tbytes\tsha256\treason\n");
+    for row in rows {
+        text.push_str(&format!(
+            "{}\t{}\t{}\t{}\t{}\t{}\t{}\n",
+            clean_cell(&row.pdb_id),
+            clean_cell(&row.status),
+            clean_cell(&row.url),
+            clean_cell(&row.path),
+            row.bytes,
+            clean_cell(&row.sha256),
+            clean_cell(&row.reason),
+        ));
+    }
+    write_text(&options.run_dir.join(RCSB_ON_DEMAND_FETCH_MANIFEST), &text)
+}
+
+fn validate_rcsb_on_demand_policy(science_store: &Path) -> Result<(), String> {
+    let path = science_store.join("downloads/rcsb/on_demand_policy.json");
+    let value = read_text(&path)
+        .ok()
+        .and_then(|text| serde_json::from_str::<Value>(text.trim_start_matches('\u{feff}')).ok())
+        .ok_or_else(|| "rcsb_on_demand_policy_missing_or_invalid_json".to_string())?;
+    let expected_strings = [
+        ("schema_version", RCSB_ON_DEMAND_POLICY_SCHEMA_VERSION),
+        ("status", "ready"),
+        ("mode", "on_demand"),
+        ("official_base_url", RCSB_OFFICIAL_DOWNLOAD_BASE_URL),
+        ("coordinate_template", RCSB_OFFICIAL_COORDINATE_TEMPLATE),
+        ("cache_root", RCSB_ON_DEMAND_CACHE_ROOT),
+        ("validation", RCSB_ON_DEMAND_VALIDATION),
+    ];
+    for (field, expected) in expected_strings {
+        if value.get(field).and_then(Value::as_str) != Some(expected) {
+            return Err(format!("rcsb_on_demand_policy_invalid:{field}"));
+        }
+    }
+    if value.get("max_fetches_per_run").and_then(Value::as_u64)
+        != Some(RCSB_ON_DEMAND_FETCH_LIMIT as u64)
+    {
+        return Err("rcsb_on_demand_policy_invalid:max_fetches_per_run".to_string());
+    }
+    Ok(())
+}
+
+fn fetch_rcsb_coordinate_with_python(
+    science_store: &Path,
+    pdb_id: &str,
+    base_url: &str,
+    python_command: Option<&[String]>,
+) -> RcsbFetchResult {
+    let path = rcsb_coordinate_cache_path(science_store, pdb_id);
+    if !is_pdb_id(&pdb_id.to_ascii_uppercase()) {
+        return RcsbFetchResult {
+            status: "failed".to_string(),
+            path,
+            sha256: String::new(),
+            reason: "invalid_pdb_id".to_string(),
+        };
+    }
+    let url = rcsb_coordinate_url(base_url, pdb_id);
+    let args = [pdb_id.to_ascii_uppercase(), url, path.display().to_string()];
+    let output = match run_python_script_with_candidates(
+        rcsb_on_demand_fetch_script(),
+        &args,
+        "rcsb_on_demand_fetch",
+        python_command
+            .map(|command| vec![command.to_vec()])
+            .unwrap_or_else(script_python_command_candidates),
+    ) {
+        Ok(output) => output,
+        Err(error) => {
+            return RcsbFetchResult {
+                status: "failed".to_string(),
+                path,
+                sha256: String::new(),
+                reason: format!("fetch_execution_failed:{error}"),
+            };
+        }
+    };
+    let value = output
+        .lines()
+        .rev()
+        .find_map(|line| serde_json::from_str::<Value>(line).ok());
+    let Some(value) = value else {
+        return RcsbFetchResult {
+            status: "failed".to_string(),
+            path,
+            sha256: String::new(),
+            reason: "fetch_result_invalid_json".to_string(),
+        };
+    };
+    let status = value
+        .get("status")
+        .and_then(Value::as_str)
+        .unwrap_or("failed")
+        .to_string();
+    let mut sha256 = value
+        .get("sha256")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    let mut reason = value
+        .get("reason")
+        .and_then(Value::as_str)
+        .unwrap_or("fetch_result_missing_reason")
+        .to_string();
+    if matches!(status.as_str(), "fetched" | "reused")
+        && (!coordinate_file_matches_pdb(&path, pdb_id)
+            || !valid_sha256_hex(&sha256)
+            || sha256_file_hex(&path).as_deref() != Some(sha256.as_str()))
+    {
+        sha256.clear();
+        reason = "post_fetch_coordinate_validation_failed".to_string();
+        return RcsbFetchResult {
+            status: "failed".to_string(),
+            path,
+            sha256,
+            reason,
+        };
+    }
+    RcsbFetchResult {
+        status,
+        path,
+        sha256,
+        reason,
+    }
+}
+
+fn rcsb_on_demand_fetch_script() -> &'static str {
+    r##"import glob
+import gzip
+import hashlib
+import json
+import os
+import re
+import sys
+import time
+import urllib.error
+import urllib.request
+import uuid
+
+pdb_id = sys.argv[1].upper()
+url = sys.argv[2]
+target = os.path.abspath(sys.argv[3])
+directory = os.path.dirname(target)
+lower = pdb_id.lower()
+lock_path = target + ".fetch.lock"
+token = f"{os.getpid()}-{uuid.uuid4().hex}"
+staging = os.path.join(directory, f".{lower}.{token}.cif.gz.part")
+identity = staging + ".identity.json"
+lock_owned = False
+
+def result(status, reason, sha256=""):
+    print(json.dumps({
+        "status": status,
+        "reason": reason,
+        "sha256": sha256,
+    }, sort_keys=True))
+
+def validate(path):
+    entry_match = False
+    has_atom_site = False
+    has_x = False
+    has_y = False
+    has_z = False
+    has_atoms = False
+    pending_entry = False
+    total = 0
+    try:
+        with gzip.open(path, "rt", encoding="utf-8", errors="replace") as handle:
+            for line in handle:
+                total += len(line)
+                if total > 2_147_483_648:
+                    return False, "uncompressed_size_limit_exceeded"
+                stripped = line.strip()
+                lowered = stripped.lower()
+                if total < 8192 and ("<html" in lowered or "<!doctype html" in lowered):
+                    return False, "html_payload_rejected"
+                if lowered == f"data_{lower}":
+                    entry_match = True
+                if pending_entry and stripped and not stripped.startswith("#"):
+                    entry_match = stripped.strip("'\"").upper() == pdb_id
+                    pending_entry = False
+                if lowered == "_entry.id":
+                    pending_entry = True
+                elif lowered.startswith("_entry.id "):
+                    entry_match = stripped.split(None, 1)[1].strip("'\"").upper() == pdb_id
+                if lowered.startswith("_atom_site."):
+                    has_atom_site = True
+                if lowered == "_atom_site.cartn_x":
+                    has_x = True
+                elif lowered == "_atom_site.cartn_y":
+                    has_y = True
+                elif lowered == "_atom_site.cartn_z":
+                    has_z = True
+                if stripped.startswith("ATOM ") or stripped.startswith("HETATM "):
+                    has_atoms = True
+    except Exception as exc:
+        return False, f"gzip_validation_failed:{type(exc).__name__}:{exc}"
+    if not entry_match:
+        return False, "pdb_entry_id_mismatch"
+    if not (has_atom_site and has_x and has_y and has_z and has_atoms):
+        return False, "atom_site_coordinates_missing"
+    return True, "validated"
+
+def digest(path):
+    hasher = hashlib.sha256()
+    with open(path, "rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            hasher.update(chunk)
+    return hasher.hexdigest()
+
+def cleanup_own():
+    for path in (staging, identity):
+        try:
+            os.remove(path)
+        except FileNotFoundError:
+            pass
+
+def cleanup_old_identity_files():
+    patterns = [
+        os.path.join(directory, f".{lower}.*.cif.gz.part"),
+        os.path.join(directory, f".{lower}.*.cif.gz.part.identity.json"),
+        os.path.join(directory, f"{lower}.cif.gz.part*"),
+        os.path.join(directory, f"{lower}.cif.gz.identity*"),
+    ]
+    for pattern in patterns:
+        for path in glob.glob(pattern):
+            if path not in (staging, identity):
+                try:
+                    os.remove(path)
+                except FileNotFoundError:
+                    pass
+
+try:
+    os.makedirs(directory, exist_ok=True)
+    if os.path.isfile(target):
+        valid, _ = validate(target)
+        if valid:
+            result("reused", "valid_cached_coordinate_reused", digest(target))
+            raise SystemExit(0)
+
+    deadline = time.monotonic() + 120.0
+    while not lock_owned:
+        try:
+            descriptor = os.open(lock_path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+            with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
+                handle.write(token)
+            lock_owned = True
+        except FileExistsError:
+            if os.path.isfile(target):
+                valid, _ = validate(target)
+                if valid:
+                    result("reused", "valid_coordinate_published_by_concurrent_run", digest(target))
+                    raise SystemExit(0)
+            try:
+                if time.time() - os.path.getmtime(lock_path) > 300:
+                    os.remove(lock_path)
+                    continue
+            except FileNotFoundError:
+                continue
+            if time.monotonic() >= deadline:
+                result("failed", "coordinate_fetch_lock_timeout")
+                raise SystemExit(0)
+            time.sleep(0.05)
+
+    if os.path.isfile(target):
+        valid, _ = validate(target)
+        if valid:
+            result("reused", "valid_coordinate_published_by_concurrent_run", digest(target))
+            raise SystemExit(0)
+
+    with open(identity, "w", encoding="utf-8") as handle:
+        json.dump({"pdb_id": pdb_id, "url": url, "target": target, "staging": staging}, handle)
+    request = urllib.request.Request(url, headers={"User-Agent": "GenoLigand/rcsb-on-demand"})
+    try:
+        with urllib.request.urlopen(request, timeout=30) as response, open(staging, "wb") as output:
+            content_type = (response.headers.get("Content-Type") or "").lower()
+            if "text/html" in content_type:
+                result("failed", "html_content_type_rejected")
+                raise SystemExit(0)
+            total = 0
+            while True:
+                chunk = response.read(1024 * 1024)
+                if not chunk:
+                    break
+                total += len(chunk)
+                if total > 1_073_741_824:
+                    result("failed", "compressed_size_limit_exceeded")
+                    raise SystemExit(0)
+                output.write(chunk)
+            output.flush()
+            os.fsync(output.fileno())
+    except urllib.error.HTTPError as exc:
+        if exc.code == 404:
+            result("not_found", "http_404")
+        else:
+            result("failed", f"http_error:{exc.code}")
+        raise SystemExit(0)
+    except (urllib.error.URLError, TimeoutError, OSError) as exc:
+        result("failed", f"network_error:{type(exc).__name__}:{exc}")
+        raise SystemExit(0)
+
+    valid, reason = validate(staging)
+    if not valid:
+        result("failed", f"validation_failed:{reason}")
+        raise SystemExit(0)
+    sha256 = digest(staging)
+    os.replace(staging, target)
+    cleanup_old_identity_files()
+    result("fetched", "validated_and_atomically_published", sha256)
+finally:
+    cleanup_own()
+    if lock_owned:
+        try:
+            with open(lock_path, "r", encoding="utf-8") as handle:
+                owned = handle.read() == token
+            if owned:
+                os.remove(lock_path)
+        except FileNotFoundError:
+            pass
+"##
 }
 
 fn known_structure_hints(path: &Path) -> Result<Vec<KnownStructureHint>, String> {
@@ -6754,7 +7819,115 @@ fn is_pdb_id(value: &str) -> bool {
 fn find_structure_coordinate_file(science_store: &Path, pdb_id: &str) -> Option<PathBuf> {
     structure_coordinate_candidate_paths(science_store, pdb_id)
         .into_iter()
-        .find(|path| path.exists())
+        .find(|path| path.is_file() && coordinate_file_matches_pdb(path, pdb_id))
+}
+
+fn coordinate_file_matches_pdb(path: &Path, pdb_id: &str) -> bool {
+    let Ok(text) = read_maybe_gz_text(path) else {
+        return false;
+    };
+    let prefix = text
+        .chars()
+        .take(8192)
+        .collect::<String>()
+        .to_ascii_lowercase();
+    if prefix.contains("<html") || prefix.contains("<!doctype html") {
+        return false;
+    }
+    if !coordinate_text_has_atoms(&text) {
+        return false;
+    }
+    coordinate_text_identity_matches(path, &text, pdb_id)
+}
+
+fn coordinate_file_identity_matches_pdb(path: &Path, pdb_id: &str) -> bool {
+    let Ok(text) = read_maybe_gz_prefix(path, 64 * 1024) else {
+        return false;
+    };
+    let prefix = text.to_ascii_lowercase();
+    if prefix.contains("<html") || prefix.contains("<!doctype html") {
+        return false;
+    }
+    coordinate_text_identity_matches(path, &text, pdb_id)
+}
+
+fn coordinate_text_identity_matches(path: &Path, text: &str, pdb_id: &str) -> bool {
+    let name = lower_file_name(path);
+    if name.contains(".pdb") || name.contains(".ent") {
+        coordinate_pdb_header_matches(text, pdb_id)
+    } else {
+        coordinate_mmcif_entry_matches(text, pdb_id)
+    }
+}
+
+fn coordinate_mmcif_entry_matches(text: &str, pdb_id: &str) -> bool {
+    let expected = pdb_id.to_ascii_uppercase();
+    let mut declared = false;
+    let mut pending_entry_id = false;
+    for line in text.lines() {
+        let trimmed = line.trim();
+        if pending_entry_id && !trimmed.is_empty() && !trimmed.starts_with('#') {
+            declared = true;
+            let value = trimmed
+                .split_whitespace()
+                .next()
+                .unwrap_or_default()
+                .trim_matches(['\'', '"']);
+            if !value.eq_ignore_ascii_case(&expected) {
+                return false;
+            }
+            pending_entry_id = false;
+        }
+        if let Some(value) = trimmed
+            .get(..5)
+            .filter(|prefix| prefix.eq_ignore_ascii_case("data_"))
+            .and_then(|_| trimmed.get(5..))
+        {
+            declared = true;
+            if !value.trim().eq_ignore_ascii_case(&expected) {
+                return false;
+            }
+        }
+        let mut fields = trimmed.split_whitespace();
+        if fields
+            .next()
+            .is_some_and(|field| field.eq_ignore_ascii_case("_entry.id"))
+        {
+            if let Some(value) = fields.next() {
+                declared = true;
+                if !value
+                    .trim_matches(['\'', '"'])
+                    .eq_ignore_ascii_case(&expected)
+                {
+                    return false;
+                }
+            } else {
+                pending_entry_id = true;
+            }
+        }
+    }
+    declared && !pending_entry_id
+}
+
+fn coordinate_pdb_header_matches(text: &str, pdb_id: &str) -> bool {
+    let expected = pdb_id.to_ascii_uppercase();
+    let mut declared = false;
+    for line in text.lines() {
+        if !line
+            .get(..6)
+            .is_some_and(|record| record.eq_ignore_ascii_case("HEADER"))
+        {
+            continue;
+        }
+        declared = true;
+        let Some(value) = line.get(62..66).map(str::trim) else {
+            return false;
+        };
+        if !value.eq_ignore_ascii_case(&expected) {
+            return false;
+        }
+    }
+    declared
 }
 
 fn structure_coordinate_candidate_paths(science_store: &Path, pdb_id: &str) -> Vec<PathBuf> {
@@ -6884,6 +8057,23 @@ fn read_maybe_gz_text(path: &Path) -> Result<String, String> {
         return Ok(text);
     }
     read_text(path)
+}
+
+fn read_maybe_gz_prefix(path: &Path, max_bytes: u64) -> Result<String, String> {
+    let file =
+        fs::File::open(path).map_err(|err| format!("open_failed:{}:{err}", path.display()))?;
+    let mut bytes = Vec::new();
+    if lower_file_name(path).ends_with(".gz") {
+        GzDecoder::new(file)
+            .take(max_bytes)
+            .read_to_end(&mut bytes)
+            .map_err(|err| format!("gzip_read_failed:{}:{err}", path.display()))?;
+    } else {
+        file.take(max_bytes)
+            .read_to_end(&mut bytes)
+            .map_err(|err| format!("read_failed:{}:{err}", path.display()))?;
+    }
+    Ok(String::from_utf8_lossy(&bytes).into_owned())
 }
 
 fn coordinate_text_has_atoms(text: &str) -> bool {
@@ -11095,6 +12285,7 @@ fn read_conversion_provenance(
             source_kind: cols[9].clone(),
             source_path: cols[10].clone(),
             content_sha256: cols[11].clone(),
+            artifact: cols[13].clone(),
         };
         if by_identity.insert(key.clone(), provenance).is_some() {
             return Err(format!(
@@ -11107,7 +12298,76 @@ fn read_conversion_provenance(
     Ok(by_identity)
 }
 
+fn read_sequence_spool_value(
+    run_dir: &Path,
+    artifact: &str,
+    expected_sha256: &str,
+) -> Result<String, String> {
+    let (relative, location) = artifact
+        .split_once('#')
+        .ok_or_else(|| format!("input_sequence_spool_reference_invalid:{artifact}"))?;
+    if relative != INPUT_SEQUENCE_SPOOL_FILE {
+        return Err(format!("input_sequence_spool_path_invalid:{relative}"));
+    }
+    let mut offset = None;
+    let mut length = None;
+    for field in location.split('&') {
+        let (name, value) = field
+            .split_once('=')
+            .ok_or_else(|| format!("input_sequence_spool_reference_invalid:{artifact}"))?;
+        let parsed = value
+            .parse::<u64>()
+            .map_err(|_| format!("input_sequence_spool_reference_invalid:{artifact}"))?;
+        match name {
+            "offset" if offset.replace(parsed).is_none() => {}
+            "length" if length.replace(parsed).is_none() => {}
+            _ => return Err(format!("input_sequence_spool_reference_invalid:{artifact}")),
+        }
+    }
+    let offset = offset.ok_or_else(|| format!("input_sequence_spool_offset_missing:{artifact}"))?;
+    let length = length.ok_or_else(|| format!("input_sequence_spool_length_missing:{artifact}"))?;
+    let path = run_dir.join(relative);
+    let resolved_root = run_dir.canonicalize().map_err(|err| {
+        format!(
+            "input_sequence_spool_root_invalid:{}:{err}",
+            run_dir.display()
+        )
+    })?;
+    let resolved = path
+        .canonicalize()
+        .map_err(|err| format!("input_sequence_spool_missing:{}:{err}", path.display()))?;
+    if !resolved.starts_with(&resolved_root) {
+        return Err(format!(
+            "input_sequence_spool_outside_run:{}",
+            resolved.display()
+        ));
+    }
+    let mut file = fs::File::open(&resolved).map_err(|err| {
+        format!(
+            "input_sequence_spool_read_failed:{}:{err}",
+            resolved.display()
+        )
+    })?;
+    file.seek(SeekFrom::Start(offset))
+        .map_err(|err| format!("input_sequence_spool_seek_failed:{artifact}:{err}"))?;
+    let mut value = String::new();
+    file.take(length)
+        .read_to_string(&mut value)
+        .map_err(|err| format!("input_sequence_spool_read_failed:{artifact}:{err}"))?;
+    if value.len() as u64 != length {
+        return Err(format!("input_sequence_spool_truncated:{artifact}"));
+    }
+    let observed_sha256 = format!("{:x}", Sha256::digest(value.as_bytes()));
+    if observed_sha256 != expected_sha256 {
+        return Err(format!("input_sequence_spool_digest_mismatch:{artifact}"));
+    }
+    Ok(value)
+}
+
 fn read_normalized_inputs(path: &Path) -> Result<Vec<NormalizedInput>, String> {
+    let run_dir = path
+        .parent()
+        .ok_or_else(|| "normalized_input_manifest_missing_parent".to_string())?;
     let text = read_text(path)?;
     let mut lines = text.lines();
     let header = lines
@@ -11234,11 +12494,16 @@ fn read_normalized_inputs(path: &Path) -> Result<Vec<NormalizedInput>, String> {
                 clean_cell(&key.1)
             ));
         }
+        let primary_value = if cols[2].is_empty() && !expected.artifact.is_empty() {
+            read_sequence_spool_value(run_dir, &expected.artifact, &expected.content_sha256)?
+        } else {
+            decode_tsv_cell(&cols[2])
+        };
         out.push(NormalizedInput {
             input_id: cols[0].clone(),
             record_id: cols[5].clone(),
             kind,
-            primary_value: decode_tsv_cell(&cols[2]),
+            primary_value,
             file_count: parse_usize(3, "file_count")?,
             tokens: cols[4].split_whitespace().map(ToOwned::to_owned).collect(),
             source_kind,
@@ -12875,11 +14140,20 @@ fn decode_tsv_cell(value: &str) -> String {
 }
 
 fn run_python_script(script: &str, args: &[String], context: &str) -> Result<String, String> {
+    run_python_script_with_candidates(script, args, context, script_python_command_candidates())
+}
+
+fn run_python_script_with_candidates(
+    script: &str,
+    args: &[String],
+    context: &str,
+    candidates: Vec<Vec<String>>,
+) -> Result<String, String> {
     let mut errors = Vec::new();
     let script_path = temp_python_script_path(context);
     fs::write(&script_path, script)
         .map_err(|err| format!("{context}_python_script_write_failed:{err}"))?;
-    for candidate in script_python_command_candidates() {
+    for candidate in candidates {
         let mut command = candidate.clone();
         command.push(python_script_arg(
             &candidate,

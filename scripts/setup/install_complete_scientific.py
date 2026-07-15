@@ -74,6 +74,12 @@ PYTHON_TOOL_PACKAGES: list[dict[str, str]] = [
         "version_expr": "'installed'",
     },
     {
+        "component": "importlib_resources",
+        "package": "importlib-resources==7.1.0",
+        "import_name": "importlib_resources",
+        "version_expr": "__import__('importlib.metadata', fromlist=['version']).version('importlib-resources')",
+    },
+    {
         "component": "pdbfixer",
         "package": "pdbfixer@5e658a4fb8d2b90d65ca8408c845cbf104ce7099",
         "import_name": "pdbfixer",
@@ -185,15 +191,36 @@ SCIENCE_READINESS_EVIDENCE_PATHS = (
     "indexes/tool_versions.tsv",
     "indexes/mmseqs/mmseqs_target_databases.tsv",
     "indexes/foldseek/foldseek_target_databases.tsv",
+    "indexes/foldseek/rcsb_mmcif/indexed_pdb_ids.tsv",
+    "downloads/chembl/chembl_query.manifest.json",
     "downloads/rcsb/ligand_bound_pdb_scope.json",
     "downloads/rcsb/ligand_bound_pdb_scope.tsv",
+    "downloads/rcsb/on_demand_policy.json",
 )
 RUNTIME_BINARY_MANIFEST_SCHEMA_VERSION = "genoligand_runtime_binary_manifest_v1"
 SOURCE_FINGERPRINT_CACHE_SCHEMA_VERSION = "genoligand_source_fingerprint_cache_v1"
 SOURCE_PAYLOAD_VALIDATION_SCHEMA_VERSION = "genoligand_source_payload_validation_v1"
+PUBLISHER_INVENTORY_CACHE_SCHEMA_VERSION = "genoligand_publisher_inventory_cache_v1"
+PUBLISHER_INVENTORY_ATTEMPTS = 3
+INSTALL_ATTEMPT_SCHEMA_VERSION = "genoligand_install_attempt_v1"
+UNCHECKSUMMED_PUBLISHER_REQUIRED_PATHS = {
+    "biolip2": {
+        "BioLiP.txt.gz",
+        "BioLiP_nr.txt.gz",
+        "peptide.fasta.gz",
+        "peptide_nr.fasta.gz",
+        "protein.fasta.gz",
+        "protein_nr.fasta.gz",
+    },
+}
 PYTHON_MIN_VERSION = (3, 12)
 PYTHON_MAX_VERSION_EXCLUSIVE = (3, 13)
 DISK_SAFETY_MARGIN_BYTES = 5 * 1024 * 1024 * 1024
+CHEMBL_QUERY_OUTPUT_MIN_BYTES = 256 * 1024 * 1024
+CHEMBL_QUERY_OUTPUT_SOURCE_RATIO_NUMERATOR = 2
+CHEMBL_QUERY_OUTPUT_SOURCE_RATIO_DENOMINATOR = 5
+CHEMBL_QUERY_TRANSACTION_SCHEMA_VERSION = "genoligand_chembl_query_transaction_v1"
+DATABASE_DIRECTORY_TRANSACTION_SCHEMA_VERSION = "genoligand_database_directory_transaction_v1"
 RCSB_CAPACITY_REMOTE_SAMPLE_SIZE = 32
 RCSB_CAPACITY_AGGREGATE_MARGIN_NUMERATOR = 3
 RCSB_CAPACITY_AGGREGATE_MARGIN_DENOMINATOR = 2
@@ -230,6 +257,8 @@ INSTALL_LOCK_HEARTBEAT_SECONDS = 15.0
 INSTALL_LOCK_WAIT_SECONDS = 5.0
 INSTALL_LOCK_INCOMPLETE_GRACE_SECONDS = 10.0
 PROCESS_START_TOLERANCE_SECONDS = 2.0
+WINDOWS_ATOMIC_REPLACE_RETRY_CODES = frozenset({5, 32, 33})
+ATOMIC_REPLACE_RETRY_DELAYS = (0.01, 0.02, 0.04, 0.08, 0.16, 0.32, 0.4)
 DOWNLOAD_RETRIES = 3
 DOWNLOAD_TIMEOUT_SECONDS = 120
 DOWNLOAD_USER_AGENT = "GenoLigand-science-store-installer/0.9"
@@ -237,16 +266,31 @@ RCSB_DOWNLOAD_WORKERS = 20
 ProgressCallback = Callable[[str, int, int | None, str], None]
 ResourceSignature = tuple[str, int, int, int, int, int, str]
 ResourceSummaryCache = dict[str, tuple[tuple[ResourceSignature, ...], dict[str, object]]]
+_COMPATIBLE_TLS_CONTEXT: ssl.SSLContext | None = None
+_COMPATIBLE_TLS_CONTEXT_LOCK = threading.Lock()
+_ATOMIC_PATH_LOCKS: dict[str, threading.Lock] = {}
+_ATOMIC_PATH_LOCKS_GUARD = threading.Lock()
+
+
+def compatible_tls_context() -> ssl.SSLContext:
+    global _COMPATIBLE_TLS_CONTEXT
+    context = _COMPATIBLE_TLS_CONTEXT
+    if context is None:
+        with _COMPATIBLE_TLS_CONTEXT_LOCK:
+            context = _COMPATIBLE_TLS_CONTEXT
+            if context is None:
+                context = ssl.create_default_context()
+                ignore_unexpected_eof = getattr(ssl, "OP_IGNORE_UNEXPECTED_EOF", None)
+                if ignore_unexpected_eof is not None:
+                    context.options |= ignore_unexpected_eof
+                _COMPATIBLE_TLS_CONTEXT = context
+    return context
 
 
 def urlopen_with_compatible_tls(request: urllib.request.Request, timeout: int):
     url = getattr(request, "full_url", "")
     if str(url).lower().startswith("https://"):
-        context = ssl.create_default_context()
-        ignore_unexpected_eof = getattr(ssl, "OP_IGNORE_UNEXPECTED_EOF", None)
-        if ignore_unexpected_eof is not None:
-            context.options |= ignore_unexpected_eof
-        return urllib.request.urlopen(request, timeout=timeout, context=context)
+        return urllib.request.urlopen(request, timeout=timeout, context=compatible_tls_context())
     return urllib.request.urlopen(request, timeout=timeout)
 
 WSL_COMMAND_WRAPPERS = [
@@ -363,6 +407,20 @@ def default_runtime_dir() -> Path:
     return Path.home() / ".local" / "state" / "genoligand" / "runtime"
 
 
+def default_installer_scratch_dir() -> Path:
+    explicit = os.environ.get("GENOLIGAND_SCRATCH_DIR")
+    if explicit:
+        return Path(explicit)
+    if os.name == "nt":
+        local = os.environ.get("LOCALAPPDATA")
+        if local:
+            return Path(local) / "GenoLigand" / "installer-scratch"
+    xdg_state = os.environ.get("XDG_STATE_HOME")
+    if xdg_state:
+        return Path(xdg_state) / "genoligand" / "installer-scratch"
+    return Path.home() / ".local" / "state" / "genoligand" / "installer-scratch"
+
+
 def default_python_env_dir(runtime_dir: Path) -> Path:
     explicit = os.environ.get("GENOLIGAND_PYTHON_ENV")
     if explicit:
@@ -453,9 +511,36 @@ class BinaryBuildError(RuntimeError):
     pass
 
 
+def require_clean_workspace_commit(root: Path) -> str:
+    before = workspace_commit(root)
+    if not before:
+        raise BinaryBuildError("runtime_source_commit_unavailable")
+    status = run_command(
+        [
+            "git",
+            "-C",
+            str(root),
+            "status",
+            "--porcelain=v1",
+            "-z",
+            "--untracked-files=all",
+            "--ignore-submodules=none",
+        ]
+    )
+    if status.returncode != 0:
+        raise BinaryBuildError("runtime_source_state_unavailable")
+    if status.stdout:
+        raise BinaryBuildError("runtime_source_tree_not_clean")
+    after = workspace_commit(root)
+    if after != before:
+        raise BinaryBuildError("runtime_source_commit_changed")
+    return before
+
+
 def build_release_binary(root: Path, binary_name: str, cargo_package: str) -> Path | None:
     if not (root / "Cargo.toml").exists():
         return None
+    expected_commit = require_clean_workspace_commit(root)
     cargo = ensure_cargo_available()
     if not cargo:
         raise BinaryBuildError(f"cannot build {binary_name}: cargo is unavailable")
@@ -467,6 +552,8 @@ def build_release_binary(root: Path, binary_name: str, cargo_package: str) -> Pa
         raise BinaryBuildError(f"cannot build {binary_name} (exit {completed.returncode}): {detail}")
     if not binary.is_file():
         raise BinaryBuildError(f"cargo reported success but did not produce {binary}")
+    if require_clean_workspace_commit(root) != expected_commit:
+        raise BinaryBuildError("runtime_source_commit_changed_during_build")
     return binary
 
 
@@ -635,6 +722,11 @@ def publish_runtime_binary(
     binary_name: str,
     workspace_root: Path | None = None,
 ) -> tuple[list[str], dict[str, object]]:
+    expected_commit = ""
+    expected_version = ""
+    if workspace_root is not None:
+        expected_commit = require_clean_workspace_commit(workspace_root)
+        expected_version = workspace_release_version(workspace_root)
     bin_dir = runtime_dir / "bin"
     bin_dir.mkdir(parents=True, exist_ok=True)
     executable = runtime_executable_name(binary_name)
@@ -649,6 +741,12 @@ def publish_runtime_binary(
         return command, status
     source = Path(command[0])
     if len(command) == 1 and source.exists() and source.is_file():
+        if workspace_root is not None:
+            source_smoke = runtime_binary_smoke([str(source)], expected_version, expected_commit)
+            if source_smoke["status"] != "ready":
+                raise BinaryBuildError("runtime_binary_identity_mismatch")
+            if require_clean_workspace_commit(workspace_root) != expected_commit:
+                raise BinaryBuildError("runtime_source_commit_changed_before_publish")
         target = bin_dir / executable
         stop_result = None
         if source.resolve() != target.resolve():
@@ -662,12 +760,12 @@ def publish_runtime_binary(
         status["sha256"] = sha256_file(target)
         status["build_profile"] = "release" if "release" in {part.lower() for part in source.parts} else "external"
         if workspace_root is not None:
-            expected_version = workspace_release_version(workspace_root)
-            expected_commit = workspace_commit(workspace_root)
             smoke = runtime_binary_smoke(published, expected_version, expected_commit)
+            if smoke["status"] != "ready":
+                raise BinaryBuildError("runtime_published_binary_identity_mismatch")
             status.update(
                 {
-                    "status": "ready" if smoke["status"] == "ready" else "needs_repair",
+                    "status": "ready",
                     "version": smoke["version"],
                     "expected_version": expected_version,
                     "commit": smoke["commit"],
@@ -822,8 +920,14 @@ def write_runtime_launch_environment(
         env["GENOLIGAND_PYTHON"] = tool_python
     path_prepend = [str(runtime_dir / "bin")]
     science_path = science_env.get("PATH", "")
-    if science_path:
-        path_prepend.append(science_path)
+    inherited_path = os.environ.get("PATH", "")
+    if science_path == inherited_path:
+        science_path = ""
+    elif inherited_path and science_path.endswith(os.pathsep + inherited_path):
+        science_path = science_path[: -(len(inherited_path) + len(os.pathsep))]
+    for entry in science_path.split(os.pathsep):
+        if entry and entry not in path_prepend:
+            path_prepend.append(entry)
     launch_json = runtime_dir / "launch_environment.json"
     launch_payload = {
         "status": "ready",
@@ -1191,6 +1295,24 @@ def python_tool_total(require_cuda: bool = False) -> int:
     return len(PYTHON_TOOL_PACKAGES) + int(require_cuda)
 
 
+def normalized_release_version(value: object) -> tuple[int, ...] | None:
+    match = re.fullmatch(
+        r"(?P<release>[0-9]+(?:\.[0-9]+)*)(?:\.dev-[0-9A-Za-z]+)?",
+        str(value).strip(),
+    )
+    if not match:
+        return None
+    return tuple(int(part) for part in match.group("release").split("."))
+
+
+def release_versions_compatible(expected: object, observed: object) -> bool:
+    if str(expected) == str(observed):
+        return True
+    expected_release = normalized_release_version(expected)
+    observed_release = normalized_release_version(observed)
+    return expected_release is not None and expected_release == observed_release
+
+
 OPENMM_CUDA_PROBE_CODE = r"""
 import json
 import os
@@ -1202,6 +1324,9 @@ payload = {
     "version": "",
     "platforms": [],
     "cuda_ready": False,
+    "cuda_context_ready": False,
+    "cuda_context_platform": "",
+    "cuda_context_failure": "",
     "plugin_dir": "",
     "default_plugin_dir": "",
     "loaded_plugins": [],
@@ -1249,12 +1374,42 @@ try:
         for index in range(openmm.Platform.getNumPlatforms())
     ]
     payload["cuda_ready"] = any(name.lower() == "cuda" for name in payload["platforms"])
+    if payload["cuda_ready"]:
+        context = None
+        integrator = None
+        try:
+            system = openmm.System()
+            system.addParticle(1.0)
+            integrator = openmm.VerletIntegrator(0.001)
+            context = openmm.Context(
+                system,
+                integrator,
+                openmm.Platform.getPlatformByName("CUDA"),
+            )
+            context.setPositions([[0.0, 0.0, 0.0]])
+            context.getState(getEnergy=True)
+            payload["cuda_context_platform"] = context.getPlatform().getName()
+            payload["cuda_context_ready"] = payload["cuda_context_platform"].lower() == "cuda"
+        except Exception as exc:
+            payload["cuda_context_failure"] = str(exc)
+        finally:
+            del context
+            del integrator
+    blocking_plugin_failures = [
+        failure for failure in payload["plugin_load_failures"] if "opencl" not in failure.lower()
+    ]
     if not payload["cuda_ready"]:
         payload["failure_reason"] = (
-            "plugin_load_failures:" + "|".join(payload["plugin_load_failures"])
-            if payload["plugin_load_failures"]
+            "plugin_load_failures:" + "|".join(blocking_plugin_failures)
+            if blocking_plugin_failures
             else "CUDA_platform_missing"
         )
+    elif not payload["cuda_context_ready"]:
+        payload["failure_reason"] = "CUDA_context_failed:" + (
+            payload["cuda_context_failure"] or "CUDA_context_unavailable"
+        )
+    elif blocking_plugin_failures:
+        payload["failure_reason"] = "plugin_load_failures:" + "|".join(blocking_plugin_failures)
 except Exception as exc:
     payload["failure_reason"] = f"openmm_probe_failed:{exc}"
 print(json.dumps(payload, sort_keys=True))
@@ -1278,6 +1433,9 @@ def parse_openmm_cuda_probe(completed: subprocess.CompletedProcess[str]) -> dict
         "version": "",
         "platforms": [],
         "cuda_ready": False,
+        "cuda_context_ready": False,
+        "cuda_context_platform": "",
+        "cuda_context_failure": "",
         "plugin_dir": "",
         "default_plugin_dir": "",
         "loaded_plugins": [],
@@ -1294,13 +1452,22 @@ def probe_wsl_openmm_cuda(distro: str, python_path: str) -> dict[str, object]:
     return parse_openmm_cuda_probe(run_wsl_command(distro, [python_path, "-c", OPENMM_CUDA_PROBE_CODE]))
 
 
+def blocking_openmm_plugin_failures(probe: dict[str, object]) -> list[str]:
+    failures = probe.get("plugin_load_failures", [])
+    if not isinstance(failures, list):
+        return [str(failures)] if failures else []
+    return [str(failure) for failure in failures if "opencl" not in str(failure).lower()]
+
+
 def openmm_cuda_probe_ready(probe: dict[str, object]) -> bool:
+    context_ready = probe.get("cuda_context_ready", probe.get("cuda_ready"))
     return bool(
         probe.get("openmm_ready")
         and probe.get("cuda_ready")
-        and str(probe.get("version", "")) == OPENMM_CUDA_VERSION
+        and context_ready
+        and release_versions_compatible(OPENMM_CUDA_VERSION, probe.get("version", ""))
         and str(probe.get("plugin_dir", ""))
-        and not probe.get("plugin_load_failures")
+        and not blocking_openmm_plugin_failures(probe)
     )
 
 
@@ -1317,10 +1484,14 @@ def openmm_cuda_notes(
         f"platforms={platforms}",
         f"cuda={cuda}",
         f"cuda_failure_reason={reason}",
+        f"cuda_context={'ready' if probe.get('cuda_context_ready', probe.get('cuda_ready')) else 'missing'}",
+        f"cuda_context_platform={probe.get('cuda_context_platform', '')}",
+        f"cuda_context_failure={probe.get('cuda_context_failure', '')}",
         f"openmm_plugin_dir={probe.get('plugin_dir', '')}",
         f"openmm_default_plugin_dir={probe.get('default_plugin_dir', '')}",
         f"loaded_plugins={','.join(str(item) for item in probe.get('loaded_plugins', []))}",
         f"plugin_load_failures={'|'.join(str(item) for item in probe.get('plugin_load_failures', []))}",
+        f"blocking_plugin_load_failures={'|'.join(blocking_openmm_plugin_failures(probe))}",
         f"repair_action={repair_action}",
     ]
     if runtime_notes:
@@ -1587,6 +1758,69 @@ def worker_source_locks() -> list[dict[str, str]]:
     return rows
 
 
+def locked_source_checkout_commands(
+    git: str,
+    repository: str | Path,
+    source: dict[str, str],
+) -> list[list[str]]:
+    repo = str(repository)
+    return [
+        [git, "-C", repo, "init", "--quiet"],
+        [git, "-C", repo, "config", "core.autocrlf", "false"],
+        [git, "-C", repo, "remote", "add", "origin", source["git_url"]],
+        [git, "-C", repo, "fetch", "--quiet", "--depth", "1", "origin", source["commit"]],
+        [git, "-C", repo, "checkout", "--quiet", "--detach", source["commit"]],
+        [git, "-C", repo, "tag", "--force", source["version"], source["commit"]],
+    ]
+
+
+def run_locked_source_checkout_command(
+    runner: Callable[[list[str]], subprocess.CompletedProcess[str]],
+    command: list[str],
+) -> subprocess.CompletedProcess[str]:
+    transient_errors = (
+        "gnutls_handshake() failed",
+        "tls connection was non-properly terminated",
+        "ssl_connect",
+        "rpc failed",
+        "early eof",
+        "connection reset",
+        "connection was reset",
+        "curl 18",
+        "curl 56",
+        "remote end hung up unexpectedly",
+    )
+    max_attempts = 3 if "fetch" in command else 1
+    for attempt in range(1, max_attempts + 1):
+        completed = runner(command)
+        if completed.returncode == 0:
+            return completed
+        output = f"{completed.stdout}\n{completed.stderr}".lower()
+        if attempt == max_attempts or not any(marker in output for marker in transient_errors):
+            return completed
+        time.sleep(attempt)
+    raise AssertionError("locked source checkout retry loop exhausted")
+
+
+def locked_source_archive_command(
+    git: str,
+    repository: str | Path,
+    archive: str | Path,
+    commit: str,
+) -> list[str]:
+    return [
+        git,
+        "-c",
+        "core.autocrlf=false",
+        "-C",
+        str(repository),
+        "archive",
+        "--format=tar",
+        f"--output={archive}",
+        commit,
+    ]
+
+
 def environment_lock_digest(platform_id: str, python_version: str, require_cuda: bool) -> str:
     paths = [
         repo_root() / "python/requirements-workers.lock.txt",
@@ -1605,7 +1839,7 @@ def locked_probe_ready(spec: dict[str, str], probe: dict[str, object]) -> bool:
         return False
     match = re.search(r"==([A-Za-z0-9_.+-]+)", spec.get("package", ""))
     observed = str(probe.get("version", ""))
-    return not match or observed == "installed" or observed == match.group(1)
+    return not match or observed == "installed" or release_versions_compatible(match.group(1), observed)
 
 
 def install_hashed_requirements_local(python: Path, locks: list[Path]) -> dict[str, str]:
@@ -1659,15 +1893,9 @@ def install_locked_sources_local(python: Path, env_dir: Path) -> dict[str, str]:
             wheel_dir = build_root / package / "wheels"
             repository.mkdir(parents=True, exist_ok=True)
             wheel_dir.mkdir(parents=True, exist_ok=True)
-            commands = [
-                [git, "-C", str(repository), "init", "--quiet"],
-                [git, "-C", str(repository), "remote", "add", "origin", source["git_url"]],
-                [git, "-C", str(repository), "fetch", "--quiet", "--depth", "1", "origin", source["commit"]],
-                [git, "-C", str(repository), "checkout", "--quiet", "--detach", source["commit"]],
-                [git, "-C", str(repository), "tag", "--force", source["version"], source["commit"]],
-            ]
+            commands = locked_source_checkout_commands(git, repository, source)
             for command in commands:
-                completed = run_command(command)
+                completed = run_locked_source_checkout_command(run_command, command)
                 if completed.returncode != 0:
                     return {"status": "failed", "reason": f"locked_source_checkout_failed:{package}:{process_note(completed)}"}
             observed = run_command([git, "-C", str(repository), "rev-parse", f"{source['commit']}^{{commit}}"])
@@ -1675,7 +1903,7 @@ def install_locked_sources_local(python: Path, env_dir: Path) -> dict[str, str]:
                 return {"status": "failed", "reason": f"locked_source_commit_mismatch:{package}"}
             archive = build_root / package / "source.tar"
             archived = run_command(
-                [git, "-C", str(repository), "archive", "--format=tar", f"--output={archive}", source["commit"]]
+                locked_source_archive_command(git, repository, archive, source["commit"])
             )
             if (
                 archived.returncode != 0
@@ -1784,7 +2012,7 @@ def install_locked_sources_wsl(
     build_root = f"{home}/.local/state/genoligand/locked-source-build-{uuid.uuid4().hex}"
     created = run_wsl_command(
         distro,
-        ["bash", "-lc", 'mkdir -p -- "$1"', "create-locked-source-root", build_root],
+        ["mkdir", "-p", "--", build_root],
     )
     if created.returncode != 0:
         return {"status": "failed", "reason": f"locked_source_build_root_failed:{process_note(created)}"}
@@ -1796,19 +2024,15 @@ def install_locked_sources_wsl(
             wheel_dir = f"{package_root}/wheels"
             prepared = run_wsl_command(
                 distro,
-                ["bash", "-lc", 'mkdir -p -- "$1" "$2"', "prepare-locked-source", repository, wheel_dir],
+                ["mkdir", "-p", "--", repository, wheel_dir],
             )
             if prepared.returncode != 0:
                 return {"status": "failed", "reason": f"locked_source_prepare_failed:{package}"}
-            commands = [
-                ["git", "-C", repository, "init", "--quiet"],
-                ["git", "-C", repository, "remote", "add", "origin", source["git_url"]],
-                ["git", "-C", repository, "fetch", "--quiet", "--depth", "1", "origin", source["commit"]],
-                ["git", "-C", repository, "checkout", "--quiet", "--detach", source["commit"]],
-                ["git", "-C", repository, "tag", "--force", source["version"], source["commit"]],
-            ]
+            commands = locked_source_checkout_commands("git", repository, source)
             for command in commands:
-                completed = run_wsl_command(distro, command)
+                completed = run_locked_source_checkout_command(
+                    lambda current: run_wsl_command(distro, current), command
+                )
                 if completed.returncode != 0:
                     return {"status": "failed", "reason": f"locked_source_checkout_failed:{package}:{process_note(completed)}"}
             observed = run_wsl_command(
@@ -1820,7 +2044,7 @@ def install_locked_sources_wsl(
             archive = f"{package_root}/source.tar"
             archived = run_wsl_command(
                 distro,
-                ["git", "-C", repository, "archive", "--format=tar", f"--output={archive}", source["commit"]],
+                locked_source_archive_command("git", repository, archive, source["commit"]),
             )
             digest_code = (
                 "import hashlib,pathlib,sys; "
@@ -1850,7 +2074,7 @@ def install_locked_sources_wsl(
             )
             found = run_wsl_command(
                 distro,
-                ["bash", "-lc", 'find "$1" -maxdepth 1 -type f -name "*.whl" -print', "find-locked-wheel", wheel_dir],
+                ["find", wheel_dir, "-maxdepth", "1", "-type", "f", "-name", "*.whl", "-print"],
             )
             wheels = [line.strip() for line in found.stdout.splitlines() if line.strip()]
             if built.returncode != 0 or found.returncode != 0 or len(wheels) != 1:
@@ -1891,7 +2115,7 @@ def install_locked_sources_wsl(
     finally:
         run_wsl_command(
             distro,
-            ["bash", "-lc", 'rm -rf -- "$1"', "cleanup-locked-source-root", build_root],
+            ["rm", "-rf", "--", build_root],
         )
 
 
@@ -2726,6 +2950,57 @@ def write_install_progress(
     return payload
 
 
+def write_capacity_attempt_state(
+    science_store: Path,
+    *,
+    status: str,
+    capacity_plan: dict[str, object] | None = None,
+    error: str = "",
+) -> None:
+    missing = capacity_plan.get("unresolved_components", []) if capacity_plan else []
+    missing_components = [str(value) for value in missing] if isinstance(missing, list) else []
+    messages = {
+        "running": "正在核对安装所需磁盘容量",
+        "blocked": "磁盘容量或远端资源大小尚未满足安装条件",
+        "failed": "容量预检执行失败",
+        "capacity_ready": "容量预检已通过",
+    }
+    next_actions = {
+        "running": "等待容量预检完成",
+        "blocked": "补足磁盘容量或恢复发布方资源身份读取后重新运行安装/修复",
+        "failed": "检查容量预检错误后重新运行安装/修复",
+        "capacity_ready": "继续安装/修复",
+    }
+    now = int(time.time())
+    write_json_atomic(
+        science_store / "install_status.json",
+        {
+            "schema_version": INSTALL_ATTEMPT_SCHEMA_VERSION,
+            "status": status,
+            "install_ready": False,
+            "stage": "容量预检",
+            "summary": messages.get(status, status),
+            "next_action": next_actions.get(status, "重新运行安装/修复"),
+            "missing_components": missing_components,
+            "capacity_plan": str(science_store / "installation_capacity_plan.json"),
+            "required_peak_bytes": capacity_plan.get("required_peak_bytes") if capacity_plan else None,
+            "available_bytes": capacity_plan.get("available_bytes") if capacity_plan else None,
+            "error": error,
+            "updated_at": now,
+        },
+    )
+    write_install_progress(
+        science_store,
+        status="ready" if status == "capacity_ready" else status,
+        stage="容量预检",
+        current_resource="安装容量",
+        completed_steps=1 if status == "capacity_ready" else 0,
+        total_steps=1,
+        failed_steps=1 if status in {"blocked", "failed"} else 0,
+        message=messages.get(status, status),
+    )
+
+
 def process_exists(pid: int) -> bool:
     if pid <= 0:
         return False
@@ -2837,57 +3112,106 @@ def read_json_object(path: Path) -> dict[str, object]:
     return value if isinstance(value, dict) else {}
 
 
-def write_json_atomic(path: Path, payload: dict[str, object]) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    temporary = path.with_name(
-        f".{path.name}.{os.getpid()}.{threading.get_ident()}.{uuid.uuid4().hex}.tmp"
-    )
+def atomic_path_lock(path: Path) -> threading.Lock:
+    key = os.path.normcase(os.path.abspath(os.fspath(path)))
+    with _ATOMIC_PATH_LOCKS_GUARD:
+        return _ATOMIC_PATH_LOCKS.setdefault(key, threading.Lock())
+
+
+def windows_atomic_replace_retryable(err: OSError) -> bool:
+    return os.name == "nt" and getattr(err, "winerror", None) in WINDOWS_ATOMIC_REPLACE_RETRY_CODES
+
+
+def fsync_directory_if_supported(directory: Path) -> None:
+    flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
     try:
-        with temporary.open("x", encoding="utf-8") as handle:
+        descriptor = os.open(directory, flags)
+    except OSError:
+        return
+    try:
+        os.fsync(descriptor)
+    except OSError:
+        pass
+    finally:
+        os.close(descriptor)
+
+
+def write_json_atomic_attempt(
+    path: Path,
+    temporary: Path,
+    err: BaseException,
+    replace_attempts: int,
+) -> None:
+    attempt = path.with_name(f"{path.name}.attempt.json")
+    payload = {
+        "status": "failed",
+        "manifest": path.name,
+        "error": str(err)[:500],
+        "error_type": type(err).__name__,
+        "winerror": getattr(err, "winerror", None),
+        "errno": getattr(err, "errno", None),
+        "replace_attempts": replace_attempts,
+        "temporary": temporary.name,
+        "failed_at": int(time.time()),
+    }
+    try:
+        with attempt.open("w", encoding="utf-8") as handle:
             json.dump(payload, handle, ensure_ascii=False, indent=2)
             handle.write("\n")
             handle.flush()
             os.fsync(handle.fileno())
-        os.replace(temporary, path)
-    finally:
+    except OSError:
+        pass
+
+
+@contextmanager
+def atomic_output_writer(path: Path, *, newline: str | None):
+    path = Path(path)
+    with atomic_path_lock(path):
+        path.parent.mkdir(parents=True, exist_ok=True)
+        temporary = path.with_name(
+            f".{path.name}.{os.getpid()}.{threading.get_ident()}.{uuid.uuid4().hex}.tmp"
+        )
+        replace_attempts = 0
         try:
-            temporary.unlink()
-        except FileNotFoundError:
-            pass
+            with temporary.open("x", encoding="utf-8", newline=newline) as handle:
+                yield handle
+                handle.flush()
+                os.fsync(handle.fileno())
+            for delay in (*ATOMIC_REPLACE_RETRY_DELAYS, None):
+                replace_attempts += 1
+                try:
+                    os.replace(temporary, path)
+                    break
+                except OSError as err:
+                    if delay is None or not windows_atomic_replace_retryable(err):
+                        raise
+                    time.sleep(delay)
+            fsync_directory_if_supported(path.parent)
+            try:
+                path.with_name(f"{path.name}.attempt.json").unlink()
+            except FileNotFoundError:
+                pass
+        except BaseException as err:
+            write_json_atomic_attempt(path, temporary, err, replace_attempts)
+            raise
+        finally:
+            try:
+                temporary.unlink()
+            except (FileNotFoundError, OSError):
+                pass
+
+
+def write_json_atomic(path: Path, payload: dict[str, object]) -> None:
+    with atomic_output_writer(path, newline=None) as handle:
+        json.dump(payload, handle, ensure_ascii=False, indent=2)
+        handle.write("\n")
 
 
 @contextmanager
 def atomic_text_writer(path: Path):
-    path.parent.mkdir(parents=True, exist_ok=True)
-    temporary = path.with_name(
-        f".{path.name}.{os.getpid()}.{threading.get_ident()}.{uuid.uuid4().hex}.tmp"
-    )
-    try:
-        with temporary.open("x", encoding="utf-8", newline="") as handle:
-            yield handle
-            handle.flush()
-            os.fsync(handle.fileno())
-        os.replace(temporary, path)
-        attempt = path.with_name(f"{path.name}.attempt.json")
-        try:
-            attempt.unlink()
-        except FileNotFoundError:
-            pass
-    except BaseException as err:
-        try:
-            temporary.unlink()
-        except FileNotFoundError:
-            pass
-        write_json_atomic(
-            path.with_name(f"{path.name}.attempt.json"),
-            {
-                "status": "failed",
-                "manifest": path.name,
-                "error": str(err)[:500],
-                "failed_at": int(time.time()),
-            },
-        )
-        raise
+    with atomic_output_writer(path, newline="") as handle:
+        yield handle
 
 
 def write_text_atomic(path: Path, value: str) -> None:
@@ -3203,6 +3527,30 @@ def remote_resource_identity(url: str) -> dict[str, object]:
     return identity_payload
 
 
+def remote_resource_size(url: str) -> int:
+    identity = remote_resource_identity(url)
+    size = int(identity.get("content_length", 0) or 0)
+    if size > 0:
+        return size
+    request = urllib.request.Request(
+        url,
+        headers={"User-Agent": DOWNLOAD_USER_AGENT, "Range": "bytes=0-0"},
+    )
+    try:
+        with urlopen_with_compatible_tls(request, timeout=DOWNLOAD_TIMEOUT_SECONDS) as response:
+            content_range = str(response.headers.get("Content-Range", ""))
+            match = re.fullmatch(r"bytes\s+0-0/(\d+)", content_range, re.IGNORECASE)
+            if match and int(match.group(1)) > 0:
+                return int(match.group(1))
+            if getattr(response, "status", 200) == 200:
+                content_length = str(response.headers.get("Content-Length", ""))
+                if content_length.isdigit() and int(content_length) > 0:
+                    return int(content_length)
+    except (urllib.error.HTTPError, urllib.error.URLError, TimeoutError, OSError, ValueError):
+        pass
+    return 0
+
+
 def write_partial_identity(partial: Path, identity: dict[str, object]) -> None:
     if identity.get("trusted"):
         write_json_atomic(partial_identity_path(partial), identity)
@@ -3214,6 +3562,22 @@ def partial_identity_matches(partial: Path, identity: dict[str, object]) -> bool
         identity.get("trusted")
         and stored.get("identity_digest")
         and stored.get("identity_digest") == identity.get("identity_digest")
+    )
+
+
+def partial_has_resumable_identity(partial: Path) -> bool:
+    stored = read_json_object(partial_identity_path(partial))
+    try:
+        content_length = int(stored.get("content_length", 0) or 0)
+        partial_bytes = partial.stat().st_size
+    except (OSError, TypeError, ValueError):
+        return False
+    return bool(
+        partial_bytes > 0
+        and content_length > partial_bytes
+        and stored.get("trusted") is True
+        and re.fullmatch(r"[0-9a-f]{64}", str(stored.get("identity_digest", "")).lower())
+        and str(stored.get("url", "")).lower().startswith("https://")
     )
 
 
@@ -3794,23 +4158,324 @@ def catalog_trust_ready(row: dict[str, str]) -> bool:
     return not catalog_release_error(row)
 
 
+def chembl_query_target_staging_bytes(source_bytes: int, archive_bytes: int) -> int:
+    projected_from_source = (
+        max(0, int(source_bytes)) * CHEMBL_QUERY_OUTPUT_SOURCE_RATIO_NUMERATOR
+        + CHEMBL_QUERY_OUTPUT_SOURCE_RATIO_DENOMINATOR
+        - 1
+    ) // CHEMBL_QUERY_OUTPUT_SOURCE_RATIO_DENOMINATOR
+    return max(
+        CHEMBL_QUERY_OUTPUT_MIN_BYTES,
+        projected_from_source,
+        max(0, int(archive_bytes)) * 2,
+    )
+
+
+def chembl_query_transaction_path(database: Path) -> Path:
+    return database.with_name(f".{database.name}.transaction.json")
+
+
+def chembl_file_identity(path: Path) -> tuple[int, str] | None:
+    try:
+        if not path.is_file():
+            return None
+        return path.stat().st_size, sha256_file(path)
+    except OSError:
+        return None
+
+
+def chembl_identity_matches(
+    identity: tuple[int, str] | None,
+    payload: dict[str, object],
+    prefix: str,
+) -> bool:
+    expected_bytes = payload.get(f"{prefix}_bytes")
+    expected_sha256 = payload.get(f"{prefix}_sha256")
+    return bool(
+        identity is not None
+        and type(expected_bytes) is int
+        and expected_bytes >= 0
+        and isinstance(expected_sha256, str)
+        and re.fullmatch(r"[0-9a-f]{64}", expected_sha256)
+        and identity == (expected_bytes, expected_sha256)
+    )
+
+
+def chembl_file_matches(path: Path, payload: dict[str, object], prefix: str) -> bool:
+    return chembl_identity_matches(chembl_file_identity(path), payload, prefix)
+
+
+def chembl_transaction_paths(
+    database: Path,
+    manifest: Path,
+    payload: dict[str, object],
+    scratch_root: Path | None = None,
+) -> dict[str, Path] | None:
+    token = payload.get("token")
+    if (
+        payload.get("schema_version") != CHEMBL_QUERY_TRANSACTION_SCHEMA_VERSION
+        or not isinstance(token, str)
+        or not re.fullmatch(r"[0-9]+-[0-9]+", token)
+    ):
+        return None
+    paths = {
+        "live_database": database,
+        "live_manifest": manifest,
+        "staging_database": database.with_name(f".{database.name}.rebuild-{token}"),
+        "staging_manifest": manifest.with_name(f".{manifest.name}.rebuild-{token}"),
+        "backup_database": database.with_name(f".{database.name}.backup-{token}"),
+        "backup_manifest": manifest.with_name(f".{manifest.name}.backup-{token}"),
+    }
+    for field, path in paths.items():
+        value = payload.get(field)
+        if not isinstance(value, str) or Path(value).resolve() != path.resolve():
+            return None
+    scratch_value = payload.get("scratch_staging")
+    if not isinstance(scratch_value, str) or Path(scratch_value).name != f"chembl-query-rebuild-{token}":
+        return None
+    if scratch_root is not None:
+        scratch_staging = scratch_root / f"chembl-query-rebuild-{token}"
+        if Path(scratch_value).resolve() != scratch_staging.resolve():
+            return None
+        paths["scratch_staging"] = scratch_staging
+    return paths
+
+
+def remove_chembl_transaction_file(path: Path) -> None:
+    if not path.exists():
+        return
+    try:
+        path.chmod(0o666)
+    except OSError:
+        pass
+    path.unlink()
+
+
+def cleanup_chembl_query_transaction(
+    transaction: Path,
+    paths: dict[str, Path],
+) -> str:
+    errors: list[str] = []
+    staging_database = paths["staging_database"]
+    for path in (
+        staging_database,
+        Path(f"{staging_database}-journal"),
+        Path(f"{staging_database}-wal"),
+        Path(f"{staging_database}-shm"),
+        paths["staging_manifest"],
+        paths["backup_database"],
+        paths["backup_manifest"],
+    ):
+        try:
+            remove_chembl_transaction_file(path)
+        except OSError as err:
+            errors.append(f"{path.name}:{exception_note(err)}")
+    scratch_staging = paths.get("scratch_staging")
+    if scratch_staging is not None and scratch_staging.exists():
+        try:
+            shutil.rmtree(scratch_staging)
+        except OSError as err:
+            errors.append(f"{scratch_staging.name}:{exception_note(err)}")
+    if errors:
+        return ";".join(errors)
+    try:
+        remove_chembl_transaction_file(transaction)
+    except OSError as err:
+        return f"{transaction.name}:{exception_note(err)}"
+    return ""
+
+
+def chembl_transaction_new_pair_ready(
+    paths: dict[str, Path],
+    payload: dict[str, object],
+) -> bool:
+    source_digest = payload.get("source_digest")
+    source_release = payload.get("source_release")
+    database_identity = chembl_file_identity(paths["live_database"])
+    return bool(
+        isinstance(source_digest, str)
+        and isinstance(source_release, str)
+        and chembl_identity_matches(database_identity, payload, "expected_database")
+        and chembl_file_matches(paths["live_manifest"], payload, "expected_manifest")
+        and chembl_query_database_ready(
+            paths["live_database"],
+            paths["live_manifest"],
+            source_digest,
+            source_release,
+            observed_database_identity=database_identity,
+        )
+    )
+
+
+def replace_chembl_transaction_file(source: Path, target: Path) -> None:
+    if source == target:
+        return
+    if target.exists():
+        try:
+            target.chmod(0o666)
+        except OSError:
+            pass
+    os.replace(source, target)
+
+
+def reconcile_chembl_query_transaction(
+    database: Path,
+    manifest: Path,
+    scratch_root: Path | None = None,
+) -> dict[str, object]:
+    transaction = chembl_query_transaction_path(database)
+    if not transaction.exists():
+        return {"status": "none", "reason": "chembl_query_transaction_absent"}
+    if not transaction.is_file():
+        return {
+            "status": "needs_repair",
+            "reason": "chembl_query_transaction_descriptor_not_file",
+            "transaction": str(transaction),
+        }
+    payload = read_json_object(transaction)
+    paths = chembl_transaction_paths(database, manifest, payload, scratch_root)
+    if paths is None:
+        return {
+            "status": "needs_repair",
+            "reason": "chembl_query_transaction_descriptor_invalid",
+            "transaction": str(transaction),
+        }
+    if chembl_transaction_new_pair_ready(paths, payload):
+        cleanup_error = cleanup_chembl_query_transaction(transaction, paths)
+        if cleanup_error:
+            return {
+                "status": "needs_repair",
+                "reason": f"chembl_query_transaction_cleanup_failed:{cleanup_error}",
+                "transaction": str(transaction),
+            }
+        try:
+            database.chmod(0o444)
+        except OSError:
+            pass
+        return {"status": "ready", "reason": "chembl_query_transaction_live_pair_committed"}
+
+    had_database = payload.get("had_live_database")
+    had_manifest = payload.get("had_live_manifest")
+    if type(had_database) is not bool or type(had_manifest) is not bool or had_database != had_manifest:
+        return {
+            "status": "needs_repair",
+            "reason": "chembl_query_transaction_initial_pair_ambiguous",
+            "transaction": str(transaction),
+        }
+    try:
+        if had_database:
+            database_source = next(
+                (
+                    path
+                    for path in (paths["backup_database"], paths["live_database"])
+                    if chembl_file_matches(path, payload, "previous_database")
+                ),
+                None,
+            )
+            manifest_source = next(
+                (
+                    path
+                    for path in (paths["backup_manifest"], paths["live_manifest"])
+                    if chembl_file_matches(path, payload, "previous_manifest")
+                ),
+                None,
+            )
+            if database_source is not None and manifest_source is not None:
+                replace_chembl_transaction_file(database_source, paths["live_database"])
+                replace_chembl_transaction_file(manifest_source, paths["live_manifest"])
+                if not (
+                    chembl_file_matches(paths["live_database"], payload, "previous_database")
+                    and chembl_file_matches(paths["live_manifest"], payload, "previous_manifest")
+                ):
+                    raise OSError("restored ChEMBL pair does not match transaction descriptor")
+                cleanup_error = cleanup_chembl_query_transaction(transaction, paths)
+                if cleanup_error:
+                    raise OSError(f"transaction cleanup failed:{cleanup_error}")
+                try:
+                    database.chmod(0o444)
+                except OSError:
+                    pass
+                return {"status": "rolled_back", "reason": "chembl_query_transaction_previous_pair_restored"}
+        else:
+            database_source = next(
+                (
+                    path
+                    for path in (paths["live_database"], paths["staging_database"])
+                    if chembl_file_matches(path, payload, "expected_database")
+                ),
+                None,
+            )
+            manifest_source = next(
+                (
+                    path
+                    for path in (paths["live_manifest"], paths["staging_manifest"])
+                    if chembl_file_matches(path, payload, "expected_manifest")
+                ),
+                None,
+            )
+            if database_source is not None and manifest_source is not None:
+                replace_chembl_transaction_file(database_source, paths["live_database"])
+                replace_chembl_transaction_file(manifest_source, paths["live_manifest"])
+                if not chembl_transaction_new_pair_ready(paths, payload):
+                    raise OSError("forward-completed ChEMBL pair failed validation")
+                cleanup_error = cleanup_chembl_query_transaction(transaction, paths)
+                if cleanup_error:
+                    raise OSError(f"transaction cleanup failed:{cleanup_error}")
+                try:
+                    database.chmod(0o444)
+                except OSError:
+                    pass
+                return {"status": "ready", "reason": "chembl_query_transaction_first_install_completed"}
+    except OSError as err:
+        return {
+            "status": "needs_repair",
+            "reason": f"chembl_query_transaction_reconcile_failed:{exception_note(err)}",
+            "transaction": str(transaction),
+        }
+    return {
+        "status": "needs_repair",
+        "reason": "chembl_query_transaction_state_ambiguous",
+        "transaction": str(transaction),
+    }
+
+
 def chembl_query_database_ready(
     database: Path,
     manifest: Path,
     source_digest: str,
     source_release: str,
+    summary_cache: ResourceSummaryCache | None = None,
+    *,
+    observed_database_identity: tuple[int, str] | None = None,
 ) -> bool:
     payload = read_json_object(manifest)
     if (
-        payload.get("status") != "ready"
+        payload.get("schema_version") != "genoligand_chembl_query_database_v1"
+        or payload.get("status") != "ready"
         or payload.get("source_digest") != source_digest
         or payload.get("source_release") != source_release
         or payload.get("table") != "genoligand_onsite_activity"
+        or type(payload.get("rows")) is not int
+        or payload.get("rows") <= 0
+        or type(payload.get("database_bytes")) is not int
+        or payload.get("database_bytes") <= 0
+        or not isinstance(payload.get("database_sha256"), str)
+        or not re.fullmatch(r"[0-9a-f]{64}", str(payload.get("database_sha256")))
         or not database.is_file()
-        or database.stat().st_size <= 0
     ):
         return False
     try:
+        if observed_database_identity is None:
+            database_summary = resource_payload_summary(database, cache=summary_cache)
+            observed_database_identity = (
+                int(database_summary.get("bytes", 0) or 0),
+                str(database_summary.get("content_sha256", "")),
+            )
+        if observed_database_identity != (
+            payload.get("database_bytes"),
+            payload.get("database_sha256"),
+        ):
+            return False
         uri = f"file:{database.as_posix()}?mode=ro"
         with closing(sqlite3.connect(uri, uri=True)) as connection:
             columns = {
@@ -3820,6 +4485,7 @@ def chembl_query_database_ready(
             required = {
                 "canonical_isomeric_smiles",
                 "target_id",
+                "source_target_id",
                 "target_name",
                 "organism",
                 "compound_name",
@@ -3837,8 +4503,15 @@ def chembl_query_database_ready(
             row = connection.execute(
                 "SELECT canonical_isomeric_smiles, target_id FROM genoligand_onsite_activity LIMIT 1"
             ).fetchone()
-            return required.issubset(columns) and "idx_genoligand_onsite_activity_smiles" in indexes and row is not None
-    except sqlite3.Error:
+            rows = int(connection.execute("SELECT COUNT(*) FROM genoligand_onsite_activity").fetchone()[0])
+            return (
+                required.issubset(columns)
+                and "idx_genoligand_onsite_activity_smiles" in indexes
+                and "idx_genoligand_onsite_activity_target" not in indexes
+                and row is not None
+                and rows == payload.get("rows")
+            )
+    except (OSError, sqlite3.Error):
         return False
 
 
@@ -3846,17 +4519,39 @@ def publish_chembl_query_database(
     science_store: Path,
     source_catalog: Path,
     summary_cache: ResourceSummaryCache | None = None,
+    *,
+    scratch_dir: Path | None = None,
 ) -> dict[str, object]:
     archive_path = science_store / "downloads/chembl/chembl_sqlite.tar.gz"
     database = science_store / "downloads/chembl/chembl_query.sqlite"
     manifest = database.with_suffix(".manifest.json")
+    transaction = chembl_query_transaction_path(database)
+    scratch_root = Path(scratch_dir) if scratch_dir is not None else science_store / "work/installer-scratch"
     catalog_row = next((row for row in read_tsv(source_catalog) if row.get("source_id") == "chembl"), {})
     source_release = catalog_row.get("release_identity") or catalog_row.get("release_or_date") or "unknown"
+    recovery = reconcile_chembl_query_transaction(database, manifest, scratch_root)
+    if recovery.get("status") == "needs_repair":
+        return {
+            "status": "needs_repair",
+            "reason": str(recovery.get("reason", "chembl_query_transaction_reconcile_failed")),
+            "database": str(database),
+            "transaction": str(transaction),
+        }
+    if (
+        database.exists() != manifest.exists()
+        or (database.exists() and not database.is_file())
+        or (manifest.exists() and not manifest.is_file())
+    ):
+        return {
+            "status": "needs_repair",
+            "reason": "chembl_query_live_pair_ambiguous",
+            "database": str(database),
+        }
     if not archive_path.is_file() or archive_path.stat().st_size <= 0:
         return {"status": "needs_repair", "reason": "chembl_archive_missing", "database": str(database)}
     source_summary = resource_payload_summary(archive_path, cache=summary_cache)
     source_digest = str(source_summary.get("sha256", ""))
-    if chembl_query_database_ready(database, manifest, source_digest, source_release):
+    if chembl_query_database_ready(database, manifest, source_digest, source_release, summary_cache):
         return {
             "status": "ready",
             "reason": "chembl_query_database_reused",
@@ -3866,9 +4561,31 @@ def publish_chembl_query_database(
             "source_digest": source_digest,
             "manifest": str(manifest),
         }
-    staging = database.parent / f".chembl-query.rebuild-{os.getpid()}-{time.time_ns()}"
-    staging_database = staging / "chembl_query.sqlite"
-    extracted_database = staging / "chembl_source.sqlite"
+    token = f"{os.getpid()}-{time.time_ns()}"
+    scratch_staging = scratch_root / f"chembl-query-rebuild-{token}"
+    extracted_database = scratch_staging / "chembl_source.sqlite"
+    staging_database = database.with_name(f".{database.name}.rebuild-{token}")
+    staging_manifest = manifest.with_name(f".{manifest.name}.rebuild-{token}")
+    backup_database = database.with_name(f".{database.name}.backup-{token}")
+    backup_manifest = manifest.with_name(f".{manifest.name}.backup-{token}")
+    attempt_manifest = manifest.with_name(f"{manifest.name}.attempt.json")
+    disk_guard_reason = ""
+
+    def remove_staged_file(path: Path) -> None:
+        remove_chembl_transaction_file(path)
+
+    def target_disk_guard() -> int:
+        nonlocal disk_guard_reason
+        try:
+            free = int(shutil.disk_usage(existing_path_for_disk_usage(database.parent)).free)
+        except OSError as err:
+            disk_guard_reason = f"chembl_target_disk_probe_failed:{exception_note(err)}"
+            return 1
+        if free <= DISK_SAFETY_MARGIN_BYTES:
+            disk_guard_reason = f"chembl_target_disk_safety_margin_reached:free={free}"
+            return 1
+        return 0
+
     try:
         with tarfile.open(archive_path, "r:gz") as archive:
             candidates = [
@@ -3878,100 +4595,247 @@ def publish_chembl_query_database(
             ]
             if len(candidates) != 1:
                 return {"status": "needs_repair", "reason": "chembl_sqlite_member_ambiguous", "database": str(database)}
-            required = candidates[0].size * 2 + DISK_SAFETY_MARGIN_BYTES
-            if required > shutil.disk_usage(existing_path_for_disk_usage(database)).free:
+            source_bytes = int(candidates[0].size)
+            target_staging_bytes = chembl_query_target_staging_bytes(source_bytes, archive_path.stat().st_size)
+            scratch_available = int(shutil.disk_usage(existing_path_for_disk_usage(scratch_root)).free)
+            target_available = int(shutil.disk_usage(existing_path_for_disk_usage(database.parent)).free)
+            scratch_required = source_bytes + DISK_SAFETY_MARGIN_BYTES
+            target_required = target_staging_bytes + DISK_SAFETY_MARGIN_BYTES
+            shared_volume = same_storage_volume(scratch_root, database.parent)
+            combined_required = source_bytes + target_staging_bytes + DISK_SAFETY_MARGIN_BYTES
+            if shared_volume and combined_required > target_available:
                 return {
                     "status": "needs_repair",
-                    "reason": "chembl_query_database_insufficient_disk",
-                    "required_peak_bytes": required,
-                    "available_bytes": shutil.disk_usage(existing_path_for_disk_usage(database)).free,
+                    "reason": "chembl_query_database_insufficient_shared_volume_disk",
+                    "required_peak_bytes": combined_required,
+                    "available_bytes": target_available,
+                    "scratch_required_peak_bytes": scratch_required,
+                    "scratch_available_bytes": scratch_available,
+                    "target_required_peak_bytes": target_required,
+                    "target_available_bytes": target_available,
                     "database": str(database),
                 }
-            staging.mkdir(parents=True, exist_ok=False)
+            if not shared_volume and scratch_required > scratch_available:
+                return {
+                    "status": "needs_repair",
+                    "reason": "chembl_query_database_insufficient_scratch_disk",
+                    "required_peak_bytes": scratch_required,
+                    "available_bytes": scratch_available,
+                    "scratch_required_peak_bytes": scratch_required,
+                    "scratch_available_bytes": scratch_available,
+                    "target_required_peak_bytes": target_required,
+                    "target_available_bytes": target_available,
+                    "database": str(database),
+                }
+            if not shared_volume and target_required > target_available:
+                return {
+                    "status": "needs_repair",
+                    "reason": "chembl_query_database_insufficient_target_disk",
+                    "required_peak_bytes": target_required,
+                    "available_bytes": target_available,
+                    "scratch_required_peak_bytes": scratch_required,
+                    "scratch_available_bytes": scratch_available,
+                    "target_required_peak_bytes": target_required,
+                    "target_available_bytes": target_available,
+                    "database": str(database),
+                }
+            scratch_staging.mkdir(parents=True, exist_ok=False)
             source_handle = archive.extractfile(candidates[0])
             if source_handle is None:
                 raise OSError("chembl sqlite archive member cannot be read")
             with source_handle, extracted_database.open("wb") as target_handle:
                 shutil.copyfileobj(source_handle, target_handle, 1024 * 1024)
-        shutil.copy2(extracted_database, staging_database)
-        with closing(sqlite3.connect(staging_database)) as connection:
+        target_uri = staging_database.resolve().as_uri() + "?mode=rwc"
+        source_uri = extracted_database.resolve().as_uri() + "?mode=ro&immutable=1"
+        with closing(sqlite3.connect(target_uri, uri=True)) as connection:
             connection.execute("PRAGMA journal_mode=OFF")
             connection.execute("PRAGMA synchronous=OFF")
             connection.execute("PRAGMA temp_store=FILE")
-            connection.execute("DROP TABLE IF EXISTS genoligand_onsite_activity")
+            connection.set_progress_handler(target_disk_guard, 250_000)
+            connection.execute("ATTACH DATABASE ? AS chembl_source", (source_uri,))
             connection.execute(
                 """
                 CREATE TABLE genoligand_onsite_activity AS
                 SELECT
                     cs.canonical_smiles AS canonical_isomeric_smiles,
-                    td.chembl_id AS target_id,
+                    COALESCE(target_accession.canonical_accession, td.chembl_id) AS target_id,
+                    td.chembl_id AS source_target_id,
                     td.pref_name AS target_name,
                     td.organism AS organism,
                     md.pref_name AS compound_name,
                     act.standard_type AS standard_type,
                     act.standard_relation AS standard_relation,
                     act.standard_value AS standard_value,
-                    act.standard_units AS standard_units,
-                    ? AS source_release,
-                    ? AS source_digest
-                FROM activities AS act
-                JOIN assays AS assay ON assay.assay_id = act.assay_id
-                JOIN target_dictionary AS td ON td.tid = assay.tid
-                JOIN molecule_dictionary AS md ON md.molregno = act.molregno
-                JOIN compound_structures AS cs ON cs.molregno = act.molregno
+                    COALESCE(act.standard_units, '') AS standard_units
+                FROM chembl_source.activities AS act
+                JOIN chembl_source.assays AS assay ON assay.assay_id = act.assay_id
+                JOIN chembl_source.target_dictionary AS td ON td.tid = assay.tid
+                JOIN chembl_source.molecule_dictionary AS md ON md.molregno = act.molregno
+                JOIN chembl_source.compound_structures AS cs ON cs.molregno = act.molregno
+                LEFT JOIN (
+                    SELECT
+                        tc.tid,
+                        CASE
+                            WHEN COUNT(DISTINCT TRIM(cseq.accession)) = 1
+                            THEN MIN(TRIM(cseq.accession))
+                            ELSE NULL
+                        END AS canonical_accession
+                    FROM chembl_source.target_components AS tc
+                    JOIN chembl_source.component_sequences AS cseq
+                      ON cseq.component_id = tc.component_id
+                    WHERE cseq.accession IS NOT NULL
+                      AND TRIM(cseq.accession) <> ''
+                    GROUP BY tc.tid
+                ) AS target_accession ON target_accession.tid = td.tid
                 WHERE cs.canonical_smiles IS NOT NULL
                   AND TRIM(cs.canonical_smiles) <> ''
                   AND td.chembl_id IS NOT NULL
+                  AND act.standard_type IN ('Ki', 'Kd', 'IC50', 'EC50')
+                  AND act.standard_value IS NOT NULL
+                  AND (act.standard_units IS NULL OR act.standard_units = '' OR act.standard_units = 'nM')
                 """,
-                (source_release, source_digest),
+            )
+            if target_disk_guard():
+                raise OSError(disk_guard_reason)
+            quoted_release = str(connection.execute("SELECT quote(?)", (source_release,)).fetchone()[0])
+            quoted_digest = str(connection.execute("SELECT quote(?)", (source_digest,)).fetchone()[0])
+            connection.execute(
+                "ALTER TABLE genoligand_onsite_activity "
+                f"ADD COLUMN source_release TEXT NOT NULL DEFAULT {quoted_release}"
+            )
+            connection.execute(
+                "ALTER TABLE genoligand_onsite_activity "
+                f"ADD COLUMN source_digest TEXT NOT NULL DEFAULT {quoted_digest}"
             )
             connection.execute(
                 "CREATE INDEX idx_genoligand_onsite_activity_smiles "
                 "ON genoligand_onsite_activity(canonical_isomeric_smiles)"
             )
-            connection.execute(
-                "CREATE INDEX idx_genoligand_onsite_activity_target "
-                "ON genoligand_onsite_activity(target_id)"
-            )
+            if target_disk_guard():
+                raise OSError(disk_guard_reason)
             connection.commit()
+            rows = int(connection.execute("SELECT COUNT(*) FROM genoligand_onsite_activity").fetchone()[0])
+            if rows <= 0:
+                raise sqlite3.DatabaseError("chembl query database contains no runtime activity rows")
             if connection.execute("PRAGMA quick_check").fetchone() != ("ok",):
                 raise sqlite3.DatabaseError("chembl query database quick_check failed")
+        payload = {
+            "schema_version": "genoligand_chembl_query_database_v1",
+            "status": "ready",
+            "database": str(database),
+            "database_bytes": staging_database.stat().st_size,
+            "database_sha256": sha256_file(staging_database),
+            "rows": rows,
+            "table": "genoligand_onsite_activity",
+            "canonical_query_column": "canonical_isomeric_smiles",
+            "source_target_column": "source_target_id",
+            "indexes": [
+                "idx_genoligand_onsite_activity_smiles",
+            ],
+            "source_release": source_release,
+            "source_digest": source_digest,
+            "source_database_bytes": source_bytes,
+            "target_staging_budget_bytes": target_staging_bytes,
+            "activity_types": ["Ki", "Kd", "IC50", "EC50"],
+            "activity_units": ["", "nM"],
+        }
+        write_json_atomic(staging_manifest, payload)
+        expected_database = chembl_file_identity(staging_database)
+        expected_manifest = chembl_file_identity(staging_manifest)
+        previous_database = chembl_file_identity(database)
+        previous_manifest = chembl_file_identity(manifest)
+        if expected_database is None or expected_manifest is None:
+            raise OSError("ChEMBL staging pair identity unavailable")
+        if (previous_database is None) != (previous_manifest is None):
+            raise OSError("ChEMBL live pair became ambiguous before publish")
+        transaction_payload: dict[str, object] = {
+            "schema_version": CHEMBL_QUERY_TRANSACTION_SCHEMA_VERSION,
+            "status": "publishing",
+            "token": token,
+            "created_at": int(time.time()),
+            "live_database": str(database.resolve()),
+            "live_manifest": str(manifest.resolve()),
+            "staging_database": str(staging_database.resolve()),
+            "staging_manifest": str(staging_manifest.resolve()),
+            "backup_database": str(backup_database.resolve()),
+            "backup_manifest": str(backup_manifest.resolve()),
+            "scratch_staging": str(scratch_staging.resolve()),
+            "expected_database_bytes": expected_database[0],
+            "expected_database_sha256": expected_database[1],
+            "expected_manifest_bytes": expected_manifest[0],
+            "expected_manifest_sha256": expected_manifest[1],
+            "had_live_database": previous_database is not None,
+            "had_live_manifest": previous_manifest is not None,
+            "previous_database_bytes": previous_database[0] if previous_database else 0,
+            "previous_database_sha256": previous_database[1] if previous_database else "",
+            "previous_manifest_bytes": previous_manifest[0] if previous_manifest else 0,
+            "previous_manifest_sha256": previous_manifest[1] if previous_manifest else "",
+            "source_release": source_release,
+            "source_digest": source_digest,
+        }
+        write_json_atomic(transaction, transaction_payload)
         if database.exists():
             try:
                 database.chmod(0o666)
             except OSError:
                 pass
+            os.replace(database, backup_database)
+        if manifest.exists():
+            os.replace(manifest, backup_manifest)
         os.replace(staging_database, database)
+        os.replace(staging_manifest, manifest)
+        transaction_paths = chembl_transaction_paths(database, manifest, transaction_payload, scratch_root)
+        if transaction_paths is None or not chembl_transaction_new_pair_ready(
+            transaction_paths,
+            transaction_payload,
+        ):
+            raise OSError("published ChEMBL pair failed transaction validation")
+        cleanup_error = cleanup_chembl_query_transaction(transaction, transaction_paths)
+        if cleanup_error:
+            raise OSError(f"ChEMBL transaction cleanup failed:{cleanup_error}")
         try:
             database.chmod(0o444)
         except OSError:
             pass
-        payload = {
-            "schema_version": "genoligand_chembl_query_database_v1",
-            "status": "ready",
-            "database": str(database),
-            "database_bytes": database.stat().st_size,
-            "database_sha256": sha256_file(database),
-            "table": "genoligand_onsite_activity",
-            "canonical_query_column": "canonical_isomeric_smiles",
-            "index": "idx_genoligand_onsite_activity_smiles",
-            "source_release": source_release,
-            "source_digest": source_digest,
-        }
-        write_json_atomic(manifest, payload)
+        try:
+            remove_staged_file(attempt_manifest)
+        except OSError:
+            pass
+        seed_resource_file_fingerprint(summary_cache, database, str(payload["database_sha256"]))
         return {**payload, "manifest": str(manifest), "reason": "chembl_query_database_published"}
     except (OSError, sqlite3.Error, tarfile.TarError) as err:
-        write_json_atomic(
-            manifest.with_name(f"{manifest.name}.attempt.json"),
-            {"status": "failed", "reason": exception_note(err), "source_digest": source_digest},
-        )
+        recovery = reconcile_chembl_query_transaction(database, manifest, scratch_root)
+        try:
+            write_json_atomic(
+                attempt_manifest,
+                {
+                    "status": "failed",
+                    "reason": disk_guard_reason or exception_note(err),
+                    "source_digest": source_digest,
+                },
+            )
+        except OSError:
+            pass
         return {
             "status": "needs_repair",
-            "reason": f"chembl_query_database_publish_failed:{exception_note(err)}",
+            "reason": f"chembl_query_database_publish_failed:{disk_guard_reason or exception_note(err)}",
             "database": str(database),
+            "transaction_recovery": recovery.get("status"),
         }
     finally:
-        shutil.rmtree(staging, ignore_errors=True)
+        if not transaction.exists():
+            for staged in (
+                staging_database,
+                Path(f"{staging_database}-journal"),
+                Path(f"{staging_database}-wal"),
+                Path(f"{staging_database}-shm"),
+                staging_manifest,
+            ):
+                try:
+                    remove_staged_file(staged)
+                except OSError:
+                    pass
+        shutil.rmtree(scratch_staging, ignore_errors=True)
 
 
 def prepare_downloads(
@@ -4375,12 +5239,25 @@ def sync_html_links(
     target: Path,
     progress: ProgressCallback | None = None,
     summary_cache: ResourceSummaryCache | None = None,
+    science_store: Path | None = None,
 ) -> dict[str, object]:
     source_url = row.get("source_url") or row.get("download_url") or row.get("landing_url")
     include_pattern = row.get("include_pattern", "")
     if not source_url:
         return {"status": "requires_resource_bundle", "bytes": 0, "sha256": "", "notes": "html_source_url_required"}
-    inventory = html_links_inventory(row) if row.get("checksum_url", "").strip() else []
+    inventory_result = (
+        publisher_inventory_with_cache(row, science_store, html_links_inventory)
+        if row.get("checksum_url", "").strip()
+        else {"items": [], "source": "not_required", "attempts": 0, "error": ""}
+    )
+    inventory = inventory_result["items"]
+    if row.get("checksum_url", "").strip() and not inventory:
+        return {
+            "status": "failed",
+            "bytes": directory_size(target),
+            "sha256": directory_digest(target, summary_cache),
+            "notes": f"publisher_inventory_unavailable:{inventory_result.get('error', '')}"[:1000],
+        }
     if inventory:
         if inventory and all(publisher_object_matches(target, item) for item in inventory):
             return {
@@ -4431,7 +5308,7 @@ def sync_html_links(
         "status": "ready" if path_has_payload(target) else "failed",
         "bytes": directory_size(target),
         "sha256": directory_digest(target, summary_cache),
-        "notes": f"html_links_synced:{len(links)}",
+        "notes": f"html_links_synced:{len(links)}:inventory={inventory_result.get('source', 'not_required')}",
     }
 
 
@@ -4664,8 +5541,7 @@ def html_links_inventory(row: dict[str, str]) -> list[dict[str, object]]:
     items: list[dict[str, object]] = []
     for link in links:
         name = Path(urllib.parse.urlparse(link).path).name
-        identity = remote_resource_identity(link)
-        size = int(identity.get("content_length", 0) or 0)
+        size = remote_resource_size(link)
         algorithm = "md5" if name in checksums else ""
         digest = checksums.get(name, "")
         if checksum_payload and name == checksum_name:
@@ -4685,6 +5561,192 @@ def html_links_inventory(row: dict[str, str]) -> list[dict[str, object]]:
             }
         )
     return sorted(items, key=lambda item: str(item["relative_path"]))
+
+
+def normalized_publisher_inventory(
+    row: dict[str, str],
+    items: list[dict[str, object]],
+) -> list[dict[str, object]]:
+    normalized: list[dict[str, object]] = []
+    for item in items:
+        relative = safe_inventory_relative_path(str(item.get("relative_path", "")))
+        try:
+            size = int(item.get("size", 0) or 0)
+        except (TypeError, ValueError) as err:
+            raise ValueError("publisher_inventory_size_invalid") from err
+        algorithm = str(item.get("digest_algorithm", "")).lower()
+        digest = str(item.get("digest", "")).lower()
+        media_url = str(item.get("media_url", ""))
+        digest_length = 32 if algorithm == "md5" else 64 if algorithm == "sha256" else 0
+        if (
+            relative is None
+            or size <= 0
+            or digest_length == 0
+            or not re.fullmatch(rf"[0-9a-f]{{{digest_length}}}", digest)
+            or urllib.parse.urlparse(media_url).scheme != "https"
+        ):
+            raise ValueError("publisher_inventory_identity_incomplete")
+        normalized.append(
+            {
+                "relative_path": relative.as_posix(),
+                "size": size,
+                "digest_algorithm": algorithm,
+                "digest": digest,
+                "media_url": media_url,
+            }
+        )
+    if not normalized:
+        raise ValueError("publisher_inventory_empty")
+    if row.get("source_id", "").strip() == "metagenome_potential":
+        required = {"LICENSE", "README.txt", "md5sum.txt", "mgy_clusters.fa.gz"}
+        if {str(item["relative_path"]) for item in normalized} != required:
+            raise ValueError("publisher_inventory_mgnify_release_incomplete")
+    return sorted(normalized, key=lambda item: str(item["relative_path"]))
+
+
+def publisher_inventory_with_cache(
+    row: dict[str, str],
+    science_store: Path | None,
+    fetcher: Callable[[dict[str, str]], list[dict[str, object]]],
+) -> dict[str, object]:
+    errors: list[str] = []
+    source_url = str(row.get("source_url") or row.get("download_url") or row.get("landing_url") or "")
+    for attempt in range(1, PUBLISHER_INVENTORY_ATTEMPTS + 1):
+        try:
+            items = normalized_publisher_inventory(row, fetcher(row))
+            if science_store is not None:
+                cache_path = science_store / "manifests/publisher_inventory_cache.json"
+                cache = load_json(cache_path)
+                raw_entries = cache.get("entries", {})
+                entries = dict(raw_entries) if isinstance(raw_entries, dict) else {}
+                source_id = row.get("source_id", "").strip() or external_plan_digest(row)
+                entries[source_id] = {
+                    "plan_digest": external_plan_digest(row),
+                    "release_identity": row.get("release_or_date", ""),
+                    "trust_source": row.get("trust_source", ""),
+                    "source_url": source_url,
+                    "items": items,
+                    "updated_at": int(time.time()),
+                }
+                write_json_atomic(
+                    cache_path,
+                    {
+                        "schema_version": PUBLISHER_INVENTORY_CACHE_SCHEMA_VERSION,
+                        "entries": entries,
+                    },
+                )
+            return {
+                "items": items,
+                "source": "remote",
+                "attempts": attempt,
+                "error": "",
+                "source_url": source_url,
+            }
+        except (OSError, ValueError, UnicodeError, json.JSONDecodeError) as err:
+            errors.append(f"{type(err).__name__}:{err}")
+            if attempt < PUBLISHER_INVENTORY_ATTEMPTS:
+                time.sleep(attempt)
+
+    if science_store is not None:
+        cache = load_json(science_store / "manifests/publisher_inventory_cache.json")
+        raw_entries = cache.get("entries", {})
+        source_id = row.get("source_id", "").strip() or external_plan_digest(row)
+        entry = raw_entries.get(source_id, {}) if isinstance(raw_entries, dict) else {}
+        cached_items = entry.get("items", []) if isinstance(entry, dict) else []
+        if (
+            cache.get("schema_version") == PUBLISHER_INVENTORY_CACHE_SCHEMA_VERSION
+            and isinstance(entry, dict)
+            and entry.get("plan_digest") == external_plan_digest(row)
+            and entry.get("release_identity") == row.get("release_or_date", "")
+            and entry.get("trust_source") == row.get("trust_source", "")
+            and isinstance(cached_items, list)
+        ):
+            try:
+                items = normalized_publisher_inventory(row, cached_items)
+            except ValueError:
+                items = []
+            if items:
+                return {
+                    "items": items,
+                    "source": "cache",
+                    "attempts": PUBLISHER_INVENTORY_ATTEMPTS,
+                    "error": " | ".join(errors),
+                    "source_url": source_url,
+                }
+    return {
+        "items": [],
+        "source": "unavailable",
+        "attempts": PUBLISHER_INVENTORY_ATTEMPTS,
+        "error": " | ".join(errors),
+        "source_url": source_url,
+    }
+
+
+def normalized_publisher_capacity_inventory(
+    row: dict[str, str],
+    items: list[dict[str, object]],
+) -> list[dict[str, object]]:
+    source_url = str(row.get("source_url") or row.get("download_url") or row.get("landing_url") or "")
+    source_host = (urllib.parse.urlparse(source_url).hostname or "").lower()
+    normalized: list[dict[str, object]] = []
+    for item in items:
+        relative = safe_inventory_relative_path(str(item.get("relative_path", "")))
+        try:
+            size = int(item.get("size", 0) or 0)
+        except (TypeError, ValueError) as err:
+            raise ValueError("publisher_capacity_size_invalid") from err
+        media_url = str(item.get("media_url", ""))
+        parsed_media = urllib.parse.urlparse(media_url)
+        if (
+            relative is None
+            or size <= 0
+            or parsed_media.scheme != "https"
+            or not source_host
+            or (parsed_media.hostname or "").lower() != source_host
+        ):
+            raise ValueError("publisher_capacity_identity_incomplete")
+        normalized.append(
+            {
+                "relative_path": relative.as_posix(),
+                "size": size,
+                "digest_algorithm": str(item.get("digest_algorithm", "")).lower(),
+                "digest": str(item.get("digest", "")).lower(),
+                "media_url": media_url,
+            }
+        )
+    paths = [str(item["relative_path"]) for item in normalized]
+    required = UNCHECKSUMMED_PUBLISHER_REQUIRED_PATHS.get(row.get("source_id", "").strip())
+    if not normalized or len(paths) != len(set(paths)) or (required is not None and set(paths) != required):
+        raise ValueError("publisher_capacity_release_links_incomplete")
+    return sorted(normalized, key=lambda item: str(item["relative_path"]))
+
+
+def publisher_capacity_inventory_with_retry(
+    row: dict[str, str],
+    fetcher: Callable[[dict[str, str]], list[dict[str, object]]],
+) -> dict[str, object]:
+    errors: list[str] = []
+    source_url = str(row.get("source_url") or row.get("download_url") or row.get("landing_url") or "")
+    for attempt in range(1, PUBLISHER_INVENTORY_ATTEMPTS + 1):
+        try:
+            return {
+                "items": normalized_publisher_capacity_inventory(row, fetcher(row)),
+                "source": "remote_capacity",
+                "attempts": attempt,
+                "error": "",
+                "source_url": source_url,
+            }
+        except (OSError, ValueError, UnicodeError, json.JSONDecodeError) as err:
+            errors.append(f"{type(err).__name__}:{err}")
+            if attempt < PUBLISHER_INVENTORY_ATTEMPTS:
+                time.sleep(attempt)
+    return {
+        "items": [],
+        "source": "unavailable",
+        "attempts": PUBLISHER_INVENTORY_ATTEMPTS,
+        "error": " | ".join(errors),
+        "source_url": source_url,
+    }
 
 
 def sync_gcs_prefix(
@@ -4775,7 +5837,10 @@ def sync_rcsb_ligand_bound_scope(
     science_store: Path,
     progress: ProgressCallback | None = None,
     summary_cache: ResourceSummaryCache | None = None,
+    *,
+    rcsb_mode: str = "on-demand",
 ) -> dict[str, object]:
+    mode = normalize_rcsb_mode(rcsb_mode)
     pdb_ids = ligand_bound_pdb_scope(science_store)
     if not pdb_ids:
         return {
@@ -4785,6 +5850,47 @@ def sync_rcsb_ligand_bound_scope(
             "notes": "ligand_bound_pdb_scope_missing",
         }
     target.mkdir(parents=True, exist_ok=True)
+    if mode == "on-demand":
+        resumable_partials, obsolete_partials = rcsb_partial_download_inventory(target)
+        for partial in obsolete_partials:
+            quarantine_partial(partial)
+        snapshot = write_rcsb_scope_manifest(
+            science_store,
+            target,
+            pdb_ids,
+            summary_cache,
+            scope_mode=mode,
+        )
+        snapshot["resumable_partial_count"] = len(resumable_partials)
+        snapshot["obsolete_partial_count_removed"] = len(obsolete_partials)
+        write_json_atomic(
+            science_store / "downloads/rcsb/ligand_bound_pdb_scope.json",
+            snapshot,
+        )
+        policy = write_rcsb_on_demand_policy(science_store, snapshot)
+        if progress:
+            progress(
+                "completed",
+                int(snapshot["ready_count"]),
+                int(snapshot["scope_count"]),
+                "RCSB 已切换为命中时补全，保留当前有效坐标缓存",
+            )
+        status = "ready" if int(snapshot["ready_count"]) > 0 else "requires_resource_bundle"
+        return {
+            "status": status,
+            "bytes": snapshot["coordinate_bytes"],
+            "sha256": snapshot["coordinate_digest"],
+            "notes": (
+                "partial_on_demand:"
+                f"ready={snapshot['ready_count']};total={snapshot['scope_count']};"
+                f"missing={snapshot['missing_count']}"
+                if status == "ready"
+                else "on_demand_coordinate_cache_empty"
+            ),
+            "policy": str(policy),
+            **snapshot,
+        }
+    (science_store / "downloads/rcsb/on_demand_policy.json").unlink(missing_ok=True)
     template = row.get("source_url") or "https://files.rcsb.org/download/{pdb_id}.cif.gz"
     downloaded = 0
     failures: list[str] = []
@@ -4814,25 +5920,44 @@ def sync_rcsb_ligand_bound_scope(
 
     last_progress = 0.0
     completed = 0
-    with concurrent.futures.ThreadPoolExecutor(max_workers=min(workers, total)) as pool:
-        futures = [pool.submit(sync_one, pdb_id) for pdb_id in sorted_ids]
-        for future in concurrent.futures.as_completed(futures):
-            upper, ok, note = future.result()
-            completed += 1
-            if ok:
-                downloaded += 1
-            else:
-                failures.append(f"{upper}:{note}")
-            now = time.time()
-            if progress and (completed == 1 or completed % 25 == 0 or now - last_progress >= 30):
-                progress(
-                    "downloading",
-                    completed,
-                    total,
-                    f"正在同步 RCSB 结构 {completed}/{total}，并行任务 {min(workers, total)}",
-                )
-                last_progress = now
-    snapshot = write_rcsb_scope_manifest(science_store, target, pdb_ids, summary_cache)
+    pool_workers = min(workers, total)
+    pdb_id_iter = iter(sorted_ids)
+    with concurrent.futures.ThreadPoolExecutor(max_workers=pool_workers) as pool:
+        pending: set[concurrent.futures.Future[tuple[str, bool, str]]] = set()
+        for _ in range(min(total, pool_workers * 2)):
+            pending.add(pool.submit(sync_one, next(pdb_id_iter)))
+        while pending:
+            done, pending = concurrent.futures.wait(
+                pending,
+                return_when=concurrent.futures.FIRST_COMPLETED,
+            )
+            for future in done:
+                upper, ok, note = future.result()
+                completed += 1
+                if ok:
+                    downloaded += 1
+                else:
+                    failures.append(f"{upper}:{note}")
+                now = time.time()
+                if progress and (completed == 1 or completed % 25 == 0 or now - last_progress >= 30):
+                    progress(
+                        "downloading",
+                        completed,
+                        total,
+                        f"正在同步 RCSB 结构 {completed}/{total}，并行任务 {pool_workers}",
+                    )
+                    last_progress = now
+                try:
+                    pending.add(pool.submit(sync_one, next(pdb_id_iter)))
+                except StopIteration:
+                    pass
+    snapshot = write_rcsb_scope_manifest(
+        science_store,
+        target,
+        pdb_ids,
+        summary_cache,
+        scope_mode=mode,
+    )
     if failures or snapshot["missing_count"]:
         return {
             "status": "failed",
@@ -4850,21 +5975,78 @@ def sync_rcsb_ligand_bound_scope(
     }
 
 
+def rcsb_partial_download_inventory(target: Path) -> tuple[list[Path], list[Path]]:
+    resumable: list[Path] = []
+    obsolete: list[Path] = []
+    if not target.is_dir():
+        return resumable, obsolete
+    for partial in sorted(target.rglob("*.part")):
+        if partial.is_file() and partial_has_resumable_identity(partial):
+            resumable.append(partial)
+        elif partial.is_file():
+            obsolete.append(partial)
+    return resumable, obsolete
+
+
 def rcsb_coordinate_validation(path: Path, expected_pdb_id: str = "") -> dict[str, object]:
     try:
-        if path.name.lower().endswith(".part") or not path.is_file() or path.stat().st_size <= 0:
+        if not path.is_file() or path.stat().st_size <= 0:
             return {"status": "failed", "reason": "coordinate_missing_or_partial"}
-        opener = gzip.open if path.name.lower().endswith(".gz") else open
+        lowered_name = path.name.lower()
+        opener = gzip.open if lowered_name.endswith((".gz", ".gz.part")) else open
+        observed = ""
+        entry_id = ""
+        pending_entry_id = False
+        has_atom_site = False
+        has_x = False
+        has_y = False
+        has_z = False
+        has_atoms = False
+        uncompressed_bytes = 0
         with opener(path, "rt", encoding="utf-8", errors="strict") as handle:
-            prefix = handle.read(4096)
-        match = re.search(r"(?im)^data_([a-z0-9]{4})\s*$", prefix)
-        if not match:
+            for line in handle:
+                uncompressed_bytes += len(line.encode("utf-8"))
+                if uncompressed_bytes > 2 * 1024 * 1024 * 1024:
+                    return {"status": "failed", "reason": "mmcif_uncompressed_size_limit_exceeded"}
+                stripped = line.strip()
+                lowered = stripped.lower()
+                if not observed:
+                    match = re.fullmatch(r"data_([a-z0-9]{4})", lowered)
+                    if match:
+                        observed = match.group(1).upper()
+                if pending_entry_id and stripped and not stripped.startswith("#"):
+                    entry_id = stripped.strip("'\"").upper()
+                    pending_entry_id = False
+                if lowered == "_entry.id":
+                    pending_entry_id = True
+                elif lowered.startswith("_entry.id "):
+                    entry_id = stripped.split(None, 1)[1].strip("'\"").upper()
+                if lowered.startswith("_atom_site."):
+                    has_atom_site = True
+                if lowered == "_atom_site.cartn_x":
+                    has_x = True
+                elif lowered == "_atom_site.cartn_y":
+                    has_y = True
+                elif lowered == "_atom_site.cartn_z":
+                    has_z = True
+                if stripped.startswith(("ATOM ", "HETATM ")):
+                    has_atoms = True
+                if observed and has_atom_site and has_x and has_y and has_z and has_atoms:
+                    break
+        if not observed:
             return {"status": "failed", "reason": "mmcif_data_block_missing"}
-        observed = match.group(1).upper()
         if expected_pdb_id and observed != expected_pdb_id.upper():
             return {"status": "failed", "reason": f"mmcif_id_mismatch:{observed}"}
-        return {"status": "ready", "reason": "mmcif_parse_passed", "pdb_id": observed}
-    except (OSError, UnicodeError, gzip.BadGzipFile) as err:
+        if expected_pdb_id and entry_id and entry_id != expected_pdb_id.upper():
+            return {"status": "failed", "reason": f"mmcif_id_mismatch:{entry_id}"}
+        if not (has_atom_site and has_x and has_y and has_z and has_atoms):
+            return {"status": "failed", "reason": "atom_site_coordinates_missing"}
+        return {
+            "status": "ready",
+            "reason": "mmcif_entry_and_atom_site_parse_passed",
+            "pdb_id": observed,
+        }
+    except (EOFError, OSError, UnicodeError, gzip.BadGzipFile) as err:
         return {"status": "failed", "reason": f"mmcif_parse_failed:{type(err).__name__}"}
 
 
@@ -4877,7 +6059,10 @@ def write_rcsb_scope_manifest(
     target: Path,
     pdb_ids: set[str],
     summary_cache: ResourceSummaryCache | None = None,
+    *,
+    scope_mode: str = "on-demand",
 ) -> dict[str, object]:
+    mode = normalize_rcsb_mode(scope_mode)
     rows: list[dict[str, str]] = []
     digest = hashlib.sha256()
     coordinate_bytes = 0
@@ -4908,7 +6093,7 @@ def write_rcsb_scope_manifest(
                 "sha256": sha256,
             }
         )
-    scope_digest = hashlib.sha256("\n".join(sorted(pdb_ids)).encode("ascii")).hexdigest()
+    scope_digest = rcsb_scope_digest(pdb_ids)
     coordinate_digest = digest.hexdigest() if ready_count else ""
     manifest = science_store / "downloads/rcsb/ligand_bound_pdb_scope.tsv"
     write_simple_tsv(
@@ -4918,6 +6103,15 @@ def write_rcsb_scope_manifest(
     )
     snapshot = {
         "schema_version": "genoligand_rcsb_scope_snapshot_v1",
+        "scope_mode": "on_demand" if mode == "on-demand" else "complete",
+        "coverage": (
+            "complete"
+            if ready_count == len(rows)
+            else "partial_on_demand"
+            if mode == "on-demand"
+            else "incomplete_complete"
+        ),
+        "refresh_needed": False,
         "scope_count": len(rows),
         "ready_count": ready_count,
         "missing_count": len(rows) - ready_count,
@@ -4929,6 +6123,65 @@ def write_rcsb_scope_manifest(
     }
     write_json_atomic(manifest.with_suffix(".json"), snapshot)
     return snapshot
+
+
+def rcsb_scope_digest(pdb_ids: set[str]) -> str:
+    return hashlib.sha256("\n".join(sorted(pdb_ids)).encode("ascii")).hexdigest()
+
+
+def rcsb_scope_snapshot_matches_current_sources(
+    science_store: Path,
+    snapshot: dict[str, object],
+) -> bool:
+    current_scope = ligand_bound_pdb_scope(science_store)
+    manifest_rows = read_tsv(science_store / "downloads/rcsb/ligand_bound_pdb_scope.tsv")
+    manifest_scope = {
+        row.get("pdb_id", "").upper()
+        for row in manifest_rows
+        if row.get("pdb_id", "")
+    }
+    try:
+        snapshot_count = int(snapshot.get("scope_count", 0) or 0)
+    except (TypeError, ValueError):
+        return False
+    return bool(
+        current_scope
+        and snapshot.get("schema_version") == "genoligand_rcsb_scope_snapshot_v1"
+        and snapshot_count == len(current_scope)
+        and len(manifest_rows) == snapshot_count
+        and manifest_scope == current_scope
+        and snapshot.get("scope_digest") == rcsb_scope_digest(current_scope)
+    )
+
+
+def normalize_rcsb_mode(value: str) -> str:
+    normalized = str(value).strip().lower().replace("_", "-")
+    if normalized not in {"on-demand", "complete"}:
+        raise ValueError(f"unsupported_rcsb_mode:{value}")
+    return normalized
+
+
+def write_rcsb_on_demand_policy(
+    science_store: Path,
+    snapshot: dict[str, object],
+) -> Path:
+    policy = science_store / "downloads/rcsb/on_demand_policy.json"
+    write_json_atomic(
+        policy,
+        {
+            "schema_version": "genoligand_rcsb_on_demand_policy_v1",
+            "status": "ready",
+            "mode": "on_demand",
+            "official_base_url": "https://files.rcsb.org/download",
+            "coordinate_template": "https://files.rcsb.org/download/{pdb_id}.cif.gz",
+            "cache_root": "downloads/rcsb/mmcif",
+            "max_fetches_per_run": 12,
+            "validation": "gzip_mmcif_entry_and_atom_site",
+            "cached_ready_count": int(snapshot.get("ready_count", 0) or 0),
+            "scope_count": int(snapshot.get("scope_count", 0) or 0),
+        },
+    )
+    return policy
 
 
 def ligand_bound_pdb_scope(science_store: Path) -> set[str]:
@@ -5027,17 +6280,24 @@ def sync_external_row(
     env: dict[str, str] | None,
     progress: ProgressCallback | None = None,
     summary_cache: ResourceSummaryCache | None = None,
+    *,
+    rcsb_mode: str = "on-demand",
 ) -> dict[str, object]:
     method = (row.get("sync_method") or "direct").strip().lower()
     if method == "html_links":
-        return sync_html_links(row, target, progress, summary_cache)
+        return sync_html_links(row, target, progress, summary_cache, science_store)
     if method == "html_tree":
         return sync_html_tree(row, target, summary_cache)
     if method == "gcs_prefix":
         return sync_gcs_prefix(row, target, progress, summary_cache)
     if method == "rcsb_ligand_bound_scope":
         return sync_rcsb_ligand_bound_scope(
-            row, target, science_store, progress, summary_cache
+            row,
+            target,
+            science_store,
+            progress,
+            summary_cache,
+            rcsb_mode=rcsb_mode,
         )
     if method == "rsync":
         return sync_rsync(row, target, env)
@@ -5132,6 +6392,8 @@ def external_plan_row_ready(
     science_store: Path,
     execution: dict[str, str],
     summary_cache: ResourceSummaryCache | None = None,
+    *,
+    rcsb_mode: str = "on-demand",
 ) -> bool:
     if execution.get("status") != "ready" or execution.get("target_rel_path", "") != row.get("target_rel_path", ""):
         return False
@@ -5147,8 +6409,31 @@ def external_plan_row_ready(
     if not marker or not path_has_payload(marker):
         return False
     if (row.get("sync_method") or "direct").strip().lower() == "rcsb_ligand_bound_scope":
-        if rcsb_scope_has_missing_coordinates(science_store, target):
+        mode = normalize_rcsb_mode(rcsb_mode)
+        serialized_mode = "on_demand" if mode == "on-demand" else "complete"
+        snapshot = read_json_object(science_store / "downloads/rcsb/ligand_bound_pdb_scope.json")
+        if (
+            execution.get("scope_mode", "") != serialized_mode
+            or snapshot.get("scope_mode") != serialized_mode
+            or not rcsb_scope_snapshot_matches_current_sources(science_store, snapshot)
+            or execution.get("scope_count", "") != str(snapshot.get("scope_count", ""))
+        ):
             return False
+        if mode == "complete" and rcsb_scope_has_missing_coordinates(science_store, target):
+            return False
+        if mode == "on-demand":
+            policy = read_json_object(science_store / "downloads/rcsb/on_demand_policy.json")
+            try:
+                ready_count = int(snapshot.get("ready_count", 0) or 0)
+            except (TypeError, ValueError):
+                return False
+            if (
+                ready_count <= 0
+                or policy.get("schema_version") != "genoligand_rcsb_on_demand_policy_v1"
+                or policy.get("status") != "ready"
+                or policy.get("mode") != "on_demand"
+            ):
+                return False
     evidence = external_evidence_path(row, target, marker)
     if not evidence or not path_has_payload(evidence):
         return False
@@ -5168,6 +6453,8 @@ def sync_external_sources(
     skip_downloads: bool,
     env: dict[str, str] | None = None,
     summary_cache: ResourceSummaryCache | None = None,
+    *,
+    rcsb_mode: str = "on-demand",
 ) -> dict[str, object]:
     manifest = science_store / "external_sync_execution_manifest.tsv"
     rows = read_tsv(plan)
@@ -5196,6 +6483,11 @@ def sync_external_sources(
                 "plan_digest",
                 "release_identity",
                 "trust_source",
+                "scope_mode",
+                "scope_digest",
+                "scope_ready_count",
+                "scope_count",
+                "scope_missing_count",
                 "notes",
             ],
         )
@@ -5242,12 +6534,23 @@ def sync_external_sources(
             method = (row.get("sync_method") or "direct").strip().lower()
             previous = previous_rows.get(source_id, {})
             marker_ready = external_plan_row_ready(
-                row, target, marker, science_store, previous, summary_cache
+                row,
+                target,
+                marker,
+                science_store,
+                previous,
+                summary_cache,
+                rcsb_mode=rcsb_mode,
             )
             if marker_ready:
                 evidence = external_evidence_path(row, target, marker)
                 evidence_bytes = directory_size(evidence) if evidence else 0
                 evidence_sha256 = external_evidence_digest(row, evidence, summary_cache) if evidence else ""
+                snapshot = (
+                    read_json_object(science_store / "downloads/rcsb/ligand_bound_pdb_scope.json")
+                    if method == "rcsb_ligand_bound_scope"
+                    else {}
+                )
                 ready += 1
                 write_install_progress(
                     science_store,
@@ -5272,11 +6575,23 @@ def sync_external_sources(
                         "plan_digest": external_plan_digest(row),
                         "release_identity": row.get("release_or_date", ""),
                         "trust_source": row.get("trust_source", ""),
-                        "notes": "previous_success_digest_matched",
+                        "scope_mode": str(snapshot.get("scope_mode", "")),
+                        "scope_digest": str(snapshot.get("scope_digest", "")),
+                        "scope_ready_count": str(snapshot.get("ready_count", "")),
+                        "scope_count": str(snapshot.get("scope_count", "")),
+                        "scope_missing_count": str(snapshot.get("missing_count", "")),
+                        "notes": (
+                            "partial_on_demand_previous_success_digest_matched"
+                            if snapshot.get("scope_mode") == "on_demand"
+                            else "previous_success_digest_matched"
+                        ),
                     }
                 )
                 continue
-            if skip_downloads:
+            if skip_downloads and not (
+                method == "rcsb_ligand_bound_scope"
+                and normalize_rcsb_mode(rcsb_mode) == "on-demand"
+            ):
                 needs_action += 1
                 write_install_progress(
                     science_store,
@@ -5367,6 +6682,7 @@ def sync_external_sources(
                     env,
                     progress_callback,
                     summary_cache,
+                    rcsb_mode=rcsb_mode,
                 )
                 if result["status"] == "ready":
                     ready += 1
@@ -5397,6 +6713,11 @@ def sync_external_sources(
                         "plan_digest": external_plan_digest(row),
                         "release_identity": row.get("release_or_date", ""),
                         "trust_source": row.get("trust_source", ""),
+                        "scope_mode": str(result.get("scope_mode", "")),
+                        "scope_digest": str(result.get("scope_digest", "")),
+                        "scope_ready_count": str(result.get("ready_count", "")),
+                        "scope_count": str(result.get("scope_count", "")),
+                        "scope_missing_count": str(result.get("missing_count", "")),
                         "notes": str(result["notes"]),
                     }
                 )
@@ -5452,9 +6773,19 @@ def build_persistent_alignment_databases(
     env: dict[str, str] | None = None,
     wsl_distro: str | None = None,
     summary_cache: ResourceSummaryCache | None = None,
+    *,
+    scratch_dir: Path | None = None,
+    rcsb_mode: str = "on-demand",
 ) -> dict[str, object]:
     mmseqs_rows = build_mmseqs_target_databases(science_store, env, wsl_distro, summary_cache)
-    foldseek_rows = build_foldseek_target_database(science_store, env, wsl_distro, summary_cache)
+    foldseek_rows = build_foldseek_target_database(
+        science_store,
+        env,
+        wsl_distro,
+        summary_cache,
+        scratch_dir=scratch_dir,
+        rcsb_mode=rcsb_mode,
+    )
     all_rows = [*mmseqs_rows, *foldseek_rows]
     ready = sum(1 for row in all_rows if row.get("status") == "ready")
     failed = sum(1 for row in all_rows if row.get("status") == "failed")
@@ -5642,24 +6973,32 @@ def build_mmseqs_target_databases(
         source_fields = alignment_source_manifest_fields(source_summary, builder_version)
         source_namespace, source_class = mmseqs_source_provenance(label)
         previous = previous_rows.get(label, {})
-        migrated = legacy_alignment_manifest_can_migrate(
-            "mmseqs",
-            previous,
-            science_store,
-            source,
+        recovery = reconcile_database_directory_publish(
             db_path,
-            command,
-            env,
-            wsl_distro,
-            source_summary,
-            builder_version,
+            lambda prefix: database_prefix_ready("mmseqs", prefix, command, env, wsl_distro),
         )
-        force_rebuild = database_artifacts_present(db_path) and not (
-            alignment_source_manifest_matches(previous, source_summary, builder_version) or migrated
-        )
-        if alignment_source_deferred(source):
+        migrated = False
+        if recovery.get("status") != "ready":
+            status = "failed"
+            notes = str(recovery.get("reason", "database_directory_recovery_needs_repair"))
+        elif alignment_source_deferred(source):
             status, notes = "deferred_large_source", "source_exceeds_sync_index_threshold"
         else:
+            migrated = legacy_alignment_manifest_can_migrate(
+                "mmseqs",
+                previous,
+                science_store,
+                source,
+                db_path,
+                command,
+                env,
+                wsl_distro,
+                source_summary,
+                builder_version,
+            )
+            force_rebuild = database_artifacts_present(db_path) and not (
+                alignment_source_manifest_matches(previous, source_summary, builder_version) or migrated
+            )
             status, notes = build_mmseqs_database(
                 command,
                 source,
@@ -5734,12 +7073,365 @@ def alignment_db_max_source_bytes() -> int:
         return DEFAULT_ALIGNMENT_DB_MAX_SOURCE_BYTES
 
 
+def rcsb_scope_rows_for_ids(science_store: Path, pdb_ids: set[str]) -> dict[str, dict[str, str]]:
+    selected: dict[str, dict[str, str]] = {}
+    manifest = science_store / "downloads/rcsb/ligand_bound_pdb_scope.tsv"
+    if not manifest.is_file():
+        return selected
+    with manifest.open("r", encoding="utf-8-sig", newline="") as handle:
+        for row in csv.DictReader(handle, delimiter="\t"):
+            normalized = {str(key): str(value or "").strip() for key, value in row.items()}
+            pdb_id = normalized.get("pdb_id", "").upper()
+            if pdb_id in pdb_ids:
+                selected[pdb_id] = normalized
+    return selected
+
+
+def foldseek_mapping_pdb_id(value: str, row_kind: str, line_number: int) -> str:
+    name = Path(value.strip().replace("\\", "/")).name
+    match = re.match(r"^([0-9][A-Za-z0-9]{3})(?=[_.-]|$)", name)
+    if not match or not valid_pdb_id(match.group(1)):
+        raise ValueError(f"foldseek_{row_kind}_pdb_id_invalid:line={line_number}")
+    return match.group(1).upper()
+
+
+def foldseek_database_mapping_summary(db_path: Path) -> dict[str, object]:
+    source_path = Path(f"{db_path}.source")
+    index_path = Path(f"{db_path}.index")
+    lookup_path = Path(f"{db_path}.lookup")
+    digest = hashlib.sha256()
+    sources: dict[int, tuple[str, str]] = {}
+    previous_key = -1
+    with source_path.open("r", encoding="utf-8", errors="strict") as handle:
+        for line_number, line in enumerate(handle, start=1):
+            fields = line.rstrip("\r\n").split("\t")
+            if len(fields) < 2:
+                raise ValueError(f"foldseek_source_row_incomplete:line={line_number}")
+            source_key = int(fields[0])
+            if source_key < 0 or source_key <= previous_key:
+                raise ValueError(f"foldseek_source_key_order_invalid:line={line_number}")
+            previous_key = source_key
+            identity = fields[1].strip()
+            sources[source_key] = (
+                foldseek_mapping_pdb_id(identity, "source", line_number),
+                identity,
+            )
+            digest.update(
+                (json.dumps(["source", *fields], ensure_ascii=True, separators=(",", ":")) + "\n").encode(
+                    "ascii"
+                )
+            )
+    if not sources:
+        raise ValueError("foldseek_source_rows_empty")
+
+    lookup_keys: list[int] = []
+    referenced_sources: set[int] = set()
+    previous_key = -1
+    with lookup_path.open("r", encoding="utf-8", errors="strict") as handle:
+        for line_number, line in enumerate(handle, start=1):
+            fields = line.rstrip("\r\n").split("\t")
+            if len(fields) < 3:
+                raise ValueError(f"foldseek_lookup_row_incomplete:line={line_number}")
+            db_key = int(fields[0])
+            source_key = int(fields[2])
+            if db_key < 0 or db_key <= previous_key:
+                raise ValueError(f"foldseek_lookup_key_order_invalid:line={line_number}")
+            previous_key = db_key
+            source = sources.get(source_key)
+            if source is None:
+                raise ValueError(f"foldseek_lookup_source_key_missing:line={line_number}")
+            lookup_pdb_id = foldseek_mapping_pdb_id(fields[1], "lookup", line_number)
+            if lookup_pdb_id != source[0]:
+                raise ValueError(f"foldseek_lookup_source_identity_mismatch:line={line_number}")
+            lookup_keys.append(db_key)
+            referenced_sources.add(source_key)
+            digest.update(
+                (json.dumps(["lookup", *fields], ensure_ascii=True, separators=(",", ":")) + "\n").encode(
+                    "ascii"
+                )
+            )
+    if not lookup_keys:
+        raise ValueError("foldseek_lookup_rows_empty")
+    unreferenced = sorted(set(sources) - referenced_sources)
+    if unreferenced:
+        raise ValueError(f"foldseek_source_unreferenced:key={unreferenced[0]}")
+
+    index_keys: list[int] = []
+    previous_key = -1
+    with index_path.open("r", encoding="ascii", errors="strict") as handle:
+        for line_number, line in enumerate(handle, start=1):
+            fields = line.rstrip("\r\n").split("\t")
+            if len(fields) < 3:
+                raise ValueError(f"foldseek_index_row_incomplete:line={line_number}")
+            db_key = int(fields[0])
+            offset = int(fields[1])
+            length = int(fields[2])
+            if db_key < 0 or db_key <= previous_key:
+                raise ValueError(f"foldseek_index_key_order_invalid:line={line_number}")
+            if offset < 0 or length <= 0:
+                raise ValueError(f"foldseek_index_bounds_invalid:line={line_number}")
+            previous_key = db_key
+            index_keys.append(db_key)
+            digest.update(
+                (json.dumps(["index", *fields], ensure_ascii=True, separators=(",", ":")) + "\n").encode(
+                    "ascii"
+                )
+            )
+    if index_keys != lookup_keys:
+        raise ValueError("foldseek_index_lookup_key_mismatch")
+    return {
+        "indexed_entries": len(index_keys),
+        "mapping_sha256": digest.hexdigest(),
+        "pdb_ids": {source[0] for source in sources.values()},
+        "source_count": len(sources),
+    }
+
+
+def foldseek_database_entry_count(db_path: Path) -> int:
+    return int(foldseek_database_mapping_summary(db_path)["indexed_entries"])
+
+
+def foldseek_subset_digest(
+    listing_sha256: str,
+    validated_ids_sha256: str,
+    mapping_sha256: str,
+    indexed_entries: int,
+    indexed_pdb_count: int,
+    coordinate_bytes: int,
+) -> str:
+    return hashlib.sha256(
+        (
+            f"{listing_sha256}\n{validated_ids_sha256}\n{mapping_sha256}\n"
+            f"{indexed_entries}\n{indexed_pdb_count}\n{coordinate_bytes}\n"
+        ).encode("ascii")
+    ).hexdigest()
+
+
+def foldseek_partial_manifest_validation(
+    science_store: Path,
+    row: dict[str, str],
+    db_path: Path,
+    command: str | None = None,
+    env: dict[str, str] | None = None,
+    wsl_distro: str | None = None,
+    *,
+    probe_database: bool = True,
+) -> dict[str, object]:
+    if (
+        row.get("manifest_schema_version") != ALIGNMENT_MANIFEST_SCHEMA_VERSION
+        or row.get("scope_status") != "ready_partial_on_demand"
+        or row.get("scope_mode") != "on_demand"
+    ):
+        return {"status": "failed", "reason": "foldseek_partial_scope_mode_invalid"}
+    snapshot = read_json_object(science_store / "downloads/rcsb/ligand_bound_pdb_scope.json")
+    if not rcsb_scope_snapshot_matches_current_sources(science_store, snapshot):
+        return {"status": "failed", "reason": "foldseek_partial_scope_snapshot_stale"}
+    listing = Path(f"{db_path}.source")
+    validated_manifest = resolve_manifest_path(science_store, row.get("indexed_validated_ids_manifest", ""))
+    if not listing.is_file() or validated_manifest is None or not validated_manifest.is_file():
+        return {"status": "failed", "reason": "foldseek_partial_evidence_missing"}
+    try:
+        listing_sha256 = sha256_file(listing)
+        validated_ids_sha256 = sha256_file(validated_manifest)
+        if listing_sha256 != row.get("indexed_source_listing_sha256", ""):
+            return {"status": "failed", "reason": "foldseek_partial_source_listing_digest_mismatch"}
+        if validated_ids_sha256 != row.get("indexed_validated_ids_sha256", ""):
+            return {"status": "failed", "reason": "foldseek_partial_validated_ids_digest_mismatch"}
+        mapping = foldseek_database_mapping_summary(db_path)
+        mapping_sha256 = str(mapping["mapping_sha256"])
+        if mapping_sha256 != row.get("indexed_mapping_sha256", ""):
+            return {"status": "failed", "reason": "foldseek_partial_mapping_digest_mismatch"}
+        indexed_rows = read_tsv(validated_manifest)
+        indexed_by_id: dict[str, dict[str, str]] = {}
+        coordinate_bytes = 0
+        for indexed in indexed_rows:
+            pdb_id = indexed.get("pdb_id", "").upper()
+            if (
+                not valid_pdb_id(pdb_id)
+                or pdb_id in indexed_by_id
+                or indexed.get("status") != "validated"
+                or not re.fullmatch(r"[0-9a-f]{64}", indexed.get("sha256", "").lower())
+            ):
+                return {"status": "failed", "reason": "foldseek_partial_validated_ids_invalid"}
+            size = int(indexed.get("size_bytes", "0"))
+            if size <= 0:
+                return {"status": "failed", "reason": "foldseek_partial_coordinate_size_invalid"}
+            indexed_by_id[pdb_id] = indexed
+            coordinate_bytes += size
+        if not indexed_by_id:
+            return {"status": "failed", "reason": "foldseek_partial_validated_ids_empty"}
+        if set(mapping["pdb_ids"]) != set(indexed_by_id):
+            return {"status": "failed", "reason": "foldseek_partial_source_validated_ids_mismatch"}
+        scope_rows = rcsb_scope_rows_for_ids(science_store, set(indexed_by_id))
+        if set(scope_rows) != set(indexed_by_id):
+            return {"status": "failed", "reason": "foldseek_partial_scope_binding_missing"}
+        for pdb_id, indexed in indexed_by_id.items():
+            scope = scope_rows[pdb_id]
+            coordinate = science_store / indexed["coordinate_rel_path"]
+            actual_sha256 = sha256_file(coordinate) if coordinate.is_file() else ""
+            if (
+                scope.get("status") != "ready"
+                or scope.get("coordinate_rel_path") != indexed.get("coordinate_rel_path")
+                or scope.get("size_bytes") != indexed.get("size_bytes")
+                or scope.get("sha256", "").lower() != indexed.get("sha256", "").lower()
+                or not coordinate.is_file()
+                or coordinate.stat().st_size != int(indexed["size_bytes"])
+                or actual_sha256 != indexed.get("sha256", "").lower()
+                or actual_sha256 != scope.get("sha256", "").lower()
+            ):
+                return {"status": "failed", "reason": f"foldseek_partial_coordinate_binding_invalid:{pdb_id}"}
+        indexed_entries = int(mapping["indexed_entries"])
+        indexed_pdb_count = len(indexed_by_id)
+        subset_digest = foldseek_subset_digest(
+            listing_sha256,
+            validated_ids_sha256,
+            mapping_sha256,
+            indexed_entries,
+            indexed_pdb_count,
+            coordinate_bytes,
+        )
+        if (
+            str(snapshot.get("scope_mode", "")).replace("_", "-") != "on-demand"
+            or row.get("scope_digest") != str(snapshot.get("scope_digest", ""))
+            or row.get("source_digest") != subset_digest
+            or row.get("indexed_subset_digest") != subset_digest
+            or row.get("source_files") != str(indexed_pdb_count)
+            or row.get("source_bytes") != str(coordinate_bytes)
+            or row.get("indexed_pdb_count") != str(indexed_pdb_count)
+            or row.get("indexed_entries") != str(indexed_entries)
+        ):
+            return {"status": "failed", "reason": "foldseek_partial_manifest_binding_mismatch"}
+        if probe_database and not database_prefix_ready("foldseek", db_path, command, env, wsl_distro):
+            return {"status": "failed", "reason": "foldseek_partial_database_smoke_failed"}
+        cached_ready_count = int(snapshot.get("ready_count", 0) or 0)
+        return {
+            "status": "ready",
+            "reason": "foldseek_partial_manifest_and_database_validated",
+            "indexed_source_listing_sha256": listing_sha256,
+            "indexed_validated_ids_manifest": relative_path(science_store, validated_manifest),
+            "indexed_validated_ids_sha256": validated_ids_sha256,
+            "indexed_mapping_sha256": mapping_sha256,
+            "indexed_subset_digest": subset_digest,
+            "indexed_pdb_count": indexed_pdb_count,
+            "indexed_entries": indexed_entries,
+            "indexed_coordinate_bytes": coordinate_bytes,
+            "refresh_needed": cached_ready_count > indexed_pdb_count,
+        }
+    except (OSError, UnicodeError, ValueError) as err:
+        return {"status": "failed", "reason": f"foldseek_partial_validation_failed:{exception_note(err)}"}
+
+
+def foldseek_legacy_partial_migration(
+    science_store: Path,
+    db_path: Path,
+    command: str | None,
+    env: dict[str, str] | None,
+    wsl_distro: str | None,
+    scope_snapshot: dict[str, object],
+    validated_manifest: Path,
+) -> dict[str, object]:
+    listing = Path(f"{db_path}.source")
+    if not rcsb_scope_snapshot_matches_current_sources(science_store, scope_snapshot):
+        return {"status": "failed", "reason": "on_demand_scope_snapshot_stale"}
+    try:
+        cached_ready_count = int(scope_snapshot.get("ready_count", 0) or 0)
+    except (TypeError, ValueError):
+        cached_ready_count = 0
+    if str(scope_snapshot.get("scope_mode", "")).replace("_", "-") != "on-demand" or cached_ready_count <= 0:
+        return {"status": "failed", "reason": "on_demand_scope_snapshot_missing"}
+    if not listing.is_file() or listing.stat().st_size <= 0:
+        return {"status": "failed", "reason": "legacy_foldseek_source_listing_missing"}
+    try:
+        mapping = foldseek_database_mapping_summary(db_path)
+    except (OSError, UnicodeError, ValueError) as err:
+        return {"status": "failed", "reason": f"legacy_foldseek_database_mapping_invalid:{exception_note(err)}"}
+    pdb_ids = set(mapping["pdb_ids"])
+    if not pdb_ids:
+        return {"status": "failed", "reason": "legacy_foldseek_source_listing_empty"}
+    scope_rows = rcsb_scope_rows_for_ids(science_store, pdb_ids)
+    if set(scope_rows) != pdb_ids:
+        return {"status": "failed", "reason": "legacy_foldseek_indexed_ids_outside_scope"}
+
+    rows: list[dict[str, str]] = []
+    coordinate_bytes = 0
+    for pdb_id in sorted(pdb_ids):
+        scope_row = scope_rows[pdb_id]
+        coordinate_rel_path = scope_row.get("coordinate_rel_path", "")
+        coordinate = science_store / coordinate_rel_path
+        try:
+            size = int(scope_row.get("size_bytes", "0"))
+        except ValueError:
+            size = 0
+        coordinate_sha256 = scope_row.get("sha256", "").lower()
+        actual_sha256 = sha256_file(coordinate) if coordinate.is_file() else ""
+        if (
+            scope_row.get("status") != "ready"
+            or not coordinate_rel_path
+            or size <= 0
+            or not re.fullmatch(r"[0-9a-f]{64}", coordinate_sha256)
+            or not coordinate.is_file()
+            or coordinate.stat().st_size != size
+            or actual_sha256 != coordinate_sha256
+        ):
+            return {
+                "status": "failed",
+                "reason": f"legacy_foldseek_indexed_coordinate_invalid:{pdb_id}",
+            }
+        coordinate_bytes += size
+        rows.append(
+            {
+                "pdb_id": pdb_id,
+                "coordinate_rel_path": coordinate_rel_path,
+                "size_bytes": str(size),
+                "sha256": actual_sha256,
+                "status": "validated",
+            }
+        )
+    if not database_prefix_ready("foldseek", db_path, command, env, wsl_distro):
+        return {"status": "failed", "reason": "legacy_foldseek_database_smoke_failed"}
+    indexed_entries = int(mapping["indexed_entries"])
+    mapping_sha256 = str(mapping["mapping_sha256"])
+
+    write_simple_tsv(
+        validated_manifest,
+        ["pdb_id", "coordinate_rel_path", "size_bytes", "sha256", "status"],
+        rows,
+    )
+    listing_sha256 = sha256_file(listing)
+    validated_ids_sha256 = sha256_file(validated_manifest)
+    subset_digest = foldseek_subset_digest(
+        listing_sha256,
+        validated_ids_sha256,
+        mapping_sha256,
+        indexed_entries,
+        len(pdb_ids),
+        coordinate_bytes,
+    )
+    return {
+        "status": "ready",
+        "reason": "legacy_foldseek_partial_subset_validated",
+        "indexed_source_listing_sha256": listing_sha256,
+        "indexed_validated_ids_manifest": relative_path(science_store, validated_manifest),
+        "indexed_validated_ids_sha256": validated_ids_sha256,
+        "indexed_mapping_sha256": mapping_sha256,
+        "indexed_subset_digest": subset_digest,
+        "indexed_pdb_count": len(pdb_ids),
+        "indexed_entries": indexed_entries,
+        "indexed_coordinate_bytes": coordinate_bytes,
+        "refresh_needed": cached_ready_count > len(pdb_ids),
+    }
+
+
 def build_foldseek_target_database(
     science_store: Path,
     env: dict[str, str] | None,
     wsl_distro: str | None,
     summary_cache: ResourceSummaryCache | None = None,
+    *,
+    scratch_dir: Path | None = None,
+    rcsb_mode: str = "on-demand",
 ) -> list[dict[str, str]]:
+    mode = normalize_rcsb_mode(rcsb_mode)
     index_root = science_store / "indexes" / "foldseek"
     manifest = index_root / "foldseek_target_databases.tsv"
     previous_rows = {row.get("source_id", ""): row for row in read_tsv(manifest)}
@@ -5748,43 +7440,137 @@ def build_foldseek_target_database(
     builder_version = database_builder_version("foldseek", command, env, wsl_distro)
     source = science_store / "downloads" / "rcsb" / "mmcif"
     db_path = index_root / "rcsb_mmcif" / "target"
+    validated_subset_manifest = index_root / "rcsb_mmcif/indexed_pdb_ids.tsv"
     scope_snapshot = read_json_object(science_store / "downloads/rcsb/ligand_bound_pdb_scope.json")
-    source_summary = resource_payload_summary(source, cache=summary_cache)
-    source_fields = alignment_source_manifest_fields(source_summary, builder_version)
     previous = previous_rows.get("rcsb_mmcif", {})
-    migrated = legacy_alignment_manifest_can_migrate(
-        "foldseek",
-        previous,
-        science_store,
-        source,
+    recovery = reconcile_database_directory_publish(
         db_path,
-        command,
-        env,
-        wsl_distro,
-        source_summary,
-        builder_version,
+        lambda prefix: database_prefix_ready("foldseek", prefix, command, env, wsl_distro),
     )
-    force_rebuild = database_artifacts_present(db_path) and not (
-        alignment_source_manifest_matches(previous, source_summary, builder_version) or migrated
-    )
-    scope_complete = bool(
-        scope_snapshot.get("scope_count")
-        and scope_snapshot.get("ready_count") == scope_snapshot.get("scope_count")
-        and scope_snapshot.get("coordinate_digest") == source_summary.get("sha256")
-    )
-    if not scope_complete:
-        status, notes = "failed", "rcsb_scope_snapshot_incomplete_or_digest_mismatch"
+    partial = {"status": "not_applicable", "reason": "partial_migration_not_selected"}
+    if recovery.get("status") != "ready":
+        partial = {
+            "status": "recovery_failed",
+            "reason": str(recovery.get("reason", "database_directory_recovery_needs_repair")),
+        }
+    elif mode == "on-demand" and database_artifacts_present(db_path):
+        if previous.get("scope_status") == "ready_partial_on_demand":
+            partial = foldseek_partial_manifest_validation(
+                science_store,
+                previous,
+                db_path,
+                command,
+                env,
+                wsl_distro,
+            )
+        if partial.get("status") != "ready":
+            partial = foldseek_legacy_partial_migration(
+                science_store,
+                db_path,
+                command,
+                env,
+                wsl_distro,
+                scope_snapshot,
+                validated_subset_manifest,
+            )
+    if partial.get("status") == "ready":
+        source_fields = {
+            "manifest_schema_version": ALIGNMENT_MANIFEST_SCHEMA_VERSION,
+            "source_digest": str(partial["indexed_subset_digest"]),
+            "source_files": str(partial["indexed_pdb_count"]),
+            "source_bytes": str(partial["indexed_coordinate_bytes"]),
+            "builder_version": builder_version,
+        }
+        status = "ready"
+        notes = (
+            "ready_partial_on_demand:manifest_database_probe_reused"
+            if previous.get("indexed_subset_digest") == partial.get("indexed_subset_digest")
+            else "ready_partial_on_demand:legacy_database_probe_and_subset_validation_passed"
+        )
+    elif partial.get("status") == "recovery_failed":
+        source_fields = {
+            "manifest_schema_version": ALIGNMENT_MANIFEST_SCHEMA_VERSION,
+            "source_digest": previous.get("source_digest", ""),
+            "source_files": previous.get("source_files", ""),
+            "source_bytes": previous.get("source_bytes", ""),
+            "builder_version": builder_version,
+        }
+        status = "failed"
+        notes = str(partial["reason"])
+        partial = {
+            "indexed_source_listing_sha256": previous.get("indexed_source_listing_sha256", ""),
+            "indexed_validated_ids_manifest": previous.get("indexed_validated_ids_manifest", ""),
+            "indexed_validated_ids_sha256": previous.get("indexed_validated_ids_sha256", ""),
+            "indexed_mapping_sha256": previous.get("indexed_mapping_sha256", ""),
+            "indexed_subset_digest": previous.get("indexed_subset_digest", ""),
+            "indexed_pdb_count": previous.get("indexed_pdb_count", ""),
+            "indexed_entries": previous.get("indexed_entries", ""),
+            "indexed_coordinate_bytes": previous.get("source_bytes", ""),
+            "refresh_needed": True,
+        }
     else:
-        status, notes = build_foldseek_database(
-            command,
+        validated_subset_manifest.unlink(missing_ok=True)
+        source_summary = resource_payload_summary(source, cache=summary_cache)
+        source_fields = alignment_source_manifest_fields(source_summary, builder_version)
+        migrated = legacy_alignment_manifest_can_migrate(
+            "foldseek",
+            previous,
+            science_store,
             source,
             db_path,
+            command,
             env,
             wsl_distro,
-            force_rebuild=force_rebuild,
+            source_summary,
+            builder_version,
         )
-        if status == "ready" and migrated:
-            notes = "legacy_manifest_migrated_after_database_smoke"
+        force_rebuild = database_artifacts_present(db_path) and not (
+            alignment_source_manifest_matches(previous, source_summary, builder_version) or migrated
+        )
+        snapshot_mode = str(scope_snapshot.get("scope_mode", "")).replace("_", "-")
+        scope_usable = bool(
+            scope_snapshot.get("scope_count")
+            and scope_snapshot.get("ready_count")
+            and snapshot_mode == mode
+            and rcsb_scope_snapshot_matches_current_sources(science_store, scope_snapshot)
+            and scope_snapshot.get("coordinate_digest") == source_summary.get("sha256")
+            and (
+                mode == "on-demand"
+                or scope_snapshot.get("ready_count") == scope_snapshot.get("scope_count")
+            )
+        )
+        if not scope_usable:
+            status, notes = "failed", "rcsb_scope_snapshot_unusable_or_digest_mismatch"
+        else:
+            status, notes = build_foldseek_database(
+                command,
+                source,
+                db_path,
+                env,
+                wsl_distro,
+                force_rebuild=force_rebuild,
+                scratch_dir=scratch_dir,
+            )
+            if status == "ready" and migrated:
+                notes = "legacy_manifest_migrated_after_database_smoke"
+        indexed_entries = source_fields["source_files"]
+        if status == "ready":
+            try:
+                indexed_entries = str(foldseek_database_entry_count(db_path))
+            except (OSError, UnicodeError, ValueError) as err:
+                status = "failed"
+                notes = f"foldseek_database_index_invalid:{exception_note(err)}"
+        partial = {
+            "indexed_source_listing_sha256": "",
+            "indexed_validated_ids_manifest": "",
+            "indexed_validated_ids_sha256": "",
+            "indexed_mapping_sha256": "",
+            "indexed_subset_digest": source_fields["source_digest"],
+            "indexed_pdb_count": source_fields["source_files"],
+            "indexed_entries": indexed_entries,
+            "indexed_coordinate_bytes": source_fields["source_bytes"],
+            "refresh_needed": False,
+        }
     rows = [
         {
             "source_id": "rcsb_mmcif",
@@ -5793,6 +7579,31 @@ def build_foldseek_target_database(
             "source_path": relative_path(science_store, source),
             **source_fields,
             "scope_digest": str(scope_snapshot.get("scope_digest", "")),
+            "scope_coordinate_digest": str(scope_snapshot.get("coordinate_digest", "")),
+            "scope_mode": "on_demand" if mode == "on-demand" else "complete",
+            "scope_status": (
+                "ready_partial_on_demand"
+                if partial.get("status") == "ready"
+                else "ready_complete"
+                if mode == "complete" and status == "ready"
+                else "ready_on_demand"
+                if status == "ready"
+                else "needs_repair"
+            ),
+            "scope_count": str(scope_snapshot.get("scope_count", 0)),
+            "scope_ready_count": str(scope_snapshot.get("ready_count", 0)),
+            "scope_missing_count": str(scope_snapshot.get("missing_count", 0)),
+            "scope_coverage": (
+                f"{partial.get('indexed_pdb_count', 0)}/{scope_snapshot.get('scope_count', 0)}"
+            ),
+            "refresh_needed": str(bool(partial.get("refresh_needed", False))).lower(),
+            "indexed_source_listing_sha256": str(partial.get("indexed_source_listing_sha256", "")),
+            "indexed_validated_ids_manifest": str(partial.get("indexed_validated_ids_manifest", "")),
+            "indexed_validated_ids_sha256": str(partial.get("indexed_validated_ids_sha256", "")),
+            "indexed_mapping_sha256": str(partial.get("indexed_mapping_sha256", "")),
+            "indexed_subset_digest": str(partial.get("indexed_subset_digest", "")),
+            "indexed_pdb_count": str(partial.get("indexed_pdb_count", "")),
+            "indexed_entries": str(partial.get("indexed_entries", "")),
             "db_path": relative_path(science_store, db_path),
             "status": status,
             "notes": notes,
@@ -5811,6 +7622,21 @@ def build_foldseek_target_database(
             "source_bytes",
             "builder_version",
             "scope_digest",
+            "scope_coordinate_digest",
+            "scope_mode",
+            "scope_status",
+            "scope_count",
+            "scope_ready_count",
+            "scope_missing_count",
+            "scope_coverage",
+            "refresh_needed",
+            "indexed_source_listing_sha256",
+            "indexed_validated_ids_manifest",
+            "indexed_validated_ids_sha256",
+            "indexed_mapping_sha256",
+            "indexed_subset_digest",
+            "indexed_pdb_count",
+            "indexed_entries",
             "db_path",
             "status",
             "notes",
@@ -5890,6 +7716,7 @@ def build_foldseek_database(
     wsl_distro: str | None,
     *,
     force_rebuild: bool = False,
+    scratch_dir: Path | None = None,
 ) -> tuple[str, str]:
     if not path_has_payload(source):
         return "failed", "source_missing"
@@ -5898,32 +7725,14 @@ def build_foldseek_database(
     artifacts_present = database_artifacts_present(db_path)
     if artifacts_present and not force_rebuild and database_prefix_ready("foldseek", db_path, command, env, wsl_distro):
         return "ready", "already_available"
-    if artifacts_present:
-        if not database_staging_capacity_ready(source, db_path):
-            return "failed", "insufficient_disk_for_atomic_rebuild"
-        return rebuild_foldseek_database(command, source, db_path, env, wsl_distro)
-    if not database_staging_capacity_ready(source, db_path):
-        return "failed", "insufficient_disk_for_database_build"
-    db_path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = db_path.parent / "tmp"
-    tmp.mkdir(parents=True, exist_ok=True)
-    if os.name == "nt" and wsl_distro:
-        created = run_wsl_database_command(wsl_distro, ["foldseek", "createdb", wsl_path(source), wsl_path(db_path)])
-        if created.returncode != 0:
-            return "failed", process_note(created)
-        indexed = run_wsl_database_command(wsl_distro, ["foldseek", "createindex", wsl_path(db_path), wsl_path(tmp)])
-        if indexed.returncode != 0:
-            return database_ready_after_index_failure("foldseek", db_path, indexed, command, env, wsl_distro)
-        return database_ready_after_build("foldseek", db_path, command, env, wsl_distro, "foldseek_createdb_createindex_completed")
-    if command is None:
-        return "failed", "foldseek_executable_missing"
-    created = run_command([command, "createdb", str(source), str(db_path)], env=env)
-    if created.returncode != 0:
-        return "failed", process_note(created)
-    indexed = run_command([command, "createindex", str(db_path), str(tmp)], env=env)
-    if indexed.returncode != 0:
-        return database_ready_after_index_failure("foldseek", db_path, indexed, command, env, wsl_distro)
-    return database_ready_after_build("foldseek", db_path, command, env, wsl_distro, "foldseek_createdb_createindex_completed")
+    return rebuild_foldseek_database(
+        command,
+        source,
+        db_path,
+        env,
+        wsl_distro,
+        scratch_dir=scratch_dir,
+    )
 
 
 def rebuild_mmseqs_database(
@@ -5954,20 +7763,210 @@ def rebuild_foldseek_database(
     db_path: Path,
     env: dict[str, str] | None,
     wsl_distro: str | None,
+    *,
+    scratch_dir: Path | None = None,
 ) -> tuple[str, str]:
-    staged_db = staged_database_path(db_path)
+    scratch_root = Path(scratch_dir) if scratch_dir is not None else db_path.parent
+    estimate = foldseek_staging_estimate(source, db_path)
     try:
-        status, notes = build_foldseek_database(command, source, staged_db, env, wsl_distro)
+        scratch_available = int(shutil.disk_usage(existing_path_for_disk_usage(scratch_root)).free)
+    except OSError as err:
+        return "failed", f"foldseek_scratch_disk_probe_failed_previous_preserved:{exception_note(err)}"
+    scratch_required = int(estimate["scratch_staging_bytes"]) + DISK_SAFETY_MARGIN_BYTES
+    if scratch_required > scratch_available:
+        return (
+            "failed",
+            "foldseek_scratch_capacity_insufficient_previous_preserved:"
+            f"required={scratch_required};available={scratch_available}",
+        )
+
+    token = f"{os.getpid()}-{time.time_ns()}"
+    scratch_parent = scratch_root / f"foldseek-rcsb-rebuild-{token}"
+    scratch_db = scratch_parent / db_path.name
+    target_staged_db = staged_database_path(db_path)
+    try:
+        scratch_parent.mkdir(parents=True, exist_ok=False)
+        status, notes = create_foldseek_database_artifacts(
+            command,
+            source,
+            scratch_db,
+            env,
+            wsl_distro,
+        )
         if status != "ready":
             return "failed", f"rebuild_failed_previous_preserved:{notes}"
-        cleanup_complete = publish_database_directory(staged_db, db_path)
+        shutil.rmtree(scratch_parent / "tmp", ignore_errors=True)
+        if not database_prefix_ready("foldseek", scratch_db, command, env, wsl_distro):
+            return "failed", "rebuild_failed_previous_preserved:foldseek_scratch_database_smoke_failed"
+
+        publish_note = "precomputed_index_retained"
+        target_available = int(shutil.disk_usage(existing_path_for_disk_usage(db_path.parent)).free)
+        staged_bytes = directory_size(scratch_parent)
+        if staged_bytes + DISK_SAFETY_MARGIN_BYTES > target_available:
+            if not remove_foldseek_precomputed_index(scratch_db):
+                return "failed", "rebuild_failed_previous_preserved:insufficient_target_disk_for_compact_publish"
+            if not database_prefix_ready("foldseek", scratch_db, command, env, wsl_distro):
+                return "failed", "rebuild_failed_previous_preserved:foldseek_compact_database_smoke_failed"
+            publish_note = "precomputed_index_removed_for_target_capacity"
+            staged_bytes = directory_size(scratch_parent)
+            target_available = int(shutil.disk_usage(existing_path_for_disk_usage(db_path.parent)).free)
+        if staged_bytes + DISK_SAFETY_MARGIN_BYTES > target_available:
+            return "failed", "rebuild_failed_previous_preserved:insufficient_target_disk_for_compact_publish"
+
+        copy_foldseek_database_with_capacity_guard(scratch_parent, target_staged_db.parent)
+        if not database_prefix_ready("foldseek", target_staged_db, command, env, wsl_distro):
+            return "failed", "rebuild_failed_previous_preserved:foldseek_target_staging_smoke_failed"
+        cleanup_complete = publish_database_directory(target_staged_db, db_path)
         cleanup_note = "" if cleanup_complete else ";previous_backup_cleanup_pending"
-        return "ready", f"atomic_rebuild_completed:{notes}{cleanup_note}"
+        volume_note = (
+            "cross_volume_scratch"
+            if not same_storage_volume(scratch_root, db_path.parent)
+            else "same_volume_scratch"
+        )
+        return (
+            "ready",
+            f"atomic_rebuild_completed:{notes};{volume_note};{publish_note}{cleanup_note}",
+        )
     except Exception as err:  # noqa: BLE001 - preserve the current database and report repair failure
         return "failed", f"rebuild_failed_previous_preserved:{exception_note(err)}"
     finally:
-        if staged_db.parent.exists():
-            shutil.rmtree(staged_db.parent)
+        shutil.rmtree(scratch_parent, ignore_errors=True)
+        shutil.rmtree(target_staged_db.parent, ignore_errors=True)
+
+
+def create_foldseek_database_artifacts(
+    command: str | None,
+    source: Path,
+    db_path: Path,
+    env: dict[str, str] | None,
+    wsl_distro: str | None,
+) -> tuple[str, str]:
+    db_path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = db_path.parent / "tmp"
+    tmp.mkdir(parents=True, exist_ok=True)
+    if os.name == "nt" and wsl_distro:
+        created = run_wsl_database_command(
+            wsl_distro,
+            ["foldseek", "createdb", wsl_path(source), wsl_path(db_path)],
+        )
+        if created.returncode != 0:
+            return "failed", process_note(created)
+        indexed = run_wsl_database_command(
+            wsl_distro,
+            ["foldseek", "createindex", wsl_path(db_path), wsl_path(tmp)],
+        )
+    elif command is not None:
+        created = run_command([command, "createdb", str(source), str(db_path)], env=env)
+        if created.returncode != 0:
+            return "failed", process_note(created)
+        indexed = run_command([command, "createindex", str(db_path), str(tmp)], env=env)
+    else:
+        return "failed", "foldseek_executable_missing"
+    if indexed.returncode != 0:
+        remove_foldseek_precomputed_index(db_path)
+        return "ready", f"foldseek_createdb_ready_createindex_not_precomputed:{process_note(indexed)}"
+    return "ready", "foldseek_createdb_createindex_completed"
+
+
+def foldseek_database_artifact_files(db_path: Path) -> list[Path]:
+    if not db_path.parent.is_dir():
+        return []
+    return sorted(
+        path
+        for path in db_path.parent.iterdir()
+        if path.is_file()
+        and (
+            path.name == db_path.name
+            or path.name.startswith(f"{db_path.name}.")
+            or path.name.startswith(f"{db_path.name}_")
+        )
+    )
+
+
+def foldseek_compact_database_size(db_path: Path) -> int:
+    index_prefix = f"{db_path.name}.idx"
+    return sum(
+        path.stat().st_size
+        for path in foldseek_database_artifact_files(db_path)
+        if path.name != index_prefix and not path.name.startswith(f"{index_prefix}.")
+    )
+
+
+def foldseek_staging_estimate(
+    source: Path,
+    db_path: Path,
+    previous: dict[str, str] | None = None,
+) -> dict[str, int]:
+    source_files = max(1, file_count(source))
+    source_bytes = max(1, directory_size(source))
+    try:
+        previous_files = max(0, int((previous or {}).get("source_files", "0")))
+    except ValueError:
+        previous_files = 0
+
+    def scaled(value: int) -> int:
+        if value <= 0:
+            return 0
+        return (value * source_files + max(1, previous_files) - 1) // max(1, previous_files)
+
+    existing_full = directory_size(db_path.parent)
+    existing_compact = foldseek_compact_database_size(db_path)
+    empirical_full = scaled(existing_full) if previous_files else existing_full
+    empirical_compact = scaled(existing_compact) if previous_files else existing_compact
+    target_staging = max(empirical_compact, source_bytes // 32, source_files * 4 * 1024)
+    scratch_staging = max(
+        empirical_full,
+        target_staging * 8,
+        source_bytes // 4,
+        source_files * 32 * 1024,
+    )
+    return {
+        "source_files": source_files,
+        "source_bytes": source_bytes,
+        "scratch_staging_bytes": scratch_staging,
+        "target_staging_bytes": target_staging,
+    }
+
+
+def remove_foldseek_precomputed_index(db_path: Path) -> bool:
+    index_prefix = f"{db_path.name}.idx"
+    removed = False
+    for path in foldseek_database_artifact_files(db_path):
+        if path.name != index_prefix and not path.name.startswith(f"{index_prefix}."):
+            continue
+        path.unlink(missing_ok=True)
+        removed = True
+    return removed
+
+
+def copy_foldseek_database_with_capacity_guard(source: Path, destination: Path) -> None:
+    files = sorted(path for path in source.rglob("*") if path.is_file())
+    remaining = sum(path.stat().st_size for path in files)
+    destination.mkdir(parents=True, exist_ok=False)
+
+    def guard() -> None:
+        available = int(shutil.disk_usage(existing_path_for_disk_usage(destination)).free)
+        if remaining + DISK_SAFETY_MARGIN_BYTES > available:
+            raise OSError(
+                "foldseek_target_disk_safety_margin_reached:"
+                f"remaining={remaining};available={available}"
+            )
+
+    guard()
+    for source_file in files:
+        relative = source_file.relative_to(source)
+        destination_file = destination / relative
+        destination_file.parent.mkdir(parents=True, exist_ok=True)
+        with source_file.open("rb") as source_handle, destination_file.open("xb") as destination_handle:
+            while True:
+                block = source_handle.read(8 * 1024 * 1024)
+                if not block:
+                    break
+                guard()
+                destination_handle.write(block)
+                remaining -= len(block)
+        shutil.copystat(source_file, destination_file)
+    guard()
 
 
 def staged_database_path(db_path: Path) -> Path:
@@ -5984,25 +7983,211 @@ def database_staging_capacity_ready(source: Path, db_path: Path) -> bool:
     return required <= available
 
 
+def database_directory_transaction_path(db_path: Path) -> Path:
+    live_parent = db_path.parent
+    return live_parent.parent / f".{live_parent.name}.publish-transaction.json"
+
+
+def database_directory_structure_ready(db_path: Path) -> bool:
+    companions = [db_path, Path(f"{db_path}.dbtype"), Path(f"{db_path}.index"), Path(f"{db_path}.lookup")]
+    try:
+        return bool(
+            all(path.is_file() and path.stat().st_size > 0 for path in companions)
+            and Path(f"{db_path}.dbtype").stat().st_size == 4
+        )
+    except OSError:
+        return False
+
+
+def database_directory_transaction_paths(
+    db_path: Path,
+    payload: dict[str, object],
+) -> dict[str, Path] | None:
+    try:
+        live_parent = db_path.parent.resolve()
+        root = live_parent.parent
+        staged_parent = Path(str(payload.get("staged_parent", ""))).resolve()
+        backup_parent = Path(str(payload.get("backup_parent", ""))).resolve()
+        recorded_live = Path(str(payload.get("live_parent", ""))).resolve()
+    except (OSError, RuntimeError, ValueError):
+        return None
+    if (
+        payload.get("schema_version") != DATABASE_DIRECTORY_TRANSACTION_SCHEMA_VERSION
+        or payload.get("database_name") != db_path.name
+        or recorded_live != live_parent
+        or staged_parent.parent != root
+        or backup_parent.parent != root
+        or not staged_parent.name.startswith(f".{live_parent.name}.rebuild-")
+        or not backup_parent.name.startswith(f".{live_parent.name}.previous-")
+    ):
+        return None
+    return {
+        "live_parent": live_parent,
+        "staged_parent": staged_parent,
+        "backup_parent": backup_parent,
+    }
+
+
+def reconcile_database_directory_publish(
+    db_path: Path,
+    validator: Callable[[Path], bool] | None = None,
+) -> dict[str, str]:
+    live_parent = db_path.parent.resolve()
+    root = live_parent.parent
+    transaction = database_directory_transaction_path(db_path)
+    rebuild_candidates = sorted(root.glob(f".{live_parent.name}.rebuild-*"))
+    backup_candidates = sorted(root.glob(f".{live_parent.name}.previous-*"))
+    if not transaction.exists() and not rebuild_candidates and not backup_candidates:
+        return {"status": "ready", "reason": "no_database_directory_transaction"}
+
+    payload = read_json_object(transaction) if transaction.exists() else {}
+    recorded = database_directory_transaction_paths(db_path, payload) if transaction.exists() else None
+    if transaction.exists() and recorded is None:
+        return {"status": "needs_repair", "reason": "database_directory_transaction_descriptor_invalid"}
+    if recorded is not None:
+        for kind, candidate in (
+            ("rebuild", recorded["staged_parent"]),
+            ("backup", recorded["backup_parent"]),
+        ):
+            candidates = rebuild_candidates if kind == "rebuild" else backup_candidates
+            if candidate.exists() and candidate not in candidates:
+                candidates.append(candidate)
+                candidates.sort()
+        allowed_rebuild = {recorded["staged_parent"]}
+        allowed_backup = {recorded["backup_parent"]}
+        if set(rebuild_candidates) - allowed_rebuild or set(backup_candidates) - allowed_backup:
+            return {"status": "needs_repair", "reason": "database_directory_transaction_candidates_ambiguous"}
+    if len(rebuild_candidates) > 1 or len(backup_candidates) > 1:
+        return {"status": "needs_repair", "reason": "database_directory_transaction_candidates_ambiguous"}
+
+    probe = validator or database_directory_structure_ready
+
+    def parent_ready(parent: Path) -> bool:
+        try:
+            return parent.is_dir() and bool(probe(parent / db_path.name))
+        except (OSError, RuntimeError, ValueError):
+            return False
+
+    staged_parent = rebuild_candidates[0] if rebuild_candidates else None
+    backup_parent = backup_candidates[0] if backup_candidates else None
+    live_ready = parent_ready(live_parent)
+    staged_ready = bool(staged_parent and parent_ready(staged_parent))
+    backup_ready = bool(backup_parent and parent_ready(backup_parent))
+
+    if live_parent.exists() and not live_ready:
+        return {"status": "needs_repair", "reason": "database_directory_live_candidate_invalid"}
+    if live_ready:
+        try:
+            if staged_parent is not None:
+                shutil.rmtree(staged_parent)
+            if backup_parent is not None:
+                shutil.rmtree(backup_parent)
+            transaction.unlink(missing_ok=True)
+        except OSError as err:
+            return {
+                "status": "needs_repair",
+                "reason": f"database_directory_recovery_cleanup_failed:{exception_note(err)}",
+            }
+        return {"status": "ready", "reason": "database_directory_live_candidate_retained"}
+
+    selected: Path | None = backup_parent if backup_ready else staged_parent if staged_ready else None
+    if selected is None:
+        return {"status": "needs_repair", "reason": "database_directory_recovery_candidate_missing_or_invalid"}
+    try:
+        selected.replace(live_parent)
+        remaining = staged_parent if selected == backup_parent else backup_parent
+        if remaining is not None:
+            shutil.rmtree(remaining)
+        transaction.unlink(missing_ok=True)
+    except OSError as err:
+        return {
+            "status": "needs_repair",
+            "reason": f"database_directory_recovery_publish_failed:{exception_note(err)}",
+        }
+    return {
+        "status": "ready",
+        "reason": (
+            "database_directory_previous_candidate_restored"
+            if selected == backup_parent
+            else "database_directory_staged_candidate_published"
+        ),
+    }
+
+
+def database_publish_hard_exit(stage: str) -> None:
+    if os.environ.get("GENOLIGAND_TEST_DATABASE_PUBLISH_HARD_EXIT_STAGE", "").strip() == stage:
+        os._exit(97)
+
+
 def publish_database_directory(staged_db: Path, db_path: Path) -> bool:
     staged_parent = staged_db.parent
     live_parent = db_path.parent
     backup = live_parent.with_name(f".{live_parent.name}.previous-{os.getpid()}-{time.time_ns()}")
-    if backup.exists():
-        shutil.rmtree(backup)
+    transaction = database_directory_transaction_path(db_path)
+    if not database_directory_structure_ready(staged_db):
+        raise ValueError("staged_database_directory_invalid")
+    if staged_parent.parent.resolve() != live_parent.parent.resolve() or not staged_parent.name.startswith(
+        f".{live_parent.name}.rebuild-"
+    ):
+        raise ValueError("staged_database_directory_path_invalid")
+    other_rebuilds = [
+        candidate
+        for candidate in live_parent.parent.glob(f".{live_parent.name}.rebuild-*")
+        if candidate.resolve() != staged_parent.resolve()
+    ]
+    if (
+        transaction.exists()
+        or other_rebuilds
+        or any(live_parent.parent.glob(f".{live_parent.name}.previous-*"))
+    ):
+        raise RuntimeError("database_directory_transaction_requires_reconciliation")
+    write_json_atomic(
+        transaction,
+        {
+            "schema_version": DATABASE_DIRECTORY_TRANSACTION_SCHEMA_VERSION,
+            "status": "prepared",
+            "database_name": db_path.name,
+            "live_parent": str(live_parent.resolve()),
+            "staged_parent": str(staged_parent.resolve()),
+            "backup_parent": str(backup.resolve()),
+            "updated_at": int(time.time()),
+        },
+    )
+    database_publish_hard_exit("after_descriptor")
     if live_parent.exists():
         live_parent.replace(backup)
+    write_json_atomic(
+        transaction,
+        {
+            **read_json_object(transaction),
+            "status": "previous_moved",
+            "updated_at": int(time.time()),
+        },
+    )
+    database_publish_hard_exit("after_backup")
     try:
         staged_parent.replace(live_parent)
     except Exception:
         if backup.exists() and not live_parent.exists():
             backup.replace(live_parent)
+        if database_directory_structure_ready(db_path):
+            transaction.unlink(missing_ok=True)
         raise
+    write_json_atomic(
+        transaction,
+        {
+            **read_json_object(transaction),
+            "status": "live_published",
+            "updated_at": int(time.time()),
+        },
+    )
+    database_publish_hard_exit("after_live")
     if backup.exists():
         try:
             shutil.rmtree(backup)
         except OSError:
             return False
+    transaction.unlink(missing_ok=True)
     return True
 
 
@@ -6286,6 +8471,37 @@ def alignment_source_manifest_matches(
     return bool(row) and all(row.get(key, "") == value for key, value in expected.items())
 
 
+def legacy_mmseqs_createdb_matches_source(source: Path, db_path: Path) -> bool:
+    header = db_path.with_name(f"{db_path.name}_h")
+    companions = [
+        db_path,
+        Path(f"{db_path}.dbtype"),
+        Path(f"{db_path}.index"),
+        Path(f"{db_path}.lookup"),
+        Path(f"{db_path}.source"),
+        header,
+        Path(f"{header}.dbtype"),
+        Path(f"{header}.index"),
+    ]
+    try:
+        if any(not path.is_file() or path.stat().st_size <= 0 for path in companions):
+            return False
+        if Path(f"{db_path}.dbtype").stat().st_size != 4 or Path(f"{header}.dbtype").stat().st_size != 4:
+            return False
+        marker_rows = [
+            line.split("\t", 1)
+            for line in Path(f"{db_path}.source").read_text(encoding="utf-8", errors="strict").splitlines()
+            if line.strip()
+        ]
+        if len(marker_rows) != 1 or len(marker_rows[0]) != 2:
+            return False
+        int(marker_rows[0][0])
+        marker_name = Path(marker_rows[0][1].strip().replace("\\", "/")).name
+        return bool(marker_name) and marker_name == source.name
+    except (OSError, UnicodeError, ValueError):
+        return False
+
+
 def legacy_alignment_manifest_can_migrate(
     tool: str,
     row: dict[str, str],
@@ -6300,13 +8516,6 @@ def legacy_alignment_manifest_can_migrate(
 ) -> bool:
     if not row or row.get("status") != "ready" or row.get("manifest_schema_version"):
         return False
-    expected = alignment_source_manifest_fields(
-        source_summary or resource_payload_summary(source),
-        builder_version,
-    )
-    provenance_fields = ("source_digest", "source_files", "source_bytes", "builder_version")
-    if any(not row.get(field, "") or row.get(field, "") != expected[field] for field in provenance_fields):
-        return False
     manifest_source = resolve_manifest_path(science_store, row.get("source_path", ""))
     manifest_db = resolve_manifest_path(science_store, row.get("db_path", ""))
     try:
@@ -6318,7 +8527,22 @@ def legacy_alignment_manifest_can_migrate(
         )
     except OSError:
         return False
-    return paths_match and database_prefix_ready(tool, db_path, command, env, wsl_distro)
+    if not paths_match:
+        return False
+    provenance_fields = ("source_digest", "source_files", "source_bytes", "builder_version")
+    provided_provenance = [row.get(field, "") for field in provenance_fields]
+    if any(provided_provenance):
+        expected = alignment_source_manifest_fields(
+            source_summary or resource_payload_summary(source),
+            builder_version,
+        )
+        if any(not value or value != expected[field] for field, value in zip(provenance_fields, provided_provenance)):
+            return False
+    elif tool != "mmseqs":
+        return False
+    if tool == "mmseqs" and not legacy_mmseqs_createdb_matches_source(source, db_path):
+        return False
+    return database_prefix_ready(tool, db_path, command, env, wsl_distro)
 
 
 def database_artifacts_present(db_path: Path) -> bool:
@@ -6876,6 +9100,8 @@ def source_sync_summary(
     science_store: Path,
     sync_result: dict[str, object],
     summary_cache: ResourceSummaryCache | None = None,
+    *,
+    rcsb_mode: str = "on-demand",
 ) -> dict[str, object]:
     rows = read_tsv(plan)
     if not rows:
@@ -6900,7 +9126,13 @@ def source_sync_summary(
         execution = execution_rows.get(row.get("source_id", ""))
         execution_status = execution.get("status", "") if execution else ""
         ready = external_plan_row_ready(
-            row, target, marker, science_store, execution or {}, summary_cache
+            row,
+            target,
+            marker,
+            science_store,
+            execution or {},
+            summary_cache,
+            rcsb_mode=rcsb_mode,
         )
         needs_bundle = execution_status == "requires_resource_bundle"
         items.append(
@@ -7131,6 +9363,20 @@ def alignment_database_manifests_ready(
             db_path = resolve_manifest_path(science_store, row.get("db_path", ""))
             if source is None or db_path is None:
                 return False
+            if tool == "foldseek" and row.get("scope_status") == "ready_partial_on_demand":
+                if row.get("builder_version") != builder_version:
+                    return False
+                validation = foldseek_partial_manifest_validation(
+                    science_store,
+                    row,
+                    db_path,
+                    command,
+                    env,
+                    wsl_distro,
+                )
+                if validation.get("status") != "ready":
+                    return False
+                continue
             source_summary = resource_payload_summary(source, cache=summary_cache)
             if not alignment_source_manifest_matches(row, source_summary, builder_version):
                 return False
@@ -7243,6 +9489,7 @@ def evaluate_installer_science_store_readiness(
     summary_cache: ResourceSummaryCache | None = None,
 ) -> dict[str, object]:
     blockers: list[dict[str, str]] = []
+    advisories: list[dict[str, str]] = []
     blocker_codes: set[str] = set()
 
     def block(code: str, component: str, evidence: str, repair_action: str) -> None:
@@ -7342,6 +9589,33 @@ def evaluate_installer_science_store_readiness(
                 REQUIRED_LOGICAL_SOURCES[logical],
             )
 
+    chembl_database = science_store / "downloads/chembl/chembl_query.sqlite"
+    chembl_manifest = chembl_database.with_suffix(".manifest.json")
+    chembl_source = source_manifest_rows.get("chembl", {})
+    chembl_source_digest = chembl_source.get("sha256", "").strip().lower()
+    chembl_source_release = chembl_source.get("release_identity", "").strip()
+    if not chembl_query_database_ready(
+        chembl_database,
+        chembl_manifest,
+        chembl_source_digest,
+        chembl_source_release,
+        summary_cache,
+    ):
+        block(
+            "chembl_query_database_not_ready",
+            "chembl_query_database",
+            "downloads/chembl/chembl_query.sqlite and manifest failed identity or schema validation",
+            "publish_chembl_query_database",
+        )
+    transaction = chembl_query_transaction_path(chembl_database)
+    if transaction.exists():
+        block(
+            "chembl_query_transaction_pending",
+            "chembl_query_database",
+            str(transaction),
+            "reconcile_chembl_query_transaction",
+        )
+
     status_payload = load_json(science_store / "install_status.json")
     missing = status_payload.get("missing_components")
     if status_payload.get("status") != "ready" or (isinstance(missing, list) and missing):
@@ -7401,18 +9675,51 @@ def evaluate_installer_science_store_readiness(
                 "db_path",
             ]
             if tool == "foldseek":
-                required.append("scope_digest")
-            if (
+                required.extend(["scope_digest", "scope_mode", "scope_status"])
+                if row.get("scope_status") == "ready_partial_on_demand":
+                    required.extend(
+                        [
+                            "indexed_source_listing_sha256",
+                            "indexed_validated_ids_manifest",
+                            "indexed_validated_ids_sha256",
+                            "indexed_mapping_sha256",
+                            "indexed_subset_digest",
+                            "indexed_pdb_count",
+                            "indexed_entries",
+                        ]
+                    )
+            manifest_invalid = bool(
                 row.get("status") != "ready"
                 or row.get("manifest_schema_version") != ALIGNMENT_MANIFEST_SCHEMA_VERSION
                 or any(not row.get(field, "") for field in required)
-            ):
+            )
+            if manifest_invalid:
                 block(
                     f"alignment_manifest_invalid:{tool}:{row.get('source_id', 'unknown')}",
                     "alignment",
                     rel_path,
                     "migrate_or_rebuild_alignment_database",
                 )
+                continue
+            if tool == "foldseek" and row.get("scope_status") == "ready_partial_on_demand":
+                db_path = resolve_manifest_path(science_store, row.get("db_path", ""))
+                validation = (
+                    foldseek_partial_manifest_validation(
+                        science_store,
+                        row,
+                        db_path,
+                        probe_database=False,
+                    )
+                    if db_path is not None
+                    else {"status": "failed", "reason": "foldseek_partial_database_path_missing"}
+                )
+                if validation.get("status") != "ready":
+                    block(
+                        f"alignment_manifest_invalid:{tool}:{row.get('source_id', 'unknown')}",
+                        "alignment",
+                        str(validation.get("reason", "foldseek_partial_validation_failed")),
+                        "migrate_or_rebuild_alignment_database",
+                    )
 
     rcsb_root = science_store / "downloads/rcsb/mmcif"
     rcsb_snapshot = read_json_object(science_store / "downloads/rcsb/ligand_bound_pdb_scope.json")
@@ -7423,27 +9730,93 @@ def evaluate_installer_science_store_readiness(
         for path in rcsb_root.rglob("*")
         if path.is_file() and (path.name.lower().endswith(".part") or ".part.quarantine-" in path.name.lower())
     ] if rcsb_root.is_dir() else []
+    rcsb_resumable_partials = [path for path in rcsb_partials if partial_has_resumable_identity(path)]
+    rcsb_obsolete_partials = [path for path in rcsb_partials if path not in rcsb_resumable_partials]
     try:
         rcsb_scope_count = int(rcsb_snapshot.get("scope_count", 0) or 0)
+        rcsb_ready_count = int(rcsb_snapshot.get("ready_count", 0) or 0)
+        rcsb_missing_count = int(rcsb_snapshot.get("missing_count", 0) or 0)
     except (TypeError, ValueError):
         rcsb_scope_count = 0
-    if (
-        rcsb_snapshot.get("schema_version") != "genoligand_rcsb_scope_snapshot_v1"
-        or not rcsb_scope_count
-        or rcsb_snapshot.get("scope_count") != rcsb_snapshot.get("ready_count")
-        or len(rcsb_scope_rows) != rcsb_scope_count
-        or not re.fullmatch(r"[0-9a-f]{64}", str(rcsb_snapshot.get("coordinate_digest", "")).lower())
-        or rcsb_snapshot.get("coordinate_files") != rcsb_source_summary.get("file_count")
-        or rcsb_snapshot.get("coordinate_bytes") != rcsb_source_summary.get("bytes")
-        or rcsb_snapshot.get("coordinate_digest") != rcsb_source_summary.get("sha256")
-    ):
+        rcsb_ready_count = 0
+        rcsb_missing_count = 0
+    rcsb_mode = str(rcsb_snapshot.get("scope_mode", "")).replace("_", "-")
+    snapshot_common_valid = bool(
+        rcsb_snapshot.get("schema_version") == "genoligand_rcsb_scope_snapshot_v1"
+        and rcsb_scope_snapshot_matches_current_sources(science_store, rcsb_snapshot)
+        and rcsb_scope_count
+        and rcsb_ready_count
+        and rcsb_missing_count == rcsb_scope_count - rcsb_ready_count
+        and len(rcsb_scope_rows) == rcsb_scope_count
+        and re.fullmatch(r"[0-9a-f]{64}", str(rcsb_snapshot.get("coordinate_digest", "")).lower())
+        and rcsb_snapshot.get("coordinate_files") == rcsb_ready_count
+    )
+    rcsb_refresh_needed = bool(
+        snapshot_common_valid
+        and (
+            rcsb_snapshot.get("coordinate_files") != rcsb_source_summary.get("file_count")
+            or rcsb_snapshot.get("coordinate_bytes") != rcsb_source_summary.get("bytes")
+            or rcsb_snapshot.get("coordinate_digest") != rcsb_source_summary.get("sha256")
+        )
+    )
+    if rcsb_mode == "on-demand":
+        policy = read_json_object(science_store / "downloads/rcsb/on_demand_policy.json")
+        policy_valid = bool(
+            policy.get("schema_version") == "genoligand_rcsb_on_demand_policy_v1"
+            and policy.get("status") == "ready"
+            and policy.get("mode") == "on_demand"
+            and policy.get("official_base_url") == "https://files.rcsb.org/download"
+            and policy.get("coordinate_template")
+            == "https://files.rcsb.org/download/{pdb_id}.cif.gz"
+            and policy.get("cache_root") == "downloads/rcsb/mmcif"
+            and policy.get("max_fetches_per_run") == 12
+            and policy.get("validation") == "gzip_mmcif_entry_and_atom_site"
+            and policy.get("cached_ready_count") == rcsb_ready_count
+            and policy.get("scope_count") == rcsb_scope_count
+        )
+        rcsb_scope_valid = snapshot_common_valid and policy_valid
+    else:
+        rcsb_scope_valid = bool(
+            snapshot_common_valid
+            and rcsb_mode == "complete"
+            and rcsb_ready_count == rcsb_scope_count
+            and not rcsb_refresh_needed
+        )
+    if not rcsb_scope_valid:
         block(
             "rcsb_scope_incomplete",
             "rcsb",
             f"ready={rcsb_snapshot.get('ready_count', 0)} scope={rcsb_snapshot.get('scope_count', 0)}",
             "sync_rcsb_ligand_bound_scope",
         )
-    if rcsb_partials:
+    if rcsb_refresh_needed and rcsb_mode == "on-demand":
+        advisories.append(
+            {
+                "code": "rcsb_foldseek_refresh_needed",
+                "component": "rcsb",
+                "evidence": "cached coordinate set changed after the published snapshot",
+                "action": "refresh_foldseek_when_convenient",
+            }
+        )
+    if rcsb_resumable_partials and rcsb_mode == "on-demand":
+        advisories.append(
+            {
+                "code": "rcsb_partial_download_preserved",
+                "component": "rcsb",
+                "evidence": f"identity_protected_partial_files={len(rcsb_resumable_partials)}",
+                "action": "resume_matching_coordinate_on_demand",
+            }
+        )
+    if rcsb_obsolete_partials and rcsb_mode == "on-demand":
+        advisories.append(
+            {
+                "code": "rcsb_partial_download_obsolete",
+                "component": "rcsb",
+                "evidence": f"untrusted_partial_files={len(rcsb_obsolete_partials)}",
+                "action": "remove_untrusted_partial_downloads",
+            }
+        )
+    elif rcsb_partials and rcsb_mode != "on-demand":
         block(
             "rcsb_partial_present",
             "rcsb",
@@ -7462,6 +9835,9 @@ def evaluate_installer_science_store_readiness(
         "evidence_digest": evidence_digest,
         "sources": sources,
         "indexes": index_rows,
+        "rcsb_scope_mode": rcsb_mode,
+        "rcsb_refresh_needed": rcsb_refresh_needed,
+        "advisories": advisories,
         "blockers": blockers,
         "repair_actions": sorted({item["repair_action"] for item in blockers if item["repair_action"]}),
     }
@@ -7794,19 +10170,32 @@ def existing_path_for_disk_usage(path: Path) -> Path:
     return current
 
 
+def same_storage_volume(left: Path, right: Path) -> bool:
+    left_existing = existing_path_for_disk_usage(left).resolve()
+    right_existing = existing_path_for_disk_usage(right).resolve()
+    if os.name == "nt":
+        return left_existing.drive.casefold() == right_existing.drive.casefold()
+    return left_existing.stat().st_dev == right_existing.stat().st_dev
+
+
 def capacity_item(
     component: str,
     action: str,
-    download_bytes: int,
+    download_bytes: int | None,
     staging_bytes: int,
     reclaimable_bytes: int,
     available_bytes: int,
 ) -> dict[str, object]:
-    required_peak = max(0, download_bytes + staging_bytes - reclaimable_bytes) + DISK_SAFETY_MARGIN_BYTES
+    known_download_bytes = max(0, int(download_bytes)) if download_bytes is not None else 0
+    required_peak = (
+        max(0, known_download_bytes + staging_bytes - reclaimable_bytes) + DISK_SAFETY_MARGIN_BYTES
+        if download_bytes is not None
+        else None
+    )
     return {
         "component": component,
         "action": action,
-        "download_bytes": max(0, int(download_bytes)),
+        "download_bytes": known_download_bytes if download_bytes is not None else None,
         "staging_bytes": max(0, int(staging_bytes)),
         "reclaimable_bytes": max(0, int(reclaimable_bytes)),
         "required_peak_bytes": required_peak,
@@ -7834,7 +10223,9 @@ def rcsb_capacity_estimate(
     science_store: Path,
     *,
     resolve_remote: bool,
+    rcsb_mode: str = "on-demand",
 ) -> dict[str, object]:
+    mode = normalize_rcsb_mode(rcsb_mode)
     scope = sorted(ligand_bound_pdb_scope(science_store))
     ready_sizes: list[int] = []
     missing_ids: list[str] = []
@@ -7845,10 +10236,29 @@ def rcsb_capacity_estimate(
             ready_sizes.append(coordinate.stat().st_size)
         else:
             missing_ids.append(upper)
-    if not missing_ids:
+    if mode == "on-demand":
+        local_mean = (
+            (sum(ready_sizes) + len(ready_sizes) - 1) // len(ready_sizes)
+            if ready_sizes
+            else 0
+        )
         return {
-            "action": "reuse_after_scope_validation" if scope else "resolve_remote_size_before_download",
+            "action": "reuse_partial_scope_on_demand",
             "download_bytes": 0,
+            "scope_mode": "on_demand",
+            "scope_objects": len(scope),
+            "missing_objects": len(missing_ids),
+            "observed_local_files": len(ready_sizes),
+            "observed_local_mean_bytes": local_mean,
+            "remote_sample_files": 0,
+            "remote_sample_mean_bytes": 0,
+            "estimated_object_bytes": 0,
+        }
+    if not missing_ids:
+        scope_ready = bool(scope)
+        return {
+            "action": "reuse_after_scope_validation" if scope_ready else "resolve_remote_size_before_download",
+            "download_bytes": 0 if scope_ready else None,
             "scope_objects": len(scope),
             "missing_objects": 0,
             "observed_local_files": len(ready_sizes),
@@ -7876,7 +10286,7 @@ def rcsb_capacity_estimate(
     if observed_mean <= 0:
         action = "resolve_remote_size_before_download"
         estimated_object_bytes = 0
-        download_bytes = 0
+        download_bytes = None
     else:
         estimated_object_bytes = (
             observed_mean * RCSB_CAPACITY_AGGREGATE_MARGIN_NUMERATOR
@@ -7904,13 +10314,27 @@ def installation_capacity_plan(
     source_sync_plan: Path,
     *,
     available_bytes: int | None = None,
+    scratch_dir: Path | None = None,
+    scratch_available_bytes: int | None = None,
     resolve_remote: bool = False,
     summary_cache: ResourceSummaryCache | None = None,
+    env: dict[str, str] | None = None,
+    wsl_distro: str | None = None,
+    rcsb_mode: str = "on-demand",
 ) -> dict[str, object]:
+    scratch_root = Path(scratch_dir) if scratch_dir is not None else default_installer_scratch_dir()
+    shared_scratch_volume = same_storage_volume(science_store, scratch_root)
     available = (
         int(available_bytes)
         if available_bytes is not None
         else int(shutil.disk_usage(existing_path_for_disk_usage(science_store)).free)
+    )
+    scratch_available = (
+        int(scratch_available_bytes)
+        if scratch_available_bytes is not None
+        else available
+        if shared_scratch_volume
+        else int(shutil.disk_usage(existing_path_for_disk_usage(scratch_root)).free)
     )
     items: list[dict[str, object]] = []
     for row in read_tsv(source_catalog):
@@ -7931,8 +10355,9 @@ def installation_capacity_plan(
             download_bytes = 0
         else:
             identity = remote_resource_identity(row.get("url", "")) if resolve_remote else {}
-            download_bytes = int(identity.get("content_length", 0) or 0)
-            action = "download" if download_bytes else "resolve_remote_size_before_download"
+            remote_bytes = int(identity.get("content_length", 0) or 0)
+            download_bytes = remote_bytes if remote_bytes > 0 else None
+            action = "download" if download_bytes is not None else "resolve_remote_size_before_download"
         partial = destination.with_suffix(destination.suffix + ".part")
         reclaimable = partial.stat().st_size if partial.is_file() and not partial_identity_path(partial).is_file() else 0
         items.append(
@@ -7962,25 +10387,40 @@ def installation_capacity_plan(
             science_store,
             previous_external.get(source_id, {}),
             summary_cache,
+            rcsb_mode=rcsb_mode,
         ):
             items.append(capacity_item(source_id, "reuse_after_digest", 0, 0, 0, available))
             continue
-        download_bytes = 0
+        download_bytes: int | None = None
         action = "resolve_remote_size_before_download"
         capacity_evidence: dict[str, object] = {}
         if method == "html_links" and resolve_remote:
-            try:
-                estimate = publisher_inventory_capacity(html_links_inventory(row), target)
+            inventory_result = (
+                publisher_inventory_with_cache(row, science_store, html_links_inventory)
+                if row.get("checksum_url", "").strip()
+                else publisher_capacity_inventory_with_retry(row, html_links_inventory)
+            )
+            capacity_evidence = {
+                "inventory_source": inventory_result["source"],
+                "inventory_attempts": inventory_result["attempts"],
+                "inventory_error": inventory_result["error"],
+                "source_url": inventory_result["source_url"],
+            }
+            inventory = inventory_result["items"]
+            if inventory:
+                estimate = publisher_inventory_capacity(inventory, target)
                 download_bytes = int(estimate["download_bytes"])
                 action = str(estimate["action"])
-                capacity_evidence = estimate
-            except (OSError, urllib.error.URLError, urllib.error.HTTPError):
-                pass
+                capacity_evidence.update(estimate)
         elif method == "gcs_prefix" and resolve_remote:
             try:
                 estimate = publisher_inventory_capacity(gcs_prefix_inventory(row), target)
-                download_bytes = int(estimate["download_bytes"])
                 action = str(estimate["action"])
+                download_bytes = (
+                    int(estimate["download_bytes"])
+                    if action != "resolve_remote_size_before_download"
+                    else None
+                )
                 capacity_evidence = estimate
             except (OSError, urllib.error.URLError, urllib.error.HTTPError, ValueError, json.JSONDecodeError):
                 pass
@@ -7990,14 +10430,17 @@ def installation_capacity_plan(
                 target,
                 science_store,
                 resolve_remote=resolve_remote,
+                rcsb_mode=rcsb_mode,
             )
-            download_bytes = int(estimate["download_bytes"])
+            raw_download_bytes = estimate["download_bytes"]
+            download_bytes = int(raw_download_bytes) if raw_download_bytes is not None else None
             action = str(estimate["action"])
             capacity_evidence = estimate
         elif method == "direct" and resolve_remote:
             identity = remote_resource_identity(direct_source_location(row))
-            download_bytes = int(identity.get("content_length", 0) or 0)
-            action = "download" if download_bytes else action
+            remote_bytes = int(identity.get("content_length", 0) or 0)
+            download_bytes = remote_bytes if remote_bytes > 0 else None
+            action = "download" if download_bytes is not None else action
         item = capacity_item(source_id, action, download_bytes, 0, 0, available)
         item.update({key: value for key, value in capacity_evidence.items() if key not in {"action", "download_bytes"}})
         items.append(item)
@@ -8010,59 +10453,200 @@ def installation_capacity_plan(
         )
         for row in read_tsv(science_store / rel)
     }
-    alignment_specs: list[tuple[str, Path, Path]] = [
-        (source_id, source, science_store / "indexes/mmseqs" / safe_file_stem(source_id) / "target")
+    alignment_specs: list[tuple[str, str, Path, Path]] = [
+        (
+            "mmseqs",
+            source_id,
+            source,
+            science_store / "indexes/mmseqs" / safe_file_stem(source_id) / "target",
+        )
         for source_id, source in sequence_database_sources(science_store)
     ]
     alignment_specs.append(
         (
+            "foldseek",
             "rcsb_mmcif",
             science_store / "downloads/rcsb/mmcif",
             science_store / "indexes/foldseek/rcsb_mmcif/target",
         )
     )
-    for source_id, source, db_path in alignment_specs:
+    for tool, source_id, source, db_path in alignment_specs:
         if not path_has_payload(source):
             continue
         previous = manifest_rows.get(source_id, {})
+        recovery = reconcile_database_directory_publish(db_path)
+        if recovery.get("status") != "ready":
+            items.append(
+                capacity_item(
+                    f"alignment:{source_id}",
+                    str(recovery.get("reason", "database_directory_recovery_needs_repair")),
+                    0,
+                    0,
+                    0,
+                    available,
+                )
+            )
+            continue
         db_bytes = directory_size(db_path.parent)
-        if previous.get("status") == "ready" and previous.get("manifest_schema_version") == ALIGNMENT_MANIFEST_SCHEMA_VERSION:
+        command = shutil.which(tool, path=(env or os.environ).get("PATH"))
+        builder_version = database_builder_version(tool, command, env, wsl_distro)
+        migrated = legacy_alignment_manifest_can_migrate(
+            tool,
+            previous,
+            science_store,
+            source,
+            db_path,
+            command,
+            env,
+            wsl_distro,
+            builder_version=builder_version,
+        )
+        partial_candidate = bool(
+            tool == "foldseek"
+            and normalize_rcsb_mode(rcsb_mode) == "on-demand"
+            and database_artifacts_present(db_path)
+            and Path(f"{db_path}.source").is_file()
+        )
+        if partial_candidate:
+            action = "migrate_partial_on_demand_after_probe"
+            staging = 0
+        elif previous.get("status") == "ready" and previous.get("manifest_schema_version") == ALIGNMENT_MANIFEST_SCHEMA_VERSION:
             action = "reuse_after_probe"
             staging = 0
-        elif previous.get("status") == "ready" and db_bytes:
+        elif migrated:
             action = "migrate_after_probe"
             staging = 0
         else:
             action = "rebuild"
             staging = max(db_bytes, directory_size(source) * 2)
-        items.append(capacity_item(f"alignment:{source_id}", action, 0, staging, 0, available))
+        if tool == "foldseek":
+            estimate = foldseek_staging_estimate(source, db_path, previous)
+            target_staging = int(estimate["target_staging_bytes"]) if action == "rebuild" else 0
+            scratch_staging = int(estimate["scratch_staging_bytes"]) if action == "rebuild" else 0
+            item = capacity_item(
+                f"alignment:{source_id}",
+                action,
+                0,
+                target_staging,
+                0,
+                available,
+            )
+            item.update(
+                {
+                    "scratch_staging_bytes": scratch_staging,
+                    "scratch_available_bytes": scratch_available,
+                    "scratch_required_peak_bytes": (
+                        scratch_staging + DISK_SAFETY_MARGIN_BYTES if scratch_staging else 0
+                    ),
+                    "target_staging_bytes": target_staging,
+                    "target_available_bytes": available,
+                    "target_required_peak_bytes": (
+                        target_staging + DISK_SAFETY_MARGIN_BYTES if target_staging else 0
+                    ),
+                    "scratch_target_same_volume": shared_scratch_volume,
+                    "source_files_for_estimate": estimate["source_files"],
+                    "source_bytes_for_estimate": estimate["source_bytes"],
+                }
+            )
+            items.append(item)
+        else:
+            items.append(capacity_item(f"alignment:{source_id}", action, 0, staging, 0, available))
 
     chembl_archive = science_store / "downloads/chembl/chembl_sqlite.tar.gz"
     chembl_query = science_store / "downloads/chembl/chembl_query.sqlite"
-    if chembl_archive.is_file() and chembl_archive.stat().st_size > 0 and not chembl_query.is_file():
-        staging = 0
+    chembl_manifest = chembl_query.with_suffix(".manifest.json")
+    chembl_ready = False
+    if chembl_archive.is_file() and chembl_archive.stat().st_size > 0 and chembl_query.is_file():
+        catalog_row = next((row for row in read_tsv(source_catalog) if row.get("source_id") == "chembl"), {})
+        source_release = catalog_row.get("release_identity") or catalog_row.get("release_or_date") or "unknown"
+        source_digest = str(resource_payload_summary(chembl_archive, cache=summary_cache).get("sha256", ""))
+        chembl_ready = chembl_query_database_ready(
+            chembl_query,
+            chembl_manifest,
+            source_digest,
+            source_release,
+            summary_cache,
+        )
+    if chembl_archive.is_file() and chembl_archive.stat().st_size > 0 and not chembl_ready:
+        source_staging = 0
         try:
             with tarfile.open(chembl_archive, "r:gz") as archive:
-                staging = max((item.size for item in archive.getmembers() if item.isfile() and item.name.endswith(".db")), default=0)
+                source_staging = max(
+                    (
+                        int(item.size)
+                        for item in archive.getmembers()
+                        if item.isfile() and item.name.lower().endswith((".db", ".sqlite"))
+                    ),
+                    default=0,
+                )
         except tarfile.TarError:
-            staging = chembl_archive.stat().st_size * 4
-        items.append(capacity_item("chembl_query_database", "extract_and_index", 0, staging * 2, 0, available))
+            source_staging = chembl_archive.stat().st_size * 4
+        target_staging = chembl_query_target_staging_bytes(source_staging, chembl_archive.stat().st_size)
+        chembl_item = capacity_item(
+            "chembl_query_database",
+            "extract_to_scratch_and_build_filtered_query_database",
+            0,
+            target_staging,
+            0,
+            available,
+        )
+        chembl_item.update(
+            {
+                "scratch_staging_bytes": source_staging,
+                "scratch_available_bytes": scratch_available,
+                "scratch_required_peak_bytes": source_staging + DISK_SAFETY_MARGIN_BYTES,
+                "target_staging_bytes": target_staging,
+                "target_available_bytes": available,
+                "target_required_peak_bytes": target_staging + DISK_SAFETY_MARGIN_BYTES,
+                "scratch_target_same_volume": shared_scratch_volume,
+            }
+        )
+        items.append(chembl_item)
 
     unresolved = [item for item in items if item["action"] == "resolve_remote_size_before_download"]
-    total_download = sum(int(item["download_bytes"]) for item in items)
+    known_download = sum(
+        int(item["download_bytes"])
+        for item in items
+        if item["download_bytes"] is not None
+    )
     peak_staging = max((int(item["staging_bytes"]) for item in items), default=0)
+    scratch_peak_staging = max((int(item.get("scratch_staging_bytes", 0)) for item in items), default=0)
     reclaimable = sum(int(item["reclaimable_bytes"]) for item in items)
-    required_peak = max(0, total_download + peak_staging - reclaimable) + DISK_SAFETY_MARGIN_BYTES
-    status = "blocked" if unresolved or required_peak > available else "ready"
+    target_required_peak = max(0, known_download + peak_staging - reclaimable) + DISK_SAFETY_MARGIN_BYTES
+    scratch_required_peak = (
+        scratch_peak_staging + DISK_SAFETY_MARGIN_BYTES if scratch_peak_staging > 0 else 0
+    )
+    required_peak = (
+        max(0, known_download + peak_staging + scratch_peak_staging - reclaimable)
+        + DISK_SAFETY_MARGIN_BYTES
+        if shared_scratch_volume
+        else target_required_peak
+    )
+    capacity_failures = []
+    if required_peak > available:
+        capacity_failures.append("target")
+    if not shared_scratch_volume and scratch_required_peak > scratch_available:
+        capacity_failures.append("scratch")
+    status = "blocked" if unresolved or capacity_failures else "ready"
     payload = {
         "schema_version": "genoligand_installation_capacity_plan_v1",
         "status": status,
         "items": items,
-        "download_bytes": total_download,
+        "download_bytes": None if unresolved else known_download,
+        "known_download_bytes": known_download,
         "staging_bytes": peak_staging,
+        "target_staging_bytes": peak_staging,
+        "scratch_staging_bytes": scratch_peak_staging,
         "reclaimable_bytes": reclaimable,
         "required_peak_bytes": required_peak,
+        "target_required_peak_bytes": target_required_peak,
+        "scratch_required_peak_bytes": scratch_required_peak,
+        "required_peak_is_lower_bound": bool(unresolved),
         "available_bytes": available,
+        "target_available_bytes": available,
+        "scratch_available_bytes": scratch_available,
+        "scratch_target_same_volume": shared_scratch_volume,
+        "capacity_failures": capacity_failures,
         "safety_margin_bytes": DISK_SAFETY_MARGIN_BYTES,
         "unresolved_components": [str(item["component"]) for item in unresolved],
     }
@@ -8078,6 +10662,8 @@ def main() -> int:
     )
     parser.add_argument("--workspace-root", default=str(repo_root()))
     parser.add_argument("--science-store", default=str(default_science_store()))
+    parser.add_argument("--scratch-dir")
+    parser.add_argument("--rcsb-mode", choices=["on-demand", "complete"], default="on-demand")
     parser.add_argument("--runtime-dir", default=str(default_runtime_dir()))
     parser.add_argument("--gls-cli")
     parser.add_argument("--gls-server")
@@ -8098,6 +10684,11 @@ def main() -> int:
 
     workspace_root = Path(args.workspace_root).resolve()
     science_store = Path(args.science_store).resolve()
+    scratch_dir = (
+        Path(args.scratch_dir).resolve()
+        if args.scratch_dir
+        else default_installer_scratch_dir().resolve()
+    )
     runtime_dir = Path(args.runtime_dir).resolve()
     runtime_dir.mkdir(parents=True, exist_ok=True)
     python_env_dir = (
@@ -8108,18 +10699,44 @@ def main() -> int:
     source_catalog = Path(args.source_catalog).resolve() if args.source_catalog else default_source_catalog(workspace_root, science_store)
     source_sync_plan = default_source_sync_plan(workspace_root, science_store)
     fingerprint_cache_path = science_store / "manifests/source_fingerprint_cache.json"
-    resource_summary_cache = load_resource_summary_cache(fingerprint_cache_path)
-    capacity_plan = installation_capacity_plan(
-        science_store,
-        source_catalog,
-        source_sync_plan,
-        resolve_remote=not args.no_download,
-        summary_cache=resource_summary_cache,
-    )
-    save_resource_summary_cache(fingerprint_cache_path, resource_summary_cache)
-    if args.dry_run or capacity_plan.get("status") != "ready":
+    write_capacity_attempt_state(science_store, status="running")
+    try:
+        resource_summary_cache = load_resource_summary_cache(fingerprint_cache_path)
+        capacity_plan = installation_capacity_plan(
+            science_store,
+            source_catalog,
+            source_sync_plan,
+            scratch_dir=scratch_dir,
+            resolve_remote=not args.no_download,
+            summary_cache=resource_summary_cache,
+            wsl_distro=args.wsl_distro,
+            rcsb_mode=args.rcsb_mode,
+        )
+        save_resource_summary_cache(fingerprint_cache_path, resource_summary_cache)
+    except Exception as err:  # noqa: BLE001 - persist a terminal preflight result
+        error = f"{type(err).__name__}:{err}"
+        write_capacity_attempt_state(science_store, status="failed", error=error)
+        print(
+            json.dumps(
+                {
+                    "schema_version": "genoligand_installation_capacity_plan_v1",
+                    "status": "failed",
+                    "error": error,
+                },
+                ensure_ascii=False,
+                indent=2,
+            )
+        )
+        return 2
+    if capacity_plan.get("status") != "ready":
+        terminal_status = "failed" if capacity_plan.get("status") == "failed" else "blocked"
+        write_capacity_attempt_state(science_store, status=terminal_status, capacity_plan=capacity_plan)
         print(json.dumps(capacity_plan, ensure_ascii=False, indent=2))
-        return 0 if args.dry_run and capacity_plan.get("status") == "ready" else 2
+        return 2
+    if args.dry_run:
+        write_capacity_attempt_state(science_store, status="capacity_ready", capacity_plan=capacity_plan)
+        print(json.dumps(capacity_plan, ensure_ascii=False, indent=2))
+        return 0
     prepend_process_path(host_toolchain_path_entries())
     install_lock = acquire_install_lock(science_store)
     write_install_progress(
@@ -8171,6 +10788,7 @@ def main() -> int:
         args.no_download,
         science_env,
         resource_summary_cache,
+        rcsb_mode=args.rcsb_mode,
     )
     write_install_progress(
         science_store,
@@ -8204,11 +10822,6 @@ def main() -> int:
         source_sync_plan,
         science_store,
         source_manifest_progress,
-        resource_summary_cache,
-    )
-    chembl_query_result = publish_chembl_query_database(
-        science_store,
-        source_catalog,
         resource_summary_cache,
     )
     write_install_progress(
@@ -8318,6 +10931,46 @@ def main() -> int:
     tool_python = str(tool_environment_result.get("python", "")).strip()
     if tool_python:
         command_env["GENOLIGAND_PYTHON"] = tool_python
+    write_install_progress(
+        science_store,
+        status="running",
+        stage="构建索引",
+        current_resource="序列和结构比对数据库",
+        completed_steps=5,
+        total_steps=6,
+        message="正在构建本地 MMseqs2 和 Foldseek 目标数据库",
+    )
+    alignment_database_result = build_persistent_alignment_databases(
+        science_store,
+        command_env,
+        selected_wsl,
+        resource_summary_cache,
+        scratch_dir=scratch_dir,
+        rcsb_mode=args.rcsb_mode,
+    )
+    alignment_consumer_result = alignment_worker_consumer_smoke(
+        workspace_root,
+        science_store,
+        tool_python,
+        python_backend,
+        selected_wsl,
+    )
+    alignment_database_result["consumer_smoke"] = alignment_consumer_result
+    if alignment_consumer_result.get("status") != "ready":
+        alignment_database_result["status"] = "needs_repair"
+    chembl_query_result = (
+        publish_chembl_query_database(
+            science_store,
+            source_catalog,
+            resource_summary_cache,
+            scratch_dir=scratch_dir,
+        )
+        if alignment_database_result.get("status") == "ready"
+        else {
+            "status": "needs_repair",
+            "reason": "chembl_query_deferred_until_alignment_ready",
+        }
+    )
     plinder_index_result = prepare_plinder_canonical_index(
         workspace_root,
         science_store,
@@ -8360,31 +11013,6 @@ def main() -> int:
         science_store,
         status="running",
         stage="构建索引",
-        current_resource="序列和结构比对数据库",
-        completed_steps=5,
-        total_steps=6,
-        message="正在构建本地 MMseqs2 和 Foldseek 目标数据库",
-    )
-    alignment_database_result = build_persistent_alignment_databases(
-        science_store,
-        command_env,
-        selected_wsl,
-        resource_summary_cache,
-    )
-    alignment_consumer_result = alignment_worker_consumer_smoke(
-        workspace_root,
-        science_store,
-        tool_python,
-        python_backend,
-        selected_wsl,
-    )
-    alignment_database_result["consumer_smoke"] = alignment_consumer_result
-    if alignment_consumer_result.get("status") != "ready":
-        alignment_database_result["status"] = "needs_repair"
-    write_install_progress(
-        science_store,
-        status="running",
-        stage="构建索引",
         current_resource="OpenFF 小分子力场",
         completed_steps=5,
         total_steps=6,
@@ -8397,6 +11025,7 @@ def main() -> int:
         science_store,
         external_sync_result,
         resource_summary_cache,
+        rcsb_mode=args.rcsb_mode,
     )
     resource_result = resource_summary(science_store)
     install_status = installation_status(
@@ -8415,6 +11044,7 @@ def main() -> int:
         science_store,
         summary_cache=resource_summary_cache,
     )
+    save_resource_summary_cache(fingerprint_cache_path, resource_summary_cache)
     worker_wrapper = Path(tool_python) if tool_python and Path(tool_python).is_file() else None
     runtime_binary_manifest = write_runtime_binary_manifest(
         runtime_dir,

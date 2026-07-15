@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import shutil
 import subprocess
 import tempfile
 import unittest
@@ -13,19 +14,35 @@ from genoligand_workers.alignment_worker import (
     SequenceInput,
     StructureQuery,
     TargetDatabase,
+    foldseek_lookup_names,
     foldseek_rows,
     foldseek_target_databases,
+    mmseqs_prefilter_options,
     mmseqs_rows,
     read_sequence_inputs,
     run_foldseek_alignment,
     run_mmseqs_alignment,
     sequence_query_id,
+    structure_query,
     write_fasta,
 )
 from genoligand_workers.md_summary_worker import canonical_digest, run_md_summary_job
 
 
 class AlignmentRecordIdentityTests(unittest.TestCase):
+    def test_metagenome_search_uses_single_query_low_memory_prefilter(self) -> None:
+        metagenome = TargetDatabase(
+            "mgnify",
+            "MGnify",
+            "metagenome",
+            "a" * 64,
+            "MMseqs2-test",
+            Path("target"),
+        )
+        known = metagenome._replace(namespace="UniProt", source_class="known")
+        self.assertEqual(mmseqs_prefilter_options(metagenome), ["--prefilter-mode", "1"])
+        self.assertEqual(mmseqs_prefilter_options(known), [])
+
     @staticmethod
     def write_sequence_manifest(run_dir: Path) -> str:
         run_dir.mkdir(parents=True, exist_ok=True)
@@ -62,9 +79,13 @@ class AlignmentRecordIdentityTests(unittest.TestCase):
         query.write_text("ATOM      1  CA  GLY A   1       0.0  0.0  0.0\n", encoding="utf-8")
         digest = hashlib.sha256(query.read_bytes()).hexdigest()
         (run_dir / "input_conversion_manifest.tsv").write_text(
-            "input_id\trecord_id\tcanonical_kind\tcanonical_value\tconversion_status\t"
-            "format\tcontent_sha256\n"
-            f"input-structure\trecord-structure\tcomplex\tstructure_viewer.pdb\tconverted\tpdb\t{digest}\n",
+            "input_id\trecord_id\toriginal_field\tinferred_kind\tcanonical_kind\t"
+            "canonical_value\tconversion_status\tconversion_method\tformat\tsource_kind\t"
+            "source_path\tcontent_sha256\treason\tartifact\trisk_flags\tstructure_atom_count\t"
+            "structure_chain_count\tstructure_residue_count\n"
+            f"input-structure\trecord-structure\tcomplex\tcomplex\tcomplex\tcoordinate-content\t"
+            f"converted\tdeclared_structure_file\tpdb\tfile\t{query.resolve()}\t{digest}\t"
+            "recognized\t\t\t1\t1\t1\n",
             encoding="utf-8",
         )
         return StructureQuery(
@@ -241,10 +262,16 @@ class AlignmentRecordIdentityTests(unittest.TestCase):
                 commands.append(command)
                 if command[1] == "version":
                     return subprocess.CompletedProcess(command, 0, "Foldseek-test\n", "")
+                if command[1] == "createdb":
+                    Path(f"{command[3]}.lookup").write_text(
+                        "0\tstructure_viewer_A\t0\n1\tstructure_viewer_B\t0\n",
+                        encoding="utf-8",
+                    )
                 if command[1] == "convertalis":
                     target = Path(command[3]).parent.name
                     Path(command[5]).write_text(
-                        f"{query.query_id}\t{target}_hit\t40\t0.8\t1e-8\t60\n",
+                        f"structure_viewer_A\t{target}_hit_A\t40\t0.8\t1e-8\t60\n"
+                        f"structure_viewer_B\t{target}_hit_B\t42\t0.7\t2e-8\t58\n",
                         encoding="utf-8",
                     )
                 return subprocess.CompletedProcess(command, 0, "", "")
@@ -271,6 +298,11 @@ class AlignmentRecordIdentityTests(unittest.TestCase):
             self.assertIn("current_run_query_id\tquery_digest\ttm_score", matches.splitlines()[0])
             self.assertIn("input-structure", matches)
             self.assertIn("record-structure", matches)
+            parsed = [line.split("\t") for line in matches.splitlines()]
+            query_id_index = parsed[0].index("current_run_query_id")
+            self.assertEqual(len(parsed), 5)
+            self.assertEqual({row[query_id_index] for row in parsed[1:]}, {query.query_id})
+            self.assertNotIn("structure_viewer_A", {row[query_id_index] for row in parsed[1:]})
 
     def test_foldseek_rejects_orphan_empty_and_unproven_databases(self) -> None:
         with tempfile.TemporaryDirectory(prefix="genoligand_foldseek_strict_") as tmp:
@@ -340,10 +372,168 @@ class AlignmentRecordIdentityTests(unittest.TestCase):
                 "query-current",
                 "b" * 64,
             )
-            rows = foldseek_rows(raw, target, query, "Foldseek-test")
+            rows = foldseek_rows(
+                raw,
+                target,
+                query,
+                "Foldseek-test",
+                {"query-current"},
+            )
             low = float(rows[0].split("\t")[6])
             high = float(rows[1].split("\t")[6])
             self.assertGreater(high, low)
+
+    def test_foldseek_rejects_provenance_id_as_a_fabricated_native_query_name(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="genoligand_foldseek_native_name_") as tmp:
+            root = Path(tmp)
+            raw = root / "matches.m8"
+            query = StructureQuery(
+                root / "query.pdb",
+                "input-current",
+                "record-current",
+                "query_" + "b" * 64,
+                "b" * 64,
+            )
+            raw.write_text(
+                f"{query.query_id}\ttarget\t40\t0.8\t1e-8\t60\n",
+                encoding="utf-8",
+            )
+            target = FoldseekTargetDatabase(
+                "rcsb", "a" * 64, 1, 8, "Foldseek-test", root / "target"
+            )
+
+            with self.assertRaisesRegex(ValueError, "foldseek_query_identity_mismatch"):
+                foldseek_rows(raw, target, query, "Foldseek-test", {"query_native_A"})
+
+    def test_structure_query_is_bound_to_manifest_path_and_digest(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="genoligand_foldseek_query_binding_") as tmp:
+            run_dir = Path(tmp)
+            declared = run_dir / "declared_input.pdb"
+            declared.write_text("ATOM declared current\n", encoding="utf-8")
+            stale = run_dir / "structure_viewer.pdb"
+            stale.write_text("ATOM stale\n", encoding="utf-8")
+            digest = hashlib.sha256(declared.read_bytes()).hexdigest()
+            (run_dir / "input_conversion_manifest.tsv").write_text(
+                "input_id\trecord_id\tcanonical_kind\tconversion_status\tformat\t"
+                "source_path\tcontent_sha256\n"
+                f"input-current\trecord-current\tcomplex\tconverted\tpdb\t"
+                f"{declared.resolve()}\t{digest}\n",
+                encoding="utf-8",
+            )
+
+            query = structure_query(run_dir)
+
+            self.assertIsNotNone(query)
+            assert query is not None
+            self.assertEqual(query.path, declared.resolve())
+            self.assertEqual(query.query_digest, digest)
+            self.assertEqual(query.query_id, f"query_{digest}")
+
+    def test_structure_query_rejects_manifest_digest_mismatch(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="genoligand_foldseek_query_digest_") as tmp:
+            run_dir = Path(tmp)
+            query = run_dir / "declared_input.pdb"
+            query.write_text("ATOM changed\n", encoding="utf-8")
+            (run_dir / "input_conversion_manifest.tsv").write_text(
+                "input_id\trecord_id\tcanonical_kind\tconversion_status\tformat\t"
+                "source_path\tcontent_sha256\n"
+                f"input-current\trecord-current\tcomplex\tconverted\tpdb\t"
+                f"{query.resolve()}\t{'f' * 64}\n",
+                encoding="utf-8",
+            )
+
+            with self.assertRaisesRegex(ValueError, "foldseek_query_digest_mismatch"):
+                structure_query(run_dir)
+
+    def test_structure_query_rejects_conflicting_artifact_and_source(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="genoligand_foldseek_query_conflict_") as tmp:
+            run_dir = Path(tmp)
+            artifact = run_dir / "tool_outputs" / "query.pdb"
+            artifact.parent.mkdir()
+            artifact.write_text("ATOM artifact\n", encoding="utf-8")
+            source = run_dir / "source.pdb"
+            source.write_text("ATOM source differs\n", encoding="utf-8")
+            digest = hashlib.sha256(artifact.read_bytes()).hexdigest()
+            (run_dir / "input_conversion_manifest.tsv").write_text(
+                "input_id\trecord_id\tcanonical_kind\tconversion_status\tformat\t"
+                "source_path\tcontent_sha256\tartifact\n"
+                f"input-current\trecord-current\tcomplex\tconverted\tpdb\t{source.resolve()}\t"
+                f"{digest}\ttool_outputs/query.pdb\n",
+                encoding="utf-8",
+            )
+
+            with self.assertRaisesRegex(ValueError, "foldseek_query_path_content_mismatch"):
+                structure_query(run_dir)
+
+    def test_structure_query_does_not_treat_canonical_content_as_a_path(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="genoligand_foldseek_query_canonical_") as tmp:
+            run_dir = Path(tmp)
+            query = run_dir / "canonical-name.pdb"
+            query.write_text("ATOM stale\n", encoding="utf-8")
+            digest = hashlib.sha256(query.read_bytes()).hexdigest()
+            (run_dir / "input_conversion_manifest.tsv").write_text(
+                "input_id\trecord_id\tcanonical_kind\tcanonical_value\tconversion_status\t"
+                "format\tsource_path\tcontent_sha256\tartifact\n"
+                f"input-current\trecord-current\tcomplex\tcanonical-name.pdb\tconverted\tpdb\t\t"
+                f"{digest}\t\n",
+                encoding="utf-8",
+            )
+
+            with self.assertRaisesRegex(ValueError, "foldseek_query_path_missing"):
+                structure_query(run_dir)
+
+    def test_foldseek_lookup_names_requires_native_database_rows(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="genoligand_foldseek_lookup_") as tmp:
+            database = Path(tmp) / "query_db"
+            Path(f"{database}.lookup").write_text(
+                "0\tquery_native_A\t0\n1\tquery_native_B\t0\n",
+                encoding="utf-8",
+            )
+            self.assertEqual(
+                foldseek_lookup_names(database),
+                {"query_native_A", "query_native_B"},
+            )
+            Path(f"{database}.lookup").write_text("bad-row\n", encoding="utf-8")
+            with self.assertRaisesRegex(ValueError, "foldseek_query_lookup_invalid"):
+                foldseek_lookup_names(database)
+            Path(f"{database}.lookup").unlink()
+            Path(f"{database}.source").write_text("0\tquery_native_C\n", encoding="utf-8")
+            self.assertEqual(foldseek_lookup_names(database), {"query_native_C"})
+
+    @unittest.skipUnless(shutil.which("foldseek"), "local Foldseek executable is unavailable")
+    def test_real_foldseek_createdb_exposes_native_query_names(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="genoligand_foldseek_real_") as tmp:
+            root = Path(tmp)
+            query = root / "mini_query.pdb"
+            atoms: list[str] = []
+            serial = 1
+            for residue in range(1, 13):
+                base = (residue - 1) * 3.8
+                y = float(residue % 2)
+                for atom, offset, y_offset, element in (
+                    ("N", 0.0, 0.0, "N"),
+                    ("CA", 1.3, 0.5, "C"),
+                    ("C", 2.6, 0.0, "C"),
+                    ("O", 3.1, -0.7, "O"),
+                ):
+                    atoms.append(
+                        f"ATOM  {serial:5d} {atom:^4s} ALA A{residue:4d}    "
+                        f"{base + offset:8.3f}{y + y_offset:8.3f}{0.0:8.3f}"
+                        f"  1.00 20.00          {element:>2s}\n"
+                    )
+                    serial += 1
+            query.write_text("".join(atoms) + "END\n", encoding="ascii")
+            database = root / "query_db"
+            completed = subprocess.run(
+                [shutil.which("foldseek"), "createdb", str(query), str(database)],
+                capture_output=True,
+                text=True,
+                timeout=60,
+            )
+            self.assertEqual(completed.returncode, 0, completed.stderr or completed.stdout)
+            names = foldseek_lookup_names(database)
+            self.assertTrue(names)
+            self.assertTrue(all(not name.startswith("query_") for name in names))
 
     def test_mmseqs_mixed_database_failure_fails_stage_and_keeps_each_outcome(self) -> None:
         with tempfile.TemporaryDirectory(prefix="genoligand_mmseqs_mixed_") as tmp:

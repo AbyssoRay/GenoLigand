@@ -74,7 +74,9 @@ def resolve_worker_python() -> Path:
         or sys.executable
     )
     executable = shutil.which(configured) or configured
-    path = Path(executable).expanduser().resolve()
+    # Keep virtual-environment launchers intact: resolving the symlink would
+    # replace the venv interpreter with its base Python and lose site-packages.
+    path = Path(os.path.abspath(os.path.expanduser(executable)))
     require(path.is_file(), f"worker Python does not exist: {path}")
     require(os.access(path, os.X_OK), f"worker Python is not executable: {path}")
     probe = subprocess.run(

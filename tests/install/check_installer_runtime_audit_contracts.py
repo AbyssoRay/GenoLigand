@@ -31,6 +31,27 @@ class InstallerRuntimeAuditContracts(unittest.TestCase):
     def setUpClass(cls) -> None:
         cls.installer = load_installer_module()
 
+    def test_digest_bound_worker_locks_checkout_with_lf(self) -> None:
+        installer = self.installer
+        paths = [
+            "python/requirements-workers.lock.txt",
+            "python/requirements-workers-sources.lock.tsv",
+            *(f"python/{row['file']}" for row in installer.worker_lock_catalog().values()),
+        ]
+        completed = subprocess.run(
+            ["git", "check-attr", "eol", "--", *paths],
+            cwd=ROOT,
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+        attributes = {
+            line.rsplit(": ", 2)[0]: line.rsplit(": ", 2)[-1]
+            for line in completed.stdout.splitlines()
+            if line.strip()
+        }
+        self.assertEqual(attributes, {path: "lf" for path in paths})
+
     def test_install_lock_is_atomic_heartbeating_and_owner_aware(self) -> None:
         installer = self.installer
         with tempfile.TemporaryDirectory() as tmp:
@@ -92,6 +113,7 @@ class InstallerRuntimeAuditContracts(unittest.TestCase):
             "version": "8.2.0",
             "platforms": ["Reference", "CPU"],
             "cuda_ready": False,
+            "cuda_context_ready": False,
             "plugin_dir": "",
             "failure_reason": "openmm_platform_list_does_not_include_CUDA",
         }
@@ -143,6 +165,9 @@ class InstallerRuntimeAuditContracts(unittest.TestCase):
                 "version": state["version"],
                 "platforms": ["Reference", "CPU", *( ["CUDA"] if state["cuda"] else [])],
                 "cuda_ready": state["cuda"],
+                "cuda_context_ready": state["cuda"],
+                "cuda_context_platform": "CUDA" if state["cuda"] else "",
+                "cuda_context_failure": "" if state["cuda"] else "CUDA_context_unavailable",
                 "plugin_dir": "/plugins" if state["cuda"] else "",
                 "default_plugin_dir": "/default-plugins",
                 "loaded_plugins": ["libOpenMMCUDA.so"] if state["cuda"] else [],
@@ -204,6 +229,177 @@ class InstallerRuntimeAuditContracts(unittest.TestCase):
                 installer.locked_requirement_version(locks[2], "openmm-cuda-12"),
                 installer.OPENMM_RUNTIME_VERSION,
             )
+
+    def test_openmmforcefields_dependency_is_pinned_and_import_gated(self) -> None:
+        installer = self.installer
+        spec = next(
+            item for item in installer.PYTHON_TOOL_PACKAGES if item["component"] == "importlib_resources"
+        )
+        self.assertEqual(spec["package"], "importlib-resources==7.1.0")
+        self.assertEqual(spec["import_name"], "importlib_resources")
+        for platform_id in ("windows_x86_64", "manylinux_2_34_x86_64"):
+            runtime_lock = installer.worker_lock_paths(platform_id, "3.12", False)[1]
+            self.assertEqual(
+                installer.locked_requirement_version(runtime_lock, "importlib-resources"),
+                "7.1.0",
+            )
+        missing = {"ready": False, "version": "", "notes": "ModuleNotFoundError"}
+        self.assertFalse(installer.locked_probe_ready(spec, missing))
+
+    def test_locked_probe_normalizes_release_versions_but_rejects_other_releases(self) -> None:
+        installer = self.installer
+        ready = {"ready": True, "notes": "import_ok"}
+        self.assertTrue(
+            installer.locked_probe_ready(
+                {"package": "rdkit==2025.9.6"},
+                {**ready, "version": "2025.09.6"},
+            )
+        )
+        self.assertTrue(
+            installer.locked_probe_ready(
+                {"package": "openmm==8.5.2"},
+                {**ready, "version": "8.5.2.dev-36a30cb"},
+            )
+        )
+        self.assertFalse(
+            installer.locked_probe_ready(
+                {"package": "openmm==8.5.2"},
+                {**ready, "version": "8.5.3"},
+            )
+        )
+
+    def test_cuda_probe_accepts_opencl_diagnostics_after_a_real_cuda_context(self) -> None:
+        installer = self.installer
+        probe = {
+            "openmm_ready": True,
+            "version": "8.5.2.dev-36a30cb",
+            "platforms": ["Reference", "CPU", "CUDA"],
+            "cuda_ready": True,
+            "cuda_context_ready": True,
+            "cuda_context_platform": "CUDA",
+            "cuda_context_failure": "",
+            "plugin_dir": "/plugins",
+            "loaded_plugins": ["/plugins/libOpenMMCUDA.so"],
+            "plugin_load_failures": [
+                "libOpenMMOpenCL.so: libOpenCL.so.1: cannot open shared object file"
+            ],
+            "failure_reason": "",
+        }
+        self.assertTrue(installer.openmm_cuda_probe_ready(probe))
+        self.assertIn("plugin_load_failures=libOpenMMOpenCL.so", installer.openmm_cuda_notes(probe, "fixture"))
+        self.assertIn("openmm.Context", installer.OPENMM_CUDA_PROBE_CODE)
+        self.assertIn("context.setPositions", installer.OPENMM_CUDA_PROBE_CODE)
+
+    def test_cuda_probe_rejects_other_release_abi_and_context_failures(self) -> None:
+        installer = self.installer
+        ready = {
+            "openmm_ready": True,
+            "version": "8.5.2",
+            "platforms": ["Reference", "CPU", "CUDA"],
+            "cuda_ready": True,
+            "cuda_context_ready": True,
+            "cuda_context_platform": "CUDA",
+            "cuda_context_failure": "",
+            "plugin_dir": "/plugins",
+            "loaded_plugins": ["/plugins/libOpenMMCUDA.so"],
+            "plugin_load_failures": [],
+            "failure_reason": "",
+        }
+        self.assertFalse(installer.openmm_cuda_probe_ready({**ready, "version": "8.5.3"}))
+        self.assertFalse(
+            installer.openmm_cuda_probe_ready(
+                {
+                    **ready,
+                    "plugin_load_failures": ["libOpenMMCUDA.so: undefined symbol: PythonForceImpl"],
+                }
+            )
+        )
+        self.assertFalse(
+            installer.openmm_cuda_probe_ready(
+                {
+                    **ready,
+                    "cuda_context_ready": False,
+                    "cuda_context_platform": "",
+                    "cuda_context_failure": "CUDA_ERROR_UNKNOWN",
+                }
+            )
+        )
+
+    def test_wsl_locked_source_build_root_uses_direct_nonempty_argv(self) -> None:
+        installer = self.installer
+        commands: list[list[str]] = []
+
+        def run(_distro: str, command: list[str]) -> subprocess.CompletedProcess[str]:
+            commands.append(command)
+            return subprocess.CompletedProcess(command, 0, "", "")
+
+        with mock.patch.object(installer, "run_wsl_command", side_effect=run), mock.patch.object(
+            installer, "worker_source_locks", return_value=[]
+        ), mock.patch.object(installer.uuid, "uuid4", return_value=mock.Mock(hex="fixed")):
+            result = installer.install_locked_sources_wsl(
+                "GenoLigandPhase08",
+                "/home/test/.venv/bin/python",
+                "/home/test",
+            )
+
+        build_root = "/home/test/.local/state/genoligand/locked-source-build-fixed"
+        self.assertEqual(result, {"status": "ready", "reason": "locked_source_wheels_installed"})
+        self.assertEqual(commands, [["mkdir", "-p", "--", build_root], ["rm", "-rf", "--", build_root]])
+        self.assertNotIn("bash", [part for command in commands for part in command])
+        self.assertTrue(all(build_root in command for command in commands))
+
+    def test_locked_source_git_commands_are_cross_backend_and_repeat_stable(self) -> None:
+        installer = self.installer
+        source = {
+            "git_url": "https://github.com/example/source.git",
+            "commit": "a" * 40,
+            "version": "1.2.3",
+        }
+        local = installer.locked_source_checkout_commands("C:/Git/bin/git.exe", Path("C:/build/repo"), source)
+        wsl = installer.locked_source_checkout_commands("git", "/build/repo", source)
+
+        self.assertEqual([command[3:] for command in local], [command[3:] for command in wsl])
+        self.assertEqual(local[1][3:], ["config", "core.autocrlf", "false"])
+        self.assertLess(
+            next(index for index, command in enumerate(local) if "core.autocrlf" in command),
+            next(index for index, command in enumerate(local) if "checkout" in command),
+        )
+        local_archive = installer.locked_source_archive_command(
+            "C:/Git/bin/git.exe", Path("C:/build/repo"), Path("C:/build/source.tar"), source["commit"]
+        )
+        wsl_archive = installer.locked_source_archive_command(
+            "git", "/build/repo", "/build/source.tar", source["commit"]
+        )
+        self.assertEqual(local_archive[1:4], ["-c", "core.autocrlf=false", "-C"])
+        self.assertEqual(wsl_archive[1:4], ["-c", "core.autocrlf=false", "-C"])
+        self.assertEqual(
+            wsl_archive,
+            installer.locked_source_archive_command(
+                "git", "/build/repo", "/build/source.tar", source["commit"]
+            ),
+        )
+
+    def test_locked_source_fetch_retries_only_explicit_transient_network_failures(self) -> None:
+        installer = self.installer
+        fetch = ["git", "-C", "/repo", "fetch", "--depth", "1", "origin", "a" * 40]
+        transient = subprocess.CompletedProcess(fetch, 1, "", "gnutls_handshake() failed")
+        success = subprocess.CompletedProcess(fetch, 0, "", "")
+        runner = mock.Mock(side_effect=[transient, transient, success])
+        with mock.patch.object(installer.time, "sleep") as sleep:
+            completed = installer.run_locked_source_checkout_command(runner, fetch)
+        self.assertEqual(completed.returncode, 0)
+        self.assertEqual(runner.call_count, 3)
+        self.assertEqual(sleep.call_args_list, [mock.call(1), mock.call(2)])
+
+        deterministic = subprocess.CompletedProcess(fetch, 1, "", "repository not found")
+        runner = mock.Mock(return_value=deterministic)
+        installer.run_locked_source_checkout_command(runner, fetch)
+        runner.assert_called_once_with(fetch)
+
+        checkout = ["git", "-C", "/repo", "checkout", "--detach", "a" * 40]
+        runner = mock.Mock(return_value=subprocess.CompletedProcess(checkout, 1, "", "RPC failed"))
+        installer.run_locked_source_checkout_command(runner, checkout)
+        runner.assert_called_once_with(checkout)
 
     def test_wsl_selection_probes_all_non_reserved_distributions(self) -> None:
         installer = self.installer
@@ -273,9 +469,9 @@ class InstallerRuntimeAuditContracts(unittest.TestCase):
                     raise PermissionError("runtime binary is locked")
                 return original_copy(src, dst)
 
-            with mock.patch.object(installer.os, "name", "nt"), mock.patch.object(
-                installer, "process_exists", return_value=True
-            ), mock.patch.object(installer, "process_start_time", return_value=100.0, create=True), mock.patch.object(
+            with mock.patch.object(installer, "process_exists", return_value=True), mock.patch.object(
+                installer, "process_start_time", return_value=100.0, create=True
+            ), mock.patch.object(
                 installer, "terminate_runtime_pid", return_value=(termination_command, termination_result)
             ) as terminate, mock.patch.object(
                 installer.subprocess,

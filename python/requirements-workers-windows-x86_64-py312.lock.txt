@@ -165,6 +165,9 @@ griddataformats==1.2.0 \
     --hash=sha256:6aec0c1cebf4373b5f59adc8f35a79037ab2ed970cae8f0eb1924724884fc45d \
     --hash=sha256:b42f0a823ce6f526c0052515047237b233748f2bdc38fc797fc37c7df81a8dd5
     # via mdanalysis
+importlib-resources==7.1.0 \
+    --hash=sha256:1bd7b48b4088eddb2cd16382150bb515af0bd2c70128194392725f82ad2c96a1
+    # via openmmforcefields
 joblib==1.5.3 \
     --hash=sha256:5fc3c5039fc5ca8c0276333a188bbd59d6b7ab37fe6632daa76bc7f9ec18e713 \
     --hash=sha256:8561a3269e6801106863fd0d6d84bb737be9e7631e33aaed3fb9ce5953688da3
