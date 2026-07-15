@@ -182,6 +182,77 @@ class DockingPocketContractTests(unittest.TestCase):
         self.assertEqual([row["residue_name"] for row in retained], ["ZN", "HEM"])
         self.assertTrue(all(row["retained"] for row in retained))
 
+    def test_known_ligand_code_selects_stable_copy_in_multichain_complex(self) -> None:
+        components = [
+            ReceptorComponent(
+                key=f"{chain}:AZM:402",
+                residue_name="AZM",
+                chain_id=chain,
+                residue_id="402",
+                center=(float(index), float(index + 1), float(index + 2)),
+                heavy_atom_count=13,
+                carbon_atom_count=4,
+                kind="ligand_candidate",
+            )
+            for index, chain in enumerate(
+                ("H", "C", "A", "F", "B", "G", "D", "E"), start=1
+            )
+        ]
+
+        box = choose_search_box(
+            {"evidence": "bindingdb_onsite_activity_row;ligand_code=AZM;pdb_ids=4XIW"},
+            components,
+        )
+
+        selected = next(
+            component for component in components if component.key == "A:AZM:402"
+        )
+        self.assertEqual(box.center, selected.center)
+        self.assertEqual(box.source, "co_crystal_ligand")
+        self.assertEqual(box.source_id, "A:AZM:402")
+        self.assertEqual(box.provenance, "coordinate_residue=A:AZM:402")
+        self.assertEqual(box.excluded_component_key, "A:AZM:402")
+
+    def test_ligand_code_without_matching_coordinate_residue_is_not_ready(self) -> None:
+        components = [
+            ReceptorComponent(
+                key="A:LIG:401",
+                residue_name="LIG",
+                chain_id="A",
+                residue_id="401",
+                center=(1.0, 2.0, 3.0),
+                heavy_atom_count=12,
+                carbon_atom_count=8,
+                kind="ligand_candidate",
+            )
+        ]
+
+        with self.assertRaisesRegex(DockingNotReady, "no_trusted_binding_pocket"):
+            choose_search_box({"evidence": "ligand_code=AZM"}, components)
+
+    def test_multiple_ligand_codes_are_not_a_trusted_binding_pocket(self) -> None:
+        components = [
+            ReceptorComponent(
+                key=f"A:{name}:{residue_id}",
+                residue_name=name,
+                chain_id="A",
+                residue_id=residue_id,
+                center=center,
+                heavy_atom_count=12,
+                carbon_atom_count=6,
+                kind="ligand_candidate",
+            )
+            for name, residue_id, center in (
+                ("AZM", "402", (1.0, 2.0, 3.0)),
+                ("LIG", "403", (4.0, 5.0, 6.0)),
+            )
+        ]
+
+        with self.assertRaisesRegex(DockingNotReady, "no_trusted_binding_pocket"):
+            choose_search_box(
+                {"evidence": "ligand_code=AZM;ligand_code=LIG"}, components
+            )
+
     def test_missing_or_ambiguous_pocket_is_not_ready(self) -> None:
         ambiguous = [
             ReceptorComponent(

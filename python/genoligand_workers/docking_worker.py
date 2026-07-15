@@ -746,17 +746,22 @@ def choose_search_box(
 
     ligand_codes = selected_ligand_codes(selection)
     if ligand_codes:
+        if len(ligand_codes) != 1:
+            raise DockingNotReady("no_trusted_binding_pocket")
         matches = [
             component
             for component in components
             if component.residue_name.upper() in ligand_codes
             and component.kind not in {"water", "polymer", "additive"}
         ]
+        if not matches:
+            raise DockingNotReady("no_trusted_binding_pocket")
+        ligand = min(matches, key=lambda component: component.key)
     else:
         matches = [component for component in components if component.kind == "ligand_candidate"]
-    if len(matches) != 1:
-        raise DockingNotReady("no_trusted_binding_pocket")
-    ligand = matches[0]
+        if len(matches) != 1:
+            raise DockingNotReady("no_trusted_binding_pocket")
+        ligand = matches[0]
     return SearchBox(
         center=ligand.center,
         source="co_crystal_ligand",
