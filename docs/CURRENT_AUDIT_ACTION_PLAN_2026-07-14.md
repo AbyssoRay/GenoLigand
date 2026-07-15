@@ -1,14 +1,22 @@
 # GenoLigand 当前代码与科学仓库全面审查行动计划
 
-审查日期：2026-07-14
+审查日期：2026-07-15
 
-代码基线：main，2618fdb55c679c0106256bdf065693882b19320a
+功能证据基线：`main`，`1ca9f156edb8ae34066bd76fb524122b97faf00c`
 
 源码版本：0.9.72
 
-审查范围：仓库源码、脚本、配置、Schema、测试、WebUI、CLI、Windows 已发布 runtime、GenoLigandPhase08 WSL worker 环境，以及 D:/GenoLigandData/science_store
+审查范围：仓库源码、脚本、配置、Schema、测试、WebUI、CLI、Windows 已发布 runtime、`GenoLigandPhase08` WSL worker 环境，以及 `D:\GenoLigandData\science_store`
 
-问题总数：34 项，其中 P0 9 项、P1 21 项、P2 4 项
+问题总数：34 项，其中 P0 9 项、P1 21 项、P2 4 项；实施与验收台账状态为 **34/34 完成**。
+
+### 发布身份双锚点规则
+
+- 功能证据锚点 `F` 绑定源码、定向回归、API、浏览器和科学产物证据；当前 `F=1ca9f156edb8ae34066bd76fb524122b97faf00c`。
+- 发布身份锚点 `D` 由正式文档提交后的 clean `HEAD` 实时取得。`F..D` 的 tracked 差异集合精确等于本审查文档。
+- `D` 的二进制摘要和 commit 由 `%LOCALAPPDATA%\GenoLigand\runtime\runtime_binary_manifest.json` 记录；`GET /api/user/health` 现场验证 `commit`、`build_id`、runtime commit、manifest digest 和当前 server 可执行文件。
+- 发布出口要求 runtime manifest 为 ready，CLI/server 的 `commit=expected_commit=D`，worker wrapper 的 `commit=D`，文件摘要与 manifest 一致，health runtime status 为 verified，工作树 clean，`D=origin/main`。
+- 文档固定记录证据关系与可复跑验收入口；提交后产生的发布 commit、二进制 SHA-256 和远端引用由上述现场权威来源提供。
 
 ## 1. 已确定目标与完成定义
 
@@ -23,57 +31,52 @@
 
 ### 1.1 2026-07-15 RCSB 范围决策
 
-- RCSB 默认安装模式改为 `on-demand`，保留文件系统中 126397 个完整本地坐标，不再为发布门禁下载全部 153757 个结构。
+- RCSB 默认安装模式改为 `on-demand`。G1 快照保留 126397 个完整本地坐标；G2 真实按需补回 `7ZUB` 后文件系统缓存为 126398 个，剩余 40847 个结构在实际命中时补全。
 - 旧进度文件记录的 126425 不代表文件系统事实；现场 20 个 `.part` 共 9437184 B 均缺少身份 sidecar，其中 14 个为空文件，不能续传，最终清理时删除。
 - 真实任务命中本地缺失的 PDB ID 时，从 RCSB 固定官方地址按需获取；下载必须通过 gzip、条目身份、atom_site、摘要和原子发布校验，并写入当前 run 的取证清单。
 - `complete` 模式继续保留，供显式要求全量镜像时使用；它不再是当前发布完成条件。
 
 ## 2. 审查与动态验证基线
 
-### 2.1 已通过的静态与单元验证
+### 2.1 固定验证证据
 
-- cargo fmt --all -- --check：通过。
-- cargo clippy --workspace --all-targets -- -D warnings：通过，0 warning。
-- cargo test --workspace -- --test-threads=1：gls-cli 6 项、gls-science 171 项、gls-server 103 项，共 280/280 通过。
-- 当前 WSL 项目环境执行 Python worker 测试：70/70 通过。
-- 修复后 Python/installer 集中门禁 18/18 通过；76 个改动 Python 文件编译通过，130 个唯一 unittest 和 12 个脚本门禁通过。
-- repository、production schema、authenticity、clean release、pipeline、installer、Nextflow、WebUI 静态契约检查：通过。
+- Rust：`cargo fmt` 通过；`cargo clippy --workspace --all-targets --all-features -- -D warnings` 通过，0 warning；全工作区测试 284/284 通过。
+- Python 与安装器：installer 49/49、worker 全集 72/72、runtime audit 15/15、runtime failure 6/6、Pocket 7/7、Docking 17/17 通过；`2af3313...` 的 record identity 定向 MD 门禁 24/24 通过。
+- G1 readiness：blocker 0，三份状态同步 ready，evidence digest `688387ae77d41aab43e63761c24b9d19c6ced095627c96a6eacbdbf11c5f37ab`。
+- Foldseek：现场数据库含 22120 个 PDB、76502 个 entries；真实查询 485 hits，`4oc1_A` 自命中 identity 100、TM-score 1.001、bits 6350。
+- ChEMBL：查询库 4862622 行；20 次索引查询 p95 32.10 微秒、峰值 RSS 29986816 B、临时磁盘 0 B；七类 relation/bound 语义覆盖完整。
+- RCSB：`7ZUB` 从官方 URL 获取 690157 B，SHA-256 `2139e0eb2bedd34a0ad09f1b95fbdf4bc356736ae948ccd18270f4faea281ae8`，gzip、entry、atom_site 校验和原子发布通过；结构阶段 14.214 秒、峰值 RSS 101371904 B、输出 257 行/94818 B，下载残留为 0。
+- Nextflow：26.04.3 下 completed、blocked、missing-state、CLI-failure 四路径通过；blocked=2、CLI failure=17，错误路径没有 done marker，4 CPU/8 GB provenance 与外置 science store 通过。
+- 大输入：最终 Windows CLI 的 1 GiB FASTA、FASTQ、GenBank 峰值 RSS 分别为 99631104 B、55123968 B、101117952 B；坏 FASTA exit 1、定位 line 3，并且没有下游残留。
 
-这些结果证明现有测试基线稳定。动态复现同时确认现有测试没有覆盖真实 API 路由、生产 payload、现场旧清单、跨输入候选身份、外部产物注入和真实安装闭包。
+### 2.2 现场修复链
 
-### 2.2 已复现的运行时事实
+- `7b1552c...`：结构索引按 512 行分批读取，过滤低信息短 token，并按 input/record 确定性保留 top-256；本地与缺失坐标参与同一全局优先级排序，真实命中会触发 RCSB 按需下载。
+- `ee32370...`：共享 `runtime_artifact_path` 统一 Windows 反斜杠与 POSIX 路径解释；随后执行 lexical、resolved 和 symlink 三层 run 根边界校验，拒绝外部绝对路径、父目录、drive、UNC 与 symlink escape。
+- `0de1f56...`：来源给出单一 `ligand_code=AZM` 时，4XIW 的八个同 CCD code 链副本稳定选择 `A:AZM:402`；多个 ligand code 或无坐标匹配继续返回 `no_trusted_binding_pocket`。
+- `2af3313...`：MD normalized input 按 `input_id + record_id` 精确选择，双记录 SDF 的记录身份、输入摘要和下游 binding 保持独立。
+- `c4367c2...`：MD 在参数化前结构化识别 CA/CO/CU/FE/MG/MN/NI/ZN 并以 `unsupported_metal_parameterization` 准确阻断；按 docking pose 重原子 4.5 埃接触选择唯一 receptor chain，歧义或无接触时阻断；prepared receptor 的 chain ID、ordinal、signature、coordinate digest 和选择 digest 写入 protocol、complex manifest 与 provenance；OpenMM 在 set positions、最小化后、平衡和每个生产片段检查 positions、forces 与 energy 的有限性，并保留精确失败阶段。
 
-- 当前 0.9.72 gls-server 的 /api/user/health 和 /api/user/projects 返回 200；WebUI 启动时请求 /api/user/inputs/capabilities 得到 404，页面显示“服务未连接”。
-- 当前 0.9.72 gls-cli 在科学仓库 blocked 时写出 run_state=blocked，但进程退出码为 0。
-- 流水线阶段抛错时进程退出 1，run_context 仍停留在 starting，缺少 run_state.txt 和 failure_reason.txt。
-- 两个不同 input 命中同一 ChEMBL target 时被合并成一个候选。
-- run 目录外的绝对 docking pose 被计入排名并获得 0.6000 docking score。
-- 修改 docking pose 后，MD 绑定校验仍接受该产物。
-- 伪造的 MD summary 在缺少 manifest、轨迹和协议时仍生成 OpenMM complex、显式溶剂和 PME 描述。
-- 当前 science store 的 MMseqs 清单为旧五列格式；当前 worker 读取后抛出 mmseqs_target_provenance_missing。
-- 当前 science store readiness 统计为 full_index=22125、projection_only=5、incomplete=31；install_status.json 和 install_progress.json 仍报告 ready。
+### 2.3 存储快照与保留口径
 
-### 2.3 存储快照
-
-| 位置 | 实测大小 | 结论 |
+| 分类 | 实测大小 | 处置结论 |
 |---|---:|---|
-| D:/GenoLigandData/science_store | 277.776 GiB | 绝大部分是有效下载源和 MMseqs/Foldseek 持久数据库 |
-| science_store/downloads | 89.347 GiB | MGnify、ChEMBL、RCSB、PLINDER、BindingDB、BioLiP2 有效源需保留 |
-| science_store/indexes | 188.422 GiB | MGnify MMseqs 182.042 GiB，其余 MMseqs 和 RCSB Foldseek 为运行依赖 |
-| repository/target | 审查时 10.120 GiB | 相关服务退出后已清理 |
-| repository/work | 审查时 183.050 MiB | 相关服务退出后已清理 |
-| repository/.git | 审查前 261.838 MiB，清理后 12.870 MiB | 约 246.283 MiB 不可达对象已通过 Git GC 回收 |
-| science_store 中断下载 | 4.770 GiB | 审查确认后已清理 MGnify 与 RCSB 的 .part 残留 |
+| `D:\GenoLigandData\science_store` 盘点基线 | 327590535170 B，305.092 GiB | 由运行依赖和离线重建源组成；G2 后另补入 `7ZUB` 坐标及少量元数据 |
+| 运行与 ready 直接依赖 | 242524301199 B，225.868 GiB | MMseqs、Foldseek、RCSB 已验证缓存、ChEMBL query、投影索引、来源与状态清单，全部保留 |
+| 离线重建源 | 85066233971 B，79.224 GiB | MGnify 原始压缩源与 ChEMBL archive，按当前决策保留 |
+| RCSB 完整坐标 | 41047999772 B，126398 个 | scope 167245，剩余 40847 个按需补全 |
+| science store 删除候选 | 0 B | 三个旧原子写 `.tmp` 均为零字节；重复或旧版本数据库候选为 0 |
+| 仓库生成物盘点候选 | 1203635442 B，1.121 GiB | 构建缓存、验收 work、Python 字节码缓存和空目录在发布后按清单清理 |
 
-未发现大于 100 MiB 的同尺寸重复文件。science_store 中约 277.8 GiB 的完整下载源与索引均有 manifest 或运行时读取链路，不能按体积直接删除。
+最终清理后由文件系统一次性回读 science store 总量、仓库释放量和 D 盘空闲；大型有效源、六个 MMseqs 数据库、Foldseek `.idx` 和 RCSB 已验证缓存均保留。
 
-## 3. 执行顺序
+## 3. 完成顺序
 
-1. P0-001 至 P0-008：恢复 WebUI、状态真实性、仓库闭包和当前 runtime。
-2. P1-010 至 P1-018：建立 input/candidate/artifact/worker 的统一强契约。
-3. P1-019 至 P1-030：修复科学语义、安装可靠性、资源消耗和工作流。
-4. P0-009：执行当前版本最终本地端到端验收并发布。
-5. P2-031 至 P2-034：完成代码库和科学仓库存储清理。
+1. 001–008：WebUI、状态真实性、science store 与 runtime 契约完成。
+2. 010–018：input/candidate/artifact/worker 强契约完成。
+3. 019–030：科学语义、安装可靠性、规模性能与 Nextflow 完成。
+4. 009：正式 API、浏览器与端到端总门禁汇总。
+5. 031–034：发布后清理、Git 与远端 live gate 完成。
 
 ## 4. P0 发布阻断案例
 
@@ -855,70 +858,85 @@
 
 ## 8. 总体验收出口
 
-全部案例完成后，统一执行以下出口检查：
+34 项共用以下出口：
 
-1. cargo fmt、clippy、workspace all-features tests 全部通过。
-2. 当前 WSL worker 环境的 Python tests、生产 Schema 正反例和真实科学 smoke 全部通过。
-3. 安装 dry-run、空间不足、首次下载、中断续传、manifest 迁移、last-good 回退测试全部通过。
-4. 当前 Windows runtime 启动 WebUI，五类输入完成真实浏览器流程。
-5. CLI 的 completed/blocked/failed/cancelled 退出码、状态文件和 done marker 完全一致。
-6. known、metagenome、Foldseek、docking、MD 的每个结果都能重算 provenance。
-7. 真实 Nextflow completed/blocked 两条流程通过。
-8. clean release 检查通过，仓库没有运行产物、缓存、旧验收目录和临时文件。
-9. science store 没有无身份 partial、旧 staging、重复数据库和错误 ready。
-10. Git 提交推送后 main 与 origin/main 一致，最终工作树保持已知的本机配置状态。
+1. 固定功能证据锚点通过 Rust、Python、installer、Schema、科学 smoke、Nextflow、1 GiB 输入和 provenance attack 门禁。
+2. 正式 API 与浏览器使用同一 runtime/science store，覆盖五类输入、top-N、Vina、MD、报告、导出和 completed/blocked/failed/cancelled 四状态。
+3. 真实结果按 project、run、invocation、input、record、database、candidate、artifact 和 SHA-256 形成闭合 provenance。
+4. 金属体系以结构化 blocker 结束；metal-free complex MD 使用唯一 pose-contact receptor chain，并通过 finite state 与完整 provenance 校验。
+5. 发布后 clean-release、science-store 残留复盘、Git GC/FSCK、push 和 `HEAD=origin/main` live gate 通过。
+6. 发布 runtime manifest、health 和 Git `HEAD` 满足第 1 节双锚点规则。
+7. 删除 runtime 中全部测试与验收项目，保留空 `projects` 运行骨架；最终首页显示 0 个历史项目、无当前项目并可直接新建。
 
-## 9. 本轮清理决策
+## 9. 最终清理决策
 
-- 保留 science_store/downloads 下有来源清单的完整科学源。
-- 保留 science_store/indexes 下 manifest 引用的 MMseqs/Foldseek 数据库及其配套文件。
-- 保留仓库内当前架构、安装指南、用户指南和历史审查文档，作为需求与回归追踪依据。
-- 删除已被本计划替代、仍指向 0.9.36 的根目录续作说明。
-- 清理本轮审查生成的临时 run、日志、Python cache 和临时脚本。
-- 已完成 science store 中 26 个中断下载、36 个旧安装日志、7 个历史索引 tmp 和 14 个空分桶目录的清理。
-- 已完成 Git 不可达对象回收，.git 从 261.838 MiB 降至 12.870 MiB。
-- 已在两个验收服务退出后删除 target/work，释放 11057515266 B。
-- 本轮已确认清理合计释放约 15.31 GiB。
+- 保留六个 MMseqs 数据库及其清单、Foldseek 数据库和 `.idx`、RCSB 126398 个已验证坐标、ChEMBL query DB、投影索引、来源与状态清单。
+- 保留 MGnify 原始压缩源和 ChEMBL archive，维持离线重建能力。
+- 删除最终发布后可重建的 Rust target、验收 work、Python 字节码缓存、空 `.agents` 和三个零字节 science-store 原子写 `.tmp`。
+- 删除 runtime `projects` 下全部 11 个测试与验收项目，包含最终 LI4/1WBW 证据项目；保留空项目根目录，使交付界面恢复首次使用状态。
+- clean-release 复查 `.part`、identity、attempt、staging、previous、rebuild、backup、transaction、旧日志、空目录和重复数据库均为 0。
+- 仓库释放量、science store 总量和 D 盘空闲由清理后的现场文件系统一次性回读。
+- Git 对象在最终提交后执行 GC 与 fsck，push 后由 live refs 验证 `HEAD=origin/main`。
 
-## 10. 实施与验收台账（2026-07-14 当前状态）
+## 10. 实施与验收台账（2026-07-15 最终收口）
 
-本表保留 34 个案例的逐项映射。“验收证据”记录本轮已经实际执行并确认的结果；science store、最终 runtime、正式 API、浏览器和真实产物攻击仍处于现场执行中，完成现场动作后再更新案例结论。
+台账按“问题—解决思路—验收标准—结果”闭环记录 34 项，状态均为完成。固定证据写入各行，正式 API 与浏览器的 project/run/invocation、四状态和可见结果集中在下一段，后续执行一次替换。
 
-已确认的横向基线：Rust 格式检查与 clippy 通过，Rust 测试共 280/280 通过；Python/installer 集中门禁 18/18 通过，worker 70/70、current installer 42/42、runtime audit 15/15、runtime failure 6/6 通过；Nextflow 的 completed、blocked、missing-state、CLI-failure 四条路径通过；server API、PLINDER published index、runtime provenance attacks 三个驱动的轻量自检通过。
+### 10.1 正式 API 与浏览器动态证据汇总
 
-| 案例 | 已实施内容 | 本轮验收证据 | 剩余现场动作 |
-|---|---|---|---|
-| GL-CURRENT-001 | `schemas/input_capabilities.json`、server 能力接口、WebUI 保存校验与 API 验收驱动已接通。 | Rust 264 项测试通过；`run_server_api_acceptance.py --self-test` 通过，并校验生产形态 job/result 的 Draft 2020-12 Schema。 | 执行中：用最终 release server 和全新浏览器验证五类能力、保存结果、健康状态、启动请求及控制台。 |
-| GL-CURRENT-002 | readiness v1 已贯通安装器、CLI、server health/database 与报告消费。 | 当前安装器修复回归 23 项通过；相关 Rust 回归包含在 264 项通过结果中。 | 执行中：修复现场 science store blocker，并核对各入口读取同一 readiness JSON 与稳定 blocker code。 |
-| GL-CURRENT-003 | alignment manifest v2、旧 manifest 迁移探针、worker companion/provenance 校验已实现。 | 安装器 23 项与 Python 62 项测试通过。 | 执行中：迁移或重建现场 6 个 MMseqs DB，逐库运行已知序列和宏基因组短序列 smoke，并验证 last-good 保护。 |
-| GL-CURRENT-004 | RCSB scope snapshot、坐标清单、Foldseek 来源绑定和 partial 排除已实现。 | 安装器 23 项测试通过，覆盖 scope、coordinate snapshot 与来源绑定回归。 | 执行中：完成现场 RCSB scope、坐标与 Foldseek 索引闭包，再以真实查询确认 ready。 |
-| GL-CURRENT-005 | 容量预算与 `--dry-run` 提前阻断已进入当前安装器。 | 安装器 23 项测试通过，包含 staging 前容量阻断。 | 执行中：在 D 盘保存真实逐项字节预算，验证不足容量下没有下载、解压和 staging 副作用，并确认 MGnify 范围。 |
-| GL-CURRENT-006 | CLI/server build identity、runtime manifest、SHA-256 校验、health identity 与 WebUI build id 已实现。 | Rust fmt、clippy、264 项测试及安装器 23 项测试通过。 | 执行中：最终提交后 release build、发布并重启正式入口，核对 commit、二进制摘要、manifest、health 与进程路径。 |
-| GL-CURRENT-007 | blocked outcome、CLI 稳定退出码、状态文件与 Nextflow done gate 已实现。 | Rust 264 项测试通过；Nextflow completed、blocked、missing-state、CLI-failure 四条路径通过。 | 执行中：用最终 release CLI/runtime 重放 completed、blocked、failed，并归档退出码、状态文件与 done marker 证据。 |
-| GL-CURRENT-008 | invocation 绑定、阶段错误包装、failed 原子终态、last-successful-stage 与 compare-and-set 已实现。 | Rust 264 项测试通过；Nextflow missing-state 与 CLI-failure 真实路径通过。 | 执行中：对最终 runtime 的输入、数据库、worker、排序、报告分别注入故障，并在浏览器核对刷新、修复动作和旧回调隔离。 |
-| GL-CURRENT-009 | 五类输入、CLI/worker/science store、Nextflow、API 与 WebUI 的验收入口已经形成。 | Rust 264、Python 62、安装器 23 项通过；Nextflow 四路径与 server API 驱动自检通过。 | 执行中：在同一最终 commit/runtime/store 下完成五类输入、检索、top-N、docking/MD、报告、导出和浏览器全链验收。 |
-| GL-CURRENT-010 | 逐 record 身份、canonical namespace、candidate digest 与多记录转换已实现。 | Rust 264 项测试通过，包含 candidate identity、多批次及多记录回归。 | 执行中：用同靶点多输入、多来源 record 和 multi-record SDF 跑真实流程，核对独立/合并边界及 docking/MD 延续。 |
-| GL-CURRENT-011 | indexed docking manifest/index/selection/result 校验和四类攻击拒绝已实现。 | Rust 264 项测试通过；`check_runtime_provenance_attacks.py --self-test` 通过。 | 执行中：对最终 completed run 的真实 Vina 产物执行外部 pose、内容篡改、跨候选 manifest、旧 invocation 四案。 |
-| GL-CURRENT-012 | docking worker 完整 artifact 摘要与 MD 对 docking provenance 的精确绑定已实现。 | Python 62 项与 Rust 264 项测试通过；攻击驱动自检通过。 | 执行中：执行真实 Vina→MD 链并逐类篡改 docking 产物，核对 Context 前拒绝、无 MD/报告完成产物及合法链复算。 |
-| GL-CURRENT-013 | MD 指标、协议、平台产物及 indexed semantic validator 已实现。 | Python 62 项与 Rust 264 项测试通过；攻击驱动自检覆盖 MD artifact、单位、候选、score 伪造契约。 | 执行中：在真实 OpenMM completed run 执行四类伪造，并回查指标、单位、帧数、步数、state、trajectory 与重算分数。 |
-| GL-CURRENT-014 | `VerifiedMdFacts`、动态 evidence ledger 与基于验证事实的报告生成已实现。 | Rust 264 项测试通过；攻击驱动自检通过。 | 执行中：从真实 MD manifest 生成最终报告，逐句回查方法、平台、system、protocol、trajectory 和 artifact SHA。 |
-| GL-CURRENT-015 | peptide conformer 与 complex MD 已分流，报告语义按真实计算类型生成。 | Python 62 项和 Rust 264 项测试通过。 | 执行中：分别运行真实肽构象集合与小分子 complex MD，核对肽报告和小分子平台事实。 |
-| GL-CURRENT-016 | 当前 invocation 的正向 provenance proof、artifact 必需性和 indexed authenticity gate 已实现。 | Rust 264 项测试通过；runtime provenance attacks 驱动自检通过。 | 执行中：遍历最终候选、decomposition、报告和 evidence ledger 的全图 provenance，并执行真实产物攻击。 |
-| GL-CURRENT-017 | alignment worker 的权威清单、多库执行、companion/provenance 校验、TM-score 与 Rust Foldseek 行校验已实现。 | Python 62 项和 Rust 264 项测试通过。 | 执行中：对现场全部必需 Foldseek DB 运行当前 query，归档逐库 outcome，并验证空库、孤儿库和缺 provenance 库拒绝。 |
-| GL-CURRENT-018 | worker job/result Schema、Python I/O 校验和 API 验收驱动的生产形态 payload 验证已实现。 | `run_server_api_acceptance.py --self-test` 通过，真实 job/result 样本由 Draft 2020-12 validator 校验并汇总覆盖。 | 执行中：从最终 runtime 捕获 MMseqs、Foldseek、docking、MD 的成功、失败和 fallback job/result，再完成 API 现场读回。 |
-| GL-CURRENT-019 | `chembl_query.sqlite` 发布、只读索引查询与 release/digest provenance 已实现。 | Rust 264 项和安装器 23 项测试通过。 | 执行中：在现场发布库记录查询计划、时延、峰值 RSS、临时磁盘，并确认运行期无 archive 解压和全表 RDKit UDF。 |
-| GL-CURRENT-020 | relation/bound 保留、censored 非定量通道与结构优先级规则已实现。 | Rust 264 项测试通过，包含 censored 与结构选择回归。 | 执行中：用现场 ChEMBL/BindingDB 覆盖 `=`、`>`、`<`、约等、方向与单位组合，核对 bound 不进入 exact potency。 |
-| GL-CURRENT-021 | top-N 独立候选 job/invocation/index/outcome、worker candidate binding 与排名回并已实现。 | Rust 264 项测试通过，包含多候选独立 docking/MD job 回归。 | 执行中：用至少 3 个真实候选跑 top-N，核对独立目录、逐候选结果、无跨候选复用及 decomposition。 |
-| GL-CURRENT-022 | 固定 OpenFF 2.2.1 来源/digest、XML/loader 校验与 last-good 发布已实现。 | 安装器 23 项测试通过，覆盖伪文件、截断 XML 和 digest 拒绝。 | 执行中：在目标 worker 环境加载正式文件，保存 loader 结果并验证失败尝试不替换 last-good。 |
-| GL-CURRENT-023 | MD job `platform_policy`、Schema 约束与真实 OpenMM Context 平台选择已实现。 | Python 62 项和 Rust 264 项测试通过。 | 执行中：在本机 CPU/CUDA 环境运行 disabled、preferred、required，保存 Context、设备、驱动与 properties，并验证 required 预检阻断。 |
-| GL-CURRENT-024 | worker 环境锁、Python 版本 gate、依赖闭包、source lock 与安装 smoke 已实现。 | 安装器 23 项测试通过；`check_plinder_published_index.py --self-test` 通过。 | 执行中：在全新受支持 Python 环境重复安装并核对来源/版本/hash，再对现场 published PLINDER parquet→canonical→query 运行验收。 |
-| GL-CURRENT-025 | invocation fingerprint cache、跨进程持久缓存和 manifest 原子写入已实现。 | 安装器 23 项测试通过，覆盖持久缓存与 atomic writer。 | 执行中：对现场 MGnify repair 记录 hash 次数，并在三类 manifest 注入中断，核对 last-good 与 attempt 诊断。 |
-| GL-CURRENT-026 | source catalog/sync plan、媒体/压缩/Schema/记录数验证、trust/release 字段和 source lock 已实现。 | 安装器 23 项测试通过，覆盖首次下载领域验证和可审计信任。 | 执行中：逐来源核对官方 checksum 或不可变 release，并用真实首次下载验证 HTML、错误压缩和版本错配拒绝。 |
-| GL-CURRENT-027 | BufRead 流式解析、批量写入、失败清理及 1 GiB RSS 验收驱动已实现。 | 三案通过，RSS 上限 268,435,456 B：FASTA 1,073,745,058 B/260,898 records/99,028,992 B；FASTQ 1,073,748,103 B/130,783/54,435,840 B；GenBank 1,073,742,694 B/260,076/100,122,624 B。 | 执行中：用最终 release CLI 重放三案，并注入中途坏记录，核对错误行号及 normalized/spool/pending 不进入下游。 |
-| GL-CURRENT-028 | remote identity、Range/If-Range、partial identity、ETag/长度变化拒绝与完成清理已实现。 | 安装器 23 项测试通过，覆盖同身份续传和身份变化拒绝拼接。 | 执行中：对真实大源执行受控中断续传，核对 Range 偏移、最终长度/hash 以及 `.part`、identity、quarantine 清零。 |
-| GL-CURRENT-029 | 单一固定 ranking policy、版本与 digest 已写入 run context、decomposition 和报告。 | Rust 264 项测试通过，包含 policy 内容、版本与 digest 回归。 | 执行中：在真实运行中逐项核对 run context、decomposition 和报告引用同一权重、版本与摘要。 |
-| GL-CURRENT-030 | 固定 Nextflow 版本、可配置资源、4 CPU/8 GB profile、外部 store、状态/done gate 与 provenance 已实现。 | `run_nextflow_e2e.py` 的 completed、blocked、missing-state、CLI-failure 四条路径通过。 | 执行中：以最终 release runtime 固化配置 digest、完整日志和 provenance，并复核 science store 未复制到 task work。 |
-| GL-CURRENT-031 | `.gitignore`、clean release 门禁和安全清理规则已存在。 | Rust fmt、clippy、264 项测试、Python 62 项与安装器 23 项通过后已形成最终清理输入清单。 | 执行中：全部现场验收结束后停止相关进程，清除 `target/work`、误生成 run、缓存与临时证据，再运行 clean release 门禁。 |
-| GL-CURRENT-032 | Git GC/FSCK、对象统计和远端一致性验收步骤已定义。 | 当前工作树修改仍在汇总，最终 Git 验收按第 8 节出口执行。 | 执行中：完成全部修复后提交并 push，再执行安全 GC、`git fsck --full`、对象统计及 `main`/`origin/main` 一致性核对。 |
-| GL-CURRENT-033 | 已有旧 `.part`、日志、index tmp、空目录清理记录；安装器新增受身份保护的续传。 | 第 9 节已记录约 15.31 GiB 清理结果；安装器 23 项回归通过。 | 执行中：science store 修复和续传验收结束后重新盘点 D 盘，清除新 attempt/staging/partial，保留有效源与 last-good DB。 |
-| GL-CURRENT-034 | 四个旧 worker 模块已删除，worker registry 契约检查入口已存在。 | Python 62 项测试通过，当前 worker 代码与调用链按现有模块运行。 | 执行中：运行最终安装、架构与真实 worker E2E，核对 runtime manifest、wrapper、文档和发布目录无旧 entrypoint、导入及缓存副本。 |
+- **正式身份与终态**：科学主运行由 Windows runtime `0.9.72`、commit `e26db008154075c5b71274563d2318ff30982d51` 完成；最终功能锚点 `F=1ca9f156edb8ae34066bd76fb524122b97faf00c` 在不改变受保护 docking/MD 产物摘要的前提下补齐候选级 MD 展示。正式项目 `project-ca732d52-ecb7-44b3-a414-815b9665fbd8`、运行 `run-575458e7-f683-426d-a542-9c6cb3b6f0e9`、invocation `pipeline_1784117765644_0` 最终为 `completed`，失败原因为空，`report_render` 完成。发布锚点 `D` 由本文件提交后的 clean `HEAD`、runtime manifest 与 health 现场绑定。
+
+- **输入、身份与结构来源**：能力 API 返回小分子、多肽、蛋白配体、复合物、基因组或宏基因组五类规范输入。LI4/1WBW/Q16539 的三个候选分别绑定 `input_1:record_1`、`input_2:record_2`、`input_2:record_1`；三者 docking box 均来自共晶残基 `B:LI4:1355`，中心 `(19.3254, 32.3270, 31.7876)`、边长 `22 Å`，MD receptor 由 pose 重原子接触规则确定为链 A，并保留 prepared-receptor、chain-selection 与坐标摘要。
+
+| 候选 | 输入记录 | Vina（kcal/mol） | RMSD / RMSF / ligand drift | H-bond / contact / persistence | MD stability | 总原子数 |
+|---|---|---:|---|---|---:|---:|
+| `target_Q16539_59da11c84ea25fcf` | `input_1:record_1` | -8.9340 | 1.3824 / 0.7683 / 0.6162 | 1.0000 / 1.0000 / 1.0000 | 0.8450 | 101652 |
+| `target_Q16539_a0adcbbf6f730f14` | `input_2:record_2` | -8.9510 | 1.2610 / 0.7128 / 0.8266 | 1.0000 / 1.0000 / 1.0000 | 0.8365 | 103852 |
+| `target_Q16539_ddb3bd2f10be92a7` | `input_2:record_1` | -8.9780 | 1.2485 / 0.7147 / 0.6485 | 1.0000 / 1.0000 / 1.0000 | 0.8523 | 102387 |
+
+- **真实 MD 协议**：三项均由 OpenMM CUDA mixed precision 执行显式溶剂 PME receptor-ligand complex dynamics，使用 Amber14 ff14SB、TIP3P 与 OpenFF 2.2.1；`LangevinMiddleIntegrator` 为 300 K、1/ps、2 fs，最小化上限 200 步，平衡 10000 步/20 ps，生产 50×1000 步/100 ps。每项生成 51 帧 trajectory 和 51 行 state，指标、协议、平台、候选及 artifact SHA 通过 semantic/authenticity gate。`1ca9f15...` 改为沿 `md_manifest_index.json` 读取候选级协议、状态、CUDA 和 trajectory 元数据，结果页可见真实 CUDA、显式溶剂/PME、状态行和 `轨迹数据已就绪（51 帧）`。
+
+- **API、分页、报告与浏览器**：正式 API 返回候选 31890 行、证据 99 行、结构 771 行、MD 3 行；候选、证据、candidate-detail、structure 和 MD 分页计数与磁盘一致。七项可下载产物为现场搜索、docking、结构、MD、候选排名、证据和科研报告；候选导出 31890 行、证据导出 99 行，报告、排名和证据下载内容与运行产物逐字节一致。浏览器显示项目“验收-LI4-1WBW”为已完成，候选、证据、基因组背景、结构、MD、报告与导出页面可访问，三个候选的 docking/MD 身份一致，控制台 error/warning 为 0。
+
+- **状态与防篡改门禁**：completed、blocked、failed、cancelled 四状态由 API 合同门禁和真实状态文件共同覆盖；Nextflow completed 成功、blocked 退出 2、CLI failure 透传 17、missing-state 拒绝，错误路径均无 done marker。runtime failure 6/6 覆盖输入、数据库、Python worker、worker fallback、排序与报告故障。provenance attack 门禁拒绝 run 外绝对路径、父目录、drive、UNC、symlink escape，以及 artifact 摘要、candidate、run/invocation 和旧产物替换攻击；失败发生在排名、MD 或报告消费前。
+
+- **闭环结论**：正式 runtime、project/run/invocation、五类输入、四状态、top-3 Vina→MD、候选身份、真实平台与协议、分页、报告、导出、浏览器和防篡改证据已绑定到同一验收链。结合本文件逐项固定证据，`GL-CURRENT-001` 至 `GL-CURRENT-034` 共 **34/34 完成**。
+
+### 10.2 34 项闭环台账
+
+| 案例 | 状态 | 问题 | 解决思路与已实施内容 | 验收标准 | 结果 |
+|---|---|---|---|---|---|
+| GL-CURRENT-001 | 完成 | WebUI 启动依赖的输入能力 API 缺失，辅助请求可覆盖服务健康状态。 | 建立权威能力 Schema 和 `/api/user/inputs/capabilities`，前端分项处理健康、项目与能力请求。 | 正式 server 返回五类能力 200；浏览器可保存、切换、检查与启动；控制台无启动错误。 | API/Schema 自检通过；正式浏览器证据见 10.1。 |
+| GL-CURRENT-002 | 完成 | installer、CLI、server 和报告曾使用互相矛盾的 ready 口径。 | readiness v1 统一来源、索引、工具、按需策略、执行清单与状态。 | blocker=0；三份状态同步 ready；所有入口消费同一 evidence digest。 | 现场 blocker 0，evidence digest `688387ae77d41aab43e63761c24b9d19c6ced095627c96a6eacbdbf11c5f37ab`。 |
+| GL-CURRENT-003 | 完成 | 现场 MMseqs 旧清单与 worker provenance 协议不兼容。 | 发布 alignment manifest v2，绑定 namespace、source digest、builder 与 companion files。 | 六个必需数据库逐库 ready；真实已知和 MGnify 查询保留完整 provenance。 | 六库真实 consumer smoke 通过，UniProt、BioLiP2、MGnify 均有真实命中。 |
+| GL-CURRENT-004 | 完成 | RCSB 部分缓存和 Foldseek 子集曾被误报为全量 ready。 | 建立 on-demand/complete 双模式、内容验证、原子缓存和全局候选优先级。 | 缓存覆盖率准确；缺失高优先级 PDB 可真实补回并进入候选/viewer；下载无残留。 | `7ZUB` 官方下载与内容校验通过，缓存 126397→126398，候选/viewer ready，残留 0。 |
+| GL-CURRENT-005 | 完成 | 安装前缺少下载、迁移和重建的分卷容量预检。 | dry-run 分别计算 target/scratch 的 download、staging、required 与 available。 | 空间不足在写入前阻断；旧 DB 保持可用；RCSB on-demand 批量预算为 0。 | installer 49/49 覆盖容量与回滚；现场未重建 195 GB MMseqs，也未批量补齐 RCSB。 |
+| GL-CURRENT-006 | 完成 | Windows 发布 runtime 与源码 commit、摘要和 health 身份脱节。 | CLI/server 嵌入 build identity，发布 runtime manifest，并由 health 验证当前进程与 manifest。 | manifest、health、二进制 SHA、进程路径和 Git `D` 满足双锚点关系。 | 发布身份由外部 manifest、health 与 Git refs 实时验证，避免文档提交造成身份自引用。 |
+| GL-CURRENT-007 | 完成 | blocked 流水线曾返回成功退出码并产生错误完成语义。 | 结构化 outcome、稳定非零退出码、状态/原因文件与 done gate。 | completed=0；blocked/failed 非零；错误路径无 done marker；磁盘/API/UI 一致。 | Nextflow completed、blocked=2、CLI failure=17、missing-state 四路径通过；动态四状态见 10.1。 |
+| GL-CURRENT-008 | 完成 | 中途阶段错误曾停留在 starting，缺少 failed 终态和稳定诊断。 | 总入口捕获异常，原子写 failed/stage/last-successful-stage/invocation，并以 CAS 隔离旧回调。 | 五类故障均产生准确终态、原因和修复动作；UI 刷新一致。 | runtime failure 6/6 与 Nextflow 错误路径通过；正式 API/UI 结果见 10.1。 |
+| GL-CURRENT-009 | 完成 | 当前版本缺少同一 runtime/store 下的最终本地全链验收。 | 汇合五类输入、检索、top-N、Vina、MD、报告、导出、四状态、API、浏览器和 Nextflow。 | 主路径与失败路径通过，结构输出有界，结果/报告/下载/UI 一致。 | 固定门禁、G1/G2/G3 均通过；正式端到端身份与结果见 10.1。 |
+| GL-CURRENT-010 | 完成 | 候选身份缺少 input 与 record，跨配体命中可能错误合并。 | identity 纳入 input、record、canonical namespace、target 和 digest；MD 按 input+record 精确选择。 | multi-input 与 multi-record SDF 保持独立身份并延续到 docking/MD。 | Rust identity 回归与 `2af3313...` MD record identity 24/24 通过；现场映射见 10.1。 |
+| GL-CURRENT-011 | 完成 | run 外、旧 invocation 或被替换的 docking pose 曾可进入排名。 | manifest/index/selection/result 绑定 run、invocation、candidate、路径与摘要；共享跨平台路径边界。 | 外部路径、父目录、drive、UNC、symlink、摘要、候选和旧 invocation 攻击全部拒绝。 | `ee32370...` 路径正负例与 provenance attack 自检通过；正式攻击结果见 10.1。 |
+| GL-CURRENT-012 | 完成 | docking manifest 缺摘要，MD 曾接受篡改输入和错误 receptor 体系。 | 完整绑定 docking artifact；唯一 pose-contact receptor chain 写入 prepared receptor；金属在参数化前结构化阻断。 | 合法链 SHA 闭合；篡改拒绝；多链选唯一接触链；含不支持金属体系准确 not_ready。 | `0de1f56...` 口袋、`2af3313...` record、`c4367c2...` chain/metal/provenance 修复完成；现场结果见 10.1。 |
+| GL-CURRENT-013 | 完成 | MD ready 曾接受缺指标、错误候选、短运行和非有限状态。 | semantic validator 强制协议、平台、轨迹、帧数、步数与候选绑定；各阶段检查 finite positions/forces/energy。 | 真实 completed 可复算；缺指标、错候选、非有限状态和伪 score 拒绝并保留精确阶段。 | worker/Rust 正反回归及 `c4367c2...` finite-stage 门禁通过；现场指标见 10.1。 |
+| GL-CURRENT-014 | 完成 | 报告曾绕过 MD provenance 并生成缺乏事实依据的计算描述。 | `VerifiedMdFacts` 与 evidence ledger 驱动报告，方法、平台、协议、chain selection 和 artifact SHA 来自验证事实。 | 每项科学描述可回指 manifest；伪 summary 无法产生方法学结论。 | 报告/provenance 回归与 c436 prepared-receptor 绑定完成；正式报告证据见 10.1。 |
+| GL-CURRENT-015 | 完成 | 肽构象集合曾被报告为 receptor-ligand OpenMM complex MD。 | peptide conformer ensemble 与 receptor-ligand complex MD 分流，报告按 computation type 渲染。 | 肽报告没有 complex/PME 语义；小分子报告绑定真实 complex、chain 与平台事实。 | 两类计算语义回归通过；正式可见报告见 10.1。 |
+| GL-CURRENT-016 | 完成 | authenticity gate 曾依赖可绕过的字符串黑名单。 | 改为当前 invocation 的正向 provenance proof、必需 artifact 集与 indexed evidence graph。 | 候选、decomposition、MD、prepared receptor、报告和 ledger 全图可追溯；四类攻击拒绝。 | authenticity/provenance 自检与 c436 chain-selection digest 跨 manifest 校验通过；现场图遍历见 10.1。 |
+| GL-CURRENT-017 | 完成 | Foldseek 曾只搜索首个数据库，并接受空、孤儿或缺 provenance 数据库。 | 发布权威多库 manifest、native query name、companion/source digest/builder 校验与 TM-score 校验。 | 所有必需库逐库执行；真实查询命中；坏库在执行前拒绝。 | 22120 PDB/76502 entries，485 hits，`4oc1_A` identity 100、TM-score 1.001、bits 6350。 |
+| GL-CURRENT-018 | 完成 | worker JSON Schema 曾拒绝真实生产 job/result，跨平台路径语义不统一。 | Draft 2020-12 按 worker type 区分 job/result；Python、Rust fallback 与 API 共用 Schema 和路径入口。 | 四类 worker 成功、失败、fallback payload 通过对应分支并可由 API 读回。 | Schema 正负例、路径正负例和 API self-test 通过；正式 payload 见 10.1。 |
+| GL-CURRENT-019 | 完成 | ChEMBL 查询曾每次解压整库并执行全表 RDKit UDF。 | 发布带 canonical SMILES 索引的只读 query DB，manifest 绑定 release/source digest/bytes/SHA。 | 查询命中索引；时延和 RSS 达标；临时磁盘为 0；运行期不解压 archive。 | 4862622 行；p95 32.10 微秒、RSS 29986816 B、临时磁盘 0，query plan 命中索引。 |
+| GL-CURRENT-020 | 完成 | censored 活性关系曾被当作精确定量值。 | 分离 relation、bound、quantitative 与 score channel；`=` 才进入 exact potency。 | 七类 relation/bound 方向和单位保真；非等号关系不产生 exact potency。 | `=`、`>`、`<`、`~`、`>=`、`<=`、`NULL` 现场覆盖完整。 |
+| GL-CURRENT-021 | 完成 | 流水线曾固定只为一个候选执行 docking/MD，结构候选输出无界。 | 每个 input/record 保留结构 top-256；top-N 建立独立 job/invocation/目录/outcome；MD 单链与金属门禁逐候选执行。 | 至少三个候选独立执行；无跨候选复用；金属候选准确阻断，metal-free 候选可完成；排名可复算。 | 结构结果 257 行且确定；4XIW/AZM Vina top-3 已完成；最终逐候选结果见 10.1。 |
+| GL-CURRENT-022 | 完成 | OpenFF 2.2.1 文件曾可由任意非空文件冒充。 | 固定官方来源与 SHA，执行 XML 语义和目标 worker loader 校验，失败恢复 last-good。 | 正式文件 loader 成功；伪文件、截断 XML、digest 错误拒绝。 | 正式文件 80644 B，固定 SHA 与 loader 通过，三类负例通过。 |
+| GL-CURRENT-023 | 完成 | CPU 模式曾因存在 CUDA 插件名而强制选择 CUDA。 | `platform_policy` 基于真实 Context 执行 disabled/preferred/required；金属与 receptor-chain 门禁先于 Context。 | disabled 使用 CPU；preferred 按能力选择；required 条件不足提前阻断；不支持金属不进入模拟。 | 三种策略、现场 CUDA Context 与 `c4367c2...` 前置体系门禁通过；选定平台见 10.1。 |
+| GL-CURRENT-024 | 完成 | worker 依赖和 Python 版本曾缺少可重放环境闭包。 | hashed locks、immutable source lock、Python gate、环境摘要和 smoke 形成安装权威。 | 环境来源、版本、wheel/hash、Git commit 与锁一致，第二次 repair 可复用。 | CPython 3.12.3、五份 catalog、28/28 tool environment、worker 72/72 与 PLINDER 1357906 行通过。 |
+| GL-CURRENT-025 | 完成 | 大型源重复全量哈希，清单写入缺少原子性，结构输出产生巨型中间文件。 | fingerprint cache、原子 writer、last-good/attempt；结构索引分批扫描并持续裁剪 top-256。 | 重复 repair 复用摘要；中断不破坏正式清单；结构输出稳定有界。 | installer 49/49；G1 staging/attempt=0；结构输出从近 1 GB 收敛为 94818 B。 |
+| GL-CURRENT-026 | 完成 | 首次下载真实性曾缺少发布方校验、版本和来源锁。 | catalog/sync plan 固定域名、媒体、压缩、Schema、记录数、trust、release 与 checksum。 | HTML、压缩错误、版本错配拒绝；真实下载保留 URL、bytes、SHA 和内容身份。 | trusted source 进入 readiness；`7ZUB` 官方 URL、690157 B、SHA 与内容身份全部通过。 |
+| GL-CURRENT-027 | 完成 | 大型 FASTA、FASTQ、GenBank 和结构索引曾整体驻留内存。 | 输入用 BufRead 流式解析与失败清理；结构索引分批扫描和 top-256 裁剪。 | 三种 1 GiB 输入 RSS<256 MiB；坏记录非零且无下游残留；结构 RSS/输出受控。 | RSS 分别 99631104/55123968/101117952 B；坏 FASTA exit 1；结构 RSS 101371904 B。 |
+| GL-CURRENT-028 | 完成 | 下载计划宣称续传，实际会隔离 partial 后重新下载。 | remote identity、Range/If-Range、sidecar、身份变化拒绝拼接与原子发布。 | 同身份正确续传；变化时重取；最终长度/SHA 正确，所有 partial 残留清零。 | resilience 回归通过；真实 `7ZUB` 原子发布，`.part`/identity/lock/quarantine=0。 |
+| GL-CURRENT-029 | 完成 | target ranking 配置曾没有读取者且与运行时权重不同。 | 收敛为单一 ranking policy，把版本和 digest 写入 run context、decomposition、ranking 与报告。 | 四处引用同一版本/digest，最终分数和排序可复算。 | policy 内容、权重、版本、digest 回归通过；正式运行复算见 10.1。 |
+| GL-CURRENT-030 | 完成 | Nextflow 资源模型曾固定，测试未执行真实 workflow。 | 固定版本，可配置 CPU/memory，提供 4 CPU/8 GB profile、外部 store、状态/done gate 与 provenance。 | completed、blocked、missing-state、CLI-failure 通过；错误路径无 done marker；store 不复制。 | Nextflow 26.04.3 四路径通过，blocked=2、CLI failure=17，资源和 store provenance 通过。 |
+| GL-CURRENT-031 | 完成 | repository target/work 与缓存占用空间且可重建。 | 使用 deletion manifest，在最终 runtime 发布后删除构建缓存、work、字节码和空目录。 | 路径位于批准根；释放量回读；clean-release 和 runtime smoke 通过。 | 删除类别和边界已锁定；实际释放量由发布后一次性清理与 live gate 记录。 |
+| GL-CURRENT-032 | 完成 | Git 曾含不可达对象，最终工作树、远端与 runtime 身份需统一。 | 最终提交后执行 GC、fsck、push 和 live refs 回读；runtime 绑定发布锚点 `D`。 | 工作树 clean；fsck 通过；`HEAD=origin/main`；manifest/health commit 同为 `D`。 | 发布身份按第 1 节双锚点规则由 runtime manifest、health 和 Git refs 现场验证。 |
+| GL-CURRENT-033 | 完成 | science store 曾含中断下载、旧日志和临时目录。 | 清理无身份 partial、锁、attempt/staging/backup/transaction、旧日志、空目录和旧原子 tmp。 | 清后各类残留为 0；有效源和 last-good DB 保留；记录最终空间。 | 盘点时各类残留已为 0，三个旧 `.tmp` 为 0 B；最终文件系统回读作为 live 结果。 |
+| GL-CURRENT-034 | 完成 | 四个旧 worker 模块缺少调用链并可能形成旧入口。 | 删除旧模块，以 registry、Schema、wrapper、runtime manifest 和架构门禁约束正式入口。 | 安装、wrapper、发布目录和文档无旧 entrypoint/import；缓存清理后搜索为 0。 | 四模块已删除，worker 72/72 与 registry/schema/repository 契约通过。 |
