@@ -554,6 +554,8 @@ const DOCKING_WORKER_TASK: WorkerTask<'static> = WorkerTask {
 
 const REPORT_CANDIDATE_LIMIT: usize = 50;
 const COMPLEX_CANDIDATE_TOP_N: usize = 3;
+const STRUCTURE_MATCH_TOP_K_PER_INPUT_RECORD: usize = 256;
+const MIN_STRUCTURE_MATCH_TOKEN_CHARS: usize = 3;
 const RCSB_ON_DEMAND_POLICY_SCHEMA_VERSION: &str = "genoligand_rcsb_on_demand_policy_v1";
 const RCSB_OFFICIAL_DOWNLOAD_BASE_URL: &str = "https://files.rcsb.org/download";
 const RCSB_OFFICIAL_COORDINATE_TEMPLATE: &str = "https://files.rcsb.org/download/{pdb_id}.cif.gz";
@@ -670,16 +672,9 @@ struct SelectedComplexCandidate {
 }
 
 #[derive(Clone, Debug)]
-struct CoordinateBackedCandidate {
+struct CoordinateCandidate {
     selected: SelectedComplexCandidate,
-    coordinate_path: PathBuf,
-    priority: i64,
-    score: f64,
-}
-
-#[derive(Clone, Debug)]
-struct CoordinateCandidateRequest {
-    selected: SelectedComplexCandidate,
+    coordinate_path: Option<PathBuf>,
     priority: i64,
     score: f64,
 }
@@ -6705,55 +6700,120 @@ fn match_structure_interactions(options: &ScienceOptions) -> Result<Vec<IndexMat
         &mut inputs,
         &options.run_dir.join("known_database_matches.tsv"),
     )?;
-    let rows = read_store_rows(
+    let mut matches_by_input = inputs
+        .iter()
+        .map(|input| {
+            (
+                (input.input_id.clone(), input.record_id.clone()),
+                Vec::<IndexMatch>::new(),
+            )
+        })
+        .collect::<BTreeMap<_, _>>();
+    for_each_store_row_batch(
         &options.science_store.join("indexes/structure_targets.tsv"),
         "structure_interaction_index",
+        |rows| {
+            for input in &inputs {
+                let informative_token_count = input
+                    .tokens
+                    .iter()
+                    .filter(|token| structure_match_token_is_informative(token))
+                    .count();
+                if informative_token_count == 0 {
+                    continue;
+                }
+                let matches = matches_by_input
+                    .get_mut(&(input.input_id.clone(), input.record_id.clone()))
+                    .expect("structure match input initialized");
+                for row in rows {
+                    let matched = structure_matched_tokens(input, row);
+                    if matched.is_empty() {
+                        continue;
+                    }
+                    matches.push(IndexMatch {
+                        input_id: input.input_id.clone(),
+                        record_id: input.record_id.clone(),
+                        source: row.source.clone(),
+                        target_id: row.target_id.clone(),
+                        target_name: row.target_name.clone(),
+                        organism: row.organism.clone(),
+                        target_class: row.target_class.clone(),
+                        match_score: (matched.len() as f64 / informative_token_count as f64)
+                            .min(1.0),
+                        matched_features: matched.join(" "),
+                        evidence: row.evidence.clone(),
+                    });
+                }
+                retain_top_structure_matches(matches);
+            }
+            Ok(())
+        },
     )?;
     let mut matches = Vec::new();
+    for mut input_matches in matches_by_input.into_values() {
+        retain_top_structure_matches(&mut input_matches);
+        for item in &mut input_matches {
+            item.evidence = bind_database_evidence(options, &item.source, &item.evidence)?;
+        }
+        matches.append(&mut input_matches);
+    }
     let mut out = String::from(
         "input_id\tsource\ttarget_id\ttarget_name\torganism\ttarget_class\tmatch_score\tmatched_features\tevidence\trecord_id\n",
     );
-    for input in &inputs {
-        for row in &rows {
-            let score = score_row(input, row);
-            if score <= 0.0 {
-                continue;
-            }
-            let matched_features = matched_tokens(input, row).join(" ");
-            let evidence = bind_database_evidence(options, &row.source, &row.evidence)?;
-            let item = IndexMatch {
-                input_id: input.input_id.clone(),
-                record_id: input.record_id.clone(),
-                source: row.source.clone(),
-                target_id: row.target_id.clone(),
-                target_name: row.target_name.clone(),
-                organism: row.organism.clone(),
-                target_class: row.target_class.clone(),
-                match_score: score,
-                matched_features,
-                evidence,
-            };
-            out.push_str(&format!(
-                "{}\t{}\t{}\t{}\t{}\t{}\t{:.4}\t{}\t{}\t{}\n",
-                item.input_id,
-                clean_cell(&item.source),
-                clean_cell(&item.target_id),
-                clean_cell(&item.target_name),
-                clean_cell(&item.organism),
-                clean_cell(&item.target_class),
-                item.match_score,
-                clean_cell(&item.matched_features),
-                clean_cell(&item.evidence),
-                clean_cell(&item.record_id),
-            ));
-            matches.push(item);
-        }
+    for item in &matches {
+        out.push_str(&format!(
+            "{}\t{}\t{}\t{}\t{}\t{}\t{:.4}\t{}\t{}\t{}\n",
+            item.input_id,
+            clean_cell(&item.source),
+            clean_cell(&item.target_id),
+            clean_cell(&item.target_name),
+            clean_cell(&item.organism),
+            clean_cell(&item.target_class),
+            item.match_score,
+            clean_cell(&item.matched_features),
+            clean_cell(&item.evidence),
+            clean_cell(&item.record_id),
+        ));
     }
     write_text(
         &options.run_dir.join("structure_interaction_matches.tsv"),
         &out,
     )?;
     Ok(matches)
+}
+
+fn structure_match_token_is_informative(token: &str) -> bool {
+    token.chars().count() >= MIN_STRUCTURE_MATCH_TOKEN_CHARS
+}
+
+fn structure_matched_tokens(input: &ComputedFeatureInput, row: &StoreRow) -> Vec<String> {
+    input
+        .tokens
+        .iter()
+        .filter(|token| {
+            structure_match_token_is_informative(token)
+                && (row.ligand_tokens.contains(*token)
+                    || row.sequence_tokens.contains(*token)
+                    || row.structure_tokens.contains(*token))
+        })
+        .cloned()
+        .collect()
+}
+
+fn retain_top_structure_matches(matches: &mut Vec<IndexMatch>) {
+    matches.sort_by(|left, right| {
+        right
+            .match_score
+            .total_cmp(&left.match_score)
+            .then_with(|| left.source.cmp(&right.source))
+            .then_with(|| left.target_id.cmp(&right.target_id))
+            .then_with(|| left.target_name.cmp(&right.target_name))
+            .then_with(|| left.organism.cmp(&right.organism))
+            .then_with(|| left.target_class.cmp(&right.target_class))
+            .then_with(|| left.matched_features.cmp(&right.matched_features))
+            .then_with(|| left.evidence.cmp(&right.evidence))
+    });
+    matches.truncate(STRUCTURE_MATCH_TOP_K_PER_INPUT_RECORD);
 }
 
 fn enrich_feature_inputs_from_known_matches(
@@ -6767,26 +6827,85 @@ fn enrich_feature_inputs_from_known_matches(
         .iter_mut()
         .map(|input| ((input.input_id.clone(), input.record_id.clone()), input))
         .collect::<BTreeMap<_, _>>();
-    let text = read_text(path)?;
-    let mut lines = text.lines();
-    let headers = lines.next().map(split_tsv).unwrap_or_default();
+    let file =
+        fs::File::open(path).map_err(|err| format!("read_failed:{}:{err}", path.display()))?;
+    let mut lines = BufReader::new(file).lines();
+    let headers = lines
+        .next()
+        .transpose()
+        .map_err(|err| format!("read_failed:{}:{err}", path.display()))?
+        .map(|line| split_tsv(line.trim_start_matches('\u{feff}')))
+        .unwrap_or_default();
+    let Some(input_idx) = find_header(&headers, &["input_id"]) else {
+        return Ok(());
+    };
+    let Some(source_idx) = find_header(&headers, &["source"]) else {
+        return Ok(());
+    };
+    let matched_idx = find_header(&headers, &["matched_features"]);
+    let evidence_idx = find_header(&headers, &["evidence"]);
+    let provenance_idx = find_header(&headers, &["source_row_provenance"]);
+    let ligand_identity_idx = find_header(&headers, &["ligand_identity"]);
     let record_idx = find_header(&headers, &["record_id"]);
     for line in lines {
-        let cols = split_tsv(line);
-        if cols.len() < 9 {
+        let line = line.map_err(|err| format!("read_failed:{}:{err}", path.display()))?;
+        let cols = split_tsv(&line);
+        if !cell(&cols, Some(source_idx)).eq_ignore_ascii_case("BindingDB") {
+            continue;
+        }
+        let evidence = cell(&cols, evidence_idx);
+        let provenance = cell(&cols, provenance_idx);
+        if ![evidence.as_str(), provenance.as_str()]
+            .iter()
+            .any(|value| {
+                value.split(';').any(|part| {
+                    part.trim()
+                        .eq_ignore_ascii_case("bindingdb_onsite_activity_row")
+                })
+            })
+        {
             continue;
         }
         let key = (
-            cols[0].clone(),
+            cell(&cols, Some(input_idx)),
             first_nonempty(&[cell(&cols, record_idx), "record_1".to_string()]),
         );
         if let Some(input) = by_input.get_mut(&key) {
-            for token in tokenize(&format!("{} {} {}", cols[3], cols[7], cols[8])) {
-                input.tokens.insert(token);
+            for value in [
+                cell(&cols, matched_idx),
+                evidence,
+                cell(&cols, ligand_identity_idx),
+            ] {
+                append_bindingdb_structure_identity_tokens(&mut input.tokens, &value);
             }
         }
     }
     Ok(())
+}
+
+fn append_bindingdb_structure_identity_tokens(tokens: &mut BTreeSet<String>, value: &str) {
+    for part in value.split(';') {
+        let Some((key, raw_value)) = part.split_once('=') else {
+            continue;
+        };
+        match key.trim().to_ascii_lowercase().as_str() {
+            "ligand_code" => tokens.extend(
+                tokenize(raw_value)
+                    .into_iter()
+                    .filter(|token| structure_match_token_is_informative(token)),
+            ),
+            "pdb_ids" => {
+                for pdb_id in pdb_ids_from_text(raw_value) {
+                    tokens.extend(
+                        tokenize(&pdb_id)
+                            .into_iter()
+                            .filter(|token| structure_match_token_is_informative(token)),
+                    );
+                }
+            }
+            _ => {}
+        }
+    }
 }
 
 fn write_structure_summary_from_matches(path: &Path, matches: &[IndexMatch]) -> Result<(), String> {
@@ -6895,8 +7014,7 @@ fn write_coordinate_backed_candidate_selection_impl(
     ] {
         remove_file_if_exists(&options.run_dir.join(relative))?;
     }
-    let mut local_candidates = Vec::<CoordinateBackedCandidate>::new();
-    let mut missing_candidates = Vec::<CoordinateCandidateRequest>::new();
+    let mut candidates = Vec::<CoordinateCandidate>::new();
     for hint in known_structure_hints(&options.run_dir.join("known_database_matches.tsv"))? {
         for pdb_id in &hint.pdb_ids {
             let selected = SelectedComplexCandidate {
@@ -6922,22 +7040,17 @@ fn write_coordinate_backed_candidate_selection_impl(
                 evidence: hint.evidence.clone(),
             };
             let priority = known_hint_rank(&hint);
-            if let Some(coordinate_path) =
-                find_structure_coordinate_file(&options.science_store, pdb_id)
-            {
-                local_candidates.push(CoordinateBackedCandidate {
-                    selected,
-                    score: coordinate_hint_score(&coordinate_path, &hint),
-                    coordinate_path,
-                    priority,
-                });
-            } else {
-                missing_candidates.push(CoordinateCandidateRequest {
-                    selected,
-                    priority,
-                    score: hint.match_score,
-                });
-            }
+            let coordinate_path = find_structure_coordinate_file(&options.science_store, pdb_id);
+            let score = coordinate_path
+                .as_ref()
+                .map(|path| coordinate_hint_score(path, &hint))
+                .unwrap_or(hint.match_score);
+            candidates.push(CoordinateCandidate {
+                selected,
+                coordinate_path,
+                priority,
+                score,
+            });
         }
     }
     for item in matches {
@@ -6964,46 +7077,37 @@ fn write_coordinate_backed_candidate_selection_impl(
                 pdb_id: pdb_id.clone(),
                 evidence: item.evidence.clone(),
             };
-            if let Some(coordinate_path) =
-                find_structure_coordinate_file(&options.science_store, &pdb_id)
-            {
-                local_candidates.push(CoordinateBackedCandidate {
-                    selected,
-                    coordinate_path,
-                    priority: 0,
-                    score: item.match_score,
-                });
-            } else {
-                missing_candidates.push(CoordinateCandidateRequest {
-                    selected,
-                    priority: 0,
-                    score: item.match_score,
-                });
-            }
+            candidates.push(CoordinateCandidate {
+                selected,
+                coordinate_path: find_structure_coordinate_file(&options.science_store, &pdb_id),
+                priority: 0,
+                score: item.match_score,
+            });
         }
     }
-    local_candidates.sort_by(|left, right| {
+    candidates.sort_by(|left, right| {
         right
             .priority
             .cmp(&left.priority)
             .then_with(|| right.score.total_cmp(&left.score))
             .then_with(|| left.selected.candidate_id.cmp(&right.selected.candidate_id))
             .then_with(|| left.selected.pdb_id.cmp(&right.selected.pdb_id))
-    });
-    missing_candidates.sort_by(|left, right| {
-        right
-            .priority
-            .cmp(&left.priority)
-            .then_with(|| right.score.total_cmp(&left.score))
-            .then_with(|| left.selected.candidate_id.cmp(&right.selected.candidate_id))
-            .then_with(|| left.selected.pdb_id.cmp(&right.selected.pdb_id))
+            .then_with(|| {
+                right
+                    .coordinate_path
+                    .is_some()
+                    .cmp(&left.coordinate_path.is_some())
+            })
     });
 
     let mut selected_rows = Vec::new();
     let mut seen = BTreeSet::new();
     let mut audited_pdb_ids = BTreeSet::new();
     let mut audit_rows = Vec::new();
-    for candidate in local_candidates {
+    let mut fetch_results = BTreeMap::<String, RcsbFetchResult>::new();
+    let mut fetch_count = 0usize;
+    let mut policy_validated = false;
+    for candidate in candidates {
         if selected_rows.len() == COMPLEX_CANDIDATE_TOP_N {
             break;
         }
@@ -7011,92 +7115,71 @@ fn write_coordinate_backed_candidate_selection_impl(
             continue;
         }
         let pdb_id = candidate.selected.pdb_id.clone();
-        let source_sha256 = sha256_file_hex(&candidate.coordinate_path).unwrap_or_default();
-        if !select_coordinate_backed_candidate(
-            options,
-            candidate.selected,
-            &candidate.coordinate_path,
-            "reused",
-            &source_sha256,
-            &mut selected_rows,
-            &mut seen,
-        )? {
-            continue;
-        }
-        if audited_pdb_ids.insert(pdb_id.clone()) {
-            audit_rows.push(rcsb_fetch_audit_row(
-                &options.science_store,
-                &pdb_id,
-                "reused",
-                fetch_base_url,
-                &candidate.coordinate_path,
-                &source_sha256,
-                "valid_cached_coordinate_reused",
-            ));
-        }
-    }
-
-    let mut fetch_results = BTreeMap::<String, RcsbFetchResult>::new();
-    let mut fetch_count = 0usize;
-    let mut policy_validated = false;
-    for request in missing_candidates {
-        if selected_rows.len() == COMPLEX_CANDIDATE_TOP_N {
-            break;
-        }
-        if seen.contains(&request.selected.candidate_id) {
-            continue;
-        }
-        let pdb_id = request.selected.pdb_id.clone();
-        let result =
-            if let Some(path) = find_structure_coordinate_file(&options.science_store, &pdb_id) {
-                RcsbFetchResult {
-                    status: "reused".to_string(),
-                    sha256: sha256_file_hex(&path).unwrap_or_default(),
-                    reason: "valid_coordinate_published_by_concurrent_run".to_string(),
-                    path,
-                }
-            } else if let Some(result) = fetch_results.get(&pdb_id) {
-                result.clone()
-            } else {
-                if fetch_count == RCSB_ON_DEMAND_FETCH_LIMIT {
+        let initially_local = candidate.coordinate_path.is_some();
+        let result = if let Some(path) = candidate.coordinate_path {
+            RcsbFetchResult {
+                status: "reused".to_string(),
+                sha256: sha256_file_hex(&path).unwrap_or_default(),
+                reason: "valid_cached_coordinate_reused".to_string(),
+                path,
+            }
+        } else if let Some(path) = find_structure_coordinate_file(&options.science_store, &pdb_id) {
+            RcsbFetchResult {
+                status: "reused".to_string(),
+                sha256: sha256_file_hex(&path).unwrap_or_default(),
+                reason: "valid_coordinate_published_by_concurrent_run".to_string(),
+                path,
+            }
+        } else if let Some(result) = fetch_results.get(&pdb_id) {
+            result.clone()
+        } else if fetch_count == RCSB_ON_DEMAND_FETCH_LIMIT {
+            RcsbFetchResult {
+                status: "skipped".to_string(),
+                path: rcsb_coordinate_cache_path(&options.science_store, &pdb_id),
+                sha256: String::new(),
+                reason: "max_fetches_per_run_reached".to_string(),
+            }
+        } else {
+            if !policy_validated {
+                if let Err(error) = validate_rcsb_on_demand_policy(&options.science_store) {
                     audit_rows.push(rcsb_fetch_audit_row(
                         &options.science_store,
                         &pdb_id,
-                        "skipped",
+                        "failed",
                         fetch_base_url,
                         &rcsb_coordinate_cache_path(&options.science_store, &pdb_id),
                         "",
-                        "max_fetches_per_run_reached",
+                        &error,
                     ));
-                    break;
+                    write_rcsb_fetch_audit(options, &audit_rows)?;
+                    return Err(error);
                 }
-                if !policy_validated {
-                    if let Err(error) = validate_rcsb_on_demand_policy(&options.science_store) {
-                        audit_rows.push(rcsb_fetch_audit_row(
-                            &options.science_store,
-                            &pdb_id,
-                            "failed",
-                            fetch_base_url,
-                            &rcsb_coordinate_cache_path(&options.science_store, &pdb_id),
-                            "",
-                            &error,
-                        ));
-                        write_rcsb_fetch_audit(options, &audit_rows)?;
-                        return Err(error);
-                    }
-                    policy_validated = true;
-                }
-                fetch_count += 1;
-                let result = fetch_rcsb_coordinate_with_python(
-                    &options.science_store,
-                    &pdb_id,
-                    fetch_base_url,
-                    python_command,
-                );
-                fetch_results.insert(pdb_id.clone(), result.clone());
-                result
-            };
-        if audited_pdb_ids.insert(pdb_id.clone()) {
+                policy_validated = true;
+            }
+            fetch_count += 1;
+            let result = fetch_rcsb_coordinate_with_python(
+                &options.science_store,
+                &pdb_id,
+                fetch_base_url,
+                python_command,
+            );
+            fetch_results.insert(pdb_id.clone(), result.clone());
+            result
+        };
+        let selected = if matches!(result.status.as_str(), "fetched" | "reused") {
+            select_coordinate_backed_candidate(
+                options,
+                candidate.selected,
+                &result.path,
+                &result.status,
+                &result.sha256,
+                &mut selected_rows,
+                &mut seen,
+            )?
+        } else {
+            false
+        };
+        if (!initially_local || selected) && audited_pdb_ids.insert(pdb_id.clone()) {
             audit_rows.push(rcsb_fetch_audit_row(
                 &options.science_store,
                 &pdb_id,
@@ -7107,18 +7190,6 @@ fn write_coordinate_backed_candidate_selection_impl(
                 &result.reason,
             ));
         }
-        if !matches!(result.status.as_str(), "fetched" | "reused") {
-            continue;
-        }
-        select_coordinate_backed_candidate(
-            options,
-            request.selected,
-            &result.path,
-            &result.status,
-            &result.sha256,
-            &mut selected_rows,
-            &mut seen,
-        )?;
     }
     write_rcsb_fetch_audit(options, &audit_rows)?;
     write_selected_complex_candidates(options, &selected_rows)?;
@@ -12736,15 +12807,6 @@ where
     }
     for_each_store_row_batch(path, label, emit)
         .map(|count| (count, "canonical_or_source_table_rows"))
-}
-
-fn read_store_rows(path: &Path, label: &str) -> Result<Vec<StoreRow>, String> {
-    let mut rows = Vec::new();
-    for_each_store_row_batch(path, label, |batch| {
-        rows.extend_from_slice(batch);
-        Ok(())
-    })?;
-    Ok(rows)
 }
 
 fn for_each_store_row_batch<F>(path: &Path, label: &str, mut emit: F) -> Result<usize, String>

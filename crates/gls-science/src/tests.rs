@@ -707,7 +707,7 @@ fn pipeline_uses_one_temporary_query_row_then_test_removes_it() {
     assert!(!report.contains("不代表"));
     assert!(!report.contains("解释边界"));
     assert!(!report.contains("不应"));
-    assert_eq!(structure.lines().count(), 3);
+    assert_eq!(structure.lines().count(), 2);
     assert_eq!(docking.lines().count(), 1);
     assert_eq!(md.lines().count(), 1);
     assert!(structure.contains("structure_index_match"));
@@ -3712,6 +3712,86 @@ fn structure_matching_uses_ligand_identity_from_known_search() {
 
     assert!(matches.contains("2H4N"));
     assert!(matches.contains("azm"));
+    fs::remove_dir_all(&root).expect("cleanup temp root");
+    assert!(!root.exists());
+}
+
+#[test]
+fn structure_matching_bounds_candidates_and_rejects_short_or_generic_known_noise() {
+    let root = temp_root("structure_candidate_bound_and_noise");
+    let store = root.join("science_store");
+    let run = root.join("run");
+    let options = ScienceOptions {
+        workspace_root: root.clone(),
+        science_store: store.clone(),
+        input_manifest: root.join("input.json"),
+        run_dir: run.clone(),
+    };
+    ensure_dir(&store.join("indexes")).expect("indexes");
+    write_test_source_manifest(&store, &["rcsb_ligand_bound"]).expect("source manifest");
+    normalize_and_compute_fixture(&options, "small_molecule", "NOS").expect("upstream manifests");
+    write_text(
+        &run.join("feature_manifest.tsv"),
+        "input_id\tinput_kind\tfeature_family\tfeature_name\tfeature_value\tfeature_source\tfeature_token\trecord_id\ninput_1\tsmall_molecule\tligand\tatom\tn\tGenoLigand\tn\trecord_1\ninput_1\tsmall_molecule\tligand\tatom\to\tGenoLigand\to\trecord_1\ninput_1\tsmall_molecule\tligand\tatom\ts\tGenoLigand\ts\trecord_1\n",
+    )
+    .expect("features");
+    let mut known = String::from(
+        "input_id\tsource\ttarget_id\ttarget_name\torganism\ttarget_class\tmatch_score\tmatched_features\tevidence\tsource_row_provenance\tactivity_value\tligand_identity\tcurrent_run_query_id\trecord_id\n",
+    );
+    known.push_str(
+        "input_1\tBindingDB\tP00918\tCarbonic anhydrase 2\tHomo sapiens\tknown_human_protein\t1.0000\tligand_code=AZM;pdb_ids=2H4N\tbindingdb_onsite_activity_row;ligand_code=AZM;pdb_ids=2H4N\tbindingdb_onsite_activity_row\tKi (nM)=12\tligand_name=Acetazolamide;ligand_code=AZM\tquery_1\trecord_1\n",
+    );
+    for row in 0..600usize {
+        known.push_str(&format!(
+            "input_1\tChEMBL\tCHEMBL_NOISE_{row}\tGeneric target provenance {row}\tunknown\tprotein\t0.2000\tgeneric known target\tchembl_activity_row;provenance=generic target\tchembl_source\t\t\tquery_{row}\trecord_1\n"
+        ));
+    }
+    write_text(&run.join("known_database_matches.tsv"), &known).expect("known matches");
+    let mut index = String::from(
+        "source\ttarget_id\ttarget_name\torganism\ttarget_class\tligand_tokens\tsequence_tokens\tstructure_tokens\tevidence\n",
+    );
+    for row in 0..700usize {
+        index.push_str(&format!(
+            "RCSB\tNOISE_{row:04}\tGeneric noise structure {row}\tunknown\tstructure_record\tn o s\t\tgen ene ner eri ric\trcsb_structure_file\n"
+        ));
+    }
+    index.push_str(
+        "RCSB\t2H4N\tCarbonic anhydrase II with AZM\tHomo sapiens\tstructure_record\tazm\t\t2h4 h4n\trcsb_structure_file\n",
+    );
+    for row in 0..399usize {
+        index.push_str(&format!(
+            "RCSB\tZ_AZM_{row:04}\tAZM structure {row}\tunknown\tstructure_record\tazm\t\t\trcsb_structure_file\n"
+        ));
+    }
+    write_text(&store.join("indexes/structure_targets.tsv"), &index).expect("structure index");
+
+    let first = match_structure_interactions(&options).expect("first structure match");
+    let first_output =
+        read_text(&run.join("structure_interaction_matches.tsv")).expect("first output");
+    let second = match_structure_interactions(&options).expect("second structure match");
+    let second_output =
+        read_text(&run.join("structure_interaction_matches.tsv")).expect("second output");
+
+    assert_eq!(first.len(), 256);
+    assert_eq!(second.len(), 256);
+    assert_eq!(first_output, second_output);
+    assert_eq!(first_output.lines().count(), 257);
+    let identity_hit = first_output
+        .lines()
+        .find(|line| line.split('\t').nth(2) == Some("2H4N"))
+        .expect("2H4N identity hit retained");
+    let identity_tokens = identity_hit
+        .split('\t')
+        .nth(7)
+        .unwrap_or_default()
+        .split_whitespace()
+        .collect::<BTreeSet<_>>();
+    assert_eq!(identity_tokens, BTreeSet::from(["2h4", "azm", "h4n"]));
+    assert!(!first_output.contains("NOISE_"));
+    assert!(!first_output.contains("\tn\t"));
+    assert!(!first_output.contains("\to\t"));
+    assert!(!first_output.contains("\ts\t"));
+    assert!(!first_output.contains("gen"));
     fs::remove_dir_all(&root).expect("cleanup temp root");
     assert!(!root.exists());
 }
@@ -7314,6 +7394,65 @@ fn rcsb_on_demand_selection_fetches_valid_coordinate_and_publishes_audit() {
                 !name.contains(".part") && !name.contains("identity") && !name.ends_with(".lock")
             })
     );
+    fs::remove_dir_all(&root).expect("cleanup temp root");
+}
+
+#[test]
+fn rcsb_on_demand_prioritizes_missing_known_hint_over_lower_ranked_local_candidates() {
+    let root = temp_root("rcsb_on_demand_global_candidate_priority");
+    let run = root.join("run");
+    let store = root.join("science_store");
+    let options = ScienceOptions {
+        workspace_root: root.clone(),
+        science_store: store.clone(),
+        input_manifest: root.join("input.json"),
+        run_dir: run.clone(),
+    };
+    write_test_rcsb_on_demand_policy(&store);
+    write_text(
+        &run.join("known_database_matches.tsv"),
+        "input_id\tsource\ttarget_id\ttarget_name\torganism\ttarget_class\tmatch_score\tmatched_features\tevidence\tprovenance\tactivity\tstructure\tstructure_source\trecord_id\ninput_1\tBindingDB\tP_HIGH\tHigh priority target\tHomo sapiens\tenzyme\t1.0\tligand_code=LIG;pdb_ids=7ZUB\tbindingdb_onsite_activity_row;Ki (nM)=1;pdb_ids=7ZUB\t\t\t\t\trecord_1\ninput_1\tBindingDB\tP_LOW_1\tLow priority target 1\tHomo sapiens\tenzyme\t0.8\tligand_code=LIG;pdb_ids=1AAA\tbindingdb_onsite_activity_row;Ki (nM)=500;pdb_ids=1AAA\t\t\t\t\trecord_1\ninput_1\tBindingDB\tP_LOW_2\tLow priority target 2\tHomo sapiens\tenzyme\t0.7\tligand_code=LIG;pdb_ids=2BBB\tbindingdb_onsite_activity_row;Ki (nM)=600;pdb_ids=2BBB\t\t\t\t\trecord_1\ninput_1\tBindingDB\tP_LOW_3\tLow priority target 3\tHomo sapiens\tenzyme\t0.6\tligand_code=LIG;pdb_ids=3CCC\tbindingdb_onsite_activity_row;Ki (nM)=700;pdb_ids=3CCC\t\t\t\t\trecord_1\n",
+    )
+    .expect("known matches");
+    for pdb_id in ["1AAA", "2BBB", "3CCC"] {
+        write_gzip(
+            &rcsb_coordinate_cache_path(&store, pdb_id),
+            &test_rcsb_mmcif(pdb_id),
+        )
+        .expect("local coordinate");
+    }
+    let server = TestHttpServer::start(BTreeMap::from([(
+        "/7ZUB.cif.gz".to_string(),
+        TestHttpResponse {
+            status: 200,
+            content_type: "application/gzip",
+            body: test_gzip_bytes(&test_rcsb_mmcif("7ZUB")),
+        },
+    )]));
+
+    assert!(
+        write_coordinate_backed_candidate_selection_with_base_url(&options, &[], &server.base_url)
+            .expect("globally prioritized selection")
+    );
+
+    assert_eq!(server.requests(), ["/7ZUB.cif.gz"]);
+    let selection =
+        read_simple_tsv_rows(&run.join("complex_candidate_selection.tsv")).expect("selection");
+    assert_eq!(selection.len(), COMPLEX_CANDIDATE_TOP_N);
+    assert!(
+        selection
+            .iter()
+            .any(|row| row.get("pdb_id").map(String::as_str) == Some("7ZUB"))
+    );
+    assert!(
+        !selection
+            .iter()
+            .any(|row| row.get("pdb_id").map(String::as_str) == Some("3CCC"))
+    );
+    let audit = read_text(&run.join(RCSB_ON_DEMAND_FETCH_MANIFEST)).expect("fetch audit");
+    assert!(audit.contains("7ZUB\tfetched\t"));
+    let viewer = read_text(&run.join("structure_viewer.cif")).expect("viewer");
+    assert!(viewer.contains("data_7ZUB"));
     fs::remove_dir_all(&root).expect("cleanup temp root");
 }
 
