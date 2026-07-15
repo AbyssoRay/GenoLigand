@@ -817,17 +817,26 @@ def selected_md_candidate(
     if len(rows) != 1:
         raise MdProvenanceError("selected_md_candidate_must_be_unique")
     row = rows[0]
-    if not row.get("candidate_id") or not row.get("input_id"):
+    if (
+        not row.get("candidate_id")
+        or not row.get("input_id")
+        or not row.get("record_id")
+    ):
         raise MdProvenanceError("selected_md_candidate_binding_incomplete")
     return row, canonical_digest(row)
 
 
-def selected_md_input(run_dir: Path, input_id: str) -> tuple[dict[str, str], str, str, str]:
+def selected_md_input(
+    run_dir: Path,
+    input_id: str,
+    record_id: str,
+) -> tuple[dict[str, str], str, str, str]:
     path = resolve_run_artifact(run_dir, "input_conversion_manifest.tsv")
     rows = [
         row
         for row in read_tsv_dicts(path)
         if row.get("input_id") == input_id
+        and row.get("record_id") == record_id
         and row.get("conversion_status") == "converted"
         and row.get("canonical_kind") in {"small_molecule", "peptide"}
     ]
@@ -1006,8 +1015,12 @@ def resolve_md_invocation(job: dict[str, Any]) -> MdInvocationBinding:
     )
     candidate_id = selection["candidate_id"]
     input_id = selection["input_id"]
-    input_row, input_value, source_digest, input_digest = selected_md_input(run_dir, input_id)
-    record_id = input_row.get("record_id", "")
+    record_id = selection["record_id"]
+    input_row, input_value, source_digest, input_digest = selected_md_input(
+        run_dir,
+        input_id,
+        record_id,
+    )
     expected_values = (
         ("candidate_id", candidate_id, "job_candidate_id_mismatch"),
         ("candidate_digest", candidate_digest, "job_candidate_digest_mismatch"),

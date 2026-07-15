@@ -211,7 +211,9 @@ def main() -> int:
             f"{input_id}\t{record_id}\tsmall_molecule\tCCO\tconverted\t{source_digest}\n",
             encoding="utf-8",
         )
-        _, _, _, input_digest = md_summary_worker.selected_md_input(binding_run, input_id)
+        _, _, _, input_digest = md_summary_worker.selected_md_input(
+            binding_run, input_id, record_id
+        )
         _, candidate_digest = md_summary_worker.selected_md_candidate(binding_run, candidate_id, input_id, record_id)
         artifact_names = {
             "receptor_coordinate": "structure_viewer.pdb",

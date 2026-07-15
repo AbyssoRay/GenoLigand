@@ -214,6 +214,100 @@ class MdArtifactProvenanceTests(unittest.TestCase):
             manifest_path.read_bytes()
         ).hexdigest()
 
+    def install_second_record_fixture(self) -> tuple[dict[str, object], str, str]:
+        record_id = "record-other"
+        candidate_id = "candidate-other"
+        canonical_value = "CCO"
+        source_digest = self.source_digest
+        input_digest = canonical_digest(
+            {
+                "input_id": self.input_id,
+                "record_id": record_id,
+                "canonical_kind": "small_molecule",
+                "canonical_value": canonical_value,
+                "source_content_sha256": source_digest,
+            }
+        )
+        with (self.run_dir / "complex_candidate_selection.tsv").open(
+            "a", encoding="utf-8"
+        ) as handle:
+            handle.write(
+                f"{candidate_id}\t{self.input_id}\t{record_id}\tT2\tTarget 2\t"
+                "Homo sapiens\tprotein\tfixture\t2BCD\tselected\n"
+            )
+        with (self.run_dir / "input_conversion_manifest.tsv").open(
+            "a", encoding="utf-8"
+        ) as handle:
+            handle.write(
+                f"{self.input_id}\t{record_id}\tsmall_molecule\t{canonical_value}\t"
+                f"converted\t{source_digest}\n"
+            )
+
+        candidate_digest = worker.selected_md_candidate(
+            self.run_dir,
+            candidate_id,
+            self.input_id,
+            record_id,
+        )[1]
+        manifest_path = self.tool_outputs / "docking_manifest.json"
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        manifest.update(
+            {
+                "candidate_id": candidate_id,
+                "candidate_digest": candidate_digest,
+                "record_id": record_id,
+                "input_digest": input_digest,
+                "source_content_sha256": source_digest,
+                "seed_provenance": {"input_digest": input_digest},
+            }
+        )
+        second_artifact_dir = self.tool_outputs / candidate_id
+        second_artifact_dir.mkdir()
+        for artifact in manifest["artifacts"]:
+            source = self.run_dir / artifact["artifact_path"]
+            destination = second_artifact_dir / source.name
+            destination.write_bytes(
+                source.read_bytes() + f"second:{artifact['artifact_name']}\n".encode()
+            )
+            relative = destination.relative_to(self.run_dir).as_posix()
+            artifact["artifact_path"] = relative
+            artifact["artifact_sha256"] = hashlib.sha256(
+                destination.read_bytes()
+            ).hexdigest()
+            artifact.update(
+                {
+                    "candidate_id": candidate_id,
+                    "candidate_digest": candidate_digest,
+                    "record_id": record_id,
+                    "input_digest": input_digest,
+                    "source_digest": source_digest,
+                }
+            )
+            manifest[artifact["artifact_name"]] = relative
+            if artifact["artifact_name"] == "receptor_coordinate":
+                receptor_digest = artifact["artifact_sha256"]
+                artifact["receptor_digest"] = receptor_digest
+                manifest["receptor_digest"] = receptor_digest
+                manifest["receptor_sha256"] = receptor_digest
+        second_manifest = self.tool_outputs / "docking_manifest-other.json"
+        second_manifest.write_text(
+            json.dumps(manifest, indent=2, sort_keys=True) + "\n",
+            encoding="utf-8",
+        )
+        job = {
+            **self.job,
+            "candidate_id": candidate_id,
+            "candidate_digest": candidate_digest,
+            "record_id": record_id,
+            "input_digest": input_digest,
+            "source_digest": source_digest,
+            "docking_manifest": "tool_outputs/docking_manifest-other.json",
+            "docking_manifest_digest": hashlib.sha256(
+                second_manifest.read_bytes()
+            ).hexdigest(),
+        }
+        return job, canonical_value, source_digest
+
     def test_current_job_candidate_input_and_docking_artifacts_are_bound(self) -> None:
         binding = worker.resolve_md_invocation(self.job)
 
@@ -228,6 +322,113 @@ class MdArtifactProvenanceTests(unittest.TestCase):
             binding.docking_pose_sdf,
             (self.tool_outputs / "docking_pose.sdf").resolve(),
         )
+
+    def test_same_input_id_records_bind_their_own_canonical_source(self) -> None:
+        second_job, second_value, second_source_digest = (
+            self.install_second_record_fixture()
+        )
+
+        current = worker.resolve_md_invocation(self.job)
+        second = worker.resolve_md_invocation(second_job)
+
+        self.assertEqual(
+            (current.record_id, current.input_value),
+            ("record-current", "CCO"),
+        )
+        self.assertEqual(current.source_digest, self.source_digest)
+        self.assertEqual(
+            (second.record_id, second.input_value),
+            ("record-other", second_value),
+        )
+        self.assertEqual(second.source_digest, second_source_digest)
+        self.assertNotEqual(current.input_digest, second.input_digest)
+
+    def test_missing_wrong_and_cross_record_bindings_fail_closed(self) -> None:
+        second_job, _, _ = self.install_second_record_fixture()
+
+        cases = [
+            ({**second_job, "record_id": ""}, "record_id_missing"),
+            (
+                {**second_job, "record_id": "record-current"},
+                "selected_md_candidate_must_be_unique",
+            ),
+            (
+                {**second_job, "source_digest": "f" * 64},
+                "job_source_digest_mismatch",
+            ),
+            (
+                {**second_job, "input_digest": self.input_digest},
+                "job_input_digest_mismatch",
+            ),
+        ]
+        for job, reason in cases:
+            with self.subTest(reason=reason):
+                with self.assertRaisesRegex(worker.MdProvenanceError, reason):
+                    worker.resolve_md_invocation(job)
+
+        second_manifest = self.tool_outputs / "docking_manifest-other.json"
+        original = json.loads(second_manifest.read_text(encoding="utf-8"))
+        crossed = json.loads(json.dumps(original))
+        crossed["record_id"] = "record-current"
+        second_manifest.write_text(
+            json.dumps(crossed, indent=2, sort_keys=True) + "\n",
+            encoding="utf-8",
+        )
+        crossed_job = {
+            **second_job,
+            "docking_manifest_digest": hashlib.sha256(
+                second_manifest.read_bytes()
+            ).hexdigest(),
+        }
+        with self.assertRaisesRegex(
+            worker.MdProvenanceError,
+            "docking_record_id_mismatch",
+        ):
+            worker.resolve_md_invocation(crossed_job)
+
+        artifact_identity_cases = [
+            ("record_id", "record-current", "docking_artifact_record_id_mismatch"),
+            ("input_digest", self.input_digest, "docking_artifact_input_digest_mismatch"),
+        ]
+        for field, value, reason in artifact_identity_cases:
+            with self.subTest(reason=reason):
+                crossed = json.loads(json.dumps(original))
+                pose_row = next(
+                    row
+                    for row in crossed["artifacts"]
+                    if row["artifact_name"] == "pose_sdf"
+                )
+                pose_row[field] = value
+                second_manifest.write_text(
+                    json.dumps(crossed, indent=2, sort_keys=True) + "\n",
+                    encoding="utf-8",
+                )
+                crossed_job["docking_manifest_digest"] = hashlib.sha256(
+                    second_manifest.read_bytes()
+                ).hexdigest()
+                with self.assertRaisesRegex(worker.MdProvenanceError, reason):
+                    worker.resolve_md_invocation(crossed_job)
+
+        crossed = json.loads(json.dumps(original))
+        crossed["pose_sdf"] = "tool_outputs/docking_pose.sdf"
+        second_manifest.write_text(
+            json.dumps(crossed, indent=2, sort_keys=True) + "\n",
+            encoding="utf-8",
+        )
+        crossed_job["docking_manifest_digest"] = hashlib.sha256(
+            second_manifest.read_bytes()
+        ).hexdigest()
+        with self.assertRaisesRegex(
+            worker.MdProvenanceError,
+            "docking_artifact_path_mismatch",
+        ):
+            worker.resolve_md_invocation(crossed_job)
+
+        with self.assertRaisesRegex(
+            worker.MdProvenanceError,
+            "selected_md_input_must_be_unique",
+        ):
+            worker.selected_md_input(self.run_dir, self.input_id, "record-missing")
 
     def test_windows_run_relative_docking_artifacts_resolve_inside_current_run(self) -> None:
         receptor = self.run_dir / "structure_candidates" / "target_1" / "receptor.cif"
