@@ -494,20 +494,13 @@ impl InputKind {
 }
 
 #[derive(Clone, Debug)]
-#[allow(dead_code)]
 struct NormalizedInput {
     input_id: String,
     record_id: String,
     kind: InputKind,
     primary_value: String,
-    #[cfg_attr(not(test), allow(dead_code))]
-    file_count: usize,
     tokens: BTreeSet<String>,
-    #[cfg_attr(not(test), allow(dead_code))]
-    source_kind: &'static str,
     source_path: String,
-    #[cfg_attr(not(test), allow(dead_code))]
-    content_sha256: String,
     structure_atom_count: usize,
     structure_chain_count: usize,
     structure_residue_count: usize,
@@ -12704,7 +12697,7 @@ fn read_normalized_inputs(path: &Path) -> Result<Vec<NormalizedInput>, String> {
                 index + 2
             ));
         }
-        let source_kind = match cols[6].as_str() {
+        match cols[6].as_str() {
             "file" if cols[7].trim().is_empty() => {
                 return Err(format!(
                     "normalized_input_manifest_missing_source_path:line_{}",
@@ -12717,8 +12710,7 @@ fn read_normalized_inputs(path: &Path) -> Result<Vec<NormalizedInput>, String> {
                     index + 2
                 ));
             }
-            "file" => "file",
-            "inline" => "inline",
+            "file" | "inline" => {}
             value => {
                 return Err(format!(
                     "normalized_input_manifest_invalid_source_kind:line_{}:{}",
@@ -12785,16 +12777,14 @@ fn read_normalized_inputs(path: &Path) -> Result<Vec<NormalizedInput>, String> {
         } else {
             decode_tsv_cell(&cols[2])
         };
+        parse_usize(3, "file_count")?;
         out.push(NormalizedInput {
             input_id: cols[0].clone(),
             record_id: cols[5].clone(),
             kind,
             primary_value,
-            file_count: parse_usize(3, "file_count")?,
             tokens: cols[4].split_whitespace().map(ToOwned::to_owned).collect(),
-            source_kind,
             source_path: cols[7].clone(),
-            content_sha256: cols[8].clone(),
             structure_atom_count: parse_usize(10, "structure_atom_count")?,
             structure_chain_count: parse_usize(11, "structure_chain_count")?,
             structure_residue_count: parse_usize(12, "structure_residue_count")?,
