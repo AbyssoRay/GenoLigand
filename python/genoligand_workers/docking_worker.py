@@ -11,7 +11,12 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from genoligand_workers.worker_io import parse_worker_args, read_job, write_result
+from genoligand_workers.worker_io import (
+    parse_worker_args,
+    read_job,
+    runtime_artifact_path,
+    write_result,
+)
 
 
 BOX_SIZE_ANGSTROM = 22.0
@@ -541,7 +546,7 @@ def resolve_run_artifact(run_dir: Path, artifact: str | Path) -> Path:
     value = str(artifact).strip()
     if not value:
         raise DockingNotReady("artifact_path_missing")
-    candidate = runtime_path(value)
+    candidate = runtime_artifact_path(artifact)
     if not candidate.is_absolute():
         candidate = root / candidate
     try:

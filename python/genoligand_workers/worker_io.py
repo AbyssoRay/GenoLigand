@@ -2,12 +2,25 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 from pathlib import Path
 from typing import Any
 
 
 PIPELINE_MODE = "genoligand_scientific_pipeline"
 SCHEMA_VERSION = "genoligand_worker_current_v2"
+
+
+def runtime_artifact_path(value: str | Path) -> Path:
+    raw = str(value)
+    path = Path(raw)
+    if path.is_absolute():
+        return path
+    if os.name != "nt" and len(raw) >= 3 and raw[1] == ":" and raw[2] in "\\/":
+        drive = raw[0].lower()
+        rest = raw[3:].replace("\\", "/")
+        return Path(f"/mnt/{drive}/{rest}")
+    return Path(raw.replace("\\", "/"))
 
 
 def parse_worker_args() -> argparse.Namespace:

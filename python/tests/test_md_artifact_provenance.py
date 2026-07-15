@@ -229,6 +229,37 @@ class MdArtifactProvenanceTests(unittest.TestCase):
             (self.tool_outputs / "docking_pose.sdf").resolve(),
         )
 
+    def test_windows_run_relative_docking_artifacts_resolve_inside_current_run(self) -> None:
+        receptor = self.run_dir / "structure_candidates" / "target_1" / "receptor.cif"
+        receptor.parent.mkdir(parents=True)
+        self.receptor.replace(receptor)
+        self.receptor = receptor
+        self.write_docking_manifest()
+        manifest_path = self.tool_outputs / "docking_manifest.json"
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        for row in manifest["artifacts"]:
+            relative = str(row["artifact_path"])
+            manifest[str(row["artifact_name"])] = relative.replace("/", "\\")
+            row["artifact_path"] = relative.replace("/", "\\")
+        manifest_path.write_text(
+            json.dumps(manifest, indent=2, sort_keys=True) + "\n",
+            encoding="utf-8",
+        )
+        self.job["docking_manifest"] = r"tool_outputs\docking_manifest.json"
+        self.refresh_docking_manifest_digest()
+
+        binding = worker.resolve_md_invocation(self.job)
+
+        self.assertEqual(binding.receptor_coordinate, receptor.resolve())
+        self.assertEqual(
+            binding.docking_ligand_sdf,
+            (self.tool_outputs / "docking_ligand.sdf").resolve(),
+        )
+        self.assertEqual(
+            binding.docking_pose_sdf,
+            (self.tool_outputs / "docking_pose.sdf").resolve(),
+        )
+
     def test_missing_or_wrong_job_docking_bindings_fail_closed(self) -> None:
         for field in [
             "docking_manifest_digest",
@@ -334,7 +365,13 @@ class MdArtifactProvenanceTests(unittest.TestCase):
     def test_absolute_relative_and_symlink_artifact_escapes_fail_closed(self) -> None:
         outside = self.root / "outside.sdf"
         outside.write_text("outside\n", encoding="utf-8")
-        for escaped in [str(outside), "../outside.sdf"]:
+        for escaped in [
+            str(outside),
+            "../outside.sdf",
+            r"..\outside.sdf",
+            r"C:\outside\pose.sdf",
+            r"\\server\share\pose.sdf",
+        ]:
             with self.subTest(escaped=escaped):
                 self.write_docking_manifest(pose_sdf=escaped)
                 with self.assertRaisesRegex(worker.MdProvenanceError, "artifact_outside_current_run"):

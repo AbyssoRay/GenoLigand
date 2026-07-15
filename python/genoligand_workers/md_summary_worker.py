@@ -12,7 +12,12 @@ from pathlib import Path
 from typing import Any
 
 from genoligand_workers.common import WorkerExecution, WorkerOutcome
-from genoligand_workers.worker_io import parse_worker_args, read_job, write_result
+from genoligand_workers.worker_io import (
+    parse_worker_args,
+    read_job,
+    runtime_artifact_path,
+    write_result,
+)
 
 
 MAX_PEPTIDE_RESIDUES = 80
@@ -749,9 +754,13 @@ def resolve_run_artifact(
     value = str(artifact).strip()
     if not value:
         raise MdProvenanceError("artifact_path_missing")
-    candidate = runtime_path(value)
+    candidate = runtime_artifact_path(artifact)
     if not candidate.is_absolute():
         candidate = root / candidate
+    try:
+        candidate.relative_to(root)
+    except ValueError as exc:
+        raise MdProvenanceError(f"artifact_outside_current_run:{value}") from exc
     try:
         resolved = candidate.resolve(strict=must_exist)
     except OSError as exc:

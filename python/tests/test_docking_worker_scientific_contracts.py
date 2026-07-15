@@ -630,32 +630,64 @@ class DockingWorkerOutputContractTests(unittest.TestCase):
             encoding="utf-8",
         )
 
+    def test_windows_run_relative_receptor_artifact_resolves_inside_current_run(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="genoligand_docking_windows_relative_") as tmp:
+            run_dir = Path(tmp)
+            self.write_binding_fixture(run_dir)
+            receptor = run_dir / "structure_candidates" / "target_2" / "receptor.cif"
+            receptor.parent.mkdir(parents=True)
+            (run_dir / "structure_viewer.pdb").replace(receptor)
+            windows_relative = r"structure_candidates\target_2\receptor.cif"
+            for name in ("complex_candidate_selection.tsv", "structure_viewer_status.tsv"):
+                path = run_dir / name
+                path.write_text(
+                    path.read_text(encoding="utf-8").replace(
+                        "structure_viewer.pdb", windows_relative
+                    ),
+                    encoding="utf-8",
+                )
+
+            binding = resolve_docking_binding(run_dir)
+
+            self.assertEqual(binding.receptor_coordinate, receptor.resolve())
+            self.assertEqual(self.job(run_dir)["receptor_digest"], binding.receptor_digest)
+
     def test_receptor_artifact_must_stay_inside_current_run(self) -> None:
         with tempfile.TemporaryDirectory(prefix="genoligand_docking_outside_") as tmp:
             root = Path(tmp)
-            run_dir = root / "run"
-            run_dir.mkdir()
-            self.write_binding_fixture(run_dir)
             outside = root / "outside.pdb"
             outside.write_bytes(b"ATOM\n")
-            selection = run_dir / "complex_candidate_selection.tsv"
-            selection.write_text(
-                selection.read_text(encoding="utf-8").replace("structure_viewer.pdb", str(outside)),
-                encoding="utf-8",
-            )
             receptor_digest = hashlib.sha256(outside.read_bytes()).hexdigest()
-            (run_dir / "structure_viewer_status.tsv").write_text(
-                "status\tcandidate_id\tinput_id\trecord_id\ttarget_id\tpdb_id\tartifact\t"
-                "coordinate_sha256\texpected_path\treason\n"
-                f"ready\tcandidate_2\tinput_2\trecord_2\tTARGET_2\t2XYZ\t{outside}\t"
-                f"{receptor_digest}\tstore/2xyz.cif\tselected\n",
-                encoding="utf-8",
+            escaped_paths = (
+                str(outside),
+                r"..\outside.pdb",
+                r"C:\outside\receptor.cif",
+                r"\\server\share\receptor.cif",
             )
+            for index, escaped in enumerate(escaped_paths):
+                with self.subTest(escaped=escaped):
+                    run_dir = root / f"run-{index}"
+                    run_dir.mkdir()
+                    self.write_binding_fixture(run_dir)
+                    selection = run_dir / "complex_candidate_selection.tsv"
+                    selection.write_text(
+                        selection.read_text(encoding="utf-8").replace(
+                            "structure_viewer.pdb", escaped
+                        ),
+                        encoding="utf-8",
+                    )
+                    (run_dir / "structure_viewer_status.tsv").write_text(
+                        "status\tcandidate_id\tinput_id\trecord_id\ttarget_id\tpdb_id\tartifact\t"
+                        "coordinate_sha256\texpected_path\treason\n"
+                        f"ready\tcandidate_2\tinput_2\trecord_2\tTARGET_2\t2XYZ\t{escaped}\t"
+                        f"{receptor_digest}\tstore/2xyz.cif\tselected\n",
+                        encoding="utf-8",
+                    )
 
-            with self.assertRaisesRegex(
-                DockingNotReady, "artifact_outside_current_run"
-            ):
-                resolve_docking_binding(run_dir)
+                    with self.assertRaisesRegex(
+                        DockingNotReady, "artifact_outside_current_run"
+                    ):
+                        resolve_docking_binding(run_dir)
 
     def test_rerun_removes_previous_docking_outputs(self) -> None:
         with tempfile.TemporaryDirectory(prefix="genoligand_docking_cleanup_") as tmp:
