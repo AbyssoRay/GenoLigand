@@ -181,6 +181,7 @@ SCIENCE_READINESS_SCHEMA_VERSION = "genoligand_science_store_readiness_v1"
 SCIENCE_READINESS_EVIDENCE_PATHS = (
     "source_requirements.tsv",
     "manifests/source_file_manifest.tsv",
+    "external_sync_execution_manifest.tsv",
     "install_status.json",
     "index_build_manifest.tsv",
     "index_readiness_manifest.tsv",
@@ -2912,8 +2913,7 @@ def read_tsv(path: Path) -> list[dict[str, str]]:
         return cleaned
 
 
-def write_install_progress(
-    science_store: Path,
+def install_progress_payload(
     *,
     status: str,
     stage: str,
@@ -2925,8 +2925,6 @@ def write_install_progress(
     bytes_total: int | None = None,
     message: str = "",
 ) -> dict[str, object]:
-    progress_dir = science_store
-    progress_dir.mkdir(parents=True, exist_ok=True)
     if bytes_total and bytes_total > 0:
         percent = min(100, round((bytes_downloaded / bytes_total) * 100))
     elif total_steps > 0:
@@ -2946,6 +2944,34 @@ def write_install_progress(
         "message": message,
         "updated_at": int(time.time()),
     }
+    return payload
+
+
+def write_install_progress(
+    science_store: Path,
+    *,
+    status: str,
+    stage: str,
+    current_resource: str = "",
+    completed_steps: int = 0,
+    total_steps: int = 0,
+    failed_steps: int = 0,
+    bytes_downloaded: int = 0,
+    bytes_total: int | None = None,
+    message: str = "",
+) -> dict[str, object]:
+    science_store.mkdir(parents=True, exist_ok=True)
+    payload = install_progress_payload(
+        status=status,
+        stage=stage,
+        current_resource=current_resource,
+        completed_steps=completed_steps,
+        total_steps=total_steps,
+        failed_steps=failed_steps,
+        bytes_downloaded=bytes_downloaded,
+        bytes_total=bytes_total,
+        message=message,
+    )
     write_json_atomic(science_store / "install_progress.json", payload)
     return payload
 
@@ -6144,14 +6170,16 @@ def rcsb_scope_snapshot_matches_current_sources(
         snapshot_count = int(snapshot.get("scope_count", 0) or 0)
     except (TypeError, ValueError):
         return False
-    return bool(
-        current_scope
-        and snapshot.get("schema_version") == "genoligand_rcsb_scope_snapshot_v1"
-        and snapshot_count == len(current_scope)
-        and len(manifest_rows) == snapshot_count
-        and manifest_scope == current_scope
-        and snapshot.get("scope_digest") == rcsb_scope_digest(current_scope)
-    )
+    if (
+        not current_scope
+        or snapshot.get("schema_version") != "genoligand_rcsb_scope_snapshot_v1"
+        or snapshot_count != len(manifest_rows)
+        or len(manifest_scope) != snapshot_count
+        or snapshot.get("scope_digest") != rcsb_scope_digest(manifest_scope)
+    ):
+        return False
+    snapshot_mode = str(snapshot.get("scope_mode", "")).replace("_", "-")
+    return manifest_scope.issubset(current_scope) if snapshot_mode == "on-demand" else manifest_scope == current_scope
 
 
 def normalize_rcsb_mode(value: str) -> str:
@@ -6182,6 +6210,164 @@ def write_rcsb_on_demand_policy(
         },
     )
     return policy
+
+
+def rcsb_scope_snapshot_validation(
+    science_store: Path,
+    *,
+    expected_mode: str | None = None,
+    execution: dict[str, str] | None = None,
+    source_summary: dict[str, object] | None = None,
+    check_current_scope: bool = False,
+) -> dict[str, object]:
+    def failed(reason: str) -> dict[str, object]:
+        return {"status": "failed", "reason": reason}
+
+    snapshot = read_json_object(science_store / "downloads/rcsb/ligand_bound_pdb_scope.json")
+    rows = read_tsv(science_store / "downloads/rcsb/ligand_bound_pdb_scope.tsv")
+    mode = str(snapshot.get("scope_mode", "")).replace("_", "-")
+    if expected_mode is not None and mode != normalize_rcsb_mode(expected_mode):
+        return failed("rcsb_scope_mode_mismatch")
+    if mode not in {"on-demand", "complete"}:
+        return failed("rcsb_scope_mode_invalid")
+    if snapshot.get("schema_version") != "genoligand_rcsb_scope_snapshot_v1":
+        return failed("rcsb_scope_schema_invalid")
+    try:
+        scope_count = int(snapshot.get("scope_count", 0) or 0)
+        ready_count = int(snapshot.get("ready_count", 0) or 0)
+        missing_count = int(snapshot.get("missing_count", 0) or 0)
+        coordinate_files = int(snapshot.get("coordinate_files", 0) or 0)
+        coordinate_bytes = int(snapshot.get("coordinate_bytes", 0) or 0)
+    except (TypeError, ValueError):
+        return failed("rcsb_scope_counts_invalid")
+    if (
+        scope_count <= 0
+        or ready_count <= 0
+        or missing_count != scope_count - ready_count
+        or coordinate_files != ready_count
+        or coordinate_bytes <= 0
+        or len(rows) != scope_count
+    ):
+        return failed("rcsb_scope_counts_invalid")
+    if mode == "complete" and (ready_count != scope_count or missing_count != 0):
+        return failed("rcsb_complete_scope_incomplete")
+
+    manifest_scope: set[str] = set()
+    ready_rows: list[tuple[str, str, int, str]] = []
+    cache_root = (science_store / "downloads/rcsb/mmcif").resolve()
+    for row in rows:
+        pdb_id = row.get("pdb_id", "").upper()
+        if not valid_pdb_id(pdb_id) or pdb_id in manifest_scope:
+            return failed("rcsb_scope_ids_invalid")
+        manifest_scope.add(pdb_id)
+        status = row.get("status", "")
+        coordinate_rel = row.get("coordinate_rel_path", "")
+        sha256 = row.get("sha256", "").lower()
+        try:
+            size = int(row.get("size_bytes", "0") or 0)
+        except ValueError:
+            return failed("rcsb_scope_coordinate_size_invalid")
+        if status == "missing":
+            if coordinate_rel or size != 0 or sha256:
+                return failed("rcsb_scope_missing_row_invalid")
+            continue
+        if status != "ready" or size <= 0 or not re.fullmatch(r"[0-9a-f]{64}", sha256):
+            return failed("rcsb_scope_ready_row_invalid")
+        coordinate = resolve_manifest_path(science_store, coordinate_rel)
+        if coordinate is None:
+            return failed("rcsb_scope_coordinate_path_missing")
+        try:
+            cache_rel = coordinate.resolve().relative_to(cache_root).as_posix()
+        except ValueError:
+            return failed("rcsb_scope_coordinate_path_outside_cache")
+        if not cache_rel.lower().endswith(".cif.gz"):
+            return failed("rcsb_scope_coordinate_extension_invalid")
+        ready_rows.append((pdb_id, cache_rel, size, sha256))
+    if len(ready_rows) != ready_count or snapshot.get("scope_digest") != rcsb_scope_digest(manifest_scope):
+        return failed("rcsb_scope_manifest_binding_invalid")
+
+    coordinate_digest = hashlib.sha256()
+    for _pdb_id, cache_rel, size, sha256 in sorted(ready_rows):
+        coordinate_digest.update(cache_rel.encode("utf-8"))
+        coordinate_digest.update(str(size).encode("ascii"))
+        coordinate_digest.update(sha256.encode("ascii"))
+    coordinate_sha256 = coordinate_digest.hexdigest()
+    if snapshot.get("coordinate_digest") != coordinate_sha256:
+        return failed("rcsb_scope_coordinate_digest_invalid")
+
+    source_digest = hashlib.sha256()
+    for _pdb_id, cache_rel, size, sha256 in sorted(ready_rows, key=lambda item: item[1]):
+        source_digest.update(cache_rel.encode("utf-8"))
+        source_digest.update(str(size).encode("ascii"))
+        source_digest.update(sha256.encode("ascii"))
+    source_sha256 = source_digest.hexdigest()
+
+    current_scope_count = scope_count
+    if check_current_scope:
+        current_scope = ligand_bound_pdb_scope(science_store)
+        if not current_scope or (
+            not manifest_scope.issubset(current_scope)
+            if mode == "on-demand"
+            else manifest_scope != current_scope
+        ):
+            return failed("rcsb_scope_snapshot_stale")
+        current_scope_count = len(current_scope)
+
+    if mode == "on-demand":
+        policy = read_json_object(science_store / "downloads/rcsb/on_demand_policy.json")
+        if not (
+            policy.get("schema_version") == "genoligand_rcsb_on_demand_policy_v1"
+            and policy.get("status") == "ready"
+            and policy.get("mode") == "on_demand"
+            and policy.get("official_base_url") == "https://files.rcsb.org/download"
+            and policy.get("coordinate_template") == "https://files.rcsb.org/download/{pdb_id}.cif.gz"
+            and policy.get("cache_root") == "downloads/rcsb/mmcif"
+            and policy.get("max_fetches_per_run") == 12
+            and policy.get("validation") == "gzip_mmcif_entry_and_atom_site"
+            and policy.get("cached_ready_count") == ready_count
+            and policy.get("scope_count") == scope_count
+        ):
+            return failed("rcsb_on_demand_policy_invalid")
+
+    if execution is not None:
+        serialized_mode = "on_demand" if mode == "on-demand" else "complete"
+        if not (
+            execution.get("status") == "ready"
+            and execution.get("scope_mode") == serialized_mode
+            and execution.get("scope_digest") == snapshot.get("scope_digest")
+            and execution.get("scope_ready_count") == str(ready_count)
+            and execution.get("scope_count") == str(scope_count)
+            and execution.get("scope_missing_count") == str(missing_count)
+            and execution.get("bytes") == str(coordinate_bytes)
+            and execution.get("sha256", "").lower() == coordinate_sha256
+        ):
+            return failed("rcsb_scope_execution_binding_invalid")
+
+    if source_summary is not None:
+        try:
+            source_files = int(source_summary.get("file_count", 0) or 0)
+            source_bytes = int(source_summary.get("bytes", 0) or 0)
+        except (TypeError, ValueError):
+            return failed("rcsb_scope_source_summary_invalid")
+        if not (
+            source_files == ready_count
+            and source_bytes == coordinate_bytes
+            and str(source_summary.get("sha256", "")).lower() == source_sha256
+        ):
+            return failed("rcsb_scope_source_summary_invalid")
+
+    return {
+        "status": "ready_partial_on_demand" if mode == "on-demand" else "ready_complete",
+        "reason": "rcsb_scope_policy_coordinate_snapshot_validated",
+        "scope_count": scope_count,
+        "ready_count": ready_count,
+        "missing_count": missing_count,
+        "current_scope_count": current_scope_count,
+        "coordinate_bytes": coordinate_bytes,
+        "coordinate_digest": coordinate_sha256,
+        "source_digest": source_sha256,
+        "refresh_needed": current_scope_count > scope_count,
+    }
 
 
 def ligand_bound_pdb_scope(science_store: Path) -> set[str]:
@@ -6410,30 +6596,20 @@ def external_plan_row_ready(
         return False
     if (row.get("sync_method") or "direct").strip().lower() == "rcsb_ligand_bound_scope":
         mode = normalize_rcsb_mode(rcsb_mode)
-        serialized_mode = "on_demand" if mode == "on-demand" else "complete"
-        snapshot = read_json_object(science_store / "downloads/rcsb/ligand_bound_pdb_scope.json")
-        if (
-            execution.get("scope_mode", "") != serialized_mode
-            or snapshot.get("scope_mode") != serialized_mode
-            or not rcsb_scope_snapshot_matches_current_sources(science_store, snapshot)
-            or execution.get("scope_count", "") != str(snapshot.get("scope_count", ""))
-        ):
-            return False
-        if mode == "complete" and rcsb_scope_has_missing_coordinates(science_store, target):
-            return False
-        if mode == "on-demand":
-            policy = read_json_object(science_store / "downloads/rcsb/on_demand_policy.json")
-            try:
-                ready_count = int(snapshot.get("ready_count", 0) or 0)
-            except (TypeError, ValueError):
-                return False
-            if (
-                ready_count <= 0
-                or policy.get("schema_version") != "genoligand_rcsb_on_demand_policy_v1"
-                or policy.get("status") != "ready"
-                or policy.get("mode") != "on_demand"
-            ):
-                return False
+        coordinate_summary = (
+            resource_payload_summary(target, cache=summary_cache)
+            if target is not None
+            else {"file_count": 0, "bytes": 0, "sha256": ""}
+        )
+        validation = rcsb_scope_snapshot_validation(
+            science_store,
+            expected_mode=mode,
+            execution=execution,
+            source_summary=coordinate_summary,
+        )
+        return validation.get("status") == (
+            "ready_partial_on_demand" if mode == "on-demand" else "ready_complete"
+        )
     evidence = external_evidence_path(row, target, marker)
     if not evidence or not path_has_payload(evidence):
         return False
@@ -6863,7 +7039,12 @@ def validate_openff_forcefield(path: Path, python_command: str) -> dict[str, obj
         "from openff.toolkit.typing.engines.smirnoff import ForceField; "
         "ForceField(__import__('sys').argv[1]); print('openff_forcefield_loaded')"
     )
-    completed = run_command([python_command, "-c", code, str(path)])
+    loader_path = (
+        wsl_path(path)
+        if Path(python_command).name.casefold() == "genoligand-wsl-python.cmd"
+        else str(path)
+    )
+    completed = run_command([python_command, "-c", code, loader_path])
     if completed.returncode != 0 or "openff_forcefield_loaded" not in completed.stdout:
         return {
             "status": "needs_repair",
@@ -7224,8 +7405,12 @@ def foldseek_partial_manifest_validation(
     ):
         return {"status": "failed", "reason": "foldseek_partial_scope_mode_invalid"}
     snapshot = read_json_object(science_store / "downloads/rcsb/ligand_bound_pdb_scope.json")
-    if not rcsb_scope_snapshot_matches_current_sources(science_store, snapshot):
-        return {"status": "failed", "reason": "foldseek_partial_scope_snapshot_stale"}
+    scope_validation = rcsb_scope_snapshot_validation(science_store, expected_mode="on-demand")
+    if scope_validation.get("status") != "ready_partial_on_demand":
+        return {
+            "status": "failed",
+            "reason": f"foldseek_partial_scope_snapshot_invalid:{scope_validation.get('reason', 'unknown')}",
+        }
     listing = Path(f"{db_path}.source")
     validated_manifest = resolve_manifest_path(science_store, row.get("indexed_validated_ids_manifest", ""))
     if not listing.is_file() or validated_manifest is None or not validated_manifest.is_file():
@@ -7293,6 +7478,10 @@ def foldseek_partial_manifest_validation(
         if (
             str(snapshot.get("scope_mode", "")).replace("_", "-") != "on-demand"
             or row.get("scope_digest") != str(snapshot.get("scope_digest", ""))
+            or row.get("scope_coordinate_digest") != str(snapshot.get("coordinate_digest", ""))
+            or row.get("scope_count") != str(snapshot.get("scope_count", ""))
+            or row.get("scope_ready_count") != str(snapshot.get("ready_count", ""))
+            or row.get("scope_missing_count") != str(snapshot.get("missing_count", ""))
             or row.get("source_digest") != subset_digest
             or row.get("indexed_subset_digest") != subset_digest
             or row.get("source_files") != str(indexed_pdb_count)
@@ -7331,8 +7520,12 @@ def foldseek_legacy_partial_migration(
     validated_manifest: Path,
 ) -> dict[str, object]:
     listing = Path(f"{db_path}.source")
-    if not rcsb_scope_snapshot_matches_current_sources(science_store, scope_snapshot):
-        return {"status": "failed", "reason": "on_demand_scope_snapshot_stale"}
+    scope_validation = rcsb_scope_snapshot_validation(science_store, expected_mode="on-demand")
+    if scope_validation.get("status") != "ready_partial_on_demand":
+        return {
+            "status": "failed",
+            "reason": f"on_demand_scope_snapshot_invalid:{scope_validation.get('reason', 'unknown')}",
+        }
     try:
         cached_ready_count = int(scope_snapshot.get("ready_count", 0) or 0)
     except (TypeError, ValueError):
@@ -7527,17 +7720,14 @@ def build_foldseek_target_database(
         force_rebuild = database_artifacts_present(db_path) and not (
             alignment_source_manifest_matches(previous, source_summary, builder_version) or migrated
         )
-        snapshot_mode = str(scope_snapshot.get("scope_mode", "")).replace("_", "-")
-        scope_usable = bool(
-            scope_snapshot.get("scope_count")
-            and scope_snapshot.get("ready_count")
-            and snapshot_mode == mode
-            and rcsb_scope_snapshot_matches_current_sources(science_store, scope_snapshot)
-            and scope_snapshot.get("coordinate_digest") == source_summary.get("sha256")
-            and (
-                mode == "on-demand"
-                or scope_snapshot.get("ready_count") == scope_snapshot.get("scope_count")
-            )
+        scope_validation = rcsb_scope_snapshot_validation(
+            science_store,
+            expected_mode=mode,
+            source_summary=source_summary,
+            check_current_scope=True,
+        )
+        scope_usable = scope_validation.get("status") == (
+            "ready_partial_on_demand" if mode == "on-demand" else "ready_complete"
         )
         if not scope_usable:
             status, notes = "failed", "rcsb_scope_snapshot_unusable_or_digest_mismatch"
@@ -8990,11 +9180,24 @@ def write_science_resource_manifests(
             digest = str(summary["sha256"])
             exists = file_count_value > 0 and bytes_count > 0
             evidence_digest = str(summary.get("content_sha256", "")) if local_path.is_file() else digest
+            rcsb_validation = (
+                rcsb_scope_snapshot_validation(
+                    science_store,
+                    execution=external_executions.get(source_id, {}),
+                    source_summary=summary,
+                )
+                if source_id == "rcsb_ligand_bound" and row["source_class"] != "direct_download"
+                else {"status": "not_applicable"}
+            )
+            execution_digest_valid = bool(
+                row["execution_sha256"].lower() == evidence_digest.lower()
+                or rcsb_validation.get("status") in {"ready_partial_on_demand", "ready_complete"}
+            )
             trusted = bool(
                 row["release_identity"]
                 and row["trust_source"]
                 and row["execution_status"] == "ready"
-                and row["execution_sha256"].lower() == evidence_digest.lower()
+                and execution_digest_valid
                 and row["execution_release_identity"] == row["release_identity"]
                 and row["execution_trust_source"] == row["trust_source"]
                 and (
@@ -9392,12 +9595,181 @@ def resolve_manifest_path(science_store: Path, value: str) -> Path | None:
     return path if path.is_absolute() else science_store / path
 
 
-def science_index_readiness_rows(science_store: Path) -> list[dict[str, str]]:
+def metagenome_alignment_authority_key(row: dict[str, str]) -> tuple[str, str, str]:
+    notes = str(row.get("notes", ""))
+    digest = next(
+        (
+            token.removeprefix("source_digest=").lower()
+            for token in notes.split(";")
+            if token.startswith("source_digest=")
+        ),
+        "",
+    )
+    return (
+        str(row.get("input_path", "")).replace("\\", "/"),
+        str(row.get("output_path", "")).replace("\\", "/"),
+        digest,
+    )
+
+
+def authoritative_metagenome_mmseqs_databases(
+    science_store: Path,
+    build_rows: list[dict[str, str]],
+    env: dict[str, str] | None = None,
+    wsl_distro: str | None = None,
+    summary_cache: ResourceSummaryCache | None = None,
+) -> set[tuple[str, str, str]]:
+    manifest_rel = "indexes/mmseqs/mmseqs_target_databases.tsv"
+    manifest_rows = read_tsv(science_store / manifest_rel)
+    command = shutil.which("mmseqs", path=(env or os.environ).get("PATH"))
+    builder_version = database_builder_version("mmseqs", command, env, wsl_distro)
+    validated: set[tuple[str, str, str]] = set()
+    for build_row in build_rows:
+        if (
+            build_row.get("index") != "metagenome_targets"
+            or build_row.get("status") != "alignment_database_used"
+        ):
+            continue
+        input_path = str(build_row.get("input_path", "")).replace("\\", "/")
+        output_path = str(build_row.get("output_path", "")).replace("\\", "/")
+        notes = str(build_row.get("notes", ""))
+        for row in manifest_rows:
+            source_path = str(row.get("source_path", "")).replace("\\", "/")
+            db_path_text = str(row.get("db_path", "")).replace("\\", "/")
+            source_digest = str(row.get("source_digest", "")).lower()
+            if (
+                row.get("status") != "ready"
+                or row.get("source_namespace") != "MGnify"
+                or row.get("source_class") != "metagenome"
+                or source_path != input_path
+                or db_path_text != output_path
+                or f"source_digest={source_digest}" not in notes.split(";")
+                or "full_searchable_alignment_database" not in notes.split(";")
+                or "consumer=mmseqs_alignment_worker" not in notes.split(";")
+                or f"database_manifest={manifest_rel}" not in notes.split(";")
+            ):
+                continue
+            source = resolve_manifest_path(science_store, source_path)
+            db_path = resolve_manifest_path(science_store, db_path_text)
+            if source is None or db_path is None:
+                continue
+            source_summary = resource_payload_summary(source, cache=summary_cache)
+            if not alignment_source_manifest_matches(row, source_summary, builder_version):
+                continue
+            if database_prefix_ready("mmseqs", db_path, command, env, wsl_distro):
+                validated.add((input_path, output_path, source_digest))
+                break
+    return validated
+
+
+def refresh_science_index_authority_manifest(science_store: Path) -> dict[str, object]:
+    build_manifest = science_store / "index_build_manifest.tsv"
+    build_rows = read_tsv(build_manifest)
+    database_manifest_rel = "indexes/mmseqs/mmseqs_target_databases.tsv"
+    database_rows = read_tsv(science_store / database_manifest_rel)
+    if not build_rows:
+        return {"status": "needs_repair", "updated_rows": 0, "reason": "index_build_manifest_empty"}
+    authorities = []
+    for row in database_rows:
+        digest = str(row.get("source_digest", "")).lower()
+        db_path_text = str(row.get("db_path", "")).replace("\\", "/")
+        db_path = resolve_manifest_path(science_store, db_path_text)
+        companions = (
+            []
+            if db_path is None
+            else [db_path, Path(f"{db_path}.dbtype"), Path(f"{db_path}.index"), Path(f"{db_path}.lookup")]
+        )
+        if (
+            row.get("manifest_schema_version") == ALIGNMENT_MANIFEST_SCHEMA_VERSION
+            and row.get("status") == "ready"
+            and row.get("source_namespace") == "MGnify"
+            and row.get("source_class") == "metagenome"
+            and re.fullmatch(r"[0-9a-f]{64}", digest)
+            and row.get("builder_version")
+            and db_path_text
+            and companions
+            and all(path.is_file() and path.stat().st_size > 0 for path in companions)
+        ):
+            authorities.append(row)
+    updated_rows = 0
+    for row in build_rows:
+        if row.get("index") != "metagenome_targets":
+            continue
+        input_path = str(row.get("input_path", "")).replace("\\", "/")
+        authority = next(
+            (
+                candidate
+                for candidate in authorities
+                if str(candidate.get("source_path", "")).replace("\\", "/") == input_path
+            ),
+            None,
+        )
+        if authority is None:
+            continue
+        digest = str(authority.get("source_digest", "")).lower()
+        db_path_text = str(authority.get("db_path", "")).replace("\\", "/")
+        expected = {
+            "status": "alignment_database_used",
+            "rows": "0",
+            "output_path": db_path_text,
+            "notes": (
+                "full_searchable_alignment_database;consumer=mmseqs_alignment_worker;"
+                f"source_namespace=MGnify;source_digest={digest};"
+                f"database_manifest={database_manifest_rel}"
+            ),
+        }
+        if any(str(row.get(key, "")) != value for key, value in expected.items()):
+            row.update(expected)
+            updated_rows += 1
+    if updated_rows:
+        write_simple_tsv(
+            build_manifest,
+            ["index", "input_path", "status", "rows", "output_path", "notes"],
+            build_rows,
+        )
+    return {
+        "status": "ready" if any(
+            row.get("index") == "metagenome_targets"
+            and row.get("status") == "alignment_database_used"
+            for row in build_rows
+        ) else "needs_repair",
+        "updated_rows": updated_rows,
+        "reason": "full_mmseqs_authority_bound" if authorities else "ready_mmseqs_authority_missing",
+    }
+
+
+def metagenome_compatibility_table_ready(path: Path) -> bool:
+    if not path.is_file():
+        return False
+    try:
+        lines = [line for line in path.read_text(encoding="utf-8-sig").splitlines() if line.strip()]
+    except (OSError, UnicodeError):
+        return False
+    return lines == [
+        "source\ttarget_id\ttarget_name\torganism\ttarget_class\tligand_tokens\tsequence_tokens\tstructure_tokens\tevidence"
+    ]
+
+
+def science_index_readiness_rows(
+    science_store: Path,
+    *,
+    metagenome_alignment_authorities: set[tuple[str, str, str]] | None = None,
+) -> list[dict[str, str]]:
+    metagenome_alignment_authorities = metagenome_alignment_authorities or set()
     source_rows = read_tsv(science_store / "index_build_manifest.tsv")
-    used_indexes = {
+    selected_indexes = {
         str(row.get("index", ""))
         for row in source_rows
         if str(row.get("status", "")) == "used"
+        or (
+            str(row.get("status", "")) == "ready"
+            and "published_chembl_query_used_by_onsite_matcher" in str(row.get("notes", ""))
+        )
+        or (
+            bool(metagenome_alignment_authorities)
+            and str(row.get("index", "")) == "metagenome_targets"
+            and str(row.get("status", "")) == "alignment_database_used"
+        )
     }
     rows: list[dict[str, str]] = []
     for row in source_rows:
@@ -9413,13 +9785,29 @@ def science_index_readiness_rows(science_store: Path) -> list[dict[str, str]]:
         index_kind = "ui_projection_tsv" if output_path.endswith(".tsv") else "derived_index"
         raw_status = str(row.get("status", ""))
         optional_missing = bool(
-            raw_status in {"missing", "not_found", "not_applicable", "not_selected", "empty"}
-            and str(row.get("index", "")) in used_indexes
-            and any(token in notes.lower() for token in ("missing", "not_found", "optional", "candidate", "empty"))
+            raw_status
+            in {"missing", "not_found", "not_present", "not_applicable", "not_selected", "empty"}
+            and str(row.get("index", "")) in selected_indexes
         )
         if optional_missing:
             readiness_status = "not_selected"
             reason = "alternate_candidate_selected"
+        elif raw_status == "alignment_database_used":
+            index_kind = "alignment_database"
+            authority_key = metagenome_alignment_authority_key(row)
+            if (
+                str(row.get("index", "")) == "metagenome_targets"
+                and authority_key in metagenome_alignment_authorities
+            ):
+                readiness_status = "full_index"
+                reason = "full_searchable_alignment_database_ready"
+            else:
+                readiness_status = "incomplete"
+                reason = "alignment_database_authority_not_ready"
+        elif raw_status == "ready" and "published_chembl_query_used_by_onsite_matcher" in notes:
+            index_kind = "consumer_database"
+            readiness_status = "full_index"
+            reason = "specialized_consumer_database_ready"
         elif raw_status != "used":
             readiness_status = "incomplete"
             reason = "index_build_status_not_used"
@@ -9466,17 +9854,27 @@ def write_science_index_readiness_manifest(science_store: Path, rows: list[dict[
     )
 
 
-def partial_legacy_index_manifest_present(science_store: Path) -> bool:
-    rows = science_index_readiness_rows(science_store)
+def partial_legacy_index_manifest_present(
+    science_store: Path,
+    rows: list[dict[str, str]] | None = None,
+) -> bool:
+    rows = rows if rows is not None else science_index_readiness_rows(science_store)
     write_science_index_readiness_manifest(science_store, rows)
     return any(row.get("readiness_status") in {"projection_only", "incomplete"} for row in rows)
 
 
-def science_readiness_evidence(science_store: Path) -> tuple[list[dict[str, str]], str]:
+def science_readiness_evidence(
+    science_store: Path,
+    digest_overrides: dict[str, str] | None = None,
+) -> tuple[list[dict[str, str]], str]:
+    overrides = digest_overrides or {}
     evidence = [
-        {"path": rel_path, "sha256": sha256_file(science_store / rel_path)}
+        {
+            "path": rel_path,
+            "sha256": overrides.get(rel_path) or sha256_file(science_store / rel_path),
+        }
         for rel_path in SCIENCE_READINESS_EVIDENCE_PATHS
-        if (science_store / rel_path).is_file()
+        if rel_path in overrides or (science_store / rel_path).is_file()
     ]
     digest_input = "".join(f"{row['path']}\t{row['sha256']}\n" for row in evidence)
     return evidence, hashlib.sha256(digest_input.encode("utf-8")).hexdigest()
@@ -9487,6 +9885,8 @@ def evaluate_installer_science_store_readiness(
     *,
     persist: bool = True,
     summary_cache: ResourceSummaryCache | None = None,
+    env: dict[str, str] | None = None,
+    wsl_distro: str | None = None,
 ) -> dict[str, object]:
     blockers: list[dict[str, str]] = []
     advisories: list[dict[str, str]] = []
@@ -9509,6 +9909,11 @@ def evaluate_installer_science_store_readiness(
     source_manifest_rows = {
         row.get("source_id", ""): row
         for row in read_tsv(science_store / "manifests/source_file_manifest.tsv")
+        if row.get("source_id", "")
+    }
+    external_execution_rows = {
+        row.get("source_id", ""): row
+        for row in read_tsv(science_store / "external_sync_execution_manifest.tsv")
         if row.get("source_id", "")
     }
     grouped: dict[str, list[dict[str, str]]] = {}
@@ -9538,8 +9943,32 @@ def evaluate_installer_science_store_readiness(
         source_digest = source_manifest.get("sha256", "").strip().lower()
         release_identity = source_manifest.get("release_identity", "").strip()
         trust_source = source_manifest.get("trust_source", "").strip()
+        rcsb_source_validation = (
+            rcsb_scope_snapshot_validation(
+                science_store,
+                execution=external_execution_rows.get("rcsb_ligand_bound", {}),
+                source_summary={
+                    "file_count": source_manifest.get("file_count", ""),
+                    "bytes": source_manifest.get("bytes", ""),
+                    "sha256": source_digest,
+                },
+            )
+            if logical == "rcsb_ligand_bound"
+            else {"status": "not_applicable"}
+        )
+        rcsb_source_ready = rcsb_source_validation.get("status") in {
+            "ready_partial_on_demand",
+            "ready_complete",
+        } and bool(
+            release_identity == external_execution_rows.get("rcsb_ligand_bound", {}).get("release_identity", "")
+            and trust_source == external_execution_rows.get("rcsb_ligand_bound", {}).get("trust_source", "")
+        )
         source_manifest_ready = bool(
-            source_manifest.get("status") == "ready"
+            (
+                rcsb_source_ready
+                if logical == "rcsb_ligand_bound"
+                else source_manifest.get("status") == "ready"
+            )
             and re.fullmatch(r"[0-9a-f]{64}", source_digest)
             and release_identity
             and trust_source
@@ -9558,7 +9987,11 @@ def evaluate_installer_science_store_readiness(
                 "status": source_status,
                 "selected_candidate": selected.get("source_id", "") if selected else "",
                 "candidates": candidate_rows,
-                "source_manifest_status": source_manifest.get("status", "missing"),
+                "source_manifest_status": (
+                    "ready_partial_on_demand"
+                    if rcsb_source_validation.get("status") == "ready_partial_on_demand"
+                    else source_manifest.get("status", "missing")
+                ),
                 "source_digest": source_digest,
                 "release_identity": release_identity,
                 "trust_source": trust_source,
@@ -9617,8 +10050,19 @@ def evaluate_installer_science_store_readiness(
         )
 
     status_payload = load_json(science_store / "install_status.json")
+    status_progress = status_payload.get("progress")
+    canonical_ready = status_payload.get("status") == "ready"
+    canonical_final_status = bool(
+        status_payload.get("status") in {"ready", "needs_repair"}
+        and isinstance(status_payload.get("install_ready"), bool)
+        and canonical_ready == status_payload.get("install_ready")
+        and isinstance(status_progress, dict)
+        and status_progress.get("status") == ("ready" if canonical_ready else "needs_repair")
+    )
     missing = status_payload.get("missing_components")
-    if status_payload.get("status") != "ready" or (isinstance(missing, list) and missing):
+    if not canonical_final_status and (
+        status_payload.get("status") != "ready" or (isinstance(missing, list) and missing)
+    ):
         block(
             "install_status_not_ready",
             "install_status",
@@ -9626,7 +10070,28 @@ def evaluate_installer_science_store_readiness(
             "prepare_science_store",
         )
 
-    index_rows = science_index_readiness_rows(science_store)
+    index_build_rows = read_tsv(science_store / "index_build_manifest.tsv")
+    metagenome_alignment_authorities = authoritative_metagenome_mmseqs_databases(
+        science_store,
+        index_build_rows,
+        env,
+        wsl_distro,
+        summary_cache,
+    )
+    metagenome_alignment_rows = [
+        row
+        for row in index_build_rows
+        if row.get("index") == "metagenome_targets"
+        and row.get("status") == "alignment_database_used"
+    ]
+    metagenome_alignment_ready = bool(metagenome_alignment_rows) and all(
+        metagenome_alignment_authority_key(row) in metagenome_alignment_authorities
+        for row in metagenome_alignment_rows
+    )
+    index_rows = science_index_readiness_rows(
+        science_store,
+        metagenome_alignment_authorities=metagenome_alignment_authorities,
+    )
     write_science_index_readiness_manifest(science_store, index_rows)
     if not index_rows:
         block("index_build_manifest_empty", "indexes", "index_build_manifest.tsv has no data rows", "build_indexes")
@@ -9648,7 +10113,14 @@ def evaluate_installer_science_store_readiness(
         "indexes/structure_targets.tsv",
         "indexes/tool_versions.tsv",
     ]:
-        if not tsv_has_data_rows(science_store / rel_path):
+        path = science_store / rel_path
+        if (
+            rel_path == "indexes/metagenome_targets.tsv"
+            and metagenome_alignment_ready
+            and metagenome_compatibility_table_ready(path)
+        ):
+            continue
+        if not tsv_has_data_rows(path):
             block(f"required_table_empty:{rel_path}", "indexes", rel_path, "prepare_science_store")
     tool_rows = {row.get("tool", ""): row for row in read_tsv(science_store / "indexes/tool_versions.tsv")}
     for tool_id in sorted(REQUIRED_TOOL_IDS):
@@ -9723,7 +10195,6 @@ def evaluate_installer_science_store_readiness(
 
     rcsb_root = science_store / "downloads/rcsb/mmcif"
     rcsb_snapshot = read_json_object(science_store / "downloads/rcsb/ligand_bound_pdb_scope.json")
-    rcsb_scope_rows = read_tsv(science_store / "downloads/rcsb/ligand_bound_pdb_scope.tsv")
     rcsb_source_summary = resource_payload_summary(rcsb_root, cache=summary_cache)
     rcsb_partials = [
         path
@@ -9741,44 +10212,33 @@ def evaluate_installer_science_store_readiness(
         rcsb_ready_count = 0
         rcsb_missing_count = 0
     rcsb_mode = str(rcsb_snapshot.get("scope_mode", "")).replace("_", "-")
+    rcsb_execution = external_execution_rows.get("rcsb_ligand_bound", {})
+    rcsb_validation = rcsb_scope_snapshot_validation(
+        science_store,
+        execution=rcsb_execution,
+        check_current_scope=True,
+    )
     snapshot_common_valid = bool(
-        rcsb_snapshot.get("schema_version") == "genoligand_rcsb_scope_snapshot_v1"
-        and rcsb_scope_snapshot_matches_current_sources(science_store, rcsb_snapshot)
-        and rcsb_scope_count
-        and rcsb_ready_count
-        and rcsb_missing_count == rcsb_scope_count - rcsb_ready_count
-        and len(rcsb_scope_rows) == rcsb_scope_count
-        and re.fullmatch(r"[0-9a-f]{64}", str(rcsb_snapshot.get("coordinate_digest", "")).lower())
-        and rcsb_snapshot.get("coordinate_files") == rcsb_ready_count
+        rcsb_validation.get("status") in {"ready_partial_on_demand", "ready_complete"}
+        and int(rcsb_source_summary.get("file_count", 0) or 0) >= rcsb_ready_count
+        and int(rcsb_source_summary.get("bytes", 0) or 0) >= int(rcsb_snapshot.get("coordinate_bytes", 0) or 0)
     )
     rcsb_refresh_needed = bool(
         snapshot_common_valid
         and (
-            rcsb_snapshot.get("coordinate_files") != rcsb_source_summary.get("file_count")
+            rcsb_validation.get("refresh_needed")
+            or rcsb_snapshot.get("coordinate_files") != rcsb_source_summary.get("file_count")
             or rcsb_snapshot.get("coordinate_bytes") != rcsb_source_summary.get("bytes")
-            or rcsb_snapshot.get("coordinate_digest") != rcsb_source_summary.get("sha256")
+            or rcsb_validation.get("source_digest") != rcsb_source_summary.get("sha256")
         )
     )
     if rcsb_mode == "on-demand":
-        policy = read_json_object(science_store / "downloads/rcsb/on_demand_policy.json")
-        policy_valid = bool(
-            policy.get("schema_version") == "genoligand_rcsb_on_demand_policy_v1"
-            and policy.get("status") == "ready"
-            and policy.get("mode") == "on_demand"
-            and policy.get("official_base_url") == "https://files.rcsb.org/download"
-            and policy.get("coordinate_template")
-            == "https://files.rcsb.org/download/{pdb_id}.cif.gz"
-            and policy.get("cache_root") == "downloads/rcsb/mmcif"
-            and policy.get("max_fetches_per_run") == 12
-            and policy.get("validation") == "gzip_mmcif_entry_and_atom_site"
-            and policy.get("cached_ready_count") == rcsb_ready_count
-            and policy.get("scope_count") == rcsb_scope_count
-        )
-        rcsb_scope_valid = snapshot_common_valid and policy_valid
+        rcsb_scope_valid = snapshot_common_valid and rcsb_validation.get("status") == "ready_partial_on_demand"
     else:
         rcsb_scope_valid = bool(
             snapshot_common_valid
             and rcsb_mode == "complete"
+            and rcsb_validation.get("status") == "ready_complete"
             and rcsb_ready_count == rcsb_scope_count
             and not rcsb_refresh_needed
         )
@@ -9876,7 +10336,12 @@ def existing_science_indexes_ready(
     wsl_distro: str | None = None,
     summary_cache: ResourceSummaryCache | None = None,
 ) -> bool:
-    readiness = evaluate_installer_science_store_readiness(science_store, summary_cache=summary_cache)
+    readiness = evaluate_installer_science_store_readiness(
+        science_store,
+        summary_cache=summary_cache,
+        env=env,
+        wsl_distro=wsl_distro,
+    )
     non_alignment_blockers = [
         item
         for item in readiness.get("blockers", [])
@@ -9886,7 +10351,11 @@ def existing_science_indexes_ready(
         return False
     if not alignment_database_manifests_ready(science_store, env, wsl_distro, summary_cache):
         return False
-    if partial_legacy_index_manifest_present(science_store):
+    index_rows = readiness.get("indexes", [])
+    if partial_legacy_index_manifest_present(
+        science_store,
+        index_rows if isinstance(index_rows, list) else None,
+    ):
         return False
     return True
 
@@ -10054,6 +10523,125 @@ def install_user_summary(payload: dict[str, object]) -> dict[str, object]:
         "forcefields": forcefield_user_summary(payload.get("forcefields", {}) if isinstance(payload.get("forcefields"), dict) else {}),
         "runtime": runtime_user_summary(payload),
     }
+
+
+def serialized_json_bytes(payload: dict[str, object]) -> bytes:
+    text = json.dumps(payload, ensure_ascii=False, indent=2) + "\n"
+    if os.linesep != "\n":
+        text = text.replace("\n", os.linesep)
+    return text.encode("utf-8")
+
+
+def canonical_install_status_payload(payload: dict[str, object]) -> dict[str, object]:
+    status = install_user_summary(payload)
+    ready = bool(payload.get("install_ready", False))
+    progress = status.get("progress")
+    readiness = payload.get("science_store_readiness")
+    expected_progress = "ready" if ready else "needs_repair"
+    if (status.get("status") == "ready") != ready:
+        raise ValueError("canonical_install_status_ready_mismatch")
+    if not isinstance(progress, dict) or progress.get("status") != expected_progress:
+        raise ValueError("canonical_install_status_progress_mismatch")
+    if ready and (
+        not isinstance(readiness, dict)
+        or readiness.get("status") != "ready"
+        or readiness.get("ready") is not True
+    ):
+        raise ValueError("canonical_install_status_readiness_mismatch")
+    return status
+
+
+def bind_science_readiness_to_install_status(
+    science_store: Path,
+    readiness: dict[str, object],
+    install_status: dict[str, object],
+) -> dict[str, object]:
+    install_status_digest = hashlib.sha256(serialized_json_bytes(install_status)).hexdigest()
+    evidence, evidence_digest = science_readiness_evidence(
+        science_store,
+        {"install_status.json": install_status_digest},
+    )
+    return {
+        **readiness,
+        "evidence_manifest": evidence,
+        "evidence_digest": evidence_digest,
+    }
+
+
+def restore_json_bytes(path: Path, previous: bytes | None) -> None:
+    if previous is None:
+        path.unlink(missing_ok=True)
+        return
+    with atomic_output_writer(path, newline="") as handle:
+        handle.write(previous.decode("utf-8"))
+
+
+def write_final_install_state(
+    science_store: Path,
+    install_status: dict[str, object],
+    progress: dict[str, object],
+    readiness: dict[str, object],
+) -> None:
+    ready = bool(install_status.get("install_ready", False))
+    expected_progress = "ready" if ready else "needs_repair"
+    if (install_status.get("status") == "ready") != ready:
+        raise ValueError("final_install_status_ready_mismatch")
+    if install_status.get("progress") != progress or progress.get("status") != expected_progress:
+        raise ValueError("final_install_progress_mismatch")
+    if ready and (readiness.get("status") != "ready" or readiness.get("ready") is not True):
+        raise ValueError("final_install_readiness_mismatch")
+    expected_status_digest = hashlib.sha256(serialized_json_bytes(install_status)).hexdigest()
+    readiness_status_digest = next(
+        (
+            str(row.get("sha256", ""))
+            for row in readiness.get("evidence_manifest", [])
+            if isinstance(row, dict) and row.get("path") == "install_status.json"
+        ),
+        "",
+    )
+    if readiness_status_digest != expected_status_digest:
+        raise ValueError("final_install_status_evidence_mismatch")
+
+    records = [
+        (science_store / "science_store_readiness.json", readiness),
+        (science_store / "install_progress.json", progress),
+        (science_store / "install_status.json", install_status),
+    ]
+    previous = {path: path.read_bytes() if path.is_file() else None for path, _payload in records}
+    published: list[Path] = []
+    publishing_status = {
+        **install_status,
+        "status": "publishing",
+        "install_ready": False,
+        "summary": "正在发布最终安装状态。",
+        "next_action": "等待最终状态发布完成",
+        "progress": {
+            **progress,
+            "status": "publishing",
+            "message": "正在发布最终安装状态",
+        },
+    }
+    try:
+        status_path = science_store / "install_status.json"
+        write_json_atomic(status_path, publishing_status)
+        published.append(status_path)
+        for path, record in records:
+            write_json_atomic(path, record)
+            if path not in published:
+                published.append(path)
+    except BaseException:
+        attempts = {
+            path.with_name(f"{path.name}.attempt.json"): path.with_name(
+                f"{path.name}.attempt.json"
+            ).read_bytes()
+            for path, _record in records
+            if path.with_name(f"{path.name}.attempt.json").is_file()
+        }
+        for path in reversed(published):
+            restore_json_bytes(path, previous[path])
+        for path, content in attempts.items():
+            restore_json_bytes(path, content)
+        raise
 
 
 def installation_status(
@@ -10978,6 +11566,7 @@ def main() -> int:
         python_backend,
         selected_wsl,
     )
+    index_authority_refresh = refresh_science_index_authority_manifest(science_store)
     write_install_progress(
         science_store,
         status="running",
@@ -11042,7 +11631,10 @@ def main() -> int:
     )
     science_store_readiness = evaluate_installer_science_store_readiness(
         science_store,
+        persist=False,
         summary_cache=resource_summary_cache,
+        env=command_env,
+        wsl_distro=selected_wsl,
     )
     save_resource_summary_cache(fingerprint_cache_path, resource_summary_cache)
     worker_wrapper = Path(tool_python) if tool_python and Path(tool_python).is_file() else None
@@ -11074,6 +11666,7 @@ def main() -> int:
         "plinder_index": plinder_index_result,
         "forcefields": forcefield_result,
         "chembl_query_database": chembl_query_result,
+        "index_authority_refresh": index_authority_refresh,
         "science_store_readiness": science_store_readiness,
         "installation_capacity": capacity_plan,
         "cuda_toolkit": cuda_toolkit_summary(),
@@ -11088,8 +11681,7 @@ def main() -> int:
     }
     payload["install_ready"] = install_ready(payload)
     final_progress_status = "ready" if payload["install_ready"] else "needs_repair"
-    payload["progress"] = write_install_progress(
-        science_store,
+    payload["progress"] = install_progress_payload(
         status=final_progress_status,
         stage="完成检查",
         current_resource="安装/修复",
@@ -11142,6 +11734,36 @@ def main() -> int:
         science_env,
     )
     payload["launch_environment"] = launch_environment
+    canonical_install_status = canonical_install_status_payload(payload)
+    science_store_readiness = bind_science_readiness_to_install_status(
+        science_store,
+        science_store_readiness,
+        canonical_install_status,
+    )
+    payload["science_store_readiness"] = science_store_readiness
+    try:
+        write_final_install_state(
+            science_store,
+            canonical_install_status,
+            payload["progress"],
+            science_store_readiness,
+        )
+    except (OSError, UnicodeError, ValueError) as err:
+        release_install_lock(install_lock)
+        install_lock = None
+        print(
+            json.dumps(
+                {
+                    "status": "failed",
+                    "summary": "最终安装状态发布失败。",
+                    "next_action": "修复状态文件写入错误后重新运行安装/修复",
+                    "error": exception_note(err),
+                },
+                ensure_ascii=False,
+                indent=2,
+            )
+        )
+        return 2
     output_payload = payload if args.debug_output else install_user_summary(payload)
     print(json.dumps(output_payload, ensure_ascii=False, indent=2))
     release_install_lock(install_lock)

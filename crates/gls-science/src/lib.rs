@@ -28,6 +28,8 @@ const MD_PROVENANCE_SCHEMA_VERSION: &str = "genoligand_md_artifact_provenance_v1
 const MAX_SEQUENCE_TOKEN_CHARS: usize = 96;
 const MAX_STRUCTURE_METADATA_CHARS: usize = 16_384;
 const LARGE_METAGENOME_FASTA_TSV_MAX_BYTES: u64 = 1_000_000_000;
+const ALIGNMENT_DATABASE_MANIFEST_SCHEMA_VERSION: &str =
+    "genoligand_alignment_database_manifest_v2";
 const SOURCE_ROW_BATCH_SIZE: usize = 512;
 const KNOWN_SCORE_WEIGHT: f64 = 0.50;
 const METAGENOME_SCORE_WEIGHT: f64 = 0.25;
@@ -44,6 +46,7 @@ const RCSB_INDEXED_PDB_IDS_REL_PATH: &str = "indexes/foldseek/rcsb_mmcif/indexed
 const SCIENCE_READINESS_EVIDENCE_PATHS: &[&str] = &[
     "source_requirements.tsv",
     "manifests/source_file_manifest.tsv",
+    "external_sync_execution_manifest.tsv",
     "install_status.json",
     "index_build_manifest.tsv",
     "index_readiness_manifest.tsv",
@@ -1536,12 +1539,18 @@ fn build_store_indexes(
     let metagenome_dir = options.science_store.join("downloads/metagenome");
     for path in discover_sequence_files(&metagenome_dir)? {
         if large_metagenome_fasta_requires_alignment_database(&path) {
-            append_alignment_database_required(
-                "metagenome_targets",
+            if !append_ready_metagenome_alignment_database(
                 &options.science_store,
                 &path,
                 &mut manifest,
-            );
+            )? {
+                append_alignment_database_required(
+                    "metagenome_targets",
+                    &options.science_store,
+                    &path,
+                    &mut manifest,
+                );
+            }
             continue;
         }
         append_fasta_source_rows(
@@ -1653,6 +1662,88 @@ fn append_alignment_database_required(
         relative_display(root, path),
         index_output_for(index_name)
     ));
+}
+
+fn append_ready_metagenome_alignment_database(
+    root: &Path,
+    source: &Path,
+    manifest: &mut String,
+) -> Result<bool, String> {
+    let database_manifest_rel = "indexes/mmseqs/mmseqs_target_databases.tsv";
+    let database_manifest = root.join(database_manifest_rel);
+    if !database_manifest.is_file() {
+        return Ok(false);
+    }
+    let text = read_text(&database_manifest)?;
+    let mut lines = text.lines();
+    let Some(header) = lines.next() else {
+        return Ok(false);
+    };
+    let headers = split_tsv(header);
+    let required = |name: &str| find_header(&headers, &[name]);
+    let Some(schema_idx) = required("manifest_schema_version") else {
+        return Ok(false);
+    };
+    let Some(namespace_idx) = required("source_namespace") else {
+        return Ok(false);
+    };
+    let Some(class_idx) = required("source_class") else {
+        return Ok(false);
+    };
+    let Some(source_idx) = required("source_path") else {
+        return Ok(false);
+    };
+    let Some(digest_idx) = required("source_digest") else {
+        return Ok(false);
+    };
+    let Some(builder_idx) = required("builder_version") else {
+        return Ok(false);
+    };
+    let Some(database_idx) = required("db_path") else {
+        return Ok(false);
+    };
+    let Some(status_idx) = required("status") else {
+        return Ok(false);
+    };
+    let expected_source = relative_display(root, source).replace('\\', "/");
+    for line in lines.filter(|line| !line.trim().is_empty()) {
+        let cols = split_tsv(line);
+        let source_path = cell(&cols, Some(source_idx)).replace('\\', "/");
+        let digest = cell(&cols, Some(digest_idx)).to_ascii_lowercase();
+        let database_rel = cell(&cols, Some(database_idx));
+        let database = root.join(&database_rel);
+        let companions = [
+            database.clone(),
+            PathBuf::from(format!("{}.dbtype", database.display())),
+            PathBuf::from(format!("{}.index", database.display())),
+            PathBuf::from(format!("{}.lookup", database.display())),
+        ];
+        let artifacts_ready = companions.iter().all(|path| {
+            fs::metadata(path)
+                .map(|metadata| metadata.is_file() && metadata.len() > 0)
+                .unwrap_or(false)
+        });
+        if cell(&cols, Some(schema_idx)) != ALIGNMENT_DATABASE_MANIFEST_SCHEMA_VERSION
+            || !cell(&cols, Some(namespace_idx)).eq_ignore_ascii_case("MGnify")
+            || !cell(&cols, Some(class_idx)).eq_ignore_ascii_case("metagenome")
+            || source_path != expected_source
+            || digest.len() != 64
+            || !digest.bytes().all(|byte| byte.is_ascii_hexdigit())
+            || cell(&cols, Some(builder_idx)).is_empty()
+            || cell(&cols, Some(status_idx)) != "ready"
+            || database_rel.is_empty()
+            || !artifacts_ready
+        {
+            continue;
+        }
+        manifest.push_str(&format!(
+            "metagenome_targets\t{}\talignment_database_used\t0\t{}\tfull_searchable_alignment_database;consumer=mmseqs_alignment_worker;source_namespace=MGnify;source_digest={digest};database_manifest={database_manifest_rel}\n",
+            relative_display(root, source),
+            relative_display(root, &database),
+        ));
+        return Ok(true);
+    }
+    Ok(false)
 }
 
 fn large_metagenome_fasta_requires_alignment_database(path: &Path) -> bool {

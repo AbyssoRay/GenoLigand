@@ -800,6 +800,17 @@ class CurrentInstallerRemediations(unittest.TestCase):
             self.assertTrue(all(item["sha256"] == installer.sha256_file(store / item["coordinate_rel_path"])
                                 for item in validated_rows))
 
+            expanded_scope = {*scope, "4JKL"}
+            explicit_scope.write_text("\n".join(sorted(expanded_scope)) + "\n", encoding="utf-8")
+            self.assertTrue(installer.rcsb_scope_snapshot_matches_current_sources(store, snapshot))
+            expanded_validation = installer.foldseek_partial_manifest_validation(
+                store,
+                row,
+                db,
+                probe_database=False,
+            )
+            self.assertEqual(expanded_validation["status"], "ready")
+
             with mock.patch.object(
                 installer, "database_prefix_ready", return_value=True
             ), mock.patch.object(
@@ -879,7 +890,7 @@ class CurrentInstallerRemediations(unittest.TestCase):
             )
             self.assertEqual(
                 validate_partial()["reason"],
-                "foldseek_partial_coordinate_binding_invalid:1ABC",
+                "foldseek_partial_scope_snapshot_invalid:rcsb_scope_coordinate_digest_invalid",
             )
             scope_manifest.write_text(scope_text, encoding="utf-8")
 
@@ -1134,6 +1145,45 @@ class CurrentInstallerRemediations(unittest.TestCase):
             (root / "ab/1abc.cif.gz.part").write_bytes(b"partial")
             snapshot = installer.write_rcsb_scope_manifest(store, root, {"1ABC", "2DEF"})
             installer.write_rcsb_on_demand_policy(store, snapshot)
+            installer.write_simple_tsv(
+                store / "external_sync_execution_manifest.tsv",
+                [
+                    "source_id",
+                    "source_label",
+                    "target_rel_path",
+                    "status",
+                    "bytes",
+                    "sha256",
+                    "plan_digest",
+                    "release_identity",
+                    "trust_source",
+                    "scope_mode",
+                    "scope_digest",
+                    "scope_ready_count",
+                    "scope_count",
+                    "scope_missing_count",
+                    "notes",
+                ],
+                [
+                    {
+                        "source_id": "rcsb_ligand_bound",
+                        "source_label": "RCSB ligand-bound structures",
+                        "target_rel_path": "downloads/rcsb/mmcif",
+                        "status": "ready",
+                        "bytes": str(snapshot["coordinate_bytes"]),
+                        "sha256": str(snapshot["coordinate_digest"]),
+                        "plan_digest": "fixture",
+                        "release_identity": "current",
+                        "trust_source": "publisher_https_mmcif_parse",
+                        "scope_mode": "on_demand",
+                        "scope_digest": str(snapshot["scope_digest"]),
+                        "scope_ready_count": str(snapshot["ready_count"]),
+                        "scope_count": str(snapshot["scope_count"]),
+                        "scope_missing_count": str(snapshot["missing_count"]),
+                        "notes": "partial_on_demand",
+                    }
+                ],
+            )
             self.assertEqual(snapshot["scope_count"], 2)
             self.assertEqual(snapshot["ready_count"], 1)
             self.assertEqual(snapshot["missing_count"], 1)
@@ -1157,6 +1207,217 @@ class CurrentInstallerRemediations(unittest.TestCase):
             self.assertNotIn("rcsb_scope_incomplete", {item["code"] for item in readiness["blockers"]})
             self.assertTrue(readiness["rcsb_refresh_needed"])
             self.assertIn("rcsb_foldseek_refresh_needed", {item["code"] for item in readiness["advisories"]})
+
+    def test_metagenome_readiness_requires_bound_and_probed_full_mmseqs_database(self) -> None:
+        installer = self.installer
+        with tempfile.TemporaryDirectory() as tmp:
+            store = Path(tmp) / "science_store"
+            source = store / "downloads/metagenome/mgnify/mgy_clusters.fa.gz"
+            source.parent.mkdir(parents=True)
+            source.write_bytes(b">MGYP003125700799\nMSEQNNTEMT\n")
+            database = store / "indexes/mmseqs/metagenome_mgy_clusters.fa/target"
+            create_database_directory_fixture(database, b"MSEQNNTEMT\n")
+            summary = installer.resource_payload_summary(source)
+            database_manifest = store / "indexes/mmseqs/mmseqs_target_databases.tsv"
+            database_manifest.parent.mkdir(parents=True, exist_ok=True)
+            database_manifest.write_text(
+                "source_id\tmanifest_schema_version\tsource_namespace\tsource_class\tsource_path\tsource_digest\tsource_files\tsource_bytes\tbuilder_version\tdb_path\tstatus\tnotes\n"
+                f"metagenome\t{installer.ALIGNMENT_MANIFEST_SCHEMA_VERSION}\tMGnify\tmetagenome\tdownloads/metagenome/mgnify/mgy_clusters.fa.gz\t{summary['sha256']}\t{summary['file_count']}\t{summary['bytes']}\ttest-builder\tindexes/mmseqs/metagenome_mgy_clusters.fa/target\tready\tvalidated\n",
+                encoding="utf-8",
+            )
+            build_rows = [
+                {
+                    "index": "metagenome_targets",
+                    "input_path": "downloads/metagenome/mgnify/mgy_clusters.fa.gz",
+                    "status": "requires_alignment_database",
+                    "rows": "0",
+                    "output_path": "indexes/metagenome_targets.tsv",
+                    "notes": "large_metagenome_source_uses_mmseqs_target_database",
+                }
+            ]
+            (store / "index_build_manifest.tsv").write_text(
+                "index\tinput_path\tstatus\trows\toutput_path\tnotes\n"
+                + "\t".join(build_rows[0][field] for field in (
+                    "index", "input_path", "status", "rows", "output_path", "notes"
+                ))
+                + "\n",
+                encoding="utf-8",
+            )
+            refresh = installer.refresh_science_index_authority_manifest(store)
+            self.assertEqual(refresh["status"], "ready")
+            self.assertEqual(refresh["updated_rows"], 1)
+            build_rows = installer.read_tsv(store / "index_build_manifest.tsv")
+            self.assertEqual(build_rows[0]["status"], "alignment_database_used")
+            self.assertEqual(
+                build_rows[0]["output_path"],
+                "indexes/mmseqs/metagenome_mgy_clusters.fa/target",
+            )
+            self.assertEqual(
+                installer.refresh_science_index_authority_manifest(store)["updated_rows"],
+                0,
+            )
+            compatibility = store / "indexes/metagenome_targets.tsv"
+            compatibility.write_text(
+                "source\ttarget_id\ttarget_name\torganism\ttarget_class\tligand_tokens\tsequence_tokens\tstructure_tokens\tevidence\n",
+                encoding="utf-8",
+            )
+            with (
+                mock.patch.object(installer, "database_builder_version", return_value="test-builder"),
+                mock.patch.object(installer, "database_prefix_ready", return_value=True),
+            ):
+                authorities = installer.authoritative_metagenome_mmseqs_databases(store, build_rows)
+                self.assertTrue(authorities)
+            rows = installer.science_index_readiness_rows(
+                store,
+                metagenome_alignment_authorities=authorities,
+            )
+            self.assertEqual(rows[0]["readiness_status"], "full_index")
+            self.assertEqual(rows[0]["reason"], "full_searchable_alignment_database_ready")
+            self.assertTrue(installer.metagenome_compatibility_table_ready(compatibility))
+
+            with (
+                mock.patch.object(installer, "database_builder_version", return_value="test-builder"),
+                mock.patch.object(installer, "database_prefix_ready", return_value=False),
+            ):
+                self.assertFalse(
+                    installer.authoritative_metagenome_mmseqs_databases(store, build_rows)
+                )
+            database_manifest.write_text(
+                database_manifest.read_text(encoding="utf-8").replace(
+                    summary["sha256"], "f" * 64
+                ),
+                encoding="utf-8",
+            )
+            with (
+                mock.patch.object(installer, "database_builder_version", return_value="test-builder"),
+                mock.patch.object(installer, "database_prefix_ready", return_value=True),
+            ):
+                self.assertFalse(
+                    installer.authoritative_metagenome_mmseqs_databases(store, build_rows)
+                )
+            compatibility.write_bytes(b"")
+            self.assertFalse(installer.metagenome_compatibility_table_ready(compatibility))
+            (store / "index_build_manifest.tsv").write_text(
+                "index\tinput_path\tstatus\trows\toutput_path\tnotes\n"
+                "metagenome_targets\tdownloads/metagenome/mgnify/mgy_clusters.fa.gz\tused\t5000\tindexes/metagenome_targets.tsv\tfasta_sequence_rows\n",
+                encoding="utf-8",
+            )
+            with mock.patch.object(installer, "large_index_source", return_value=True):
+                rows = installer.science_index_readiness_rows(store)
+            self.assertEqual(rows[0]["readiness_status"], "projection_only")
+
+    def test_metagenome_authority_is_bound_to_each_source_and_database(self) -> None:
+        installer = self.installer
+        with tempfile.TemporaryDirectory() as tmp:
+            store = Path(tmp) / "science_store"
+            manifest_rows = []
+            build_rows = []
+            databases = []
+            for name, sequence in (("good", "MSEQNNTEMT"), ("bad", "MPEPTIDE")):
+                input_path = f"downloads/metagenome/mgnify/{name}.fa.gz"
+                output_path = f"indexes/mmseqs/{name}/target"
+                source = store / input_path
+                source.parent.mkdir(parents=True, exist_ok=True)
+                source.write_text(f">{name}\n{sequence}\n", encoding="utf-8")
+                database = store / output_path
+                create_database_directory_fixture(database, f"{sequence}\n".encode())
+                databases.append(database)
+                summary = installer.resource_payload_summary(source)
+                manifest_rows.append(
+                    {
+                        "source_id": name,
+                        "manifest_schema_version": installer.ALIGNMENT_MANIFEST_SCHEMA_VERSION,
+                        "source_namespace": "MGnify",
+                        "source_class": "metagenome",
+                        "source_path": input_path,
+                        "source_digest": summary["sha256"],
+                        "source_files": str(summary["file_count"]),
+                        "source_bytes": str(summary["bytes"]),
+                        "builder_version": "test-builder",
+                        "db_path": output_path,
+                        "status": "ready",
+                        "notes": "validated",
+                    }
+                )
+                build_rows.append(
+                    {
+                        "index": "metagenome_targets",
+                        "input_path": input_path,
+                        "status": "alignment_database_used",
+                        "rows": "0",
+                        "output_path": output_path,
+                        "notes": (
+                            "full_searchable_alignment_database;consumer=mmseqs_alignment_worker;"
+                            f"source_namespace=MGnify;source_digest={summary['sha256']};"
+                            "database_manifest=indexes/mmseqs/mmseqs_target_databases.tsv"
+                        ),
+                    }
+                )
+            installer.write_simple_tsv(
+                store / "indexes/mmseqs/mmseqs_target_databases.tsv",
+                [
+                    "source_id",
+                    "manifest_schema_version",
+                    "source_namespace",
+                    "source_class",
+                    "source_path",
+                    "source_digest",
+                    "source_files",
+                    "source_bytes",
+                    "builder_version",
+                    "db_path",
+                    "status",
+                    "notes",
+                ],
+                manifest_rows,
+            )
+            installer.write_simple_tsv(
+                store / "index_build_manifest.tsv",
+                ["index", "input_path", "status", "rows", "output_path", "notes"],
+                build_rows,
+            )
+
+            def probe(_tool: str, database: Path, *_args: object) -> bool:
+                return database == databases[0]
+
+            with (
+                mock.patch.object(installer, "database_builder_version", return_value="test-builder"),
+                mock.patch.object(installer, "database_prefix_ready", side_effect=probe),
+            ):
+                authorities = installer.authoritative_metagenome_mmseqs_databases(
+                    store,
+                    build_rows,
+                )
+            self.assertEqual(len(authorities), 1)
+            rows = installer.science_index_readiness_rows(
+                store,
+                metagenome_alignment_authorities=authorities,
+            )
+            statuses = {row["input_path"]: row["readiness_status"] for row in rows}
+            self.assertEqual(statuses[build_rows[0]["input_path"]], "full_index")
+            self.assertEqual(statuses[build_rows[1]["input_path"]], "incomplete")
+
+    def test_known_index_readiness_aggregates_real_consumers_and_skips_absent_candidates(self) -> None:
+        installer = self.installer
+        with tempfile.TemporaryDirectory() as tmp:
+            store = Path(tmp)
+            (store / "downloads/bindingdb").mkdir(parents=True)
+            bindingdb = store / "downloads/bindingdb/bindingdb_all.tsv.zip"
+            bindingdb.write_bytes(b"bindingdb")
+            (store / "index_build_manifest.tsv").write_text(
+                "index\tinput_path\tstatus\trows\toutput_path\tnotes\n"
+                "known_targets\timports/known_targets.tsv\tmissing\t0\tindexes/known_targets.tsv\tnot_present\n"
+                "known_targets\timports/empty_candidate.tsv\tempty\t0\tindexes/known_targets.tsv\t\n"
+                "known_targets\tdownloads/bindingdb/bindingdb_all.tsv.zip\tused\t3228554\tindexes/known_targets.tsv\tcanonical_or_source_table_rows;complete_source_scan\n"
+                "known_targets\tdownloads/chembl/chembl_query.sqlite\tready\t0\tdownloads/chembl/chembl_query.sqlite\tpublished_chembl_query_used_by_onsite_matcher\n",
+                encoding="utf-8",
+            )
+            rows = installer.science_index_readiness_rows(store)
+            statuses = {(row["input_path"], row["readiness_status"]) for row in rows}
+            self.assertIn(("imports/known_targets.tsv", "not_selected"), statuses)
+            self.assertIn(("imports/empty_candidate.tsv", "not_selected"), statuses)
+            self.assertIn(("downloads/bindingdb/bindingdb_all.tsv.zip", "full_index"), statuses)
+            self.assertIn(("downloads/chembl/chembl_query.sqlite", "full_index"), statuses)
 
     def test_rcsb_on_demand_replaces_stale_scope_from_validated_files_and_discards_untrusted_parts(self) -> None:
         installer = self.installer
@@ -1279,6 +1540,9 @@ class CurrentInstallerRemediations(unittest.TestCase):
             with gzip.open(coordinate, "wt", encoding="utf-8") as handle:
                 handle.write(rcsb_mmcif_text("1ABC"))
             scope = {"1ABC", "2DEF"}
+            explicit_scope = store / "downloads/rcsb/ligand_bound_pdb_ids.txt"
+            explicit_scope.parent.mkdir(parents=True, exist_ok=True)
+            explicit_scope.write_text("\n".join(sorted(scope)) + "\n", encoding="utf-8")
             plan = Path(tmp) / "source_sync_plan.tsv"
             installer.write_simple_tsv(
                 plan,
@@ -1291,6 +1555,7 @@ class CurrentInstallerRemediations(unittest.TestCase):
                     "ready_marker",
                     "release_or_date",
                     "trust_source",
+                    "license_note",
                 ],
                 [
                     {
@@ -1302,6 +1567,7 @@ class CurrentInstallerRemediations(unittest.TestCase):
                         "ready_marker": "downloads/rcsb/mmcif",
                         "release_or_date": "current",
                         "trust_source": "publisher_https_mmcif_parse",
+                        "license_note": "RCSB fixture usage policy",
                     }
                 ],
             )
@@ -1353,6 +1619,87 @@ class CurrentInstallerRemediations(unittest.TestCase):
                     "scope_count": 2,
                 },
             )
+            explicit_scope.write_text("1ABC\n2DEF\n3GHI\n", encoding="utf-8")
+            summary = installer.source_sync_summary(
+                plan,
+                store,
+                {**result, "failed": 0},
+                rcsb_mode="on-demand",
+            )
+            self.assertEqual(summary["status"], "ready")
+            self.assertEqual(summary["items"][0]["status"], "就绪")
+            plan_row = installer.read_tsv(plan)[0]
+            self.assertFalse(
+                installer.external_plan_row_ready(
+                    plan_row,
+                    target,
+                    target,
+                    store,
+                    execution,
+                    rcsb_mode="complete",
+                ),
+                "complete mode must reject partial on-demand evidence",
+            )
+
+            source_catalog = Path(tmp) / "source_catalog.tsv"
+            source_catalog.write_text("source_id\n", encoding="utf-8")
+            manifest_result = installer.write_science_resource_manifests(
+                source_catalog,
+                plan,
+                store,
+            )
+            self.assertEqual(manifest_result["status"], "ready")
+            source_manifest = next(
+                row
+                for row in installer.read_tsv(store / "manifests/source_file_manifest.tsv")
+                if row["source_id"] == "rcsb_ligand_bound"
+            )
+            self.assertEqual(source_manifest["status"], "ready")
+            installer.write_simple_tsv(
+                store / "source_requirements.tsv",
+                ["source_id", "logical_source", "status", "repair_action"],
+                [
+                    {
+                        "source_id": "rcsb_ligand_bound",
+                        "logical_source": "rcsb_ligand_bound",
+                        "status": "ready",
+                        "repair_action": "download_and_index_rcsb_ligand_bound",
+                    }
+                ],
+            )
+            readiness = installer.evaluate_installer_science_store_readiness(store, persist=False)
+            blocker_codes = {item["code"] for item in readiness["blockers"]}
+            self.assertNotIn("source_required:rcsb_ligand_bound", blocker_codes)
+            self.assertNotIn("rcsb_scope_incomplete", blocker_codes)
+            self.assertTrue(readiness["rcsb_refresh_needed"])
+            self.assertIn(
+                "external_sync_execution_manifest.tsv",
+                installer.SCIENCE_READINESS_EVIDENCE_PATHS,
+            )
+
+            execution_path = store / "external_sync_execution_manifest.tsv"
+            execution_text = execution_path.read_text(encoding="utf-8")
+            header_only = execution_text.splitlines()[0] + "\n"
+            mutations = [
+                ("manifest_deleted", None),
+                ("execution_row_missing", header_only),
+                ("execution_status_tampered", execution_text.replace("\tready\t", "\tfailed\t", 1)),
+                ("execution_digest_tampered", execution_text.replace(execution["sha256"], "f" * 64, 1)),
+            ]
+            for label, content in mutations:
+                with self.subTest(execution_evidence=label):
+                    if content is None:
+                        execution_path.unlink(missing_ok=True)
+                    else:
+                        execution_path.write_text(content, encoding="utf-8")
+                    rejected = installer.evaluate_installer_science_store_readiness(
+                        store,
+                        persist=False,
+                    )
+                    rejected_codes = {item["code"] for item in rejected["blockers"]}
+                    self.assertIn("source_required:rcsb_ligand_bound", rejected_codes)
+                    self.assertIn("rcsb_scope_incomplete", rejected_codes)
+            execution_path.write_text(execution_text, encoding="utf-8")
 
     def test_https_head_and_range_get_share_one_tls_context_across_workers(self) -> None:
         installer = self.installer
@@ -1872,6 +2219,25 @@ class CurrentInstallerRemediations(unittest.TestCase):
                 self.assertEqual(result["status"], expected_status)
                 self.assertEqual(last_good.read_bytes(), b"last-good-forcefield")
                 self.assertFalse(Path(f"{last_good}.part").exists())
+
+    def test_openff_wsl_loader_receives_linux_forcefield_path(self) -> None:
+        installer = self.installer
+        with tempfile.TemporaryDirectory() as tmp:
+            forcefield = Path(tmp) / "openff-2.2.1.offxml"
+            forcefield.write_text(
+                "<SMIRNOFF version='0.3'><A/><B/><C/><D/><E/></SMIRNOFF>",
+                encoding="utf-8",
+            )
+            wrapper = Path(tmp) / "genoligand-wsl-python.cmd"
+            completed = subprocess.CompletedProcess([], 0, "openff_forcefield_loaded\n", "")
+            with (
+                mock.patch.object(installer, "sha256_file", return_value=installer.OPENFF_FORCEFIELD_SHA256),
+                mock.patch.object(installer, "run_command", return_value=completed) as run_command,
+            ):
+                result = installer.validate_openff_forcefield(forcefield, str(wrapper))
+
+            self.assertEqual(result["status"], "ready")
+            self.assertEqual(run_command.call_args.args[0][-1], installer.wsl_path(forcefield))
 
     def test_worker_environment_is_pinned_complete_and_version_gated(self) -> None:
         installer = self.installer
@@ -2661,6 +3027,180 @@ class CurrentInstallerRemediations(unittest.TestCase):
             self.assertEqual(list(scratch.glob("chembl-query-rebuild-*")), [])
             self.assertEqual(list(chembl_dir.glob(".*.rebuild-*")), [])
             query_db.chmod(0o666)
+
+    def test_final_install_state_ready_and_needs_repair_are_canonical(self) -> None:
+        installer = self.installer
+        cases = [
+            ("ready", True, "ready", True),
+            ("needs_repair", False, "needs_repair", False),
+        ]
+        for status, install_ready, readiness_status, readiness_ready in cases:
+            with self.subTest(status=status), tempfile.TemporaryDirectory() as tmp:
+                store = Path(tmp) / "science_store"
+                progress = installer.install_progress_payload(
+                    status="ready" if install_ready else "needs_repair",
+                    stage="完成检查",
+                    current_resource="安装/修复",
+                    completed_steps=6,
+                    total_steps=6,
+                    failed_steps=0 if install_ready else 1,
+                    message="final gate",
+                )
+                readiness = {
+                    "schema_version": installer.SCIENCE_READINESS_SCHEMA_VERSION,
+                    "status": readiness_status,
+                    "ready": readiness_ready,
+                    "blockers": [] if readiness_ready else [{"code": "fixture_blocker"}],
+                }
+                payload = {
+                    "status": status,
+                    "install_ready": install_ready,
+                    "summary": "ready" if install_ready else "repair",
+                    "next_action": "continue" if install_ready else "repair",
+                    "access_url": "http://127.0.0.1:19090/",
+                    "progress": progress,
+                    "science_store_readiness": readiness,
+                }
+                canonical = installer.canonical_install_status_payload(payload)
+                bound_readiness = installer.bind_science_readiness_to_install_status(
+                    store,
+                    readiness,
+                    canonical,
+                )
+                with mock.patch.object(
+                    installer,
+                    "write_json_atomic",
+                    wraps=installer.write_json_atomic,
+                ) as writer:
+                    installer.write_final_install_state(
+                        store,
+                        canonical,
+                        progress,
+                        bound_readiness,
+                    )
+                publication_order = [
+                    (Path(call.args[0]).name, call.args[1]["status"])
+                    for call in writer.call_args_list
+                ]
+                self.assertEqual(
+                    publication_order,
+                    [
+                        ("install_status.json", "publishing"),
+                        ("science_store_readiness.json", readiness_status),
+                        ("install_progress.json", "ready" if install_ready else "needs_repair"),
+                        ("install_status.json", status),
+                    ],
+                )
+
+                persisted_status = json.loads(
+                    (store / "install_status.json").read_text(encoding="utf-8")
+                )
+                persisted_progress = json.loads(
+                    (store / "install_progress.json").read_text(encoding="utf-8")
+                )
+                persisted_readiness = json.loads(
+                    (store / "science_store_readiness.json").read_text(encoding="utf-8")
+                )
+                status_evidence = next(
+                    row
+                    for row in persisted_readiness["evidence_manifest"]
+                    if row["path"] == "install_status.json"
+                )
+                self.assertEqual(persisted_status["status"], status)
+                self.assertEqual(persisted_status["install_ready"], install_ready)
+                self.assertEqual(persisted_status["progress"], persisted_progress)
+                self.assertEqual(persisted_progress["status"], "ready" if install_ready else "needs_repair")
+                self.assertEqual(persisted_readiness["status"], readiness_status)
+                self.assertEqual(
+                    status_evidence["sha256"],
+                    hashlib.sha256((store / "install_status.json").read_bytes()).hexdigest(),
+                )
+
+    def test_final_install_state_publishing_marker_is_fail_closed(self) -> None:
+        installer = self.installer
+        with tempfile.TemporaryDirectory() as tmp:
+            store = Path(tmp) / "science_store"
+            installer.write_json_atomic(
+                store / "install_status.json",
+                {
+                    "status": "publishing",
+                    "install_ready": False,
+                    "progress": {"status": "publishing"},
+                },
+            )
+            readiness = installer.evaluate_installer_science_store_readiness(
+                store,
+                persist=False,
+            )
+            self.assertIn(
+                "install_status_not_ready",
+                {item["code"] for item in readiness["blockers"]},
+            )
+
+    def test_final_install_state_write_failure_restores_all_last_good_files(self) -> None:
+        installer = self.installer
+        with tempfile.TemporaryDirectory() as tmp:
+            store = Path(tmp) / "science_store"
+            store.mkdir()
+            paths = [
+                store / "science_store_readiness.json",
+                store / "install_progress.json",
+                store / "install_status.json",
+            ]
+            for index, path in enumerate(paths, start=1):
+                path.write_bytes(f'{{"last_good":{index}}}\n'.encode("utf-8"))
+            last_good = {path: path.read_bytes() for path in paths}
+            progress = installer.install_progress_payload(
+                status="ready",
+                stage="完成检查",
+                completed_steps=6,
+                total_steps=6,
+                message="final gate",
+            )
+            readiness = {
+                "schema_version": installer.SCIENCE_READINESS_SCHEMA_VERSION,
+                "status": "ready",
+                "ready": True,
+                "blockers": [],
+            }
+            payload = {
+                "status": "ready",
+                "install_ready": True,
+                "summary": "ready",
+                "next_action": "continue",
+                "access_url": "http://127.0.0.1:19090/",
+                "progress": progress,
+                "science_store_readiness": readiness,
+            }
+            canonical = installer.canonical_install_status_payload(payload)
+            bound_readiness = installer.bind_science_readiness_to_install_status(
+                store,
+                readiness,
+                canonical,
+            )
+            real_replace = installer.os.replace
+
+            def fail_canonical_replace(source: object, destination: object) -> None:
+                source_payload = json.loads(Path(source).read_text(encoding="utf-8"))
+                if (
+                    Path(destination) == store / "install_status.json"
+                    and source_payload.get("status") == "ready"
+                ):
+                    raise OSError("simulated final status sharing violation")
+                real_replace(source, destination)
+
+            with mock.patch.object(installer.os, "replace", side_effect=fail_canonical_replace):
+                with self.assertRaises(OSError):
+                    installer.write_final_install_state(
+                        store,
+                        canonical,
+                        progress,
+                        bound_readiness,
+                    )
+
+            for path in paths:
+                self.assertEqual(path.read_bytes(), last_good[path])
+            self.assertTrue((store / "install_status.json.attempt.json").is_file())
 
     def test_trusted_http_identity_resumes_from_existing_offset(self) -> None:
         installer = self.installer

@@ -5285,6 +5285,38 @@ fn readiness_evidence_digest_matches_python_contract() {
 }
 
 #[test]
+fn runtime_readiness_binds_external_sync_execution_evidence() {
+    let root = temp_root("external_sync_readiness_evidence");
+    let store = root.join("science_store");
+    ensure_dir(&store).expect("science store");
+    let execution = store.join("external_sync_execution_manifest.tsv");
+    let ready = "source_id\tstatus\tsha256\nrcsb_ligand_bound\tready\tfixture\n";
+    write_text(&execution, ready).expect("external sync execution evidence");
+    write_test_science_store_readiness(&store, &[]).expect("canonical readiness");
+
+    let accepted = evaluate_science_store_readiness(&store).expect("accepted readiness");
+    assert!(accepted.ready);
+    assert!(accepted.blockers.is_empty());
+
+    write_text(
+        &execution,
+        "source_id\tstatus\tsha256\nrcsb_ligand_bound\tfailed\ttampered\n",
+    )
+    .expect("tampered execution evidence");
+    let tampered = evaluate_science_store_readiness(&store).expect("tampered readiness");
+    assert_eq!(tampered.blockers, ["science_store_readiness_stale"]);
+
+    write_text(&execution, ready).expect("restored execution evidence");
+    write_test_science_store_readiness(&store, &[]).expect("rebound readiness");
+    fs::remove_file(&execution).expect("removed execution evidence");
+    let removed = evaluate_science_store_readiness(&store).expect("removed readiness");
+    assert_eq!(removed.blockers, ["science_store_readiness_stale"]);
+
+    fs::remove_dir_all(&root).expect("cleanup temp root");
+    assert!(!root.exists());
+}
+
+#[test]
 fn runtime_readiness_evidence_binds_small_manifests_without_large_database_hashes() {
     let root = temp_root("chembl_readiness_evidence");
     let store = root.join("science_store");
@@ -5537,6 +5569,74 @@ fn large_metagenome_fasta_is_reserved_for_persistent_alignment_database() {
     assert!(metagenome_fasta_requires_alignment_database(&path, 10));
     fs::remove_dir_all(&root).expect("cleanup temp root");
     assert!(!root.exists());
+}
+
+#[test]
+fn large_metagenome_binds_ready_mmseqs_database_without_fake_tsv_rows() {
+    let root = temp_root("large_metagenome_ready_mmseqs_binding");
+    let store = root.join("science_store");
+    let source = store.join("downloads/metagenome/mgnify/mgy_clusters.fa.gz");
+    fs::create_dir_all(source.parent().expect("source parent")).expect("source parent");
+    let source_file = fs::OpenOptions::new()
+        .create(true)
+        .truncate(true)
+        .write(true)
+        .open(&source)
+        .expect("sparse metagenome source");
+    source_file
+        .set_len(LARGE_METAGENOME_FASTA_TSV_MAX_BYTES + 1)
+        .expect("large sparse source");
+    drop(source_file);
+    let database = store.join("indexes/mmseqs/metagenome_mgy_clusters.fa/target");
+    write_text(&database, "SEQUENCE\n").expect("database payload");
+    write_text(
+        &PathBuf::from(format!("{}.dbtype", database.display())),
+        "ABCD",
+    )
+    .expect("database type");
+    write_text(
+        &PathBuf::from(format!("{}.index", database.display())),
+        "0\t0\t9\n",
+    )
+    .expect("database index");
+    write_text(
+        &PathBuf::from(format!("{}.lookup", database.display())),
+        "0\tMGYP003125700799\t0\n",
+    )
+    .expect("database lookup");
+    write_text(
+        &store.join("indexes/mmseqs/mmseqs_target_databases.tsv"),
+        &format!(
+            "source_id\tmanifest_schema_version\tsource_namespace\tsource_class\tsource_path\tsource_digest\tsource_files\tsource_bytes\tbuilder_version\tdb_path\tstatus\tnotes\nmetagenome\t{}\tMGnify\tmetagenome\tdownloads/metagenome/mgnify/mgy_clusters.fa.gz\t{}\t1\t{}\ttest-builder\tindexes/mmseqs/metagenome_mgy_clusters.fa/target\tready\tvalidated\n",
+            ALIGNMENT_DATABASE_MANIFEST_SCHEMA_VERSION,
+            "a".repeat(64),
+            LARGE_METAGENOME_FASTA_TSV_MAX_BYTES + 1,
+        ),
+    )
+    .expect("alignment manifest");
+    let options = StoreOptions {
+        workspace_root: root.clone(),
+        science_store: store.clone(),
+    };
+    let build_manifest = store.join("index_build_manifest.tsv");
+
+    build_store_indexes(&options, &build_manifest).expect("build indexes");
+    let manifest = read_text(&build_manifest).expect("build manifest");
+    let projection =
+        read_text(&store.join("indexes/metagenome_targets.tsv")).expect("compatibility table");
+    assert!(manifest.contains("alignment_database_used\t0\tindexes/mmseqs"));
+    assert!(manifest.contains("full_searchable_alignment_database"));
+    assert!(manifest.contains("consumer=mmseqs_alignment_worker"));
+    assert!(manifest.contains(&format!("source_digest={}", "a".repeat(64))));
+    assert_eq!(projection.lines().count(), 1);
+
+    fs::remove_file(PathBuf::from(format!("{}.lookup", database.display())))
+        .expect("remove lookup");
+    build_store_indexes(&options, &build_manifest).expect("rebuild without database authority");
+    let manifest = read_text(&build_manifest).expect("repaired build manifest");
+    assert!(manifest.contains("requires_alignment_database"));
+    assert!(!manifest.contains("alignment_database_used"));
+    fs::remove_dir_all(&root).expect("cleanup temp root");
 }
 
 #[test]
