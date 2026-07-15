@@ -44,6 +44,46 @@ LIGAND_DRIFT_SCORE_SCALE_ANGSTROM = 3.0
 CONTACT_CUTOFF_ANGSTROM = 4.5
 RECEPTOR_CHAIN_SELECTION_VERSION = "pose_heavy_atom_contact_v1"
 RECEPTOR_CHAIN_CONTACT_CUTOFF_ANGSTROM = 4.5
+RECEPTOR_SELECTION_FIELDS = (
+    "receptor_chain_selection_algorithm",
+    "receptor_chain_atom_policy",
+    "receptor_chain_contact_cutoff_angstrom",
+    "original_protein_chain_count",
+    "retained_protein_chain_count",
+    "selected_chain_id",
+    "selected_chain_ordinal",
+    "selected_chain_signature_sha256",
+    "selected_chain_coordinate_sha256",
+    "selected_chain_minimum_distance_angstrom",
+    "source_receptor_coordinate",
+    "source_receptor_sha256",
+    "docking_pose_sha256",
+    "receptor_chain_selection_digest",
+    "prepared_receptor_sha256",
+)
+RECEPTOR_SELECTION_DIGEST_FIELDS = (
+    "source_receptor_sha256",
+    "docking_pose_sha256",
+    "receptor_chain_selection_algorithm",
+    "receptor_chain_atom_policy",
+    "receptor_chain_contact_cutoff_angstrom",
+    "selected_chain_id",
+    "selected_chain_signature_sha256",
+    "selected_chain_coordinate_sha256",
+)
+RECEPTOR_SELECTION_PROTOCOL_FIELDS = (
+    ("receptor_chain_selection_algorithm", "receptor_chain_selection_algorithm", ""),
+    ("receptor_chain_atom_policy", "receptor_chain_atom_policy", ""),
+    ("receptor_chain_contact_cutoff", "receptor_chain_contact_cutoff_angstrom", "angstrom"),
+    ("original_protein_chain_count", "original_protein_chain_count", "chains"),
+    ("retained_protein_chain_count", "retained_protein_chain_count", "chains"),
+    ("selected_chain_id", "selected_chain_id", ""),
+    ("selected_chain_ordinal", "selected_chain_ordinal", ""),
+    ("selected_chain_signature_sha256", "selected_chain_signature_sha256", ""),
+    ("selected_chain_coordinate_sha256", "selected_chain_coordinate_sha256", ""),
+    ("selected_chain_minimum_distance", "selected_chain_minimum_distance_angstrom", "angstrom"),
+    ("receptor_chain_selection_digest", "receptor_chain_selection_digest", ""),
+)
 STANDARD_PROTEIN_RESIDUES = {
     "ALA", "ARG", "ASN", "ASP", "CYS", "GLN", "GLU", "GLY", "HIS", "ILE",
     "LEU", "LYS", "MET", "PHE", "PRO", "SER", "THR", "TRP", "TYR", "VAL",
@@ -313,16 +353,7 @@ def run_md_summary_job(job: dict[str, Any]) -> WorkerExecution:
         chain_selection["docking_pose_sha256"] = sha256_file(binding.docking_pose_sdf)
         selection_binding = {
             key: chain_selection[key]
-            for key in (
-                "source_receptor_sha256",
-                "docking_pose_sha256",
-                "receptor_chain_selection_algorithm",
-                "receptor_chain_atom_policy",
-                "receptor_chain_contact_cutoff_angstrom",
-                "selected_chain_id",
-                "selected_chain_signature_sha256",
-                "selected_chain_coordinate_sha256",
-            )
+            for key in RECEPTOR_SELECTION_DIGEST_FIELDS
         }
         chain_selection["receptor_chain_selection_digest"] = hashlib.sha256(
             json.dumps(selection_binding, sort_keys=True, separators=(",", ":")).encode("utf-8")
@@ -1364,6 +1395,133 @@ def bound_tsv_rows(binding: MdInvocationBinding, artifact: str) -> list[dict[str
     return rows
 
 
+def validate_receptor_selection_semantics(
+    binding: MdInvocationBinding,
+    manifest: dict[str, Any],
+    protocol: dict[tuple[str, str], dict[str, str]],
+) -> None:
+    system_value = manifest.get("system")
+    system = system_value if isinstance(system_value, dict) else {}
+    complex_manifest = read_json_object(md_artifact_path(binding, "complex_md_manifest.json"))
+    complex_system_value = complex_manifest.get("system")
+    complex_system = complex_system_value if isinstance(complex_system_value, dict) else {}
+    protocol_markers = {
+        parameter
+        for parameter, _field_name, _unit in RECEPTOR_SELECTION_PROTOCOL_FIELDS
+    }
+    has_selection_schema = (
+        any(field_name in system for field_name in RECEPTOR_SELECTION_FIELDS)
+        or any(field_name in complex_system for field_name in RECEPTOR_SELECTION_FIELDS)
+        or any(stage == "input" and parameter in protocol_markers for stage, parameter in protocol)
+    )
+    if not has_selection_schema:
+        return
+
+    missing = [field_name for field_name in RECEPTOR_SELECTION_FIELDS if field_name not in system]
+    if missing:
+        raise MdProvenanceError(f"md_receptor_selection_field_missing:{missing[0]}")
+    if system["receptor_chain_selection_algorithm"] != RECEPTOR_CHAIN_SELECTION_VERSION:
+        raise MdProvenanceError("md_receptor_selection_algorithm_invalid")
+    if system["receptor_chain_atom_policy"] != "protein_and_ligand_heavy_atoms":
+        raise MdProvenanceError("md_receptor_selection_atom_policy_invalid")
+
+    cutoff = system["receptor_chain_contact_cutoff_angstrom"]
+    minimum_distance = system["selected_chain_minimum_distance_angstrom"]
+    if (
+        isinstance(cutoff, bool)
+        or not isinstance(cutoff, (int, float))
+        or not math.isfinite(float(cutoff))
+        or float(cutoff) != RECEPTOR_CHAIN_CONTACT_CUTOFF_ANGSTROM
+    ):
+        raise MdProvenanceError("md_receptor_selection_contact_cutoff_invalid")
+    if (
+        isinstance(minimum_distance, bool)
+        or not isinstance(minimum_distance, (int, float))
+        or not math.isfinite(float(minimum_distance))
+        or not 0.0 <= float(minimum_distance) <= float(cutoff)
+    ):
+        raise MdProvenanceError("md_receptor_selection_minimum_distance_invalid")
+    for field_name in ("original_protein_chain_count", "retained_protein_chain_count", "selected_chain_ordinal"):
+        value = system[field_name]
+        if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+            raise MdProvenanceError(f"md_receptor_selection_field_invalid:{field_name}")
+    if system["original_protein_chain_count"] < 1 or system["retained_protein_chain_count"] != 1:
+        raise MdProvenanceError("md_receptor_selection_chain_count_invalid")
+    if not isinstance(system["selected_chain_id"], str):
+        raise MdProvenanceError("md_receptor_selection_field_invalid:selected_chain_id")
+
+    digest_fields = (
+        "source_receptor_sha256",
+        "docking_pose_sha256",
+        "selected_chain_signature_sha256",
+        "selected_chain_coordinate_sha256",
+        "receptor_chain_selection_digest",
+        "prepared_receptor_sha256",
+    )
+    for field_name in digest_fields:
+        value = system[field_name]
+        if not isinstance(value, str) or not valid_sha256(value):
+            raise MdProvenanceError(f"md_receptor_selection_sha256_invalid:{field_name}")
+    expected_selection_digest = canonical_digest(
+        {field_name: system[field_name] for field_name in RECEPTOR_SELECTION_DIGEST_FIELDS}
+    )
+    if system["receptor_chain_selection_digest"] != expected_selection_digest:
+        raise MdProvenanceError("md_receptor_selection_digest_mismatch")
+
+    if binding.receptor_coordinate is None:
+        raise MdProvenanceError("md_source_receptor_coordinate_missing")
+    source_receptor = resolve_run_artifact(binding.run_dir, binding.receptor_coordinate)
+    expected_source_relative = source_receptor.relative_to(binding.run_dir).as_posix()
+    if system["source_receptor_coordinate"] != expected_source_relative:
+        raise MdProvenanceError("md_source_receptor_coordinate_mismatch")
+    if sha256_file(source_receptor) != system["source_receptor_sha256"]:
+        raise MdProvenanceError("md_source_receptor_sha256_mismatch")
+    if binding.docking_pose_sdf is None:
+        raise MdProvenanceError("md_docking_pose_missing")
+    docking_pose = resolve_run_artifact(binding.run_dir, binding.docking_pose_sdf)
+    if sha256_file(docking_pose) != system["docking_pose_sha256"]:
+        raise MdProvenanceError("md_docking_pose_sha256_mismatch")
+
+    prepared_relative = md_artifact_relative(binding, "receptor_prepared.pdb")
+    if manifest.get("receptor_coordinate") != prepared_relative:
+        raise MdProvenanceError("md_prepared_receptor_path_mismatch")
+    prepared_path = resolve_run_artifact(binding.run_dir, prepared_relative)
+    prepared_sha256 = sha256_file(prepared_path)
+    if prepared_sha256 != system["prepared_receptor_sha256"]:
+        raise MdProvenanceError("md_prepared_receptor_sha256_mismatch")
+
+    if not isinstance(complex_system_value, dict):
+        raise MdProvenanceError("md_receptor_selection_manifest_mismatch")
+    if complex_manifest.get("receptor_coordinate") != prepared_relative:
+        raise MdProvenanceError("md_receptor_selection_manifest_mismatch")
+    if any(complex_system.get(field_name) != system[field_name] for field_name in RECEPTOR_SELECTION_FIELDS):
+        raise MdProvenanceError("md_receptor_selection_manifest_mismatch")
+
+    for parameter, field_name, expected_unit in RECEPTOR_SELECTION_PROTOCOL_FIELDS:
+        row = protocol.get(("input", parameter))
+        if (
+            row is None
+            or row.get("value") != str(system[field_name])
+            or row.get("unit", "") != expected_unit
+        ):
+            raise MdProvenanceError(f"md_receptor_selection_protocol_mismatch:{parameter}")
+
+    provenance_relative = md_artifact_relative(binding, MD_PROVENANCE_ARTIFACT)
+    if manifest.get("artifact_provenance") != provenance_relative:
+        raise MdProvenanceError("md_prepared_receptor_provenance_mismatch")
+    provenance = read_json_object(resolve_run_artifact(binding.run_dir, provenance_relative))
+    provenance_rows = provenance.get("artifacts")
+    if not isinstance(provenance_rows, list):
+        raise MdProvenanceError("md_prepared_receptor_provenance_mismatch")
+    prepared_rows = [
+        row
+        for row in provenance_rows
+        if isinstance(row, dict) and row.get("artifact_path") == prepared_relative
+    ]
+    if len(prepared_rows) != 1 or prepared_rows[0].get("artifact_sha256") != prepared_sha256:
+        raise MdProvenanceError("md_prepared_receptor_provenance_mismatch")
+
+
 def validate_completed_md_semantics(binding: MdInvocationBinding) -> dict[str, Any]:
     manifest = read_json_object(md_artifact_path(binding, "md_run_manifest.json"))
     validate_manifest_binding(manifest, binding)
@@ -1488,44 +1646,7 @@ def validate_complex_md_semantics(
             raise MdProvenanceError("md_protocol_parameter_missing")
         if row.get("unit", "") != unit:
             raise MdProvenanceError("md_protocol_unit_invalid")
-    system = manifest.get("system")
-    if isinstance(system, dict) and system.get("receptor_chain_selection_digest"):
-        prepared_relative = md_artifact_relative(binding, "receptor_prepared.pdb")
-        if manifest.get("receptor_coordinate") != prepared_relative:
-            raise MdProvenanceError("md_prepared_receptor_path_mismatch")
-        prepared_path = resolve_run_artifact(binding.run_dir, prepared_relative)
-        prepared_sha256 = str(system.get("prepared_receptor_sha256", "")).lower()
-        if not valid_sha256(prepared_sha256) or sha256_file(prepared_path) != prepared_sha256:
-            raise MdProvenanceError("md_prepared_receptor_sha256_mismatch")
-        protocol_fields = {
-            "receptor_chain_selection_algorithm": "receptor_chain_selection_algorithm",
-            "receptor_chain_atom_policy": "receptor_chain_atom_policy",
-            "selected_chain_id": "selected_chain_id",
-            "selected_chain_ordinal": "selected_chain_ordinal",
-            "selected_chain_signature_sha256": "selected_chain_signature_sha256",
-            "selected_chain_coordinate_sha256": "selected_chain_coordinate_sha256",
-            "receptor_chain_selection_digest": "receptor_chain_selection_digest",
-        }
-        for parameter, field_name in protocol_fields.items():
-            row = protocol.get(("input", parameter))
-            if row is None or row.get("value") != str(system.get(field_name, "")):
-                raise MdProvenanceError(f"md_receptor_selection_protocol_mismatch:{parameter}")
-        complex_manifest = read_json_object(md_artifact_path(binding, "complex_md_manifest.json"))
-        if (
-            complex_manifest.get("receptor_coordinate") != prepared_relative
-            or not isinstance(complex_manifest.get("system"), dict)
-            or complex_manifest["system"].get("receptor_chain_selection_digest")
-            != system.get("receptor_chain_selection_digest")
-        ):
-            raise MdProvenanceError("md_receptor_selection_manifest_mismatch")
-        provenance = read_json_object(md_artifact_path(binding, MD_PROVENANCE_ARTIFACT))
-        prepared_rows = [
-            row
-            for row in provenance.get("artifacts", [])
-            if isinstance(row, dict) and row.get("artifact_path") == prepared_relative
-        ]
-        if len(prepared_rows) != 1 or prepared_rows[0].get("artifact_sha256") != prepared_sha256:
-            raise MdProvenanceError("md_prepared_receptor_provenance_mismatch")
+    validate_receptor_selection_semantics(binding, manifest, protocol)
     timestep = finite_float(protocol[("integrator", "time_step")].get("value"), "md_timestep_invalid")
     production_steps = int(
         finite_float(protocol[("production", "total_steps")].get("value"), "md_production_steps_invalid")

@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import tempfile
 import unittest
+from dataclasses import replace
 from pathlib import Path
 
 from genoligand_workers import md_summary_worker as worker
@@ -166,12 +167,160 @@ class MdSemanticValidationTests(unittest.TestCase):
             encoding="utf-8",
         )
 
+    def write_valid_selected_receptor_artifacts(self) -> dict[str, Path | str]:
+        source_receptor = self.run_dir / "source_receptor.pdb"
+        docking_pose = self.run_dir / "docking_pose.sdf"
+        prepared_receptor = self.outputs / "receptor_prepared.pdb"
+        source_receptor.write_text("SOURCE RECEPTOR\n", encoding="utf-8")
+        docking_pose.write_text("DOCKING POSE\n", encoding="utf-8")
+        prepared_receptor.write_text("PREPARED RECEPTOR\n", encoding="utf-8")
+        self.binding = replace(
+            self.binding,
+            receptor_coordinate=source_receptor.resolve(),
+            docking_pose_sdf=docking_pose.resolve(),
+        )
+        system = {
+            "receptor_chain_selection_algorithm": worker.RECEPTOR_CHAIN_SELECTION_VERSION,
+            "receptor_chain_atom_policy": "protein_and_ligand_heavy_atoms",
+            "receptor_chain_contact_cutoff_angstrom": worker.RECEPTOR_CHAIN_CONTACT_CUTOFF_ANGSTROM,
+            "original_protein_chain_count": 2,
+            "retained_protein_chain_count": 1,
+            "selected_chain_id": "A",
+            "selected_chain_ordinal": 1,
+            "selected_chain_signature_sha256": "d" * 64,
+            "selected_chain_coordinate_sha256": "e" * 64,
+            "selected_chain_minimum_distance_angstrom": 2.0,
+            "source_receptor_coordinate": "source_receptor.pdb",
+            "source_receptor_sha256": worker.sha256_file(source_receptor),
+            "docking_pose_sha256": worker.sha256_file(docking_pose),
+            "prepared_receptor_sha256": worker.sha256_file(prepared_receptor),
+        }
+        system["receptor_chain_selection_digest"] = worker.canonical_digest(
+            {field_name: system[field_name] for field_name in worker.RECEPTOR_SELECTION_DIGEST_FIELDS}
+        )
+        run_manifest_path = self.outputs / "md_run_manifest.json"
+        run_manifest = json.loads(run_manifest_path.read_text(encoding="utf-8"))
+        run_manifest.update(
+            {
+                "system": system,
+                "receptor_coordinate": "tool_outputs/receptor_prepared.pdb",
+                "artifact_provenance": "tool_outputs/md_artifact_provenance.json",
+            }
+        )
+        run_manifest_path.write_text(
+            json.dumps(run_manifest, indent=2, sort_keys=True) + "\n",
+            encoding="utf-8",
+        )
+        (self.outputs / "complex_md_manifest.json").write_text(
+            json.dumps(
+                {
+                    "receptor_coordinate": "tool_outputs/receptor_prepared.pdb",
+                    "system": system,
+                },
+                indent=2,
+                sort_keys=True,
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        protocol_path = self.outputs / "md_protocol.tsv"
+        protocol_rows = "".join(
+            f"{self.binding.candidate_id}\t{self.binding.input_id}\tinput\t{parameter}\t"
+            f"{system[field_name]}\t{unit}\tGenoLigand\n"
+            for parameter, field_name, unit in worker.RECEPTOR_SELECTION_PROTOCOL_FIELDS
+        )
+        protocol_path.write_text(
+            protocol_path.read_text(encoding="utf-8") + protocol_rows,
+            encoding="utf-8",
+        )
+        worker.write_md_artifact_provenance(
+            self.binding,
+            [
+                path
+                for path in sorted(self.outputs.iterdir())
+                if path.name != worker.MD_PROVENANCE_ARTIFACT
+            ],
+            tool_name="OpenMM",
+            tool_version="fixture",
+            parameters={"system": system},
+        )
+        return {
+            "source_receptor": source_receptor,
+            "docking_pose": docking_pose,
+            "prepared_receptor": prepared_receptor,
+            "selection_digest": system["receptor_chain_selection_digest"],
+        }
+
     def test_complete_bound_complex_metrics_are_accepted(self) -> None:
         facts = worker.validate_completed_md_semantics(self.binding)
         self.assertEqual(facts["method"], "openmm_receptor_ligand_complex_dynamics")
         self.assertEqual(facts["candidate_id"], self.binding.candidate_id)
         self.assertEqual(facts["frame_count"], 10)
         self.assertEqual(facts["production_steps"], 100)
+
+    def test_selected_receptor_schema_rejects_downgrade_and_tampering(self) -> None:
+        self.write_valid_selected_receptor_artifacts()
+        worker.validate_completed_md_semantics(self.binding)
+
+        cases = {
+            "missing_digest": "md_receptor_selection_field_missing:receptor_chain_selection_digest",
+            "forged_digest": "md_receptor_selection_digest_mismatch",
+            "source_receptor": "md_source_receptor_sha256_mismatch",
+            "docking_pose": "md_docking_pose_sha256_mismatch",
+            "prepared_receptor": "md_prepared_receptor_sha256_mismatch",
+            "complex_manifest": "md_receptor_selection_manifest_mismatch",
+            "protocol": "md_receptor_selection_protocol_mismatch:selected_chain_id",
+            "provenance": "md_prepared_receptor_provenance_mismatch",
+        }
+        for name, reason in cases.items():
+            with self.subTest(name=name):
+                self.write_valid_complex_artifacts()
+                artifacts = self.write_valid_selected_receptor_artifacts()
+                run_manifest_path = self.outputs / "md_run_manifest.json"
+                complex_manifest_path = self.outputs / "complex_md_manifest.json"
+                provenance_path = self.outputs / worker.MD_PROVENANCE_ARTIFACT
+                if name == "missing_digest":
+                    manifest = json.loads(run_manifest_path.read_text(encoding="utf-8"))
+                    del manifest["system"]["receptor_chain_selection_digest"]
+                    run_manifest_path.write_text(json.dumps(manifest) + "\n", encoding="utf-8")
+                elif name == "forged_digest":
+                    forged = "f" * 64
+                    for path in (run_manifest_path, complex_manifest_path):
+                        value = json.loads(path.read_text(encoding="utf-8"))
+                        value["system"]["receptor_chain_selection_digest"] = forged
+                        path.write_text(json.dumps(value) + "\n", encoding="utf-8")
+                    protocol_path = self.outputs / "md_protocol.tsv"
+                    protocol_path.write_text(
+                        protocol_path.read_text(encoding="utf-8").replace(
+                            str(artifacts["selection_digest"]), forged
+                        ),
+                        encoding="utf-8",
+                    )
+                elif name in {"source_receptor", "docking_pose", "prepared_receptor"}:
+                    Path(artifacts[name]).write_text("TAMPERED\n", encoding="utf-8")
+                elif name == "complex_manifest":
+                    value = json.loads(complex_manifest_path.read_text(encoding="utf-8"))
+                    value["system"]["selected_chain_id"] = "B"
+                    complex_manifest_path.write_text(json.dumps(value) + "\n", encoding="utf-8")
+                elif name == "protocol":
+                    protocol_path = self.outputs / "md_protocol.tsv"
+                    protocol_path.write_text(
+                        protocol_path.read_text(encoding="utf-8").replace(
+                            "input\tselected_chain_id\tA\t",
+                            "input\tselected_chain_id\tB\t",
+                        ),
+                        encoding="utf-8",
+                    )
+                else:
+                    value = json.loads(provenance_path.read_text(encoding="utf-8"))
+                    value["artifacts"] = [
+                        row
+                        for row in value["artifacts"]
+                        if row["artifact_path"] != "tool_outputs/receptor_prepared.pdb"
+                    ]
+                    provenance_path.write_text(json.dumps(value) + "\n", encoding="utf-8")
+                with self.assertRaisesRegex(worker.MdProvenanceError, reason):
+                    worker.validate_completed_md_semantics(self.binding)
 
     def test_missing_metric_wrong_candidate_nonfinite_and_short_runs_fail(self) -> None:
         mutations = {
