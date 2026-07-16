@@ -910,6 +910,7 @@ def write_runtime_launch_environment(
     server_command: list[str],
     tool_python: str,
     science_env: dict[str, str],
+    inherited_path: str,
 ) -> dict[str, object]:
     runtime_dir.mkdir(parents=True, exist_ok=True)
     env = {
@@ -921,7 +922,6 @@ def write_runtime_launch_environment(
         env["GENOLIGAND_PYTHON"] = tool_python
     path_prepend = [str(runtime_dir / "bin")]
     science_path = science_env.get("PATH", "")
-    inherited_path = os.environ.get("PATH", "")
     if science_path == inherited_path:
         science_path = ""
     elif inherited_path and science_path.endswith(os.pathsep + inherited_path):
@@ -11346,6 +11346,7 @@ def main() -> int:
         wrapper_dir = python_env_dir / "command-wrappers"
         command_wrapper_result = write_wsl_command_wrappers(wrapper_dir, selected_wsl)
         extra_tool_paths.append(wrapper_dir)
+    inherited_path = os.environ.get("PATH", "")
     science_env = environment_for_science_tools(workspace_root, extra_tool_paths)
     download_result = (
         {
@@ -11730,6 +11731,7 @@ def main() -> int:
         server_command,
         tool_python,
         science_env,
+        inherited_path,
     )
     payload["launch_environment"] = launch_environment
     canonical_install_status = canonical_install_status_payload(payload)

@@ -2143,7 +2143,7 @@ class InstallerRegressionTests(unittest.TestCase):
                 "status": "ready",
                 "path": str(binary),
                 "sha256": hashlib.sha256(b"binary").hexdigest(),
-                "version": "0.9.72",
+                "version": "0.9.73",
                 "commit": "abc",
                 "build_profile": "release",
                 "smoke": "ready",
@@ -2172,7 +2172,8 @@ class InstallerRegressionTests(unittest.TestCase):
             inherited = os.pathsep.join([str(root / "system-bin"), str(root / "inherited-cache")])
             additions = [str(root / "worker-wrappers"), str(root / "cuda-bin")]
             science_env = {"PATH": os.pathsep.join([*additions, inherited])}
-            with mock.patch.dict(os.environ, {"PATH": inherited}, clear=False):
+            changed_process_path = os.pathsep.join([str(root / "late-tool"), inherited])
+            with mock.patch.dict(os.environ, {"PATH": changed_process_path}, clear=False):
                 installer.write_runtime_launch_environment(
                     runtime,
                     root / "science-store",
@@ -2183,6 +2184,7 @@ class InstallerRegressionTests(unittest.TestCase):
                     [str(runtime / "bin" / "gls-server")],
                     str(runtime / "python"),
                     science_env,
+                    inherited,
                 )
             payload = json.loads((runtime / "launch_environment.json").read_text(encoding="utf-8"))
             self.assertEqual(payload["path_prepend"], [str(runtime / "bin"), *additions])
