@@ -194,6 +194,8 @@ SCIENCE_READINESS_EVIDENCE_PATHS = (
     "indexes/foldseek/foldseek_target_databases.tsv",
     "indexes/foldseek/rcsb_mmcif/indexed_pdb_ids.tsv",
     "downloads/chembl/chembl_query.manifest.json",
+    "indexes/bindingdb/bindingdb_query.manifest.json",
+    "manifests/source_retention_manifest.tsv",
     "downloads/rcsb/ligand_bound_pdb_scope.json",
     "downloads/rcsb/ligand_bound_pdb_scope.tsv",
     "downloads/rcsb/on_demand_policy.json",
@@ -222,6 +224,61 @@ CHEMBL_QUERY_OUTPUT_SOURCE_RATIO_NUMERATOR = 2
 CHEMBL_QUERY_OUTPUT_SOURCE_RATIO_DENOMINATOR = 5
 CHEMBL_QUERY_TRANSACTION_SCHEMA_VERSION = "genoligand_chembl_query_transaction_v1"
 DATABASE_DIRECTORY_TRANSACTION_SCHEMA_VERSION = "genoligand_database_directory_transaction_v1"
+SOURCE_RETENTION_SCHEMA_VERSION = "genoligand_source_retention_v1"
+SOURCE_RETENTION_MANIFEST_REL_PATH = "manifests/source_retention_manifest.tsv"
+RCSB_ON_DEMAND_MAX_CACHE_BYTES = 2 * 1024 * 1024 * 1024
+RCSB_ON_DEMAND_MAX_CACHE_FILES = 4096
+RCSB_ON_DEMAND_INITIAL_CACHE_FILES = 256
+INDEXED_SOURCE_RETENTION_POLICIES: dict[str, dict[str, object]] = {
+    "chembl": {
+        "payloads": ("downloads/chembl/chembl_sqlite.tar.gz",),
+        "derived": (
+            "downloads/chembl/chembl_query.sqlite",
+            "downloads/chembl/chembl_query.manifest.json",
+        ),
+    },
+    "bindingdb": {
+        "payloads": ("downloads/bindingdb/bindingdb_all.tsv.zip",),
+        "derived": (
+            "indexes/bindingdb/bindingdb_query.sqlite",
+            "indexes/bindingdb/bindingdb_query.manifest.json",
+        ),
+    },
+    "uniprot_human_reviewed": {
+        "payloads": ("downloads/uniprot/uniprot_human_reviewed.fasta.gz",),
+        "derived": (
+            "indexes/known_targets.tsv",
+            "indexes/mmseqs/mmseqs_target_databases.tsv",
+        ),
+    },
+    "binding_moad": {
+        "payloads": ("downloads/binding_moad/bindingmoad.csv",),
+        "derived": ("indexes/structure_targets.tsv",),
+    },
+    "biolip2": {
+        "payloads": ("downloads/biolip2",),
+        "derived": (
+            "indexes/known_targets.tsv",
+            "indexes/structure_targets.tsv",
+            "indexes/mmseqs/mmseqs_target_databases.tsv",
+        ),
+    },
+    "plinder": {
+        "payloads": ("downloads/plinder/index",),
+        "derived": (
+            "indexes/plinder_targets.tsv",
+            "indexes/plinder_targets.manifest.json",
+            "indexes/structure_targets.tsv",
+        ),
+    },
+    "metagenome_potential": {
+        "payloads": ("downloads/metagenome/mgnify/mgy_clusters.fa.gz",),
+        "derived": (
+            "indexes/metagenome_targets.tsv",
+            "indexes/mmseqs/mmseqs_target_databases.tsv",
+        ),
+    },
+}
 RCSB_CAPACITY_REMOTE_SAMPLE_SIZE = 32
 RCSB_CAPACITY_AGGREGATE_MARGIN_NUMERATOR = 3
 RCSB_CAPACITY_AGGREGATE_MARGIN_DENOMINATOR = 2
@@ -4572,6 +4629,28 @@ def publish_chembl_query_database(
             "database": str(database),
         }
     if not archive_path.is_file() or archive_path.stat().st_size <= 0:
+        retained = source_retention_row(science_store, "chembl")
+        if (
+            retained.get("schema_version") == SOURCE_RETENTION_SCHEMA_VERSION
+            and retained.get("state") == "pruned"
+            and retained.get("source_local_path") == "downloads/chembl/chembl_sqlite.tar.gz"
+            and chembl_query_database_ready(
+                database,
+                manifest,
+                retained.get("source_manifest_sha256", ""),
+                retained.get("release_identity", ""),
+                summary_cache,
+            )
+        ):
+            return {
+                "status": "ready",
+                "reason": "chembl_query_database_reused_after_source_payload_pruned",
+                "database": str(database),
+                "table": "genoligand_onsite_activity",
+                "source_release": retained.get("release_identity", ""),
+                "source_digest": retained.get("source_manifest_sha256", ""),
+                "manifest": str(manifest),
+            }
         return {"status": "needs_repair", "reason": "chembl_archive_missing", "database": str(database)}
     source_summary = resource_payload_summary(archive_path, cache=summary_cache)
     source_digest = str(source_summary.get("sha256", ""))
@@ -4862,6 +4941,756 @@ def publish_chembl_query_database(
         shutil.rmtree(scratch_staging, ignore_errors=True)
 
 
+SOURCE_RETENTION_FIELDS = [
+    "schema_version",
+    "source_id",
+    "source_local_path",
+    "state",
+    "source_files",
+    "source_bytes",
+    "source_manifest_sha256",
+    "execution_sha256",
+    "release_identity",
+    "provenance",
+    "trust_source",
+    "payload_records_json",
+    "derived_paths",
+    "pruned_bytes",
+    "pruned_at",
+    "notes",
+]
+
+
+def source_retention_manifest_path(science_store: Path) -> Path:
+    return science_store / SOURCE_RETENTION_MANIFEST_REL_PATH
+
+
+def source_retention_rows(science_store: Path) -> list[dict[str, str]]:
+    return read_tsv(source_retention_manifest_path(science_store))
+
+
+def source_retention_row(science_store: Path, source_id: str) -> dict[str, str]:
+    return next(
+        (row for row in source_retention_rows(science_store) if row.get("source_id") == source_id),
+        {},
+    )
+
+
+def source_manifest_rows_by_id(science_store: Path) -> dict[str, dict[str, str]]:
+    return {
+        row.get("source_id", ""): row
+        for row in read_tsv(science_store / "manifests/source_file_manifest.tsv")
+        if row.get("source_id")
+    }
+
+
+def retention_payload_records(row: dict[str, str]) -> list[dict[str, object]]:
+    try:
+        value = json.loads(row.get("payload_records_json", "[]"))
+    except json.JSONDecodeError:
+        return []
+    return [item for item in value if isinstance(item, dict)] if isinstance(value, list) else []
+
+
+def retention_covers_source_path(science_store: Path, source_path: str) -> bool:
+    normalized = source_path.replace("\\", "/").strip("/").casefold()
+    if not normalized:
+        return False
+    for row in source_retention_rows(science_store):
+        if (
+            row.get("schema_version") != SOURCE_RETENTION_SCHEMA_VERSION
+            or row.get("state") not in {"pruned", "pruning", "cleanup_failed"}
+        ):
+            continue
+        for record in retention_payload_records(row):
+            payload = str(record.get("path", "")).replace("\\", "/").strip("/").casefold()
+            kind = str(record.get("kind", ""))
+            if normalized == payload or (kind == "directory" and normalized.startswith(f"{payload}/")):
+                return retention_source_identity_and_derivatives_ready(science_store, row)
+    return False
+
+
+def bindingdb_query_database_ready(
+    science_store: Path,
+    source_manifest: dict[str, str] | None = None,
+    execution_sha256: str = "",
+    summary_cache: ResourceSummaryCache | None = None,
+) -> bool:
+    database = science_store / "indexes/bindingdb/bindingdb_query.sqlite"
+    manifest = science_store / "indexes/bindingdb/bindingdb_query.manifest.json"
+    payload = read_json_object(manifest)
+    source = source_manifest or source_manifest_rows_by_id(science_store).get("bindingdb", {})
+    try:
+        database_summary = resource_payload_summary(database, cache=summary_cache)
+        return bool(
+            payload.get("schema_version") == "genoligand_bindingdb_query_database_v1"
+            and payload.get("status") == "ready"
+            and payload.get("table") == "genoligand_bindingdb_activity"
+            and type(payload.get("rows")) is int
+            and int(payload.get("rows", 0)) > 0
+            and type(payload.get("database_bytes")) is int
+            and int(payload.get("database_bytes", 0)) == int(database_summary.get("bytes", 0))
+            and payload.get("database_sha256") == database_summary.get("content_sha256")
+            and payload.get("source_digest") == source.get("sha256")
+            and payload.get("source_release") == source.get("release_identity")
+            and (
+                not execution_sha256
+                or payload.get("source_archive_sha256") == execution_sha256
+            )
+            and isinstance(payload.get("indexes"), list)
+            and {
+                "idx_bindingdb_activity_canonical_smiles",
+                "idx_bindingdb_activity_compact_smiles",
+            }.issubset(set(payload.get("indexes", [])))
+        )
+    except (OSError, TypeError, ValueError):
+        return False
+
+
+def indexed_source_derivatives_ready(
+    science_store: Path,
+    source_id: str,
+    source_manifest: dict[str, str],
+    payload_records: list[dict[str, object]],
+    derived_paths: tuple[str, ...] | list[str],
+    summary_cache: ResourceSummaryCache | None = None,
+) -> bool:
+    if (
+        source_manifest.get("status") != "ready"
+        or not re.fullmatch(r"[0-9a-f]{64}", source_manifest.get("sha256", "").lower())
+        or not source_manifest.get("release_identity")
+        or not source_manifest.get("trust_source")
+        or not derived_paths
+        or any(not path_has_payload(science_store / rel_path) for rel_path in derived_paths)
+    ):
+        return False
+    execution_sha256 = ""
+    if payload_records:
+        execution_sha256 = str(payload_records[0].get("content_sha256", ""))
+    if source_id == "chembl":
+        database = science_store / "downloads/chembl/chembl_query.sqlite"
+        return chembl_query_database_ready(
+            database,
+            database.with_suffix(".manifest.json"),
+            source_manifest.get("sha256", ""),
+            source_manifest.get("release_identity", ""),
+            summary_cache,
+        )
+    if source_id == "bindingdb":
+        return bindingdb_query_database_ready(
+            science_store,
+            source_manifest,
+            execution_sha256,
+            summary_cache,
+        )
+    mmseqs_namespaces = {
+        "uniprot_human_reviewed": ("UniProt", 1),
+        "biolip2": ("BioLiP2", 4),
+        "metagenome_potential": ("MGnify", 1),
+    }
+    if source_id in mmseqs_namespaces:
+        namespace, minimum = mmseqs_namespaces[source_id]
+        rows = [
+            row
+            for row in read_tsv(science_store / "indexes/mmseqs/mmseqs_target_databases.tsv")
+            if row.get("source_namespace") == namespace
+            and row.get("status") == "ready"
+            and row.get("manifest_schema_version") == ALIGNMENT_MANIFEST_SCHEMA_VERSION
+            and re.fullmatch(r"[0-9a-f]{64}", row.get("source_digest", "").lower())
+            and (
+                (db_path := resolve_manifest_path(science_store, row.get("db_path", ""))) is not None
+                and database_artifacts_present(db_path)
+            )
+        ]
+        if len(rows) < minimum:
+            return False
+    build_rows = read_tsv(science_store / "index_build_manifest.tsv")
+    if source_id == "binding_moad":
+        return any(
+            row.get("index") == "structure_targets"
+            and "binding_moad" in row.get("input_path", "").replace("\\", "/").lower()
+            and row.get("status") == "used"
+            for row in build_rows
+        )
+    if source_id == "biolip2":
+        return any(
+            row.get("index") == "structure_targets"
+            and "biolip2" in row.get("input_path", "").replace("\\", "/").lower()
+            and row.get("status") == "used"
+            for row in build_rows
+        )
+    if source_id == "plinder":
+        manifest = read_json_object(science_store / "indexes/plinder_targets.manifest.json")
+        canonical = manifest.get("canonical", {})
+        return bool(
+            manifest.get("status") == "ready"
+            and isinstance(canonical, dict)
+            and int(canonical.get("row_count", 0) or 0) > 0
+            and int(canonical.get("size_bytes", 0) or 0)
+            == (science_store / "indexes/plinder_targets.tsv").stat().st_size
+        )
+    return True
+
+
+def retention_source_identity_and_derivatives_ready(
+    science_store: Path,
+    row: dict[str, str],
+    summary_cache: ResourceSummaryCache | None = None,
+) -> bool:
+    if (
+        row.get("schema_version") != SOURCE_RETENTION_SCHEMA_VERSION
+        or not re.fullmatch(r"[0-9a-f]{64}", row.get("source_manifest_sha256", "").lower())
+    ):
+        return False
+    source_manifest = source_manifest_rows_by_id(science_store).get(row.get("source_id", ""), {})
+    if not (
+        source_manifest.get("status") == "ready"
+        and source_manifest.get("sha256") == row.get("source_manifest_sha256")
+        and source_manifest.get("release_identity") == row.get("release_identity")
+        and source_manifest.get("trust_source") == row.get("trust_source")
+    ):
+        return False
+    derived = [value for value in row.get("derived_paths", "").split(";") if value]
+    return indexed_source_derivatives_ready(
+        science_store,
+        row.get("source_id", ""),
+        source_manifest,
+        retention_payload_records(row),
+        derived,
+        summary_cache,
+    )
+
+
+def retained_source_derivatives_ready(
+    science_store: Path,
+    row: dict[str, str],
+    summary_cache: ResourceSummaryCache | None = None,
+) -> bool:
+    return row.get("state") == "pruned" and retention_source_identity_and_derivatives_ready(
+        science_store,
+        row,
+        summary_cache,
+    )
+
+
+def retained_source_ready(
+    science_store: Path,
+    source_id: str,
+    expected_local_path: str = "",
+    summary_cache: ResourceSummaryCache | None = None,
+    *,
+    expected_release_identity: str = "",
+    expected_trust_source: str = "",
+    expected_sha256: str = "",
+) -> dict[str, str]:
+    row = source_retention_row(science_store, source_id)
+    if expected_local_path and row.get("source_local_path", "").replace("\\", "/") != expected_local_path.replace("\\", "/"):
+        return {}
+    if expected_release_identity and row.get("release_identity", "") != expected_release_identity:
+        return {}
+    if expected_trust_source and row.get("trust_source", "") != expected_trust_source:
+        return {}
+    if expected_sha256 and row.get("execution_sha256", "").lower() != expected_sha256.lower():
+        return {}
+    if row.get("state") not in {"pruned", "pruning", "cleanup_failed"}:
+        return {}
+    return row if retention_source_identity_and_derivatives_ready(science_store, row, summary_cache) else {}
+
+
+def reconcile_interrupted_source_retention(
+    science_store: Path,
+    summary_cache: ResourceSummaryCache | None = None,
+) -> dict[str, object]:
+    rows = source_retention_rows(science_store)
+    changed = 0
+    for row in rows:
+        if row.get("state") not in {"pruning", "cleanup_failed"}:
+            continue
+        if not retention_source_identity_and_derivatives_ready(science_store, row, summary_cache):
+            continue
+        records = retention_payload_records(row)
+        if not records or any(
+            path_has_payload(science_store / str(record.get("path", ""))) for record in records
+        ):
+            continue
+        recorded_bytes = sum(int(record.get("bytes", 0) or 0) for record in records)
+        row["state"] = "pruned"
+        row["pruned_bytes"] = str(max(int(row.get("pruned_bytes", "0") or 0), recorded_bytes))
+        row["pruned_at"] = row.get("pruned_at", "") or str(int(time.time()))
+        row["notes"] = "reconciled_after_source_payload_cleanup"
+        changed += 1
+    if changed:
+        write_source_retention_rows(science_store, rows)
+        update_source_storage_states(
+            science_store,
+            {
+                row.get("source_id", ""): "indexed_source_pruned"
+                for row in rows
+                if row.get("state") == "pruned"
+            },
+        )
+    return {"status": "ready", "reconciled": changed}
+
+
+def write_source_retention_rows(science_store: Path, rows: list[dict[str, str]]) -> None:
+    write_simple_tsv(
+        source_retention_manifest_path(science_store),
+        SOURCE_RETENTION_FIELDS,
+        sorted(rows, key=lambda row: row.get("source_id", "")),
+    )
+
+
+def safe_remove_indexed_payload(science_store: Path, relative: str) -> int:
+    store_root = science_store.resolve()
+    downloads_root = (science_store / "downloads").resolve()
+    target = science_store / relative
+    resolved = target.resolve()
+    try:
+        resolved.relative_to(downloads_root)
+        resolved.relative_to(store_root)
+    except ValueError as err:
+        raise OSError(f"source_retention_path_outside_downloads:{relative}") from err
+    if resolved == downloads_root or target.is_symlink():
+        raise OSError(f"source_retention_path_unsafe:{relative}")
+    if target.is_dir() and any(child.is_symlink() for child in target.rglob("*")):
+        raise OSError(f"source_retention_symlink_rejected:{relative}")
+    reclaimed = directory_size(target)
+    if target.is_dir():
+        shutil.rmtree(target)
+    elif target.exists():
+        target.unlink()
+    return reclaimed
+
+
+def update_source_storage_states(science_store: Path, states: dict[str, str]) -> None:
+    manifest = science_store / "manifests/source_file_manifest.tsv"
+    rows = read_tsv(manifest)
+    fields = [
+        "source_id",
+        "source_label",
+        "source_class",
+        "local_path",
+        "status",
+        "storage_state",
+        "file_count",
+        "bytes",
+        "sha256",
+        "provenance",
+        "release_identity",
+        "trust_source",
+    ]
+    for row in rows:
+        row["storage_state"] = states.get(row.get("source_id", ""), row.get("storage_state", "materialized"))
+    write_simple_tsv(manifest, fields, rows)
+
+
+def prune_indexed_source_payloads(
+    science_store: Path,
+    summary_cache: ResourceSummaryCache | None = None,
+) -> dict[str, object]:
+    source_rows = source_manifest_rows_by_id(science_store)
+    previous = {row.get("source_id", ""): row for row in source_retention_rows(science_store)}
+    download_rows = {
+        row.get("source_id", ""): row
+        for row in read_tsv(science_store / "download_execution_manifest.tsv")
+    }
+    external_rows = {
+        row.get("source_id", ""): row
+        for row in read_tsv(science_store / "external_sync_execution_manifest.tsv")
+    }
+    prepared: list[dict[str, str]] = []
+    preserved = [
+        dict(row)
+        for source_id, row in previous.items()
+        if source_id not in INDEXED_SOURCE_RETENTION_POLICIES
+    ]
+    failures: list[str] = []
+    for source_id, policy in INDEXED_SOURCE_RETENTION_POLICIES.items():
+        old = previous.get(source_id, {})
+        if retained_source_derivatives_ready(science_store, old, summary_cache):
+            prepared.append(dict(old))
+            continue
+        if old.get("state") in {"pruning", "cleanup_failed"} and retention_source_identity_and_derivatives_ready(
+            science_store,
+            old,
+            summary_cache,
+        ):
+            resumed = dict(old)
+            resumed["state"] = "pruning"
+            resumed["notes"] = "resuming_verified_source_cleanup"
+            prepared.append(resumed)
+            continue
+        source_manifest = source_rows.get(source_id, {})
+        payload_records: list[dict[str, object]] = []
+        for relative in policy["payloads"]:
+            path = science_store / str(relative)
+            if not path_has_payload(path):
+                failures.append(f"{source_id}:source_payload_missing:{relative}")
+                continue
+            summary = resource_payload_summary(path, cache=summary_cache)
+            payload_records.append(
+                {
+                    "path": str(relative).replace("\\", "/"),
+                    "kind": "directory" if path.is_dir() else "file",
+                    "file_count": int(summary.get("file_count", 0) or 0),
+                    "bytes": int(summary.get("bytes", 0) or 0),
+                    "sha256": str(summary.get("sha256", "")),
+                    "content_sha256": str(summary.get("content_sha256", "")),
+                }
+            )
+        derived = tuple(str(value) for value in policy["derived"])
+        if len(payload_records) != len(policy["payloads"]):
+            continue
+        if not indexed_source_derivatives_ready(
+            science_store,
+            source_id,
+            source_manifest,
+            payload_records,
+            derived,
+            summary_cache,
+        ):
+            failures.append(f"{source_id}:derived_index_not_ready")
+            continue
+        execution = download_rows.get(source_id) or external_rows.get(source_id) or {}
+        prepared.append(
+            {
+                "schema_version": SOURCE_RETENTION_SCHEMA_VERSION,
+                "source_id": source_id,
+                "source_local_path": source_manifest.get("local_path", ""),
+                "state": "pruning",
+                "source_files": source_manifest.get("file_count", "0"),
+                "source_bytes": source_manifest.get("bytes", "0"),
+                "source_manifest_sha256": source_manifest.get("sha256", ""),
+                "execution_sha256": execution.get("sha256", ""),
+                "release_identity": source_manifest.get("release_identity", ""),
+                "provenance": source_manifest.get("provenance", ""),
+                "trust_source": source_manifest.get("trust_source", ""),
+                "payload_records_json": json.dumps(payload_records, ensure_ascii=True, separators=(",", ":")),
+                "derived_paths": ";".join(derived),
+                "pruned_bytes": "0",
+                "pruned_at": "",
+                "notes": "validated_indexes_pending_source_cleanup",
+            }
+        )
+    if failures or len(prepared) != len(INDEXED_SOURCE_RETENTION_POLICIES):
+        return {
+            "status": "needs_repair",
+            "ready": len(prepared),
+            "total": len(INDEXED_SOURCE_RETENTION_POLICIES),
+            "reclaimed_bytes": 0,
+            "failures": failures,
+        }
+    def persist_prepared() -> None:
+        write_source_retention_rows(science_store, [*prepared, *preserved])
+
+    persist_prepared()
+    reclaimed_total = 0
+    for row in prepared:
+        if row.get("state") == "pruned":
+            continue
+        reclaimed = 0
+        try:
+            for record in retention_payload_records(row):
+                relative = str(record.get("path", ""))
+                reclaimed += safe_remove_indexed_payload(science_store, relative)
+                if summary_cache is not None:
+                    prefix = str((science_store / relative).resolve()).casefold()
+                    for key in [key for key in summary_cache if key.casefold() == prefix or key.casefold().startswith(f"{prefix}{os.sep}")]:
+                        summary_cache.pop(key, None)
+        except OSError as err:
+            row["state"] = "cleanup_failed"
+            row["notes"] = exception_note(err)
+            persist_prepared()
+            return {
+                "status": "needs_repair",
+                "ready": sum(item.get("state") == "pruned" for item in prepared),
+                "total": len(prepared),
+                "reclaimed_bytes": reclaimed_total,
+                "failures": [f"{row.get('source_id')}:{exception_note(err)}"],
+            }
+        reclaimed_total += reclaimed
+        row["state"] = "pruned"
+        row["pruned_bytes"] = str(reclaimed)
+        row["pruned_at"] = str(int(time.time()))
+        row["notes"] = "source_payload_removed_after_verified_index_publish"
+        persist_prepared()
+    states = {row["source_id"]: "indexed_source_pruned" for row in prepared}
+    update_source_storage_states(science_store, states)
+    valid = all(retained_source_derivatives_ready(science_store, row, summary_cache) for row in prepared)
+    return {
+        "status": "ready" if valid else "needs_repair",
+        "ready": sum(row.get("state") == "pruned" for row in prepared),
+        "total": len(prepared),
+        "reclaimed_bytes": reclaimed_total,
+        "manifest": str(source_retention_manifest_path(science_store)),
+        "failures": [] if valid else ["retained_derivative_validation_failed"],
+    }
+
+
+def rcsb_cache_usage(cache_root: Path) -> tuple[int, int]:
+    files = 0
+    bytes_total = 0
+    if not cache_root.is_dir():
+        return files, bytes_total
+    for path in cache_root.rglob("*.cif.gz"):
+        if not path.is_file() or path.is_symlink():
+            continue
+        try:
+            size = path.stat().st_size
+        except OSError:
+            continue
+        if size > 0:
+            files += 1
+            bytes_total += size
+    return files, bytes_total
+
+
+def prune_rcsb_on_demand_cache(
+    science_store: Path,
+    summary_cache: ResourceSummaryCache | None = None,
+) -> dict[str, object]:
+    policy_path = science_store / "downloads/rcsb/on_demand_policy.json"
+    policy = read_json_object(policy_path)
+    if policy.get("mode") != "on_demand":
+        return {"status": "ready", "reclaimed_bytes": 0, "reason": "rcsb_complete_mode_retained"}
+    cache_root = science_store / "downloads/rcsb/mmcif"
+    if not cache_root.is_dir():
+        return {"status": "needs_repair", "reclaimed_bytes": 0, "reason": "rcsb_cache_missing"}
+    files: list[tuple[Path, int, int]] = []
+    for path in cache_root.rglob("*.cif.gz"):
+        if not path.is_file() or path.is_symlink():
+            continue
+        stat = path.stat()
+        if stat.st_size > 0:
+            files.append((path, stat.st_size, stat.st_mtime_ns))
+    if not files:
+        return {"status": "needs_repair", "reclaimed_bytes": 0, "reason": "rcsb_cache_empty"}
+    files.sort(key=lambda item: (item[2], item[0].as_posix()), reverse=True)
+    retained: set[Path] = set()
+    retained_bytes = 0
+    install_cache_files = min(RCSB_ON_DEMAND_INITIAL_CACHE_FILES, RCSB_ON_DEMAND_MAX_CACHE_FILES)
+    for path, size, _mtime in files:
+        if len(retained) >= install_cache_files:
+            continue
+        if retained and retained_bytes + size > RCSB_ON_DEMAND_MAX_CACHE_BYTES:
+            continue
+        retained.add(path)
+        retained_bytes += size
+    removed_bytes = 0
+    cache_resolved = cache_root.resolve()
+    for path, size, _mtime in files:
+        if path in retained:
+            continue
+        try:
+            path.resolve().relative_to(cache_resolved)
+        except ValueError as err:
+            return {
+                "status": "needs_repair",
+                "reclaimed_bytes": removed_bytes,
+                "reason": f"rcsb_cache_path_outside_root:{exception_note(err)}",
+            }
+        path.unlink()
+        removed_bytes += size
+    for directory in sorted(
+        (path for path in cache_root.rglob("*") if path.is_dir()),
+        key=lambda path: len(path.parts),
+        reverse=True,
+    ):
+        try:
+            directory.rmdir()
+        except OSError:
+            pass
+    if summary_cache is not None:
+        prefix = str(cache_resolved).casefold()
+        for key in [key for key in summary_cache if key.casefold() == prefix or key.casefold().startswith(f"{prefix}{os.sep}")]:
+            summary_cache.pop(key, None)
+    scope = ligand_bound_pdb_scope(science_store)
+    if not scope:
+        return {
+            "status": "needs_repair",
+            "reclaimed_bytes": removed_bytes,
+            "reason": "rcsb_scope_missing_after_cache_prune",
+        }
+    snapshot = write_rcsb_scope_manifest(
+        science_store,
+        cache_root,
+        scope,
+        summary_cache,
+        scope_mode="on-demand",
+    )
+    write_rcsb_on_demand_policy(science_store, snapshot)
+    foldseek_manifest = science_store / "indexes/foldseek/foldseek_target_databases.tsv"
+    foldseek_rows = read_tsv(foldseek_manifest)
+    cached_ids = {
+        row.get("pdb_id", "").upper()
+        for row in read_tsv(science_store / "downloads/rcsb/ligand_bound_pdb_scope.tsv")
+        if row.get("status") == "ready"
+    }
+    for row in foldseek_rows:
+        if row.get("source_id") != "rcsb_mmcif" or row.get("status") != "ready":
+            continue
+        validated_manifest = resolve_manifest_path(
+            science_store, row.get("indexed_validated_ids_manifest", "")
+        )
+        indexed_ids = (
+            {
+                item.get("pdb_id", "").upper()
+                for item in read_tsv(validated_manifest)
+                if item.get("pdb_id")
+            }
+            if validated_manifest is not None
+            else set()
+        )
+        row.update(
+            {
+                "scope_digest": str(snapshot["scope_digest"]),
+                "scope_coordinate_digest": str(snapshot["coordinate_digest"]),
+                "scope_count": str(snapshot["scope_count"]),
+                "scope_ready_count": str(snapshot["ready_count"]),
+                "scope_missing_count": str(snapshot["missing_count"]),
+                "scope_coverage": f"{row.get('indexed_pdb_count', 0)}/{snapshot['scope_count']}",
+                "refresh_needed": str(bool(cached_ids - indexed_ids)).lower(),
+            }
+        )
+    if foldseek_rows:
+        write_simple_tsv(foldseek_manifest, list(foldseek_rows[0]), foldseek_rows)
+    execution_manifest = science_store / "external_sync_execution_manifest.tsv"
+    execution_rows = read_tsv(execution_manifest)
+    execution_fields = [
+        "source_id",
+        "source_label",
+        "target_rel_path",
+        "status",
+        "bytes",
+        "sha256",
+        "plan_digest",
+        "release_identity",
+        "trust_source",
+        "scope_mode",
+        "scope_digest",
+        "scope_ready_count",
+        "scope_count",
+        "scope_missing_count",
+        "notes",
+    ]
+    updated_execution = False
+    for row in execution_rows:
+        if row.get("source_id") != "rcsb_ligand_bound":
+            continue
+        row.update(
+            {
+                "status": "ready",
+                "bytes": str(snapshot["coordinate_bytes"]),
+                "sha256": str(snapshot["coordinate_digest"]),
+                "scope_mode": str(snapshot["scope_mode"]),
+                "scope_digest": str(snapshot["scope_digest"]),
+                "scope_ready_count": str(snapshot["ready_count"]),
+                "scope_count": str(snapshot["scope_count"]),
+                "scope_missing_count": str(snapshot["missing_count"]),
+                "notes": "bounded_on_demand_coordinate_cache",
+            }
+        )
+        updated_execution = True
+    if not updated_execution:
+        return {
+            "status": "needs_repair",
+            "reclaimed_bytes": removed_bytes,
+            "reason": "rcsb_external_execution_row_missing",
+        }
+    write_simple_tsv(execution_manifest, execution_fields, execution_rows)
+    source_manifest = science_store / "manifests/source_file_manifest.tsv"
+    source_rows = read_tsv(source_manifest)
+    source_summary = resource_payload_summary(cache_root, cache=summary_cache)
+    source_fields = [
+        "source_id",
+        "source_label",
+        "source_class",
+        "local_path",
+        "status",
+        "storage_state",
+        "file_count",
+        "bytes",
+        "sha256",
+        "provenance",
+        "release_identity",
+        "trust_source",
+    ]
+    rcsb_source: dict[str, str] = {}
+    for row in source_rows:
+        if row.get("source_id") == "rcsb_ligand_bound":
+            row.update(
+                {
+                    "status": "ready",
+                    "storage_state": "bounded_runtime_cache",
+                    "file_count": str(source_summary.get("file_count", 0)),
+                    "bytes": str(source_summary.get("bytes", 0)),
+                    "sha256": str(source_summary.get("sha256", "")),
+                }
+            )
+            rcsb_source = row
+    if not rcsb_source:
+        return {
+            "status": "needs_repair",
+            "reclaimed_bytes": removed_bytes,
+            "reason": "rcsb_source_manifest_row_missing",
+        }
+    write_simple_tsv(source_manifest, source_fields, source_rows)
+    hash_manifest = science_store / "manifests/hash_manifest.tsv"
+    hash_rows = read_tsv(hash_manifest)
+    for row in hash_rows:
+        if row.get("source_id") == "rcsb_ligand_bound":
+            row.update(
+                {
+                    "status": "ready",
+                    "bytes": str(source_summary.get("bytes", 0)),
+                    "sha256": str(source_summary.get("sha256", "")),
+                }
+            )
+    write_simple_tsv(
+        hash_manifest,
+        ["source_id", "local_path", "status", "bytes", "sha256"],
+        hash_rows,
+    )
+    retention_rows = [
+        row for row in source_retention_rows(science_store) if row.get("source_id") != "rcsb_ligand_bound"
+    ]
+    retention_rows.append(
+        {
+            "schema_version": SOURCE_RETENTION_SCHEMA_VERSION,
+            "source_id": "rcsb_ligand_bound",
+            "source_local_path": "downloads/rcsb/mmcif",
+            "state": "runtime_cache_bounded",
+            "source_files": str(source_summary.get("file_count", 0)),
+            "source_bytes": str(source_summary.get("bytes", 0)),
+            "source_manifest_sha256": str(source_summary.get("sha256", "")),
+            "execution_sha256": str(snapshot["coordinate_digest"]),
+            "release_identity": rcsb_source.get("release_identity", ""),
+            "provenance": rcsb_source.get("provenance", ""),
+            "trust_source": rcsb_source.get("trust_source", ""),
+            "payload_records_json": "[]",
+            "derived_paths": ";".join(
+                [
+                    "indexes/foldseek/foldseek_target_databases.tsv",
+                    "indexes/structure_targets.tsv",
+                    "downloads/rcsb/on_demand_policy.json",
+                ]
+            ),
+            "pruned_bytes": str(removed_bytes),
+            "pruned_at": str(int(time.time())),
+            "notes": "runtime_coordinate_cache_bounded_after_index_publish",
+        }
+    )
+    write_source_retention_rows(science_store, retention_rows)
+    return {
+        "status": "ready",
+        "reclaimed_bytes": removed_bytes,
+        "cached_files": int(source_summary.get("file_count", 0)),
+        "cached_bytes": int(source_summary.get("bytes", 0)),
+        "max_cache_files": RCSB_ON_DEMAND_MAX_CACHE_FILES,
+        "max_cache_bytes": RCSB_ON_DEMAND_MAX_CACHE_BYTES,
+    }
+
+
 def prepare_downloads(
     catalog: Path,
     science_store: Path,
@@ -4995,6 +5824,48 @@ def prepare_downloads(
                         "release_identity": release_identity,
                         "trust_source": trust_source,
                         "notes": "source_identity_and_domain_validation_required",
+                    }
+                )
+                continue
+            retained = retained_source_ready(
+                science_store,
+                source_id,
+                local_path,
+                summary_cache,
+                expected_release_identity=release_identity,
+                expected_trust_source=trust_source,
+                expected_sha256=expected or "",
+            )
+            if retained:
+                ready += 1
+                retained_sha256 = retained.get("execution_sha256", "") or expected or ""
+                retained_bytes = retained.get("source_bytes", "0")
+                writer.writerow(
+                    {
+                        "source_id": source_id,
+                        "url": url,
+                        "local_path": local_path,
+                        "status": "ready",
+                        "bytes": retained_bytes,
+                        "sha256": retained_sha256,
+                        "expected_sha256": expected or "",
+                        "observed_bytes": retained_bytes,
+                        "observed_sha256": retained_sha256,
+                        "source_version": source_version,
+                        "release_identity": release_identity,
+                        "trust_source": trust_source,
+                        "validation_schema": previous.get(
+                            "validation_schema", SOURCE_PAYLOAD_VALIDATION_SCHEMA_VERSION
+                        ),
+                        "validated_records": previous.get("validated_records", "1"),
+                        "validation_reason": previous.get(
+                            "validation_reason", "domain_schema_and_records_valid"
+                        ),
+                        "resource_identity": previous.get("resource_identity", "indexed_source_pruned"),
+                        "etag": previous.get("etag", ""),
+                        "content_length": previous.get("content_length", retained_bytes),
+                        "completed_at": str(int(time.time())),
+                        "notes": "verified_index_reused_source_payload_remains_pruned",
                     }
                 )
                 continue
@@ -5878,6 +6749,51 @@ def sync_rcsb_ligand_bound_scope(
         resumable_partials, obsolete_partials = rcsb_partial_download_inventory(target)
         for partial in obsolete_partials:
             quarantine_partial(partial)
+        existing_ready = any(
+            valid_rcsb_coordinate(
+                target / pdb_id[1:3].lower() / f"{pdb_id.lower()}.cif.gz",
+                pdb_id,
+            )
+            for pdb_id in sorted(pdb_ids)
+        )
+        seeded = 0
+        seed_failures: list[str] = []
+        if not existing_ready:
+            template = row.get("source_url") or "https://files.rcsb.org/download/{pdb_id}.cif.gz"
+            seed_ids = sorted(pdb_ids)[:RCSB_ON_DEMAND_INITIAL_CACHE_FILES]
+
+            def seed_one(pdb_id: str) -> tuple[str, bool, str]:
+                destination = target / pdb_id[1:3].lower() / f"{pdb_id.lower()}.cif.gz"
+                url = template.replace("{pdb_id}", pdb_id).replace("{pdb_id_lower}", pdb_id.lower())
+                try:
+                    result = copy_or_download(
+                        url,
+                        destination,
+                        None,
+                        validator=lambda path, expected=pdb_id: rcsb_coordinate_validation(path, expected),
+                        summary_cache=summary_cache,
+                    )
+                    return pdb_id, result.get("status") == "ready", str(result.get("status", "unknown"))
+                except Exception as err:  # noqa: BLE001 - retain per-coordinate seed diagnostics
+                    return pdb_id, False, exception_note(err)
+
+            workers = min(
+                max(1, int(os.environ.get("GENOLIGAND_RCSB_DOWNLOAD_WORKERS", str(RCSB_DOWNLOAD_WORKERS)))),
+                len(seed_ids),
+            )
+            with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as pool:
+                for completed_seed, (pdb_id, ready, note) in enumerate(pool.map(seed_one, seed_ids), start=1):
+                    if ready:
+                        seeded += 1
+                    else:
+                        seed_failures.append(f"{pdb_id}:{note}")
+                    if progress and (completed_seed == 1 or completed_seed % 25 == 0):
+                        progress(
+                            "downloading",
+                            completed_seed,
+                            len(seed_ids),
+                            f"正在准备按需结构缓存 {completed_seed}/{len(seed_ids)}",
+                        )
         snapshot = write_rcsb_scope_manifest(
             science_store,
             target,
@@ -5907,7 +6823,7 @@ def sync_rcsb_ligand_bound_scope(
             "notes": (
                 "partial_on_demand:"
                 f"ready={snapshot['ready_count']};total={snapshot['scope_count']};"
-                f"missing={snapshot['missing_count']}"
+                f"missing={snapshot['missing_count']};seeded={seeded};seed_failures={len(seed_failures)}"
                 if status == "ready"
                 else "on_demand_coordinate_cache_empty"
             ),
@@ -6202,6 +7118,8 @@ def write_rcsb_on_demand_policy(
             "coordinate_template": "https://files.rcsb.org/download/{pdb_id}.cif.gz",
             "cache_root": "downloads/rcsb/mmcif",
             "max_fetches_per_run": 12,
+            "max_cache_bytes": RCSB_ON_DEMAND_MAX_CACHE_BYTES,
+            "max_cache_files": RCSB_ON_DEMAND_MAX_CACHE_FILES,
             "validation": "gzip_mmcif_entry_and_atom_site",
             "cached_ready_count": int(snapshot.get("ready_count", 0) or 0),
             "scope_count": int(snapshot.get("scope_count", 0) or 0),
@@ -6321,6 +7239,8 @@ def rcsb_scope_snapshot_validation(
             and policy.get("coordinate_template") == "https://files.rcsb.org/download/{pdb_id}.cif.gz"
             and policy.get("cache_root") == "downloads/rcsb/mmcif"
             and policy.get("max_fetches_per_run") == 12
+            and policy.get("max_cache_bytes") == RCSB_ON_DEMAND_MAX_CACHE_BYTES
+            and policy.get("max_cache_files") == RCSB_ON_DEMAND_MAX_CACHE_FILES
             and policy.get("validation") == "gzip_mmcif_entry_and_atom_site"
             and policy.get("cached_ready_count") == ready_count
             and policy.get("scope_count") == scope_count
@@ -6590,6 +7510,16 @@ def external_plan_row_ready(
         or execution.get("trust_source", "") != row.get("trust_source", "")
     ):
         return False
+    retained = retained_source_ready(
+        science_store,
+        row.get("source_id", ""),
+        row.get("target_rel_path", ""),
+        summary_cache,
+        expected_release_identity=row.get("release_or_date", ""),
+        expected_trust_source=row.get("trust_source", ""),
+    )
+    if retained:
+        return True
     if not marker or not path_has_payload(marker):
         return False
     if (row.get("sync_method") or "direct").strip().lower() == "rcsb_ligand_bound_scope":
@@ -6717,9 +7647,18 @@ def sync_external_sources(
                 rcsb_mode=rcsb_mode,
             )
             if marker_ready:
+                retained = retained_source_ready(science_store, source_id, target_rel, summary_cache)
                 evidence = external_evidence_path(row, target, marker)
-                evidence_bytes = directory_size(evidence) if evidence else 0
-                evidence_sha256 = external_evidence_digest(row, evidence, summary_cache) if evidence else ""
+                evidence_bytes = (
+                    int(retained.get("source_bytes", "0") or 0)
+                    if retained
+                    else directory_size(evidence) if evidence else 0
+                )
+                evidence_sha256 = (
+                    retained.get("execution_sha256", "")
+                    if retained
+                    else external_evidence_digest(row, evidence, summary_cache) if evidence else ""
+                )
                 snapshot = (
                     read_json_object(science_store / "downloads/rcsb/ligand_bound_pdb_scope.json")
                     if method == "rcsb_ligand_bound_scope"
@@ -6755,6 +7694,9 @@ def sync_external_sources(
                         "scope_count": str(snapshot.get("scope_count", "")),
                         "scope_missing_count": str(snapshot.get("missing_count", "")),
                         "notes": (
+                            "verified_index_reused_source_payload_remains_pruned"
+                            if retained
+                            else
                             "partial_on_demand_previous_success_digest_matched"
                             if snapshot.get("scope_mode") == "on_demand"
                             else "previous_success_digest_matched"
@@ -7200,6 +8142,24 @@ def build_mmseqs_target_databases(
                 "notes": notes,
             }
         )
+    current_ids = {row.get("source_id", "") for row in rows}
+    for source_id, previous in previous_rows.items():
+        if source_id in current_ids or not retention_covers_source_path(
+            science_store, previous.get("source_path", "")
+        ):
+            continue
+        db_path = resolve_manifest_path(science_store, previous.get("db_path", ""))
+        if not (
+            previous.get("status") == "ready"
+            and previous.get("manifest_schema_version") == ALIGNMENT_MANIFEST_SCHEMA_VERSION
+            and previous.get("builder_version") == builder_version
+            and db_path is not None
+            and database_prefix_ready("mmseqs", db_path, command, env, wsl_distro)
+        ):
+            continue
+        carried = dict(previous)
+        carried["notes"] = "verified_index_reused_after_source_payload_pruned"
+        rows.append(carried)
     write_simple_tsv(
         manifest,
         [
@@ -7448,21 +8408,6 @@ def foldseek_partial_manifest_validation(
         scope_rows = rcsb_scope_rows_for_ids(science_store, set(indexed_by_id))
         if set(scope_rows) != set(indexed_by_id):
             return {"status": "failed", "reason": "foldseek_partial_scope_binding_missing"}
-        for pdb_id, indexed in indexed_by_id.items():
-            scope = scope_rows[pdb_id]
-            coordinate = science_store / indexed["coordinate_rel_path"]
-            actual_sha256 = sha256_file(coordinate) if coordinate.is_file() else ""
-            if (
-                scope.get("status") != "ready"
-                or scope.get("coordinate_rel_path") != indexed.get("coordinate_rel_path")
-                or scope.get("size_bytes") != indexed.get("size_bytes")
-                or scope.get("sha256", "").lower() != indexed.get("sha256", "").lower()
-                or not coordinate.is_file()
-                or coordinate.stat().st_size != int(indexed["size_bytes"])
-                or actual_sha256 != indexed.get("sha256", "").lower()
-                or actual_sha256 != scope.get("sha256", "").lower()
-            ):
-                return {"status": "failed", "reason": f"foldseek_partial_coordinate_binding_invalid:{pdb_id}"}
         indexed_entries = int(mapping["indexed_entries"])
         indexed_pdb_count = len(indexed_by_id)
         subset_digest = foldseek_subset_digest(
@@ -7490,7 +8435,11 @@ def foldseek_partial_manifest_validation(
             return {"status": "failed", "reason": "foldseek_partial_manifest_binding_mismatch"}
         if probe_database and not database_prefix_ready("foldseek", db_path, command, env, wsl_distro):
             return {"status": "failed", "reason": "foldseek_partial_database_smoke_failed"}
-        cached_ready_count = int(snapshot.get("ready_count", 0) or 0)
+        cached_ids = {
+            row.get("pdb_id", "").upper()
+            for row in read_tsv(science_store / "downloads/rcsb/ligand_bound_pdb_scope.tsv")
+            if row.get("status") == "ready"
+        }
         return {
             "status": "ready",
             "reason": "foldseek_partial_manifest_and_database_validated",
@@ -7502,7 +8451,7 @@ def foldseek_partial_manifest_validation(
             "indexed_pdb_count": indexed_pdb_count,
             "indexed_entries": indexed_entries,
             "indexed_coordinate_bytes": coordinate_bytes,
-            "refresh_needed": cached_ready_count > indexed_pdb_count,
+            "refresh_needed": bool(cached_ids - set(indexed_by_id)),
         }
     except (OSError, UnicodeError, ValueError) as err:
         return {"status": "failed", "reason": f"foldseek_partial_validation_failed:{exception_note(err)}"}
@@ -9071,6 +10020,7 @@ def write_science_resource_manifests(
         for row in read_tsv(science_store / "external_sync_execution_manifest.tsv")
         if row.get("source_id")
     }
+    previous_source_rows = source_manifest_rows_by_id(science_store)
     source_rows: list[dict[str, str]] = []
     for row in read_tsv(source_catalog):
         execution = download_executions.get(row.get("source_id", ""), {})
@@ -9133,6 +10083,7 @@ def write_science_resource_manifests(
                 "source_class",
                 "local_path",
                 "status",
+                "storage_state",
                 "file_count",
                 "bytes",
                 "sha256",
@@ -9172,12 +10123,33 @@ def write_science_resource_manifests(
                 if progress:
                     progress(source_id, bytes_done, bytes_total, f"{message} ({index}/{total_sources})")
 
-            summary = resource_payload_summary(local_path, source_progress, cache=summary_cache)
-            file_count_value = int(summary["file_count"])
-            bytes_count = int(summary["bytes"])
-            digest = str(summary["sha256"])
-            exists = file_count_value > 0 and bytes_count > 0
-            evidence_digest = str(summary.get("content_sha256", "")) if local_path.is_file() else digest
+            retained = retained_source_ready(
+                science_store,
+                source_id,
+                local_rel,
+                summary_cache,
+                expected_release_identity=row.get("release_identity", ""),
+                expected_trust_source=row.get("trust_source", ""),
+                expected_sha256=row.get("sha256", ""),
+            )
+            if retained:
+                previous_source = previous_source_rows.get(source_id, {})
+                file_count_value = int(retained.get("source_files", "0") or 0)
+                bytes_count = int(retained.get("source_bytes", "0") or 0)
+                digest = retained.get("source_manifest_sha256", "")
+                exists = file_count_value > 0 and bytes_count > 0 and bool(digest)
+                evidence_digest = retained.get("execution_sha256", "")
+                storage_state = "indexed_source_pruned"
+                if not row["provenance"]:
+                    row["provenance"] = previous_source.get("provenance", "")
+            else:
+                summary = resource_payload_summary(local_path, source_progress, cache=summary_cache)
+                file_count_value = int(summary["file_count"])
+                bytes_count = int(summary["bytes"])
+                digest = str(summary["sha256"])
+                exists = file_count_value > 0 and bytes_count > 0
+                evidence_digest = str(summary.get("content_sha256", "")) if local_path.is_file() else digest
+                storage_state = "materialized"
             rcsb_validation = (
                 rcsb_scope_snapshot_validation(
                     science_store,
@@ -9225,6 +10197,7 @@ def write_science_resource_manifests(
                 "source_class": row["source_class"],
                 "local_path": local_rel,
                 "status": status,
+                "storage_state": storage_state,
                 "file_count": str(file_count_value),
                 "bytes": str(bytes_count),
                 "sha256": digest,
@@ -9478,6 +10451,18 @@ def prepare_plinder_canonical_index(
 ) -> dict[str, object]:
     source = plinder_parquet_source(science_store)
     if source is None:
+        retained = retained_source_ready(science_store, "plinder", "downloads/plinder/index")
+        if retained:
+            manifest = science_store / "indexes" / "plinder_targets.manifest.json"
+            payload = read_json_object(manifest)
+            canonical = payload.get("canonical", {})
+            return {
+                "status": "ready",
+                "rebuilt": False,
+                "reason": "plinder_canonical_reused_after_source_payload_pruned",
+                "rows": canonical.get("row_count", 0) if isinstance(canonical, dict) else 0,
+                "manifest": str(manifest),
+            }
         return {"status": "not_applicable", "rebuilt": False, "reason": "plinder_source_absent"}
     canonical = science_store / "indexes" / "plinder_targets.tsv"
     manifest = science_store / "indexes" / "plinder_targets.manifest.json"
@@ -9578,6 +10563,16 @@ def alignment_database_manifests_ready(
                 if validation.get("status") != "ready":
                     return False
                 continue
+            if not path_has_payload(source) and retention_covers_source_path(
+                science_store, row.get("source_path", "")
+            ):
+                if (
+                    row.get("builder_version") != builder_version
+                    or not re.fullmatch(r"[0-9a-f]{64}", row.get("source_digest", "").lower())
+                    or not database_prefix_ready(tool, db_path, command, env, wsl_distro)
+                ):
+                    return False
+                continue
             source_summary = resource_payload_summary(source, cache=summary_cache)
             if not alignment_source_manifest_matches(row, source_summary, builder_version):
                 return False
@@ -9651,9 +10646,16 @@ def authoritative_metagenome_mmseqs_databases(
             db_path = resolve_manifest_path(science_store, db_path_text)
             if source is None or db_path is None:
                 continue
-            source_summary = resource_payload_summary(source, cache=summary_cache)
-            if not alignment_source_manifest_matches(row, source_summary, builder_version):
-                continue
+            if not path_has_payload(source) and retention_covers_source_path(science_store, source_path):
+                if (
+                    row.get("builder_version") != builder_version
+                    or not re.fullmatch(r"[0-9a-f]{64}", source_digest)
+                ):
+                    continue
+            else:
+                source_summary = resource_payload_summary(source, cache=summary_cache)
+                if not alignment_source_manifest_matches(row, source_summary, builder_version):
+                    continue
             if database_prefix_ready("mmseqs", db_path, command, env, wsl_distro):
                 validated.add((input_path, output_path, source_digest))
                 break
@@ -9885,6 +10887,8 @@ def evaluate_installer_science_store_readiness(
     summary_cache: ResourceSummaryCache | None = None,
     env: dict[str, str] | None = None,
     wsl_distro: str | None = None,
+    check_install_status: bool = True,
+    check_source_retention: bool = True,
 ) -> dict[str, object]:
     blockers: list[dict[str, str]] = []
     advisories: list[dict[str, str]] = []
@@ -10047,26 +11051,86 @@ def evaluate_installer_science_store_readiness(
             "reconcile_chembl_query_transaction",
         )
 
-    status_payload = load_json(science_store / "install_status.json")
-    status_progress = status_payload.get("progress")
-    canonical_ready = status_payload.get("status") == "ready"
-    canonical_final_status = bool(
-        status_payload.get("status") in {"ready", "needs_repair"}
-        and isinstance(status_payload.get("install_ready"), bool)
-        and canonical_ready == status_payload.get("install_ready")
-        and isinstance(status_progress, dict)
-        and status_progress.get("status") == ("ready" if canonical_ready else "needs_repair")
-    )
-    missing = status_payload.get("missing_components")
-    if not canonical_final_status and (
-        status_payload.get("status") != "ready" or (isinstance(missing, list) and missing)
+    if not bindingdb_query_database_ready(
+        science_store,
+        source_manifest_rows.get("bindingdb", {}),
+        summary_cache=summary_cache,
     ):
         block(
-            "install_status_not_ready",
-            "install_status",
-            str(status_payload.get("status", "missing")),
-            "prepare_science_store",
+            "bindingdb_query_database_not_ready",
+            "bindingdb_query_database",
+            "indexes/bindingdb/bindingdb_query.sqlite and manifest failed identity or schema validation",
+            "publish_bindingdb_query_database",
         )
+
+    retention_manifest = source_retention_manifest_path(science_store)
+    retention_required = any(
+        row.get("storage_state") in {"indexed_source_pruned", "bounded_runtime_cache"}
+        for row in source_manifest_rows.values()
+    )
+    if check_source_retention and retention_manifest.is_file():
+        retention_rows = {
+            row.get("source_id", ""): row for row in source_retention_rows(science_store)
+        }
+        for source_id in INDEXED_SOURCE_RETENTION_POLICIES:
+            retained = retention_rows.get(source_id, {})
+            if not retained_source_derivatives_ready(science_store, retained, summary_cache):
+                block(
+                    f"source_retention_invalid:{source_id}",
+                    "source_retention",
+                    source_id,
+                    "restore_source_and_rebuild_index",
+                )
+        rcsb_retention = retention_rows.get("rcsb_ligand_bound", {})
+        rcsb_policy = read_json_object(science_store / "downloads/rcsb/on_demand_policy.json")
+        rcsb_snapshot = read_json_object(science_store / "downloads/rcsb/ligand_bound_pdb_scope.json")
+        rcsb_mode = str(rcsb_snapshot.get("scope_mode", "")).replace("_", "-")
+        cache_files, cache_bytes = rcsb_cache_usage(science_store / "downloads/rcsb/mmcif")
+        rcsb_retention_ready = rcsb_mode == "complete" or (
+            rcsb_mode == "on-demand"
+            and rcsb_retention.get("schema_version") == SOURCE_RETENTION_SCHEMA_VERSION
+            and rcsb_retention.get("state") == "runtime_cache_bounded"
+            and rcsb_policy.get("max_cache_bytes") == RCSB_ON_DEMAND_MAX_CACHE_BYTES
+            and rcsb_policy.get("max_cache_files") == RCSB_ON_DEMAND_MAX_CACHE_FILES
+            and cache_bytes <= RCSB_ON_DEMAND_MAX_CACHE_BYTES
+            and cache_files <= RCSB_ON_DEMAND_MAX_CACHE_FILES
+        )
+        if not rcsb_retention_ready:
+            block(
+                "rcsb_runtime_cache_not_bounded",
+                "source_retention",
+                "downloads/rcsb/mmcif",
+                "prune_rcsb_on_demand_cache",
+            )
+    elif check_source_retention and retention_required:
+        block(
+            "source_retention_missing",
+            "source_retention",
+            SOURCE_RETENTION_MANIFEST_REL_PATH,
+            "restore_source_retention_evidence",
+        )
+
+    if check_install_status:
+        status_payload = load_json(science_store / "install_status.json")
+        status_progress = status_payload.get("progress")
+        canonical_ready = status_payload.get("status") == "ready"
+        canonical_final_status = bool(
+            status_payload.get("status") in {"ready", "needs_repair"}
+            and isinstance(status_payload.get("install_ready"), bool)
+            and canonical_ready == status_payload.get("install_ready")
+            and isinstance(status_progress, dict)
+            and status_progress.get("status") == ("ready" if canonical_ready else "needs_repair")
+        )
+        missing = status_payload.get("missing_components")
+        if not canonical_final_status and (
+            status_payload.get("status") != "ready" or (isinstance(missing, list) and missing)
+        ):
+            block(
+                "install_status_not_ready",
+                "install_status",
+                str(status_payload.get("status", "missing")),
+                "prepare_science_store",
+            )
 
     index_build_rows = read_tsv(science_store / "index_build_manifest.tsv")
     metagenome_alignment_authorities = authoritative_metagenome_mmseqs_databases(
@@ -10336,9 +11400,12 @@ def existing_science_indexes_ready(
 ) -> bool:
     readiness = evaluate_installer_science_store_readiness(
         science_store,
+        persist=False,
         summary_cache=summary_cache,
         env=env,
         wsl_distro=wsl_distro,
+        check_install_status=False,
+        check_source_retention=False,
     )
     non_alignment_blockers = [
         item
@@ -10386,6 +11453,7 @@ def install_ready(payload: dict[str, object]) -> bool:
     alignment_databases = payload.get("alignment_databases")
     forcefields = payload.get("forcefields")
     chembl_query_database = payload.get("chembl_query_database")
+    source_retention = payload.get("source_retention")
     science_store_readiness = payload.get("science_store_readiness")
     runtime_binary_manifest = payload.get("runtime_binary_manifest")
     download_status = downloads.get("status") if isinstance(downloads, dict) else None
@@ -10397,6 +11465,9 @@ def install_ready(payload: dict[str, object]) -> bool:
     forcefield_status = forcefields.get("status") if isinstance(forcefields, dict) else None
     chembl_query_status = (
         chembl_query_database.get("status") if isinstance(chembl_query_database, dict) else None
+    )
+    source_retention_status = (
+        source_retention.get("status") if isinstance(source_retention, dict) else None
     )
     readiness_status = (
         science_store_readiness.get("status") if isinstance(science_store_readiness, dict) else None
@@ -10418,6 +11489,7 @@ def install_ready(payload: dict[str, object]) -> bool:
         and alignment_status == "ready"
         and forcefield_status == "ready"
         and chembl_query_status == "ready"
+        and source_retention_status == "ready"
         and readiness_status == "ready"
         and runtime_status == "ready"
         and download_ok
@@ -10654,8 +11726,6 @@ def installation_status(
     external_source_summary: dict[str, object],
     resource_result: dict[str, object],
 ) -> dict[str, object]:
-    status_payload = load_json(science_store / "install_status.json")
-    store_status = str(status_payload.get("status", "")).strip()
     download_status = str(download_result.get("status", "unknown"))
     external_status = str(
         external_source_summary.get("status") or external_sync_result.get("status", "unknown")
@@ -10665,8 +11735,14 @@ def installation_status(
     alignment_status = str(alignment_database_result.get("status", "unknown"))
     forcefield_status = str(forcefield_result.get("status", "unknown"))
     source_manifest_status = str(source_manifest_result.get("status", "unknown"))
-    missing = status_payload.get("missing_components", [])
-    missing_count = len(missing) if isinstance(missing, list) else 0
+    current_components_ready = bool(
+        resource_status == "ready"
+        and external_status == "ready"
+        and tool_status == "ready"
+        and alignment_status == "ready"
+        and forcefield_status == "ready"
+        and source_manifest_status == "ready"
+    )
     if completed.returncode != 0:
         status = "failed"
         summary = "安装/修复未完成。"
@@ -10681,14 +11757,7 @@ def installation_status(
         next_action = "检查网络、磁盘空间后重新运行安装/修复"
     elif (
         download_status == "skipped"
-        and store_status == "ready"
-        and missing_count == 0
-        and resource_status == "ready"
-        and external_status == "ready"
-        and tool_status == "ready"
-        and alignment_status == "ready"
-        and forcefield_status == "ready"
-        and source_manifest_status == "ready"
+        and current_components_ready
     ):
         status = "ready"
         summary = "科学仓库已就绪。"
@@ -10733,19 +11802,15 @@ def installation_status(
         status = "needs_repair"
         summary = "科学资源索引仍有缺项。"
         next_action = "补齐科学资源后重新运行安装/修复"
-    elif store_status == "ready" and missing_count == 0:
+    else:
         status = "ready"
         summary = "科学仓库已就绪。"
         next_action = "打开 WebUI 并输入研究对象"
-    else:
-        status = "needs_repair"
-        summary = "安装/修复已执行，但仍有资源需要准备。"
-        next_action = "保持联网和足够磁盘空间后重新运行安装/修复"
     return {
         "status": status,
         "summary": summary,
         "next_action": next_action,
-        "missing_components_count": missing_count,
+        "missing_components_count": 0 if status == "ready" else 1,
     }
 
 
@@ -10926,7 +11991,16 @@ def installation_capacity_plan(
     for row in read_tsv(source_catalog):
         destination = science_store / row.get("local_path", "")
         expected = row.get("sha256", "")
-        destination_valid = (
+        retained = retained_source_ready(
+            science_store,
+            row.get("source_id", ""),
+            row.get("local_path", ""),
+            summary_cache,
+            expected_release_identity=row.get("release_identity", ""),
+            expected_trust_source=row.get("trust_source", ""),
+            expected_sha256=expected,
+        )
+        destination_valid = bool(retained) or (
             destination.is_file()
             and destination.stat().st_size > 0
             and (
@@ -10937,7 +12011,7 @@ def installation_capacity_plan(
             and validate_catalog_payload(row, destination).get("status") == "ready"
         )
         if destination_valid:
-            action = "reuse"
+            action = "reuse_verified_index" if retained else "reuse"
             download_bytes = 0
         else:
             identity = remote_resource_identity(row.get("url", "")) if resolve_remote else {}
@@ -11288,6 +12362,7 @@ def main() -> int:
     write_capacity_attempt_state(science_store, status="running")
     try:
         resource_summary_cache = load_resource_summary_cache(fingerprint_cache_path)
+        reconcile_interrupted_source_retention(science_store, resource_summary_cache)
         capacity_plan = installation_capacity_plan(
             science_store,
             source_catalog,
@@ -11608,6 +12683,46 @@ def main() -> int:
     )
     forcefield_result = ensure_openff_forcefield_file(science_store, tool_python)
     save_resource_summary_cache(fingerprint_cache_path, resource_summary_cache)
+    pre_retention_readiness = evaluate_installer_science_store_readiness(
+        science_store,
+        persist=False,
+        summary_cache=resource_summary_cache,
+        env=command_env,
+        wsl_distro=selected_wsl,
+        check_install_status=False,
+        check_source_retention=False,
+    )
+    source_retention_result = (
+        prune_indexed_source_payloads(science_store, resource_summary_cache)
+        if completed.returncode == 0
+        and alignment_database_result.get("status") == "ready"
+        and chembl_query_result.get("status") == "ready"
+        and forcefield_result.get("status") == "ready"
+        and pre_retention_readiness.get("status") == "ready"
+        else {
+            "status": "needs_repair",
+            "ready": 0,
+            "total": len(INDEXED_SOURCE_RETENTION_POLICIES),
+            "reclaimed_bytes": 0,
+            "failures": ["source_cleanup_deferred_until_all_indexes_are_ready"],
+        }
+    )
+    rcsb_cache_result = (
+        prune_rcsb_on_demand_cache(science_store, resource_summary_cache)
+        if source_retention_result.get("status") == "ready"
+        else {
+            "status": "needs_repair",
+            "reclaimed_bytes": 0,
+            "reason": "rcsb_cache_cleanup_deferred_until_source_cleanup_ready",
+        }
+    )
+    source_retention_result["rcsb_cache"] = rcsb_cache_result
+    source_retention_result["reclaimed_bytes"] = int(
+        source_retention_result.get("reclaimed_bytes", 0) or 0
+    ) + int(rcsb_cache_result.get("reclaimed_bytes", 0) or 0)
+    if rcsb_cache_result.get("status") != "ready":
+        source_retention_result["status"] = "needs_repair"
+    save_resource_summary_cache(fingerprint_cache_path, resource_summary_cache)
     external_source_summary = source_sync_summary(
         source_sync_plan,
         science_store,
@@ -11634,6 +12749,7 @@ def main() -> int:
         summary_cache=resource_summary_cache,
         env=command_env,
         wsl_distro=selected_wsl,
+        check_install_status=False,
     )
     save_resource_summary_cache(fingerprint_cache_path, resource_summary_cache)
     worker_wrapper = Path(tool_python) if tool_python and Path(tool_python).is_file() else None
@@ -11644,6 +12760,7 @@ def main() -> int:
     )
     if (
         chembl_query_result.get("status") != "ready"
+        or source_retention_result.get("status") != "ready"
         or science_store_readiness.get("status") != "ready"
         or runtime_binary_manifest.get("status") != "ready"
     ):
@@ -11665,6 +12782,7 @@ def main() -> int:
         "plinder_index": plinder_index_result,
         "forcefields": forcefield_result,
         "chembl_query_database": chembl_query_result,
+        "source_retention": source_retention_result,
         "index_authority_refresh": index_authority_refresh,
         "science_store_readiness": science_store_readiness,
         "installation_capacity": capacity_plan,

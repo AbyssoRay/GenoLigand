@@ -40,6 +40,11 @@ const RANKING_POLICY_VERSION: &str = "genoligand_target_ranking_v1";
 const SCIENCE_READINESS_SCHEMA_VERSION: &str = "genoligand_science_store_readiness_v1";
 const CHEMBL_QUERY_MANIFEST_SCHEMA_VERSION: &str = "genoligand_chembl_query_database_v1";
 const CHEMBL_QUERY_MANIFEST_REL_PATH: &str = "downloads/chembl/chembl_query.manifest.json";
+const SOURCE_RETENTION_SCHEMA_VERSION: &str = "genoligand_source_retention_v1";
+const BINDINGDB_QUERY_MANIFEST_SCHEMA_VERSION: &str = "genoligand_bindingdb_query_database_v1";
+const BINDINGDB_QUERY_DATABASE_REL_PATH: &str = "indexes/bindingdb/bindingdb_query.sqlite";
+const BINDINGDB_QUERY_MANIFEST_REL_PATH: &str = "indexes/bindingdb/bindingdb_query.manifest.json";
+const BINDINGDB_SOURCE_REL_PATH: &str = "downloads/bindingdb/bindingdb_all.tsv.zip";
 const CHEMBL_QUERY_HASH_CACHE_SCHEMA_VERSION: &str = "genoligand_chembl_query_sha256_cache_v1";
 const CHEMBL_QUERY_HASH_CACHE_DIR: &str = ".chembl_query.sha256_cache";
 const RCSB_INDEXED_PDB_IDS_REL_PATH: &str = "indexes/foldseek/rcsb_mmcif/indexed_pdb_ids.tsv";
@@ -59,6 +64,8 @@ const SCIENCE_READINESS_EVIDENCE_PATHS: &[&str] = &[
     "indexes/foldseek/foldseek_target_databases.tsv",
     RCSB_INDEXED_PDB_IDS_REL_PATH,
     CHEMBL_QUERY_MANIFEST_REL_PATH,
+    BINDINGDB_QUERY_MANIFEST_REL_PATH,
+    "manifests/source_retention_manifest.tsv",
     "downloads/rcsb/ligand_bound_pdb_scope.json",
     "downloads/rcsb/ligand_bound_pdb_scope.tsv",
     "downloads/rcsb/on_demand_policy.json",
@@ -91,6 +98,14 @@ pub struct ScienceStoreReadinessBlocker {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ScienceStoreReadinessAdvisory {
+    pub code: String,
+    pub component: String,
+    pub evidence: String,
+    pub action: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ScienceStoreReadinessEvidence {
     pub path: String,
     pub sha256: String,
@@ -102,6 +117,8 @@ pub struct ScienceStoreReadiness {
     pub ready: bool,
     pub blockers: Vec<String>,
     pub blocker_details: Vec<ScienceStoreReadinessBlocker>,
+    pub advisories: Vec<String>,
+    pub advisory_details: Vec<ScienceStoreReadinessAdvisory>,
     pub repair_actions: Vec<String>,
     pub evidence_manifest: Vec<ScienceStoreReadinessEvidence>,
     pub evidence_digest: String,
@@ -243,6 +260,24 @@ pub fn evaluate_science_store_readiness(
             "rerun_science_store_installer",
         ));
     };
+    let Some(mut advisory_details) = parse_readiness_advisories(value.get("advisories")) else {
+        return Ok(readiness_failure(
+            "science_store_readiness_invalid",
+            "advisories is not a valid advisory array",
+            "rerun_science_store_installer",
+        ));
+    };
+    if let Some(advisory) = foldseek_refresh_advisory(science_store)
+        && !advisory_details
+            .iter()
+            .any(|item| item.code == advisory.code)
+    {
+        advisory_details.push(advisory);
+    }
+    let advisories = advisory_details
+        .iter()
+        .map(|advisory| advisory.code.clone())
+        .collect();
     let ready = value.get("ready").and_then(Value::as_bool);
     let status = value.get("status").and_then(Value::as_str);
     if !matches!(
@@ -282,6 +317,8 @@ pub fn evaluate_science_store_readiness(
         ready: ready.expect("validated ready flag"),
         blockers,
         blocker_details,
+        advisories,
+        advisory_details,
         repair_actions,
         evidence_manifest: current_evidence,
         evidence_digest: current_digest,
@@ -301,12 +338,141 @@ fn readiness_failure(code: &str, evidence: &str, repair_action: &str) -> Science
             evidence: evidence.to_string(),
             repair_action: repair_action.to_string(),
         }],
+        advisories: Vec::new(),
+        advisory_details: Vec::new(),
         repair_actions: vec![repair_action.to_string()],
         evidence_manifest: Vec::new(),
         evidence_digest: String::new(),
         sources: Vec::new(),
         indexes: Vec::new(),
     }
+}
+
+fn parse_readiness_advisories(value: Option<&Value>) -> Option<Vec<ScienceStoreReadinessAdvisory>> {
+    let Some(value) = value else {
+        return Some(Vec::new());
+    };
+    let rows = value.as_array()?;
+    let mut seen = BTreeSet::new();
+    rows.iter()
+        .map(|row| {
+            let code = row.get("code")?.as_str()?.trim();
+            let component = row.get("component")?.as_str()?.trim();
+            let evidence = row.get("evidence")?.as_str()?.trim();
+            let action = row.get("action")?.as_str()?.trim();
+            if code.is_empty()
+                || component.is_empty()
+                || evidence.is_empty()
+                || action.is_empty()
+                || !seen.insert(code.to_string())
+            {
+                return None;
+            }
+            Some(ScienceStoreReadinessAdvisory {
+                code: code.to_string(),
+                component: component.to_string(),
+                evidence: evidence.to_string(),
+                action: action.to_string(),
+            })
+        })
+        .collect()
+}
+
+fn foldseek_refresh_advisory(science_store: &Path) -> Option<ScienceStoreReadinessAdvisory> {
+    let manifest = science_store.join("indexes/foldseek/foldseek_target_databases.tsv");
+    let row = read_simple_tsv_rows(&manifest)
+        .ok()?
+        .into_iter()
+        .find(|row| {
+            row.get("source_id").map(String::as_str) == Some("rcsb_mmcif")
+                && row.get("scope_mode").map(String::as_str) == Some("on_demand")
+                && row.get("status").map(String::as_str) == Some("ready")
+        })?;
+    let indexed_ids = read_simple_tsv_rows(&science_store.join(RCSB_INDEXED_PDB_IDS_REL_PATH))
+        .ok()?
+        .into_iter()
+        .filter_map(|row| {
+            row.get("pdb_id")
+                .map(|value| value.trim().to_ascii_uppercase())
+        })
+        .filter(|pdb_id| is_pdb_id(pdb_id))
+        .collect::<BTreeSet<_>>();
+    let cached_ids = current_valid_rcsb_cache_ids(science_store)?;
+    let unindexed_ids = cached_ids
+        .difference(&indexed_ids)
+        .cloned()
+        .collect::<Vec<_>>();
+    if unindexed_ids.is_empty() {
+        return None;
+    }
+    let coverage = row
+        .get("scope_coverage")
+        .filter(|value| !value.trim().is_empty())
+        .cloned()
+        .unwrap_or_else(|| {
+            format!(
+                "{}/{}",
+                row.get("indexed_pdb_count")
+                    .map(String::as_str)
+                    .unwrap_or("unknown"),
+                row.get("scope_count")
+                    .map(String::as_str)
+                    .unwrap_or("unknown")
+            )
+        });
+    Some(ScienceStoreReadinessAdvisory {
+        code: "rcsb_foldseek_refresh_needed".to_string(),
+        component: "rcsb".to_string(),
+        evidence: format!(
+            "scope_coverage={coverage};cached_unindexed_count={};cached_unindexed_sample={}",
+            unindexed_ids.len(),
+            unindexed_ids
+                .iter()
+                .take(5)
+                .cloned()
+                .collect::<Vec<_>>()
+                .join(",")
+        ),
+        action: "refresh_foldseek_when_convenient".to_string(),
+    })
+}
+
+fn current_valid_rcsb_cache_ids(science_store: &Path) -> Option<BTreeSet<String>> {
+    let cache_root = science_store.join(RCSB_ON_DEMAND_CACHE_ROOT);
+    if !cache_root.is_dir() {
+        return Some(BTreeSet::new());
+    }
+    let canonical_store = fs::canonicalize(science_store).ok()?;
+    let canonical_root = fs::canonicalize(&cache_root).ok()?;
+    if !canonical_root.starts_with(&canonical_store) {
+        return None;
+    }
+    let mut entries = Vec::new();
+    collect_rcsb_cache_entries(&cache_root, &mut entries).ok()?;
+    let mut ids = BTreeSet::new();
+    for entry in entries {
+        let Ok(candidate) = fs::canonicalize(&entry.path) else {
+            continue;
+        };
+        if !candidate.starts_with(&canonical_root) {
+            continue;
+        }
+        let Some(pdb_id) = lower_file_name(&candidate)
+            .strip_suffix(".cif.gz")
+            .map(str::to_ascii_uppercase)
+            .filter(|value| is_pdb_id(value))
+        else {
+            continue;
+        };
+        let Ok(expected) = fs::canonicalize(rcsb_coordinate_cache_path(science_store, &pdb_id))
+        else {
+            continue;
+        };
+        if candidate == expected && coordinate_file_identity_matches_pdb(&candidate, &pdb_id) {
+            ids.insert(pdb_id);
+        }
+    }
+    Some(ids)
 }
 
 fn parse_readiness_evidence(value: Option<&Value>) -> Option<Vec<ScienceStoreReadinessEvidence>> {
@@ -557,6 +723,8 @@ const RCSB_OFFICIAL_COORDINATE_TEMPLATE: &str = "https://files.rcsb.org/download
 const RCSB_ON_DEMAND_CACHE_ROOT: &str = "downloads/rcsb/mmcif";
 const RCSB_ON_DEMAND_VALIDATION: &str = "gzip_mmcif_entry_and_atom_site";
 const RCSB_ON_DEMAND_FETCH_LIMIT: usize = 12;
+const RCSB_ON_DEMAND_CACHE_MAX_BYTES: u64 = 2 * 1024 * 1024 * 1024;
+const RCSB_ON_DEMAND_CACHE_MAX_FILES: usize = 4096;
 const RCSB_ON_DEMAND_FETCH_MANIFEST: &str = "rcsb_on_demand_fetch.tsv";
 
 #[derive(Clone, Debug)]
@@ -680,6 +848,19 @@ struct RcsbFetchResult {
     path: PathBuf,
     sha256: String,
     reason: String,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct RcsbOnDemandPolicy {
+    max_cache_bytes: u64,
+    max_cache_files: usize,
+}
+
+#[derive(Debug)]
+struct RcsbCacheEntry {
+    path: PathBuf,
+    bytes: u64,
+    modified: SystemTime,
 }
 
 #[derive(Clone, Debug)]
@@ -1068,6 +1249,7 @@ fn write_test_science_store_readiness(
                 "sources": [],
                 "indexes": [],
                 "blockers": blocker_values,
+                "advisories": [],
                 "repair_actions": repair_actions,
             })
         ),
@@ -1101,6 +1283,7 @@ fn prepare_science_store(options: &StoreOptions) -> Result<String, String> {
     let index_plan = options.science_store.join("index_plan.tsv");
     let index_build = options.science_store.join("index_build_manifest.tsv");
     write_tool_versions(&tools)?;
+    prepare_bindingdb_query_database(options)?;
     let build_summary = build_store_indexes(options, &index_build)?;
     write_source_requirements(options, &source_requirements)?;
     write_download_plan(options, &download_plan)?;
@@ -2883,7 +3066,7 @@ fn source_local_available(options: &StoreOptions, source: &RequiredSource) -> bo
     if local_path.is_file() || path_has_any_file(&local_path) {
         return true;
     }
-    match source.id {
+    let alternate_payload_available = match source.id {
         "chembl" => {
             any_source_path_exists(
                 store,
@@ -2896,7 +3079,10 @@ fn source_local_available(options: &StoreOptions, source: &RequiredSource) -> bo
                     "downloads/chembl/known_targets.zip",
                 ],
             ) || discover_chembl_sqlite_sources(&store.join("downloads/chembl"))
-                .map(|files| !files.is_empty())
+                .map(|files| {
+                    let derived_query = store.join("downloads/chembl/chembl_query.sqlite");
+                    files.iter().any(|path| path != &derived_query)
+                })
                 .unwrap_or(false)
         }
         "bindingdb" => any_source_path_exists(
@@ -2944,7 +3130,124 @@ fn source_local_available(options: &StoreOptions, source: &RequiredSource) -> bo
                 .unwrap_or(false)
         }
         _ => false,
+    };
+    alternate_payload_available || retained_source_available(store, source)
+}
+
+fn retained_source_available(store: &Path, source: &RequiredSource) -> bool {
+    let Ok(retention_rows) =
+        read_simple_tsv_rows(&store.join("manifests/source_retention_manifest.tsv"))
+    else {
+        return false;
+    };
+    let mut retention_matches = retention_rows
+        .iter()
+        .filter(|row| row.get("source_id").map(String::as_str) == Some(source.id));
+    let Some(retention) = retention_matches.next() else {
+        return false;
+    };
+    if retention_matches.next().is_some()
+        || retention.get("schema_version").map(String::as_str)
+            != Some(SOURCE_RETENTION_SCHEMA_VERSION)
+        || retention.get("state").map(String::as_str) != Some("pruned")
+        || !source_path_matches(
+            retention.get("source_local_path").map(String::as_str),
+            source.local_rel_path,
+        )
+    {
+        return false;
     }
+
+    let Ok(source_rows) = read_simple_tsv_rows(&store.join("manifests/source_file_manifest.tsv"))
+    else {
+        return false;
+    };
+    let mut source_matches = source_rows
+        .iter()
+        .filter(|row| row.get("source_id").map(String::as_str) == Some(source.id));
+    let Some(source_row) = source_matches.next() else {
+        return false;
+    };
+    if source_matches.next().is_some()
+        || source_row.get("status").map(String::as_str) != Some("ready")
+        || source_row.get("storage_state").map(String::as_str) != Some("indexed_source_pruned")
+        || !source_path_matches(
+            source_row.get("local_path").map(String::as_str),
+            source.local_rel_path,
+        )
+    {
+        return false;
+    }
+
+    let source_digest = source_row.get("sha256").map(String::as_str).unwrap_or("");
+    let release = source_row
+        .get("release_identity")
+        .map(String::as_str)
+        .unwrap_or("");
+    let trust_source = source_row
+        .get("trust_source")
+        .map(String::as_str)
+        .unwrap_or("");
+    if !valid_sha256_hex(source_digest)
+        || release.trim().is_empty()
+        || trust_source.trim().is_empty()
+        || retention.get("source_manifest_sha256").map(String::as_str) != Some(source_digest)
+        || retention.get("release_identity").map(String::as_str) != Some(release)
+        || retention.get("trust_source").map(String::as_str) != Some(trust_source)
+    {
+        return false;
+    }
+
+    let Some(derived_paths) = retention.get("derived_paths") else {
+        return false;
+    };
+    let derived_paths = derived_paths
+        .split(';')
+        .map(str::trim)
+        .filter(|path| !path.is_empty())
+        .collect::<Vec<_>>();
+    !derived_paths.is_empty()
+        && derived_paths
+            .iter()
+            .all(|relative| retained_derived_path_has_payload(store, relative))
+}
+
+fn source_path_matches(actual: Option<&str>, expected: &str) -> bool {
+    actual.is_some_and(|actual| actual.replace('\\', "/") == expected.replace('\\', "/"))
+}
+
+fn retained_derived_path_has_payload(store: &Path, relative: &str) -> bool {
+    let relative = Path::new(relative);
+    if relative.is_absolute()
+        || relative.components().any(|component| {
+            matches!(
+                component,
+                std::path::Component::ParentDir
+                    | std::path::Component::RootDir
+                    | std::path::Component::Prefix(_)
+            )
+        })
+    {
+        return false;
+    }
+    let path = store.join(relative);
+    if path.is_file() {
+        return path.metadata().is_ok_and(|metadata| metadata.len() > 0);
+    }
+    if !path.is_dir() {
+        return false;
+    }
+    let Ok(entries) = fs::read_dir(path) else {
+        return false;
+    };
+    entries.flatten().any(|entry| {
+        let path = entry.path();
+        if path.is_file() {
+            path.metadata().is_ok_and(|metadata| metadata.len() > 0)
+        } else {
+            retained_derived_path_has_payload(store, &relative_display(store, &path))
+        }
+    })
 }
 
 fn any_source_path_exists(store: &Path, rel_paths: &[&str]) -> bool {
@@ -3700,6 +4003,23 @@ fn readiness_blocker_details(readiness: &ScienceStoreReadiness) -> String {
                 clean_cell(&blocker.component),
                 clean_cell(&blocker.evidence),
                 clean_cell(&blocker.repair_action),
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(";")
+}
+
+fn readiness_advisory_details(readiness: &ScienceStoreReadiness) -> String {
+    readiness
+        .advisory_details
+        .iter()
+        .map(|advisory| {
+            format!(
+                "{}|component={}|evidence={}|action={}",
+                clean_cell(&advisory.code),
+                clean_cell(&advisory.component),
+                clean_cell(&advisory.evidence),
+                clean_cell(&advisory.action),
             )
         })
         .collect::<Vec<_>>()
@@ -4686,17 +5006,257 @@ with open(result_path, "w", encoding="utf-8", newline="") as handle:
 "#
 }
 
+fn prepare_bindingdb_query_database(options: &StoreOptions) -> Result<(), String> {
+    let source = options.science_store.join(BINDINGDB_SOURCE_REL_PATH);
+    let database = options
+        .science_store
+        .join(BINDINGDB_QUERY_DATABASE_REL_PATH);
+    let manifest = options
+        .science_store
+        .join(BINDINGDB_QUERY_MANIFEST_REL_PATH);
+    if !source.is_file() {
+        if database.is_file() && manifest.is_file() {
+            validate_bindingdb_query_runtime_contract(
+                &options.science_store,
+                &database,
+                &manifest,
+            )?;
+        } else if database.exists() || manifest.exists() {
+            return Err("bindingdb_query_contract_incomplete".to_string());
+        }
+        return Ok(());
+    }
+
+    let (source_digest, source_release) =
+        science_store_source_identity(&options.science_store, "bindingdb")?;
+    let source_archive_sha256 = sha256_file_hex(&source)
+        .ok_or_else(|| "bindingdb_source_sha256_read_failed".to_string())?;
+    if database.is_file()
+        && manifest.is_file()
+        && validate_bindingdb_query_runtime_contract(&options.science_store, &database, &manifest)
+            .is_ok()
+        && bindingdb_manifest_source_archive_sha256(&manifest).as_deref()
+            == Some(source_archive_sha256.as_str())
+    {
+        return Ok(());
+    }
+    build_bindingdb_query_database(
+        &source,
+        &database,
+        &manifest,
+        &source_digest,
+        &source_release,
+        &source_archive_sha256,
+    )?;
+    validate_bindingdb_query_runtime_contract(&options.science_store, &database, &manifest)
+}
+
+fn bindingdb_manifest_source_archive_sha256(manifest: &Path) -> Option<String> {
+    let text = read_text(manifest).ok()?;
+    serde_json::from_str::<Value>(text.trim_start_matches('\u{feff}'))
+        .ok()?
+        .get("source_archive_sha256")?
+        .as_str()
+        .map(str::to_ascii_lowercase)
+}
+
+fn build_bindingdb_query_database(
+    source: &Path,
+    database: &Path,
+    manifest: &Path,
+    source_digest: &str,
+    source_release: &str,
+    source_archive_sha256: &str,
+) -> Result<usize, String> {
+    let parent = database
+        .parent()
+        .ok_or_else(|| "bindingdb_query_database_parent_missing".to_string())?;
+    ensure_dir(parent)?;
+    let pending_database = temporary_data_path(parent, "bindingdb_query", "sqlite");
+    let pending_manifest = temporary_data_path(parent, "bindingdb_query_manifest", "json");
+    let cleanup = || {
+        let _ = fs::remove_file(&pending_database);
+        let _ = fs::remove_file(&pending_manifest);
+    };
+    let source_bytes = fs::metadata(source)
+        .map_err(|err| format!("bindingdb_source_metadata_failed:{err}"))?
+        .len();
+    let output = match run_python_script(
+        bindingdb_query_build_script(),
+        &[
+            source.display().to_string(),
+            pending_database.display().to_string(),
+            source_digest.to_string(),
+            source_release.to_string(),
+            source_archive_sha256.to_string(),
+        ],
+        "bindingdb_query_build",
+    ) {
+        Ok(output) => output,
+        Err(error) => {
+            cleanup();
+            return Err(error);
+        }
+    };
+    let summary = output
+        .lines()
+        .rev()
+        .find_map(|line| serde_json::from_str::<Value>(line).ok())
+        .ok_or_else(|| {
+            cleanup();
+            "bindingdb_query_build_result_invalid".to_string()
+        })?;
+    let rows = summary
+        .get("rows")
+        .and_then(Value::as_u64)
+        .filter(|rows| *rows > 0)
+        .ok_or_else(|| {
+            cleanup();
+            "bindingdb_query_build_empty".to_string()
+        })?;
+    if sha256_file_hex(source).as_deref() != Some(source_archive_sha256) {
+        cleanup();
+        return Err("bindingdb_source_changed_during_query_build".to_string());
+    }
+    OpenOptions::new()
+        .write(true)
+        .open(&pending_database)
+        .and_then(|file| file.sync_all())
+        .map_err(|err| {
+            cleanup();
+            format!("bindingdb_query_database_sync_failed:{err}")
+        })?;
+    let database_bytes = fs::metadata(&pending_database)
+        .map_err(|err| {
+            cleanup();
+            format!("bindingdb_query_database_metadata_failed:{err}")
+        })?
+        .len();
+    let database_sha256 = sha256_file_hex(&pending_database).ok_or_else(|| {
+        cleanup();
+        "bindingdb_query_database_sha256_read_failed".to_string()
+    })?;
+    let payload = serde_json::to_string_pretty(&json!({
+        "schema_version": BINDINGDB_QUERY_MANIFEST_SCHEMA_VERSION,
+        "status": "ready",
+        "table": "genoligand_bindingdb_activity",
+        "rows": rows,
+        "database_bytes": database_bytes,
+        "database_sha256": database_sha256,
+        "source_path": BINDINGDB_SOURCE_REL_PATH,
+        "source_bytes": source_bytes,
+        "source_digest": source_digest,
+        "source_release": source_release,
+        "source_archive_sha256": source_archive_sha256,
+        "builder_version": env!("CARGO_PKG_VERSION"),
+        "indexes": [
+            "idx_bindingdb_activity_canonical_smiles",
+            "idx_bindingdb_activity_compact_smiles"
+        ],
+    }))
+    .map_err(|err| format!("bindingdb_query_manifest_serialize_failed:{err}"))?
+        + "\n";
+    if let Err(error) = write_text(&pending_manifest, &payload) {
+        cleanup();
+        return Err(error);
+    }
+    if let Err(error) = OpenOptions::new()
+        .write(true)
+        .open(&pending_manifest)
+        .and_then(|file| file.sync_all())
+    {
+        cleanup();
+        return Err(format!("bindingdb_query_manifest_sync_failed:{error}"));
+    }
+    if let Err(error) = publish_pending_file(&pending_database, database) {
+        cleanup();
+        return Err(error);
+    }
+    if let Err(error) = publish_pending_file(&pending_manifest, manifest) {
+        cleanup();
+        return Err(error);
+    }
+    Ok(rows as usize)
+}
+
+fn validate_bindingdb_query_runtime_contract(
+    science_store: &Path,
+    database: &Path,
+    manifest: &Path,
+) -> Result<(), String> {
+    let text = read_text(manifest)
+        .map_err(|err| format!("bindingdb_query_manifest_contract_invalid:read_failed:{err}"))?;
+    let value = serde_json::from_str::<Value>(text.trim_start_matches('\u{feff}'))
+        .map_err(|err| format!("bindingdb_query_manifest_contract_invalid:json:{err}"))?;
+    let (source_digest, source_release) =
+        science_store_source_identity(science_store, "bindingdb")?;
+    let database_bytes = fs::metadata(database)
+        .map_err(|err| {
+            format!("bindingdb_query_manifest_contract_invalid:database_metadata:{err}")
+        })?
+        .len();
+    let expected_database_sha256 = value
+        .get("database_sha256")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    let expected_indexes = [
+        "idx_bindingdb_activity_canonical_smiles",
+        "idx_bindingdb_activity_compact_smiles",
+    ];
+    let valid = value.get("schema_version").and_then(Value::as_str)
+        == Some(BINDINGDB_QUERY_MANIFEST_SCHEMA_VERSION)
+        && value.get("status").and_then(Value::as_str) == Some("ready")
+        && value.get("table").and_then(Value::as_str) == Some("genoligand_bindingdb_activity")
+        && value
+            .get("rows")
+            .and_then(Value::as_u64)
+            .is_some_and(|rows| rows > 0)
+        && value.get("database_bytes").and_then(Value::as_u64) == Some(database_bytes)
+        && valid_sha256_hex(expected_database_sha256)
+        && value.get("source_path").and_then(Value::as_str) == Some(BINDINGDB_SOURCE_REL_PATH)
+        && value
+            .get("source_bytes")
+            .and_then(Value::as_u64)
+            .is_some_and(|bytes| bytes > 0)
+        && value.get("source_digest").and_then(Value::as_str) == Some(source_digest.as_str())
+        && value.get("source_release").and_then(Value::as_str) == Some(source_release.as_str())
+        && value
+            .get("source_archive_sha256")
+            .and_then(Value::as_str)
+            .is_some_and(valid_sha256_hex)
+        && value
+            .get("builder_version")
+            .and_then(Value::as_str)
+            .is_some_and(|version| !version.is_empty())
+        && value
+            .get("indexes")
+            .and_then(Value::as_array)
+            .is_some_and(|indexes| {
+                expected_indexes.iter().all(|expected| {
+                    indexes
+                        .iter()
+                        .any(|value| value.as_str() == Some(*expected))
+                })
+            });
+    if !valid {
+        return Err(
+            "bindingdb_query_manifest_contract_invalid:fixed_fields_or_identity".to_string(),
+        );
+    }
+    let manifest_sha256 = sha256_bytes_hex(text.as_bytes());
+    let actual_database_sha256 = chembl_query_database_sha256(database, &manifest_sha256)
+        .map_err(|err| err.replace("chembl_query", "bindingdb_query"))?;
+    if !actual_database_sha256.eq_ignore_ascii_case(expected_database_sha256) {
+        return Err("bindingdb_query_database_sha256_mismatch".to_string());
+    }
+    Ok(())
+}
+
 fn append_bindingdb_onsite_matches<W: Write>(
     options: &ScienceOptions,
     inputs: &[NormalizedInput],
     out: &mut W,
 ) -> Result<(), String> {
-    let bindingdb = options
-        .science_store
-        .join("downloads/bindingdb/bindingdb_all.tsv.zip");
-    if !bindingdb.exists() {
-        return Ok(());
-    }
     let small_molecules = inputs
         .iter()
         .filter(|input| input.kind == InputKind::SmallMolecule)
@@ -4704,6 +5264,26 @@ fn append_bindingdb_onsite_matches<W: Write>(
     if small_molecules.is_empty() {
         return Ok(());
     }
+    let bindingdb = options
+        .science_store
+        .join(BINDINGDB_QUERY_DATABASE_REL_PATH);
+    let manifest = options
+        .science_store
+        .join(BINDINGDB_QUERY_MANIFEST_REL_PATH);
+    if !bindingdb.is_file() || !manifest.is_file() {
+        if bindingdb.exists()
+            || manifest.exists()
+            || science_store_source_identity(&options.science_store, "bindingdb").is_ok()
+        {
+            return Err(format!(
+                "bindingdb_query_contract_missing:database={}:manifest={}",
+                bindingdb.display(),
+                manifest.display()
+            ));
+        }
+        return Ok(());
+    }
+    validate_bindingdb_query_runtime_contract(&options.science_store, &bindingdb, &manifest)?;
     ensure_dir(&options.run_dir)?;
     let query_path = options.run_dir.join("bindingdb_onsite_queries.tsv");
     let mut queries = String::from("input_id\trecord_id\tquery\n");
@@ -4926,6 +5506,214 @@ fn append_bound_known_rows<W: Write>(
         .map_err(|err| format!("database_evidence_append_failed:{err}"))
 }
 
+fn bindingdb_query_build_script() -> &'static str {
+    r#"
+import csv
+import json
+import os
+import sqlite3
+import sys
+import zipfile
+from functools import lru_cache
+
+archive_path, database_path, source_digest, source_release, source_archive_sha256 = sys.argv[1:6]
+
+def clean(value):
+    return str(value or "").replace("\t", " ").replace("\r", " ").replace("\n", " ").strip()
+
+def first(row, names):
+    for name in names:
+        value = clean(row.get(name, ""))
+        if value:
+            return value
+    return ""
+
+def numeric_activity(value):
+    text = clean(value).replace(",", "")
+    number = []
+    seen_digit = False
+    for ch in text:
+        if ch.isdigit() or ch == ".":
+            number.append(ch)
+            seen_digit = True
+        elif seen_digit:
+            break
+    try:
+        return float("".join(number)) if number else 1e300
+    except ValueError:
+        return 1e300
+
+def activity_relation(value):
+    text = clean(value).lstrip()
+    for relation in ("<=", ">=", "<", ">", "~"):
+        if text.startswith(relation):
+            return relation
+    return "="
+
+def activity_score(value):
+    if activity_relation(value) != "=":
+        return 0.0
+    numeric = numeric_activity(value)
+    if numeric <= 10:
+        return 1.0
+    if numeric <= 100:
+        return 0.95
+    if numeric <= 1000:
+        return 0.85
+    if numeric <= 10000:
+        return 0.70
+    if numeric <= 100000:
+        return 0.55
+    return 0.40 if numeric < 1e300 else 0.0
+
+try:
+    from rdkit import Chem
+except Exception as exc:
+    raise RuntimeError("rdkit_required_for_bindingdb_query_index") from exc
+
+@lru_cache(maxsize=100000)
+def canonical_smiles(value):
+    molecule = Chem.MolFromSmiles(clean(value))
+    if molecule is None:
+        return ""
+    return Chem.MolToSmiles(molecule, isomericSmiles=True)
+
+if os.path.exists(database_path):
+    os.remove(database_path)
+connection = sqlite3.connect(database_path)
+try:
+    connection.execute("PRAGMA journal_mode=OFF")
+    connection.execute("PRAGMA synchronous=OFF")
+    connection.execute("PRAGMA temp_store=FILE")
+    connection.execute("""
+        CREATE TABLE genoligand_bindingdb_activity (
+            source_row_id INTEGER PRIMARY KEY,
+            canonical_smiles TEXT NOT NULL,
+            compact_smiles TEXT NOT NULL,
+            ligand_smiles TEXT NOT NULL,
+            ligand_name TEXT NOT NULL,
+            ligand_name_lower TEXT NOT NULL,
+            target_id TEXT NOT NULL,
+            target_name TEXT NOT NULL,
+            organism TEXT NOT NULL,
+            ligand_code TEXT NOT NULL,
+            pdb_ids TEXT NOT NULL,
+            target_chain_pdb_ids TEXT NOT NULL,
+            activity TEXT NOT NULL,
+            activity_type TEXT NOT NULL,
+            relation TEXT NOT NULL,
+            numeric_rank REAL NOT NULL,
+            relation_rank INTEGER NOT NULL,
+            activity_score REAL NOT NULL,
+            pubchem_cid TEXT NOT NULL
+        )
+    """)
+    connection.execute("""
+        CREATE TABLE genoligand_bindingdb_metadata (
+            key TEXT PRIMARY KEY,
+            value TEXT NOT NULL
+        )
+    """)
+    insert = """
+        INSERT INTO genoligand_bindingdb_activity (
+            canonical_smiles, compact_smiles, ligand_smiles, ligand_name,
+            ligand_name_lower, target_id, target_name, organism, ligand_code,
+            pdb_ids, target_chain_pdb_ids, activity, activity_type, relation,
+            numeric_rank, relation_rank, activity_score, pubchem_cid
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    """
+    pending = []
+    rows = 0
+    with zipfile.ZipFile(archive_path) as archive:
+        members = sorted(
+            (name for name in archive.namelist() if name.lower().endswith((".tsv", ".txt"))),
+            key=str.lower,
+        )
+        if not members:
+            raise RuntimeError("bindingdb_query_source_members_missing")
+        for member_name in members:
+            with archive.open(member_name) as raw:
+                text = (line.decode("utf-8", "replace") for line in raw)
+                for row in csv.DictReader(text, delimiter="\t"):
+                    smiles = first(row, ["Ligand SMILES", "SMILES"])
+                    ligand_name = first(row, ["BindingDB Ligand Name", "Ligand Name", "Compound Name"])
+                    target_name = first(row, ["Target Name", "UniProt (SwissProt) Recommended Name of Target Chain 1"])
+                    organism = first(row, ["Target Source Organism According to Curator or DataSource", "Organism"])
+                    target_id = first(row, [
+                        "UniProt (SwissProt) Primary ID of Target Chain 1",
+                        "UniProt (TrEMBL) Primary ID of Target Chain 1",
+                        "BindingDB MonomerID",
+                        "Target Name",
+                    ])
+                    if not target_id:
+                        continue
+                    if not target_name:
+                        target_name = target_id
+                    activity_names = ["Ki (nM)", "IC50 (nM)", "Kd (nM)", "EC50 (nM)"]
+                    activity = first(row, activity_names)
+                    activity_type = next(
+                        (name for name in activity_names if clean(row.get(name, ""))),
+                        "activity",
+                    )
+                    relation = activity_relation(activity)
+                    pending.append((
+                        canonical_smiles(smiles),
+                        "".join(smiles.split()).lower(),
+                        smiles,
+                        ligand_name,
+                        ligand_name.lower(),
+                        target_id,
+                        target_name,
+                        organism,
+                        first(row, ["Ligand HET ID in PDB"]),
+                        first(row, ["PDB ID(s) for Ligand-Target Complex"]),
+                        first(row, ["PDB ID(s) of Target Chain 1"]),
+                        activity,
+                        activity_type,
+                        relation,
+                        numeric_activity(activity) if relation == "=" else 1e300,
+                        0 if relation == "=" else 1,
+                        activity_score(activity),
+                        first(row, ["PubChem CID"]),
+                    ))
+                    rows += 1
+                    if len(pending) >= 5000:
+                        connection.executemany(insert, pending)
+                        connection.commit()
+                        pending.clear()
+    if pending:
+        connection.executemany(insert, pending)
+    if rows == 0:
+        raise RuntimeError("bindingdb_query_index_empty")
+    connection.execute(
+        "CREATE INDEX idx_bindingdb_activity_canonical_smiles "
+        "ON genoligand_bindingdb_activity(canonical_smiles)"
+    )
+    connection.execute(
+        "CREATE INDEX idx_bindingdb_activity_compact_smiles "
+        "ON genoligand_bindingdb_activity(compact_smiles)"
+    )
+    metadata = {
+        "schema_version": "genoligand_bindingdb_query_database_v1",
+        "source_digest": source_digest,
+        "source_release": source_release,
+        "source_archive_sha256": source_archive_sha256,
+        "rows": str(rows),
+    }
+    connection.executemany(
+        "INSERT INTO genoligand_bindingdb_metadata(key, value) VALUES (?, ?)",
+        sorted(metadata.items()),
+    )
+    connection.commit()
+    if connection.execute("PRAGMA quick_check").fetchone()[0] != "ok":
+        raise RuntimeError("bindingdb_query_database_integrity_failed")
+finally:
+    connection.close()
+
+print(json.dumps({"rows": rows}, sort_keys=True))
+"#
+}
+
 fn bindingdb_onsite_query_script() -> &'static str {
     r#"
 import csv
@@ -4934,9 +5722,12 @@ import os
 import sqlite3
 import sys
 import tempfile
-import zipfile
+from pathlib import Path
 
-zip_path, query_path, result_path, source_digest, source_release, run_id, invocation_id = sys.argv[1:8]
+database_path, query_path, result_path, source_digest, source_release, run_id, invocation_id = sys.argv[1:8]
+
+if database_path.lower().endswith((".zip", ".gz", ".tsv", ".txt")):
+    raise RuntimeError("bindingdb_query_requires_published_sqlite")
 
 def clean(value):
     return str(value or "").replace("\t", " ").replace("\r", " ").replace("\n", " ").strip()
@@ -4965,60 +5756,11 @@ def decode(value):
         index += 2
     return "".join(out)
 
-def first(row, names):
-    for name in names:
-        value = clean(row.get(name, ""))
-        if value:
-            return value
-    return ""
-
 def target_class(organism):
     low = organism.lower()
     if "homo sapiens" in low or "human" in low:
         return "known_human_protein"
     return "known_protein"
-
-def numeric_activity(value):
-    text = clean(value).replace(",", "")
-    number = []
-    seen_digit = False
-    for ch in text:
-        if ch.isdigit() or ch == ".":
-            number.append(ch)
-            seen_digit = True
-        elif seen_digit:
-            break
-    try:
-        return float("".join(number)) if number else float("inf")
-    except ValueError:
-        return float("inf")
-
-def activity_relation(value):
-    text = clean(value).lstrip()
-    for relation in ("<=", ">=", "<", ">", "~"):
-        if text.startswith(relation):
-            return relation
-    return "="
-
-def activity_score(value):
-    if activity_relation(value) != "=":
-        return 0.0
-    numeric = numeric_activity(value)
-    if numeric == float("inf"):
-        return 0.0
-    if numeric <= 10:
-        score = 1.0
-    elif numeric <= 100:
-        score = 0.95
-    elif numeric <= 1000:
-        score = 0.85
-    elif numeric <= 10000:
-        score = 0.70
-    elif numeric <= 100000:
-        score = 0.55
-    else:
-        score = 0.40
-    return score
 
 try:
     from rdkit import Chem
@@ -5039,19 +5781,6 @@ def canonical_smiles(value):
     return canonical_cache[text]
 
 canonical_cache = {}
-
-def query_matches(query_info, smiles, ligand_name):
-    _input_id, _record_id, query, query_canonical = query_info
-    q = query.strip()
-    q_lower = q.lower()
-    compact = "".join(q.split()).lower()
-    if query_canonical:
-        return query_canonical == canonical_smiles(smiles)
-    if compact and compact == "".join(smiles.split()).lower():
-        return True
-    if q_lower and q_lower in ligand_name.lower():
-        return True
-    return False
 
 queries = []
 with open(query_path, "r", encoding="utf-8-sig", newline="") as handle:
@@ -5095,85 +5824,121 @@ try:
            OR (excluded.relation_rank = best.relation_rank AND excluded.numeric_rank < best.numeric_rank)
            OR (excluded.relation_rank = best.relation_rank AND excluded.numeric_rank = best.numeric_rank AND excluded.tie_rank < best.tie_rank)
     """
-    pending = 0
-    with zipfile.ZipFile(zip_path) as archive:
-        members = sorted(
-            (name for name in archive.namelist() if name.lower().endswith((".tsv", ".txt"))),
-            key=str.lower,
-        )
-        if not members:
-            open(result_path, "w", encoding="utf-8").close()
-            raise SystemExit(0)
-        for member_name in members:
-            with archive.open(member_name) as raw:
-                text = (line.decode("utf-8", "replace") for line in raw)
-                reader = csv.DictReader(text, delimiter="\t")
-                for row in reader:
-                    smiles = first(row, ["Ligand SMILES", "SMILES"])
-                    ligand_name = first(row, ["BindingDB Ligand Name", "Ligand Name", "Compound Name"])
-                    for query_info in queries:
-                        input_id = query_info[0]
-                        record_id = query_info[1]
-                        query_value = query_info[3] or query_info[2]
-                        if not query_matches(query_info, smiles, ligand_name):
-                            continue
-                        target_name = first(row, ["Target Name", "UniProt (SwissProt) Recommended Name of Target Chain 1"])
-                        organism = first(row, ["Target Source Organism According to Curator or DataSource", "Organism"])
-                        target_id = first(row, [
-                            "UniProt (SwissProt) Primary ID of Target Chain 1",
-                            "UniProt (TrEMBL) Primary ID of Target Chain 1",
-                            "BindingDB MonomerID",
-                            "Target Name",
-                        ])
-                        if not target_name:
-                            target_name = target_id
-                        if not target_id:
-                            continue
-                        ligand_code = first(row, ["Ligand HET ID in PDB"])
-                        ligand_complex_pdb_ids = first(row, ["PDB ID(s) for Ligand-Target Complex"])
-                        target_chain_pdb_ids = first(row, ["PDB ID(s) of Target Chain 1"])
-                        activity = first(row, ["Ki (nM)", "IC50 (nM)", "Kd (nM)", "EC50 (nM)"])
-                        activity_type = next((name for name in ["Ki (nM)", "IC50 (nM)", "Kd (nM)", "EC50 (nM)"] if clean(row.get(name, ""))), "activity")
-                        pubchem = first(row, ["PubChem CID"])
-                        matched = f"ligand_name={ligand_name};ligand_smiles={smiles};ligand_code={ligand_code};pdb_ids={ligand_complex_pdb_ids};target_chain_pdb_ids={target_chain_pdb_ids}"
-                        activity_value = f"{activity_type}={activity}".strip()
-                        ligand_identity = f"ligand_smiles={smiles};ligand_name={ligand_name};ligand_code={ligand_code}"
-                        relation = activity_relation(activity)
-                        query_digest = hashlib.sha256(
-                            "\0".join([
-                                run_id, invocation_id, input_id, record_id, query_value,
-                                source_release, source_digest,
-                            ]).encode("utf-8")
-                        ).hexdigest()
-                        evidence = f"bindingdb_onsite_activity_row;{activity_value};relation={relation};quantitative={'true' if relation == '=' else 'false'};ligand_code={ligand_code};pdb_ids={ligand_complex_pdb_ids};target_chain_pdb_ids={target_chain_pdb_ids};pubchem_cid={pubchem};source_release={source_release};source_digest={source_digest};query_digest={query_digest};run_id={run_id};invocation_id={invocation_id}"
-                        relation_rank = 0 if relation == "=" else 1
-                        numeric_rank = numeric_activity(activity) if relation_rank == 0 else 1e300
-                        tie_rank = f"{target_name.lower()}\x1f{organism.lower()}\x1f{activity_value}\x1f{record_id}"
-                        out_row = [
-                            input_id,
-                            "BindingDB",
-                            target_id,
-                            target_name,
-                            organism or "unknown",
-                            target_class(organism),
-                            f"{activity_score(activity):.4f}",
-                            clean(matched),
-                            clean(evidence),
-                            f"bindingdb_onsite_activity_row;source_release={source_release};source_digest={source_digest}",
-                            clean(activity_value),
-                            clean(ligand_identity),
-                            query_digest,
-                            record_id,
-                        ]
-                        best_connection.execute(
-                            upsert,
-                            (input_id, record_id, target_id, relation_rank, numeric_rank, tie_rank, "\t".join(out_row)),
-                        )
-                        pending += 1
-                        if pending >= 1000:
-                            best_connection.commit()
-                            pending = 0
-    best_connection.commit()
+    columns_sql = """
+        SELECT ligand_smiles, ligand_name, target_id, target_name, organism,
+               ligand_code, pdb_ids, target_chain_pdb_ids, activity,
+               activity_type, relation, numeric_rank, relation_rank,
+               activity_score, pubchem_cid
+        FROM genoligand_bindingdb_activity
+    """
+    canonical_sql = columns_sql + " WHERE canonical_smiles = ? ORDER BY source_row_id"
+    fallback_sql = columns_sql + (
+        " WHERE compact_smiles = ? OR instr(ligand_name_lower, ?) > 0"
+        " ORDER BY source_row_id"
+    )
+    uri = Path(database_path).resolve().as_uri() + "?mode=ro&immutable=1"
+    source_connection = sqlite3.connect(uri, uri=True)
+    try:
+        metadata = dict(source_connection.execute(
+            "SELECT key, value FROM genoligand_bindingdb_metadata"
+        ))
+        if (
+            metadata.get("schema_version") != "genoligand_bindingdb_query_database_v1"
+            or metadata.get("source_digest") != source_digest
+            or metadata.get("source_release") != source_release
+        ):
+            raise RuntimeError("bindingdb_query_metadata_invalid")
+        indexes = {
+            row[1]
+            for row in source_connection.execute(
+                "PRAGMA index_list(genoligand_bindingdb_activity)"
+            )
+        }
+        required_indexes = {
+            "idx_bindingdb_activity_canonical_smiles",
+            "idx_bindingdb_activity_compact_smiles",
+        }
+        if not required_indexes.issubset(indexes):
+            raise RuntimeError("bindingdb_query_indexes_missing")
+        for query_info in queries:
+            input_id, record_id, query, query_canonical = query_info
+            query_value = query_canonical or query
+            compact = "".join(query.split()).lower()
+            if query_canonical:
+                plan = source_connection.execute(
+                    "EXPLAIN QUERY PLAN " + canonical_sql,
+                    (query_canonical,),
+                ).fetchall()
+                if any(
+                    "SCAN GENOLIGAND_BINDINGDB_ACTIVITY" in clean(row[-1]).upper()
+                    for row in plan
+                ):
+                    raise RuntimeError("bindingdb_query_plan_full_scan")
+                source_rows = source_connection.execute(canonical_sql, (query_canonical,))
+            else:
+                source_rows = source_connection.execute(
+                    fallback_sql,
+                    (compact, query.lower()),
+                )
+            for source_row in source_rows:
+                (
+                    smiles, ligand_name, target_id, target_name, organism,
+                    ligand_code, ligand_complex_pdb_ids, target_chain_pdb_ids,
+                    activity, activity_type, relation, numeric_rank,
+                    relation_rank, score, pubchem,
+                ) = source_row
+                values = [
+                    smiles, ligand_name, target_id, target_name, organism,
+                    ligand_code, ligand_complex_pdb_ids, target_chain_pdb_ids,
+                    activity, activity_type, relation, pubchem,
+                ]
+                (
+                    smiles, ligand_name, target_id, target_name, organism,
+                    ligand_code, ligand_complex_pdb_ids, target_chain_pdb_ids,
+                    activity, activity_type, relation, pubchem,
+                ) = [clean(value) for value in values]
+                matched = f"ligand_name={ligand_name};ligand_smiles={smiles};ligand_code={ligand_code};pdb_ids={ligand_complex_pdb_ids};target_chain_pdb_ids={target_chain_pdb_ids}"
+                activity_value = f"{activity_type}={activity}".strip()
+                ligand_identity = f"ligand_smiles={smiles};ligand_name={ligand_name};ligand_code={ligand_code}"
+                query_digest = hashlib.sha256(
+                    "\0".join([
+                        run_id, invocation_id, input_id, record_id, query_value,
+                        source_release, source_digest,
+                    ]).encode("utf-8")
+                ).hexdigest()
+                evidence = f"bindingdb_onsite_activity_row;{activity_value};relation={relation};quantitative={'true' if relation == '=' else 'false'};ligand_code={ligand_code};pdb_ids={ligand_complex_pdb_ids};target_chain_pdb_ids={target_chain_pdb_ids};pubchem_cid={pubchem};source_release={source_release};source_digest={source_digest};query_digest={query_digest};run_id={run_id};invocation_id={invocation_id}"
+                tie_rank = f"{target_name.lower()}\x1f{organism.lower()}\x1f{activity_value}\x1f{record_id}"
+                out_row = [
+                    input_id,
+                    "BindingDB",
+                    target_id,
+                    target_name,
+                    organism or "unknown",
+                    target_class(organism),
+                    f"{float(score):.4f}",
+                    clean(matched),
+                    clean(evidence),
+                    f"bindingdb_onsite_activity_row;source_release={source_release};source_digest={source_digest}",
+                    clean(activity_value),
+                    clean(ligand_identity),
+                    query_digest,
+                    record_id,
+                ]
+                best_connection.execute(
+                    upsert,
+                    (
+                        input_id,
+                        record_id,
+                        target_id,
+                        int(relation_rank),
+                        float(numeric_rank),
+                        tie_rank,
+                        "\t".join(out_row),
+                    ),
+                )
+        best_connection.commit()
+    finally:
+        source_connection.close()
     with open(result_path, "w", encoding="utf-8", newline="") as handle:
         for (row_text,) in best_connection.execute(
             "SELECT row_text FROM best ORDER BY input_id, record_id, relation_rank, numeric_rank, target_id, tie_rank"
@@ -7412,7 +8177,7 @@ fn write_rcsb_fetch_audit(
     write_text(&options.run_dir.join(RCSB_ON_DEMAND_FETCH_MANIFEST), &text)
 }
 
-fn validate_rcsb_on_demand_policy(science_store: &Path) -> Result<(), String> {
+fn validate_rcsb_on_demand_policy(science_store: &Path) -> Result<RcsbOnDemandPolicy, String> {
     let path = science_store.join("downloads/rcsb/on_demand_policy.json");
     let value = read_text(&path)
         .ok()
@@ -7437,7 +8202,128 @@ fn validate_rcsb_on_demand_policy(science_store: &Path) -> Result<(), String> {
     {
         return Err("rcsb_on_demand_policy_invalid:max_fetches_per_run".to_string());
     }
+    let max_cache_bytes = value
+        .get("max_cache_bytes")
+        .and_then(Value::as_u64)
+        .ok_or_else(|| "rcsb_on_demand_policy_invalid:max_cache_bytes".to_string())?;
+    if max_cache_bytes != RCSB_ON_DEMAND_CACHE_MAX_BYTES {
+        return Err("rcsb_on_demand_policy_invalid:max_cache_bytes".to_string());
+    }
+    let max_cache_files = value
+        .get("max_cache_files")
+        .and_then(Value::as_u64)
+        .and_then(|value| usize::try_from(value).ok())
+        .ok_or_else(|| "rcsb_on_demand_policy_invalid:max_cache_files".to_string())?;
+    if max_cache_files != RCSB_ON_DEMAND_CACHE_MAX_FILES {
+        return Err("rcsb_on_demand_policy_invalid:max_cache_files".to_string());
+    }
+    Ok(RcsbOnDemandPolicy {
+        max_cache_bytes,
+        max_cache_files,
+    })
+}
+
+fn enforce_rcsb_on_demand_cache_limit(
+    science_store: &Path,
+    protected_path: &Path,
+    policy: RcsbOnDemandPolicy,
+) -> Result<(), String> {
+    let cache_root = science_store.join(RCSB_ON_DEMAND_CACHE_ROOT);
+    let canonical_root = fs::canonicalize(&cache_root)
+        .map_err(|error| format!("rcsb_cache_root_invalid:{error}"))?;
+    let canonical_protected = fs::canonicalize(protected_path)
+        .map_err(|error| format!("rcsb_cache_protected_file_invalid:{error}"))?;
+    if !canonical_protected.starts_with(&canonical_root)
+        || !rcsb_cache_coordinate_path(&canonical_protected)
+    {
+        return Err("rcsb_cache_protected_file_outside_cache".to_string());
+    }
+
+    let mut entries = Vec::new();
+    collect_rcsb_cache_entries(&cache_root, &mut entries)?;
+    let mut total_files = entries.len();
+    let mut total_bytes = entries.iter().map(|entry| entry.bytes).sum::<u64>();
+    entries.sort_by(|left, right| {
+        left.modified
+            .cmp(&right.modified)
+            .then_with(|| left.path.cmp(&right.path))
+    });
+
+    for entry in entries {
+        if total_files <= policy.max_cache_files && total_bytes <= policy.max_cache_bytes {
+            break;
+        }
+        let candidate = match fs::canonicalize(&entry.path) {
+            Ok(candidate) => candidate,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                total_files = total_files.saturating_sub(1);
+                total_bytes = total_bytes.saturating_sub(entry.bytes);
+                continue;
+            }
+            Err(error) => return Err(format!("rcsb_cache_candidate_invalid:{error}")),
+        };
+        if candidate == canonical_protected {
+            continue;
+        }
+        if !candidate.starts_with(&canonical_root) || !rcsb_cache_coordinate_path(&candidate) {
+            return Err("rcsb_cache_candidate_outside_cache".to_string());
+        }
+        match fs::remove_file(&candidate) {
+            Ok(()) => {
+                total_files = total_files.saturating_sub(1);
+                total_bytes = total_bytes.saturating_sub(entry.bytes);
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                total_files = total_files.saturating_sub(1);
+                total_bytes = total_bytes.saturating_sub(entry.bytes);
+            }
+            Err(error) => return Err(format!("rcsb_cache_eviction_failed:{error}")),
+        }
+    }
+    if total_files > policy.max_cache_files || total_bytes > policy.max_cache_bytes {
+        return Err("rcsb_cache_limit_requires_protected_file_eviction".to_string());
+    }
     Ok(())
+}
+
+fn collect_rcsb_cache_entries(
+    directory: &Path,
+    entries: &mut Vec<RcsbCacheEntry>,
+) -> Result<(), String> {
+    let children = fs::read_dir(directory)
+        .map_err(|error| format!("rcsb_cache_directory_unreadable:{error}"))?;
+    for child in children {
+        let child = child.map_err(|error| format!("rcsb_cache_entry_unreadable:{error}"))?;
+        let file_type = child
+            .file_type()
+            .map_err(|error| format!("rcsb_cache_entry_type_unreadable:{error}"))?;
+        if file_type.is_symlink() {
+            continue;
+        }
+        let path = child.path();
+        if file_type.is_dir() {
+            collect_rcsb_cache_entries(&path, entries)?;
+            continue;
+        }
+        if !file_type.is_file() || !rcsb_cache_coordinate_path(&path) {
+            continue;
+        }
+        let metadata = child
+            .metadata()
+            .map_err(|error| format!("rcsb_cache_entry_metadata_unreadable:{error}"))?;
+        entries.push(RcsbCacheEntry {
+            path,
+            bytes: metadata.len(),
+            modified: metadata.modified().unwrap_or(UNIX_EPOCH),
+        });
+    }
+    Ok(())
+}
+
+fn rcsb_cache_coordinate_path(path: &Path) -> bool {
+    path.file_name()
+        .and_then(|name| name.to_str())
+        .is_some_and(|name| name.to_ascii_lowercase().ends_with(".cif.gz"))
 }
 
 fn fetch_rcsb_coordinate_with_python(
@@ -7515,6 +8401,18 @@ fn fetch_rcsb_coordinate_with_python(
             sha256,
             reason,
         };
+    }
+    if matches!(status.as_str(), "fetched" | "reused") {
+        let cache_result = validate_rcsb_on_demand_policy(science_store)
+            .and_then(|policy| enforce_rcsb_on_demand_cache_limit(science_store, &path, policy));
+        if let Err(error) = cache_result {
+            return RcsbFetchResult {
+                status: "failed".to_string(),
+                path,
+                sha256: String::new(),
+                reason: format!("post_fetch_cache_enforcement_failed:{error}"),
+            };
+        }
     }
     RcsbFetchResult {
         status,
@@ -11852,9 +12750,13 @@ fn report_source_summary(options: &ScienceOptions, candidate_count: usize) -> St
         "\u{672a}\u{8bfb}\u{53d6}\u{5230}\u{5f53}\u{524d}\u{9879}\u{76ee}\u{8f93}\u{5165}"
     };
     let database_status = match evaluate_science_store_readiness(&options.science_store) {
-        Ok(readiness) if readiness.ready => {
+        Ok(readiness) if readiness.ready && readiness.advisories.is_empty() => {
             "\u{79d1}\u{5b66}\u{8d44}\u{6e90}\u{5df2}\u{5c31}\u{7eea}".to_string()
         }
+        Ok(readiness) if readiness.ready => format!(
+            "\u{79d1}\u{5b66}\u{8d44}\u{6e90}\u{5df2}\u{5c31}\u{7eea}\u{ff0c}\u{5efa}\u{8bae}\u{7ef4}\u{62a4}\u{ff1a}{}",
+            readiness_advisory_details(&readiness)
+        ),
         Ok(readiness) => format!(
             "\u{79d1}\u{5b66}\u{8d44}\u{6e90}\u{9700}\u{8981}\u{4fee}\u{590d}\u{ff1a}{}",
             readiness_blocker_details(&readiness)

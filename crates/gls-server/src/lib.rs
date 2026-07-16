@@ -3495,12 +3495,26 @@ fn science_store_readiness_json(options: &ServerOptions) -> Value {
                 .iter()
                 .map(|row| json!({"path": row.path, "sha256": row.sha256}))
                 .collect::<Vec<_>>();
+            let advisory_details = readiness
+                .advisory_details
+                .iter()
+                .map(|advisory| {
+                    json!({
+                        "code": advisory.code,
+                        "component": advisory.component,
+                        "evidence": advisory.evidence,
+                        "action": advisory.action,
+                    })
+                })
+                .collect::<Vec<_>>();
             json!({
                 "schema_version":"genoligand_science_store_readiness_v1",
                 "status":readiness.status,
                 "ready":readiness.ready,
                 "blockers":readiness.blockers,
                 "blocker_details":blocker_details,
+                "advisories":readiness.advisories,
+                "advisory_details":advisory_details,
                 "repair_actions":readiness.repair_actions,
                 "evidence_manifest":evidence_manifest,
                 "evidence_digest":readiness.evidence_digest,
@@ -3519,6 +3533,8 @@ fn science_store_readiness_json(options: &ServerOptions) -> Value {
                 "evidence":reason,
                 "repair_action":"rerun_science_store_installer"
             }],
+            "advisories":[],
+            "advisory_details":[],
             "repair_actions":["rerun_science_store_installer"],
             "evidence_manifest":[],
             "evidence_digest":"",

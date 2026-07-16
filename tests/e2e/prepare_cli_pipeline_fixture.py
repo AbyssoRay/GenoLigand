@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import sqlite3
 from pathlib import Path
 
 
@@ -19,6 +20,7 @@ EVIDENCE_PATHS = (
     "indexes/tool_versions.tsv",
     "indexes/mmseqs/mmseqs_target_databases.tsv",
     "indexes/foldseek/foldseek_target_databases.tsv",
+    "indexes/bindingdb/bindingdb_query.manifest.json",
     "downloads/rcsb/ligand_bound_pdb_scope.json",
     "downloads/rcsb/ligand_bound_pdb_scope.tsv",
 )
@@ -128,6 +130,88 @@ def file_sha256(path: Path) -> str:
     return hashlib.sha256(path.read_bytes()).hexdigest()
 
 
+def write_bindingdb_query_fixture(store: Path) -> None:
+    database = store / "indexes/bindingdb/bindingdb_query.sqlite"
+    database.parent.mkdir(parents=True, exist_ok=True)
+    connection = sqlite3.connect(database)
+    try:
+        connection.execute(
+            """
+            CREATE TABLE genoligand_bindingdb_activity (
+                source_row_id INTEGER PRIMARY KEY,
+                canonical_smiles TEXT NOT NULL,
+                compact_smiles TEXT NOT NULL,
+                ligand_smiles TEXT NOT NULL,
+                ligand_name TEXT NOT NULL,
+                ligand_name_lower TEXT NOT NULL,
+                target_id TEXT NOT NULL,
+                target_name TEXT NOT NULL,
+                organism TEXT NOT NULL,
+                ligand_code TEXT NOT NULL,
+                pdb_ids TEXT NOT NULL,
+                target_chain_pdb_ids TEXT NOT NULL,
+                activity TEXT NOT NULL,
+                activity_type TEXT NOT NULL,
+                relation TEXT NOT NULL,
+                numeric_rank REAL NOT NULL,
+                relation_rank INTEGER NOT NULL,
+                activity_score REAL NOT NULL,
+                pubchem_cid TEXT NOT NULL
+            )
+            """
+        )
+        connection.execute(
+            "CREATE TABLE genoligand_bindingdb_metadata (key TEXT PRIMARY KEY, value TEXT NOT NULL)"
+        )
+        connection.executemany(
+            "INSERT INTO genoligand_bindingdb_metadata VALUES (?, ?)",
+            [
+                ("schema_version", "genoligand_bindingdb_query_database_v1"),
+                ("source_digest", "a" * 64),
+                ("source_release", "unit_test_release"),
+            ],
+        )
+        connection.execute(
+            "INSERT INTO genoligand_bindingdb_activity VALUES "
+            "(1, 'CCO', 'cco', 'CCO', 'ethanol', 'ethanol', 'P24941', "
+            "'Cyclin-dependent kinase 2', 'Homo sapiens', '', '', '', '12', "
+            "'Ki (nM)', '=', 12.0, 0, 0.95, '')"
+        )
+        connection.execute(
+            "CREATE INDEX idx_bindingdb_activity_canonical_smiles "
+            "ON genoligand_bindingdb_activity(canonical_smiles)"
+        )
+        connection.execute(
+            "CREATE INDEX idx_bindingdb_activity_compact_smiles "
+            "ON genoligand_bindingdb_activity(compact_smiles)"
+        )
+        connection.commit()
+    finally:
+        connection.close()
+    manifest = {
+        "schema_version": "genoligand_bindingdb_query_database_v1",
+        "status": "ready",
+        "table": "genoligand_bindingdb_activity",
+        "rows": 1,
+        "database_bytes": database.stat().st_size,
+        "database_sha256": file_sha256(database),
+        "source_path": "downloads/bindingdb/bindingdb_all.tsv.zip",
+        "source_bytes": 1,
+        "source_digest": "a" * 64,
+        "source_release": "unit_test_release",
+        "source_archive_sha256": "b" * 64,
+        "builder_version": "unit-test-fixture",
+        "indexes": [
+            "idx_bindingdb_activity_canonical_smiles",
+            "idx_bindingdb_activity_compact_smiles",
+        ],
+    }
+    database.with_suffix(".manifest.json").write_text(
+        json.dumps(manifest, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+
+
 def write_ready_store(store: Path) -> None:
     indexes = store / "indexes"
     indexes.mkdir(parents=True, exist_ok=True)
@@ -202,6 +286,8 @@ def write_ready_store(store: Path) -> None:
             f"{'a' * 64}\t1\t1\tunit_test_builder\t{relative}\tready\n",
             encoding="utf-8",
         )
+
+    write_bindingdb_query_fixture(store)
 
     evidence = []
     for relative in EVIDENCE_PATHS:

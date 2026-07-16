@@ -162,6 +162,8 @@ fn write_test_rcsb_on_demand_policy(store: &Path) {
             "coordinate_template": RCSB_OFFICIAL_COORDINATE_TEMPLATE,
             "cache_root": RCSB_ON_DEMAND_CACHE_ROOT,
             "max_fetches_per_run": RCSB_ON_DEMAND_FETCH_LIMIT,
+            "max_cache_bytes": RCSB_ON_DEMAND_CACHE_MAX_BYTES,
+            "max_cache_files": RCSB_ON_DEMAND_CACHE_MAX_FILES,
             "validation": RCSB_ON_DEMAND_VALIDATION,
         })
         .to_string()
@@ -632,6 +634,14 @@ fn pipeline_uses_one_temporary_query_row_then_test_removes_it() {
     let root = temp_root("one_row");
     install_not_applicable_worker_fixtures(&root).expect("worker fixtures");
     let store = create_temporary_test_store(&root).expect("store");
+    write_zip(
+        &store.join(BINDINGDB_SOURCE_REL_PATH),
+        "BindingDB_All.tsv",
+        "Ligand SMILES\tBindingDB Ligand Name\tTarget Name\tTarget Source Organism According to Curator or DataSource\tKi (nM)\tUniProt (SwissProt) Primary ID of Target Chain 1\nCCO\tethanol\tCyclin-dependent kinase 2\tHomo sapiens\t12\tP24941\n",
+    )
+    .expect("BindingDB fixture archive");
+    publish_test_store_bindingdb_query(&store).expect("BindingDB query index");
+    write_test_science_store_readiness(&store, &[]).expect("refresh store readiness");
     let input = root.join("input.json");
     let run = root.join("run");
     write_text(
@@ -2956,7 +2966,7 @@ fn foldseek_tool_rows_preserve_source_database_and_query_id() {
 }
 
 #[test]
-fn known_matching_searches_bindingdb_zip_for_current_small_molecule() {
+fn known_matching_uses_bindingdb_query_index_after_source_archive_removal() {
     let root = temp_root("bindingdb_onsite_search");
     let store = root.join("science_store");
     let run = root.join("run");
@@ -2973,6 +2983,9 @@ fn known_matching_searches_bindingdb_zip_for_current_small_molecule() {
     )
     .expect("bindingdb zip");
     write_test_source_manifest(&store, &["bindingdb"]).expect("bindingdb source manifest");
+    publish_test_store_bindingdb_query(&store).expect("BindingDB query index");
+    fs::remove_file(store.join(BINDINGDB_SOURCE_REL_PATH))
+        .expect("remove BindingDB source archive");
     write_text(
         &input,
         "{\"inputs\":[{\"field\":\"small_molecule\",\"value\":\"CC(=O)Nc1nnc(s1)S(=O)(=O)N\"}],\"files\":[]}\n",
@@ -3005,6 +3018,52 @@ fn known_matching_searches_bindingdb_zip_for_current_small_molecule() {
     assert!(matches.contains("pdb_ids=3HS4,1AZM,2H4N"));
     fs::remove_dir_all(&root).expect("cleanup temp root");
     assert!(!root.exists());
+}
+
+#[test]
+fn prepare_science_store_publishes_source_bound_bindingdb_query_database() {
+    let root = temp_root("bindingdb_query_publish");
+    let store = root.join("science_store");
+    let source = store.join(BINDINGDB_SOURCE_REL_PATH);
+    write_zip(
+        &source,
+        "BindingDB_All.tsv",
+        "Ligand SMILES\tBindingDB Ligand Name\tTarget Name\tTarget Source Organism According to Curator or DataSource\tKi (nM)\tUniProt (SwissProt) Primary ID of Target Chain 1\nCCO\tethanol\tTarget one\tHomo sapiens\t12\tP_ONE\n",
+    )
+    .expect("BindingDB zip");
+    write_test_source_manifest(&store, &["bindingdb"]).expect("BindingDB source manifest");
+    let options = StoreOptions {
+        workspace_root: root.clone(),
+        science_store: store.clone(),
+    };
+
+    run_store_command(ScienceCommand::PrepareScienceStore, &options).expect("prepare store");
+
+    let database = store.join(BINDINGDB_QUERY_DATABASE_REL_PATH);
+    let manifest = store.join(BINDINGDB_QUERY_MANIFEST_REL_PATH);
+    let value: Value = serde_json::from_str(&read_text(&manifest).expect("query manifest"))
+        .expect("query manifest JSON");
+    assert!(database.is_file());
+    assert_eq!(
+        value["schema_version"],
+        BINDINGDB_QUERY_MANIFEST_SCHEMA_VERSION
+    );
+    assert_eq!(value["status"], "ready");
+    assert_eq!(value["table"], "genoligand_bindingdb_activity");
+    assert_eq!(value["rows"], 1);
+    assert_eq!(value["source_digest"], test_source_digest("bindingdb"));
+    assert_eq!(
+        value["source_archive_sha256"],
+        sha256_file_hex(&source).expect("source sha256")
+    );
+    assert_eq!(
+        value["database_sha256"],
+        sha256_file_hex(&database).expect("database sha256")
+    );
+    fs::remove_file(&source).expect("remove source archive");
+    validate_bindingdb_query_runtime_contract(&store, &database, &manifest)
+        .expect("published query database remains valid after source cleanup");
+    fs::remove_dir_all(&root).expect("cleanup temp root");
 }
 
 #[test]
@@ -3254,7 +3313,7 @@ fn chembl_onsite_preserves_exact_relation_and_has_no_shared_row_cap() {
 }
 
 #[test]
-fn bindingdb_onsite_streams_all_zip_members_without_shared_row_cap() {
+fn bindingdb_query_index_preserves_all_source_members_without_shared_row_cap() {
     let root = temp_root("bindingdb_all_members_unbounded_targets");
     let store = root.join("science_store");
     let run = root.join("run");
@@ -3288,6 +3347,7 @@ fn bindingdb_onsite_streams_all_zip_members_without_shared_row_cap() {
     )
     .expect("bindingdb zip");
     write_test_source_manifest(&store, &["bindingdb"]).expect("bindingdb source manifest");
+    publish_test_store_bindingdb_query(&store).expect("BindingDB query index");
     write_text(
         &input,
         "{\"inputs\":[{\"field\":\"small_molecule\",\"value\":\"CCO\"},{\"field\":\"small_molecule\",\"value\":\"CCN\"}],\"files\":[]}\n",
@@ -3323,6 +3383,7 @@ fn bindingdb_onsite_streams_all_zip_members_without_shared_row_cap() {
 fn onsite_query_scripts_require_published_index_and_disk_backed_deduplication() {
     let chembl = chembl_onsite_query_script();
     let bindingdb = bindingdb_onsite_query_script();
+    let bindingdb_builder = bindingdb_query_build_script();
 
     assert!(chembl.contains("chembl_query_requires_published_sqlite"));
     assert!(chembl.contains("mode=ro"));
@@ -3332,10 +3393,14 @@ fn onsite_query_scripts_require_published_index_and_disk_backed_deduplication() 
     assert!(!chembl.contains("tarfile"));
     assert!(!chembl.contains("zipfile"));
     assert!(chembl.contains("result_path"));
-    assert!(bindingdb.contains("for member_name in members"));
-    assert!(!bindingdb.contains("members[0]"));
+    assert!(bindingdb.contains("mode=ro&immutable=1"));
+    assert!(bindingdb.contains("idx_bindingdb_activity_canonical_smiles"));
+    assert!(bindingdb.contains("bindingdb_query_requires_published_sqlite"));
+    assert!(!bindingdb.contains("zipfile"));
     assert!(!bindingdb.contains("best = {}"));
     assert!(bindingdb.contains("CREATE TABLE best"));
+    assert!(bindingdb_builder.contains("zipfile.ZipFile"));
+    assert!(bindingdb_builder.contains("CREATE INDEX idx_bindingdb_activity_canonical_smiles"));
 }
 
 #[test]
@@ -3364,13 +3429,16 @@ fn onsite_aggregation_uses_input_namespace_target_key_across_records_and_sources
     .expect("chembl query");
     let chembl_rows = read_text(&chembl_result).expect("chembl results");
 
-    let bindingdb = root.join("bindingdb.zip");
+    let bindingdb_archive = root.join("bindingdb.zip");
     write_zip(
-        &bindingdb,
+        &bindingdb_archive,
         "bindingdb.tsv",
         "Ligand SMILES\tBindingDB Ligand Name\tTarget Name\tTarget Source Organism According to Curator or DataSource\tKi (nM)\tUniProt (SwissProt) Primary ID of Target Chain 1\nCCO\tethanol\tTarget one\tHomo sapiens\t12\tP_ONE\n",
     )
     .expect("bindingdb zip");
+    let bindingdb = root.join("bindingdb_query.sqlite");
+    publish_test_bindingdb_query(&bindingdb_archive, &bindingdb)
+        .expect("published BindingDB query index");
     let bindingdb_result = root.join("bindingdb_results.tsv");
     run_python_script(
         bindingdb_onsite_query_script(),
@@ -3549,7 +3617,7 @@ fn chembl_onsite_aggregation_keeps_more_than_200_targets_for_each_input() {
 }
 
 #[test]
-fn bindingdb_onsite_aggregation_streams_all_members_without_a_200_target_cap() {
+fn bindingdb_query_aggregation_keeps_all_targets_without_a_200_target_cap() {
     let root = temp_root("bindingdb_per_input_unbounded");
     let store = root.join("science_store");
     let run = root.join("run");
@@ -3580,6 +3648,7 @@ fn bindingdb_onsite_aggregation_streams_all_members_without_a_200_target_cap() {
     )
     .expect("bindingdb zip");
     write_test_source_manifest(&store, &["bindingdb"]).expect("bindingdb source manifest");
+    publish_test_store_bindingdb_query(&store).expect("BindingDB query index");
     write_text(
         &input,
         "{\"inputs\":[{\"field\":\"small_molecule\",\"value\":\"CCO\"},{\"field\":\"small_molecule\",\"value\":\"CCN\"}],\"files\":[]}\n",
@@ -3628,6 +3697,7 @@ fn known_matching_deduplicates_onsite_hits_and_downweights_token_noise() {
     )
     .expect("bindingdb zip");
     write_test_source_manifest(&store, &["bindingdb", "chembl"]).expect("known source manifest");
+    publish_test_store_bindingdb_query(&store).expect("BindingDB query index");
     let options = ScienceOptions {
         workspace_root: root.clone(),
         science_store: store,
@@ -5278,6 +5348,151 @@ fn prepare_science_store_reports_needs_repair_until_sources_and_tools_are_ready(
 }
 
 #[test]
+fn source_local_available_accepts_pruned_source_only_with_complete_retention_evidence() {
+    for attack in [
+        "valid",
+        "wrong_schema",
+        "wrong_state",
+        "wrong_source_id",
+        "wrong_retention_path",
+        "wrong_source_path",
+        "wrong_storage_state",
+        "tampered_digest",
+        "tampered_release",
+        "tampered_trust",
+        "missing_retention",
+        "missing_source_manifest",
+        "missing_derived",
+        "empty_derived",
+    ] {
+        let root = temp_root(&format!("pruned_source_availability_{attack}"));
+        let store = root.join("science_store");
+        let source = REQUIRED_SOURCES
+            .iter()
+            .find(|source| source.id == "bindingdb")
+            .expect("BindingDB required source");
+        let options = StoreOptions {
+            workspace_root: root.clone(),
+            science_store: store.clone(),
+        };
+        let digest = "b".repeat(64);
+        let source_id = if attack == "wrong_source_id" {
+            "chembl"
+        } else {
+            source.id
+        };
+        let retention_path = if attack == "wrong_retention_path" {
+            "downloads/bindingdb/foreign.zip"
+        } else {
+            source.local_rel_path
+        };
+        let source_path = if attack == "wrong_source_path" {
+            "downloads/bindingdb/foreign.zip"
+        } else {
+            source.local_rel_path
+        };
+        let storage_state = if attack == "wrong_storage_state" {
+            "materialized"
+        } else {
+            "indexed_source_pruned"
+        };
+        let retention_digest = if attack == "tampered_digest" {
+            "c".repeat(64)
+        } else {
+            digest.clone()
+        };
+        let retention_release = if attack == "tampered_release" {
+            "bindingdb-foreign-release"
+        } else {
+            "bindingdb-test-release"
+        };
+        let retention_trust = if attack == "tampered_trust" {
+            "foreign_trust"
+        } else {
+            "unit_test"
+        };
+        let schema = if attack == "wrong_schema" {
+            "genoligand_source_retention_foreign"
+        } else {
+            SOURCE_RETENTION_SCHEMA_VERSION
+        };
+        let state = if attack == "wrong_state" {
+            "pruning"
+        } else {
+            "pruned"
+        };
+        let derived = "indexes/bindingdb/bindingdb_query.sqlite";
+
+        if attack != "missing_derived" {
+            write_text(
+                &store.join(derived),
+                if attack == "empty_derived" {
+                    ""
+                } else {
+                    "sqlite-payload"
+                },
+            )
+            .expect("derived payload");
+        }
+        if attack != "missing_source_manifest" {
+            write_text(
+                &store.join("manifests/source_file_manifest.tsv"),
+                &format!(
+                    "source_id\tlocal_path\tstatus\tstorage_state\tsha256\trelease_identity\ttrust_source\n{}\t{}\tready\t{}\t{}\tbindingdb-test-release\tunit_test\n",
+                    source.id, source_path, storage_state, digest
+                ),
+            )
+            .expect("source manifest");
+        }
+        if attack != "missing_retention" {
+            write_text(
+                &store.join("manifests/source_retention_manifest.tsv"),
+                &format!(
+                    "schema_version\tsource_id\tsource_local_path\tstate\tsource_manifest_sha256\trelease_identity\ttrust_source\tderived_paths\n{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\n",
+                    schema,
+                    source_id,
+                    retention_path,
+                    state,
+                    retention_digest,
+                    retention_release,
+                    retention_trust,
+                    derived
+                ),
+            )
+            .expect("retention manifest");
+        }
+
+        assert_eq!(
+            source_local_available(&options, source),
+            attack == "valid",
+            "unexpected availability for attack {attack}"
+        );
+        fs::remove_dir_all(&root).expect("cleanup temp root");
+        assert!(!root.exists());
+    }
+}
+
+#[test]
+fn source_local_available_keeps_original_payload_path_behavior() {
+    let root = temp_root("original_source_availability");
+    let store = root.join("science_store");
+    let source = REQUIRED_SOURCES
+        .iter()
+        .find(|source| source.id == "bindingdb")
+        .expect("BindingDB required source");
+    write_text(&store.join(source.local_rel_path), "bindingdb-archive")
+        .expect("original source payload");
+    let options = StoreOptions {
+        workspace_root: root.clone(),
+        science_store: store,
+    };
+
+    assert!(source_local_available(&options, source));
+    fs::remove_dir_all(&root).expect("cleanup temp root");
+    assert!(!root.exists());
+}
+
+#[test]
 fn pipeline_blocks_when_store_lacks_install_closure() {
     let root = temp_root("missing_install_closure");
     let store = root.join("science_store");
@@ -5397,6 +5612,90 @@ fn canonical_readiness_is_shared_by_pipeline_and_report_and_rejects_stale_eviden
 }
 
 #[test]
+fn canonical_readiness_reports_foldseek_refresh_advisory_without_blocking() {
+    let root = temp_root("foldseek_refresh_advisory");
+    let store = create_temporary_test_store(&root).expect("science store");
+    write_text(
+        &store.join("indexes/foldseek/foldseek_target_databases.tsv"),
+        &format!(
+            "source_id\tmanifest_schema_version\tsource_namespace\tsource_class\tsource_digest\tsource_files\tsource_bytes\tbuilder_version\tscope_mode\tscope_count\tscope_coverage\trefresh_needed\tdb_path\tstatus\nrcsb_mmcif\t{}\tRCSB\tstructure\t{}\t22120\t3996832517\t10.941cd33\ton_demand\t167245\t22120/167245\tfalse\tindexes/foldseek/unit_test/target\tready\n",
+            ALIGNMENT_DATABASE_MANIFEST_SCHEMA_VERSION,
+            "a".repeat(64),
+        ),
+    )
+    .expect("Foldseek manifest");
+    write_text(
+        &store.join(RCSB_INDEXED_PDB_IDS_REL_PATH),
+        "pdb_id\tstatus\n1ABC\tvalidated\n",
+    )
+    .expect("indexed PDB identifiers");
+    write_gzip(
+        &rcsb_coordinate_cache_path(&store, "1ABC"),
+        &test_rcsb_mmcif("1ABC"),
+    )
+    .expect("indexed cached coordinate");
+    write_test_science_store_readiness(&store, &[]).expect("rebound readiness");
+
+    let current = evaluate_science_store_readiness(&store).expect("current readiness");
+    assert!(current.ready, "{:?}", current.blockers);
+    assert!(current.advisories.is_empty());
+
+    write_gzip(
+        &rcsb_coordinate_cache_path(&store, "2BBB"),
+        &test_rcsb_mmcif("2BBB"),
+    )
+    .expect("new cached coordinate");
+    let readiness = evaluate_science_store_readiness(&store).expect("readiness after cache growth");
+    assert!(readiness.ready, "{:?}", readiness.blockers);
+    assert_eq!(readiness.advisories, ["rcsb_foldseek_refresh_needed"]);
+    assert_eq!(
+        readiness.advisory_details[0].evidence,
+        "scope_coverage=22120/167245;cached_unindexed_count=1;cached_unindexed_sample=2BBB"
+    );
+    assert_eq!(
+        readiness.advisory_details[0].action,
+        "refresh_foldseek_when_convenient"
+    );
+    let options = ScienceOptions {
+        workspace_root: root.clone(),
+        science_store: store.clone(),
+        input_manifest: root.join("input.json"),
+        run_dir: root.join("run"),
+    };
+    let report = report_source_summary(&options, 0);
+    assert!(report.contains("rcsb_foldseek_refresh_needed"));
+    assert!(report.contains("refresh_foldseek_when_convenient"));
+    fs::remove_dir_all(&root).expect("cleanup temp root");
+}
+
+#[test]
+fn foldseek_refresh_advisory_ignores_non_rcsb_and_complete_scope_rows() {
+    let root = temp_root("foldseek_refresh_advisory_scope_filter");
+    let store = create_temporary_test_store(&root).expect("science store");
+    write_text(
+        &store.join("indexes/foldseek/foldseek_target_databases.tsv"),
+        "source_id\tscope_mode\tscope_coverage\trefresh_needed\tstatus\nother_structure\ton_demand\t0/1\ttrue\tready\nrcsb_mmcif\tcomplete\t0/1\ttrue\tready\n",
+    )
+    .expect("Foldseek manifest");
+    write_text(
+        &store.join(RCSB_INDEXED_PDB_IDS_REL_PATH),
+        "pdb_id\tstatus\n",
+    )
+    .expect("indexed PDB identifiers");
+    write_gzip(
+        &rcsb_coordinate_cache_path(&store, "2BBB"),
+        &test_rcsb_mmcif("2BBB"),
+    )
+    .expect("uncached index coordinate");
+    write_test_science_store_readiness(&store, &[]).expect("canonical readiness");
+
+    let readiness = evaluate_science_store_readiness(&store).expect("readiness");
+    assert!(readiness.ready, "{:?}", readiness.blockers);
+    assert!(readiness.advisories.is_empty());
+    fs::remove_dir_all(&root).expect("cleanup temp root");
+}
+
+#[test]
 fn canonical_readiness_missing_and_invalid_have_stable_blockers() {
     let root = temp_root("canonical_readiness_invalid");
     let store = root.join("science_store");
@@ -5427,16 +5726,35 @@ fn readiness_evidence_digest_matches_python_contract() {
         "source_id\tstatus\n",
     )
     .expect("evidence file");
+    write_text(
+        &store.join("manifests/source_retention_manifest.tsv"),
+        "schema_version\n",
+    )
+    .expect("source retention evidence");
+    write_text(
+        &store.join("downloads/rcsb/ligand_bound_pdb_scope.json"),
+        "{}\n",
+    )
+    .expect("RCSB scope evidence");
     let (evidence, digest) = science_readiness_evidence(&store).expect("evidence");
-    assert_eq!(evidence.len(), 1);
-    assert_eq!(evidence[0].path, "source_requirements.tsv");
+    assert_eq!(
+        evidence
+            .iter()
+            .map(|entry| entry.path.as_str())
+            .collect::<Vec<_>>(),
+        [
+            "source_requirements.tsv",
+            "manifests/source_retention_manifest.tsv",
+            "downloads/rcsb/ligand_bound_pdb_scope.json",
+        ]
+    );
     assert_eq!(
         evidence[0].sha256,
         "c98fc19b87dc2a95f7717e75e77f39f30d426017f11522d54592e2920f750268"
     );
     assert_eq!(
         digest,
-        "03b37f2669405833e8745f0fb5dcc7c2b0a780da126c07ad56eb43d5b65aefd5"
+        "2e9a87483b26f9dca2144590d2b2dd9d551d8ae2658c54a4d6d80d88054f62a6"
     );
     fs::remove_dir_all(&root).expect("cleanup temp root");
 }
@@ -6495,13 +6813,16 @@ fn chembl_canonical_target_runtime_merges_same_input_record_across_sources() {
     assert!(chembl_cols[8].contains("source_target_id=CHEMBL205"));
     assert!(chembl_cols[9].contains("source_database_id=CHEMBL205"));
 
-    let bindingdb = root.join("bindingdb.zip");
+    let bindingdb_archive = root.join("bindingdb.zip");
     write_zip(
-        &bindingdb,
+        &bindingdb_archive,
         "bindingdb.tsv",
         "Ligand SMILES\tBindingDB Ligand Name\tTarget Name\tTarget Source Organism According to Curator or DataSource\tKi (nM)\tUniProt (SwissProt) Primary ID of Target Chain 1\nCCO\tacetaldehyde\tCarbonic anhydrase 2\tHomo sapiens\t12\tP00918\n",
     )
     .expect("BindingDB zip");
+    let bindingdb = root.join("bindingdb_query.sqlite");
+    publish_test_bindingdb_query(&bindingdb_archive, &bindingdb)
+        .expect("published BindingDB query index");
     let bindingdb_result = root.join("bindingdb.tsv");
     run_python_script(
         bindingdb_onsite_query_script(),
@@ -6723,6 +7044,39 @@ fn write_zip_members(path: &Path, members: &[(&str, &str)]) -> Result<(), String
     writer
         .finish()
         .map_err(|err| format!("zip_finish_failed:{}:{err}", path.display()))?;
+    Ok(())
+}
+
+fn publish_test_bindingdb_query(source: &Path, database: &Path) -> Result<PathBuf, String> {
+    let manifest = database.with_extension("manifest.json");
+    let source_archive_sha256 =
+        sha256_file_hex(source).ok_or_else(|| "test_bindingdb_source_sha256_failed".to_string())?;
+    build_bindingdb_query_database(
+        source,
+        database,
+        &manifest,
+        &test_source_digest("bindingdb"),
+        "bindingdb-test-release",
+        &source_archive_sha256,
+    )?;
+    Ok(manifest)
+}
+
+fn publish_test_store_bindingdb_query(store: &Path) -> Result<(), String> {
+    let source = store.join(BINDINGDB_SOURCE_REL_PATH);
+    let database = store.join(BINDINGDB_QUERY_DATABASE_REL_PATH);
+    let manifest = store.join(BINDINGDB_QUERY_MANIFEST_REL_PATH);
+    let (source_digest, source_release) = science_store_source_identity(store, "bindingdb")?;
+    let source_archive_sha256 = sha256_file_hex(&source)
+        .ok_or_else(|| "test_bindingdb_source_sha256_failed".to_string())?;
+    build_bindingdb_query_database(
+        &source,
+        &database,
+        &manifest,
+        &source_digest,
+        &source_release,
+        &source_archive_sha256,
+    )?;
     Ok(())
 }
 
@@ -7666,7 +8020,19 @@ fn rcsb_on_demand_reuses_cache_without_network_and_serializes_same_id_fetches() 
     .expect("known matches");
     let cached = rcsb_coordinate_cache_path(&store, "4DDD");
     write_gzip(&cached, &test_rcsb_mmcif("4DDD")).expect("cached coordinate");
+    let cache_root = store.join(RCSB_ON_DEMAND_CACHE_ROOT);
+    for index in 0..RCSB_ON_DEMAND_CACHE_MAX_FILES {
+        write_text(&cache_root.join(format!("overflow-{index:04}.cif.gz")), "x")
+            .expect("overflow cache coordinate");
+    }
+    let mut entries = Vec::new();
+    collect_rcsb_cache_entries(&cache_root, &mut entries).expect("cache entries before reuse");
+    assert_eq!(entries.len(), RCSB_ON_DEMAND_CACHE_MAX_FILES + 1);
     let cached_server = TestHttpServer::start(BTreeMap::new());
+    let python = vec!["python".to_string()];
+    let reused =
+        fetch_rcsb_coordinate_with_python(&store, "4DDD", &cached_server.base_url, Some(&python));
+    assert_eq!(reused.status, "reused");
 
     for _ in 0..2 {
         assert!(
@@ -7679,6 +8045,10 @@ fn rcsb_on_demand_reuses_cache_without_network_and_serializes_same_id_fetches() 
         );
     }
     assert!(cached_server.requests().is_empty());
+    entries.clear();
+    collect_rcsb_cache_entries(&cache_root, &mut entries).expect("cache entries after reuse");
+    assert_eq!(entries.len(), RCSB_ON_DEMAND_CACHE_MAX_FILES);
+    assert!(cached.exists());
     assert!(
         read_text(&run.join(RCSB_ON_DEMAND_FETCH_MANIFEST))
             .expect("cached fetch audit")
@@ -7686,6 +8056,7 @@ fn rcsb_on_demand_reuses_cache_without_network_and_serializes_same_id_fetches() 
     );
 
     let concurrent_store = root.join("concurrent_store");
+    write_test_rcsb_on_demand_policy(&concurrent_store);
     let concurrent_server = TestHttpServer::start(BTreeMap::from([(
         "/5EEE.cif.gz".to_string(),
         TestHttpResponse {
@@ -7715,7 +8086,6 @@ fn rcsb_on_demand_reuses_cache_without_network_and_serializes_same_id_fetches() 
     assert_eq!(concurrent_server.requests(), ["/5EEE.cif.gz"]);
     let concurrent_coordinate = rcsb_coordinate_cache_path(&concurrent_store, "5EEE");
     assert!(coordinate_file_matches_pdb(&concurrent_coordinate, "5EEE"));
-    let python = vec!["python".to_string()];
     let repeated = fetch_rcsb_coordinate_with_python(
         &concurrent_store,
         "5EEE",
@@ -7724,6 +8094,67 @@ fn rcsb_on_demand_reuses_cache_without_network_and_serializes_same_id_fetches() 
     );
     assert_eq!(repeated.status, "reused");
     assert_eq!(concurrent_server.requests(), ["/5EEE.cif.gz"]);
+    fs::remove_dir_all(&root).expect("cleanup temp root");
+}
+
+#[test]
+fn rcsb_on_demand_cache_evicts_oldest_coordinates_inside_cache() {
+    let root = temp_root("rcsb_on_demand_cache_eviction");
+    let store = root.join("science_store");
+    let oldest = rcsb_coordinate_cache_path(&store, "1AAA");
+    let newer = rcsb_coordinate_cache_path(&store, "2BBB");
+    let protected = rcsb_coordinate_cache_path(&store, "3CCC");
+    let partial = oldest.with_extension("gz.part");
+    let outside = root.join("outside.cif.gz");
+    for path in [&oldest, &newer, &protected] {
+        write_text(path, "abc").expect("cached coordinate");
+    }
+    write_text(&partial, "partial").expect("partial download");
+    write_text(&outside, "outside").expect("outside coordinate");
+
+    let escaped = enforce_rcsb_on_demand_cache_limit(
+        &store,
+        &outside,
+        RcsbOnDemandPolicy {
+            max_cache_bytes: 6,
+            max_cache_files: 2,
+        },
+    )
+    .expect_err("protected path outside cache must fail");
+    assert!(escaped.contains("protected_file_outside_cache"));
+    assert!(oldest.exists());
+
+    enforce_rcsb_on_demand_cache_limit(
+        &store,
+        &protected,
+        RcsbOnDemandPolicy {
+            max_cache_bytes: 6,
+            max_cache_files: 2,
+        },
+    )
+    .expect("enforce bounded cache");
+
+    assert!(!oldest.exists());
+    assert!(newer.exists());
+    assert!(protected.exists());
+    assert!(partial.exists());
+    assert!(outside.exists());
+    fs::remove_dir_all(&root).expect("cleanup temp root");
+}
+
+#[test]
+fn rcsb_on_demand_policy_requires_declared_cache_limits() {
+    let root = temp_root("rcsb_on_demand_cache_policy_limits");
+    let store = root.join("science_store");
+    write_test_rcsb_on_demand_policy(&store);
+    let policy_path = store.join("downloads/rcsb/on_demand_policy.json");
+    let mut policy = serde_json::from_str::<Value>(&read_text(&policy_path).expect("policy"))
+        .expect("policy JSON");
+    policy["max_cache_files"] = json!(RCSB_ON_DEMAND_CACHE_MAX_FILES - 1);
+    write_text(&policy_path, &(policy.to_string() + "\n")).expect("tampered policy");
+
+    let error = validate_rcsb_on_demand_policy(&store).expect_err("cache limit must be fixed");
+    assert_eq!(error, "rcsb_on_demand_policy_invalid:max_cache_files");
     fs::remove_dir_all(&root).expect("cleanup temp root");
 }
 

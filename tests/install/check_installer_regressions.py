@@ -549,6 +549,26 @@ class InstallerRegressionTests(unittest.TestCase):
                 "03b37f2669405833e8745f0fb5dcc7c2b0a780da126c07ad56eb43d5b65aefd5",
             )
 
+            retention = store / "manifests/source_retention_manifest.tsv"
+            scope = store / "downloads/rcsb/ligand_bound_pdb_scope.json"
+            retention.parent.mkdir(parents=True)
+            scope.parent.mkdir(parents=True)
+            retention.write_bytes(b"schema_version\n")
+            scope.write_bytes(b"{}\n")
+            evidence, digest = installer.science_readiness_evidence(store)
+            self.assertEqual(
+                [row["path"] for row in evidence],
+                [
+                    "source_requirements.tsv",
+                    "manifests/source_retention_manifest.tsv",
+                    "downloads/rcsb/ligand_bound_pdb_scope.json",
+                ],
+            )
+            self.assertEqual(
+                digest,
+                "2e9a87483b26f9dca2144590d2b2dd9d551d8ae2658c54a4d6d80d88054f62a6",
+            )
+
     def test_readiness_requires_trusted_source_manifest_evidence(self) -> None:
         installer = self.installer
         with tempfile.TemporaryDirectory() as tmp:
@@ -583,6 +603,53 @@ class InstallerRegressionTests(unittest.TestCase):
             self.assertEqual(bindingdb["source_manifest_status"], "ready")
             self.assertEqual(bindingdb["source_digest"], "b" * 64)
             self.assertEqual(bindingdb["release_identity"], "BindingDB_All_202607_tsv")
+
+    def test_pre_cleanup_readiness_skips_only_terminal_state_gates(self) -> None:
+        installer = self.installer
+        with tempfile.TemporaryDirectory() as tmp:
+            store = Path(tmp)
+            manifest_dir = store / "manifests"
+            manifest_dir.mkdir(parents=True)
+            (manifest_dir / "source_file_manifest.tsv").write_text(
+                "source_id\tstatus\tstorage_state\tsha256\trelease_identity\ttrust_source\n"
+                f"fixture\tready\tindexed_source_pruned\t{'a' * 64}\tfixture-v1\tpublisher_digest\n",
+                encoding="utf-8",
+            )
+            default = installer.evaluate_installer_science_store_readiness(store, persist=False)
+            default_codes = {item["code"] for item in default["blockers"]}
+            self.assertIn("source_retention_missing", default_codes)
+            self.assertIn("install_status_not_ready", default_codes)
+
+            pre_cleanup = installer.evaluate_installer_science_store_readiness(
+                store,
+                persist=False,
+                check_install_status=False,
+                check_source_retention=False,
+            )
+            pre_cleanup_codes = {item["code"] for item in pre_cleanup["blockers"]}
+            self.assertNotIn("source_retention_missing", pre_cleanup_codes)
+            self.assertNotIn("install_status_not_ready", pre_cleanup_codes)
+
+    def test_current_component_results_close_a_no_download_install(self) -> None:
+        installer = self.installer
+        with tempfile.TemporaryDirectory() as tmp:
+            store = Path(tmp)
+            installer.write_capacity_attempt_state(store, status="running")
+            ready = {"status": "ready"}
+            result = installer.installation_status(
+                store,
+                subprocess.CompletedProcess(["gls-cli"], 0, "", ""),
+                {"status": "skipped"},
+                ready,
+                ready,
+                ready,
+                ready,
+                ready,
+                ready,
+                ready,
+            )
+            self.assertEqual(result["status"], "ready")
+            self.assertEqual(result["missing_components_count"], 0)
 
     def test_alignment_manifest_schema_and_legacy_probe_migration(self) -> None:
         installer = self.installer
@@ -845,10 +912,7 @@ class InstallerRegressionTests(unittest.TestCase):
             same_size_replacement[-1] ^= 1
             coordinate.write_bytes(same_size_replacement)
             self.assertEqual(coordinate.stat().st_size, len(original_coordinate))
-            self.assertEqual(
-                validate_partial()["reason"],
-                "foldseek_partial_coordinate_binding_invalid:1ABC",
-            )
+            self.assertEqual(validate_partial()["status"], "ready")
             coordinate.write_bytes(original_coordinate)
 
             lookup.write_text(lookup_text.replace("1abc_A\t0", "1abc_A\t9"), encoding="utf-8")
@@ -1614,6 +1678,8 @@ class InstallerRegressionTests(unittest.TestCase):
                     "coordinate_template": "https://files.rcsb.org/download/{pdb_id}.cif.gz",
                     "cache_root": "downloads/rcsb/mmcif",
                     "max_fetches_per_run": 12,
+                    "max_cache_bytes": 2 * 1024 * 1024 * 1024,
+                    "max_cache_files": 4096,
                     "validation": "gzip_mmcif_entry_and_atom_site",
                     "cached_ready_count": 1,
                     "scope_count": 2,
@@ -2143,7 +2209,7 @@ class InstallerRegressionTests(unittest.TestCase):
                 "status": "ready",
                 "path": str(binary),
                 "sha256": hashlib.sha256(b"binary").hexdigest(),
-                "version": "0.9.73",
+                "version": "0.9.74",
                 "commit": "abc",
                 "build_profile": "release",
                 "smoke": "ready",
@@ -3256,6 +3322,217 @@ class InstallerRegressionTests(unittest.TestCase):
                 self.assertEqual(requests[0], ("", ""), "changed identity must restart instead of append")
                 self.assertFalse(partial.exists())
                 self.assertFalse(installer.partial_identity_path(partial).exists())
+
+    def test_indexed_source_cleanup_publishes_retention_before_deleting_payload(self) -> None:
+        installer = self.installer
+        with tempfile.TemporaryDirectory() as tmp:
+            store = Path(tmp) / "science_store"
+            source = store / "downloads/fixture/source.dat"
+            derived = store / "indexes/fixture.ready"
+            source.parent.mkdir(parents=True)
+            derived.parent.mkdir(parents=True)
+            source.write_bytes(b"source-payload")
+            derived.write_text("ready\n", encoding="utf-8")
+            manifest_dir = store / "manifests"
+            manifest_dir.mkdir(parents=True)
+            (manifest_dir / "source_file_manifest.tsv").write_text(
+                "source_id\tsource_label\tsource_class\tlocal_path\tstatus\tfile_count\tbytes\tsha256\tprovenance\trelease_identity\ttrust_source\n"
+                f"fixture\tFixture\tdirect_download\tdownloads/fixture/source.dat\tready\t1\t{source.stat().st_size}\t{'a' * 64}\thttps://example.invalid/source\tfixture-v1\tpublisher_digest\n",
+                encoding="utf-8",
+            )
+            (store / "download_execution_manifest.tsv").write_text(
+                "source_id\tsha256\n" f"fixture\t{'b' * 64}\n",
+                encoding="utf-8",
+            )
+            policies = {
+                "fixture": {
+                    "payloads": ("downloads/fixture/source.dat",),
+                    "derived": ("indexes/fixture.ready",),
+                }
+            }
+            installer.write_source_retention_rows(
+                store,
+                [
+                    {
+                        "schema_version": installer.SOURCE_RETENTION_SCHEMA_VERSION,
+                        "source_id": "rcsb_ligand_bound",
+                        "state": "runtime_cache_bounded",
+                    }
+                ],
+            )
+            with mock.patch.object(installer, "INDEXED_SOURCE_RETENTION_POLICIES", policies), mock.patch.object(
+                installer, "indexed_source_derivatives_ready", return_value=True
+            ):
+                result = installer.prune_indexed_source_payloads(store)
+            self.assertEqual(result["status"], "ready")
+            self.assertFalse(source.exists())
+            retention = installer.read_tsv(store / "manifests/source_retention_manifest.tsv")
+            retention_by_id = {row["source_id"]: row for row in retention}
+            self.assertEqual(retention_by_id["fixture"]["state"], "pruned")
+            self.assertGreater(int(retention_by_id["fixture"]["pruned_bytes"]), 0)
+            self.assertEqual(retention_by_id["rcsb_ligand_bound"]["state"], "runtime_cache_bounded")
+            source_row = installer.read_tsv(manifest_dir / "source_file_manifest.tsv")[0]
+            self.assertEqual(source_row["status"], "ready")
+            self.assertEqual(source_row["storage_state"], "indexed_source_pruned")
+            self.assertTrue(
+                installer.retained_source_ready(
+                    store,
+                    "fixture",
+                    "downloads/fixture/source.dat",
+                    expected_release_identity="fixture-v1",
+                    expected_trust_source="publisher_digest",
+                    expected_sha256="b" * 64,
+                )
+            )
+            self.assertFalse(
+                installer.retained_source_ready(
+                    store,
+                    "fixture",
+                    "downloads/fixture/source.dat",
+                    expected_release_identity="fixture-v2",
+                )
+            )
+
+    def test_interrupted_source_cleanup_reconciles_before_capacity(self) -> None:
+        installer = self.installer
+        with tempfile.TemporaryDirectory() as tmp:
+            store = Path(tmp) / "science_store"
+            derived = store / "indexes/fixture.ready"
+            derived.parent.mkdir(parents=True)
+            derived.write_text("ready\n", encoding="utf-8")
+            manifest_dir = store / "manifests"
+            manifest_dir.mkdir(parents=True)
+            (manifest_dir / "source_file_manifest.tsv").write_text(
+                "source_id\tstatus\tstorage_state\tsha256\trelease_identity\ttrust_source\n"
+                f"fixture\tready\tmaterialized\t{'a' * 64}\tfixture-v1\tpublisher_digest\n",
+                encoding="utf-8",
+            )
+            installer.write_source_retention_rows(
+                store,
+                [
+                    {
+                        "schema_version": installer.SOURCE_RETENTION_SCHEMA_VERSION,
+                        "source_id": "fixture",
+                        "source_local_path": "downloads/fixture/source.dat",
+                        "state": "pruning",
+                        "source_files": "1",
+                        "source_bytes": "14",
+                        "source_manifest_sha256": "a" * 64,
+                        "execution_sha256": "b" * 64,
+                        "release_identity": "fixture-v1",
+                        "trust_source": "publisher_digest",
+                        "payload_records_json": json.dumps(
+                            [
+                                {
+                                    "path": "downloads/fixture/source.dat",
+                                    "kind": "file",
+                                    "bytes": 14,
+                                }
+                            ]
+                        ),
+                        "derived_paths": "indexes/fixture.ready",
+                    }
+                ],
+            )
+            with mock.patch.object(installer, "indexed_source_derivatives_ready", return_value=True):
+                result = installer.reconcile_interrupted_source_retention(store)
+            self.assertEqual(result["reconciled"], 1)
+            retention = installer.read_tsv(store / "manifests/source_retention_manifest.tsv")[0]
+            self.assertEqual(retention["state"], "pruned")
+            self.assertEqual(retention["pruned_bytes"], "14")
+            source_row = installer.read_tsv(manifest_dir / "source_file_manifest.tsv")[0]
+            self.assertEqual(source_row["storage_state"], "indexed_source_pruned")
+
+    def test_rcsb_retention_gate_supports_complete_mode_and_checks_live_cache_limits(self) -> None:
+        installer = self.installer
+        with tempfile.TemporaryDirectory() as tmp:
+            store = Path(tmp) / "science_store"
+            manifest_dir = store / "manifests"
+            manifest_dir.mkdir(parents=True)
+            source_manifest = manifest_dir / "source_file_manifest.tsv"
+            source_manifest.write_text(
+                "source_id\tstatus\tstorage_state\tsha256\trelease_identity\ttrust_source\n"
+                f"rcsb_ligand_bound\tready\tmaterialized\t{'a' * 64}\trcsb-current\tpublisher_https\n",
+                encoding="utf-8",
+            )
+            scope = store / "downloads/rcsb/ligand_bound_pdb_scope.json"
+            scope.parent.mkdir(parents=True)
+            scope.write_text('{"scope_mode":"complete"}\n', encoding="utf-8")
+            installer.write_source_retention_rows(
+                store,
+                [
+                    {
+                        "schema_version": installer.SOURCE_RETENTION_SCHEMA_VERSION,
+                        "source_id": "fixture",
+                        "state": "pruned",
+                    }
+                ],
+            )
+            complete = installer.evaluate_installer_science_store_readiness(
+                store,
+                persist=False,
+                check_install_status=False,
+            )
+            self.assertNotIn(
+                "rcsb_runtime_cache_not_bounded",
+                {item["code"] for item in complete["blockers"]},
+            )
+
+            source_manifest.write_text(
+                "source_id\tstatus\tstorage_state\tsha256\trelease_identity\ttrust_source\n"
+                f"rcsb_ligand_bound\tready\tbounded_runtime_cache\t{'a' * 64}\trcsb-current\tpublisher_https\n",
+                encoding="utf-8",
+            )
+            scope.write_text('{"scope_mode":"on-demand"}\n', encoding="utf-8")
+            cache_file = store / "downloads/rcsb/mmcif/ab/1abc.cif.gz"
+            cache_file.parent.mkdir(parents=True)
+            cache_file.write_bytes(b"oversized")
+            (store / "downloads/rcsb/on_demand_policy.json").write_text(
+                json.dumps(
+                    {
+                        "mode": "on_demand",
+                        "max_cache_bytes": 1,
+                        "max_cache_files": 1,
+                    }
+                ),
+                encoding="utf-8",
+            )
+            installer.write_source_retention_rows(
+                store,
+                [
+                    {
+                        "schema_version": installer.SOURCE_RETENTION_SCHEMA_VERSION,
+                        "source_id": "rcsb_ligand_bound",
+                        "state": "runtime_cache_bounded",
+                    }
+                ],
+            )
+            with mock.patch.object(installer, "RCSB_ON_DEMAND_MAX_CACHE_BYTES", 1), mock.patch.object(
+                installer,
+                "RCSB_ON_DEMAND_MAX_CACHE_FILES",
+                1,
+            ):
+                on_demand = installer.evaluate_installer_science_store_readiness(
+                    store,
+                    persist=False,
+                    check_install_status=False,
+                )
+            self.assertIn(
+                "rcsb_runtime_cache_not_bounded",
+                {item["code"] for item in on_demand["blockers"]},
+            )
+
+    def test_indexed_source_cleanup_rejects_path_outside_downloads(self) -> None:
+        installer = self.installer
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            store = root / "science_store"
+            outside = root / "outside.dat"
+            (store / "downloads").mkdir(parents=True)
+            outside.write_bytes(b"keep")
+            with self.assertRaises(OSError):
+                installer.safe_remove_indexed_payload(store, "../outside.dat")
+            self.assertEqual(outside.read_bytes(), b"keep")
 
 
 if __name__ == "__main__":

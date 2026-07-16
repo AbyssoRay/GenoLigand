@@ -1030,6 +1030,12 @@ fn health_and_setup_expose_canonical_readiness_blocker_evidence_and_repair() {
                 "evidence": "ready=7 scope=9",
                 "repair_action": "sync_rcsb_ligand_bound_scope"
             }],
+            "advisories": [{
+                "code": "rcsb_foldseek_refresh_needed",
+                "component": "rcsb",
+                "evidence": "cached coordinate set changed after the published snapshot",
+                "action": "refresh_foldseek_when_convenient"
+            }],
             "repair_actions": ["sync_rcsb_ligand_bound_scope"]
         })
         .to_string(),
@@ -1051,6 +1057,14 @@ fn health_and_setup_expose_canonical_readiness_blocker_evidence_and_repair() {
         );
         assert_eq!(readiness["sources"][0]["logical_source"], "rcsb_ligand_bound");
         assert_eq!(readiness["indexes"][0]["index"], "structure_targets");
+        assert_eq!(
+            readiness["advisories"][0],
+            "rcsb_foldseek_refresh_needed"
+        );
+        assert_eq!(
+            readiness["advisory_details"][0]["action"],
+            "refresh_foldseek_when_convenient"
+        );
     }
     fs::remove_dir_all(root).ok();
 }
