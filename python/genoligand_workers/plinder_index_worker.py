@@ -131,6 +131,7 @@ def build_plinder_canonical(
                 "batch_size": scan_batch_size,
                 "batch_count": batch_count,
                 "max_batch_rows": max_batch_rows,
+                "filtered_rows": parquet.metadata.num_rows - row_count,
             },
         }
         manifest_tmp = _temporary_path(manifest_output)

@@ -187,6 +187,18 @@ LIGAND_SIMILARITY_STANDARDIZATION = (
 )
 LIGAND_SIMILARITY_TAUTOMER_LIMIT = 100
 LIGAND_SIMILARITY_SQLITE_VALIDATION_CACHE: set[tuple[str, int, str]] = set()
+STRUCTURE_TARGETS_MANIFEST_REL_PATH = "indexes/structure_targets.manifest.json"
+LEGACY_STRUCTURE_TARGETS_PUBLICATION_SCHEMA_VERSION = "genoligand_structure_targets_publication_v1"
+STRUCTURE_TARGETS_PUBLICATION_SCHEMA_VERSION = "genoligand_structure_targets_publication_v2"
+STRUCTURE_CONTRIBUTION_SOURCE_IDS = {
+    "PLINDER": "plinder",
+    "BioLiP2": "biolip2",
+    "Binding MOAD": "binding_moad",
+    "RCSB": "rcsb_ligand_bound",
+}
+STRUCTURE_TARGETS_PUBLICATION_VALIDATION_CACHE: dict[
+    tuple[str, int, int, str, str], frozenset[str]
+] = {}
 SCIENCE_READINESS_EVIDENCE_PATHS = (
     "source_requirements.tsv",
     "manifests/source_file_manifest.tsv",
@@ -198,6 +210,7 @@ SCIENCE_READINESS_EVIDENCE_PATHS = (
     "indexes/known_targets.tsv",
     "indexes/metagenome_targets.tsv",
     "indexes/structure_targets.tsv",
+    STRUCTURE_TARGETS_MANIFEST_REL_PATH,
     "indexes/tool_versions.tsv",
     "indexes/mmseqs/mmseqs_target_databases.tsv",
     "indexes/foldseek/foldseek_target_databases.tsv",
@@ -237,6 +250,14 @@ SOURCE_RETENTION_MANIFEST_REL_PATH = "manifests/source_retention_manifest.tsv"
 RCSB_ON_DEMAND_MAX_CACHE_BYTES = 2 * 1024 * 1024 * 1024
 RCSB_ON_DEMAND_MAX_CACHE_FILES = 4096
 RCSB_ON_DEMAND_INITIAL_CACHE_FILES = 256
+BIOLIP2_MMSEQS_SOURCE_PATHS = frozenset(
+    {
+        "downloads/biolip2/peptide.fasta.gz",
+        "downloads/biolip2/peptide_nr.fasta.gz",
+        "downloads/biolip2/protein.fasta.gz",
+        "downloads/biolip2/protein_nr.fasta.gz",
+    }
+)
 INDEXED_SOURCE_RETENTION_POLICIES: dict[str, dict[str, object]] = {
     "chembl": {
         "payloads": ("downloads/chembl/chembl_sqlite.tar.gz",),
@@ -254,29 +275,31 @@ INDEXED_SOURCE_RETENTION_POLICIES: dict[str, dict[str, object]] = {
     },
     "uniprot_human_reviewed": {
         "payloads": ("downloads/uniprot/uniprot_human_reviewed.fasta.gz",),
-        "derived": (
-            "indexes/known_targets.tsv",
-            "indexes/mmseqs/mmseqs_target_databases.tsv",
-        ),
+        "derived": ("indexes/mmseqs/mmseqs_target_databases.tsv",),
     },
     "binding_moad": {
         "payloads": ("downloads/binding_moad/bindingmoad.csv",),
-        "derived": ("indexes/structure_targets.tsv",),
+        "derived": (
+            "indexes/structure_targets.tsv",
+            STRUCTURE_TARGETS_MANIFEST_REL_PATH,
+            "index_build_manifest.tsv",
+        ),
     },
     "biolip2": {
         "payloads": ("downloads/biolip2",),
         "derived": (
-            "indexes/known_targets.tsv",
             "indexes/structure_targets.tsv",
+            STRUCTURE_TARGETS_MANIFEST_REL_PATH,
+            "index_build_manifest.tsv",
             "indexes/mmseqs/mmseqs_target_databases.tsv",
         ),
     },
     "plinder": {
         "payloads": ("downloads/plinder/index",),
         "derived": (
-            "indexes/plinder_targets.tsv",
-            "indexes/plinder_targets.manifest.json",
             "indexes/structure_targets.tsv",
+            STRUCTURE_TARGETS_MANIFEST_REL_PATH,
+            "index_build_manifest.tsv",
         ),
     },
     "metagenome_potential": {
@@ -4963,6 +4986,8 @@ SOURCE_RETENTION_FIELDS = [
     "trust_source",
     "payload_records_json",
     "derived_paths",
+    "structure_input_bytes",
+    "structure_input_digest",
     "pruned_bytes",
     "pruned_at",
     "notes",
@@ -4998,6 +5023,30 @@ def retention_payload_records(row: dict[str, str]) -> list[dict[str, object]]:
     except json.JSONDecodeError:
         return []
     return [item for item in value if isinstance(item, dict)] if isinstance(value, list) else []
+
+
+def retention_payload_record_valid(record: dict[str, object]) -> bool:
+    relative = str(record.get("path", "")).replace("\\", "/")
+    path = Path(relative)
+    try:
+        return bool(
+            relative
+            and not path.is_absolute()
+            and ".." not in path.parts
+            and str(record.get("kind", "")) in {"file", "directory"}
+            and int(record.get("file_count", 0) or 0) > 0
+            and int(record.get("bytes", 0) or 0) > 0
+            and re.fullmatch(r"[0-9a-f]{64}", str(record.get("sha256", "")).lower())
+            and (
+                str(record.get("kind", "")) != "file"
+                or re.fullmatch(
+                    r"[0-9a-f]{64}",
+                    str(record.get("content_sha256", "")).lower(),
+                )
+            )
+        )
+    except (TypeError, ValueError):
+        return False
 
 
 def retention_covers_source_path(science_store: Path, source_path: str) -> bool:
@@ -5230,6 +5279,433 @@ def ligand_similarity_index_ready(
         return False
 
 
+def structure_contribution_source_paths_state(science_store: Path, source_paths: object) -> str:
+    if not isinstance(source_paths, list) or not source_paths:
+        return "invalid"
+    store_root = science_store.resolve()
+    states: list[bool] = []
+    try:
+        for value in source_paths:
+            if not isinstance(value, str) or not value.strip():
+                return "invalid"
+            relative = Path(value.replace("\\", "/"))
+            if relative.is_absolute() or ".." in relative.parts:
+                return "invalid"
+            candidate = science_store / relative
+            resolved = candidate.resolve()
+            if not resolved.is_relative_to(store_root) or candidate.is_symlink():
+                return "invalid"
+            states.append(path_has_payload(candidate))
+    except (OSError, ValueError):
+        return "invalid"
+    if all(states):
+        return "all"
+    if not any(states):
+        return "none"
+    return "partial"
+
+
+def structure_contribution_input_summary(
+    science_store: Path,
+    source_paths: object,
+    summary_cache: ResourceSummaryCache | None = None,
+) -> dict[str, object]:
+    if not isinstance(source_paths, list) or not source_paths:
+        return {}
+    store_root = science_store.resolve()
+    files: dict[str, Path] = {}
+    try:
+        for value in source_paths:
+            if not isinstance(value, str) or not value.strip():
+                return {}
+            relative = Path(value.replace("\\", "/"))
+            if relative.is_absolute() or ".." in relative.parts:
+                return {}
+            candidate = science_store / relative
+            resolved = candidate.resolve()
+            if not resolved.is_relative_to(store_root) or candidate.is_symlink():
+                return {}
+            if candidate.is_file():
+                candidates = [candidate]
+            elif candidate.is_dir():
+                candidates = sorted(
+                    child
+                    for child in candidate.rglob("*")
+                    if child.is_file() and resource_manifest_file(child) and child.stat().st_size > 0
+                )
+            else:
+                return {}
+            if not candidates:
+                return {}
+            for child in candidates:
+                child_resolved = child.resolve()
+                if (
+                    child.is_symlink()
+                    or not child_resolved.is_relative_to(store_root)
+                    or child.stat().st_size <= 0
+                ):
+                    return {}
+                rel = child_resolved.relative_to(store_root).as_posix()
+                files[rel] = child
+        if not files:
+            return {}
+        digest = hashlib.sha256()
+        total_bytes = 0
+        for rel, child in sorted(files.items()):
+            summary = resource_payload_summary(child, cache=summary_cache)
+            size = int(summary.get("bytes", 0) or 0)
+            content_sha256 = str(summary.get("content_sha256", "")).lower()
+            if size <= 0 or not re.fullmatch(r"[0-9a-f]{64}", content_sha256):
+                return {}
+            digest.update(rel.encode("utf-8"))
+            digest.update(str(size).encode("ascii"))
+            digest.update(content_sha256.encode("ascii"))
+            total_bytes += size
+        return {
+            "file_count": len(files),
+            "input_bytes": total_bytes,
+            "input_digest": digest.hexdigest(),
+            "paths": sorted(files),
+        }
+    except (OSError, TypeError, ValueError):
+        return {}
+
+
+def structure_contribution_source_identity_matches(
+    contribution: dict[str, object],
+    source_manifest: dict[str, str],
+) -> bool:
+    return bool(
+        source_manifest.get("status") == "ready"
+        and str(contribution.get("source_digest", "")).lower()
+        == source_manifest.get("sha256", "").lower()
+        and contribution.get("release_identity") == source_manifest.get("release_identity")
+        and contribution.get("trust_source") == source_manifest.get("trust_source")
+    )
+
+
+def structure_contribution_retention_identity_matches(
+    contribution: dict[str, object],
+    retention: dict[str, str],
+) -> bool:
+    try:
+        return bool(
+            retention.get("schema_version") == SOURCE_RETENTION_SCHEMA_VERSION
+            and retention.get("state")
+            in {"pruned", "pruning", "cleanup_failed", "runtime_cache_bounded"}
+            and str(contribution.get("source_digest", "")).lower()
+            == retention.get("source_manifest_sha256", "").lower()
+            and contribution.get("release_identity") == retention.get("release_identity")
+            and contribution.get("trust_source") == retention.get("trust_source")
+            and int(contribution.get("input_bytes", 0))
+            == int(retention.get("structure_input_bytes", 0) or 0)
+            and str(contribution.get("input_digest", "")).lower()
+            == retention.get("structure_input_digest", "").lower()
+        )
+    except (TypeError, ValueError):
+        return False
+
+
+def structure_build_contributions(science_store: Path) -> dict[str, tuple[int, tuple[str, ...]]]:
+    contribution_notes = {
+        "plinder_canonical_rows": "PLINDER",
+        "biolip2_interaction_rows": "BioLiP2",
+        "binding_moad_complex_rows": "Binding MOAD",
+        "rcsb_structure_file_rows": "RCSB",
+    }
+    rows_by_source: dict[str, int] = {}
+    paths_by_source: dict[str, set[str]] = {}
+    try:
+        for row in read_tsv(science_store / "index_build_manifest.tsv"):
+            if (
+                row.get("index") != "structure_targets"
+                or row.get("status") != "used"
+                or row.get("output_path", "").replace("\\", "/")
+                != "indexes/structure_targets.tsv"
+            ):
+                continue
+            notes = set(row.get("notes", "").split(";"))
+            sources = {source for token, source in contribution_notes.items() if token in notes}
+            if len(sources) != 1:
+                return {}
+            source = sources.pop()
+            count = int(row.get("rows", 0) or 0)
+            path = row.get("input_path", "").replace("\\", "/")
+            if count <= 0 or not path:
+                return {}
+            rows_by_source[source] = rows_by_source.get(source, 0) + count
+            paths_by_source.setdefault(source, set()).add(path)
+    except (TypeError, ValueError):
+        return {}
+    return {
+        source: (rows_by_source[source], tuple(sorted(paths)))
+        for source, paths in paths_by_source.items()
+    }
+
+
+def structure_targets_publication_contribution(
+    science_store: Path,
+    required_source: str,
+) -> dict[str, object]:
+    manifest = read_json_object(science_store / STRUCTURE_TARGETS_MANIFEST_REL_PATH)
+    contributions = manifest.get("contributions")
+    if manifest.get("schema_version") != STRUCTURE_TARGETS_PUBLICATION_SCHEMA_VERSION or not isinstance(
+        contributions, list
+    ):
+        return {}
+    return next(
+        (
+            dict(contribution)
+            for contribution in contributions
+            if isinstance(contribution, dict) and contribution.get("source") == required_source
+        ),
+        {},
+    )
+
+
+def structure_targets_publication_ready(
+    science_store: Path,
+    required_source: str = "",
+    summary_cache: ResourceSummaryCache | None = None,
+    *,
+    require_live_inputs: bool = False,
+) -> bool:
+    table = science_store / "indexes/structure_targets.tsv"
+    manifest_path = science_store / STRUCTURE_TARGETS_MANIFEST_REL_PATH
+    if (
+        not table.is_file()
+        or table.is_symlink()
+        or not manifest_path.is_file()
+        or manifest_path.is_symlink()
+    ):
+        return False
+    manifest = read_json_object(manifest_path)
+    contributions = manifest.get("contributions")
+    declared_rows = manifest.get("rows")
+    declared_bytes = manifest.get("bytes")
+    declared_sha256 = str(manifest.get("sha256", "")).lower()
+    if not (
+        manifest.get("schema_version") == STRUCTURE_TARGETS_PUBLICATION_SCHEMA_VERSION
+        and manifest.get("status") == "ready"
+        and manifest.get("path") == "indexes/structure_targets.tsv"
+        and type(declared_rows) is int
+        and declared_rows > 0
+        and type(declared_bytes) is int
+        and declared_bytes > 0
+        and re.fullmatch(r"[0-9a-f]{64}", declared_sha256)
+        and isinstance(contributions, list)
+        and contributions
+    ):
+        return False
+    source_manifest_rows = read_tsv(science_store / "manifests/source_file_manifest.tsv")
+    source_rows = {
+        source_id: matches[0]
+        for source_id in STRUCTURE_CONTRIBUTION_SOURCE_IDS.values()
+        if len(
+            matches := [
+                row
+                for row in source_manifest_rows
+                if row.get("source_id") == source_id and row.get("status") == "ready"
+            ]
+        )
+        == 1
+    }
+    build_contributions = structure_build_contributions(science_store)
+    retention_rows = {
+        row.get("source_id", ""): row
+        for row in source_retention_rows(science_store)
+        if row.get("source_id")
+    }
+    contribution_sources: set[str] = set()
+    for contribution in contributions:
+        if not isinstance(contribution, dict):
+            return False
+        source = str(contribution.get("source", ""))
+        source_id = str(contribution.get("source_id", ""))
+        rows = contribution.get("rows")
+        source_paths = contribution.get("source_paths")
+        source_digest = str(contribution.get("source_digest", "")).lower()
+        release_identity = contribution.get("release_identity")
+        trust_source = contribution.get("trust_source")
+        input_bytes = contribution.get("input_bytes")
+        input_digest = str(contribution.get("input_digest", "")).lower()
+        if not (
+            source in STRUCTURE_CONTRIBUTION_SOURCE_IDS
+            and source_id == STRUCTURE_CONTRIBUTION_SOURCE_IDS[source]
+            and source not in contribution_sources
+            and type(rows) is int
+            and rows > 0
+            and isinstance(source_paths, list)
+            and source_paths
+            and all(isinstance(path, str) and path.strip() for path in source_paths)
+            and re.fullmatch(r"[0-9a-f]{64}", source_digest)
+            and isinstance(release_identity, str)
+            and bool(release_identity)
+            and isinstance(trust_source, str)
+            and bool(trust_source)
+            and type(input_bytes) is int
+            and input_bytes > 0
+            and re.fullmatch(r"[0-9a-f]{64}", input_digest)
+        ):
+            return False
+        if build_contributions.get(source) != (
+            rows,
+            tuple(sorted(path.replace("\\", "/") for path in source_paths)),
+        ):
+            return False
+        source_identity_ready = structure_contribution_source_identity_matches(
+            contribution,
+            source_rows.get(source_id, {}),
+        )
+        retention_identity_ready = structure_contribution_retention_identity_matches(
+            contribution,
+            retention_rows.get(source_id, {}),
+        )
+        if not source_identity_ready and not retention_identity_ready:
+            return False
+        input_state = structure_contribution_source_paths_state(science_store, source_paths)
+        if input_state == "invalid" or (
+            input_state == "partial" and not (source == "RCSB" and retention_identity_ready)
+        ):
+            return False
+        live_input = (
+            structure_contribution_input_summary(science_store, source_paths, summary_cache)
+            if input_state == "all"
+            else {}
+        )
+        if input_state == "all":
+            if not (
+                int(live_input.get("input_bytes", 0)) == input_bytes
+                and str(live_input.get("input_digest", "")).lower() == input_digest
+            ):
+                return False
+        elif require_live_inputs or not retention_identity_ready:
+            return False
+        contribution_sources.add(source)
+    if set(build_contributions) != contribution_sources:
+        return False
+    if required_source and required_source not in contribution_sources:
+        return False
+    try:
+        table_stat = table.stat()
+        cache_key = (
+            str(table.resolve()),
+            table_stat.st_size,
+            table_stat.st_mtime_ns,
+            declared_sha256,
+            sha256_file(manifest_path),
+        )
+        cached_sources = STRUCTURE_TARGETS_PUBLICATION_VALIDATION_CACHE.get(cache_key)
+        if cached_sources is not None:
+            return not required_source or required_source in cached_sources
+        if table_stat.st_size != declared_bytes:
+            return False
+        digest = hashlib.sha256()
+        row_count = 0
+        with table.open("rb") as handle:
+            header = handle.readline()
+            digest.update(header)
+            if header.rstrip(b"\r\n") != (
+                b"source\ttarget_id\ttarget_name\torganism\ttarget_class\tligand_tokens\t"
+                b"sequence_tokens\tstructure_tokens\tevidence"
+            ):
+                return False
+            for line in handle:
+                digest.update(line)
+                if line.strip():
+                    row_count += 1
+        if row_count != declared_rows or digest.hexdigest() != declared_sha256:
+            return False
+        STRUCTURE_TARGETS_PUBLICATION_VALIDATION_CACHE[cache_key] = frozenset(contribution_sources)
+        return True
+    except (OSError, TypeError, ValueError):
+        return False
+
+
+def mmseqs_namespace_rows_complete(
+    rows: list[dict[str, str]],
+    namespace: str,
+    minimum: int,
+) -> bool:
+    identities = {
+        (
+            str(row.get("source_path", "")).replace("\\", "/").strip("/").casefold(),
+            str(row.get("db_path", "")).replace("\\", "/").strip("/").casefold(),
+        )
+        for row in rows
+        if row.get("source_namespace") == namespace
+        and str(row.get("source_path", "")).strip()
+        and str(row.get("db_path", "")).strip()
+    }
+    if namespace == "BioLiP2":
+        source_paths = {source_path for source_path, _ in identities}
+        database_paths = {database_path for _, database_path in identities}
+        return bool(
+            BIOLIP2_MMSEQS_SOURCE_PATHS.issubset(source_paths)
+            and len(database_paths) >= len(BIOLIP2_MMSEQS_SOURCE_PATHS)
+        )
+    return len(identities) >= minimum
+
+
+def structure_source_payload_matches_manifest(
+    science_store: Path,
+    source_id: str,
+    source_manifest: dict[str, str],
+    payload_records: list[dict[str, object]],
+    summary_cache: ResourceSummaryCache | None = None,
+) -> bool:
+    local_path = source_manifest.get("local_path", "").replace("\\", "/").strip("/")
+    matching = next(
+        (
+            record
+            for record in payload_records
+            if str(record.get("path", "")).replace("\\", "/").strip("/") == local_path
+        ),
+        {},
+    )
+    try:
+        exact = bool(
+            matching
+            and str(matching.get("sha256", "")).lower() == source_manifest.get("sha256", "").lower()
+            and int(matching.get("bytes", 0) or 0) == int(source_manifest.get("bytes", 0) or 0)
+            and int(matching.get("file_count", 0) or 0)
+            == int(source_manifest.get("file_count", 0) or 0)
+        )
+    except (TypeError, ValueError):
+        return False
+    if exact:
+        return True
+    if source_id != "biolip2":
+        return False
+    contribution = structure_targets_publication_contribution(science_store, "BioLiP2")
+    input_summary = structure_contribution_input_summary(
+        science_store,
+        contribution.get("source_paths"),
+        summary_cache,
+    )
+    if not input_summary or not (
+        int(input_summary.get("input_bytes", 0)) == int(contribution.get("input_bytes", 0) or 0)
+        and str(input_summary.get("input_digest", "")).lower()
+        == str(contribution.get("input_digest", "")).lower()
+    ):
+        return False
+    live_files: set[str] = set()
+    store_root = science_store.resolve()
+    try:
+        for record in payload_records:
+            path = science_store / str(record.get("path", ""))
+            candidates = [path] if path.is_file() else list(path.rglob("*")) if path.is_dir() else []
+            for child in candidates:
+                if child.is_file() and resource_manifest_file(child) and child.stat().st_size > 0:
+                    resolved = child.resolve()
+                    if child.is_symlink() or not resolved.is_relative_to(store_root):
+                        return False
+                    live_files.add(resolved.relative_to(store_root).as_posix())
+    except (OSError, ValueError):
+        return False
+    return bool(live_files and live_files == set(input_summary.get("paths", [])))
+
+
 def indexed_source_derivatives_ready(
     science_store: Path,
     source_id: str,
@@ -5250,6 +5726,40 @@ def indexed_source_derivatives_ready(
     execution_sha256 = ""
     if payload_records:
         execution_sha256 = str(payload_records[0].get("content_sha256", ""))
+    live_payload = any(
+        path_has_payload(science_store / str(record.get("path", "")))
+        for record in payload_records
+        if str(record.get("path", "")).strip()
+    )
+    if live_payload and not structure_source_payload_matches_manifest(
+        science_store,
+        source_id,
+        source_manifest,
+        payload_records,
+        summary_cache,
+    ):
+        return False
+    structure_sources = {
+        "biolip2": "BioLiP2",
+        "binding_moad": "Binding MOAD",
+        "plinder": "PLINDER",
+    }
+    if source_id in structure_sources:
+        if not structure_targets_publication_ready(
+            science_store,
+            structure_sources[source_id],
+            summary_cache,
+            require_live_inputs=live_payload,
+        ):
+            return False
+        if source_id == "plinder":
+            source = plinder_parquet_source(science_store)
+            if source is not None and not plinder_canonical_index_ready(
+                source,
+                science_store / "indexes/plinder_targets.tsv",
+                science_store / "indexes/plinder_targets.manifest.json",
+            ):
+                return False
     if source_id in {"chembl", "bindingdb"} and ligand_similarity_index_ready(
         science_store,
         source_manifest_rows_by_id(science_store),
@@ -5291,7 +5801,7 @@ def indexed_source_derivatives_ready(
                 and database_artifacts_present(db_path)
             )
         ]
-        if len(rows) < minimum:
+        if not mmseqs_namespace_rows_complete(rows, namespace, minimum):
             return False
     build_rows = read_tsv(science_store / "index_build_manifest.tsv")
     if source_id == "binding_moad":
@@ -5309,14 +5819,16 @@ def indexed_source_derivatives_ready(
             for row in build_rows
         )
     if source_id == "plinder":
-        manifest = read_json_object(science_store / "indexes/plinder_targets.manifest.json")
-        canonical = manifest.get("canonical", {})
-        return bool(
-            manifest.get("status") == "ready"
-            and isinstance(canonical, dict)
-            and int(canonical.get("row_count", 0) or 0) > 0
-            and int(canonical.get("size_bytes", 0) or 0)
-            == (science_store / "indexes/plinder_targets.tsv").stat().st_size
+        return any(
+            row.get("index") == "structure_targets"
+            and row.get("status") == "used"
+            and row.get("input_path", "").replace("\\", "/")
+            == "indexes/plinder_targets.tsv"
+            and row.get("output_path", "").replace("\\", "/")
+            == "indexes/structure_targets.tsv"
+            and int(row.get("rows", 0) or 0) > 0
+            and "plinder_canonical_rows" in row.get("notes", "").split(";")
+            for row in build_rows
         )
     return True
 
@@ -5355,8 +5867,11 @@ def retained_source_derivatives_ready(
     row: dict[str, str],
     summary_cache: ResourceSummaryCache | None = None,
 ) -> bool:
+    records = retention_payload_records(row)
     return bool(
         row.get("state") == "pruned"
+        and records
+        and all(retention_payload_record_valid(record) for record in records)
         and retention_source_identity_and_derivatives_ready(
             science_store,
             row,
@@ -5364,7 +5879,7 @@ def retained_source_derivatives_ready(
         )
         and all(
             not path_has_payload(science_store / str(record.get("path", "")))
-            for record in retention_payload_records(row)
+            for record in records
             if str(record.get("path", "")).strip()
         )
     )
@@ -5389,9 +5904,46 @@ def retained_source_ready(
         return {}
     if expected_sha256 and row.get("execution_sha256", "").lower() != expected_sha256.lower():
         return {}
-    if row.get("state") not in {"pruned", "pruning", "cleanup_failed"}:
+    if row.get("state") != "pruned":
         return {}
-    return row if retention_source_identity_and_derivatives_ready(science_store, row, summary_cache) else {}
+    return row if retained_source_derivatives_ready(science_store, row, summary_cache) else {}
+
+
+def retention_live_payloads_match_records(
+    science_store: Path,
+    row: dict[str, str],
+    summary_cache: ResourceSummaryCache | None = None,
+) -> bool:
+    records = retention_payload_records(row)
+    if not records or not all(retention_payload_record_valid(record) for record in records):
+        return False
+    for record in records:
+        relative = str(record.get("path", ""))
+        if not relative:
+            return False
+        path = science_store / relative
+        if not path_has_payload(path):
+            continue
+        kind = "directory" if path.is_dir() else "file" if path.is_file() else ""
+        summary = resource_payload_summary(path, cache=summary_cache)
+        try:
+            if not (
+                kind == str(record.get("kind", ""))
+                and int(summary.get("file_count", 0) or 0)
+                == int(record.get("file_count", 0) or 0)
+                and int(summary.get("bytes", 0) or 0) == int(record.get("bytes", 0) or 0)
+                and str(summary.get("sha256", "")).lower()
+                == str(record.get("sha256", "")).lower()
+                and (
+                    kind != "file"
+                    or str(summary.get("content_sha256", "")).lower()
+                    == str(record.get("content_sha256", "")).lower()
+                )
+            ):
+                return False
+        except (TypeError, ValueError):
+            return False
+    return True
 
 
 def reconcile_interrupted_source_retention(
@@ -5459,6 +6011,25 @@ def safe_remove_indexed_payload(science_store: Path, relative: str) -> int:
     return reclaimed
 
 
+def remove_plinder_canonical_intermediates(science_store: Path) -> int:
+    indexes_root = (science_store / "indexes").resolve()
+    reclaimed = 0
+    for relative in ("indexes/plinder_targets.tsv", "indexes/plinder_targets.manifest.json"):
+        target = science_store / relative
+        if not target.exists():
+            continue
+        resolved = target.resolve()
+        try:
+            resolved.relative_to(indexes_root)
+        except ValueError as err:
+            raise OSError(f"plinder_intermediate_path_unsafe:{relative}") from err
+        if target.is_symlink() or not target.is_file():
+            raise OSError(f"plinder_intermediate_file_required:{relative}")
+        reclaimed += target.stat().st_size
+        target.unlink()
+    return reclaimed
+
+
 def update_source_storage_states(science_store: Path, states: dict[str, str]) -> None:
     manifest = science_store / "manifests/source_file_manifest.tsv"
     rows = read_tsv(manifest)
@@ -5504,6 +6075,12 @@ def prune_indexed_source_payloads(
     failures: list[str] = []
     for source_id, policy in INDEXED_SOURCE_RETENTION_POLICIES.items():
         old = previous.get(source_id, {})
+        if old:
+            migrated = dict(old)
+            migrated["derived_paths"] = ";".join(str(value) for value in policy["derived"])
+            if retained_source_derivatives_ready(science_store, migrated, summary_cache):
+                prepared.append(migrated)
+                continue
         if retained_source_derivatives_ready(science_store, old, summary_cache):
             prepared.append(dict(old))
             continue
@@ -5512,6 +6089,9 @@ def prune_indexed_source_payloads(
             old,
             summary_cache,
         ):
+            if not retention_live_payloads_match_records(science_store, old, summary_cache):
+                failures.append(f"{source_id}:source_payload_changed_during_cleanup_resume")
+                continue
             resumed = dict(old)
             resumed["state"] = "pruning"
             resumed["notes"] = "resuming_verified_source_cleanup"
@@ -5549,6 +6129,16 @@ def prune_indexed_source_payloads(
             failures.append(f"{source_id}:derived_index_not_ready")
             continue
         execution = download_rows.get(source_id) or external_rows.get(source_id) or {}
+        structure_source = {
+            "biolip2": "BioLiP2",
+            "binding_moad": "Binding MOAD",
+            "plinder": "PLINDER",
+        }.get(source_id, "")
+        structure_contribution = (
+            structure_targets_publication_contribution(science_store, structure_source)
+            if structure_source
+            else {}
+        )
         prepared.append(
             {
                 "schema_version": SOURCE_RETENTION_SCHEMA_VERSION,
@@ -5564,6 +6154,8 @@ def prune_indexed_source_payloads(
                 "trust_source": source_manifest.get("trust_source", ""),
                 "payload_records_json": json.dumps(payload_records, ensure_ascii=True, separators=(",", ":")),
                 "derived_paths": ";".join(derived),
+                "structure_input_bytes": str(structure_contribution.get("input_bytes", "")),
+                "structure_input_digest": str(structure_contribution.get("input_digest", "")),
                 "pruned_bytes": "0",
                 "pruned_at": "",
                 "notes": "validated_indexes_pending_source_cleanup",
@@ -5587,7 +6179,11 @@ def prune_indexed_source_payloads(
             continue
         reclaimed = 0
         try:
+            if not retention_live_payloads_match_records(science_store, row, summary_cache):
+                raise OSError("source_payload_changed_before_cleanup")
             for record in retention_payload_records(row):
+                if not retention_live_payloads_match_records(science_store, row, summary_cache):
+                    raise OSError("source_payload_changed_during_cleanup")
                 relative = str(record.get("path", ""))
                 reclaimed += safe_remove_indexed_payload(science_store, relative)
                 if summary_cache is not None:
@@ -5614,13 +6210,28 @@ def prune_indexed_source_payloads(
     states = {row["source_id"]: "indexed_source_pruned" for row in prepared}
     update_source_storage_states(science_store, states)
     valid = all(retained_source_derivatives_ready(science_store, row, summary_cache) for row in prepared)
+    cleanup_failures: list[str] = []
+    plinder_retention = source_retention_row(science_store, "plinder")
+    plinder_policy_paths = ";".join(
+        str(value) for value in INDEXED_SOURCE_RETENTION_POLICIES.get("plinder", {}).get("derived", ())
+    )
+    if (
+        valid
+        and plinder_retention.get("derived_paths") == plinder_policy_paths
+        and retained_source_derivatives_ready(science_store, plinder_retention, summary_cache)
+        and structure_targets_publication_ready(science_store, "PLINDER", summary_cache)
+    ):
+        try:
+            reclaimed_total += remove_plinder_canonical_intermediates(science_store)
+        except OSError as err:
+            cleanup_failures.append(f"plinder:{exception_note(err)}")
     return {
-        "status": "ready" if valid else "needs_repair",
+        "status": "ready" if valid and not cleanup_failures else "needs_repair",
         "ready": sum(row.get("state") == "pruned" for row in prepared),
         "total": len(prepared),
         "reclaimed_bytes": reclaimed_total,
         "manifest": str(source_retention_manifest_path(science_store)),
-        "failures": [] if valid else ["retained_derivative_validation_failed"],
+        "failures": cleanup_failures if valid else ["retained_derivative_validation_failed"],
     }
 
 
@@ -5653,6 +6264,18 @@ def prune_rcsb_on_demand_cache(
     cache_root = science_store / "downloads/rcsb/mmcif"
     if not cache_root.is_dir():
         return {"status": "needs_repair", "reclaimed_bytes": 0, "reason": "rcsb_cache_missing"}
+    if not structure_targets_publication_ready(
+        science_store,
+        "RCSB",
+        summary_cache,
+        require_live_inputs=True,
+    ):
+        return {
+            "status": "needs_repair",
+            "reclaimed_bytes": 0,
+            "reason": "rcsb_structure_publication_identity_mismatch",
+        }
+    rcsb_contribution = structure_targets_publication_contribution(science_store, "RCSB")
     files: list[tuple[Path, int, int]] = []
     for path in cache_root.rglob("*.cif.gz"):
         if not path.is_file() or path.is_symlink():
@@ -5859,11 +6482,11 @@ def prune_rcsb_on_demand_cache(
             "state": "runtime_cache_bounded",
             "source_files": str(source_summary.get("file_count", 0)),
             "source_bytes": str(source_summary.get("bytes", 0)),
-            "source_manifest_sha256": str(source_summary.get("sha256", "")),
+            "source_manifest_sha256": str(rcsb_contribution.get("source_digest", "")),
             "execution_sha256": str(snapshot["coordinate_digest"]),
-            "release_identity": rcsb_source.get("release_identity", ""),
+            "release_identity": str(rcsb_contribution.get("release_identity", "")),
             "provenance": rcsb_source.get("provenance", ""),
-            "trust_source": rcsb_source.get("trust_source", ""),
+            "trust_source": str(rcsb_contribution.get("trust_source", "")),
             "payload_records_json": "[]",
             "derived_paths": ";".join(
                 [
@@ -5872,6 +6495,8 @@ def prune_rcsb_on_demand_cache(
                     "downloads/rcsb/on_demand_policy.json",
                 ]
             ),
+            "structure_input_bytes": str(rcsb_contribution.get("input_bytes", "")),
+            "structure_input_digest": str(rcsb_contribution.get("input_digest", "")),
             "pruned_bytes": str(removed_bytes),
             "pruned_at": str(int(time.time())),
             "notes": "runtime_coordinate_cache_bounded_after_index_publish",
@@ -10800,8 +11425,13 @@ def migrate_ligand_source_retention(
             "reason": "ligand_source_retention_incomplete",
         }
     valid = all(
-        row.get("state") in {"pruned", "pruning", "cleanup_failed"}
-        and retention_source_identity_and_derivatives_ready(science_store, row, summary_cache)
+        retained_source_derivatives_ready(science_store, row, summary_cache)
+        if row.get("state") == "pruned"
+        else bool(
+            row.get("state") in {"pruning", "cleanup_failed"}
+            and retention_source_identity_and_derivatives_ready(science_store, row, summary_cache)
+            and retention_live_payloads_match_records(science_store, row, summary_cache)
+        )
         for row in selected
     )
     return {
@@ -10952,15 +11582,22 @@ def prepare_plinder_canonical_index(
     if source is None:
         retained = retained_source_ready(science_store, "plinder", "downloads/plinder/index")
         if retained:
-            manifest = science_store / "indexes" / "plinder_targets.manifest.json"
-            payload = read_json_object(manifest)
-            canonical = payload.get("canonical", {})
+            projection = science_store / "indexes" / "structure_targets.tsv"
+            rows = max(
+                (
+                    int(row.get("rows", 0) or 0)
+                    for row in read_tsv(science_store / "index_build_manifest.tsv")
+                    if row.get("index") == "structure_targets"
+                    and "plinder_canonical_rows" in row.get("notes", "").split(";")
+                ),
+                default=0,
+            )
             return {
                 "status": "ready",
                 "rebuilt": False,
-                "reason": "plinder_canonical_reused_after_source_payload_pruned",
-                "rows": canonical.get("row_count", 0) if isinstance(canonical, dict) else 0,
-                "manifest": str(manifest),
+                "reason": "plinder_structure_projection_reused_after_source_payload_pruned",
+                "rows": rows,
+                "projection": str(projection),
             }
         return {"status": "not_applicable", "rebuilt": False, "reason": "plinder_source_absent"}
     canonical = science_store / "indexes" / "plinder_targets.tsv"
@@ -11104,9 +11741,10 @@ def metagenome_alignment_authority_key(row: dict[str, str]) -> tuple[str, str, s
     )
 
 
-def authoritative_metagenome_mmseqs_databases(
+def authoritative_mmseqs_databases(
     science_store: Path,
     build_rows: list[dict[str, str]],
+    namespaces: dict[str, tuple[str, str]],
     env: dict[str, str] | None = None,
     wsl_distro: str | None = None,
     summary_cache: ResourceSummaryCache | None = None,
@@ -11117,22 +11755,21 @@ def authoritative_metagenome_mmseqs_databases(
     builder_version = database_builder_version("mmseqs", command, env, wsl_distro)
     validated: set[tuple[str, str, str]] = set()
     for build_row in build_rows:
-        if (
-            build_row.get("index") != "metagenome_targets"
-            or build_row.get("status") != "alignment_database_used"
-        ):
+        if build_row.get("status") != "alignment_database_used":
             continue
         input_path = str(build_row.get("input_path", "")).replace("\\", "/")
         output_path = str(build_row.get("output_path", "")).replace("\\", "/")
         notes = str(build_row.get("notes", ""))
         for row in manifest_rows:
+            expected = namespaces.get(str(row.get("source_namespace", "")))
             source_path = str(row.get("source_path", "")).replace("\\", "/")
             db_path_text = str(row.get("db_path", "")).replace("\\", "/")
             source_digest = str(row.get("source_digest", "")).lower()
             if (
-                row.get("status") != "ready"
-                or row.get("source_namespace") != "MGnify"
-                or row.get("source_class") != "metagenome"
+                expected is None
+                or build_row.get("index") != expected[0]
+                or row.get("status") != "ready"
+                or row.get("source_class") != expected[1]
                 or source_path != input_path
                 or db_path_text != output_path
                 or f"source_digest={source_digest}" not in notes.split(";")
@@ -11161,6 +11798,64 @@ def authoritative_metagenome_mmseqs_databases(
     return validated
 
 
+def authoritative_metagenome_mmseqs_databases(
+    science_store: Path,
+    build_rows: list[dict[str, str]],
+    env: dict[str, str] | None = None,
+    wsl_distro: str | None = None,
+    summary_cache: ResourceSummaryCache | None = None,
+) -> set[tuple[str, str, str]]:
+    return authoritative_mmseqs_databases(
+        science_store,
+        build_rows,
+        {"MGnify": ("metagenome_targets", "metagenome")},
+        env,
+        wsl_distro,
+        summary_cache,
+    )
+
+
+def authoritative_known_mmseqs_databases(
+    science_store: Path,
+    build_rows: list[dict[str, str]],
+    env: dict[str, str] | None = None,
+    wsl_distro: str | None = None,
+    summary_cache: ResourceSummaryCache | None = None,
+) -> set[tuple[str, str, str]]:
+    return authoritative_mmseqs_databases(
+        science_store,
+        build_rows,
+        {
+            "UniProt": ("known_targets", "known"),
+            "BioLiP2": ("known_targets", "known"),
+        },
+        env,
+        wsl_distro,
+        summary_cache,
+    )
+
+
+def mmseqs_namespaces_complete(
+    science_store: Path,
+    authorities: set[tuple[str, str, str]],
+    required_counts: dict[str, int],
+) -> bool:
+    rows = read_tsv(science_store / "indexes/mmseqs/mmseqs_target_databases.tsv")
+    for namespace, minimum in required_counts.items():
+        namespace_rows = [row for row in rows if row.get("source_namespace") == namespace]
+        if not mmseqs_namespace_rows_complete(namespace_rows, namespace, minimum) or any(
+            (
+                str(row.get("source_path", "")).replace("\\", "/"),
+                str(row.get("db_path", "")).replace("\\", "/"),
+                str(row.get("source_digest", "")).lower(),
+            )
+            not in authorities
+            for row in namespace_rows
+        ):
+            return False
+    return True
+
+
 def refresh_science_index_authority_manifest(
     science_store: Path,
     summary_cache: ResourceSummaryCache | None = None,
@@ -11169,10 +11864,14 @@ def refresh_science_index_authority_manifest(
     build_rows = read_tsv(build_manifest)
     database_manifest_rel = "indexes/mmseqs/mmseqs_target_databases.tsv"
     database_rows = read_tsv(science_store / database_manifest_rel)
-    if not build_rows:
-        return {"status": "needs_repair", "updated_rows": 0, "reason": "index_build_manifest_empty"}
     authorities = []
+    authority_specs = {
+        "UniProt": ("known_targets", "known"),
+        "BioLiP2": ("known_targets", "known"),
+        "MGnify": ("metagenome_targets", "metagenome"),
+    }
     for row in database_rows:
+        spec = authority_specs.get(str(row.get("source_namespace", "")))
         digest = str(row.get("source_digest", "")).lower()
         db_path_text = str(row.get("db_path", "")).replace("\\", "/")
         db_path = resolve_manifest_path(science_store, db_path_text)
@@ -11184,8 +11883,9 @@ def refresh_science_index_authority_manifest(
         if (
             row.get("manifest_schema_version") == ALIGNMENT_MANIFEST_SCHEMA_VERSION
             and row.get("status") == "ready"
-            and row.get("source_namespace") == "MGnify"
-            and row.get("source_class") == "metagenome"
+            and spec is not None
+            and row.get("source_class") == spec[1]
+            and str(row.get("source_path", "")).strip()
             and re.fullmatch(r"[0-9a-f]{64}", digest)
             and row.get("builder_version")
             and db_path_text
@@ -11233,35 +11933,57 @@ def refresh_science_index_authority_manifest(
         elif any(existing.get(key, "") != value for key, value in compact_row.items()):
             existing.update(compact_row)
             updated_rows += 1
-    for row in build_rows:
-        if row.get("index") != "metagenome_targets":
-            continue
-        input_path = str(row.get("input_path", "")).replace("\\", "/")
-        authority = next(
-            (
-                candidate
-                for candidate in authorities
-                if str(candidate.get("source_path", "")).replace("\\", "/") == input_path
-            ),
-            None,
-        )
-        if authority is None:
-            continue
+    expected_authority_keys: set[tuple[str, str]] = set()
+    for authority in authorities:
+        namespace = str(authority.get("source_namespace", ""))
+        index_id = authority_specs[namespace][0]
+        input_path = str(authority.get("source_path", "")).replace("\\", "/")
         digest = str(authority.get("source_digest", "")).lower()
         db_path_text = str(authority.get("db_path", "")).replace("\\", "/")
         expected = {
+            "index": index_id,
+            "input_path": input_path,
             "status": "alignment_database_used",
             "rows": "0",
             "output_path": db_path_text,
             "notes": (
                 "full_searchable_alignment_database;consumer=mmseqs_alignment_worker;"
-                f"source_namespace=MGnify;source_digest={digest};"
+                f"source_namespace={namespace};source_digest={digest};"
                 f"database_manifest={database_manifest_rel}"
             ),
         }
-        if any(str(row.get(key, "")) != value for key, value in expected.items()):
-            row.update(expected)
+        expected_authority_keys.add((index_id, input_path))
+        existing = next(
+            (
+                row
+                for row in build_rows
+                if row.get("index") == index_id
+                and row.get("status") == "alignment_database_used"
+                and str(row.get("input_path", "")).replace("\\", "/") == input_path
+            ),
+            None,
+        )
+        if existing is None:
+            build_rows.append(expected)
             updated_rows += 1
+        elif any(str(existing.get(key, "")) != value for key, value in expected.items()):
+            existing.update(expected)
+            updated_rows += 1
+    retained_authority_rows = [
+        row
+        for row in build_rows
+        if not (
+            row.get("status") == "alignment_database_used"
+            and row.get("index") in {"known_targets", "metagenome_targets"}
+            and (
+                str(row.get("index", "")),
+                str(row.get("input_path", "")).replace("\\", "/"),
+            )
+            not in expected_authority_keys
+        )
+    ]
+    updated_rows += len(build_rows) - len(retained_authority_rows)
+    build_rows = retained_authority_rows
     if updated_rows:
         write_simple_tsv(
             build_manifest,
@@ -11269,11 +11991,7 @@ def refresh_science_index_authority_manifest(
             build_rows,
         )
     return {
-        "status": "ready" if any(
-            row.get("index") == "metagenome_targets"
-            and row.get("status") == "alignment_database_used"
-            for row in build_rows
-        ) else "needs_repair",
+        "status": "ready" if authorities else "needs_repair",
         "updated_rows": updated_rows,
         "reason": "full_mmseqs_authority_bound" if authorities else "ready_mmseqs_authority_missing",
     }
@@ -11291,11 +12009,32 @@ def metagenome_compatibility_table_ready(path: Path) -> bool:
     ]
 
 
+def standard_header_only_projection_ready(
+    path: Path,
+    index_id: str,
+    build_rows: list[dict[str, str]],
+    alignment_ready: bool,
+    *,
+    compact_ready: bool = True,
+) -> bool:
+    return bool(
+        alignment_ready
+        and compact_ready
+        and metagenome_compatibility_table_ready(path)
+        and not any(
+            row.get("index") == index_id and row.get("status") in {"used", "preserved"}
+            for row in build_rows
+        )
+    )
+
+
 def science_index_readiness_rows(
     science_store: Path,
     *,
+    known_alignment_authorities: set[tuple[str, str, str]] | None = None,
     metagenome_alignment_authorities: set[tuple[str, str, str]] | None = None,
 ) -> list[dict[str, str]]:
+    known_alignment_authorities = known_alignment_authorities or set()
     metagenome_alignment_authorities = metagenome_alignment_authorities or set()
     source_rows = read_tsv(science_store / "index_build_manifest.tsv")
     selected_indexes = {
@@ -11307,9 +12046,18 @@ def science_index_readiness_rows(
             and "published_chembl_query_used_by_onsite_matcher" in str(row.get("notes", ""))
         )
         or (
-            bool(metagenome_alignment_authorities)
-            and str(row.get("index", "")) == "metagenome_targets"
-            and str(row.get("status", "")) == "alignment_database_used"
+            str(row.get("status", "")) == "alignment_database_used"
+            and (
+                (
+                    str(row.get("index", "")) == "known_targets"
+                    and metagenome_alignment_authority_key(row) in known_alignment_authorities
+                )
+                or (
+                    str(row.get("index", "")) == "metagenome_targets"
+                    and metagenome_alignment_authority_key(row)
+                    in metagenome_alignment_authorities
+                )
+            )
         )
     }
     rows: list[dict[str, str]] = []
@@ -11337,8 +12085,14 @@ def science_index_readiness_rows(
             index_kind = "alignment_database"
             authority_key = metagenome_alignment_authority_key(row)
             if (
-                str(row.get("index", "")) == "metagenome_targets"
-                and authority_key in metagenome_alignment_authorities
+                (
+                    str(row.get("index", "")) == "known_targets"
+                    and authority_key in known_alignment_authorities
+                )
+                or (
+                    str(row.get("index", "")) == "metagenome_targets"
+                    and authority_key in metagenome_alignment_authorities
+                )
             ):
                 readiness_status = "full_index"
                 reason = "full_searchable_alignment_database_ready"
@@ -11657,6 +12411,13 @@ def evaluate_installer_science_store_readiness(
             )
 
     index_build_rows = read_tsv(science_store / "index_build_manifest.tsv")
+    known_alignment_authorities = authoritative_known_mmseqs_databases(
+        science_store,
+        index_build_rows,
+        env,
+        wsl_distro,
+        summary_cache,
+    )
     metagenome_alignment_authorities = authoritative_metagenome_mmseqs_databases(
         science_store,
         index_build_rows,
@@ -11674,8 +12435,19 @@ def evaluate_installer_science_store_readiness(
         metagenome_alignment_authority_key(row) in metagenome_alignment_authorities
         for row in metagenome_alignment_rows
     )
+    known_alignment_ready = mmseqs_namespaces_complete(
+        science_store,
+        known_alignment_authorities,
+        {"UniProt": 1, "BioLiP2": 4},
+    )
+    metagenome_alignment_ready = metagenome_alignment_ready and mmseqs_namespaces_complete(
+        science_store,
+        metagenome_alignment_authorities,
+        {"MGnify": 1},
+    )
     index_rows = science_index_readiness_rows(
         science_store,
+        known_alignment_authorities=known_alignment_authorities,
         metagenome_alignment_authorities=metagenome_alignment_authorities,
     )
     write_science_index_readiness_manifest(science_store, index_rows)
@@ -11700,10 +12472,19 @@ def evaluate_installer_science_store_readiness(
         "indexes/tool_versions.tsv",
     ]:
         path = science_store / rel_path
-        if (
-            rel_path == "indexes/metagenome_targets.tsv"
-            and metagenome_alignment_ready
-            and metagenome_compatibility_table_ready(path)
+        if rel_path == "indexes/known_targets.tsv" and standard_header_only_projection_ready(
+            path,
+            "known_targets",
+            index_build_rows,
+            known_alignment_ready,
+            compact_ready=ligand_similarity_index_ready(science_store, summary_cache=summary_cache),
+        ):
+            continue
+        if rel_path == "indexes/metagenome_targets.tsv" and standard_header_only_projection_ready(
+            path,
+            "metagenome_targets",
+            index_build_rows,
+            metagenome_alignment_ready,
         ):
             continue
         if not tsv_has_data_rows(path):
@@ -13191,6 +13972,15 @@ def main() -> int:
         science_store,
         summary_cache=resource_summary_cache,
     )
+    pre_prepare_ligand_retention = (
+        migrate_ligand_source_retention(science_store, resource_summary_cache)
+        if existing_ligand_similarity_ready
+        else {
+            "status": "not_applicable",
+            "updated": 0,
+            "reason": "ligand_similarity_index_not_ready",
+        }
+    )
     chembl_query_result = (
         {
             "status": "ready",
@@ -13274,7 +14064,10 @@ def main() -> int:
         }
     )
     ligand_retention_migration = (
-        migrate_ligand_source_retention(science_store, resource_summary_cache)
+        pre_prepare_ligand_retention
+        if ligand_similarity_result.get("status") == "ready"
+        and pre_prepare_ligand_retention.get("status") == "ready"
+        else migrate_ligand_source_retention(science_store, resource_summary_cache)
         if ligand_similarity_result.get("status") == "ready"
         else {"status": "needs_repair", "updated": 0, "reason": "ligand_similarity_index_not_ready"}
     )

@@ -603,6 +603,40 @@ fn pipeline_blocks_without_science_store_and_writes_zero_candidates() {
 }
 
 #[test]
+fn structure_file_context_uses_publication_identity_without_reading_large_index() {
+    let root = temp_root("structure_file_context");
+    let store = root.join("science_store");
+    let structure = store.join("indexes/structure_targets.tsv");
+    ensure_dir(structure.parent().expect("structure parent")).expect("structure parent");
+    fs::write(&structure, [0xff]).expect("non-UTF8 structure fixture");
+    let digest = "A".repeat(64);
+    write_text(
+        &store.join(STRUCTURE_TARGETS_MANIFEST_REL_PATH),
+        &format!(
+            "{{\"schema_version\":\"{}\",\"status\":\"ready\",\"path\":\"indexes/structure_targets.tsv\",\"bytes\":1,\"sha256\":\"{}\"}}\n",
+            STRUCTURE_TARGETS_MANIFEST_SCHEMA_VERSION, digest
+        ),
+    )
+    .expect("structure manifest");
+
+    let context = structure_file_context(&store, &structure);
+    assert_eq!(context["content_id"], digest.to_ascii_lowercase());
+
+    let mut invalid_manifest =
+        read_json_value_if_file(&store.join(STRUCTURE_TARGETS_MANIFEST_REL_PATH))
+            .expect("structure manifest JSON");
+    invalid_manifest["bytes"] = json!(2);
+    write_text(
+        &store.join(STRUCTURE_TARGETS_MANIFEST_REL_PATH),
+        &(serde_json::to_string(&invalid_manifest).expect("serialize invalid manifest") + "\n"),
+    )
+    .expect("invalid structure manifest");
+    assert!(structure_file_context(&store, &structure)["content_id"].is_null());
+
+    fs::remove_dir_all(&root).expect("cleanup temp root");
+}
+
+#[test]
 fn pipeline_stage_errors_write_failed_terminal_state_for_every_boundary() {
     for stage in [
         "input_normalize",
@@ -3499,6 +3533,634 @@ fn prepare_science_store_migrates_legacy_ligand_queries_to_compact_authority() {
 }
 
 #[test]
+fn prepare_reuses_pruned_published_store_without_rewriting_readiness_evidence() {
+    let root = temp_root("reuse_pruned_published_store");
+    let store = root.join("science_store");
+    install_ligand_similarity_builder_fixture(&root, false).expect("similarity builder");
+    write_ligand_similarity_staging_fixture(&store).expect("legacy ligand staging");
+    let options = StoreOptions {
+        workspace_root: root.clone(),
+        science_store: store.clone(),
+    };
+    run_store_command(ScienceCommand::PrepareScienceStore, &options).expect("initial prepare");
+
+    write_text(
+        &store.join("indexes/known_targets.tsv"),
+        &store_row_header(),
+    )
+    .expect("known published index");
+    write_text(
+        &store.join("indexes/metagenome_targets.tsv"),
+        &store_row_header(),
+    )
+    .expect("metagenome compatibility header");
+    write_text(
+        &store.join("indexes/structure_targets.tsv"),
+        "source\ttarget_id\ttarget_name\torganism\ttarget_class\tligand_tokens\tsequence_tokens\tstructure_tokens\tevidence\nBioLiP2\tBIO_SENTINEL\tPublished interaction\tHomo sapiens\tstructure_interaction_record\tlig\tprotein\tpocket\tpublished_biolip_projection\nPLINDER\tPLI_SENTINEL\tPublished complex\tHomo sapiens\tstructure_interaction_record\tlig\tprotein\tpocket\tpublished_plinder_projection\nRCSB\t1ABC\tPublished structure\tunknown\tstructure_interaction_record\tlig\tprotein\t1abc\tpublished_rcsb_projection\n",
+    )
+    .expect("structure published index");
+    write_text(
+        &store.join("index_build_manifest.tsv"),
+        &format!(
+            "index\tinput_path\tstatus\trows\toutput_path\tnotes\nknown_targets\tindexes/known_targets.tsv\tused\t0\tindexes/known_targets.tsv\tcompact_and_alignment_authority\nligand_similarity\t{}\tready\t1\t{}\tcompact_ligand_similarity_used_by_onsite_matcher\nmetagenome_targets\tdownloads/metagenome/mgnify/mgy_clusters.fa.gz\talignment_database_used\t0\tindexes/mmseqs/mgnify/target\tfull_searchable_alignment_database\nstructure_targets\tdownloads/biolip2/BioLiP.txt.gz\tused\t1\tindexes/structure_targets.tsv\tbiolip2_interaction_rows;complete_source_scan\nstructure_targets\tindexes/plinder_targets.tsv\tused\t1\tindexes/structure_targets.tsv\tplinder_canonical_rows;complete_source_scan\nstructure_targets\tdownloads/rcsb/mmcif/1abc.cif\tused\t1\tindexes/structure_targets.tsv\trcsb_structure_file_rows;complete_source_scan\n",
+            LIGAND_SIMILARITY_MANIFEST_REL_PATH, LIGAND_SIMILARITY_DATABASE_REL_PATH,
+        ),
+    )
+    .expect("published build manifest");
+    write_text(
+        &store.join("manifests/source_retention_manifest.tsv"),
+        &format!(
+            "schema_version\tsource_id\tstate\tderived_paths\n{0}\tuniprot_human_reviewed\tpruned\tindexes/mmseqs/mmseqs_target_databases.tsv\n{0}\tbiolip2\tpruned\tindexes/mmseqs/mmseqs_target_databases.tsv;indexes/structure_targets.tsv;indexes/structure_targets.manifest.json\n{0}\tmetagenome_potential\tpruned\tindexes/mmseqs/mmseqs_target_databases.tsv\n{0}\tplinder\tpruned\tindexes/structure_targets.tsv;indexes/structure_targets.manifest.json\n",
+            SOURCE_RETENTION_SCHEMA_VERSION
+        ),
+    )
+    .expect("source retention");
+    write_text(
+        &store.join("downloads/rcsb/mmcif/1abc.cif"),
+        "data_1ABC\n_entry.id 1ABC\n_atom_site.group_PDB ATOM\n",
+    )
+    .expect("partial on-demand RCSB cache");
+    write_text(
+        &store.join("downloads/biolip2/BioLiP.txt.gz"),
+        "published BioLiP source\n",
+    )
+    .expect("published BioLiP input");
+    write_text(
+        &store.join("indexes/plinder_targets.tsv"),
+        "published PLINDER canonical input\n",
+    )
+    .expect("published PLINDER input");
+    write_test_pruned_alignment_identity_fixture(&store)
+        .expect("published and alignment source identities");
+    let alignment_sources = [
+        ("uniprot", "UniProt", "known"),
+        ("biolip2_protein", "BioLiP2", "known"),
+        ("biolip2_protein_nr", "BioLiP2", "known"),
+        ("biolip2_peptide", "BioLiP2", "known"),
+        ("biolip2_peptide_nr", "BioLiP2", "known"),
+        ("mgnify", "MGnify", "metagenome"),
+    ];
+    for (source_id, namespace, class) in alignment_sources {
+        write_alignment_database_fixture(&store, "mmseqs", source_id, namespace, class)
+            .expect("alignment authority");
+    }
+    let mut alignment_manifest = String::from(
+        "source_id\tmanifest_schema_version\tsource_namespace\tsource_class\tsource_path\tsource_digest\tsource_files\tsource_bytes\tbuilder_version\tdb_path\tstatus\n",
+    );
+    for (source_id, namespace, class) in alignment_sources {
+        let source_path = match source_id {
+            "uniprot" => "downloads/uniprot/uniprot_human_reviewed.fasta.gz",
+            "biolip2_protein" => "downloads/biolip2/protein.fasta.gz",
+            "biolip2_protein_nr" => "downloads/biolip2/protein_nr.fasta.gz",
+            "biolip2_peptide" => "downloads/biolip2/peptide.fasta.gz",
+            "biolip2_peptide_nr" => "downloads/biolip2/peptide_nr.fasta.gz",
+            "mgnify" => "downloads/metagenome/mgnify/mgy_clusters.fa.gz",
+            _ => unreachable!("unknown alignment fixture"),
+        };
+        alignment_manifest.push_str(&format!(
+            "{source_id}\t{}\t{namespace}\t{class}\t{source_path}\t{}\t1\t1\tmmseqs-test\tindexes/mmseqs/{source_id}/target\tready\n",
+            ALIGNMENT_DATABASE_MANIFEST_SCHEMA_VERSION,
+            test_source_digest(source_id),
+        ));
+    }
+    write_text(
+        &store.join("indexes/mmseqs/mmseqs_target_databases.tsv"),
+        &alignment_manifest,
+    )
+    .expect("combined MMseqs authority manifest");
+    write_structure_targets_manifest(&store, &store.join("index_build_manifest.tsv"))
+        .expect("structure publication");
+    write_test_science_store_readiness(&store, &[]).expect("canonical readiness");
+
+    let protected = [
+        "indexes/known_targets.tsv",
+        "indexes/metagenome_targets.tsv",
+        "indexes/structure_targets.tsv",
+        STRUCTURE_TARGETS_MANIFEST_REL_PATH,
+        "index_build_manifest.tsv",
+        "install_status.json",
+        "science_store_readiness.json",
+    ];
+    let before = protected
+        .iter()
+        .map(|relative| {
+            (
+                *relative,
+                fs::read(store.join(relative)).expect("read protected publication"),
+            )
+        })
+        .collect::<BTreeMap<_, _>>();
+
+    let result = run_store_command(ScienceCommand::PrepareScienceStore, &options)
+        .expect("reuse published store");
+    assert!(result.contains("reused_published_indexes=true"));
+    for relative in protected {
+        assert_eq!(
+            fs::read(store.join(relative)).expect("read reused publication"),
+            before[relative],
+            "prepare rewrote protected publication {relative}"
+        );
+    }
+    assert!(
+        evaluate_science_store_readiness(&store)
+            .expect("readiness after reuse")
+            .ready
+    );
+
+    let database = store.join(LIGAND_SIMILARITY_DATABASE_REL_PATH);
+    let mut bytes = fs::read(&database).expect("compact database bytes");
+    bytes[0] ^= 1;
+    fs::write(&database, bytes).expect("same-size compact tamper");
+    assert_eq!(reusable_published_science_store(&options), None);
+    fs::remove_dir_all(&root).expect("cleanup temp root");
+}
+
+#[test]
+fn retained_mmseqs_authority_binds_sources_payloads_and_complete_databases() {
+    let root = temp_root("retained_mmseqs_authority_identity");
+    let store = root.join("science_store");
+    write_test_pruned_alignment_identity_fixture(&store).expect("source retention identities");
+    let alignment_sources = [
+        ("uniprot", "UniProt", "known"),
+        ("biolip2_protein", "BioLiP2", "known"),
+        ("biolip2_protein_nr", "BioLiP2", "known"),
+        ("biolip2_peptide", "BioLiP2", "known"),
+        ("biolip2_peptide_nr", "BioLiP2", "known"),
+        ("mgnify", "MGnify", "metagenome"),
+    ];
+    for (source_id, namespace, class) in alignment_sources {
+        write_alignment_database_fixture(&store, "mmseqs", source_id, namespace, class)
+            .expect("alignment database");
+    }
+    let mut manifest = String::from(
+        "source_id\tmanifest_schema_version\tsource_namespace\tsource_class\tsource_path\tsource_digest\tsource_files\tsource_bytes\tbuilder_version\tdb_path\tstatus\n",
+    );
+    for (source_id, namespace, class, source_path) in [
+        (
+            "uniprot",
+            "UniProt",
+            "known",
+            "downloads/uniprot/uniprot_human_reviewed.fasta.gz",
+        ),
+        (
+            "biolip2_protein",
+            "BioLiP2",
+            "known",
+            "downloads/biolip2/protein.fasta.gz",
+        ),
+        (
+            "biolip2_protein_nr",
+            "BioLiP2",
+            "known",
+            "downloads/biolip2/protein_nr.fasta.gz",
+        ),
+        (
+            "biolip2_peptide",
+            "BioLiP2",
+            "known",
+            "downloads/biolip2/peptide.fasta.gz",
+        ),
+        (
+            "biolip2_peptide_nr",
+            "BioLiP2",
+            "known",
+            "downloads/biolip2/peptide_nr.fasta.gz",
+        ),
+        (
+            "mgnify",
+            "MGnify",
+            "metagenome",
+            "downloads/metagenome/mgnify/mgy_clusters.fa.gz",
+        ),
+    ] {
+        manifest.push_str(&format!(
+            "{source_id}\t{}\t{namespace}\t{class}\t{source_path}\t{}\t1\t1\tmmseqs-test\tindexes/mmseqs/{source_id}/target\tready\n",
+            ALIGNMENT_DATABASE_MANIFEST_SCHEMA_VERSION,
+            test_source_digest(source_id),
+        ));
+    }
+    let manifest_path = store.join("indexes/mmseqs/mmseqs_target_databases.tsv");
+    write_text(&manifest_path, &manifest).expect("alignment manifest");
+    assert!(ready_alignment_namespaces(
+        &store,
+        "known",
+        &["UniProt", "BioLiP2"]
+    ));
+    assert!(ready_alignment_namespaces(
+        &store,
+        "metagenome",
+        &["MGnify"]
+    ));
+
+    let wrong_digest = "b".repeat(64);
+    let tampered_uniprot = manifest.replacen(&test_source_digest("uniprot"), &wrong_digest, 1);
+    write_text(&manifest_path, &tampered_uniprot).expect("tampered UniProt aggregate");
+    assert!(!ready_alignment_namespaces(&store, "known", &["UniProt"]));
+
+    let mgnify_line = manifest
+        .lines()
+        .find(|line| line.starts_with("mgnify\t"))
+        .expect("MGnify row");
+    let tampered_mgnify = manifest.replace(
+        mgnify_line,
+        &mgnify_line.replacen(&test_source_digest("mgnify"), &wrong_digest, 1),
+    );
+    write_text(&manifest_path, &tampered_mgnify).expect("tampered MGnify payload digest");
+    assert!(!ready_alignment_namespaces(
+        &store,
+        "metagenome",
+        &["MGnify"]
+    ));
+
+    let duplicate_biolip = manifest.replace(
+        "downloads/biolip2/peptide_nr.fasta.gz",
+        "downloads/biolip2/peptide.fasta.gz",
+    );
+    write_text(&manifest_path, &duplicate_biolip).expect("duplicate BioLiP source path");
+    assert!(!ready_alignment_namespaces(&store, "known", &["BioLiP2"]));
+
+    write_text(&manifest_path, &manifest).expect("restore alignment manifest");
+    fs::remove_file(store.join("indexes/mmseqs/biolip2_protein/target.lookup"))
+        .expect("remove required MMseqs artifact");
+    assert!(!ready_alignment_namespaces(&store, "known", &["BioLiP2"]));
+    fs::remove_dir_all(&root).expect("cleanup temp root");
+}
+
+#[test]
+fn build_store_indexes_keeps_nonempty_published_indexes_when_sources_are_partial() {
+    let root = temp_root("preserve_partial_source_rebuild");
+    let store = root.join("science_store");
+    let header = store_row_header();
+    let indexes = [
+        (
+            "known_targets",
+            format!(
+                "{header}UniProt\tKNOWN_SENTINEL\tKnown\tHomo sapiens\tknown_human_protein\t\tknown token\t\tpublished\n"
+            ),
+        ),
+        (
+            "metagenome_targets",
+            format!(
+                "{header}MGnify\tMETA_SENTINEL\tMeta\tmetagenome\tmetagenome_potential\t\tmeta token\t\tpublished\n"
+            ),
+        ),
+        (
+            "structure_targets",
+            format!(
+                "{header}PLINDER\tSTRUCT_SENTINEL\tStructure\tHomo sapiens\tstructure_interaction_record\tlig\tprotein\tpocket\tpublished\nRCSB\t1ABC\tStructure\tunknown\tstructure_interaction_record\tlig\tprotein\t1abc\tpublished\n"
+            ),
+        ),
+    ];
+    for (name, text) in &indexes {
+        write_text(&store.join(format!("indexes/{name}.tsv")), text).expect("published index");
+    }
+    write_text(
+        &store.join("downloads/rcsb/mmcif/1abc.cif"),
+        "data_1ABC\n_entry.id 1ABC\n_atom_site.group_PDB ATOM\n",
+    )
+    .expect("partial source");
+    write_text(
+        &store.join("indexes/plinder_targets.tsv"),
+        "published PLINDER canonical input\n",
+    )
+    .expect("published PLINDER input");
+    write_test_source_manifest(&store, &["plinder", "rcsb_ligand_bound"])
+        .expect("published source identities");
+    let build_manifest = store.join("index_build_manifest.tsv");
+    let mut build_manifest_text = String::from(
+        "index\tinput_path\tstatus\trows\toutput_path\tnotes\nknown_targets\told/known\tused\t1\tindexes/known_targets.tsv\tcomplete_source_scan\nmetagenome_targets\told/meta\tused\t1\tindexes/metagenome_targets.tsv\tcomplete_source_scan\nstructure_targets\tindexes/plinder_targets.tsv\tused\t1\tindexes/structure_targets.tsv\tplinder_canonical_rows;complete_source_scan\nstructure_targets\tdownloads/rcsb/mmcif/1abc.cif\tused\t1\tindexes/structure_targets.tsv\trcsb_structure_file_rows;complete_source_scan\n",
+    );
+    append_store_index_publication_identity(
+        &store,
+        "known_targets",
+        &store.join("indexes/known_targets.tsv"),
+        1,
+        &mut build_manifest_text,
+    )
+    .expect("known publication identity");
+    append_store_index_publication_identity(
+        &store,
+        "metagenome_targets",
+        &store.join("indexes/metagenome_targets.tsv"),
+        1,
+        &mut build_manifest_text,
+    )
+    .expect("metagenome publication identity");
+    write_text(&build_manifest, &build_manifest_text).expect("published manifest");
+    write_structure_targets_manifest(&store, &build_manifest).expect("structure publication");
+    let before = indexes
+        .iter()
+        .map(|(name, _)| {
+            (
+                *name,
+                fs::read(store.join(format!("indexes/{name}.tsv"))).expect("published bytes"),
+            )
+        })
+        .collect::<BTreeMap<_, _>>();
+    let options = StoreOptions {
+        workspace_root: root.clone(),
+        science_store: store.clone(),
+    };
+
+    build_store_indexes(&options, &build_manifest).expect("preserving build");
+
+    for (name, _) in indexes {
+        assert_eq!(
+            fs::read(store.join(format!("indexes/{name}.tsv"))).expect("preserved bytes"),
+            before[name]
+        );
+    }
+    let rebuilt_manifest = read_text(&build_manifest).expect("manifest text");
+    assert!(
+        rebuilt_manifest.contains("known_targets\tindexes/known_targets.tsv\tpublication_ready")
+    );
+    assert!(
+        rebuilt_manifest
+            .contains("metagenome_targets\tindexes/metagenome_targets.tsv\tpublication_ready")
+    );
+    let known_path = store.join("indexes/known_targets.tsv");
+    let mut tampered = fs::read(&known_path).expect("known publication bytes");
+    let offset = tampered
+        .iter()
+        .position(|byte| *byte == b'K')
+        .expect("known tamper byte");
+    tampered[offset] = b'X';
+    fs::write(&known_path, &tampered).expect("same-size known tamper");
+    let error = build_store_indexes(&options, &build_manifest)
+        .expect_err("tampered known publication must not be restamped");
+    assert!(error.contains("known_targets_publication_identity_mismatch"));
+    assert_eq!(
+        fs::read(&known_path).expect("tampered known remains untouched"),
+        tampered
+    );
+    fs::remove_dir_all(&root).expect("cleanup temp root");
+}
+
+#[test]
+fn materialized_known_input_update_rebuilds_publication() {
+    let root = temp_root("materialized_known_input_update");
+    let store = root.join("science_store");
+    let input = store.join("imports/known_targets.tsv");
+    let output = store.join("indexes/known_targets.tsv");
+    let build_manifest = store.join("index_build_manifest.tsv");
+    let options = StoreOptions {
+        workspace_root: root.clone(),
+        science_store: store.clone(),
+    };
+    write_text(
+        &input,
+        &format!(
+            "{}Custom\tOLD_TARGET\tOld target\tHomo sapiens\tcustom_target\told_ligand\told_sequence\told_structure\told_evidence\n",
+            store_row_header()
+        ),
+    )
+    .expect("initial custom known input");
+
+    build_store_indexes(&options, &build_manifest).expect("initial known publication");
+    let initial_text = read_text(&output).expect("initial known publication text");
+    let initial_digest = sha256_file_hex(&output).expect("initial known publication digest");
+    assert!(initial_text.contains("\tOLD_TARGET\t"));
+    assert_eq!(
+        published_store_index_identity(&output, &build_manifest, "known_targets")
+            .expect("initial known publication identity"),
+        Some(1)
+    );
+
+    write_text(
+        &input,
+        &format!(
+            "{}Custom\tNEW_TARGET\tNew target\tHomo sapiens\tcustom_target\tnew_ligand\tnew_sequence\tnew_structure\tnew_evidence\n",
+            store_row_header()
+        ),
+    )
+    .expect("updated custom known input");
+    build_store_indexes(&options, &build_manifest).expect("updated known publication");
+
+    let updated_text = read_text(&output).expect("updated known publication text");
+    let updated_digest = sha256_file_hex(&output).expect("updated known publication digest");
+    let updated_manifest = read_text(&build_manifest).expect("updated build manifest");
+    assert!(updated_text.contains("\tNEW_TARGET\t"));
+    assert!(!updated_text.contains("\tOLD_TARGET\t"));
+    assert_ne!(updated_text, initial_text);
+    assert_ne!(updated_digest, initial_digest);
+    assert!(updated_manifest.contains(&format!("publication_sha256={updated_digest}")));
+    assert_eq!(
+        published_store_index_identity(&output, &build_manifest, "known_targets")
+            .expect("updated known publication identity"),
+        Some(1)
+    );
+    fs::remove_dir_all(&root).expect("cleanup temp root");
+}
+
+#[test]
+fn changed_partial_structure_source_cannot_replace_published_index() {
+    let root = temp_root("changed_partial_structure_source");
+    let store = root.join("science_store");
+    let source = store.join("downloads/biolip2/BioLiP.txt.gz");
+    let structure = store.join("indexes/structure_targets.tsv");
+    let build_manifest = store.join("index_build_manifest.tsv");
+    write_text(&source, "old BioLiP input\n").expect("old BioLiP input");
+    write_text(
+        &structure,
+        &format!(
+            "{}BioLiP2\tOLD_TARGET\tOld target\tunknown\tstructure_interaction_record\tlig\tprotein\tpocket\tpublished\n",
+            store_row_header()
+        ),
+    )
+    .expect("published structure index");
+    write_text(
+        &build_manifest,
+        "index\tinput_path\tstatus\trows\toutput_path\tnotes\nstructure_targets\tdownloads/biolip2/BioLiP.txt.gz\tused\t1\tindexes/structure_targets.tsv\tbiolip2_interaction_rows;complete_source_scan\n",
+    )
+    .expect("published build manifest");
+    write_test_source_manifest(&store, &["biolip2"]).expect("BioLiP source identity");
+    write_structure_targets_manifest(&store, &build_manifest).expect("structure publication");
+    let before = fs::read(&structure).expect("published bytes");
+    write_text(&source, "new partial BioLiP input\n").expect("new partial BioLiP input");
+    let options = StoreOptions {
+        workspace_root: root.clone(),
+        science_store: store.clone(),
+    };
+
+    let error = build_store_indexes(&options, &build_manifest)
+        .expect_err("partial new source cannot replace publication");
+
+    assert!(error.contains("structure_targets_publication_invalid_without_rebuild_authority"));
+    assert_eq!(
+        fs::read(&structure).expect("preserved structure bytes"),
+        before
+    );
+    assert_eq!(
+        read_text(&source).expect("new source remains available"),
+        "new partial BioLiP input\n"
+    );
+    fs::remove_dir_all(&root).expect("cleanup temp root");
+}
+
+#[test]
+fn bounded_rcsb_retention_preserves_structure_publication_identity() {
+    let root = temp_root("bounded_rcsb_structure_identity");
+    let store = root.join("science_store");
+    let source = store.join("downloads/rcsb/mmcif/1abc.cif");
+    let structure = store.join("indexes/structure_targets.tsv");
+    let build_manifest = store.join("index_build_manifest.tsv");
+    write_text(
+        &source,
+        "data_1ABC\n_entry.id 1ABC\n_atom_site.group_PDB ATOM\n",
+    )
+    .expect("RCSB source");
+    write_text(
+        &structure,
+        &format!(
+            "{}RCSB\t1ABC\tStructure\tunknown\tstructure_interaction_record\tlig\tprotein\t1abc\tpublished\n",
+            store_row_header()
+        ),
+    )
+    .expect("structure publication");
+    write_text(
+        &build_manifest,
+        "index\tinput_path\tstatus\trows\toutput_path\tnotes\nstructure_targets\tdownloads/rcsb/mmcif/1abc.cif\tused\t1\tindexes/structure_targets.tsv\trcsb_structure_file_rows;complete_source_scan\n",
+    )
+    .expect("build manifest");
+    write_test_source_manifest(&store, &["rcsb_ligand_bound"]).expect("RCSB source identity");
+    write_structure_targets_manifest(&store, &build_manifest).expect("structure manifest");
+    let publication = read_json_value_if_file(&store.join(STRUCTURE_TARGETS_MANIFEST_REL_PATH))
+        .expect("structure publication JSON");
+    let contribution = publication["contributions"]
+        .as_array()
+        .and_then(|rows| rows.first())
+        .expect("RCSB contribution");
+    write_text(
+        &store.join("manifests/source_retention_manifest.tsv"),
+        &format!(
+            "schema_version\tsource_id\tstate\tsource_manifest_sha256\trelease_identity\ttrust_source\tstructure_input_bytes\tstructure_input_digest\n{}\trcsb_ligand_bound\truntime_cache_bounded\t{}\t{}\t{}\t{}\t{}\n",
+            SOURCE_RETENTION_SCHEMA_VERSION,
+            contribution["source_digest"].as_str().expect("source digest"),
+            contribution["release_identity"].as_str().expect("release identity"),
+            contribution["trust_source"].as_str().expect("trust source"),
+            contribution["input_bytes"].as_u64().expect("input bytes"),
+            contribution["input_digest"].as_str().expect("input digest"),
+        ),
+    )
+    .expect("bounded RCSB retention");
+    let current = source_payload_identity(&store.join("downloads/rcsb/mmcif"))
+        .expect("current bounded-cache payload identity");
+    write_text(
+        &store.join("manifests/source_file_manifest.tsv"),
+        &format!(
+            "source_id\tsource_label\tsource_class\tlocal_path\tstatus\tstorage_state\tfile_count\tbytes\tsha256\tprovenance\trelease_identity\ttrust_source\nrcsb_ligand_bound\tRCSB\tstructure\tdownloads/rcsb/mmcif\tready\tbounded_runtime_cache\t{}\t{}\t{}\ttest\tbounded-cache-release\tpublisher\n",
+            current.file_count, current.bytes, current.digest,
+        ),
+    )
+    .expect("current bounded-cache source identity");
+    structure_source_identity(&store, "RCSB").expect("Python bounded cache state accepted");
+    write_text(
+        &source,
+        "data_2XYZ\n_entry.id 2XYZ\n_atom_site.group_PDB ATOM\n",
+    )
+    .expect("mutate runtime cache after publication");
+
+    validate_structure_targets_publication(&store)
+        .expect("bounded retention validates original structure publication");
+    fs::remove_dir_all(&root).expect("cleanup temp root");
+}
+
+#[test]
+fn published_index_replace_failure_rolls_back_existing_file() {
+    let root = temp_root("published_index_rollback");
+    let output = root.join("indexes/known_targets.tsv");
+    let missing_pending = root.join("indexes/missing.pending.tsv");
+    write_text(&output, "published sentinel\n").expect("published output");
+
+    let error = publish_store_row_index(&missing_pending, &output).expect_err("replace failure");
+
+    assert!(error.contains("published_index_replace_failed"));
+    assert_eq!(
+        read_text(&output).expect("rolled back output"),
+        "published sentinel\n"
+    );
+    fs::remove_dir_all(&root).expect("cleanup temp root");
+}
+
+#[test]
+fn interrupted_structure_publication_restores_complete_previous_bundle() {
+    let root = temp_root("structure_publication_reconcile");
+    let store = root.join("science_store");
+    let bundle = structure_publication_bundle_paths(&store);
+    let previous = [
+        "old known targets\n",
+        "old metagenome targets\n",
+        "old structure\n",
+        "old build manifest\n",
+        "old publication\n",
+    ];
+    for (path, text) in bundle.iter().zip(previous.iter().copied()) {
+        write_text(path, text).expect("old publication member");
+    }
+    let refs = bundle.iter().map(PathBuf::as_path).collect::<Vec<_>>();
+    let backups = backup_publication_bundle(&store, &refs).expect("backup publication bundle");
+    assert_eq!(backups.len(), 5);
+    for (index, path) in bundle.iter().take(4).enumerate() {
+        write_text(path, &format!("partial new publication member {index}\n"))
+            .expect("partial new publication");
+    }
+    fs::remove_file(&bundle[4]).expect("interrupt before final publication member");
+
+    reconcile_structure_publication_transaction(&store).expect("reconcile publication");
+
+    for (path, text) in bundle.iter().zip(previous.iter().copied()) {
+        assert_eq!(read_text(path).expect("restored publication member"), text);
+    }
+    assert!(
+        !store
+            .join(STRUCTURE_PUBLICATION_TRANSACTION_REL_PATH)
+            .exists()
+    );
+    assert!(
+        backups
+            .iter()
+            .all(|entry| !entry.pending.exists() && !entry.backup.exists())
+    );
+    fs::remove_dir_all(&root).expect("cleanup temp root");
+}
+
+#[test]
+fn incomplete_publication_backup_never_replaces_current_bundle() {
+    let root = temp_root("structure_publication_incomplete_backup");
+    let store = root.join("science_store");
+    let bundle = structure_publication_bundle_paths(&store);
+    for (index, path) in bundle.iter().enumerate() {
+        write_text(path, &format!("old publication member {index}\n"))
+            .expect("old publication member");
+    }
+    let refs = bundle.iter().map(PathBuf::as_path).collect::<Vec<_>>();
+    let backups = backup_publication_bundle(&store, &refs).expect("backup publication bundle");
+    for (index, path) in bundle.iter().enumerate() {
+        write_text(path, &format!("current publication member {index}\n"))
+            .expect("current publication member");
+    }
+    fs::remove_file(&backups[0].backup).expect("remove completed backup");
+    write_text(&backups[0].pending, "incomplete backup\n").expect("partial pending backup");
+
+    let error = reconcile_structure_publication_transaction(&store)
+        .expect_err("incomplete backup blocks restoration");
+
+    assert!(error.contains("publication_bundle_backup_identity_invalid"));
+    for (index, path) in bundle.iter().enumerate() {
+        assert_eq!(
+            read_text(path).expect("current publication remains"),
+            format!("current publication member {index}\n")
+        );
+    }
+    assert!(
+        store
+            .join(STRUCTURE_PUBLICATION_TRANSACTION_REL_PATH)
+            .is_file()
+    );
+    fs::remove_dir_all(&root).expect("cleanup temp root");
+}
+
+#[test]
 fn failed_compact_ligand_build_keeps_all_legacy_staging() {
     let root = temp_root("ligand_similarity_build_failure");
     let store = root.join("science_store");
@@ -6132,6 +6794,9 @@ fn source_local_available_accepts_pruned_source_only_with_complete_retention_evi
         "missing_derived",
         "empty_derived",
         "legacy_derived",
+        "tampered_compact_database",
+        "wrong_compact_schema",
+        "wrong_compact_source_identity",
     ] {
         let root = temp_root(&format!("pruned_source_availability_{attack}"));
         let store = root.join("science_store");
@@ -6146,6 +6811,7 @@ fn source_local_available_accepts_pruned_source_only_with_complete_retention_evi
             science_store: store.clone(),
         };
         prepare_ligand_similarity_authority(&options).expect("compact ligand authority");
+        fs::remove_dir_all(root.join("python")).expect("remove source-tree worker fixture");
         fs::remove_file(store.join(BINDINGDB_SOURCE_REL_PATH))
             .expect("remove retained BindingDB source payload");
         let digest = test_source_digest("bindingdb");
@@ -6216,6 +6882,33 @@ fn source_local_available_accepts_pruned_source_only_with_complete_retention_evi
             )
             .expect("legacy derived payload");
         }
+        if attack == "tampered_compact_database" {
+            write_text(
+                &store.join(LIGAND_SIMILARITY_DATABASE_REL_PATH),
+                "tampered compact database\n",
+            )
+            .expect("tamper compact database");
+        } else if matches!(
+            attack,
+            "wrong_compact_schema" | "wrong_compact_source_identity"
+        ) {
+            let manifest_path = store.join(LIGAND_SIMILARITY_MANIFEST_REL_PATH);
+            let mut manifest = serde_json::from_str::<Value>(
+                &read_text(&manifest_path).expect("read compact manifest"),
+            )
+            .expect("parse compact manifest");
+            if attack == "wrong_compact_schema" {
+                manifest["schema_version"] = json!("genoligand_ligand_similarity_index_foreign");
+            } else {
+                manifest["inputs"]["bindingdb"]["source_digest"] = json!("c".repeat(64));
+            }
+            write_text(
+                &manifest_path,
+                &(serde_json::to_string_pretty(&manifest).expect("serialize compact manifest")
+                    + "\n"),
+            )
+            .expect("write compact manifest attack");
+        }
         if attack != "missing_source_manifest" {
             write_text(
                 &store.join("manifests/source_file_manifest.tsv"),
@@ -6275,6 +6968,15 @@ fn source_local_available_keeps_original_payload_path_behavior() {
     assert!(source_local_available(&options, source));
     fs::remove_dir_all(&root).expect("cleanup temp root");
     assert!(!root.exists());
+}
+
+#[test]
+fn plinder_required_source_uses_the_canonical_download_scope() {
+    let source = REQUIRED_SOURCES
+        .iter()
+        .find(|source| source.id == "plinder")
+        .expect("PLINDER required source");
+    assert_eq!(source.local_rel_path, "downloads/plinder/index");
 }
 
 #[test]
@@ -7303,21 +8005,56 @@ fn prepare_science_store_builds_structure_index_from_downloaded_sources() {
         "1ABC\tA\tA\t1\tATP\tadenosine triphosphate\n",
     )
     .expect("write biolip2 table");
-    write_text(
-        &store.join("downloads/plinder/index/annotation_table.parquet"),
-        "PAR1fixturePAR1",
-    )
-    .expect("write plinder parquet fixture marker");
+    let plinder_source = store.join("downloads/plinder/index/annotation_table.parquet");
+    write_text(&plinder_source, "PAR1fixturePAR1").expect("write plinder parquet fixture marker");
     write_text(
         &store.join("indexes/plinder_targets.tsv"),
         "source\ttarget_id\ttarget_name\torganism\ttarget_class\tligand_tokens\tsequence_tokens\tstructure_tokens\tevidence\nPLINDER\tPLINDER_SYSTEM_REAL\tPLINDER 3GRT system PLINDER_SYSTEM_REAL\tunknown\tstructure_record\tfad\tchain_a\t3grt system_real\tplinder_2024-06_v2_parquet;structure_id=3GRT;system_id=PLINDER_SYSTEM_REAL;ligand_id=FAD\n",
     )
     .expect("write canonical plinder rows");
+    let plinder_canonical = store.join("indexes/plinder_targets.tsv");
+    let schema_mapping = json!({
+        "system_id": "system_id",
+        "entry_pdb_id": "entry_pdb_id",
+        "ligand_unique_ccd_code": "ligand_unique_ccd_code",
+    });
+    write_text(
+        &store.join("indexes/plinder_targets.manifest.json"),
+        &(json!({
+            "schema_version": PLINDER_CANONICAL_MANIFEST_SCHEMA_VERSION,
+            "status": "ready",
+            "source": {
+                "path": plinder_source.display().to_string(),
+                "size_bytes": fs::metadata(&plinder_source).expect("source metadata").len(),
+                "sha256": sha256_file_hex(&plinder_source).expect("source digest"),
+                "parquet_rows": 1,
+                "row_groups": 1,
+                "schema_field_count": 3,
+                "schema_sha256": sha256_file_hex(&plinder_source).expect("schema digest"),
+                "schema_mapping": schema_mapping.clone(),
+            },
+            "schema_mapping": schema_mapping,
+            "canonical": {
+                "path": plinder_canonical.display().to_string(),
+                "row_count": 1,
+                "size_bytes": fs::metadata(&plinder_canonical).expect("canonical metadata").len(),
+                "sha256": sha256_file_hex(&plinder_canonical).expect("canonical digest"),
+            }
+        })
+        .to_string()
+            + "\n"),
+    )
+    .expect("write canonical plinder manifest");
     write_text(
         &store.join("downloads/binding_moad/bindingmoad.csv"),
         "pdb,ligand,affinity\n2XYZ,ATP,10 nM\n",
     )
     .expect("write moad table");
+    write_test_source_manifest(
+        &store,
+        &["plinder", "biolip2", "binding_moad", "rcsb_ligand_bound"],
+    )
+    .expect("structure source identities");
     let options = StoreOptions {
         workspace_root: root.clone(),
         science_store: store.clone(),
@@ -7339,9 +8076,128 @@ fn prepare_science_store_builds_structure_index_from_downloaded_sources() {
     assert!(manifest.contains("biolip2_interaction_rows"));
     assert!(manifest.contains("binding_moad_complex_rows"));
     assert!(manifest.contains("plinder_canonical_rows"));
+    let publication: Value = serde_json::from_str(
+        &read_text(&store.join(STRUCTURE_TARGETS_MANIFEST_REL_PATH))
+            .expect("structure publication"),
+    )
+    .expect("structure publication JSON");
+    assert_eq!(publication["status"], "ready");
+    assert_eq!(publication["rows"], 4);
+    for source in ["RCSB", "BioLiP2", "PLINDER", "Binding MOAD"] {
+        assert!(publication["contributions"].as_array().is_some_and(|rows| {
+            rows.iter()
+                .any(|row| row["source"] == source && row["rows"] == 1)
+        }));
+    }
+    validate_structure_targets_publication(&store).expect("validated structure publication");
     assert!(status.contains("\"structure\":"));
     fs::remove_dir_all(&root).expect("cleanup temp root");
     assert!(!root.exists());
+}
+
+#[test]
+fn plinder_canonical_and_structure_publications_reject_same_size_tampering() {
+    let root = temp_root("structure_publication_tampering");
+    let store = root.join("science_store");
+    let plinder_source = store.join("downloads/plinder/index/annotation_table.parquet");
+    write_text(&plinder_source, "PAR1fixturePAR1").expect("PLINDER source");
+    let canonical = store.join("indexes/plinder_targets.tsv");
+    write_text(
+        &canonical,
+        "source\ttarget_id\ttarget_name\torganism\ttarget_class\tligand_tokens\tsequence_tokens\tstructure_tokens\tevidence\nPLINDER\tSYSTEM_ONE\tSystem one\tunknown\tstructure_record\tatp\tchain_a\t1abc system_one\tplinder_row\n",
+    )
+    .expect("canonical PLINDER");
+    let schema_mapping = json!({
+        "system_id": "system_id",
+        "entry_pdb_id": "entry_pdb_id",
+        "ligand_unique_ccd_code": "ligand_unique_ccd_code",
+    });
+    write_text(
+        &store.join("indexes/plinder_targets.manifest.json"),
+        &(json!({
+            "schema_version": PLINDER_CANONICAL_MANIFEST_SCHEMA_VERSION,
+            "status": "ready",
+            "source": {
+                "path": plinder_source.display().to_string(),
+                "size_bytes": fs::metadata(&plinder_source).expect("source metadata").len(),
+                "sha256": sha256_file_hex(&plinder_source).expect("source digest"),
+                "parquet_rows": 1,
+                "row_groups": 1,
+                "schema_field_count": 3,
+                "schema_sha256": sha256_file_hex(&plinder_source).expect("schema digest"),
+                "schema_mapping": schema_mapping.clone(),
+            },
+            "schema_mapping": schema_mapping,
+            "canonical": {
+                "path": canonical.display().to_string(),
+                "row_count": 1,
+                "size_bytes": fs::metadata(&canonical).expect("metadata").len(),
+                "sha256": sha256_file_hex(&canonical).expect("digest"),
+            }
+        })
+        .to_string()
+            + "\n"),
+    )
+    .expect("PLINDER manifest");
+    write_test_source_manifest(&store, &["plinder"]).expect("PLINDER source identity");
+    validate_plinder_canonical_publication(&store).expect("valid PLINDER publication");
+    let manifest_path = store.join("indexes/plinder_targets.manifest.json");
+    let legacy_manifest = read_json_value_if_file(&manifest_path).expect("legacy manifest");
+    let mut missing_filtered = legacy_manifest.clone();
+    missing_filtered["source"]["parquet_rows"] = json!(2);
+    write_text(
+        &manifest_path,
+        &(serde_json::to_string(&missing_filtered).expect("serialize missing filtered") + "\n"),
+    )
+    .expect("write missing filtered manifest");
+    assert!(validate_plinder_canonical_publication(&store).is_err());
+    missing_filtered["scan"] = json!({"filtered_rows": 1});
+    write_text(
+        &manifest_path,
+        &(serde_json::to_string(&missing_filtered).expect("serialize conserved scan") + "\n"),
+    )
+    .expect("write conserved scan manifest");
+    validate_plinder_canonical_publication(&store).expect("filtered rows conserve parquet scan");
+    missing_filtered["scan"]["filtered_rows"] = json!(2);
+    write_text(
+        &manifest_path,
+        &(serde_json::to_string(&missing_filtered).expect("serialize invalid scan") + "\n"),
+    )
+    .expect("write invalid scan manifest");
+    assert!(validate_plinder_canonical_publication(&store).is_err());
+    write_text(
+        &manifest_path,
+        &(serde_json::to_string(&legacy_manifest).expect("serialize legacy manifest") + "\n"),
+    )
+    .expect("restore legacy manifest");
+    let original = fs::read(&canonical).expect("canonical bytes");
+    let mut tampered = original.clone();
+    let offset = tampered
+        .iter()
+        .position(|byte| *byte == b'O')
+        .expect("tamper byte");
+    tampered[offset] = b'X';
+    fs::write(&canonical, &tampered).expect("same-size tamper");
+    assert!(validate_plinder_canonical_publication(&store).is_err());
+    fs::write(&canonical, original).expect("restore canonical");
+
+    let options = StoreOptions {
+        workspace_root: root.clone(),
+        science_store: store.clone(),
+    };
+    let build_manifest = store.join("index_build_manifest.tsv");
+    build_store_indexes(&options, &build_manifest).expect("publish structure index");
+    validate_structure_targets_publication(&store).expect("valid structure publication");
+    let structure = store.join("indexes/structure_targets.tsv");
+    let mut bytes = fs::read(&structure).expect("structure bytes");
+    let offset = bytes
+        .iter()
+        .position(|byte| *byte == b'O')
+        .expect("structure tamper byte");
+    bytes[offset] = b'X';
+    fs::write(&structure, bytes).expect("same-size structure tamper");
+    assert!(validate_structure_targets_publication(&store).is_err());
+    fs::remove_dir_all(root).expect("cleanup");
 }
 
 #[test]
@@ -7364,6 +8220,8 @@ fn prepare_science_store_streams_all_structure_table_zip_members() {
         ],
     )
     .expect("write Binding MOAD archive");
+    write_test_source_manifest(&store, &["biolip2", "binding_moad"])
+        .expect("structure source identities");
     let options = StoreOptions {
         workspace_root: root.clone(),
         science_store: store.clone(),
@@ -7410,6 +8268,7 @@ fn structure_index_reads_ligand_names_from_mmcif_coordinates() {
         "data_2H4N\n_struct.title 'H94N CARBONIC ANHYDRASE II COMPLEXED WITH ACETAZOLAMIDE'\nloop_\n_chem_comp.id\n_chem_comp.type\n_chem_comp.mon_nstd_flag\n_chem_comp.name\n_chem_comp.pdbx_synonyms\n_chem_comp.formula\n_chem_comp.formula_weight\nAZM non-polymer . 5-ACETAMIDO-1,3,4-THIADIAZOLE-2-SULFONAMIDE ACETAZOLAMIDE 'C4 H6 N4 O3 S2' 222.25\nATOM 1 N N . GLY A 1 1 ? 11.104 13.207 2.100 1.00 20.00 ? 1 GLY A N 1\n",
     )
     .expect("write mmcif");
+    write_test_source_manifest(&store, &["rcsb_ligand_bound"]).expect("RCSB source identity");
     let options = StoreOptions {
         workspace_root: root.clone(),
         science_store: store.clone(),
@@ -8187,14 +9046,135 @@ fn write_test_source_manifest_with_digests(
     sources: &[(&str, String)],
 ) -> Result<(), String> {
     let mut manifest = String::from(
-        "source_id\tsource_label\tsource_class\tlocal_path\tstatus\tfile_count\tbytes\tsha256\tprovenance\trelease_identity\ttrust_source\n",
+        "source_id\tsource_label\tsource_class\tlocal_path\tstatus\tstorage_state\tfile_count\tbytes\tsha256\tprovenance\trelease_identity\ttrust_source\n",
     );
     for (source_id, digest) in sources {
         manifest.push_str(&format!(
-            "{source_id}\t{source_id}\tunit_test\tdownloads/{source_id}\tready\t1\t1\t{digest}\tunit_test\t{source_id}-test-release\tunit_test\n",
+            "{source_id}\t{source_id}\tunit_test\tdownloads/{source_id}\tready\tunit_test\t1\t1\t{digest}\tunit_test\t{source_id}-test-release\tunit_test\n",
         ));
     }
     write_text(&store.join("manifests/source_file_manifest.tsv"), &manifest)
+}
+
+fn write_test_pruned_alignment_identity_fixture(store: &Path) -> Result<(), String> {
+    let digest = test_source_digest("alignment");
+    let mut source_manifest = String::from(
+        "source_id\tsource_label\tsource_class\tlocal_path\tstatus\tstorage_state\tfile_count\tbytes\tsha256\tprovenance\trelease_identity\ttrust_source\n",
+    );
+    for (source_id, local_path, storage_state, files, bytes) in [
+        ("chembl", "downloads/chembl", "unit_test", 1, 1),
+        ("bindingdb", "downloads/bindingdb", "unit_test", 1, 1),
+        (
+            "plinder",
+            "downloads/plinder/index",
+            "indexed_source_pruned",
+            1,
+            1,
+        ),
+        (
+            "biolip2",
+            "downloads/biolip2",
+            "indexed_source_pruned",
+            6,
+            6,
+        ),
+        (
+            "rcsb_ligand_bound",
+            "downloads/rcsb/mmcif",
+            "unit_test",
+            1,
+            1,
+        ),
+        (
+            "uniprot_human_reviewed",
+            "downloads/uniprot/uniprot_human_reviewed.fasta.gz",
+            "indexed_source_pruned",
+            1,
+            1,
+        ),
+        (
+            "metagenome_potential",
+            "downloads/metagenome/mgnify",
+            "indexed_source_pruned",
+            4,
+            4,
+        ),
+    ] {
+        source_manifest.push_str(&format!(
+            "{source_id}\t{source_id}\tunit_test\t{local_path}\tready\t{storage_state}\t{files}\t{bytes}\t{digest}\tunit_test\t{source_id}-test-release\tunit_test\n"
+        ));
+    }
+    write_text(
+        &store.join("manifests/source_file_manifest.tsv"),
+        &source_manifest,
+    )?;
+    let payload = |path: &str, kind: &str, files: u64, bytes: u64| {
+        json!([{
+            "path": path,
+            "kind": kind,
+            "file_count": files,
+            "bytes": bytes,
+            "sha256": digest,
+            "content_sha256": digest,
+        }])
+        .to_string()
+    };
+    let mut retention = String::from(
+        "schema_version\tsource_id\tsource_local_path\tstate\tsource_files\tsource_bytes\tsource_manifest_sha256\trelease_identity\ttrust_source\tpayload_records_json\tderived_paths\n",
+    );
+    for (source_id, local_path, files, bytes, payload_records, derived) in [
+        (
+            "uniprot_human_reviewed",
+            "downloads/uniprot/uniprot_human_reviewed.fasta.gz",
+            1,
+            1,
+            payload(
+                "downloads/uniprot/uniprot_human_reviewed.fasta.gz",
+                "file",
+                1,
+                1,
+            ),
+            "indexes/mmseqs/mmseqs_target_databases.tsv",
+        ),
+        (
+            "biolip2",
+            "downloads/biolip2",
+            6,
+            6,
+            payload("downloads/biolip2", "directory", 6, 6),
+            "indexes/mmseqs/mmseqs_target_databases.tsv;indexes/structure_targets.tsv;indexes/structure_targets.manifest.json",
+        ),
+        (
+            "metagenome_potential",
+            "downloads/metagenome/mgnify",
+            4,
+            4,
+            payload(
+                "downloads/metagenome/mgnify/mgy_clusters.fa.gz",
+                "file",
+                1,
+                1,
+            ),
+            "indexes/mmseqs/mmseqs_target_databases.tsv",
+        ),
+        (
+            "plinder",
+            "downloads/plinder/index",
+            1,
+            1,
+            payload("downloads/plinder/index", "directory", 1, 1),
+            "indexes/structure_targets.tsv;indexes/structure_targets.manifest.json",
+        ),
+    ] {
+        retention.push_str(&format!(
+            "{}\t{source_id}\t{local_path}\tpruned\t{files}\t{bytes}\t{digest}\t{source_id}-test-release\tunit_test\t{payload_records}\t{derived}\n",
+            SOURCE_RETENTION_SCHEMA_VERSION
+        ));
+    }
+    write_text(
+        &store.join("manifests/source_retention_manifest.tsv"),
+        &retention,
+    )
 }
 
 fn write_alignment_database_fixture(

@@ -44,6 +44,14 @@ const LIGAND_SIMILARITY_DATABASE_REL_PATH: &str =
 const LIGAND_SIMILARITY_MANIFEST_REL_PATH: &str =
     "indexes/ligand_similarity/ligand_similarity.manifest.json";
 const LIGAND_SIMILARITY_SCHEMA_VERSION: &str = "genoligand_ligand_similarity_index_v2";
+const STRUCTURE_TARGETS_MANIFEST_REL_PATH: &str = "indexes/structure_targets.manifest.json";
+const STRUCTURE_TARGETS_MANIFEST_SCHEMA_VERSION: &str =
+    "genoligand_structure_targets_publication_v2";
+const STRUCTURE_PUBLICATION_TRANSACTION_REL_PATH: &str =
+    "indexes/structure_publication.transaction.json";
+const STRUCTURE_PUBLICATION_TRANSACTION_SCHEMA_VERSION: &str =
+    "genoligand_structure_publication_transaction_v2";
+const PLINDER_CANONICAL_MANIFEST_SCHEMA_VERSION: &str = "genoligand_plinder_canonical_v1";
 const LIGAND_SIMILARITY_STANDARDIZATION: &str =
     "rdkit_cleanup_fragment_parent_reionize_canonical_tautomer_v1";
 const BINDINGDB_SOURCE_REL_PATH: &str = "downloads/bindingdb/bindingdb_all.tsv.zip";
@@ -61,6 +69,7 @@ const SCIENCE_READINESS_EVIDENCE_PATHS: &[&str] = &[
     "indexes/known_targets.tsv",
     "indexes/metagenome_targets.tsv",
     "indexes/structure_targets.tsv",
+    STRUCTURE_TARGETS_MANIFEST_REL_PATH,
     "indexes/tool_versions.tsv",
     "indexes/mmseqs/mmseqs_target_databases.tsv",
     "indexes/foldseek/foldseek_target_databases.tsv",
@@ -1146,7 +1155,7 @@ const REQUIRED_SOURCES: &[RequiredSource] = &[
         landing_url: "https://github.com/plinder-org/plinder",
         access_method: "download_plinder_release",
         license_note: "PLINDER data and package license records must be recorded.",
-        local_rel_path: "downloads/plinder",
+        local_rel_path: "downloads/plinder/index",
         index_rel_path: "indexes/structure_targets.tsv",
         repair_action: "download_and_index_plinder",
     },
@@ -1273,11 +1282,11 @@ fn create_temporary_test_store(root: &Path) -> Result<PathBuf, String> {
     write_text(&store.join("source_requirements.tsv"), &sources)?;
     ensure_dir(&store.join("manifests"))?;
     let mut source_manifest = String::from(
-        "source_id\tsource_label\tsource_class\tlocal_path\tstatus\tfile_count\tbytes\tsha256\tprovenance\trelease_identity\ttrust_source\n",
+        "source_id\tsource_label\tsource_class\tlocal_path\tstatus\tstorage_state\tfile_count\tbytes\tsha256\tprovenance\trelease_identity\ttrust_source\n",
     );
     for source in REQUIRED_SOURCES {
         source_manifest.push_str(&format!(
-            "{}\t{}\tunit_test\t{}\tready\t1\t1\t{}\tunit_test\tunit_test_release\tunit_test\n",
+            "{}\t{}\tunit_test\t{}\tready\tunit_test\t1\t1\t{}\tunit_test\tunit_test_release\tunit_test\n",
             source.id,
             source.label,
             source.local_rel_path,
@@ -1382,6 +1391,14 @@ fn unit_test_tool_versions_text() -> String {
 fn prepare_science_store(options: &StoreOptions) -> Result<String, String> {
     ensure_dir(&options.science_store)?;
     ensure_dir(&options.science_store.join("indexes"))?;
+    reconcile_structure_publication_transaction(&options.science_store)?;
+    if let Some(status) = reusable_published_science_store(options) {
+        cleanup_superseded_ligand_query_artifacts(&options.science_store)?;
+        return Ok(format!(
+            "science_store_prepared\tstatus={status}\treused_published_indexes=true\tstore={}",
+            options.science_store.display()
+        ));
+    }
     let manifest = options.science_store.join("science_store_manifest.tsv");
     let known = options.science_store.join("indexes/known_targets.tsv");
     let metagenome = options.science_store.join("indexes/metagenome_targets.tsv");
@@ -1525,6 +1542,354 @@ fn prepare_science_store(options: &StoreOptions) -> Result<String, String> {
         missing.len(),
         options.science_store.display()
     ))
+}
+
+fn reusable_published_science_store(options: &StoreOptions) -> Option<&'static str> {
+    let readiness = evaluate_science_store_readiness(&options.science_store).ok()?;
+    let structure_publication_ready =
+        validate_structure_targets_publication(&options.science_store).is_ok();
+    if readiness.blockers.iter().any(|blocker| {
+        matches!(
+            blocker.as_str(),
+            "science_store_readiness_missing"
+                | "science_store_readiness_invalid"
+                | "science_store_readiness_stale"
+        )
+    }) || validate_retained_ligand_similarity_publication(&options.science_store).is_err()
+        || !published_indexes_have_pruned_retention(&options.science_store)
+        || !structure_publication_ready
+        || ![
+            "indexes/known_targets.tsv",
+            "indexes/metagenome_targets.tsv",
+            "indexes/structure_targets.tsv",
+            "index_build_manifest.tsv",
+        ]
+        .iter()
+        .all(|relative| options.science_store.join(relative).is_file())
+    {
+        return None;
+    }
+    if !readiness.ready && structure_rebuild_authority_available(&options.science_store) {
+        return None;
+    }
+    Some(if readiness.ready {
+        "ready"
+    } else {
+        "needs_repair"
+    })
+}
+
+fn structure_rebuild_authority_available(store: &Path) -> bool {
+    let mut available = BTreeSet::new();
+    if validate_plinder_canonical_publication(store).is_ok()
+        && structure_source_identity(store, "PLINDER").is_ok()
+    {
+        available.insert("PLINDER".to_string());
+    }
+    if discover_biolip_tables(&store.join("downloads/biolip2")).is_ok_and(|paths| {
+        structure_source_identity(store, "BioLiP2").is_ok()
+            && source_files_have_minimum_bytes(&paths, 10 * 1024 * 1024)
+    }) {
+        available.insert("BioLiP2".to_string());
+    }
+    if discover_moad_tables(&store.join("downloads/binding_moad")).is_ok_and(|paths| {
+        structure_source_identity(store, "Binding MOAD").is_ok()
+            && source_files_have_minimum_bytes(&paths, 100 * 1024)
+    }) {
+        available.insert("Binding MOAD".to_string());
+    }
+    if current_valid_rcsb_cache_ids(store).is_some_and(|ids| !ids.is_empty())
+        && structure_source_identity(store, "RCSB").is_ok()
+    {
+        available.insert("RCSB".to_string());
+    }
+    let required = required_structure_contributions(store);
+    !available.is_empty() && required.is_subset(&available)
+}
+
+fn source_files_have_minimum_bytes(paths: &[PathBuf], minimum: u64) -> bool {
+    !paths.is_empty()
+        && paths
+            .iter()
+            .try_fold(0_u64, |total, path| {
+                fs::metadata(path)
+                    .ok()
+                    .filter(|meta| meta.is_file() && meta.len() > 0)
+                    .and_then(|meta| total.checked_add(meta.len()))
+            })
+            .is_some_and(|bytes| bytes >= minimum)
+}
+
+fn published_indexes_have_pruned_retention(store: &Path) -> bool {
+    let Ok(rows) = read_simple_tsv_rows(&store.join("manifests/source_retention_manifest.tsv"))
+    else {
+        return false;
+    };
+    let retained = |source_id: &str, required: &str| {
+        rows.iter().any(|row| {
+            row.get("schema_version").map(String::as_str) == Some(SOURCE_RETENTION_SCHEMA_VERSION)
+                && row.get("state").map(String::as_str) == Some("pruned")
+                && row.get("source_id").map(String::as_str) == Some(source_id)
+                && row.get("derived_paths").is_some_and(|paths| {
+                    paths
+                        .split(';')
+                        .map(|path| path.trim().replace('\\', "/"))
+                        .any(|path| path == required)
+                })
+        })
+    };
+    published_index_is_header_only(&store.join("indexes/known_targets.tsv"))
+        && published_index_is_header_only(&store.join("indexes/metagenome_targets.tsv"))
+        && retained(
+            "uniprot_human_reviewed",
+            "indexes/mmseqs/mmseqs_target_databases.tsv",
+        )
+        && retained("biolip2", "indexes/mmseqs/mmseqs_target_databases.tsv")
+        && retained(
+            "metagenome_potential",
+            "indexes/mmseqs/mmseqs_target_databases.tsv",
+        )
+        && ready_alignment_namespaces(store, "known", &["UniProt", "BioLiP2"])
+        && ready_alignment_namespaces(store, "metagenome", &["MGnify"])
+}
+
+fn published_index_is_header_only(path: &Path) -> bool {
+    let expected = store_row_header();
+    fs::metadata(path).is_ok_and(|meta| meta.is_file() && meta.len() == expected.len() as u64)
+        && fs::read(path).is_ok_and(|bytes| bytes == expected.as_bytes())
+}
+
+fn ready_alignment_namespaces(store: &Path, source_class: &str, expected: &[&str]) -> bool {
+    let Ok(rows) = read_simple_tsv_rows(&store.join("indexes/mmseqs/mmseqs_target_databases.tsv"))
+    else {
+        return false;
+    };
+    expected.iter().all(|expected_namespace| {
+        retained_alignment_namespace_ready(store, &rows, source_class, expected_namespace)
+    })
+}
+
+fn retained_alignment_namespace_ready(
+    store: &Path,
+    rows: &[BTreeMap<String, String>],
+    source_class: &str,
+    namespace: &str,
+) -> bool {
+    let (source_id, source_root, expected_sources): (&str, &str, &[&str]) = match namespace {
+        "UniProt" => (
+            "uniprot_human_reviewed",
+            "downloads/uniprot/uniprot_human_reviewed.fasta.gz",
+            &["downloads/uniprot/uniprot_human_reviewed.fasta.gz"],
+        ),
+        "BioLiP2" => (
+            "biolip2",
+            "downloads/biolip2",
+            &[
+                "downloads/biolip2/peptide.fasta.gz",
+                "downloads/biolip2/peptide_nr.fasta.gz",
+                "downloads/biolip2/protein.fasta.gz",
+                "downloads/biolip2/protein_nr.fasta.gz",
+            ],
+        ),
+        "MGnify" => (
+            "metagenome_potential",
+            "downloads/metagenome/mgnify",
+            &["downloads/metagenome/mgnify/mgy_clusters.fa.gz"],
+        ),
+        _ => return false,
+    };
+    let Ok(source_rows) = read_simple_tsv_rows(&store.join("manifests/source_file_manifest.tsv"))
+    else {
+        return false;
+    };
+    let Ok(retention_rows) =
+        read_simple_tsv_rows(&store.join("manifests/source_retention_manifest.tsv"))
+    else {
+        return false;
+    };
+    let mut source_matches = source_rows
+        .iter()
+        .filter(|row| row.get("source_id").map(String::as_str) == Some(source_id));
+    let Some(source) = source_matches.next() else {
+        return false;
+    };
+    let mut retention_matches = retention_rows
+        .iter()
+        .filter(|row| row.get("source_id").map(String::as_str) == Some(source_id));
+    let Some(retention) = retention_matches.next() else {
+        return false;
+    };
+    let source_digest = source.get("sha256").map(String::as_str).unwrap_or("");
+    let source_files = source
+        .get("file_count")
+        .and_then(|value| value.parse::<u64>().ok());
+    let source_bytes = source
+        .get("bytes")
+        .and_then(|value| value.parse::<u64>().ok());
+    if source_matches.next().is_some()
+        || retention_matches.next().is_some()
+        || source.get("status").map(String::as_str) != Some("ready")
+        || source.get("storage_state").map(String::as_str) != Some("indexed_source_pruned")
+        || source
+            .get("local_path")
+            .map(|path| path.replace('\\', "/"))
+            .as_deref()
+            != Some(source_root)
+        || !valid_sha256_hex(source_digest)
+        || source_files.is_none_or(|value| value == 0)
+        || source_bytes.is_none_or(|value| value == 0)
+        || source
+            .get("release_identity")
+            .is_none_or(|value| value.trim().is_empty())
+        || source
+            .get("trust_source")
+            .is_none_or(|value| value.trim().is_empty())
+        || retention.get("schema_version").map(String::as_str)
+            != Some(SOURCE_RETENTION_SCHEMA_VERSION)
+        || retention.get("state").map(String::as_str) != Some("pruned")
+        || retention
+            .get("source_local_path")
+            .map(|path| path.replace('\\', "/"))
+            .as_deref()
+            != Some(source_root)
+        || retention.get("source_manifest_sha256").map(String::as_str) != Some(source_digest)
+        || retention.get("release_identity") != source.get("release_identity")
+        || retention.get("trust_source") != source.get("trust_source")
+        || retention
+            .get("source_files")
+            .and_then(|value| value.parse::<u64>().ok())
+            != source_files
+        || retention
+            .get("source_bytes")
+            .and_then(|value| value.parse::<u64>().ok())
+            != source_bytes
+        || !retention.get("derived_paths").is_some_and(|paths| {
+            paths.split(';').any(|path| {
+                path.trim().replace('\\', "/") == "indexes/mmseqs/mmseqs_target_databases.tsv"
+            })
+        })
+    {
+        return false;
+    }
+
+    let namespace_rows = rows
+        .iter()
+        .filter(|row| row.get("source_namespace").map(String::as_str) == Some(namespace))
+        .collect::<Vec<_>>();
+    if namespace_rows.len() != expected_sources.len() {
+        return false;
+    }
+    let mut ready_sources = BTreeMap::new();
+    let mut database_paths = BTreeSet::new();
+    for row in namespace_rows {
+        let source_rel = row
+            .get("source_path")
+            .map(|path| path.trim().replace('\\', "/"))
+            .unwrap_or_default();
+        let digest = row.get("source_digest").map(String::as_str).unwrap_or("");
+        let bytes = row
+            .get("source_bytes")
+            .and_then(|value| value.parse::<u64>().ok());
+        let database_rel = row
+            .get("db_path")
+            .map(|path| path.trim().replace('\\', "/"))
+            .unwrap_or_default();
+        let relative_database = Path::new(&database_rel);
+        if row.get("manifest_schema_version").map(String::as_str)
+            != Some(ALIGNMENT_DATABASE_MANIFEST_SCHEMA_VERSION)
+            || row.get("source_class").map(String::as_str) != Some(source_class)
+            || row.get("status").map(String::as_str) != Some("ready")
+            || !expected_sources.contains(&source_rel.as_str())
+            || !valid_sha256_hex(digest)
+            || row
+                .get("source_files")
+                .and_then(|value| value.parse::<u64>().ok())
+                != Some(1)
+            || bytes.is_none_or(|value| value == 0)
+            || row
+                .get("builder_version")
+                .is_none_or(|version| version.trim().is_empty())
+            || database_rel.is_empty()
+            || relative_database.is_absolute()
+            || relative_database.components().any(|component| {
+                matches!(
+                    component,
+                    std::path::Component::ParentDir
+                        | std::path::Component::RootDir
+                        | std::path::Component::Prefix(_)
+                )
+            })
+            || !database_rel.starts_with("indexes/mmseqs/")
+            || !database_paths.insert(database_rel.clone())
+        {
+            return false;
+        }
+        let database = store.join(relative_database);
+        if ![
+            database.clone(),
+            PathBuf::from(format!("{}.dbtype", database.display())),
+            PathBuf::from(format!("{}.index", database.display())),
+            PathBuf::from(format!("{}.lookup", database.display())),
+        ]
+        .iter()
+        .all(|path| fs::metadata(path).is_ok_and(|meta| meta.is_file() && meta.len() > 0))
+            || ready_sources
+                .insert(
+                    source_rel,
+                    (digest.to_ascii_lowercase(), bytes.unwrap_or(0)),
+                )
+                .is_some()
+        {
+            return false;
+        }
+    }
+
+    if namespace == "UniProt" {
+        return source_files == Some(1)
+            && ready_sources.get(expected_sources[0])
+                == Some(&(
+                    source_digest.to_ascii_lowercase(),
+                    source_bytes.unwrap_or(0),
+                ));
+    }
+    if namespace == "MGnify" {
+        let Ok(payloads) = serde_json::from_str::<Vec<Value>>(
+            retention
+                .get("payload_records_json")
+                .map(String::as_str)
+                .unwrap_or(""),
+        ) else {
+            return false;
+        };
+        let matches = payloads
+            .iter()
+            .filter(|payload| {
+                payload
+                    .get("path")
+                    .and_then(Value::as_str)
+                    .map(|path| path.replace('\\', "/"))
+                    .as_deref()
+                    == Some(expected_sources[0])
+            })
+            .collect::<Vec<_>>();
+        return matches.len() == 1
+            && matches[0].get("kind").and_then(Value::as_str) == Some("file")
+            && matches[0].get("file_count").and_then(Value::as_u64) == Some(1)
+            && matches[0]
+                .get("sha256")
+                .and_then(Value::as_str)
+                .is_some_and(valid_sha256_hex)
+            && ready_sources.get(expected_sources[0])
+                == matches[0]
+                    .get("sha256")
+                    .and_then(Value::as_str)
+                    .zip(matches[0].get("bytes").and_then(Value::as_u64))
+                    .map(|(digest, bytes)| (digest.to_ascii_lowercase(), bytes))
+                    .as_ref();
+    }
+    expected_sources
+        .iter()
+        .all(|source| ready_sources.contains_key(*source))
 }
 
 fn prepare_ligand_similarity_authority(options: &StoreOptions) -> Result<(), String> {
@@ -2067,6 +2432,27 @@ struct IndexBuildSummary {
     structure_rows: usize,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct StructureSourceIdentity {
+    source_id: String,
+    source_digest: String,
+    release_identity: String,
+    trust_source: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct StructureInputIdentity {
+    bytes: u64,
+    digest: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct SourcePayloadIdentity {
+    file_count: u64,
+    bytes: u64,
+    digest: String,
+}
+
 struct StoreRowSpool {
     path: PathBuf,
     writer: Option<BufWriter<fs::File>>,
@@ -2114,10 +2500,980 @@ impl StoreRowSpool {
         let row_count = self.rows;
         drop(writer);
         if row_count == 0 {
-            return write_store_rows(output, &[]).map(|_| 0);
+            let parent = output
+                .parent()
+                .ok_or_else(|| format!("index_output_parent_missing:{}", output.display()))?;
+            let pending = temporary_data_path(parent, "empty_store_rows", "tsv");
+            write_store_rows(&pending, &[])?;
+            publish_store_row_index(&pending, output)?;
+            return Ok(0);
         }
         dedupe_store_row_spool(&self.path, output)
     }
+
+    fn finish_preserving_published(
+        self,
+        output: &Path,
+        published_rows: Option<usize>,
+    ) -> Result<(usize, bool), String> {
+        if let Some(rows) = published_rows {
+            return Ok((rows, true));
+        }
+        self.finish(output).map(|rows| (rows, false))
+    }
+}
+
+fn published_store_index_has_rows(path: &Path) -> Result<bool, String> {
+    if !path.is_file() {
+        return Ok(false);
+    }
+    let file = fs::File::open(path)
+        .map_err(|err| format!("published_index_open_failed:{}:{err}", path.display()))?;
+    let mut lines = BufReader::new(file).lines();
+    let header = lines
+        .next()
+        .transpose()
+        .map_err(|err| format!("published_index_read_failed:{}:{err}", path.display()))?
+        .unwrap_or_default();
+    if header.trim_start_matches('\u{feff}') != store_row_header().trim_end() {
+        return Ok(false);
+    }
+    for line in lines {
+        let line =
+            line.map_err(|err| format!("published_index_read_failed:{}:{err}", path.display()))?;
+        if line.trim().is_empty() {
+            continue;
+        }
+        let cols = split_tsv(line.trim_start_matches('\u{feff}'));
+        return Ok(cols.len() >= 9 && !cols[0].trim().is_empty() && !cols[1].trim().is_empty());
+    }
+    Ok(false)
+}
+
+fn store_row_count(path: &Path, context: &str) -> Result<u64, String> {
+    let file = fs::File::open(path).map_err(|err| format!("{context}_open_failed:{err}"))?;
+    let mut lines = BufReader::new(file).lines();
+    let header = lines
+        .next()
+        .transpose()
+        .map_err(|err| format!("{context}_read_failed:{err}"))?
+        .unwrap_or_default();
+    if header.trim_start_matches('\u{feff}') != store_row_header().trim_end() {
+        return Err(format!("{context}_header_invalid"));
+    }
+    let mut rows = 0_u64;
+    for line in lines {
+        if !line
+            .map_err(|err| format!("{context}_read_failed:{err}"))?
+            .trim()
+            .is_empty()
+        {
+            rows = rows
+                .checked_add(1)
+                .ok_or_else(|| format!("{context}_row_count_overflow"))?;
+        }
+    }
+    Ok(rows)
+}
+
+fn validate_plinder_canonical_publication(store: &Path) -> Result<u64, String> {
+    let canonical = store.join("indexes/plinder_targets.tsv");
+    let manifest_path = store.join("indexes/plinder_targets.manifest.json");
+    let manifest = read_json_value_if_file(&manifest_path)
+        .ok_or_else(|| "plinder_canonical_manifest_invalid".to_string())?;
+    let publication = manifest
+        .get("canonical")
+        .and_then(Value::as_object)
+        .ok_or_else(|| "plinder_canonical_identity_missing".to_string())?;
+    let source = manifest
+        .get("source")
+        .and_then(Value::as_object)
+        .ok_or_else(|| "plinder_canonical_source_identity_missing".to_string())?;
+    let rows = publication
+        .get("row_count")
+        .and_then(Value::as_u64)
+        .filter(|rows| *rows > 0)
+        .ok_or_else(|| "plinder_canonical_row_count_invalid".to_string())?;
+    let bytes = fs::metadata(&canonical)
+        .map_err(|err| format!("plinder_canonical_metadata_failed:{err}"))?
+        .len();
+    let declared_path = publication
+        .get("path")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    let declared_sha = publication
+        .get("sha256")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    let source_path = source
+        .get("path")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    let source_name = source_path
+        .replace('\\', "/")
+        .rsplit('/')
+        .next()
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    let expected_source = store.join("downloads/plinder/index").join(&source_name);
+    let source_bytes = source
+        .get("size_bytes")
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    let source_sha = source
+        .get("sha256")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    let parquet_rows = source.get("parquet_rows").and_then(Value::as_u64);
+    let filtered_rows = manifest
+        .get("scan")
+        .and_then(|scan| scan.get("filtered_rows"))
+        .and_then(Value::as_u64);
+    let scan_rows_conserved = match (parquet_rows, filtered_rows) {
+        (Some(parquet), Some(filtered)) => rows.checked_add(filtered) == Some(parquet),
+        (Some(parquet), None) => {
+            manifest.get("schema_version").and_then(Value::as_str)
+                == Some(PLINDER_CANONICAL_MANIFEST_SCHEMA_VERSION)
+                && rows == parquet
+        }
+        _ => false,
+    };
+    let source_identity_ready = if expected_source.is_file() {
+        fs::metadata(&expected_source).is_ok_and(|meta| meta.len() == source_bytes)
+            && sha256_file_hex(&expected_source).as_deref() == Some(source_sha)
+    } else {
+        read_simple_tsv_rows(&store.join("manifests/source_retention_manifest.tsv")).is_ok_and(
+            |rows| {
+                rows.iter().any(|row| {
+                    row.get("schema_version").map(String::as_str)
+                        == Some(SOURCE_RETENTION_SCHEMA_VERSION)
+                        && row.get("source_id").map(String::as_str) == Some("plinder")
+                        && row.get("state").map(String::as_str) == Some("pruned")
+                        && row.get("source_local_path").is_some_and(|path| {
+                            path.replace('\\', "/") == "downloads/plinder/index"
+                        })
+                        && row
+                            .get("source_bytes")
+                            .and_then(|value| value.parse::<u64>().ok())
+                            == Some(source_bytes)
+                        && row
+                            .get("source_manifest_sha256")
+                            .is_some_and(|digest| valid_sha256_hex(digest))
+                        && row
+                            .get("release_identity")
+                            .is_some_and(|value| !value.trim().is_empty())
+                        && row
+                            .get("trust_source")
+                            .is_some_and(|value| !value.trim().is_empty())
+                })
+            },
+        )
+    };
+    if manifest.get("schema_version").and_then(Value::as_str)
+        != Some(PLINDER_CANONICAL_MANIFEST_SCHEMA_VERSION)
+        || manifest.get("status").and_then(Value::as_str) != Some("ready")
+        || !matches!(
+            source_name.as_str(),
+            "annotation_table.parquet" | "annotation_table_nonredundant.parquet"
+        )
+        || !ligand_similarity_declared_path_matches(&expected_source, source_path)
+        || source_bytes == 0
+        || !valid_sha256_hex(source_sha)
+        || !scan_rows_conserved
+        || source
+            .get("row_groups")
+            .and_then(Value::as_u64)
+            .is_none_or(|value| value == 0)
+        || source
+            .get("schema_field_count")
+            .and_then(Value::as_u64)
+            .is_none_or(|value| value == 0)
+        || !source
+            .get("schema_sha256")
+            .and_then(Value::as_str)
+            .is_some_and(valid_sha256_hex)
+        || source.get("schema_mapping") != manifest.get("schema_mapping")
+        || !source_identity_ready
+        || !ligand_similarity_declared_path_matches(&canonical, declared_path)
+        || publication.get("size_bytes").and_then(Value::as_u64) != Some(bytes)
+        || !valid_sha256_hex(declared_sha)
+        || sha256_file_hex(&canonical).as_deref() != Some(declared_sha)
+        || store_row_count(&canonical, "plinder_canonical")? != rows
+    {
+        return Err("plinder_canonical_publication_mismatch".to_string());
+    }
+    Ok(rows)
+}
+
+fn structure_contribution_source(notes: &str) -> Option<&'static str> {
+    if notes.contains("plinder_canonical_rows") {
+        Some("PLINDER")
+    } else if notes.contains("biolip2_interaction_rows") {
+        Some("BioLiP2")
+    } else if notes.contains("binding_moad_complex_rows") {
+        Some("Binding MOAD")
+    } else if notes.contains("rcsb_structure_file_rows") {
+        Some("RCSB")
+    } else {
+        None
+    }
+}
+
+fn structure_contributions(
+    manifest_path: &Path,
+) -> Result<BTreeMap<String, (u64, BTreeSet<String>)>, String> {
+    let mut contributions = BTreeMap::<String, (u64, BTreeSet<String>)>::new();
+    for row in read_simple_tsv_rows(manifest_path)? {
+        if row.get("index").map(String::as_str) != Some("structure_targets")
+            || row.get("status").map(String::as_str) != Some("used")
+            || row
+                .get("output_path")
+                .map(|path| path.replace('\\', "/"))
+                .as_deref()
+                != Some("indexes/structure_targets.tsv")
+        {
+            continue;
+        }
+        let Some(source) = row
+            .get("notes")
+            .and_then(|notes| structure_contribution_source(notes))
+        else {
+            continue;
+        };
+        let rows = row
+            .get("rows")
+            .and_then(|value| value.parse::<u64>().ok())
+            .filter(|rows| *rows > 0)
+            .ok_or_else(|| format!("structure_contribution_rows_invalid:{source}"))?;
+        let path = row
+            .get("input_path")
+            .map(|path| path.replace('\\', "/"))
+            .filter(|path| !path.trim().is_empty())
+            .ok_or_else(|| format!("structure_contribution_path_missing:{source}"))?;
+        let entry = contributions
+            .entry(source.to_string())
+            .or_insert_with(|| (0, BTreeSet::new()));
+        entry.0 = entry
+            .0
+            .checked_add(rows)
+            .ok_or_else(|| format!("structure_contribution_rows_overflow:{source}"))?;
+        entry.1.insert(path);
+    }
+    Ok(contributions)
+}
+
+fn required_structure_contributions(store: &Path) -> BTreeSet<String> {
+    let mut required = BTreeSet::new();
+    if let Some(manifest) =
+        read_json_value_if_file(&store.join(STRUCTURE_TARGETS_MANIFEST_REL_PATH))
+        && let Some(contributions) = manifest.get("contributions").and_then(Value::as_array)
+    {
+        for contribution in contributions {
+            if let Some(source) = contribution.get("source").and_then(Value::as_str)
+                && structure_source_id(source).is_some()
+            {
+                required.insert(source.to_string());
+            }
+        }
+    }
+    if let Ok(rows) = read_simple_tsv_rows(&store.join("manifests/source_file_manifest.tsv")) {
+        for row in rows {
+            if row.get("status").map(String::as_str) != Some("ready") {
+                continue;
+            }
+            if let Some(source) = match row.get("source_id").map(String::as_str) {
+                Some("plinder") => Some("PLINDER"),
+                Some("biolip2") => Some("BioLiP2"),
+                Some("binding_moad") => Some("Binding MOAD"),
+                Some("rcsb_ligand_bound") => Some("RCSB"),
+                _ => None,
+            } {
+                required.insert(source.to_string());
+            }
+        }
+    }
+    if let Ok(rows) = read_simple_tsv_rows(&store.join("manifests/source_retention_manifest.tsv")) {
+        for row in rows {
+            if row.get("schema_version").map(String::as_str)
+                != Some(SOURCE_RETENTION_SCHEMA_VERSION)
+                || row.get("state").map(String::as_str) != Some("pruned")
+                || !row.get("derived_paths").is_some_and(|paths| {
+                    paths.split(';').any(|path| {
+                        path.trim().replace('\\', "/") == "indexes/structure_targets.tsv"
+                    })
+                })
+            {
+                continue;
+            }
+            if let Some(source) = match row.get("source_id").map(String::as_str) {
+                Some("plinder") => Some("PLINDER"),
+                Some("biolip2") => Some("BioLiP2"),
+                Some("binding_moad") => Some("Binding MOAD"),
+                _ => None,
+            } {
+                required.insert(source.to_string());
+            }
+        }
+    }
+    if current_valid_rcsb_cache_ids(store).is_some_and(|ids| !ids.is_empty()) {
+        required.insert("RCSB".to_string());
+    }
+    required
+}
+
+fn require_structure_contributions(
+    store: &Path,
+    contributions: &BTreeMap<String, (u64, BTreeSet<String>)>,
+    unique_rows: &BTreeMap<String, u64>,
+    verified_trust_sources: Option<&BTreeMap<String, String>>,
+) -> Result<(), String> {
+    for source in required_structure_contributions(store) {
+        let Some((rows, paths)) = contributions.get(&source) else {
+            return Err(format!("structure_contribution_missing:{source}"));
+        };
+        if *rows == 0 || paths.is_empty() {
+            return Err(format!("structure_contribution_missing:{source}"));
+        }
+        let trust_source = if let Some(verified) = verified_trust_sources {
+            verified
+                .get(&source)
+                .ok_or_else(|| format!("structure_contribution_identity_missing:{source}"))?
+                .clone()
+        } else {
+            structure_source_identity(store, &source)?.trust_source
+        };
+        let minimum = if trust_source == "unit_test" {
+            1
+        } else {
+            match source.as_str() {
+                "PLINDER" | "BioLiP2" => 100_000,
+                "Binding MOAD" => 1_000,
+                "RCSB" => 1,
+                _ => 1,
+            }
+        };
+        let unique = unique_rows.get(&source).copied().unwrap_or(0);
+        if unique < minimum {
+            return Err(format!(
+                "structure_contribution_incomplete:{source}:{unique}:{minimum}"
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn structure_output_counts(path: &Path) -> Result<(u64, BTreeMap<String, u64>), String> {
+    let file = fs::File::open(path)
+        .map_err(|err| format!("structure_targets_open_failed:{}:{err}", path.display()))?;
+    let mut lines = BufReader::new(file).lines();
+    let header = lines
+        .next()
+        .transpose()
+        .map_err(|err| format!("structure_targets_read_failed:{err}"))?
+        .unwrap_or_default();
+    if header.trim_start_matches('\u{feff}') != store_row_header().trim_end() {
+        return Err("structure_targets_header_invalid".to_string());
+    }
+    let mut counts = BTreeMap::new();
+    let mut total = 0_u64;
+    for line in lines {
+        let line = line.map_err(|err| format!("structure_targets_read_failed:{err}"))?;
+        if line.trim().is_empty() {
+            continue;
+        }
+        total = total
+            .checked_add(1)
+            .ok_or_else(|| "structure_targets_row_count_overflow".to_string())?;
+        let source = line.split('\t').next().unwrap_or_default().trim();
+        if structure_source_id(source).is_some() {
+            let count = counts.entry(source.to_string()).or_insert(0_u64);
+            *count = count
+                .checked_add(1)
+                .ok_or_else(|| format!("structure_targets_source_count_overflow:{source}"))?;
+        }
+    }
+    Ok((total, counts))
+}
+
+fn structure_source_id(source: &str) -> Option<&'static str> {
+    match source {
+        "PLINDER" => Some("plinder"),
+        "BioLiP2" => Some("biolip2"),
+        "Binding MOAD" => Some("binding_moad"),
+        "RCSB" => Some("rcsb_ligand_bound"),
+        _ => None,
+    }
+}
+
+fn source_payload_file_included(relative: &str) -> bool {
+    let normalized = relative.replace('\\', "/").to_ascii_lowercase();
+    let name = normalized.rsplit('/').next().unwrap_or_default();
+    !(name.ends_with(".part")
+        || name.contains(".part.quarantine-")
+        || normalized.contains(".rebuild-")
+        || normalized.contains(".previous-")
+        || name.ends_with(".attempt.json")
+        || name.ends_with(".identity.json")
+        || name.ends_with(".tmp"))
+}
+
+fn collect_source_payload_files(
+    root: &Path,
+    current: &Path,
+    out: &mut Vec<(String, PathBuf, u64)>,
+) -> Result<(), String> {
+    let metadata = fs::symlink_metadata(current)
+        .map_err(|err| format!("source_payload_metadata_failed:{}:{err}", current.display()))?;
+    if metadata.file_type().is_symlink() {
+        return Err(format!(
+            "source_payload_symlink_rejected:{}",
+            current.display()
+        ));
+    }
+    if metadata.is_dir() {
+        let mut entries = fs::read_dir(current)
+            .map_err(|err| format!("source_payload_read_dir_failed:{}:{err}", current.display()))?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|err| format!("source_payload_read_dir_entry_failed:{err}"))?;
+        entries.sort_by_key(|entry| entry.file_name());
+        for entry in entries {
+            collect_source_payload_files(root, &entry.path(), out)?;
+        }
+        return Ok(());
+    }
+    if !metadata.is_file() || metadata.len() == 0 {
+        return Ok(());
+    }
+    let relative = if root.is_file() {
+        current
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or_default()
+            .to_string()
+    } else {
+        current
+            .strip_prefix(root)
+            .map_err(|err| format!("source_payload_relative_path_failed:{err}"))?
+            .to_string_lossy()
+            .replace('\\', "/")
+    };
+    if source_payload_file_included(&relative) {
+        out.push((relative, current.to_path_buf(), metadata.len()));
+    }
+    Ok(())
+}
+
+fn source_payload_identity(path: &Path) -> Result<SourcePayloadIdentity, String> {
+    let mut files = Vec::new();
+    collect_source_payload_files(path, path, &mut files)?;
+    files.sort_by(|left, right| left.0.cmp(&right.0));
+    let mut bytes = 0_u64;
+    let mut hasher = Sha256::new();
+    for (relative, file, size) in &files {
+        let digest = sha256_file_hex(file)
+            .ok_or_else(|| format!("source_payload_sha256_failed:{}", file.display()))?;
+        bytes = bytes
+            .checked_add(*size)
+            .ok_or_else(|| "source_payload_bytes_overflow".to_string())?;
+        hasher.update(relative.as_bytes());
+        hasher.update(size.to_string().as_bytes());
+        hasher.update(digest.as_bytes());
+    }
+    if files.is_empty() || bytes == 0 {
+        return Err(format!("source_payload_empty:{}", path.display()));
+    }
+    Ok(SourcePayloadIdentity {
+        file_count: files.len() as u64,
+        bytes,
+        digest: format!("{:x}", hasher.finalize()),
+    })
+}
+
+fn structure_source_identity(
+    store: &Path,
+    source: &str,
+) -> Result<StructureSourceIdentity, String> {
+    let source_id = structure_source_id(source)
+        .ok_or_else(|| format!("structure_source_id_unknown:{source}"))?;
+    let rows = read_simple_tsv_rows(&store.join("manifests/source_file_manifest.tsv"))?;
+    let mut matches = rows.iter().filter(|row| {
+        row.get("source_id").map(String::as_str) == Some(source_id)
+            && row.get("status").map(String::as_str) == Some("ready")
+    });
+    let row = matches
+        .next()
+        .ok_or_else(|| format!("structure_source_identity_missing:{source_id}"))?;
+    if matches.next().is_some() {
+        return Err(format!("structure_source_identity_duplicate:{source_id}"));
+    }
+    let source_digest = row
+        .get("sha256")
+        .filter(|value| valid_sha256_hex(value))
+        .cloned()
+        .ok_or_else(|| format!("structure_source_digest_invalid:{source_id}"))?;
+    let release_identity = row
+        .get("release_identity")
+        .filter(|value| !value.trim().is_empty())
+        .cloned()
+        .ok_or_else(|| format!("structure_source_release_invalid:{source_id}"))?;
+    let trust_source = row
+        .get("trust_source")
+        .filter(|value| !value.trim().is_empty())
+        .cloned()
+        .ok_or_else(|| format!("structure_source_trust_invalid:{source_id}"))?;
+    let storage_state = row.get("storage_state").map(String::as_str).unwrap_or("");
+    if storage_state == "indexed_source_pruned" {
+        let retention_rows =
+            read_simple_tsv_rows(&store.join("manifests/source_retention_manifest.tsv"))?;
+        let mut retention_matches = retention_rows
+            .iter()
+            .filter(|entry| entry.get("source_id").map(String::as_str) == Some(source_id));
+        let retention = retention_matches
+            .next()
+            .ok_or_else(|| format!("structure_source_retention_missing:{source_id}"))?;
+        if retention_matches.next().is_some()
+            || retention.get("schema_version").map(String::as_str)
+                != Some(SOURCE_RETENTION_SCHEMA_VERSION)
+            || retention.get("state").map(String::as_str) != Some("pruned")
+            || retention.get("source_manifest_sha256").map(String::as_str)
+                != Some(source_digest.as_str())
+            || retention.get("release_identity").map(String::as_str)
+                != Some(release_identity.as_str())
+            || retention.get("trust_source").map(String::as_str) != Some(trust_source.as_str())
+        {
+            return Err(format!("structure_source_retention_mismatch:{source_id}"));
+        }
+    } else if matches!(
+        storage_state,
+        "materialized" | "runtime_cache_bounded" | "bounded_runtime_cache"
+    ) {
+        let local_path = row
+            .get("local_path")
+            .filter(|value| !value.trim().is_empty())
+            .ok_or_else(|| format!("structure_source_local_path_missing:{source_id}"))?;
+        let relative = Path::new(local_path);
+        if relative.is_absolute()
+            || relative.components().any(|component| {
+                matches!(
+                    component,
+                    std::path::Component::ParentDir
+                        | std::path::Component::RootDir
+                        | std::path::Component::Prefix(_)
+                )
+            })
+        {
+            return Err(format!("structure_source_local_path_invalid:{source_id}"));
+        }
+        let actual = source_payload_identity(&store.join(relative))?;
+        let expected_files = row
+            .get("file_count")
+            .and_then(|value| value.parse::<u64>().ok())
+            .filter(|value| *value > 0)
+            .ok_or_else(|| format!("structure_source_file_count_invalid:{source_id}"))?;
+        let expected_bytes = row
+            .get("bytes")
+            .and_then(|value| value.parse::<u64>().ok())
+            .filter(|value| *value > 0)
+            .ok_or_else(|| format!("structure_source_bytes_invalid:{source_id}"))?;
+        if actual.file_count != expected_files
+            || actual.bytes != expected_bytes
+            || !actual.digest.eq_ignore_ascii_case(&source_digest)
+        {
+            return Err(format!(
+                "structure_source_materialized_identity_mismatch:{source_id}"
+            ));
+        }
+    } else if storage_state == "unit_test" {
+        #[cfg(not(test))]
+        return Err(format!(
+            "structure_source_storage_state_invalid:{source_id}"
+        ));
+    } else {
+        return Err(format!(
+            "structure_source_storage_state_invalid:{source_id}"
+        ));
+    }
+    Ok(StructureSourceIdentity {
+        source_id: source_id.to_string(),
+        source_digest: source_digest.to_ascii_lowercase(),
+        release_identity,
+        trust_source,
+    })
+}
+
+fn retained_rcsb_structure_identity_matches(
+    store: &Path,
+    source_digest: &str,
+    release_identity: &str,
+    trust_source: &str,
+    input_bytes: u64,
+    input_digest: &str,
+) -> bool {
+    let Ok(rows) = read_simple_tsv_rows(&store.join("manifests/source_retention_manifest.tsv"))
+    else {
+        return false;
+    };
+    let mut matches = rows
+        .iter()
+        .filter(|row| row.get("source_id").map(String::as_str) == Some("rcsb_ligand_bound"));
+    let Some(row) = matches.next() else {
+        return false;
+    };
+    matches.next().is_none()
+        && row.get("schema_version").map(String::as_str) == Some(SOURCE_RETENTION_SCHEMA_VERSION)
+        && row.get("state").map(String::as_str) == Some("runtime_cache_bounded")
+        && row.get("source_manifest_sha256").map(String::as_str) == Some(source_digest)
+        && row.get("release_identity").map(String::as_str) == Some(release_identity)
+        && row.get("trust_source").map(String::as_str) == Some(trust_source)
+        && row
+            .get("structure_input_bytes")
+            .and_then(|value| value.parse::<u64>().ok())
+            == Some(input_bytes)
+        && row.get("structure_input_digest").map(String::as_str) == Some(input_digest)
+}
+
+fn structure_input_identity(
+    store: &Path,
+    source_paths: &BTreeSet<String>,
+) -> Result<StructureInputIdentity, String> {
+    let mut bytes = 0_u64;
+    let mut hasher = Sha256::new();
+    for relative in source_paths {
+        let normalized = relative.replace('\\', "/");
+        let relative_path = Path::new(&normalized);
+        if relative_path.is_absolute()
+            || relative_path.components().any(|component| {
+                matches!(
+                    component,
+                    std::path::Component::ParentDir
+                        | std::path::Component::RootDir
+                        | std::path::Component::Prefix(_)
+                )
+            })
+        {
+            return Err(format!("structure_input_path_invalid:{relative}"));
+        }
+        let path = store.join(relative_path);
+        let size = fs::metadata(&path)
+            .map_err(|err| format!("structure_input_metadata_failed:{}:{err}", path.display()))?
+            .len();
+        if size == 0 || !path.is_file() {
+            return Err(format!("structure_input_file_invalid:{}", path.display()));
+        }
+        let digest = sha256_file_hex(&path)
+            .ok_or_else(|| format!("structure_input_sha256_failed:{}", path.display()))?;
+        bytes = bytes
+            .checked_add(size)
+            .ok_or_else(|| "structure_input_bytes_overflow".to_string())?;
+        hasher.update(normalized.as_bytes());
+        hasher.update(size.to_string().as_bytes());
+        hasher.update(digest.as_bytes());
+    }
+    if source_paths.is_empty() || bytes == 0 {
+        return Err("structure_input_identity_empty".to_string());
+    }
+    Ok(StructureInputIdentity {
+        bytes,
+        digest: format!("{:x}", hasher.finalize()),
+    })
+}
+
+fn write_structure_targets_manifest(store: &Path, index_manifest: &Path) -> Result<u64, String> {
+    let structure = store.join("indexes/structure_targets.tsv");
+    let (rows, source_counts) = structure_output_counts(&structure)?;
+    let contributions = structure_contributions(index_manifest)?;
+    require_structure_contributions(store, &contributions, &source_counts, None)?;
+    let bytes = fs::metadata(&structure)
+        .map_err(|err| format!("structure_targets_metadata_failed:{err}"))?
+        .len();
+    let sha256 =
+        sha256_file_hex(&structure).ok_or_else(|| "structure_targets_sha256_failed".to_string())?;
+    let contribution_values = contributions
+        .into_iter()
+        .map(|(source, (rows, source_paths))| {
+            let source_identity = structure_source_identity(store, &source)?;
+            let input_identity = structure_input_identity(store, &source_paths)?;
+            Ok(json!({
+                "source": source,
+                "source_id": source_identity.source_id,
+                "source_digest": source_identity.source_digest,
+                "release_identity": source_identity.release_identity,
+                "trust_source": source_identity.trust_source,
+                "rows": rows,
+                "source_paths": source_paths.into_iter().collect::<Vec<_>>(),
+                "input_bytes": input_identity.bytes,
+                "input_digest": input_identity.digest,
+            }))
+        })
+        .collect::<Result<Vec<_>, String>>()?;
+    let value = json!({
+        "schema_version": STRUCTURE_TARGETS_MANIFEST_SCHEMA_VERSION,
+        "status": if rows > 0 { "ready" } else { "empty" },
+        "path": "indexes/structure_targets.tsv",
+        "bytes": bytes,
+        "sha256": sha256,
+        "rows": rows,
+        "contributions": contribution_values,
+    });
+    let output = store.join(STRUCTURE_TARGETS_MANIFEST_REL_PATH);
+    let pending = temporary_data_path(
+        output.parent().unwrap_or(store),
+        "structure_targets_manifest",
+        "json",
+    );
+    write_text(
+        &pending,
+        &(serde_json::to_string_pretty(&value)
+            .map_err(|err| format!("structure_targets_manifest_serialize_failed:{err}"))?
+            + "\n"),
+    )?;
+    publish_store_row_index(&pending, &output)?;
+    Ok(rows)
+}
+
+fn validate_structure_targets_publication(store: &Path) -> Result<u64, String> {
+    let structure = store.join("indexes/structure_targets.tsv");
+    let manifest = read_json_value_if_file(&store.join(STRUCTURE_TARGETS_MANIFEST_REL_PATH))
+        .ok_or_else(|| "structure_targets_manifest_invalid".to_string())?;
+    let rows = manifest
+        .get("rows")
+        .and_then(Value::as_u64)
+        .filter(|rows| *rows > 0)
+        .ok_or_else(|| "structure_targets_rows_invalid".to_string())?;
+    let bytes = fs::metadata(&structure)
+        .map_err(|err| format!("structure_targets_metadata_failed:{err}"))?
+        .len();
+    let digest = manifest
+        .get("sha256")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    let (actual_rows, source_counts) = structure_output_counts(&structure)?;
+    if manifest.get("schema_version").and_then(Value::as_str)
+        != Some(STRUCTURE_TARGETS_MANIFEST_SCHEMA_VERSION)
+        || manifest.get("status").and_then(Value::as_str) != Some("ready")
+        || manifest.get("path").and_then(Value::as_str) != Some("indexes/structure_targets.tsv")
+        || manifest.get("bytes").and_then(Value::as_u64) != Some(bytes)
+        || !valid_sha256_hex(digest)
+        || sha256_file_hex(&structure).as_deref() != Some(digest)
+        || actual_rows != rows
+    {
+        return Err("structure_targets_publication_mismatch".to_string());
+    }
+    let mut contributions = BTreeMap::new();
+    let mut verified_trust_sources = BTreeMap::new();
+    for contribution in manifest
+        .get("contributions")
+        .and_then(Value::as_array)
+        .ok_or_else(|| "structure_targets_contributions_invalid".to_string())?
+    {
+        let source = contribution
+            .get("source")
+            .and_then(Value::as_str)
+            .filter(|source| matches!(*source, "PLINDER" | "BioLiP2" | "Binding MOAD" | "RCSB"))
+            .ok_or_else(|| "structure_targets_contribution_source_invalid".to_string())?;
+        let contribution_rows = contribution
+            .get("rows")
+            .and_then(Value::as_u64)
+            .filter(|rows| *rows > 0)
+            .ok_or_else(|| format!("structure_targets_contribution_rows_invalid:{source}"))?;
+        let paths = contribution
+            .get("source_paths")
+            .and_then(Value::as_array)
+            .and_then(|paths| {
+                paths
+                    .iter()
+                    .map(|path| path.as_str().map(ToOwned::to_owned))
+                    .collect::<Option<BTreeSet<_>>>()
+            })
+            .filter(|paths| !paths.is_empty())
+            .ok_or_else(|| format!("structure_targets_contribution_paths_invalid:{source}"))?;
+        let source_id = contribution
+            .get("source_id")
+            .and_then(Value::as_str)
+            .filter(|value| structure_source_id(source) == Some(*value))
+            .ok_or_else(|| format!("structure_targets_source_id_invalid:{source}"))?;
+        let source_digest = contribution
+            .get("source_digest")
+            .and_then(Value::as_str)
+            .filter(|digest| valid_sha256_hex(digest))
+            .ok_or_else(|| format!("structure_targets_source_digest_invalid:{source}"))?;
+        let release_identity = contribution
+            .get("release_identity")
+            .and_then(Value::as_str)
+            .filter(|value| !value.trim().is_empty())
+            .ok_or_else(|| format!("structure_targets_source_release_invalid:{source}"))?;
+        let trust_source = contribution
+            .get("trust_source")
+            .and_then(Value::as_str)
+            .filter(|value| !value.trim().is_empty())
+            .ok_or_else(|| format!("structure_targets_source_trust_invalid:{source}"))?;
+        let input_bytes = contribution
+            .get("input_bytes")
+            .and_then(Value::as_u64)
+            .filter(|bytes| *bytes > 0)
+            .ok_or_else(|| format!("structure_targets_input_bytes_invalid:{source}"))?;
+        let input_digest = contribution
+            .get("input_digest")
+            .and_then(Value::as_str)
+            .filter(|digest| valid_sha256_hex(digest))
+            .ok_or_else(|| format!("structure_targets_input_digest_invalid:{source}"))?;
+        let retained_rcsb_identity = source == "RCSB"
+            && retained_rcsb_structure_identity_matches(
+                store,
+                source_digest,
+                release_identity,
+                trust_source,
+                input_bytes,
+                input_digest,
+            );
+        let source_identity_matches = if retained_rcsb_identity {
+            true
+        } else {
+            let current = structure_source_identity(store, source)?;
+            source_id == current.source_id
+                && source_digest.eq_ignore_ascii_case(&current.source_digest)
+                && release_identity == current.release_identity
+                && trust_source == current.trust_source
+        };
+        if !source_identity_matches {
+            return Err(format!(
+                "structure_targets_source_identity_mismatch:{source}"
+            ));
+        }
+        verified_trust_sources.insert(source.to_string(), trust_source.to_string());
+        let existing_paths = paths
+            .iter()
+            .filter(|relative| store.join(relative.replace('\\', "/")).is_file())
+            .count();
+        if existing_paths > 0 && !retained_rcsb_identity {
+            if existing_paths != paths.len() {
+                return Err(format!("structure_targets_input_set_partial:{source}"));
+            }
+            let actual = structure_input_identity(store, &paths)?;
+            if actual.bytes != input_bytes || actual.digest != input_digest {
+                return Err(format!(
+                    "structure_targets_input_identity_mismatch:{source}"
+                ));
+            }
+        }
+        if contributions
+            .insert(source.to_string(), (contribution_rows, paths))
+            .is_some()
+        {
+            return Err(format!("structure_targets_contribution_duplicate:{source}"));
+        }
+    }
+    if structure_contributions(&store.join("index_build_manifest.tsv"))? != contributions {
+        return Err("structure_targets_contributions_mismatch".to_string());
+    }
+    require_structure_contributions(
+        store,
+        &contributions,
+        &source_counts,
+        Some(&verified_trust_sources),
+    )?;
+    Ok(rows)
+}
+
+fn published_store_index_identity(
+    output: &Path,
+    manifest_path: &Path,
+    index_name: &str,
+) -> Result<Option<usize>, String> {
+    if !published_store_index_has_rows(output)? {
+        return Ok(None);
+    }
+    let rows = read_simple_tsv_rows(manifest_path)?;
+    let mut matches = rows.iter().filter(|row| {
+        row.get("index").map(String::as_str) == Some(index_name)
+            && row.get("status").map(String::as_str) == Some("publication_ready")
+            && row
+                .get("output_path")
+                .map(|path| path.replace('\\', "/"))
+                .as_deref()
+                == Some(index_output_for(index_name))
+    });
+    let row = matches
+        .next()
+        .ok_or_else(|| format!("{index_name}_publication_identity_missing"))?;
+    if matches.next().is_some() {
+        return Err(format!("{index_name}_publication_identity_duplicate"));
+    }
+    let expected_rows = row
+        .get("rows")
+        .and_then(|value| value.parse::<usize>().ok())
+        .filter(|rows| *rows > 0)
+        .ok_or_else(|| format!("{index_name}_publication_rows_invalid"))?;
+    let notes = row.get("notes").map(String::as_str).unwrap_or_default();
+    let fields = notes
+        .split(';')
+        .filter_map(|field| field.split_once('='))
+        .collect::<BTreeMap<_, _>>();
+    let expected_bytes = fields
+        .get("publication_bytes")
+        .and_then(|value| value.parse::<u64>().ok())
+        .ok_or_else(|| format!("{index_name}_publication_bytes_invalid"))?;
+    let expected_digest = fields
+        .get("publication_sha256")
+        .filter(|digest| valid_sha256_hex(digest))
+        .ok_or_else(|| format!("{index_name}_publication_sha256_invalid"))?;
+    if fs::metadata(output)
+        .map_err(|err| format!("{index_name}_publication_metadata_failed:{err}"))?
+        .len()
+        != expected_bytes
+        || sha256_file_hex(output).as_deref() != Some(*expected_digest)
+        || store_row_count(output, index_name)? != expected_rows as u64
+    {
+        return Err(format!("{index_name}_publication_identity_mismatch"));
+    }
+    Ok(Some(expected_rows))
+}
+
+fn append_store_index_publication_identity(
+    store: &Path,
+    index_name: &str,
+    output: &Path,
+    rows: usize,
+    manifest: &mut String,
+) -> Result<(), String> {
+    if rows == 0 {
+        return Ok(());
+    }
+    let bytes = fs::metadata(output)
+        .map_err(|err| format!("{index_name}_publication_metadata_failed:{err}"))?
+        .len();
+    let digest =
+        sha256_file_hex(output).ok_or_else(|| format!("{index_name}_publication_sha256_failed"))?;
+    manifest.push_str(&format!(
+        "{index_name}\t{}\tpublication_ready\t{rows}\t{}\tpublication_bytes={bytes};publication_sha256={digest}\n",
+        relative_display(store, output),
+        index_output_for(index_name),
+    ));
+    Ok(())
+}
+
+fn append_published_manifest_rows(
+    manifest_path: &Path,
+    index_name: &str,
+    manifest: &mut String,
+) -> Result<bool, String> {
+    if !manifest_path.is_file() {
+        return Ok(false);
+    }
+    let text = read_text(manifest_path)?;
+    let mut appended = false;
+    for line in text.lines().skip(1) {
+        let cols = split_tsv(line);
+        if cols.first().map(String::as_str) == Some(index_name)
+            || (index_name == "known_targets"
+                && cols.first().map(String::as_str) == Some("ligand_similarity"))
+        {
+            manifest.push_str(line);
+            manifest.push('\n');
+            appended = true;
+        }
+    }
+    Ok(appended)
 }
 
 impl Drop for StoreRowSpool {
@@ -2158,21 +3514,469 @@ fn dedupe_store_row_spool(raw_path: &Path, output_path: &Path) -> Result<usize, 
         let _ = fs::remove_file(&pending_path);
         return Err("store_row_dedupe_missing_row_count".to_string());
     };
-    if output_path.exists()
-        && let Err(err) = fs::remove_file(output_path)
-    {
-        let _ = fs::remove_file(&pending_path);
-        return Err(format!("remove_failed:{}:{err}", output_path.display()));
+    publish_store_row_index(&pending_path, output_path)?;
+    Ok(row_count)
+}
+
+fn publish_store_row_index(pending: &Path, output: &Path) -> Result<(), String> {
+    if !output.exists() {
+        return fs::rename(pending, output).map_err(|err| {
+            format!(
+                "rename_failed:{}:{}:{err}",
+                pending.display(),
+                output.display()
+            )
+        });
     }
-    if let Err(err) = fs::rename(&pending_path, output_path) {
-        let _ = fs::remove_file(&pending_path);
+    let parent = output
+        .parent()
+        .ok_or_else(|| format!("index_output_parent_missing:{}", output.display()))?;
+    let backup = temporary_data_path(parent, "published_store_rows_backup", "tsv");
+    fs::rename(output, &backup)
+        .map_err(|err| format!("published_index_backup_failed:{}:{err}", output.display()))?;
+    if let Err(err) = fs::rename(pending, output) {
+        let rollback = fs::rename(&backup, output);
+        let _ = fs::remove_file(pending);
+        return match rollback {
+            Ok(()) => Err(format!(
+                "published_index_replace_failed:{}:{}:{err}",
+                pending.display(),
+                output.display()
+            )),
+            Err(rollback_err) => Err(format!(
+                "published_index_replace_and_rollback_failed:{}:{}:{err}:{rollback_err}",
+                pending.display(),
+                output.display()
+            )),
+        };
+    }
+    fs::remove_file(&backup).map_err(|err| {
+        format!(
+            "published_index_backup_cleanup_failed:{}:{err}",
+            backup.display()
+        )
+    })
+}
+
+fn publish_text_file(path: &Path, text: &str) -> Result<(), String> {
+    let parent = path
+        .parent()
+        .ok_or_else(|| format!("publish_text_parent_missing:{}", path.display()))?;
+    let extension = path
+        .extension()
+        .and_then(|value| value.to_str())
+        .unwrap_or("tmp");
+    let pending = temporary_data_path(parent, "published_text", extension);
+    if let Err(err) = write_text(&pending, text) {
+        let _ = fs::remove_file(&pending);
+        return Err(err);
+    }
+    publish_store_row_index(&pending, path)
+}
+
+fn structure_publication_bundle_paths(store: &Path) -> [PathBuf; 5] {
+    [
+        store.join("indexes/known_targets.tsv"),
+        store.join("indexes/metagenome_targets.tsv"),
+        store.join("indexes/structure_targets.tsv"),
+        store.join("index_build_manifest.tsv"),
+        store.join(STRUCTURE_TARGETS_MANIFEST_REL_PATH),
+    ]
+}
+
+fn write_structure_publication_transaction(
+    store: &Path,
+    backups: &[PublicationBackup],
+) -> Result<(), String> {
+    let entries = backups
+        .iter()
+        .map(|entry| {
+            json!({
+                "original": entry.original.display().to_string(),
+                "pending": entry.pending.display().to_string(),
+                "backup": entry.backup.display().to_string(),
+                "bytes": entry.bytes,
+                "sha256": entry.sha256,
+            })
+        })
+        .collect::<Vec<_>>();
+    let value = json!({
+        "schema_version": STRUCTURE_PUBLICATION_TRANSACTION_SCHEMA_VERSION,
+        "phase": "publishing",
+        "entries": entries,
+    });
+    publish_text_file(
+        &store.join(STRUCTURE_PUBLICATION_TRANSACTION_REL_PATH),
+        &(serde_json::to_string_pretty(&value)
+            .map_err(|err| format!("structure_publication_transaction_serialize_failed:{err}"))?
+            + "\n"),
+    )
+}
+
+#[derive(Debug)]
+struct PublicationBackup {
+    original: PathBuf,
+    pending: PathBuf,
+    backup: PathBuf,
+    bytes: u64,
+    sha256: String,
+}
+
+fn publication_backup_matches(entry: &PublicationBackup) -> bool {
+    fs::metadata(&entry.backup).is_ok_and(|metadata| {
+        metadata.is_file()
+            && metadata.len() == entry.bytes
+            && sha256_file_hex(&entry.backup).as_deref() == Some(entry.sha256.as_str())
+    })
+}
+
+fn copy_publication_backup(entry: &PublicationBackup) -> Result<(), String> {
+    let result = (|| {
+        fs::copy(&entry.original, &entry.pending).map_err(|err| {
+            format!(
+                "publication_bundle_backup_copy_failed:{}:{}:{err}",
+                entry.original.display(),
+                entry.pending.display()
+            )
+        })?;
+        OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&entry.pending)
+            .and_then(|file| file.sync_all())
+            .map_err(|err| {
+                format!(
+                    "publication_bundle_backup_sync_failed:{}:{err}",
+                    entry.pending.display()
+                )
+            })?;
+        let pending_matches = fs::metadata(&entry.pending).is_ok_and(|metadata| {
+            metadata.is_file()
+                && metadata.len() == entry.bytes
+                && sha256_file_hex(&entry.pending).as_deref() == Some(entry.sha256.as_str())
+        });
+        if !pending_matches {
+            return Err(format!(
+                "publication_bundle_backup_identity_mismatch:{}",
+                entry.original.display()
+            ));
+        }
+        fs::rename(&entry.pending, &entry.backup).map_err(|err| {
+            format!(
+                "publication_bundle_backup_publish_failed:{}:{}:{err}",
+                entry.pending.display(),
+                entry.backup.display()
+            )
+        })?;
+        if !publication_backup_matches(entry) {
+            return Err(format!(
+                "publication_bundle_backup_identity_mismatch:{}",
+                entry.backup.display()
+            ));
+        }
+        Ok(())
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(&entry.pending);
+    }
+    result
+}
+
+fn backup_publication_bundle(
+    store: &Path,
+    paths: &[&Path],
+) -> Result<Vec<PublicationBackup>, String> {
+    let mut backups = Vec::<PublicationBackup>::new();
+    for path in paths {
+        if !path.exists() {
+            continue;
+        }
+        if !path.is_file() {
+            return Err(format!(
+                "publication_bundle_file_required:{}",
+                path.display()
+            ));
+        }
+        let parent = path
+            .parent()
+            .ok_or_else(|| format!("publication_bundle_parent_missing:{}", path.display()))?;
+        let extension = path
+            .extension()
+            .and_then(|value| value.to_str())
+            .unwrap_or("tmp");
+        let metadata = fs::metadata(path).map_err(|err| {
+            format!(
+                "publication_bundle_backup_metadata_failed:{}:{err}",
+                path.display()
+            )
+        })?;
+        let sha256 = sha256_file_hex(path)
+            .ok_or_else(|| format!("publication_bundle_backup_sha256_failed:{}", path.display()))?;
+        let pending = temporary_data_path(parent, "publication_bundle_backup_pending", extension);
+        let backup = temporary_data_path(parent, "publication_bundle_backup", extension);
+        backups.push(PublicationBackup {
+            original: path.to_path_buf(),
+            pending,
+            backup,
+            bytes: metadata.len(),
+            sha256,
+        });
+    }
+    write_structure_publication_transaction(store, &backups)?;
+    for entry in &backups {
+        if let Err(err) = copy_publication_backup(entry) {
+            let cleanup = discard_publication_backups(store, &backups);
+            return match cleanup {
+                Ok(()) => Err(err),
+                Err(cleanup_err) => Err(format!(
+                    "{err};publication_bundle_backup_cleanup_failed:{cleanup_err}"
+                )),
+            };
+        }
+    }
+    Ok(backups)
+}
+
+fn restore_publication_bundle(
+    store: &Path,
+    paths: &[&Path],
+    backups: &[PublicationBackup],
+) -> Result<(), String> {
+    if let Some(entry) = backups
+        .iter()
+        .find(|entry| !publication_backup_matches(entry))
+    {
         return Err(format!(
-            "rename_failed:{}:{}:{err}",
-            pending_path.display(),
-            output_path.display()
+            "publication_bundle_backup_identity_invalid:{}",
+            entry.backup.display()
         ));
     }
-    Ok(row_count)
+    for entry in backups {
+        let parent = entry.original.parent().ok_or_else(|| {
+            format!(
+                "publication_bundle_rollback_parent_missing:{}",
+                entry.original.display()
+            )
+        })?;
+        let extension = entry
+            .original
+            .extension()
+            .and_then(|value| value.to_str())
+            .unwrap_or("tmp");
+        let pending = temporary_data_path(parent, "publication_bundle_restore", extension);
+        let restore_result = (|| {
+            fs::copy(&entry.backup, &pending).map_err(|err| {
+                format!(
+                    "publication_bundle_rollback_copy_failed:{}:{}:{err}",
+                    entry.backup.display(),
+                    pending.display()
+                )
+            })?;
+            OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(&pending)
+                .and_then(|file| file.sync_all())
+                .map_err(|err| {
+                    format!(
+                        "publication_bundle_rollback_sync_failed:{}:{err}",
+                        pending.display()
+                    )
+                })?;
+            let pending_matches = fs::metadata(&pending).is_ok_and(|metadata| {
+                metadata.is_file()
+                    && metadata.len() == entry.bytes
+                    && sha256_file_hex(&pending).as_deref() == Some(entry.sha256.as_str())
+            });
+            if !pending_matches {
+                return Err(format!(
+                    "publication_bundle_rollback_identity_mismatch:{}",
+                    pending.display()
+                ));
+            }
+            publish_store_row_index(&pending, &entry.original)?;
+            Ok(())
+        })();
+        if let Err(err) = restore_result {
+            let _ = fs::remove_file(&pending);
+            return Err(err);
+        }
+    }
+    for path in paths {
+        if backups
+            .iter()
+            .any(|entry| entry.original.as_path() == *path)
+        {
+            continue;
+        }
+        if path.exists() {
+            fs::remove_file(path).map_err(|err| {
+                format!(
+                    "publication_bundle_rollback_remove_failed:{}:{err}",
+                    path.display()
+                )
+            })?;
+        }
+    }
+    discard_publication_backups(store, backups)
+}
+
+fn discard_publication_backups(store: &Path, backups: &[PublicationBackup]) -> Result<(), String> {
+    let transaction = store.join(STRUCTURE_PUBLICATION_TRANSACTION_REL_PATH);
+    if transaction.exists() {
+        fs::remove_file(&transaction).map_err(|err| {
+            format!(
+                "publication_bundle_transaction_cleanup_failed:{}:{err}",
+                transaction.display()
+            )
+        })?;
+    }
+    for entry in backups {
+        for path in [&entry.pending, &entry.backup] {
+            if !path.exists() {
+                continue;
+            }
+            fs::remove_file(path).map_err(|err| {
+                format!(
+                    "publication_bundle_backup_cleanup_failed:{}:{err}",
+                    path.display()
+                )
+            })?;
+        }
+    }
+    Ok(())
+}
+
+struct PublicationBundleTransaction {
+    store: PathBuf,
+    paths: Vec<PathBuf>,
+    backups: Vec<PublicationBackup>,
+    committed: bool,
+}
+
+impl PublicationBundleTransaction {
+    fn begin(store: &Path, paths: &[&Path]) -> Result<Self, String> {
+        Ok(Self {
+            store: store.to_path_buf(),
+            paths: paths.iter().map(|path| (*path).to_path_buf()).collect(),
+            backups: backup_publication_bundle(store, paths)?,
+            committed: false,
+        })
+    }
+
+    fn commit(&mut self) -> Result<(), String> {
+        self.committed = true;
+        discard_publication_backups(&self.store, &self.backups)
+    }
+}
+
+impl Drop for PublicationBundleTransaction {
+    fn drop(&mut self) {
+        if self.committed {
+            return;
+        }
+        let paths = self.paths.iter().map(PathBuf::as_path).collect::<Vec<_>>();
+        let _ = restore_publication_bundle(&self.store, &paths, &self.backups);
+    }
+}
+
+fn reconcile_structure_publication_transaction(store: &Path) -> Result<(), String> {
+    let transaction_path = store.join(STRUCTURE_PUBLICATION_TRANSACTION_REL_PATH);
+    if !transaction_path.is_file() {
+        return Ok(());
+    }
+    let value = read_json_value_if_file(&transaction_path)
+        .ok_or_else(|| "structure_publication_transaction_invalid".to_string())?;
+    if value.get("schema_version").and_then(Value::as_str)
+        != Some(STRUCTURE_PUBLICATION_TRANSACTION_SCHEMA_VERSION)
+        || value.get("phase").and_then(Value::as_str) != Some("publishing")
+    {
+        return Err("structure_publication_transaction_schema_invalid".to_string());
+    }
+    let bundle = structure_publication_bundle_paths(store);
+    let allowed = bundle.iter().cloned().collect::<BTreeSet<_>>();
+    let mut backups = Vec::new();
+    for entry in value
+        .get("entries")
+        .and_then(Value::as_array)
+        .ok_or_else(|| "structure_publication_transaction_entries_invalid".to_string())?
+    {
+        let original = PathBuf::from(
+            entry
+                .get("original")
+                .and_then(Value::as_str)
+                .ok_or_else(|| "structure_publication_transaction_original_invalid".to_string())?,
+        );
+        let pending = PathBuf::from(
+            entry
+                .get("pending")
+                .and_then(Value::as_str)
+                .ok_or_else(|| "structure_publication_transaction_pending_invalid".to_string())?,
+        );
+        let backup = PathBuf::from(
+            entry
+                .get("backup")
+                .and_then(Value::as_str)
+                .ok_or_else(|| "structure_publication_transaction_backup_invalid".to_string())?,
+        );
+        let bytes = entry
+            .get("bytes")
+            .and_then(Value::as_u64)
+            .ok_or_else(|| "structure_publication_transaction_bytes_invalid".to_string())?;
+        let sha256 = entry
+            .get("sha256")
+            .and_then(Value::as_str)
+            .filter(|value| valid_sha256_hex(value))
+            .ok_or_else(|| "structure_publication_transaction_sha256_invalid".to_string())?
+            .to_string();
+        let pending_name = pending
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or_default();
+        let backup_name = backup
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or_default();
+        if !allowed.contains(&original)
+            || pending.parent() != original.parent()
+            || backup.parent() != original.parent()
+            || !pending_name.contains("publication_bundle_backup_pending")
+            || !backup_name.contains("publication_bundle_backup")
+            || backup_name.contains("publication_bundle_backup_pending")
+            || pending == backup
+            || backups
+                .iter()
+                .any(|known: &PublicationBackup| known.original == original)
+        {
+            return Err("structure_publication_transaction_path_invalid".to_string());
+        }
+        backups.push(PublicationBackup {
+            original,
+            pending,
+            backup,
+            bytes,
+            sha256,
+        });
+    }
+    let known = store.join("indexes/known_targets.tsv");
+    let metagenome = store.join("indexes/metagenome_targets.tsv");
+    let build_manifest = store.join("index_build_manifest.tsv");
+    let complete_bundle = bundle.iter().all(|path| path.is_file());
+    let compatibility_indexes_ready = matches!(
+        published_store_index_identity(&known, &build_manifest, "known_targets"),
+        Ok(Some(_))
+    ) && matches!(
+        published_store_index_identity(&metagenome, &build_manifest, "metagenome_targets"),
+        Ok(Some(_))
+    );
+    if complete_bundle
+        && compatibility_indexes_ready
+        && validate_structure_targets_publication(store).is_ok()
+    {
+        return discard_publication_backups(store, &backups);
+    }
+    let refs = bundle.iter().map(PathBuf::as_path).collect::<Vec<_>>();
+    restore_publication_bundle(store, &refs, &backups)
 }
 
 fn store_row_dedupe_script() -> &'static str {
@@ -2309,51 +4113,54 @@ fn build_store_indexes(
     let mut manifest = String::from("index\tinput_path\tstatus\trows\toutput_path\tnotes\n");
     let indexes_dir = options.science_store.join("indexes");
     let ligand_similarity_ready = validate_ligand_similarity_runtime_contract(options).is_ok();
+    let known_output = indexes_dir.join("known_targets.tsv");
+    let metagenome_output = indexes_dir.join("metagenome_targets.tsv");
+    let structure_output = indexes_dir.join("structure_targets.tsv");
+    let known_inputs_materialized = known_sources
+        .iter()
+        .any(|relative| path_has_any_file(&options.science_store.join(relative)))
+        || discover_sequence_files(&options.science_store.join("downloads/uniprot"))
+            .is_ok_and(|paths| !paths.is_empty());
+    let metagenome_inputs_materialized = metagenome_sources
+        .iter()
+        .any(|relative| path_has_any_file(&options.science_store.join(relative)))
+        || discover_sequence_files(&options.science_store.join("downloads/metagenome"))
+            .is_ok_and(|paths| !paths.is_empty());
+    let known_published = if known_inputs_materialized {
+        None
+    } else {
+        published_store_index_identity(&known_output, manifest_path, "known_targets")?
+    };
+    let metagenome_published = if metagenome_inputs_materialized {
+        None
+    } else {
+        published_store_index_identity(&metagenome_output, manifest_path, "metagenome_targets")?
+    };
+    let structure_published = validate_structure_targets_publication(&options.science_store)
+        .ok()
+        .and_then(|rows| usize::try_from(rows).ok());
+    if published_store_index_has_rows(&structure_output)?
+        && structure_published.is_none()
+        && !structure_rebuild_authority_available(&options.science_store)
+    {
+        return Err("structure_targets_publication_invalid_without_rebuild_authority".to_string());
+    }
     let mut known_rows = StoreRowSpool::create(&indexes_dir, "known_targets_raw")?;
-    for rel in known_sources {
-        let path = options.science_store.join(rel);
-        if ligand_similarity_ready && rel.starts_with("downloads/bindingdb/bindingdb_all") {
-            manifest.push_str(&format!(
+    if known_published.is_some() {
+        if !append_published_manifest_rows(manifest_path, "known_targets", &mut manifest)? {
+            manifest.push_str(
+                "known_targets\tindexes/known_targets.tsv\tpreserved\t1\tindexes/known_targets.tsv\tpublished_nonempty_index_preserved\n",
+            );
+        }
+    } else {
+        for rel in known_sources {
+            let path = options.science_store.join(rel);
+            if ligand_similarity_ready && rel.starts_with("downloads/bindingdb/bindingdb_all") {
+                manifest.push_str(&format!(
                 "known_targets\t{}\tsuperseded\t0\t{}\tcompact_ligand_similarity_is_authoritative\n",
                 relative_display(&options.science_store, &path),
                 LIGAND_SIMILARITY_DATABASE_REL_PATH,
             ));
-            continue;
-        }
-        append_canonical_rows(
-            "known_targets",
-            &options.science_store,
-            &path,
-            &mut known_rows,
-            &mut manifest,
-        )?;
-    }
-    let chembl_dir = options.science_store.join("downloads/chembl");
-    let published_chembl_query = chembl_dir.join("chembl_query.sqlite");
-    if ligand_similarity_ready {
-        let ligand_manifest = options
-            .science_store
-            .join(LIGAND_SIMILARITY_MANIFEST_REL_PATH);
-        let target_count = read_text(&ligand_manifest)
-            .ok()
-            .and_then(|text| {
-                serde_json::from_str::<Value>(text.trim_start_matches('\u{feff}')).ok()
-            })
-            .and_then(|value| {
-                value
-                    .get("counts")
-                    .and_then(|counts| counts.get("targets"))
-                    .and_then(Value::as_u64)
-            })
-            .unwrap_or(0);
-        manifest.push_str(&format!(
-            "ligand_similarity\t{}\tready\t{target_count}\t{}\tcompact_ligand_similarity_used_by_onsite_matcher\n",
-            LIGAND_SIMILARITY_MANIFEST_REL_PATH,
-            LIGAND_SIMILARITY_DATABASE_REL_PATH,
-        ));
-    } else {
-        for path in discover_chembl_sqlite_sources(&chembl_dir)? {
-            if path == published_chembl_query {
                 continue;
             }
             append_canonical_rows(
@@ -2364,71 +4171,175 @@ fn build_store_indexes(
                 &mut manifest,
             )?;
         }
-    }
-    let uniprot_dir = options.science_store.join("downloads/uniprot");
-    for path in discover_sequence_files(&uniprot_dir)? {
-        append_fasta_source_rows(
-            "known_targets",
-            &options.science_store,
-            &path,
-            "UniProt",
-            "Homo sapiens",
-            "known_human_protein",
-            "protein_sequence_record",
-            &mut known_rows,
-            &mut manifest,
-            "fasta_sequence_rows",
-        )?;
+        let chembl_dir = options.science_store.join("downloads/chembl");
+        let published_chembl_query = chembl_dir.join("chembl_query.sqlite");
+        if ligand_similarity_ready {
+            let ligand_manifest = options
+                .science_store
+                .join(LIGAND_SIMILARITY_MANIFEST_REL_PATH);
+            let target_count = read_text(&ligand_manifest)
+                .ok()
+                .and_then(|text| {
+                    serde_json::from_str::<Value>(text.trim_start_matches('\u{feff}')).ok()
+                })
+                .and_then(|value| {
+                    value
+                        .get("counts")
+                        .and_then(|counts| counts.get("targets"))
+                        .and_then(Value::as_u64)
+                })
+                .unwrap_or(0);
+            manifest.push_str(&format!(
+            "ligand_similarity\t{}\tready\t{target_count}\t{}\tcompact_ligand_similarity_used_by_onsite_matcher\n",
+            LIGAND_SIMILARITY_MANIFEST_REL_PATH,
+            LIGAND_SIMILARITY_DATABASE_REL_PATH,
+        ));
+        } else {
+            for path in discover_chembl_sqlite_sources(&chembl_dir)? {
+                if path == published_chembl_query {
+                    continue;
+                }
+                append_canonical_rows(
+                    "known_targets",
+                    &options.science_store,
+                    &path,
+                    &mut known_rows,
+                    &mut manifest,
+                )?;
+            }
+        }
+        let uniprot_dir = options.science_store.join("downloads/uniprot");
+        for path in discover_sequence_files(&uniprot_dir)? {
+            append_fasta_source_rows(
+                "known_targets",
+                &options.science_store,
+                &path,
+                "UniProt",
+                "Homo sapiens",
+                "known_human_protein",
+                "protein_sequence_record",
+                &mut known_rows,
+                &mut manifest,
+                "fasta_sequence_rows",
+            )?;
+        }
     }
 
     let mut metagenome_rows = StoreRowSpool::create(&indexes_dir, "metagenome_targets_raw")?;
-    for rel in metagenome_sources {
-        let path = options.science_store.join(rel);
-        append_canonical_rows(
-            "metagenome_targets",
-            &options.science_store,
-            &path,
-            &mut metagenome_rows,
-            &mut manifest,
-        )?;
-    }
-    let metagenome_dir = options.science_store.join("downloads/metagenome");
-    for path in discover_sequence_files(&metagenome_dir)? {
-        if large_metagenome_fasta_requires_alignment_database(&path) {
-            if !append_ready_metagenome_alignment_database(
+    if metagenome_published.is_some() {
+        if !append_published_manifest_rows(manifest_path, "metagenome_targets", &mut manifest)? {
+            manifest.push_str(
+                "metagenome_targets\tindexes/metagenome_targets.tsv\tpreserved\t1\tindexes/metagenome_targets.tsv\tpublished_nonempty_index_preserved\n",
+            );
+        }
+    } else {
+        for rel in metagenome_sources {
+            let path = options.science_store.join(rel);
+            append_canonical_rows(
+                "metagenome_targets",
                 &options.science_store,
                 &path,
+                &mut metagenome_rows,
                 &mut manifest,
-            )? {
-                append_alignment_database_required(
-                    "metagenome_targets",
+            )?;
+        }
+        let metagenome_dir = options.science_store.join("downloads/metagenome");
+        for path in discover_sequence_files(&metagenome_dir)? {
+            if large_metagenome_fasta_requires_alignment_database(&path) {
+                if !append_ready_metagenome_alignment_database(
                     &options.science_store,
                     &path,
                     &mut manifest,
-                );
+                )? {
+                    append_alignment_database_required(
+                        "metagenome_targets",
+                        &options.science_store,
+                        &path,
+                        &mut manifest,
+                    );
+                }
+                continue;
             }
-            continue;
+            append_fasta_source_rows(
+                "metagenome_targets",
+                &options.science_store,
+                &path,
+                "metagenome",
+                "metagenome_or_custom_source",
+                "potential_metagenome_sequence",
+                "sequence_record",
+                &mut metagenome_rows,
+                &mut manifest,
+                "fasta_sequence_rows",
+            )?;
         }
-        append_fasta_source_rows(
-            "metagenome_targets",
-            &options.science_store,
-            &path,
-            "metagenome",
-            "metagenome_or_custom_source",
-            "potential_metagenome_sequence",
-            "sequence_record",
-            &mut metagenome_rows,
-            &mut manifest,
-            "fasta_sequence_rows",
-        )?;
     }
 
-    let known_count = known_rows.finish(&indexes_dir.join("known_targets.tsv"))?;
-    let metagenome_count = metagenome_rows.finish(&indexes_dir.join("metagenome_targets.tsv"))?;
+    if let (Some(known_rows), Some(metagenome_rows), Some(structure_rows)) =
+        (known_published, metagenome_published, structure_published)
+    {
+        return Ok(IndexBuildSummary {
+            known_rows,
+            metagenome_rows,
+            structure_rows,
+        });
+    }
+    let bundle = structure_publication_bundle_paths(&options.science_store);
+    let bundle_paths = bundle.iter().map(PathBuf::as_path).collect::<Vec<_>>();
+    let mut publication_transaction =
+        PublicationBundleTransaction::begin(&options.science_store, &bundle_paths)?;
+    let (known_count, known_preserved) =
+        known_rows.finish_preserving_published(&known_output, known_published)?;
+    let (metagenome_count, metagenome_preserved) =
+        metagenome_rows.finish_preserving_published(&metagenome_output, metagenome_published)?;
+    if !known_preserved {
+        append_store_index_publication_identity(
+            &options.science_store,
+            "known_targets",
+            &known_output,
+            known_count,
+            &mut manifest,
+        )?;
+    }
+    if !metagenome_preserved {
+        append_store_index_publication_identity(
+            &options.science_store,
+            "metagenome_targets",
+            &metagenome_output,
+            metagenome_count,
+            &mut manifest,
+        )?;
+    }
     let mut structure_rows = StoreRowSpool::create(&indexes_dir, "structure_targets_raw")?;
-    build_structure_index_rows(options, &mut manifest, &mut structure_rows)?;
-    let structure_count = structure_rows.finish(&indexes_dir.join("structure_targets.tsv"))?;
-    write_text(manifest_path, &manifest)?;
+    if structure_published.is_some() {
+        if !append_published_manifest_rows(manifest_path, "structure_targets", &mut manifest)? {
+            manifest.push_str(
+                "structure_targets\tindexes/structure_targets.tsv\tpreserved\t1\tindexes/structure_targets.tsv\tpublished_nonempty_index_preserved\n",
+            );
+        }
+    } else {
+        build_structure_index_rows(options, &mut manifest, &mut structure_rows)?;
+    }
+    let (structure_count, _structure_preserved) = if structure_published.is_some() {
+        let result =
+            structure_rows.finish_preserving_published(&structure_output, structure_published)?;
+        publish_text_file(manifest_path, &manifest)?;
+        validate_structure_targets_publication(&options.science_store)?;
+        result
+    } else {
+        let result = structure_rows.finish_preserving_published(&structure_output, None)?;
+        publish_text_file(manifest_path, &manifest)?;
+        let published_rows =
+            write_structure_targets_manifest(&options.science_store, manifest_path)?;
+        if published_rows != result.0 as u64 {
+            return Err("structure_targets_published_row_count_mismatch".to_string());
+        }
+        if published_rows > 0 {
+            validate_structure_targets_publication(&options.science_store)?;
+        }
+        result
+    };
+    publication_transaction.commit()?;
     Ok(IndexBuildSummary {
         known_rows: known_count,
         metagenome_rows: metagenome_count,
@@ -2662,20 +4573,15 @@ fn build_structure_index_rows(
     }
     let plinder_sources =
         discover_plinder_tables(&options.science_store.join("downloads/plinder"))?;
-    if !plinder_sources.is_empty() {
-        let canonical = options.science_store.join("indexes/plinder_targets.tsv");
-        if !canonical.is_file() {
-            return Err(format!(
-                "plinder_canonical_index_missing:{}",
-                canonical.display()
-            ));
-        }
+    let canonical = options.science_store.join("indexes/plinder_targets.tsv");
+    if canonical.is_file() {
+        let published_rows = validate_plinder_canonical_publication(&options.science_store)?;
         let count = for_each_store_row_batch(&canonical, "plinder_canonical_index", |batch| {
             rows.append(batch)
         })?;
-        if count == 0 {
+        if count == 0 || count as u64 != published_rows {
             return Err(format!(
-                "plinder_canonical_index_empty:{}",
+                "plinder_canonical_index_row_count_mismatch:{}",
                 canonical.display()
             ));
         }
@@ -2687,6 +4593,11 @@ fn build_structure_index_rows(
             manifest,
             "plinder_canonical_rows",
         );
+    } else if !plinder_sources.is_empty() {
+        return Err(format!(
+            "plinder_canonical_index_missing:{}",
+            canonical.display()
+        ));
     }
     for path in discover_moad_tables(&options.science_store.join("downloads/binding_moad"))? {
         let count = for_each_moad_structure_row_batch(&path, |batch| rows.append(batch))?;
@@ -3897,11 +5808,7 @@ fn retained_source_available(store: &Path, source: &RequiredSource) -> bool {
         if actual != expected || derived_paths.len() != expected.len() {
             return false;
         }
-        let options = StoreOptions {
-            workspace_root: store.to_path_buf(),
-            science_store: store.to_path_buf(),
-        };
-        return validate_ligand_similarity_runtime_contract(&options).is_ok();
+        return validate_retained_ligand_similarity_publication(store).is_ok();
     }
     !derived_paths.is_empty()
         && derived_paths
@@ -3952,6 +5859,9 @@ fn any_source_path_exists(store: &Path, rel_paths: &[&str]) -> bool {
 }
 
 fn path_has_any_file(path: &Path) -> bool {
+    if path.is_file() {
+        return true;
+    }
     if !path.is_dir() {
         return false;
     }
@@ -7447,12 +9357,14 @@ fn compact_known_row_publication_fields(value: &str) -> Result<BTreeMap<String, 
 fn current_ligand_similarity_publication(
     options: &ScienceOptions,
 ) -> Result<LigandSimilarityPublication, String> {
-    let database = options
-        .science_store
-        .join(LIGAND_SIMILARITY_DATABASE_REL_PATH);
-    let manifest = options
-        .science_store
-        .join(LIGAND_SIMILARITY_MANIFEST_REL_PATH);
+    ligand_similarity_publication(&options.science_store)
+}
+
+fn ligand_similarity_publication(
+    science_store: &Path,
+) -> Result<LigandSimilarityPublication, String> {
+    let database = science_store.join(LIGAND_SIMILARITY_DATABASE_REL_PATH);
+    let manifest = science_store.join(LIGAND_SIMILARITY_MANIFEST_REL_PATH);
     let manifest_identity = ligand_similarity_publication_file_identity(&manifest)?;
     let manifest_bytes = fs::read(&manifest)
         .map_err(|err| format!("ligand_similarity_publication_manifest_read_failed:{err}"))?;
@@ -7491,6 +9403,60 @@ fn current_ligand_similarity_publication(
         schema_version,
         build_identity: ligand_similarity_compact_build_identity(&manifest_value)?,
     })
+}
+
+fn validate_retained_ligand_similarity_publication(science_store: &Path) -> Result<(), String> {
+    ligand_similarity_publication(science_store)?;
+    let database = science_store.join(LIGAND_SIMILARITY_DATABASE_REL_PATH);
+    let manifest = science_store.join(LIGAND_SIMILARITY_MANIFEST_REL_PATH);
+    let manifest_bytes = fs::read(&manifest)
+        .map_err(|err| format!("ligand_similarity_retained_manifest_read_failed:{err}"))?;
+    let manifest_value = serde_json::from_slice::<Value>(
+        manifest_bytes
+            .strip_prefix(&[0xef, 0xbb, 0xbf])
+            .unwrap_or(&manifest_bytes),
+    )
+    .map_err(|err| format!("ligand_similarity_retained_manifest_invalid:{err}"))?;
+    let database_meta = manifest_value
+        .get("database")
+        .and_then(Value::as_object)
+        .ok_or_else(|| "ligand_similarity_retained_database_missing".to_string())?;
+    let database_bytes = fs::metadata(&database)
+        .map_err(|err| format!("ligand_similarity_retained_database_metadata_failed:{err}"))?
+        .len();
+    if database_bytes == 0
+        || database_meta.get("bytes").and_then(Value::as_u64) != Some(database_bytes)
+        || !ligand_similarity_declared_path_matches(
+            &database,
+            database_meta
+                .get("path")
+                .and_then(Value::as_str)
+                .unwrap_or_default(),
+        )
+    {
+        return Err("ligand_similarity_retained_database_identity_invalid".to_string());
+    }
+    let inputs = manifest_value
+        .get("inputs")
+        .and_then(Value::as_object)
+        .ok_or_else(|| "ligand_similarity_retained_inputs_missing".to_string())?;
+    for source_id in ["chembl", "bindingdb"] {
+        let input = inputs
+            .get(source_id)
+            .and_then(Value::as_object)
+            .ok_or_else(|| format!("ligand_similarity_retained_input_missing:{source_id}"))?;
+        let (expected_digest, expected_release) =
+            science_store_source_identity(science_store, source_id)?;
+        if input.get("source_digest").and_then(Value::as_str) != Some(expected_digest.as_str())
+            || input.get("source_release").and_then(Value::as_str)
+                != Some(expected_release.as_str())
+        {
+            return Err(format!(
+                "ligand_similarity_retained_source_identity_invalid:{source_id}"
+            ));
+        }
+    }
+    Ok(())
 }
 
 fn ligand_similarity_compact_build_identity(manifest: &Value) -> Result<String, String> {
@@ -15726,6 +17692,7 @@ fn write_run_context(
     let known_index = options.science_store.join("indexes/known_targets.tsv");
     let metagenome_index = options.science_store.join("indexes/metagenome_targets.tsv");
     let structure_index = options.science_store.join("indexes/structure_targets.tsv");
+    let structure_context = structure_file_context(&options.science_store, &structure_index);
     let tool_versions = options.science_store.join("indexes/tool_versions.tsv");
     let ranking_policy = ranking_policy_value();
     let ranking_policy_digest = ranking_policy_digest();
@@ -15741,7 +17708,7 @@ fn write_run_context(
         "database_indexes": {
             "known_targets": file_context(&known_index),
             "metagenome_targets": file_context(&metagenome_index),
-            "structure_targets": file_context(&structure_index),
+            "structure_targets": structure_context,
             "tool_versions": file_context(&tool_versions)
         },
         "ranking_policy": ranking_policy,
@@ -15800,6 +17767,31 @@ fn file_context(path: &Path) -> Value {
         "exists": exists,
         "bytes": bytes,
         "content_id": content_id,
+    })
+}
+
+fn structure_file_context(store: &Path, path: &Path) -> Value {
+    let exists = path.is_file();
+    let bytes = fs::metadata(path).map(|meta| meta.len()).unwrap_or(0);
+    let manifest_path = store.join(STRUCTURE_TARGETS_MANIFEST_REL_PATH);
+    let content_id = read_json_value_if_file(&manifest_path).and_then(|manifest| {
+        let digest = manifest.get("sha256").and_then(Value::as_str)?;
+        (exists
+            && manifest.get("schema_version").and_then(Value::as_str)
+                == Some(STRUCTURE_TARGETS_MANIFEST_SCHEMA_VERSION)
+            && manifest.get("status").and_then(Value::as_str) == Some("ready")
+            && manifest.get("path").and_then(Value::as_str)
+                == Some("indexes/structure_targets.tsv")
+            && manifest.get("bytes").and_then(Value::as_u64) == Some(bytes)
+            && valid_sha256_hex(digest))
+        .then(|| digest.to_ascii_lowercase())
+    });
+    json!({
+        "path": path.display().to_string(),
+        "exists": exists,
+        "bytes": bytes,
+        "content_id": content_id,
+        "publication_manifest": manifest_path.display().to_string(),
     })
 }
 

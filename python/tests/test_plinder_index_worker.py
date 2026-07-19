@@ -60,12 +60,38 @@ class PlinderIndexWorkerTests(unittest.TestCase):
             self.assertEqual(manifest["scan"]["batch_size"], MAX_BATCH_SIZE)
             self.assertLessEqual(manifest["scan"]["max_batch_rows"], MAX_BATCH_SIZE)
             self.assertGreaterEqual(manifest["scan"]["batch_count"], 2)
+            self.assertEqual(manifest["scan"]["filtered_rows"], 0)
             self.assertEqual(
                 manifest["canonical"]["sha256"],
                 hashlib.sha256(canonical.read_bytes()).hexdigest(),
             )
             self.assertEqual(json.loads(manifest_path.read_text(encoding="utf-8")), manifest)
             self.assertFalse(list(root.glob("*.tmp")))
+
+    def test_filtered_rows_are_accounted_for_in_manifest(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="genoligand_plinder_filtered_") as tmp:
+            root = Path(tmp)
+            source = root / "filtered.parquet"
+            pq.write_table(
+                pa.table(
+                    {
+                        "entry_pdb_id": ["1abc", ""],
+                        "system_id": ["system_1", "system_2"],
+                        "ligand_ccd_code": ["ATP", "FAD"],
+                    }
+                ),
+                source,
+            )
+
+            manifest = build_plinder_canonical(
+                source,
+                root / "canonical.tsv",
+                root / "manifest.json",
+            )
+
+            self.assertEqual(manifest["source"]["parquet_rows"], 2)
+            self.assertEqual(manifest["canonical"]["row_count"], 1)
+            self.assertEqual(manifest["scan"]["filtered_rows"], 1)
 
     def test_supported_aliases_are_resolved_into_manifest(self) -> None:
         with tempfile.TemporaryDirectory(prefix="genoligand_plinder_aliases_") as tmp:

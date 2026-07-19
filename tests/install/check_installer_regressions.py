@@ -60,6 +60,33 @@ def create_database_directory_fixture(prefix: Path, payload: bytes, entries: int
     )
 
 
+def write_structure_publication_fixture(
+    installer,
+    store: Path,
+    contributions: list[dict[str, object]],
+) -> Path:
+    table = store / "indexes/structure_targets.tsv"
+    rows = sum(1 for line in table.read_text(encoding="utf-8").splitlines()[1:] if line.strip())
+    manifest = store / installer.STRUCTURE_TARGETS_MANIFEST_REL_PATH
+    manifest.write_text(
+        json.dumps(
+            {
+                "schema_version": installer.STRUCTURE_TARGETS_PUBLICATION_SCHEMA_VERSION,
+                "status": "ready",
+                "path": "indexes/structure_targets.tsv",
+                "bytes": table.stat().st_size,
+                "sha256": hashlib.sha256(table.read_bytes()).hexdigest(),
+                "rows": rows,
+                "contributions": contributions,
+            },
+            sort_keys=True,
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    return manifest
+
+
 def directory_bytes(root: Path) -> dict[str, bytes]:
     return {
         path.relative_to(root).as_posix(): path.read_bytes()
@@ -1344,9 +1371,18 @@ class InstallerRegressionTests(unittest.TestCase):
         main_text = source_text[source_text.index("def main() -> int:") :]
         alignment_position = main_text.index("alignment_database_result = build_persistent_alignment_databases")
         chembl_position = main_text.index("chembl_query_result = (", alignment_position)
+        retention_position = main_text.index("pre_prepare_ligand_retention = (", alignment_position)
         cli_position = main_text.index("completed = run_command(command, env=command_env)", chembl_position)
+        authority_position = main_text.index("index_authority_refresh =", cli_position)
+        pre_retention_readiness_position = main_text.index(
+            "pre_retention_readiness = evaluate_installer_science_store_readiness(",
+            authority_position,
+        )
         self.assertLess(alignment_position, chembl_position)
+        self.assertLess(retention_position, cli_position)
         self.assertLess(chembl_position, cli_position)
+        self.assertLess(authority_position, pre_retention_readiness_position)
+        self.assertNotIn("source_requirements_refresh =", main_text)
         self.assertNotIn("tarfile.open", main_text[chembl_position:cli_position])
         self.assertNotIn("chembl_sqlite.tar.gz", main_text[chembl_position:cli_position])
         self.assertIn('parser.add_argument("--rcsb-mode", choices=["on-demand", "complete"], default="on-demand")', main_text)
@@ -1483,9 +1519,12 @@ class InstallerRegressionTests(unittest.TestCase):
             self.assertEqual(refresh["status"], "ready")
             self.assertEqual(refresh["updated_rows"], 1)
             build_rows = installer.read_tsv(store / "index_build_manifest.tsv")
-            self.assertEqual(build_rows[0]["status"], "alignment_database_used")
+            self.assertEqual(build_rows[0]["status"], "requires_alignment_database")
+            authority_row = next(
+                row for row in build_rows if row["status"] == "alignment_database_used"
+            )
             self.assertEqual(
-                build_rows[0]["output_path"],
+                authority_row["output_path"],
                 "indexes/mmseqs/metagenome_mgy_clusters.fa/target",
             )
             self.assertEqual(
@@ -1507,8 +1546,14 @@ class InstallerRegressionTests(unittest.TestCase):
                 store,
                 metagenome_alignment_authorities=authorities,
             )
-            self.assertEqual(rows[0]["readiness_status"], "full_index")
-            self.assertEqual(rows[0]["reason"], "full_searchable_alignment_database_ready")
+            authority_readiness = next(
+                row for row in rows if row["index_kind"] == "alignment_database"
+            )
+            self.assertEqual(authority_readiness["readiness_status"], "full_index")
+            self.assertEqual(
+                authority_readiness["reason"],
+                "full_searchable_alignment_database_ready",
+            )
             self.assertTrue(installer.metagenome_compatibility_table_ready(compatibility))
 
             with (
@@ -1541,6 +1586,122 @@ class InstallerRegressionTests(unittest.TestCase):
             with mock.patch.object(installer, "large_index_source", return_value=True):
                 rows = installer.science_index_readiness_rows(store)
             self.assertEqual(rows[0]["readiness_status"], "projection_only")
+
+    def test_refresh_recovers_all_ready_mmseqs_authorities_without_build_rows(self) -> None:
+        installer = self.installer
+        with tempfile.TemporaryDirectory() as tmp:
+            store = Path(tmp) / "science_store"
+            manifest_rows = []
+            sources = [
+                ("uniprot", "UniProt", "known", "downloads/uniprot/human.fa.gz"),
+            ]
+            sources.extend(
+                (f"biolip_{Path(source_path).stem}", "BioLiP2", "known", source_path)
+                for source_path in sorted(installer.BIOLIP2_MMSEQS_SOURCE_PATHS)
+            )
+            sources.append(("mgnify", "MGnify", "metagenome", "downloads/metagenome/mgnify.fa.gz"))
+            for source_id, namespace, source_class, source_path in sources:
+                database_path = f"indexes/mmseqs/{source_id}/target"
+                create_database_directory_fixture(store / database_path, source_id.encode("ascii"))
+                manifest_rows.append(
+                    {
+                        "source_id": source_id,
+                        "manifest_schema_version": installer.ALIGNMENT_MANIFEST_SCHEMA_VERSION,
+                        "source_namespace": namespace,
+                        "source_class": source_class,
+                        "source_path": source_path,
+                        "source_digest": hashlib.sha256(source_id.encode("ascii")).hexdigest(),
+                        "source_files": "1",
+                        "source_bytes": "1",
+                        "builder_version": "test-builder",
+                        "db_path": database_path,
+                        "status": "ready",
+                        "notes": "validated",
+                    }
+                )
+            installer.write_simple_tsv(
+                store / "indexes/mmseqs/mmseqs_target_databases.tsv",
+                list(manifest_rows[0]),
+                manifest_rows,
+            )
+            refresh = installer.refresh_science_index_authority_manifest(store)
+            self.assertEqual(refresh["status"], "ready")
+            self.assertEqual(refresh["updated_rows"], 6)
+            build_rows = installer.read_tsv(store / "index_build_manifest.tsv")
+            self.assertEqual(len(build_rows), 6)
+            self.assertEqual(
+                {row["index"] for row in build_rows},
+                {"known_targets", "metagenome_targets"},
+            )
+            self.assertEqual(
+                sum("source_namespace=BioLiP2" in row["notes"] for row in build_rows),
+                4,
+            )
+            biolip_rows = [
+                row for row in manifest_rows if row["source_namespace"] == "BioLiP2"
+            ]
+            self.assertTrue(
+                installer.mmseqs_namespace_rows_complete(biolip_rows, "BioLiP2", 4)
+            )
+            self.assertFalse(
+                installer.mmseqs_namespace_rows_complete(
+                    [dict(biolip_rows[0]) for _ in range(4)], "BioLiP2", 4
+                )
+            )
+            self.assertEqual(
+                installer.refresh_science_index_authority_manifest(store)["updated_rows"],
+                0,
+            )
+
+    def test_standard_header_only_indexes_require_complete_authorities_and_no_custom_rows(self) -> None:
+        installer = self.installer
+        with tempfile.TemporaryDirectory() as tmp:
+            compatibility = Path(tmp) / "known_targets.tsv"
+            compatibility.write_text(
+                "source\ttarget_id\ttarget_name\torganism\ttarget_class\tligand_tokens\t"
+                "sequence_tokens\tstructure_tokens\tevidence\n",
+                encoding="utf-8",
+            )
+            authority_rows = [
+                {
+                    "index": "known_targets",
+                    "status": "alignment_database_used",
+                }
+            ]
+            self.assertTrue(
+                installer.standard_header_only_projection_ready(
+                    compatibility,
+                    "known_targets",
+                    authority_rows,
+                    True,
+                    compact_ready=True,
+                )
+            )
+            self.assertFalse(
+                installer.standard_header_only_projection_ready(
+                    compatibility,
+                    "known_targets",
+                    authority_rows,
+                    True,
+                    compact_ready=False,
+                )
+            )
+            authority_rows.append(
+                {
+                    "index": "known_targets",
+                    "status": "used",
+                    "input_path": "imports/known_targets.tsv",
+                }
+            )
+            self.assertFalse(
+                installer.standard_header_only_projection_ready(
+                    compatibility,
+                    "known_targets",
+                    authority_rows,
+                    True,
+                    compact_ready=True,
+                )
+            )
 
     def test_metagenome_authority_is_bound_to_each_source_and_database(self) -> None:
         installer = self.installer
@@ -2704,6 +2865,27 @@ class InstallerRegressionTests(unittest.TestCase):
             "metagenome_potential",
         }
         self.assertEqual({row["source_id"] for row in [*catalog, *external]}, expected)
+        self.assertEqual(
+            installer.INDEXED_SOURCE_RETENTION_POLICIES["plinder"]["derived"],
+            (
+                "indexes/structure_targets.tsv",
+                installer.STRUCTURE_TARGETS_MANIFEST_REL_PATH,
+                "index_build_manifest.tsv",
+            ),
+        )
+        self.assertEqual(
+            installer.INDEXED_SOURCE_RETENTION_POLICIES["uniprot_human_reviewed"]["derived"],
+            ("indexes/mmseqs/mmseqs_target_databases.tsv",),
+        )
+        self.assertEqual(
+            installer.INDEXED_SOURCE_RETENTION_POLICIES["biolip2"]["derived"],
+            (
+                "indexes/structure_targets.tsv",
+                installer.STRUCTURE_TARGETS_MANIFEST_REL_PATH,
+                "index_build_manifest.tsv",
+                "indexes/mmseqs/mmseqs_target_databases.tsv",
+            ),
+        )
         self.assertTrue(all(not installer.catalog_release_error(row) for row in catalog))
         with tempfile.TemporaryDirectory() as tmp:
             store = Path(tmp)
@@ -3198,7 +3380,7 @@ class InstallerRegressionTests(unittest.TestCase):
                 ],
             )
             migration = installer.migrate_ligand_source_retention(store)
-            self.assertEqual(migration["status"], "ready")
+            self.assertEqual(migration["status"], "needs_repair")
             self.assertEqual(migration["updated"], 2)
             expected = ";".join(
                 (
@@ -3209,8 +3391,8 @@ class InstallerRegressionTests(unittest.TestCase):
             rows = installer.source_retention_rows(store)
             self.assertEqual({row["source_id"] for row in rows}, {"chembl", "bindingdb"})
             self.assertTrue(all(row["derived_paths"] == expected for row in rows))
-            self.assertTrue(
-                all(installer.retained_source_derivatives_ready(store, row) for row in rows)
+            self.assertFalse(
+                any(installer.retained_source_derivatives_ready(store, row) for row in rows)
             )
 
             installer.write_source_retention_rows(store, [rows[0]])
@@ -3221,9 +3403,9 @@ class InstallerRegressionTests(unittest.TestCase):
                 row["state"] = "pruning"
             installer.write_source_retention_rows(store, rows)
             recoverable = installer.migrate_ligand_source_retention(store)
-            self.assertEqual(recoverable["status"], "ready")
+            self.assertEqual(recoverable["status"], "needs_repair")
 
-    def test_pruned_ligand_retention_removes_restored_source_archives(self) -> None:
+    def test_pruned_ligand_retention_preserves_unrecognized_restored_archives(self) -> None:
         installer = self.installer
         with tempfile.TemporaryDirectory() as tmp:
             store = Path(tmp) / "science_store"
@@ -3233,13 +3415,11 @@ class InstallerRegressionTests(unittest.TestCase):
                 "chembl": "downloads/chembl/chembl_sqlite.tar.gz",
                 "bindingdb": "downloads/bindingdb/bindingdb_all.tsv.zip",
             }
-            restored_bytes = 0
             retention_rows = []
             for source_id, relative in payloads.items():
                 payload = store / relative
                 payload.parent.mkdir(parents=True, exist_ok=True)
                 payload.write_bytes(f"restored-{source_id}".encode("ascii"))
-                restored_bytes += payload.stat().st_size
                 retention_rows.append(
                     {
                         "schema_version": installer.SOURCE_RETENTION_SCHEMA_VERSION,
@@ -3274,9 +3454,409 @@ class InstallerRegressionTests(unittest.TestCase):
             }
             with mock.patch.object(installer, "INDEXED_SOURCE_RETENTION_POLICIES", policies):
                 result = installer.prune_indexed_source_payloads(store)
+            self.assertEqual(result["status"], "needs_repair")
+            self.assertEqual(result["reclaimed_bytes"], 0)
+            self.assertTrue(all((store / relative).is_file() for relative in payloads.values()))
+
+    def test_plinder_retention_keeps_projection_and_removes_canonical_intermediates(self) -> None:
+        installer = self.installer
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            store = root / "science_store"
+            source = store / "downloads/plinder/index/annotation_table.parquet"
+            source.parent.mkdir(parents=True)
+            source.write_bytes(b"PAR1fixturePAR1")
+            indexes = store / "indexes"
+            indexes.mkdir(parents=True)
+            structure = indexes / "structure_targets.tsv"
+            structure.write_text(
+                "source\ttarget_id\ttarget_name\torganism\ttarget_class\tligand_tokens\t"
+                "sequence_tokens\tstructure_tokens\tevidence\n"
+                "PLINDER\tPLINDER_SYSTEM\tPLINDER system\tunknown\tstructure_record\tfad\t"
+                "chain_a\t3grt\tplinder_2024-06_v2_parquet\n",
+                encoding="utf-8",
+            )
+            canonical = indexes / "plinder_targets.tsv"
+            canonical.write_bytes(b"large canonical intermediate")
+            canonical_manifest = indexes / "plinder_targets.manifest.json"
+            canonical_manifest.write_text(
+                json.dumps(
+                    {
+                        "status": "ready",
+                        "source": {
+                            "size_bytes": source.stat().st_size,
+                            "sha256": hashlib.sha256(source.read_bytes()).hexdigest(),
+                        },
+                        "canonical": {
+                            "size_bytes": canonical.stat().st_size,
+                            "sha256": hashlib.sha256(canonical.read_bytes()).hexdigest(),
+                            "row_count": 2,
+                        },
+                    }
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            canonical_bytes = canonical.read_bytes()
+            canonical_manifest_bytes = canonical_manifest.read_bytes()
+            manifest_dir = store / "manifests"
+            manifest_dir.mkdir(parents=True)
+            source_summary = installer.resource_payload_summary(source.parent)
+            (manifest_dir / "source_file_manifest.tsv").write_text(
+                "source_id\tsource_label\tsource_class\tlocal_path\tstatus\tfile_count\tbytes\t"
+                "sha256\tprovenance\trelease_identity\ttrust_source\n"
+                "plinder\tPLINDER\tstructure_interaction\tdownloads/plinder/index\tready\t"
+                f"{source_summary['file_count']}\t{source_summary['bytes']}\t{source_summary['sha256']}\t"
+                "fixture\tplinder-v2\tpublisher_snapshot\n",
+                encoding="utf-8",
+            )
+            (store / "index_build_manifest.tsv").write_text(
+                "index\tinput_path\tstatus\trows\toutput_path\tnotes\n"
+                "structure_targets\tindexes/plinder_targets.tsv\tused\t2\t"
+                "indexes/structure_targets.tsv\tplinder_canonical_rows;complete_source_scan\n",
+                encoding="utf-8",
+            )
+            input_summary = installer.structure_contribution_input_summary(
+                store,
+                ["indexes/plinder_targets.tsv"],
+            )
+            structure_manifest = write_structure_publication_fixture(
+                installer,
+                store,
+                [
+                    {
+                        "source": "PLINDER",
+                        "source_id": "plinder",
+                        "source_digest": source_summary["sha256"],
+                        "release_identity": "plinder-v2",
+                        "trust_source": "publisher_snapshot",
+                        "rows": 2,
+                        "source_paths": ["indexes/plinder_targets.tsv"],
+                        "input_bytes": input_summary["input_bytes"],
+                        "input_digest": input_summary["input_digest"],
+                    }
+                ],
+            )
+            policy = {
+                "plinder": {
+                    "payloads": ("downloads/plinder/index",),
+                    "derived": (
+                        "indexes/structure_targets.tsv",
+                        installer.STRUCTURE_TARGETS_MANIFEST_REL_PATH,
+                        "index_build_manifest.tsv",
+                    ),
+                }
+            }
+            with mock.patch.object(installer, "INDEXED_SOURCE_RETENTION_POLICIES", policy):
+                result = installer.prune_indexed_source_payloads(store)
             self.assertEqual(result["status"], "ready")
-            self.assertEqual(result["reclaimed_bytes"], restored_bytes)
-            self.assertTrue(all(not (store / relative).exists() for relative in payloads.values()))
+            self.assertFalse(source.exists())
+            self.assertFalse(canonical.exists())
+            self.assertFalse(canonical_manifest.exists())
+            self.assertTrue(structure.is_file())
+            self.assertTrue(structure_manifest.is_file())
+            retained = installer.source_retention_row(store, "plinder")
+            self.assertEqual(
+                retained["derived_paths"],
+                "indexes/structure_targets.tsv;indexes/structure_targets.manifest.json;"
+                "index_build_manifest.tsv",
+            )
+            retained["derived_paths"] = (
+                "indexes/plinder_targets.tsv;indexes/plinder_targets.manifest.json;"
+                "indexes/structure_targets.tsv"
+            )
+            installer.write_source_retention_rows(store, [retained])
+            canonical.write_bytes(canonical_bytes)
+            canonical_manifest.write_bytes(canonical_manifest_bytes)
+            with mock.patch.object(installer, "INDEXED_SOURCE_RETENTION_POLICIES", policy):
+                migrated = installer.prune_indexed_source_payloads(store)
+            self.assertEqual(migrated["status"], "ready")
+            self.assertFalse(canonical.exists())
+            self.assertFalse(canonical_manifest.exists())
+            self.assertEqual(
+                installer.source_retention_row(store, "plinder")["derived_paths"],
+                "indexes/structure_targets.tsv;indexes/structure_targets.manifest.json;"
+                "index_build_manifest.tsv",
+            )
+            reused = installer.prepare_plinder_canonical_index(root, store, "", "local", None)
+            self.assertEqual(reused["status"], "ready")
+            self.assertEqual(
+                reused["reason"],
+                "plinder_structure_projection_reused_after_source_payload_pruned",
+            )
+            source.parent.mkdir(parents=True, exist_ok=True)
+            source.write_bytes(b"PAR1new-releasePAR1")
+            canonical.write_bytes(canonical_bytes)
+            canonical_manifest.write_bytes(canonical_manifest_bytes)
+            with mock.patch.object(installer, "INDEXED_SOURCE_RETENTION_POLICIES", policy):
+                replaced = installer.prune_indexed_source_payloads(store)
+            self.assertEqual(replaced["status"], "needs_repair")
+            self.assertTrue(source.is_file())
+            self.assertTrue(canonical.is_file())
+            self.assertTrue(canonical_manifest.is_file())
+
+    def test_structure_publication_v1_is_rejected_until_rebuilt(self) -> None:
+        installer = self.installer
+        with tempfile.TemporaryDirectory() as tmp:
+            store = Path(tmp) / "science_store"
+            source = store / "downloads/binding_moad/bindingmoad.csv"
+            source.parent.mkdir(parents=True)
+            source.write_bytes(b"pdb_id,ligand\n1abc,ATP\n")
+            indexes = store / "indexes"
+            indexes.mkdir(parents=True)
+            table = indexes / "structure_targets.tsv"
+            table.write_text(
+                "source\ttarget_id\ttarget_name\torganism\ttarget_class\tligand_tokens\t"
+                "sequence_tokens\tstructure_tokens\tevidence\n"
+                "Binding MOAD\t1ABC\tMOAD complex\tunknown\tstructure_record\tatp\tchain_a\t"
+                "1abc\tbinding_moad\n",
+                encoding="utf-8",
+            )
+            source_summary = installer.resource_payload_summary(source)
+            source_manifest = store / "manifests/source_file_manifest.tsv"
+            source_manifest.parent.mkdir(parents=True)
+            installer.write_simple_tsv(
+                source_manifest,
+                [
+                    "source_id",
+                    "local_path",
+                    "status",
+                    "file_count",
+                    "bytes",
+                    "sha256",
+                    "release_identity",
+                    "trust_source",
+                ],
+                [
+                    {
+                        "source_id": "binding_moad",
+                        "local_path": "downloads/binding_moad/bindingmoad.csv",
+                        "status": "ready",
+                        "file_count": str(source_summary["file_count"]),
+                        "bytes": str(source_summary["bytes"]),
+                        "sha256": str(source_summary["sha256"]),
+                        "release_identity": "moad-fixture-v1",
+                        "trust_source": "publisher_snapshot",
+                    }
+                ],
+            )
+            (store / "index_build_manifest.tsv").write_text(
+                "index\tinput_path\tstatus\trows\toutput_path\tnotes\n"
+                "structure_targets\tdownloads/binding_moad/bindingmoad.csv\tused\t1\t"
+                "indexes/structure_targets.tsv\tbinding_moad_complex_rows;complete_source_scan\n",
+                encoding="utf-8",
+            )
+            manifest = write_structure_publication_fixture(
+                installer,
+                store,
+                [
+                    {
+                        "source": "Binding MOAD",
+                        "rows": 1,
+                        "source_paths": ["downloads/binding_moad/bindingmoad.csv"],
+                    }
+                ],
+            )
+            legacy = json.loads(manifest.read_text(encoding="utf-8"))
+            legacy["schema_version"] = installer.LEGACY_STRUCTURE_TARGETS_PUBLICATION_SCHEMA_VERSION
+            manifest.write_text(json.dumps(legacy) + "\n", encoding="utf-8")
+
+            self.assertFalse(installer.structure_targets_publication_ready(store, "Binding MOAD"))
+            unchanged = json.loads(manifest.read_text(encoding="utf-8"))
+            self.assertEqual(
+                unchanged["schema_version"],
+                installer.LEGACY_STRUCTURE_TARGETS_PUBLICATION_SCHEMA_VERSION,
+            )
+            self.assertTrue(source.is_file())
+
+    def test_replaced_structure_payload_is_preserved_by_cleanup(self) -> None:
+        installer = self.installer
+        with tempfile.TemporaryDirectory() as tmp:
+            store = Path(tmp) / "science_store"
+            source = store / "downloads/binding_moad/bindingmoad.csv"
+            source.parent.mkdir(parents=True)
+            source.write_bytes(b"pdb_id,ligand\n1abc,ATP\n")
+            indexes = store / "indexes"
+            indexes.mkdir(parents=True)
+            table = indexes / "structure_targets.tsv"
+            table.write_text(
+                "source\ttarget_id\ttarget_name\torganism\ttarget_class\tligand_tokens\t"
+                "sequence_tokens\tstructure_tokens\tevidence\n"
+                "Binding MOAD\t1ABC\tMOAD complex\tunknown\tstructure_record\tatp\tchain_a\t"
+                "1abc\tbinding_moad\n",
+                encoding="utf-8",
+            )
+            source_summary = installer.resource_payload_summary(source)
+            source_manifest = store / "manifests/source_file_manifest.tsv"
+            source_manifest.parent.mkdir(parents=True)
+            installer.write_simple_tsv(
+                source_manifest,
+                [
+                    "source_id",
+                    "local_path",
+                    "status",
+                    "file_count",
+                    "bytes",
+                    "sha256",
+                    "release_identity",
+                    "trust_source",
+                ],
+                [
+                    {
+                        "source_id": "binding_moad",
+                        "local_path": "downloads/binding_moad/bindingmoad.csv",
+                        "status": "ready",
+                        "file_count": str(source_summary["file_count"]),
+                        "bytes": str(source_summary["bytes"]),
+                        "sha256": str(source_summary["sha256"]),
+                        "release_identity": "moad-fixture-v1",
+                        "trust_source": "publisher_snapshot",
+                    }
+                ],
+            )
+            (store / "index_build_manifest.tsv").write_text(
+                "index\tinput_path\tstatus\trows\toutput_path\tnotes\n"
+                "structure_targets\tdownloads/binding_moad/bindingmoad.csv\tused\t1\t"
+                "indexes/structure_targets.tsv\tbinding_moad_complex_rows;complete_source_scan\n",
+                encoding="utf-8",
+            )
+            input_summary = installer.structure_contribution_input_summary(
+                store,
+                ["downloads/binding_moad/bindingmoad.csv"],
+            )
+            write_structure_publication_fixture(
+                installer,
+                store,
+                [
+                    {
+                        "source": "Binding MOAD",
+                        "source_id": "binding_moad",
+                        "source_digest": source_summary["sha256"],
+                        "release_identity": "moad-fixture-v1",
+                        "trust_source": "publisher_snapshot",
+                        "rows": 1,
+                        "source_paths": ["downloads/binding_moad/bindingmoad.csv"],
+                        "input_bytes": input_summary["input_bytes"],
+                        "input_digest": input_summary["input_digest"],
+                    }
+                ],
+            )
+            self.assertTrue(installer.structure_targets_publication_ready(store, "Binding MOAD"))
+            source_manifest_text = source_manifest.read_text(encoding="utf-8")
+            source_manifest.write_text(
+                source_manifest_text.replace("moad-fixture-v1", "moad-fixture-v2"),
+                encoding="utf-8",
+            )
+            self.assertFalse(installer.structure_targets_publication_ready(store, "Binding MOAD"))
+            source_manifest.write_text(source_manifest_text, encoding="utf-8")
+            build_manifest = store / "index_build_manifest.tsv"
+            build_manifest_text = build_manifest.read_text(encoding="utf-8")
+            build_manifest.write_text(
+                build_manifest_text.replace("\tused\t1\t", "\tused\t2\t"),
+                encoding="utf-8",
+            )
+            self.assertFalse(installer.structure_targets_publication_ready(store, "Binding MOAD"))
+            build_manifest.write_text(build_manifest_text, encoding="utf-8")
+            policy = {
+                "binding_moad": {
+                    "payloads": ("downloads/binding_moad/bindingmoad.csv",),
+                    "derived": (
+                        "indexes/structure_targets.tsv",
+                        installer.STRUCTURE_TARGETS_MANIFEST_REL_PATH,
+                        "index_build_manifest.tsv",
+                    ),
+                }
+            }
+            with mock.patch.object(installer, "INDEXED_SOURCE_RETENTION_POLICIES", policy):
+                first = installer.prune_indexed_source_payloads(store)
+            self.assertEqual(first["status"], "ready")
+            self.assertFalse(source.exists())
+
+            source.write_bytes(b"pdb_id,ligand\n9xyz,NEW\n")
+            with mock.patch.object(installer, "INDEXED_SOURCE_RETENTION_POLICIES", policy):
+                second = installer.prune_indexed_source_payloads(store)
+            self.assertEqual(second["status"], "needs_repair")
+            self.assertTrue(source.is_file())
+            self.assertEqual(source.read_bytes(), b"pdb_id,ligand\n9xyz,NEW\n")
+
+    def test_biolip_structure_only_payload_rejects_unpublished_extra_files(self) -> None:
+        installer = self.installer
+        with tempfile.TemporaryDirectory() as tmp:
+            store = Path(tmp) / "science_store"
+            annotation = store / "downloads/biolip2/BioLiP.txt.gz"
+            annotation.parent.mkdir(parents=True)
+            annotation.write_bytes(b"biolip-annotation")
+            input_summary = installer.structure_contribution_input_summary(
+                store,
+                ["downloads/biolip2/BioLiP.txt.gz"],
+            )
+            manifest = store / installer.STRUCTURE_TARGETS_MANIFEST_REL_PATH
+            manifest.parent.mkdir(parents=True)
+            manifest.write_text(
+                json.dumps(
+                    {
+                        "schema_version": installer.STRUCTURE_TARGETS_PUBLICATION_SCHEMA_VERSION,
+                        "contributions": [
+                            {
+                                "source": "BioLiP2",
+                                "source_id": "biolip2",
+                                "source_digest": "a" * 64,
+                                "release_identity": "biolip-fixture",
+                                "trust_source": "publisher_inventory",
+                                "rows": 1,
+                                "source_paths": ["downloads/biolip2/BioLiP.txt.gz"],
+                                "input_bytes": input_summary["input_bytes"],
+                                "input_digest": input_summary["input_digest"],
+                            }
+                        ],
+                    }
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            source_manifest = {
+                "local_path": "downloads/biolip2",
+                "status": "ready",
+                "file_count": "6",
+                "bytes": "999999",
+                "sha256": "a" * 64,
+                "release_identity": "biolip-fixture",
+                "trust_source": "publisher_inventory",
+            }
+
+            summary = installer.resource_payload_summary(annotation.parent)
+            record = {
+                "path": "downloads/biolip2",
+                "kind": "directory",
+                "file_count": summary["file_count"],
+                "bytes": summary["bytes"],
+                "sha256": summary["sha256"],
+            }
+            self.assertTrue(
+                installer.structure_source_payload_matches_manifest(
+                    store,
+                    "biolip2",
+                    source_manifest,
+                    [record],
+                )
+            )
+            (annotation.parent / "protein.fasta.gz").write_bytes(b">P1\nMSEQ\n")
+            changed = installer.resource_payload_summary(annotation.parent)
+            record.update(
+                {
+                    "file_count": changed["file_count"],
+                    "bytes": changed["bytes"],
+                    "sha256": changed["sha256"],
+                }
+            )
+            self.assertFalse(
+                installer.structure_source_payload_matches_manifest(
+                    store,
+                    "biolip2",
+                    source_manifest,
+                    [record],
+                )
+            )
 
     def test_ligand_index_rejects_hash_manifest_and_internal_contract_corruption(self) -> None:
         installer = self.installer
@@ -4001,6 +4581,120 @@ class InstallerRegressionTests(unittest.TestCase):
                 "rcsb_runtime_cache_not_bounded",
                 {item["code"] for item in on_demand["blockers"]},
             )
+
+    def test_rcsb_structure_publication_uses_bounded_retention_identity_after_prune(self) -> None:
+        installer = self.installer
+        with tempfile.TemporaryDirectory() as tmp:
+            store = Path(tmp) / "science_store"
+            first = store / "downloads/rcsb/mmcif/ab/1abc.cif.gz"
+            second = store / "downloads/rcsb/mmcif/de/2def.cif.gz"
+            first.parent.mkdir(parents=True)
+            second.parent.mkdir(parents=True)
+            first.write_bytes(b"rcsb-1abc")
+            second.write_bytes(b"rcsb-2def")
+            indexes = store / "indexes"
+            indexes.mkdir(parents=True)
+            table = indexes / "structure_targets.tsv"
+            table.write_text(
+                "source\ttarget_id\ttarget_name\torganism\ttarget_class\tligand_tokens\t"
+                "sequence_tokens\tstructure_tokens\tevidence\n"
+                "RCSB\t1ABC\t1ABC\tunknown\tstructure_record\tunknown\tunknown\t1abc\trcsb\n"
+                "RCSB\t2DEF\t2DEF\tunknown\tstructure_record\tunknown\tunknown\t2def\trcsb\n",
+                encoding="utf-8",
+            )
+            source_summary = installer.resource_payload_summary(first.parents[1])
+            source_manifest = store / "manifests/source_file_manifest.tsv"
+            source_manifest.parent.mkdir(parents=True)
+            fields = [
+                "source_id",
+                "local_path",
+                "status",
+                "storage_state",
+                "file_count",
+                "bytes",
+                "sha256",
+                "release_identity",
+                "trust_source",
+            ]
+            source_row = {
+                "source_id": "rcsb_ligand_bound",
+                "local_path": "downloads/rcsb/mmcif",
+                "status": "ready",
+                "storage_state": "materialized",
+                "file_count": str(source_summary["file_count"]),
+                "bytes": str(source_summary["bytes"]),
+                "sha256": str(source_summary["sha256"]),
+                "release_identity": "rcsb-build-snapshot",
+                "trust_source": "publisher_https_mmcif_parse",
+            }
+            installer.write_simple_tsv(source_manifest, fields, [source_row])
+            source_paths = [
+                "downloads/rcsb/mmcif/ab/1abc.cif.gz",
+                "downloads/rcsb/mmcif/de/2def.cif.gz",
+            ]
+            (store / "index_build_manifest.tsv").write_text(
+                "index\tinput_path\tstatus\trows\toutput_path\tnotes\n"
+                + "".join(
+                    "structure_targets\t"
+                    f"{path}\tused\t1\tindexes/structure_targets.tsv\t"
+                    "rcsb_structure_file_rows;complete_source_scan\n"
+                    for path in source_paths
+                ),
+                encoding="utf-8",
+            )
+            input_summary = installer.structure_contribution_input_summary(store, source_paths)
+            write_structure_publication_fixture(
+                installer,
+                store,
+                [
+                    {
+                        "source": "RCSB",
+                        "source_id": "rcsb_ligand_bound",
+                        "source_digest": source_summary["sha256"],
+                        "release_identity": "rcsb-build-snapshot",
+                        "trust_source": "publisher_https_mmcif_parse",
+                        "rows": 2,
+                        "source_paths": source_paths,
+                        "input_bytes": input_summary["input_bytes"],
+                        "input_digest": input_summary["input_digest"],
+                    }
+                ],
+            )
+            self.assertTrue(installer.structure_targets_publication_ready(store, "RCSB"))
+
+            second.unlink()
+            current = installer.resource_payload_summary(first.parents[1])
+            source_row.update(
+                {
+                    "storage_state": "bounded_runtime_cache",
+                    "file_count": str(current["file_count"]),
+                    "bytes": str(current["bytes"]),
+                    "sha256": str(current["sha256"]),
+                }
+            )
+            installer.write_simple_tsv(source_manifest, fields, [source_row])
+            retention = {
+                "schema_version": installer.SOURCE_RETENTION_SCHEMA_VERSION,
+                "source_id": "rcsb_ligand_bound",
+                "state": "runtime_cache_bounded",
+                "source_manifest_sha256": str(source_summary["sha256"]),
+                "release_identity": "rcsb-build-snapshot",
+                "trust_source": "publisher_https_mmcif_parse",
+                "structure_input_bytes": str(input_summary["input_bytes"]),
+                "structure_input_digest": str(input_summary["input_digest"]),
+            }
+            installer.write_source_retention_rows(store, [retention])
+            self.assertTrue(installer.structure_targets_publication_ready(store, "RCSB"))
+            self.assertFalse(
+                installer.structure_targets_publication_ready(
+                    store,
+                    "RCSB",
+                    require_live_inputs=True,
+                )
+            )
+            retention["trust_source"] = "different_trust"
+            installer.write_source_retention_rows(store, [retention])
+            self.assertFalse(installer.structure_targets_publication_ready(store, "RCSB"))
 
     def test_indexed_source_cleanup_rejects_path_outside_downloads(self) -> None:
         installer = self.installer
