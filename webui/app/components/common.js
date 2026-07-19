@@ -15,6 +15,10 @@
 function columnsFor(kind) {
   const common = [
     { key: "rank", label: "排序" },
+    { key: "input_id", label: "输入编号" },
+    { key: "record_id", label: "记录编号" },
+    { key: "input_kind", label: "输入类型" },
+    { key: "ranking_policy", label: "排序路线" },
     { key: "candidate_id", label: "候选编号" },
     { key: "target_id", label: "目标编号" },
     { key: "target_name", label: "目标名称" },
@@ -35,6 +39,10 @@ function columnsFor(kind) {
   if (kind === "ranking") return common;
   if (kind === "candidate_detail") {
     return [
+      { key: "input_id", label: "输入编号" },
+      { key: "record_id", label: "记录编号" },
+      { key: "input_kind", label: "输入类型" },
+      { key: "ranking_policy", label: "排序路线" },
       { key: "candidate_id", label: "候选编号" },
       { key: "target_id", label: "目标编号" },
       { key: "target_name", label: "目标名称" },
@@ -180,8 +188,47 @@ function friendlyScope(value) {
 function formatCell(key, value) {
   if (value === undefined || value === null || value === "") return "未提供";
   if (key === "candidate_scope") return friendlyScope(value);
+  if (key === "input_kind") return friendlyInputKind(value);
+  if (key === "ranking_policy") return friendlyRankingPolicy(value);
   if (key === "status") return friendlyStatus(value);
   return value;
+}
+
+function friendlyInputKind(value) {
+  return {
+    small_molecule: "小分子",
+    peptide: "肽",
+    protein_ligand: "蛋白-配体",
+    complex: "复合物",
+    genome_or_metagenome: "基因组/宏基因组",
+  }[value] || value || "未提供";
+}
+
+function friendlyRankingPolicy(value) {
+  if (!value) return "未提供";
+  const version = String(value).match(/v(\d+)$/)?.[1];
+  const suffix = version ? ` v${version}` : "";
+  if (String(value).startsWith("small_molecule")) return `小分子路线${suffix}`;
+  if (String(value).startsWith("peptide")) return `肽路线${suffix}`;
+  if (String(value).startsWith("protein_ligand")) return `蛋白-配体路线${suffix}`;
+  if (String(value).startsWith("complex")) return `复合物路线${suffix}`;
+  if (String(value).startsWith("genome_or_metagenome")) return `基因组/宏基因组路线${suffix}`;
+  if (String(value).startsWith("fallback")) return `通用路线${suffix}`;
+  return value;
+}
+
+function rankingWeightSummary(row) {
+  const weights = [
+    ["已知库", row.known_database_weight],
+    ["宏基因组", row.metagenome_weight],
+    ["结构", row.structure_weight],
+    ["对接", row.docking_weight],
+    ["MD", row.md_weight],
+  ]
+    .map(([label, value]) => [label, Number(value)])
+    .filter(([, value]) => Number.isFinite(value) && value > 0)
+    .map(([label, value]) => `${label} ${Math.round(value * 100)}%`);
+  return weights.length ? weights.join(" · ") : "未提供";
 }
 
 function friendlyStatus(value) {

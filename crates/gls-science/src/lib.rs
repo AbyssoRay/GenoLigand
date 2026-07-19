@@ -31,12 +31,7 @@ const LARGE_METAGENOME_FASTA_TSV_MAX_BYTES: u64 = 1_000_000_000;
 const ALIGNMENT_DATABASE_MANIFEST_SCHEMA_VERSION: &str =
     "genoligand_alignment_database_manifest_v2";
 const SOURCE_ROW_BATCH_SIZE: usize = 512;
-const KNOWN_SCORE_WEIGHT: f64 = 0.50;
-const METAGENOME_SCORE_WEIGHT: f64 = 0.25;
-const STRUCTURE_SCORE_WEIGHT: f64 = 0.10;
-const DOCKING_SCORE_WEIGHT: f64 = 0.05;
-const MD_SCORE_WEIGHT: f64 = 0.10;
-const RANKING_POLICY_VERSION: &str = "genoligand_target_ranking_v1";
+const RANKING_POLICY_VERSION: &str = "genoligand_target_ranking_v3";
 const SCIENCE_READINESS_SCHEMA_VERSION: &str = "genoligand_science_store_readiness_v1";
 const CHEMBL_QUERY_MANIFEST_SCHEMA_VERSION: &str = "genoligand_chembl_query_database_v1";
 const CHEMBL_QUERY_MANIFEST_REL_PATH: &str = "downloads/chembl/chembl_query.manifest.json";
@@ -44,6 +39,13 @@ const SOURCE_RETENTION_SCHEMA_VERSION: &str = "genoligand_source_retention_v1";
 const BINDINGDB_QUERY_MANIFEST_SCHEMA_VERSION: &str = "genoligand_bindingdb_query_database_v1";
 const BINDINGDB_QUERY_DATABASE_REL_PATH: &str = "indexes/bindingdb/bindingdb_query.sqlite";
 const BINDINGDB_QUERY_MANIFEST_REL_PATH: &str = "indexes/bindingdb/bindingdb_query.manifest.json";
+const LIGAND_SIMILARITY_DATABASE_REL_PATH: &str =
+    "indexes/ligand_similarity/ligand_similarity.sqlite";
+const LIGAND_SIMILARITY_MANIFEST_REL_PATH: &str =
+    "indexes/ligand_similarity/ligand_similarity.manifest.json";
+const LIGAND_SIMILARITY_SCHEMA_VERSION: &str = "genoligand_ligand_similarity_index_v2";
+const LIGAND_SIMILARITY_STANDARDIZATION: &str =
+    "rdkit_cleanup_fragment_parent_reionize_canonical_tautomer_v1";
 const BINDINGDB_SOURCE_REL_PATH: &str = "downloads/bindingdb/bindingdb_all.tsv.zip";
 const CHEMBL_QUERY_HASH_CACHE_SCHEMA_VERSION: &str = "genoligand_chembl_query_sha256_cache_v1";
 const CHEMBL_QUERY_HASH_CACHE_DIR: &str = ".chembl_query.sha256_cache";
@@ -63,8 +65,7 @@ const SCIENCE_READINESS_EVIDENCE_PATHS: &[&str] = &[
     "indexes/mmseqs/mmseqs_target_databases.tsv",
     "indexes/foldseek/foldseek_target_databases.tsv",
     RCSB_INDEXED_PDB_IDS_REL_PATH,
-    CHEMBL_QUERY_MANIFEST_REL_PATH,
-    BINDINGDB_QUERY_MANIFEST_REL_PATH,
+    LIGAND_SIMILARITY_MANIFEST_REL_PATH,
     "manifests/source_retention_manifest.tsv",
     "downloads/rcsb/ligand_bound_pdb_scope.json",
     "downloads/rcsb/ligand_bound_pdb_scope.tsv",
@@ -76,6 +77,9 @@ static PIPELINE_INVOCATION_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 static CHEMBL_QUERY_HASH_CACHE_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 static CHEMBL_QUERY_PROCESS_HASH_CACHE: OnceLock<Mutex<BTreeMap<String, (String, String)>>> =
     OnceLock::new();
+static LIGAND_SIMILARITY_PUBLICATION_HASH_CACHE: OnceLock<Mutex<BTreeMap<String, String>>> =
+    OnceLock::new();
+const LIGAND_SIMILARITY_PUBLICATION_HASH_CACHE_LIMIT: usize = 8;
 #[cfg(test)]
 static CHEMBL_QUERY_TEST_HASH_COUNTS: OnceLock<Mutex<BTreeMap<String, u64>>> = OnceLock::new();
 const WORKER_INVOCATION_FILE: &str = "worker_invocation_id.txt";
@@ -610,6 +614,7 @@ pub enum ScienceCommand {
     DatabaseMatchKnown,
     MetagenomeMatchPotential,
     StructureEvaluate,
+    CandidateCoarseRank,
     DynamicsScreen,
     TargetRank,
     EvidenceBuild,
@@ -627,6 +632,7 @@ impl ScienceCommand {
             ("database", "match-known") => Ok(Self::DatabaseMatchKnown),
             ("metagenome", "match-potential") => Ok(Self::MetagenomeMatchPotential),
             ("structure", "evaluate") => Ok(Self::StructureEvaluate),
+            ("candidate", "coarse-rank") => Ok(Self::CandidateCoarseRank),
             ("dynamics", "screen") => Ok(Self::DynamicsScreen),
             ("target", "rank") => Ok(Self::TargetRank),
             ("evidence", "build") => Ok(Self::EvidenceBuild),
@@ -674,6 +680,13 @@ struct NormalizedInput {
 
 const NORMALIZED_INPUT_HEADER: &str = "input_id\tinput_kind\tprimary_value\tfile_count\tfeature_tokens\trecord_id\tsource_kind\tsource_path\tcontent_sha256\tstatus\tstructure_atom_count\tstructure_chain_count\tstructure_residue_count";
 const FEATURE_MANIFEST_HEADER: &str = "input_id\tinput_kind\tfeature_family\tfeature_name\tfeature_value\tfeature_source\tfeature_token\trecord_id";
+const QUERY_STRUCTURE_MANIFEST_HEADER: &str = "input_id\trecord_id\tinput_kind\tinput_digest\tmethod\tfeatures_json\tcoordinate_artifact\tfeature_digest\tstatus";
+const QUERY_STRUCTURE_ARTIFACT_SCHEMA_VERSION: &str = "genoligand_query_structure_artifact_v1";
+const QUERY_STRUCTURE_FEATURE_SCHEMA_VERSION: &str = "genoligand_query_structure_features_v1";
+const MAX_QUERY_STRUCTURE_FEATURE_BYTES: u64 = 256 * 1024;
+const MAX_QUERY_STRUCTURE_MANIFEST_BYTES: u64 = 64 * 1024;
+const MAX_QUERY_STRUCTURE_FEATURE_ROWS: usize = 96;
+const TARGET_CANDIDATE_RANKING_HEADER: &str = "rank\tcandidate_id\ttarget_id\ttarget_name\tcandidate_scope\torganism\tfinal_score\tknown_database_score\tmetagenome_score\tstructure_score\tdocking_score\tmd_score\tevidence_summary\tstatus\tinput_id\trecord_id\tidentity_namespace\tinput_kind\tranking_policy\tknown_database_weight\tmetagenome_weight\tstructure_weight\tdocking_weight\tmd_weight";
 const INPUT_SEQUENCE_SPOOL_FILE: &str = "input_sequence_spool.bin";
 const INPUT_SEQUENCE_SPOOL_PENDING_FILE: &str = "input_sequence_spool.bin.pending";
 
@@ -736,6 +749,28 @@ struct ComputedFeatureInput {
 }
 
 #[derive(Clone, Debug)]
+struct QueryStructureArtifact {
+    method: String,
+    coordinate_artifact: String,
+    feature_digest: String,
+    status: String,
+    feature_rows: Vec<FeatureRow>,
+}
+
+#[derive(Clone, Debug)]
+struct QueryStructureIndexRow {
+    input_id: String,
+    record_id: String,
+    input_kind: String,
+    input_digest: String,
+    method: String,
+    features_json: String,
+    coordinate_artifact: String,
+    feature_digest: String,
+    status: String,
+}
+
+#[derive(Clone, Debug)]
 struct ConversionProvenance {
     canonical_kind: String,
     source_kind: String,
@@ -777,11 +812,16 @@ struct Candidate {
     candidate_id: String,
     input_id: String,
     record_id: String,
+    input_kind: String,
+    ranking_policy: String,
     identity_namespace: String,
     target_id: String,
     target_name: String,
+    target_class: String,
     candidate_scope: String,
     organism: String,
+    sources: BTreeSet<String>,
+    pdb_ids: BTreeSet<String>,
     metadata_quality: u16,
     known_score: f64,
     metagenome_score: f64,
@@ -790,6 +830,67 @@ struct Candidate {
     dynamics_score: f64,
     final_score: f64,
     evidence: String,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct RankingRoute {
+    key: &'static str,
+    known: f64,
+    metagenome: f64,
+    structure: f64,
+    docking: f64,
+    md: f64,
+}
+
+impl RankingRoute {
+    fn score(self, candidate: &Candidate) -> f64 {
+        self.score_components(
+            candidate.known_score,
+            candidate.metagenome_score,
+            candidate.structure_score,
+            candidate.docking_score,
+            candidate.dynamics_score,
+        )
+    }
+
+    fn score_components(
+        self,
+        known: f64,
+        metagenome: f64,
+        structure: f64,
+        docking: f64,
+        md: f64,
+    ) -> f64 {
+        debug_assert!((self.weight_sum() - 1.0).abs() < 1e-9);
+        (known * self.known
+            + metagenome * self.metagenome
+            + structure * self.structure
+            + docking * self.docking
+            + md * self.md)
+            .clamp(0.0, 1.0)
+    }
+
+    fn weight_sum(self) -> f64 {
+        self.known + self.metagenome + self.structure + self.docking + self.md
+    }
+
+    fn preliminary_weights(self) -> (f64, f64, f64) {
+        let sum = self.known + self.metagenome + self.structure;
+        debug_assert!(sum > 0.0);
+        (
+            self.known / sum,
+            self.metagenome / sum,
+            self.structure / sum,
+        )
+    }
+
+    fn preliminary_score(self, candidate: &Candidate) -> f64 {
+        let (known, metagenome, structure) = self.preliminary_weights();
+        (candidate.known_score * known
+            + candidate.metagenome_score * metagenome
+            + candidate.structure_score * structure)
+            .clamp(0.0, 1.0)
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -1088,12 +1189,22 @@ pub fn run_science_command(
     options: &ScienceOptions,
 ) -> Result<String, String> {
     match command {
-        ScienceCommand::InputNormalize => normalize_input(options),
-        ScienceCommand::FeaturesCompute => compute_features(options),
+        ScienceCommand::InputNormalize => {
+            start_pipeline_invocation(options)?;
+            start_worker_invocation(options)?;
+            normalize_input(options)
+        }
+        ScienceCommand::FeaturesCompute => {
+            start_pipeline_invocation(options)?;
+            start_worker_invocation(options)?;
+            prepare_query_structures(options)?;
+            compute_features(options)
+        }
         ScienceCommand::DatabaseMatchKnown => match_known(options),
         ScienceCommand::MetagenomeMatchPotential => match_metagenome(options),
         ScienceCommand::StructureEvaluate => evaluate_structure(options),
-        ScienceCommand::DynamicsScreen => screen_dynamics(options),
+        ScienceCommand::CandidateCoarseRank => coarse_rank_candidates(options),
+        ScienceCommand::DynamicsScreen => execute_dynamics_screen(options),
         ScienceCommand::TargetRank => rank_targets(options),
         ScienceCommand::EvidenceBuild => build_evidence(options),
         ScienceCommand::ReportRender => render_report(options),
@@ -1282,8 +1393,13 @@ fn prepare_science_store(options: &StoreOptions) -> Result<String, String> {
     let download_plan = options.science_store.join("download_plan.tsv");
     let index_plan = options.science_store.join("index_plan.tsv");
     let index_build = options.science_store.join("index_build_manifest.tsv");
+    let ligand_similarity_manifest = options
+        .science_store
+        .join(LIGAND_SIMILARITY_MANIFEST_REL_PATH);
     write_tool_versions(&tools)?;
-    prepare_bindingdb_query_database(options)?;
+    let ligand_similarity_error = prepare_ligand_similarity_authority(options).err();
+    let ligand_similarity_ready =
+        ligand_similarity_error.is_none() && ligand_similarity_authority_ready(options).is_ok();
     let build_summary = build_store_indexes(options, &index_build)?;
     write_source_requirements(options, &source_requirements)?;
     write_download_plan(options, &download_plan)?;
@@ -1313,7 +1429,14 @@ fn prepare_science_store(options: &StoreOptions) -> Result<String, String> {
             &tools,
             "install_or_repair_scientific_tools",
         ),
+        (
+            "ligand_similarity_index",
+            ligand_similarity_ready,
+            &ligand_similarity_manifest,
+            "build_compact_ligand_similarity_index",
+        ),
     ];
+    let required_items = rows.len();
     let mut text = String::from("item\tstatus\tpath\n");
     let mut repair_text = String::from("component\tstatus\taction\tdetail\n");
     let mut missing = Vec::new();
@@ -1371,8 +1494,11 @@ fn prepare_science_store(options: &StoreOptions) -> Result<String, String> {
             json!({
                 "status": if missing.is_empty() {"ready"} else {"needs_repair"},
                 "ready_items": ready,
-                "required_items": 4,
+                "required_items": required_items,
                 "missing_components": missing,
+                "ligand_similarity_detail": ligand_similarity_error
+                    .as_deref()
+                    .unwrap_or("ready"),
                 "science_store": options.science_store.display().to_string(),
                 "workspace_root": options.workspace_root.display().to_string(),
                 "repair_actions": "repair_actions.tsv",
@@ -1390,7 +1516,7 @@ fn prepare_science_store(options: &StoreOptions) -> Result<String, String> {
         ),
     )?;
     Ok(format!(
-        "science_store_prepared\tready_items={ready}\trequired_items=4\tstatus={}\tmissing_components={}\tstore={}",
+        "science_store_prepared\tready_items={ready}\trequired_items={required_items}\tstatus={}\tmissing_components={}\tstore={}",
         if missing.is_empty() {
             "ready"
         } else {
@@ -1399,6 +1525,539 @@ fn prepare_science_store(options: &StoreOptions) -> Result<String, String> {
         missing.len(),
         options.science_store.display()
     ))
+}
+
+fn prepare_ligand_similarity_authority(options: &StoreOptions) -> Result<(), String> {
+    if validate_ligand_similarity_runtime_contract(options).is_ok() {
+        cleanup_superseded_ligand_query_artifacts(&options.science_store)?;
+        return ligand_similarity_authority_ready(options);
+    }
+
+    prepare_bindingdb_query_database(options)?;
+    let chembl_database = options
+        .science_store
+        .join("downloads/chembl/chembl_query.sqlite");
+    let chembl_manifest = options.science_store.join(CHEMBL_QUERY_MANIFEST_REL_PATH);
+    let bindingdb_database = options
+        .science_store
+        .join(BINDINGDB_QUERY_DATABASE_REL_PATH);
+    let bindingdb_manifest = options
+        .science_store
+        .join(BINDINGDB_QUERY_MANIFEST_REL_PATH);
+    if !chembl_database.is_file() || !chembl_manifest.is_file() {
+        return Err("ligand_similarity_chembl_staging_missing".to_string());
+    }
+    if !bindingdb_database.is_file() || !bindingdb_manifest.is_file() {
+        return Err("ligand_similarity_bindingdb_staging_missing".to_string());
+    }
+    validate_chembl_query_runtime_contract(
+        &options.science_store,
+        &chembl_database,
+        &chembl_manifest,
+    )?;
+    validate_bindingdb_query_runtime_contract(
+        &options.science_store,
+        &bindingdb_database,
+        &bindingdb_manifest,
+    )?;
+
+    let database = options
+        .science_store
+        .join(LIGAND_SIMILARITY_DATABASE_REL_PATH);
+    let manifest = options
+        .science_store
+        .join(LIGAND_SIMILARITY_MANIFEST_REL_PATH);
+    let arguments = vec![
+        "build".to_string(),
+        "--chembl-db".to_string(),
+        chembl_database.display().to_string(),
+        "--chembl-manifest".to_string(),
+        chembl_manifest.display().to_string(),
+        "--bindingdb-db".to_string(),
+        bindingdb_database.display().to_string(),
+        "--bindingdb-manifest".to_string(),
+        bindingdb_manifest.display().to_string(),
+        "--output-db".to_string(),
+        database.display().to_string(),
+        "--manifest".to_string(),
+        manifest.display().to_string(),
+    ];
+    run_ligand_similarity_module(options, &arguments, "ligand_similarity_build")?;
+    validate_ligand_similarity_runtime_contract(options)?;
+    cleanup_superseded_ligand_query_artifacts(&options.science_store)?;
+    ligand_similarity_authority_ready(options)
+}
+
+fn ligand_similarity_authority_ready(options: &StoreOptions) -> Result<(), String> {
+    validate_ligand_similarity_runtime_contract(options)?;
+    if superseded_ligand_query_artifacts_present(&options.science_store)? {
+        return Err("superseded_ligand_query_artifacts_present".to_string());
+    }
+    Ok(())
+}
+
+fn validate_ligand_similarity_runtime_contract(options: &StoreOptions) -> Result<(), String> {
+    let database = options
+        .science_store
+        .join(LIGAND_SIMILARITY_DATABASE_REL_PATH);
+    let manifest = options
+        .science_store
+        .join(LIGAND_SIMILARITY_MANIFEST_REL_PATH);
+    if !database.exists() && !manifest.exists() {
+        return Err("ligand_similarity_index_missing".to_string());
+    }
+    if !database.is_file() || !manifest.is_file() {
+        return Err("ligand_similarity_index_contract_incomplete".to_string());
+    }
+    let text =
+        read_text(&manifest).map_err(|err| format!("ligand_similarity_manifest_invalid:{err}"))?;
+    let value = serde_json::from_str::<Value>(text.trim_start_matches('\u{feff}'))
+        .map_err(|err| format!("ligand_similarity_manifest_invalid:json:{err}"))?;
+    if value.get("schema_version").and_then(Value::as_str) != Some(LIGAND_SIMILARITY_SCHEMA_VERSION)
+        || value.get("status").and_then(Value::as_str) != Some("ready")
+    {
+        return Err("ligand_similarity_manifest_invalid:fixed_fields".to_string());
+    }
+    let database_meta = value
+        .get("database")
+        .and_then(Value::as_object)
+        .ok_or_else(|| "ligand_similarity_manifest_invalid:database".to_string())?;
+    let database_bytes = fs::metadata(&database)
+        .map_err(|err| format!("ligand_similarity_database_metadata_failed:{err}"))?
+        .len();
+    if database_bytes == 0
+        || database_meta.get("bytes").and_then(Value::as_u64) != Some(database_bytes)
+        || !database_meta
+            .get("sha256")
+            .and_then(Value::as_str)
+            .is_some_and(valid_sha256_hex)
+        || !ligand_similarity_declared_path_matches(
+            &database,
+            database_meta
+                .get("path")
+                .and_then(Value::as_str)
+                .unwrap_or_default(),
+        )
+    {
+        return Err("ligand_similarity_manifest_invalid:database_identity".to_string());
+    }
+
+    let counts = value
+        .get("counts")
+        .and_then(Value::as_object)
+        .ok_or_else(|| "ligand_similarity_manifest_invalid:counts".to_string())?;
+    if ["molecules", "targets", "evidence"]
+        .iter()
+        .any(|name| counts.get(*name).and_then(Value::as_u64).unwrap_or(0) == 0)
+        || counts.get("hints").and_then(Value::as_u64).is_none()
+    {
+        return Err("ligand_similarity_manifest_invalid:empty_counts".to_string());
+    }
+
+    let inputs = value
+        .get("inputs")
+        .and_then(Value::as_object)
+        .ok_or_else(|| "ligand_similarity_manifest_invalid:inputs".to_string())?;
+    let mut input_bytes = 0_u64;
+    let mut source_identity = serde_json::Map::new();
+    for source_id in ["chembl", "bindingdb"] {
+        let input = inputs
+            .get(source_id)
+            .and_then(Value::as_object)
+            .ok_or_else(|| format!("ligand_similarity_manifest_invalid:input:{source_id}"))?;
+        let bytes = input.get("bytes").and_then(Value::as_u64).unwrap_or(0);
+        let sha256 = input
+            .get("sha256")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        let source_digest = input
+            .get("source_digest")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        let source_release = input
+            .get("source_release")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        let (expected_digest, expected_release) =
+            science_store_source_identity(&options.science_store, source_id)?;
+        if bytes == 0
+            || !valid_sha256_hex(sha256)
+            || source_digest != expected_digest
+            || source_release != expected_release
+            || input
+                .get("path")
+                .and_then(Value::as_str)
+                .is_none_or(str::is_empty)
+            || input
+                .get("manifest_path")
+                .and_then(Value::as_str)
+                .is_none_or(str::is_empty)
+        {
+            return Err(format!(
+                "ligand_similarity_manifest_invalid:source_identity:{source_id}"
+            ));
+        }
+        input_bytes = input_bytes
+            .checked_add(bytes)
+            .ok_or_else(|| "ligand_similarity_input_bytes_overflow".to_string())?;
+        source_identity.insert(
+            source_id.to_string(),
+            json!({
+                "source_digest": source_digest,
+                "source_release": source_release,
+            }),
+        );
+    }
+    if database_bytes >= input_bytes
+        || value
+            .get("reclaimed_candidate_bytes")
+            .and_then(Value::as_u64)
+            != Some(input_bytes - database_bytes)
+    {
+        return Err("ligand_similarity_manifest_invalid:size_reduction".to_string());
+    }
+
+    let fingerprint = value
+        .get("fingerprint")
+        .and_then(Value::as_object)
+        .ok_or_else(|| "ligand_similarity_manifest_invalid:fingerprint".to_string())?;
+    let fingerprint_valid = fingerprint.get("type").and_then(Value::as_str) == Some("morgan_ecfp4")
+        && fingerprint.get("radius").and_then(Value::as_u64) == Some(2)
+        && fingerprint.get("bits").and_then(Value::as_u64) == Some(2048)
+        && fingerprint
+            .get("include_chirality")
+            .and_then(Value::as_bool)
+            == Some(true)
+        && fingerprint.get("standardization").and_then(Value::as_str)
+            == Some(LIGAND_SIMILARITY_STANDARDIZATION)
+        && fingerprint
+            .get("tautomer_max_tautomers")
+            .and_then(Value::as_u64)
+            == Some(100)
+        && fingerprint
+            .get("tautomer_max_transforms")
+            .and_then(Value::as_u64)
+            == Some(100)
+        && fingerprint.get("lsh_bands").and_then(Value::as_u64) == Some(0)
+        && fingerprint.get("search_algorithm").and_then(Value::as_str)
+            == Some("popcount_bitbound_exact_tanimoto")
+        && fingerprint.get("bitbound_formula").and_then(Value::as_str)
+            == Some("ceil(t*q_popcount) <= db_popcount <= floor(q_popcount/t)")
+        && fingerprint.get("reference")
+            == Some(&json!({"name":"FPSim2","license":"MIT","commit":"e03e669"}))
+        && matches!(
+            fingerprint.get("encoding").and_then(Value::as_str),
+            Some("rdkit_binary_text" | "zlib1_rdkit_binary_text")
+        );
+    if !fingerprint_valid {
+        return Err("ligand_similarity_manifest_invalid:fingerprint".to_string());
+    }
+    let stable_fingerprint = json!({
+        "type": fingerprint.get("type"),
+        "radius": fingerprint.get("radius"),
+        "bits": fingerprint.get("bits"),
+        "include_chirality": fingerprint.get("include_chirality"),
+        "standardization": fingerprint.get("standardization"),
+        "tautomer_max_tautomers": fingerprint.get("tautomer_max_tautomers"),
+        "tautomer_max_transforms": fingerprint.get("tautomer_max_transforms"),
+        "lsh_bands": fingerprint.get("lsh_bands"),
+        "search_algorithm": fingerprint.get("search_algorithm"),
+        "bitbound_formula": fingerprint.get("bitbound_formula"),
+        "reference": fingerprint.get("reference"),
+        "encoding": fingerprint.get("encoding"),
+    });
+    let expected = json!({
+        "counts": Value::Object(counts.clone()),
+        "fingerprint": stable_fingerprint,
+        "source_identity": Value::Object(source_identity),
+    });
+    run_python_script(
+        ligand_similarity_sqlite_contract_script(),
+        &[database.display().to_string(), expected.to_string()],
+        "ligand_similarity_contract",
+    )?;
+    Ok(())
+}
+
+fn ligand_similarity_declared_path_matches(database: &Path, declared: &str) -> bool {
+    let Ok(database) = database.canonicalize() else {
+        return false;
+    };
+    let declared = wsl_path_to_windows(declared).unwrap_or_else(|| PathBuf::from(declared));
+    declared
+        .canonicalize()
+        .is_ok_and(|declared| declared == database)
+}
+
+fn ligand_similarity_sqlite_contract_script() -> &'static str {
+    r#"
+import json
+import sqlite3
+import sys
+from pathlib import Path
+
+database, expected_json = sys.argv[1:3]
+expected = json.loads(expected_json)
+uri = Path(database).resolve().as_uri() + "?mode=ro&immutable=1"
+connection = sqlite3.connect(uri, uri=True)
+try:
+    objects = {
+        (str(row[0]), str(row[1]))
+        for row in connection.execute(
+            "SELECT type, name FROM sqlite_master WHERE type IN ('table', 'index')"
+        )
+    }
+    required = {
+        ("table", "molecule"), ("table", "target"),
+        ("table", "evidence"), ("table", "structure_hint"),
+        ("table", "metadata"),
+        ("index", "idx_molecule_popcount"),
+    }
+    if not required.issubset(objects):
+        raise RuntimeError("ligand_similarity_database_objects_missing")
+    if any(kind == "table" and name.startswith("_build_") for kind, name in objects):
+        raise RuntimeError("ligand_similarity_build_tables_retained")
+    required_columns = {
+        "molecule": {"id", "canonical_smiles", "fingerprint", "popcount"},
+        "target": {
+            "id", "source", "target_id", "source_target_id", "target_name",
+            "organism", "target_class", "source_release", "source_digest",
+        },
+        "evidence": {
+            "molecule_id", "target_fk", "activity_score", "activity",
+            "relation_rank", "numeric_rank",
+        },
+        "structure_hint": {
+            "molecule_id", "target_fk", "ligand_code", "pdb_ids",
+            "target_chain_pdb_ids",
+        },
+        "metadata": {"key", "value"},
+    }
+    for table, columns in required_columns.items():
+        actual = {str(row[1]) for row in connection.execute(f"PRAGMA table_info({table})")}
+        if not columns.issubset(actual):
+            raise RuntimeError(f"ligand_similarity_columns_missing:{table}")
+    metadata = dict(connection.execute("SELECT key, value FROM metadata"))
+    if metadata.get("schema_version") != "genoligand_ligand_similarity_index_v2":
+        raise RuntimeError("ligand_similarity_metadata_schema_invalid")
+    if metadata.get("status") != "ready":
+        raise RuntimeError("ligand_similarity_metadata_status_invalid")
+    for key in ("counts", "fingerprint", "source_identity"):
+        if json.loads(metadata.get(key, "{}")) != expected[key]:
+            raise RuntimeError(f"ligand_similarity_metadata_mismatch:{key}")
+    sample = connection.execute(
+        "SELECT m.fingerprint, m.popcount, t.source_digest, e.activity_score "
+        "FROM evidence e JOIN molecule m ON m.id=e.molecule_id "
+        "JOIN target t ON t.id=e.target_fk LIMIT 1"
+    ).fetchone()
+    if (
+        sample is None or not sample[0] or not 1 <= int(sample[1]) <= 2048
+        or len(str(sample[2])) != 64 or not 0.0 <= float(sample[3]) <= 1.0
+    ):
+        raise RuntimeError("ligand_similarity_sample_invalid")
+    if int(expected["counts"]["hints"]) > 0:
+        hint = connection.execute(
+            "SELECT ligand_code, pdb_ids, target_chain_pdb_ids FROM structure_hint LIMIT 1"
+        ).fetchone()
+        if hint is None or not any(str(value).strip() for value in hint):
+            raise RuntimeError("ligand_similarity_structure_hint_sample_invalid")
+    plan = connection.execute(
+        "EXPLAIN QUERY PLAN SELECT id FROM molecule INDEXED BY idx_molecule_popcount "
+        "WHERE popcount BETWEEN ? AND ?", (1, 2048)
+    ).fetchall()
+    if not any("IDX_MOLECULE_POPCOUNT" in str(row[-1]).upper() for row in plan):
+        raise RuntimeError("ligand_similarity_popcount_index_unused")
+finally:
+    connection.close()
+print("ready")
+"#
+}
+
+fn run_ligand_similarity_module(
+    options: &StoreOptions,
+    arguments: &[String],
+    context: &str,
+) -> Result<String, String> {
+    let python_root = options.workspace_root.join("python");
+    let mut errors = Vec::new();
+    for candidate in python_command_candidates() {
+        let mut command = Command::new(&candidate[0]);
+        command.args(&candidate[1..]);
+        command
+            .arg("-m")
+            .arg("genoligand_workers.ligand_similarity_index");
+        for argument in arguments {
+            command.arg(python_script_arg(&candidate, argument));
+        }
+        if python_root.exists()
+            && let Some(joined) = worker_pythonpath_env(&candidate, &python_root)
+        {
+            command.env("PYTHONPATH", joined);
+            if is_wsl_python_wrapper(&candidate) {
+                command.env("WSLENV", wsl_env_with_pythonpath());
+            }
+        }
+        match command.output() {
+            Ok(output) if output.status.success() => {
+                return Ok(decode_process_bytes(&output.stdout));
+            }
+            Ok(output) => {
+                let stderr = decode_process_bytes(&output.stderr);
+                let stdout = decode_process_bytes(&output.stdout);
+                let detail = stderr
+                    .lines()
+                    .find(|line| !line.trim().is_empty())
+                    .or_else(|| stdout.lines().find(|line| !line.trim().is_empty()))
+                    .unwrap_or("ligand_similarity_module_failed");
+                errors.push(format!("{}:{detail}", candidate.join(" ")));
+            }
+            Err(err) => errors.push(format!("{}:{err}", candidate.join(" "))),
+        }
+    }
+    Err(format!(
+        "{context}_python_failed:{}",
+        clean_cell(&errors.join(" | "))
+    ))
+}
+
+fn cleanup_superseded_ligand_query_artifacts(science_store: &Path) -> Result<(), String> {
+    for path in superseded_ligand_query_fixed_paths(science_store) {
+        remove_controlled_store_artifact(science_store, &path)?;
+    }
+    for (directory, prefixes) in superseded_ligand_query_temp_roots(science_store) {
+        if !directory.is_dir() {
+            continue;
+        }
+        for entry in fs::read_dir(&directory)
+            .map_err(|err| format!("ligand_cleanup_read_failed:{}:{err}", directory.display()))?
+        {
+            let entry = entry.map_err(|err| {
+                format!("ligand_cleanup_entry_failed:{}:{err}", directory.display())
+            })?;
+            let name = entry.file_name().to_string_lossy().to_string();
+            if prefixes.iter().any(|prefix| name.starts_with(prefix)) {
+                remove_controlled_store_artifact(science_store, &entry.path())?;
+            }
+        }
+    }
+    Ok(())
+}
+
+fn superseded_ligand_query_artifacts_present(science_store: &Path) -> Result<bool, String> {
+    if superseded_ligand_query_fixed_paths(science_store)
+        .iter()
+        .any(|path| fs::symlink_metadata(path).is_ok())
+    {
+        return Ok(true);
+    }
+    for (directory, prefixes) in superseded_ligand_query_temp_roots(science_store) {
+        if !directory.is_dir() {
+            continue;
+        }
+        for entry in fs::read_dir(&directory)
+            .map_err(|err| format!("ligand_cleanup_read_failed:{}:{err}", directory.display()))?
+        {
+            let entry = entry.map_err(|err| {
+                format!("ligand_cleanup_entry_failed:{}:{err}", directory.display())
+            })?;
+            let name = entry.file_name().to_string_lossy().into_owned();
+            if prefixes.iter().any(|prefix| name.starts_with(prefix)) {
+                return Ok(true);
+            }
+        }
+    }
+    Ok(false)
+}
+
+fn superseded_ligand_query_fixed_paths(science_store: &Path) -> Vec<PathBuf> {
+    let databases = [
+        science_store.join("downloads/chembl/chembl_query.sqlite"),
+        science_store.join(BINDINGDB_QUERY_DATABASE_REL_PATH),
+    ];
+    let manifests = [
+        science_store.join(CHEMBL_QUERY_MANIFEST_REL_PATH),
+        science_store.join(BINDINGDB_QUERY_MANIFEST_REL_PATH),
+    ];
+    let mut paths = Vec::new();
+    for database in databases {
+        paths.push(database.clone());
+        for suffix in ["-wal", "-shm", "-journal"] {
+            paths.push(PathBuf::from(format!("{}{suffix}", database.display())));
+        }
+    }
+    for manifest in manifests {
+        paths.push(manifest.clone());
+        paths.push(PathBuf::from(format!("{}.pending", manifest.display())));
+        paths.push(PathBuf::from(format!("{}.previous", manifest.display())));
+    }
+    paths.push(
+        science_store
+            .join("downloads/chembl")
+            .join(CHEMBL_QUERY_HASH_CACHE_DIR),
+    );
+    paths
+}
+
+fn superseded_ligand_query_temp_roots(science_store: &Path) -> [(PathBuf, [&'static str; 2]); 2] {
+    [
+        (
+            science_store.join("downloads/chembl"),
+            [".chembl_query_", ".chembl_query_manifest_"],
+        ),
+        (
+            science_store.join("indexes/bindingdb"),
+            [".bindingdb_query_", ".bindingdb_query_manifest_"],
+        ),
+    ]
+}
+
+fn remove_controlled_store_artifact(science_store: &Path, path: &Path) -> Result<(), String> {
+    let Ok(metadata) = fs::symlink_metadata(path) else {
+        return Ok(());
+    };
+    let root = science_store.canonicalize().map_err(|err| {
+        format!(
+            "ligand_cleanup_store_canonicalize_failed:{}:{err}",
+            science_store.display()
+        )
+    })?;
+    if metadata.file_type().is_symlink() {
+        return fs::remove_file(path)
+            .or_else(|_| fs::remove_dir(path))
+            .map_err(|err| format!("ligand_cleanup_symlink_failed:{}:{err}", path.display()));
+    }
+    let resolved = path
+        .canonicalize()
+        .map_err(|err| format!("ligand_cleanup_path_invalid:{}:{err}", path.display()))?;
+    if resolved == root || !resolved.starts_with(&root) {
+        return Err(format!(
+            "ligand_cleanup_path_outside_store:{}",
+            path.display()
+        ));
+    }
+    if metadata.is_file() {
+        #[cfg(windows)]
+        if metadata.permissions().readonly() {
+            let mut permissions = metadata.permissions();
+            permissions.set_readonly(false);
+            fs::set_permissions(&resolved, permissions).map_err(|err| {
+                format!(
+                    "ligand_cleanup_permissions_failed:{}:{err}",
+                    resolved.display()
+                )
+            })?;
+        }
+        fs::remove_file(&resolved)
+            .map_err(|err| format!("ligand_cleanup_remove_failed:{}:{err}", resolved.display()))
+    } else if metadata.is_dir() {
+        fs::remove_dir_all(&resolved)
+            .map_err(|err| format!("ligand_cleanup_remove_failed:{}:{err}", resolved.display()))
+    } else {
+        Err(format!(
+            "ligand_cleanup_unsupported_artifact:{}",
+            path.display()
+        ))
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -1649,9 +2308,18 @@ fn build_store_indexes(
     ];
     let mut manifest = String::from("index\tinput_path\tstatus\trows\toutput_path\tnotes\n");
     let indexes_dir = options.science_store.join("indexes");
+    let ligand_similarity_ready = validate_ligand_similarity_runtime_contract(options).is_ok();
     let mut known_rows = StoreRowSpool::create(&indexes_dir, "known_targets_raw")?;
     for rel in known_sources {
         let path = options.science_store.join(rel);
+        if ligand_similarity_ready && rel.starts_with("downloads/bindingdb/bindingdb_all") {
+            manifest.push_str(&format!(
+                "known_targets\t{}\tsuperseded\t0\t{}\tcompact_ligand_similarity_is_authoritative\n",
+                relative_display(&options.science_store, &path),
+                LIGAND_SIMILARITY_DATABASE_REL_PATH,
+            ));
+            continue;
+        }
         append_canonical_rows(
             "known_targets",
             &options.science_store,
@@ -1662,12 +2330,26 @@ fn build_store_indexes(
     }
     let chembl_dir = options.science_store.join("downloads/chembl");
     let published_chembl_query = chembl_dir.join("chembl_query.sqlite");
-    let published_chembl_manifest = published_chembl_query.with_extension("manifest.json");
-    if published_chembl_query.is_file() && published_chembl_manifest.is_file() {
+    if ligand_similarity_ready {
+        let ligand_manifest = options
+            .science_store
+            .join(LIGAND_SIMILARITY_MANIFEST_REL_PATH);
+        let target_count = read_text(&ligand_manifest)
+            .ok()
+            .and_then(|text| {
+                serde_json::from_str::<Value>(text.trim_start_matches('\u{feff}')).ok()
+            })
+            .and_then(|value| {
+                value
+                    .get("counts")
+                    .and_then(|counts| counts.get("targets"))
+                    .and_then(Value::as_u64)
+            })
+            .unwrap_or(0);
         manifest.push_str(&format!(
-            "known_targets\t{}\tready\t0\t{}\tpublished_chembl_query_used_by_onsite_matcher\n",
-            relative_display(&options.science_store, &published_chembl_query),
-            relative_display(&options.science_store, &published_chembl_query),
+            "ligand_similarity\t{}\tready\t{target_count}\t{}\tcompact_ligand_similarity_used_by_onsite_matcher\n",
+            LIGAND_SIMILARITY_MANIFEST_REL_PATH,
+            LIGAND_SIMILARITY_DATABASE_REL_PATH,
         ));
     } else {
         for path in discover_chembl_sqlite_sources(&chembl_dir)? {
@@ -3206,6 +3888,21 @@ fn retained_source_available(store: &Path, source: &RequiredSource) -> bool {
         .map(str::trim)
         .filter(|path| !path.is_empty())
         .collect::<Vec<_>>();
+    if matches!(source.id, "chembl" | "bindingdb") {
+        let expected = BTreeSet::from([
+            LIGAND_SIMILARITY_DATABASE_REL_PATH,
+            LIGAND_SIMILARITY_MANIFEST_REL_PATH,
+        ]);
+        let actual = derived_paths.iter().copied().collect::<BTreeSet<_>>();
+        if actual != expected || derived_paths.len() != expected.len() {
+            return false;
+        }
+        let options = StoreOptions {
+            workspace_root: store.to_path_buf(),
+            science_store: store.to_path_buf(),
+        };
+        return validate_ligand_similarity_runtime_contract(&options).is_ok();
+    }
     !derived_paths.is_empty()
         && derived_paths
             .iter()
@@ -3654,6 +4351,7 @@ fn first_nonempty_line(text: &str) -> Option<String> {
 fn run_pipeline(options: &ScienceOptions) -> Result<String, String> {
     ensure_dir(&options.run_dir)?;
     let invocation_id = start_pipeline_invocation(options)?;
+    start_worker_invocation(options)?;
     write_text(&options.run_dir.join("last_successful_stage.txt"), "none\n")?;
     write_run_context(options, "starting", &[])?;
     let blocked = pipeline_blockers(options).map_err(|err| {
@@ -3674,6 +4372,9 @@ fn run_pipeline(options: &ScienceOptions) -> Result<String, String> {
     run_pipeline_stage(options, &invocation_id, "input_normalize", || {
         normalize_input(options)
     })?;
+    run_pipeline_stage(options, &invocation_id, "query_structure_prepare", || {
+        prepare_query_structures(options)
+    })?;
     run_pipeline_stage(options, &invocation_id, "features_compute", || {
         compute_features(options)
     })?;
@@ -3693,9 +4394,11 @@ fn run_pipeline(options: &ScienceOptions) -> Result<String, String> {
     run_pipeline_stage(options, &invocation_id, "structure_evaluate", || {
         evaluate_structure(options)
     })?;
+    run_pipeline_stage(options, &invocation_id, "candidate_coarse_rank", || {
+        coarse_rank_candidates(options)
+    })?;
     run_pipeline_stage(options, &invocation_id, "dynamics_screen", || {
-        run_scientific_workers(options)?;
-        screen_dynamics(options)
+        execute_dynamics_screen(options)
     })?;
     run_pipeline_stage(options, &invocation_id, "target_rank", || {
         rank_targets(options)
@@ -3893,7 +4596,7 @@ fn repair_action_for_stage(stage: &str) -> &'static str {
         "onsite_sequence_alignment" | "database_match_known" | "metagenome_match_potential" => {
             "repair_the_reported_database_or_worker_then_rerun"
         }
-        "structure_evaluate" | "dynamics_screen" => {
+        "structure_evaluate" | "candidate_coarse_rank" | "dynamics_screen" => {
             "repair_the_reported_candidate_artifact_or_worker_then_rerun"
         }
         _ => "inspect_failure_reason_then_rerun",
@@ -3975,7 +4678,7 @@ fn write_blocked_outputs(
     )?;
     write_text(
         &options.run_dir.join("target_candidate_ranking.tsv"),
-        "rank\tcandidate_id\ttarget_id\ttarget_name\tcandidate_scope\torganism\tfinal_score\tknown_database_score\tmetagenome_score\tstructure_score\tdocking_score\tmd_score\tevidence_summary\tstatus\tinput_id\trecord_id\tidentity_namespace\n",
+        &(TARGET_CANDIDATE_RANKING_HEADER.to_string() + "\n"),
     )?;
     write_text(
         &options.run_dir.join("candidate_detail.json"),
@@ -4230,6 +4933,1103 @@ fn normalize_input(options: &ScienceOptions) -> Result<String, String> {
     ))
 }
 
+fn prepare_query_structures(options: &ScienceOptions) -> Result<String, String> {
+    let normalized_path = options.run_dir.join("input_normalized_manifest.tsv");
+    let inputs = read_normalized_inputs(&normalized_path)?;
+    if inputs.is_empty() {
+        return Err("query_structure_normalized_input_missing".to_string());
+    }
+    let provenance = read_conversion_provenance(&normalized_path)?;
+    remove_run_subdir_if_exists(&options.run_dir, "tool_outputs/query_structure")?;
+    remove_file_if_exists(&options.run_dir.join("query_structure_manifest.tsv"))?;
+    clear_candidate_worker_files(options, "query_structure_prepare")?;
+
+    let job_dir = options.run_dir.join("worker_jobs");
+    let result_dir = options.run_dir.join("worker_results");
+    ensure_dir(&job_dir)?;
+    ensure_dir(&result_dir)?;
+    let invocation_id = current_worker_invocation(options)?;
+    for input in &inputs {
+        let identity = (input.input_id.clone(), input.record_id.clone());
+        let source = provenance.get(&identity).ok_or_else(|| {
+            format!(
+                "query_structure_conversion_provenance_missing:{}:{}",
+                clean_cell(&input.input_id),
+                clean_cell(&input.record_id)
+            )
+        })?;
+        let input_digest = query_structure_input_digest(input, source);
+        let job_id = query_structure_job_id(&input.input_id, &input.record_id, &invocation_id);
+        let task = WorkerTask {
+            job_id: &job_id,
+            worker: "query_structure_prepare",
+            module: "genoligand_workers.query_structure_worker",
+            stage: "query_structure_prepare",
+        };
+        let job_path = job_dir.join(format!("{job_id}.json"));
+        let result_path = result_dir.join(format!("{job_id}.json"));
+        remove_file_if_exists(&result_path)?;
+        let mut job = worker_job_value(options, &task)?;
+        job["input_id"] = json!(&input.input_id);
+        job["record_id"] = json!(&input.record_id);
+        job["input_kind"] = json!(input.kind.as_str());
+        job["input_digest"] = json!(&input_digest);
+        job["source_digest"] = json!(&source.content_sha256);
+        job["content_sha256"] = json!(&source.content_sha256);
+        if !validate_worker_job(&job, &task) {
+            return Err(format!("query_structure_job_invalid:{job_id}"));
+        }
+        write_text(&job_path, &(job.to_string() + "\n"))?;
+        run_worker_task(options, &task, &job_path, &result_path)?;
+        let result = read_worker_result_or_failure(&result_path, &task, &job)?;
+        if let Some(error) = worker_result_stage_error_bound(&result, &job, options, &task) {
+            return Err(error);
+        }
+    }
+
+    let manifest_path = options.run_dir.join("query_structure_manifest.tsv");
+    let artifacts =
+        load_validated_query_structure_artifacts(options, &inputs, &provenance, &invocation_id)?;
+    Ok(format!(
+        "query_structures_prepared\trows={}\tout={}",
+        artifacts.len(),
+        manifest_path.display()
+    ))
+}
+
+fn query_structure_input_digest(input: &NormalizedInput, source: &ConversionProvenance) -> String {
+    canonical_json_sha256(&json!({
+        "input_id": &input.input_id,
+        "record_id": &input.record_id,
+        "canonical_kind": input.kind.as_str(),
+        "canonical_value": &input.primary_value,
+        "source_content_sha256": &source.content_sha256,
+    }))
+}
+
+fn load_validated_query_structure_artifacts(
+    options: &ScienceOptions,
+    inputs: &[NormalizedInput],
+    provenance: &BTreeMap<(String, String), ConversionProvenance>,
+    invocation_id: &str,
+) -> Result<BTreeMap<(String, String), QueryStructureArtifact>, String> {
+    let index_rows =
+        read_query_structure_index(&options.run_dir.join("query_structure_manifest.tsv"))?;
+    if index_rows.len() != inputs.len() {
+        return Err("query_structure_manifest_row_count_mismatch".to_string());
+    }
+    let mut indexed = BTreeMap::new();
+    for row in index_rows {
+        let key = (row.input_id.clone(), row.record_id.clone());
+        if row.input_id.trim().is_empty()
+            || row.record_id.trim().is_empty()
+            || row.method.trim().is_empty()
+            || row
+                .method
+                .chars()
+                .any(|ch| matches!(ch, '\t' | '\r' | '\n'))
+            || !matches!(row.status.as_str(), "ready" | "not_applicable")
+            || indexed.insert(key, row).is_some()
+        {
+            return Err("query_structure_manifest_binding_invalid".to_string());
+        }
+    }
+
+    let run_id = infer_run_id(&options.run_dir);
+    let conversion_digest = sha256_file_hex(&options.run_dir.join("input_conversion_manifest.tsv"))
+        .ok_or_else(|| "query_structure_conversion_manifest_digest_unavailable".to_string())?;
+    let mut artifacts = BTreeMap::new();
+    for input in inputs {
+        let identity = (input.input_id.clone(), input.record_id.clone());
+        let source = provenance.get(&identity).ok_or_else(|| {
+            format!(
+                "query_structure_conversion_provenance_missing:{}:{}",
+                clean_cell(&input.input_id),
+                clean_cell(&input.record_id)
+            )
+        })?;
+        let input_digest = query_structure_input_digest(input, source);
+        let row = indexed
+            .get(&identity)
+            .ok_or_else(|| "query_structure_manifest_identity_missing".to_string())?;
+        if row.input_kind != input.kind.as_str()
+            || row.input_digest != input_digest
+            || !valid_sha256_hex(&row.input_digest)
+        {
+            return Err("query_structure_manifest_binding_invalid".to_string());
+        }
+
+        let job_id = query_structure_job_id(&input.input_id, &input.record_id, invocation_id);
+        let task = WorkerTask {
+            job_id: &job_id,
+            worker: "query_structure_prepare",
+            module: "genoligand_workers.query_structure_worker",
+            stage: "query_structure_prepare",
+        };
+        let job = read_json_value_if_file(
+            &options
+                .run_dir
+                .join("worker_jobs")
+                .join(format!("{job_id}.json")),
+        )
+        .ok_or_else(|| format!("query_structure_job_missing:{job_id}"))?;
+        if !validate_worker_job(&job, &task)
+            || !query_structure_job_binding_matches(
+                &job,
+                &run_id,
+                invocation_id,
+                input,
+                &input_digest,
+                &source.content_sha256,
+            )
+        {
+            return Err(format!("query_structure_job_binding_invalid:{job_id}"));
+        }
+        let result = read_json_value_if_file(
+            &options
+                .run_dir
+                .join("worker_results")
+                .join(format!("{job_id}.json")),
+        )
+        .ok_or_else(|| format!("query_structure_result_missing:{job_id}"))?;
+        if let Some(error) = worker_result_stage_error_bound(&result, &job, options, &task) {
+            return Err(error);
+        }
+        if !query_structure_result_binding_matches(
+            &result,
+            &run_id,
+            invocation_id,
+            input,
+            &input_digest,
+            &source.content_sha256,
+            &row.status,
+        ) {
+            return Err(format!("query_structure_result_binding_invalid:{job_id}"));
+        }
+
+        let manifest_reference = result
+            .get("manifest")
+            .and_then(Value::as_str)
+            .filter(|value| !value.trim().is_empty())
+            .ok_or_else(|| format!("query_structure_result_manifest_missing:{job_id}"))?;
+        let (manifest_relative, manifest_path) = current_query_artifact(
+            &options.run_dir,
+            manifest_reference,
+            "query_structure_result_manifest",
+        )?;
+        if fs::metadata(&manifest_path)
+            .map_err(|err| format!("query_structure_manifest_metadata_failed:{err}"))?
+            .len()
+            > MAX_QUERY_STRUCTURE_MANIFEST_BYTES
+        {
+            return Err("query_structure_artifact_manifest_too_large".to_string());
+        }
+        let manifest = read_current_run_json_artifact(&options.run_dir, &manifest_relative)?;
+        if !query_structure_json_binding_matches(
+            &manifest,
+            QUERY_STRUCTURE_ARTIFACT_SCHEMA_VERSION,
+            &row.status,
+            &run_id,
+            &job_id,
+            invocation_id,
+            input,
+            &input_digest,
+            &source.content_sha256,
+            &row.method,
+        ) {
+            return Err(format!("query_structure_artifact_binding_invalid:{job_id}"));
+        }
+
+        let artifact = if row.status == "ready" {
+            validate_ready_query_structure_artifact(
+                options,
+                input,
+                row,
+                &result,
+                &manifest,
+                &run_id,
+                &job_id,
+                invocation_id,
+                &input_digest,
+                source,
+                &conversion_digest,
+            )?
+        } else {
+            validate_not_applicable_query_structure_artifact(row, &result, &manifest)?
+        };
+        artifacts.insert(identity, artifact);
+    }
+    if artifacts.len() != indexed.len() {
+        return Err("query_structure_manifest_unknown_identity".to_string());
+    }
+    Ok(artifacts)
+}
+
+fn read_query_structure_index(path: &Path) -> Result<Vec<QueryStructureIndexRow>, String> {
+    let text = read_text(path)?;
+    let mut lines = text.lines();
+    let header = lines
+        .next()
+        .map(|line| line.trim_start_matches('\u{feff}'))
+        .unwrap_or_default();
+    if header != QUERY_STRUCTURE_MANIFEST_HEADER {
+        return Err("query_structure_manifest_schema_mismatch:header".to_string());
+    }
+    let mut rows = Vec::new();
+    for (index, line) in lines.enumerate() {
+        if line.trim().is_empty() {
+            continue;
+        }
+        let cols = split_tsv(line);
+        if cols.len() != 9 {
+            return Err(format!(
+                "query_structure_manifest_schema_mismatch:line_{}:columns_{}",
+                index + 2,
+                cols.len()
+            ));
+        }
+        rows.push(QueryStructureIndexRow {
+            input_id: cols[0].clone(),
+            record_id: cols[1].clone(),
+            input_kind: cols[2].clone(),
+            input_digest: cols[3].clone(),
+            method: cols[4].clone(),
+            features_json: cols[5].clone(),
+            coordinate_artifact: cols[6].clone(),
+            feature_digest: cols[7].clone(),
+            status: cols[8].clone(),
+        });
+    }
+    Ok(rows)
+}
+
+fn query_structure_job_binding_matches(
+    value: &Value,
+    run_id: &str,
+    invocation_id: &str,
+    input: &NormalizedInput,
+    input_digest: &str,
+    source_digest: &str,
+) -> bool {
+    [
+        ("run_id", run_id),
+        ("invocation_id", invocation_id),
+        ("input_id", input.input_id.as_str()),
+        ("record_id", input.record_id.as_str()),
+        ("input_kind", input.kind.as_str()),
+        ("input_digest", input_digest),
+        ("source_digest", source_digest),
+        ("content_sha256", source_digest),
+    ]
+    .into_iter()
+    .all(|(field, expected)| value.get(field).and_then(Value::as_str) == Some(expected))
+}
+
+fn query_structure_result_binding_matches(
+    value: &Value,
+    run_id: &str,
+    invocation_id: &str,
+    input: &NormalizedInput,
+    input_digest: &str,
+    source_digest: &str,
+    artifact_status: &str,
+) -> bool {
+    let status_matches = match artifact_status {
+        "ready" => {
+            value.get("status").and_then(Value::as_str) == Some("PASS")
+                && value.get("execution_status").and_then(Value::as_str) == Some("completed")
+        }
+        "not_applicable" => {
+            value.get("status").and_then(Value::as_str) == Some("NOT_APPLICABLE")
+                && value.get("execution_status").and_then(Value::as_str) == Some("not_applicable")
+        }
+        _ => false,
+    };
+    let expected_rows = usize::from(artifact_status == "ready") as u64;
+    let outcome_matches = value
+        .get("outcomes")
+        .and_then(Value::as_array)
+        .is_some_and(|outcomes| {
+            outcomes.len() == 1
+                && outcomes[0].get("database_id").and_then(Value::as_str)
+                    == Some("query_structure_prepare")
+                && outcomes[0].get("row_count").and_then(Value::as_u64) == Some(expected_rows)
+        });
+    let optional_kind_matches = value
+        .get("input_kind")
+        .is_none_or(|kind| kind.as_str() == Some(input.kind.as_str()));
+    status_matches
+        && outcome_matches
+        && optional_kind_matches
+        && [
+            ("run_id", run_id),
+            ("invocation_id", invocation_id),
+            ("input_id", input.input_id.as_str()),
+            ("record_id", input.record_id.as_str()),
+            ("input_digest", input_digest),
+            ("source_digest", source_digest),
+        ]
+        .into_iter()
+        .all(|(field, expected)| value.get(field).and_then(Value::as_str) == Some(expected))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn query_structure_json_binding_matches(
+    value: &Value,
+    schema_version: &str,
+    status: &str,
+    run_id: &str,
+    job_id: &str,
+    invocation_id: &str,
+    input: &NormalizedInput,
+    input_digest: &str,
+    source_digest: &str,
+    method: &str,
+) -> bool {
+    [
+        ("schema_version", schema_version),
+        ("status", status),
+        ("run_id", run_id),
+        ("job_id", job_id),
+        ("invocation_id", invocation_id),
+        ("input_id", input.input_id.as_str()),
+        ("record_id", input.record_id.as_str()),
+        ("input_kind", input.kind.as_str()),
+        ("input_digest", input_digest),
+        ("source_content_sha256", source_digest),
+        ("method_version", method),
+    ]
+    .into_iter()
+    .all(|(field, expected)| value.get(field).and_then(Value::as_str) == Some(expected))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn validate_ready_query_structure_artifact(
+    options: &ScienceOptions,
+    input: &NormalizedInput,
+    row: &QueryStructureIndexRow,
+    result: &Value,
+    manifest: &Value,
+    run_id: &str,
+    job_id: &str,
+    invocation_id: &str,
+    input_digest: &str,
+    source: &ConversionProvenance,
+    conversion_digest: &str,
+) -> Result<QueryStructureArtifact, String> {
+    if row.features_json.trim().is_empty()
+        || !valid_sha256_hex(&row.feature_digest)
+        || row.feature_digest != row.feature_digest.to_ascii_lowercase()
+        || manifest.get("features_json").and_then(Value::as_str) != Some(row.features_json.as_str())
+        || manifest.get("feature_digest").and_then(Value::as_str)
+            != Some(row.feature_digest.as_str())
+        || manifest
+            .get("conversion_manifest_sha256")
+            .and_then(Value::as_str)
+            != Some(conversion_digest)
+    {
+        return Err("query_structure_ready_manifest_incomplete".to_string());
+    }
+    let result_features = result
+        .get("artifact_path")
+        .and_then(Value::as_str)
+        .filter(|value| !value.trim().is_empty())
+        .ok_or_else(|| "query_structure_result_features_missing".to_string())?;
+    let (feature_relative, feature_path) = current_query_artifact(
+        &options.run_dir,
+        &row.features_json,
+        "query_structure_features",
+    )?;
+    let (result_feature_relative, _) = current_query_artifact(
+        &options.run_dir,
+        result_features,
+        "query_structure_result_features",
+    )?;
+    if feature_relative != result_feature_relative {
+        return Err("query_structure_result_features_mismatch".to_string());
+    }
+    let feature_size = fs::metadata(&feature_path)
+        .map_err(|err| format!("query_structure_features_metadata_failed:{err}"))?
+        .len();
+    if feature_size == 0 || feature_size > MAX_QUERY_STRUCTURE_FEATURE_BYTES {
+        return Err("query_structure_features_size_invalid".to_string());
+    }
+    if sha256_file_hex(&feature_path).as_deref() != Some(row.feature_digest.as_str()) {
+        return Err("query_structure_features_digest_mismatch".to_string());
+    }
+    let features = read_current_run_json_artifact(&options.run_dir, &feature_relative)?;
+    if !query_structure_json_binding_matches(
+        &features,
+        QUERY_STRUCTURE_FEATURE_SCHEMA_VERSION,
+        "ready",
+        run_id,
+        job_id,
+        invocation_id,
+        input,
+        input_digest,
+        &source.content_sha256,
+        &row.method,
+    ) || features
+        .get("conversion_manifest_sha256")
+        .and_then(Value::as_str)
+        != Some(conversion_digest)
+    {
+        return Err("query_structure_features_binding_invalid".to_string());
+    }
+
+    let manifest_coordinate = manifest
+        .get("coordinate_artifact")
+        .and_then(Value::as_str)
+        .ok_or_else(|| "query_structure_coordinate_binding_missing".to_string())?;
+    let coordinate_digest = manifest
+        .get("coordinate_sha256")
+        .and_then(Value::as_str)
+        .ok_or_else(|| "query_structure_coordinate_digest_missing".to_string())?;
+    let coordinate_size = manifest
+        .get("coordinate_size_bytes")
+        .and_then(Value::as_u64)
+        .ok_or_else(|| "query_structure_coordinate_size_missing".to_string())?;
+    let feature_coordinate = features
+        .get("coordinate_artifact")
+        .and_then(Value::as_object)
+        .ok_or_else(|| "query_structure_features_coordinate_missing".to_string())?;
+    if manifest_coordinate != row.coordinate_artifact
+        || feature_coordinate.get("path").and_then(Value::as_str) != Some(manifest_coordinate)
+        || feature_coordinate.get("sha256").and_then(Value::as_str) != Some(coordinate_digest)
+        || feature_coordinate.get("size_bytes").and_then(Value::as_u64) != Some(coordinate_size)
+        || feature_coordinate
+            .get("retention")
+            .and_then(Value::as_str)
+            .is_none_or(|value| value.trim().is_empty())
+        || manifest
+            .get("retention")
+            .and_then(Value::as_str)
+            .is_none_or(|value| value.trim().is_empty())
+    {
+        return Err("query_structure_coordinate_binding_invalid".to_string());
+    }
+    if manifest_coordinate.is_empty() {
+        if !coordinate_digest.is_empty() || coordinate_size != 0 {
+            return Err("query_structure_empty_coordinate_binding_invalid".to_string());
+        }
+    } else {
+        if !valid_sha256_hex(coordinate_digest)
+            || coordinate_digest != coordinate_digest.to_ascii_lowercase()
+        {
+            return Err("query_structure_coordinate_digest_invalid".to_string());
+        }
+        let coordinate_path =
+            resolve_query_coordinate_artifact(&options.run_dir, manifest_coordinate, source)?;
+        let actual_size = fs::metadata(&coordinate_path)
+            .map_err(|err| format!("query_structure_coordinate_metadata_failed:{err}"))?
+            .len();
+        if actual_size != coordinate_size
+            || sha256_file_hex(&coordinate_path).as_deref() != Some(coordinate_digest)
+        {
+            return Err("query_structure_coordinate_content_mismatch".to_string());
+        }
+    }
+
+    let feature_rows = query_structure_feature_rows(&features, input.kind.as_str())?;
+    if feature_rows.is_empty() || feature_rows.len() > MAX_QUERY_STRUCTURE_FEATURE_ROWS {
+        return Err("query_structure_compact_feature_count_invalid".to_string());
+    }
+    Ok(QueryStructureArtifact {
+        method: row.method.clone(),
+        coordinate_artifact: row.coordinate_artifact.clone(),
+        feature_digest: row.feature_digest.clone(),
+        status: row.status.clone(),
+        feature_rows,
+    })
+}
+
+fn validate_not_applicable_query_structure_artifact(
+    row: &QueryStructureIndexRow,
+    result: &Value,
+    manifest: &Value,
+) -> Result<QueryStructureArtifact, String> {
+    if !row.features_json.is_empty()
+        || !row.coordinate_artifact.is_empty()
+        || !row.feature_digest.is_empty()
+        || result
+            .get("artifact_path")
+            .and_then(Value::as_str)
+            .is_some_and(|value| !value.trim().is_empty())
+        || [
+            "features_json",
+            "feature_digest",
+            "coordinate_artifact",
+            "coordinate_sha256",
+            "coordinate_size_bytes",
+        ]
+        .into_iter()
+        .any(|field| manifest.get(field).is_some())
+        || manifest
+            .get("reason")
+            .and_then(Value::as_str)
+            .is_none_or(|value| value.trim().is_empty())
+        || manifest.get("reason").and_then(Value::as_str)
+            != result.get("reason").and_then(Value::as_str)
+    {
+        return Err("query_structure_not_applicable_binding_invalid".to_string());
+    }
+    Ok(QueryStructureArtifact {
+        method: row.method.clone(),
+        coordinate_artifact: String::new(),
+        feature_digest: String::new(),
+        status: row.status.clone(),
+        feature_rows: Vec::new(),
+    })
+}
+
+fn current_query_artifact(
+    run_dir: &Path,
+    reference: &str,
+    label: &str,
+) -> Result<(String, PathBuf), String> {
+    let relative = current_run_artifact_relative(run_dir, reference)
+        .ok_or_else(|| format!("{label}_outside_run:{}", clean_cell(reference)))?;
+    Ok((relative.clone(), run_dir.join(relative)))
+}
+
+fn resolve_query_coordinate_artifact(
+    run_dir: &Path,
+    reference: &str,
+    source: &ConversionProvenance,
+) -> Result<PathBuf, String> {
+    if let Some(relative) = current_run_artifact_relative(run_dir, reference) {
+        return Ok(run_dir.join(relative));
+    }
+    if source.source_kind != "file" || source.source_path.trim().is_empty() {
+        return Err("query_structure_coordinate_outside_run".to_string());
+    }
+    let resolve = |value: &str| {
+        let path = if cfg!(windows) {
+            wsl_path_to_windows(value).unwrap_or_else(|| PathBuf::from(value))
+        } else {
+            PathBuf::from(value)
+        };
+        path.canonicalize().ok()
+    };
+    let coordinate = resolve(reference)
+        .filter(|path| path.is_file())
+        .ok_or_else(|| "query_structure_coordinate_missing".to_string())?;
+    let source_path = resolve(&source.source_path)
+        .filter(|path| path.is_file())
+        .ok_or_else(|| "query_structure_coordinate_source_missing".to_string())?;
+    if coordinate != source_path {
+        return Err("query_structure_coordinate_source_path_mismatch".to_string());
+    }
+    Ok(coordinate)
+}
+
+fn query_structure_feature_rows(
+    value: &Value,
+    input_kind: &str,
+) -> Result<Vec<FeatureRow>, String> {
+    if let Some(structure) = value.get("structure").and_then(Value::as_object) {
+        return query_coordinate_feature_rows(structure, value);
+    }
+    match input_kind {
+        "small_molecule" => query_small_molecule_feature_rows(value),
+        "peptide" | "protein_ligand" => query_sequence_feature_rows(value),
+        "complex" => Err("query_structure_complex_ready_without_coordinates".to_string()),
+        "genome_or_metagenome" => Err("query_structure_genome_ready_status_invalid".to_string()),
+        _ => Err("query_structure_feature_kind_invalid".to_string()),
+    }
+}
+
+fn query_small_molecule_feature_rows(value: &Value) -> Result<Vec<FeatureRow>, String> {
+    let physicochemical = value
+        .get("physicochemical")
+        .and_then(Value::as_object)
+        .ok_or_else(|| "query_structure_physicochemical_missing".to_string())?;
+    let mut rows = Vec::new();
+    for (name, width, minimum, maximum) in [
+        ("molecular_weight", 50.0, 0.0, 100_000.0),
+        ("logp", 0.5, -100.0, 100.0),
+        ("topological_polar_surface_area", 20.0, 0.0, 100_000.0),
+        ("hydrogen_bond_donors", 1.0, 0.0, 10_000.0),
+        ("hydrogen_bond_acceptors", 1.0, 0.0, 10_000.0),
+        ("rotatable_bonds", 2.0, 0.0, 10_000.0),
+        ("ring_count", 1.0, 0.0, 10_000.0),
+        ("aromatic_ring_count", 1.0, 0.0, 10_000.0),
+        ("fraction_csp3", 0.1, 0.0, 1.0),
+        ("formal_charge", 1.0, -1_000.0, 1_000.0),
+        ("heavy_atom_count", 5.0, 0.0, 100_000.0),
+        ("qed", 0.1, 0.0, 1.0),
+    ] {
+        let number = query_json_number(physicochemical.get(name), name, minimum, maximum)?;
+        rows.push(query_binned_feature_row(
+            "query_structure_physicochemical",
+            name,
+            number,
+            width,
+        ));
+    }
+
+    let fingerprint = value
+        .get("fingerprint")
+        .and_then(Value::as_object)
+        .ok_or_else(|| "query_structure_fingerprint_missing".to_string())?;
+    let packed = fingerprint
+        .get("packed_hex")
+        .and_then(Value::as_str)
+        .and_then(decode_lower_hex)
+        .filter(|bytes| bytes.len() == 256)
+        .ok_or_else(|| "query_structure_fingerprint_encoding_invalid".to_string())?;
+    let population = fingerprint
+        .get("population_count")
+        .and_then(Value::as_u64)
+        .filter(|count| *count <= 2048)
+        .ok_or_else(|| "query_structure_fingerprint_population_invalid".to_string())?;
+    let observed_population = packed
+        .iter()
+        .map(|byte| byte.count_ones() as u64)
+        .sum::<u64>();
+    if fingerprint.get("algorithm").and_then(Value::as_str) != Some("morgan_ecfp4")
+        || fingerprint.get("radius").and_then(Value::as_u64) != Some(2)
+        || fingerprint.get("n_bits").and_then(Value::as_u64) != Some(2048)
+        || fingerprint
+            .get("include_chirality")
+            .and_then(Value::as_bool)
+            != Some(true)
+        || fingerprint.get("encoding").and_then(Value::as_str) != Some("rdkit_binary_text_hex_v1")
+        || fingerprint.get("packed_sha256").and_then(Value::as_str)
+            != Some(sha256_bytes_hex(&packed).as_str())
+        || observed_population != population
+    {
+        return Err("query_structure_fingerprint_contract_invalid".to_string());
+    }
+    rows.push(query_binned_feature_row(
+        "query_structure_fingerprint",
+        "population_count",
+        population as f64,
+        16.0,
+    ));
+    rows.extend(query_pharmacophore_feature_rows(value)?);
+    Ok(rows)
+}
+
+fn query_pharmacophore_feature_rows(value: &Value) -> Result<Vec<FeatureRow>, String> {
+    let pharmacophore = value
+        .get("pharmacophore")
+        .and_then(Value::as_object)
+        .ok_or_else(|| "query_structure_pharmacophore_missing".to_string())?;
+    let counts = pharmacophore
+        .get("counts")
+        .and_then(Value::as_object)
+        .filter(|counts| counts.len() <= 32)
+        .ok_or_else(|| "query_structure_pharmacophore_counts_invalid".to_string())?;
+    let point_count = pharmacophore
+        .get("point_count")
+        .and_then(Value::as_u64)
+        .filter(|count| *count <= 100_000)
+        .ok_or_else(|| "query_structure_pharmacophore_point_count_invalid".to_string())?;
+    let mut total = 0_u64;
+    let mut rows = Vec::new();
+    for (family, count) in counts {
+        let count = count
+            .as_u64()
+            .filter(|count| *count > 0 && *count <= point_count)
+            .ok_or_else(|| "query_structure_pharmacophore_count_invalid".to_string())?;
+        total = total
+            .checked_add(count)
+            .ok_or_else(|| "query_structure_pharmacophore_count_invalid".to_string())?;
+        let family = query_token_component(family)
+            .ok_or_else(|| "query_structure_pharmacophore_family_invalid".to_string())?;
+        rows.push(query_binned_feature_row(
+            "query_structure_pharmacophore",
+            &format!("{family}_count"),
+            count as f64,
+            1.0,
+        ));
+    }
+    if total != point_count {
+        return Err("query_structure_pharmacophore_total_mismatch".to_string());
+    }
+    rows.push(query_binned_feature_row(
+        "query_structure_pharmacophore",
+        "total_point_count",
+        point_count as f64,
+        4.0,
+    ));
+    Ok(rows)
+}
+
+fn query_sequence_feature_rows(value: &Value) -> Result<Vec<FeatureRow>, String> {
+    let sequence = value
+        .get("sequence_features")
+        .and_then(Value::as_object)
+        .ok_or_else(|| "query_structure_sequence_features_missing".to_string())?;
+    let length = sequence
+        .get("length")
+        .and_then(Value::as_u64)
+        .filter(|length| *length >= 2 && *length <= 100_000_000)
+        .ok_or_else(|| "query_structure_sequence_length_invalid".to_string())?;
+    let composition = sequence
+        .get("composition")
+        .and_then(Value::as_object)
+        .filter(|composition| composition.len() <= 20)
+        .ok_or_else(|| "query_structure_sequence_composition_invalid".to_string())?;
+    let mut counts = BTreeMap::new();
+    let mut total = 0_u64;
+    for (residue, count) in composition {
+        if residue.len() != 1
+            || !residue
+                .bytes()
+                .all(|byte| b"ACDEFGHIKLMNPQRSTVWY".contains(&byte))
+        {
+            return Err("query_structure_sequence_residue_invalid".to_string());
+        }
+        let count = count
+            .as_u64()
+            .filter(|count| *count > 0 && *count <= length)
+            .ok_or_else(|| "query_structure_sequence_composition_invalid".to_string())?;
+        total = total
+            .checked_add(count)
+            .ok_or_else(|| "query_structure_sequence_composition_invalid".to_string())?;
+        counts.insert(residue.as_bytes()[0] as char, count);
+    }
+    if total != length {
+        return Err("query_structure_sequence_composition_total_mismatch".to_string());
+    }
+
+    let mut rows = vec![query_binned_feature_row(
+        "query_structure_sequence_prior",
+        "length",
+        length as f64,
+        25.0,
+    )];
+    for (name, width, minimum, maximum) in [
+        (
+            "estimated_net_charge_ph7",
+            1.0,
+            -100_000_000.0,
+            100_000_000.0,
+        ),
+        ("mean_kyte_doolittle_hydropathy", 0.5, -5.0, 5.0),
+        ("hydrophobic_fraction", 0.1, 0.0, 1.0),
+    ] {
+        let number = query_json_number(sequence.get(name), name, minimum, maximum)?;
+        rows.push(query_binned_feature_row(
+            "query_structure_sequence_prior",
+            name,
+            number,
+            width,
+        ));
+    }
+    if let Some(weight) = sequence.get("molecular_weight") {
+        rows.push(query_binned_feature_row(
+            "query_structure_sequence_prior",
+            "molecular_weight",
+            query_json_number(Some(weight), "molecular_weight", 0.0, 1_000_000_000.0)?,
+            250.0,
+        ));
+    }
+    for (name, residues) in [
+        ("hydrophobic_fraction_from_composition", "AILMFWVY"),
+        ("charged_fraction_from_composition", "DEKRH"),
+        ("polar_fraction_from_composition", "STNQCY"),
+        ("aromatic_fraction_from_composition", "FWY"),
+    ] {
+        let count = residues
+            .chars()
+            .map(|residue| counts.get(&residue).copied().unwrap_or(0))
+            .sum::<u64>();
+        rows.push(query_binned_feature_row(
+            "query_structure_sequence_prior",
+            name,
+            count as f64 / length as f64,
+            0.1,
+        ));
+    }
+    if let Some(propensity) = sequence
+        .get("secondary_structure_propensity")
+        .and_then(Value::as_object)
+    {
+        for name in ["alpha_helix", "beta_sheet", "turn"] {
+            rows.push(query_binned_feature_row(
+                "query_structure_sequence_prior",
+                name,
+                query_json_number(propensity.get(name), name, 0.0, 5.0)?,
+                0.1,
+            ));
+        }
+    }
+    if value.get("pharmacophore").is_some() {
+        rows.extend(query_pharmacophore_feature_rows(value)?);
+    }
+    Ok(rows)
+}
+
+fn query_coordinate_feature_rows(
+    structure: &serde_json::Map<String, Value>,
+    root: &Value,
+) -> Result<Vec<FeatureRow>, String> {
+    let atom_count = query_json_u64(structure.get("atom_count"), "atom_count", 1, 500_000)?;
+    let heavy_atom_count = query_json_u64(
+        structure.get("heavy_atom_count"),
+        "heavy_atom_count",
+        1,
+        atom_count,
+    )?;
+    let chain_count = query_json_u64(structure.get("chain_count"), "chain_count", 1, 100_000)?;
+    let residue_count =
+        query_json_u64(structure.get("residue_count"), "residue_count", 1, 200_000)?;
+    let radius = query_json_number(
+        structure.get("radius_of_gyration_angstrom"),
+        "radius_of_gyration_angstrom",
+        0.0,
+        1_000_000.0,
+    )?;
+    if structure.get("coordinate_sha256").and_then(Value::as_str)
+        != root.get("source_content_sha256").and_then(Value::as_str)
+    {
+        return Err("query_structure_coordinate_source_digest_mismatch".to_string());
+    }
+    let minimum = query_json_xyz(
+        structure.get("bounding_box_min_angstrom"),
+        "bounding_box_min",
+    )?;
+    let maximum = query_json_xyz(
+        structure.get("bounding_box_max_angstrom"),
+        "bounding_box_max",
+    )?;
+    let mut extents = [0.0; 3];
+    for index in 0..3 {
+        if maximum[index] < minimum[index] {
+            return Err("query_structure_bounding_box_invalid".to_string());
+        }
+        extents[index] = maximum[index] - minimum[index];
+    }
+    extents.sort_by(f64::total_cmp);
+
+    let mut rows = vec![
+        query_binned_feature_row(
+            "query_structure_coordinate",
+            "atom_count",
+            atom_count as f64,
+            250.0,
+        ),
+        query_binned_feature_row(
+            "query_structure_coordinate",
+            "heavy_atom_count",
+            heavy_atom_count as f64,
+            250.0,
+        ),
+        query_binned_feature_row(
+            "query_structure_coordinate",
+            "chain_count",
+            chain_count as f64,
+            1.0,
+        ),
+        query_binned_feature_row(
+            "query_structure_coordinate",
+            "residue_count",
+            residue_count as f64,
+            25.0,
+        ),
+        query_binned_feature_row(
+            "query_structure_coordinate",
+            "radius_of_gyration_angstrom",
+            radius,
+            5.0,
+        ),
+    ];
+    for (index, extent) in extents.into_iter().enumerate() {
+        rows.push(query_binned_feature_row(
+            "query_structure_coordinate",
+            &format!("sorted_extent_{}_angstrom", index + 1),
+            extent,
+            5.0,
+        ));
+    }
+
+    let element_counts = query_count_map(
+        structure.get("element_counts"),
+        "element_counts",
+        atom_count,
+        64,
+    )?;
+    if element_counts.iter().map(|(_, count)| *count).sum::<u64>() != atom_count {
+        return Err("query_structure_element_count_total_mismatch".to_string());
+    }
+    rows.extend(query_top_composition_rows(
+        "query_structure_element_composition",
+        element_counts,
+        atom_count,
+        5,
+    )?);
+    let residue_counts = query_count_map(
+        structure.get("residue_counts"),
+        "residue_counts",
+        residue_count,
+        512,
+    )?;
+    if residue_counts.iter().map(|(_, count)| *count).sum::<u64>() != residue_count {
+        return Err("query_structure_residue_count_total_mismatch".to_string());
+    }
+    rows.extend(query_top_composition_rows(
+        "query_structure_residue_composition",
+        residue_counts,
+        residue_count,
+        8,
+    )?);
+    Ok(rows)
+}
+
+fn query_count_map(
+    value: Option<&Value>,
+    label: &str,
+    maximum: u64,
+    max_keys: usize,
+) -> Result<Vec<(String, u64)>, String> {
+    let object = value
+        .and_then(Value::as_object)
+        .filter(|object| !object.is_empty() && object.len() <= max_keys)
+        .ok_or_else(|| format!("query_structure_{label}_invalid"))?;
+    object
+        .iter()
+        .map(|(name, count)| {
+            let name = query_token_component(name)
+                .ok_or_else(|| format!("query_structure_{label}_name_invalid"))?;
+            let count = count
+                .as_u64()
+                .filter(|count| *count > 0 && *count <= maximum)
+                .ok_or_else(|| format!("query_structure_{label}_count_invalid"))?;
+            Ok((name, count))
+        })
+        .collect()
+}
+
+fn query_top_composition_rows(
+    family: &str,
+    mut counts: Vec<(String, u64)>,
+    total: u64,
+    limit: usize,
+) -> Result<Vec<FeatureRow>, String> {
+    if total == 0 {
+        return Err("query_structure_composition_total_invalid".to_string());
+    }
+    counts.sort_by(|left, right| right.1.cmp(&left.1).then_with(|| left.0.cmp(&right.0)));
+    Ok(counts
+        .into_iter()
+        .take(limit)
+        .map(|(name, count)| {
+            query_binned_feature_row(
+                family,
+                &format!("{name}_fraction"),
+                count as f64 / total as f64,
+                0.1,
+            )
+        })
+        .collect())
+}
+
+fn query_json_number(
+    value: Option<&Value>,
+    label: &str,
+    minimum: f64,
+    maximum: f64,
+) -> Result<f64, String> {
+    value
+        .and_then(Value::as_f64)
+        .filter(|value| value.is_finite() && *value >= minimum && *value <= maximum)
+        .ok_or_else(|| format!("query_structure_{label}_invalid"))
+}
+
+fn query_json_u64(
+    value: Option<&Value>,
+    label: &str,
+    minimum: u64,
+    maximum: u64,
+) -> Result<u64, String> {
+    value
+        .and_then(Value::as_u64)
+        .filter(|value| *value >= minimum && *value <= maximum)
+        .ok_or_else(|| format!("query_structure_{label}_invalid"))
+}
+
+fn query_json_xyz(value: Option<&Value>, label: &str) -> Result<[f64; 3], String> {
+    let values = value
+        .and_then(Value::as_array)
+        .filter(|values| values.len() == 3)
+        .ok_or_else(|| format!("query_structure_{label}_invalid"))?;
+    let mut result = [0.0; 3];
+    for (index, value) in values.iter().enumerate() {
+        result[index] = value
+            .as_f64()
+            .filter(|value| value.is_finite() && value.abs() <= 1_000_000.0)
+            .ok_or_else(|| format!("query_structure_{label}_invalid"))?;
+    }
+    Ok(result)
+}
+
+fn query_binned_feature_row(family: &str, name: &str, value: f64, width: f64) -> FeatureRow {
+    let bin = (value / width).floor() as i64;
+    let bin = if bin < 0 {
+        format!("neg{}", bin.unsigned_abs())
+    } else {
+        format!("pos{bin}")
+    };
+    feature_row(
+        family,
+        name,
+        format!("{value:.6}"),
+        &format!(
+            "qs_{}_{}_bin_{bin}",
+            clean_token_component(family),
+            clean_token_component(name)
+        ),
+    )
+}
+
+fn clean_token_component(value: &str) -> String {
+    value
+        .chars()
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() {
+                ch.to_ascii_lowercase()
+            } else {
+                '_'
+            }
+        })
+        .collect()
+}
+
+fn query_token_component(value: &str) -> Option<String> {
+    let token = clean_token_component(value).trim_matches('_').to_string();
+    (!token.is_empty() && token.len() <= 48).then_some(token)
+}
+
+fn decode_lower_hex(value: &str) -> Option<Vec<u8>> {
+    if value.len() % 2 != 0
+        || value
+            .bytes()
+            .any(|byte| !byte.is_ascii_hexdigit() || byte.is_ascii_uppercase())
+    {
+        return None;
+    }
+    value
+        .as_bytes()
+        .chunks_exact(2)
+        .map(|pair| {
+            let text = std::str::from_utf8(pair).ok()?;
+            u8::from_str_radix(text, 16).ok()
+        })
+        .collect()
+}
+
+fn query_structure_job_id(input_id: &str, record_id: &str, invocation_id: &str) -> String {
+    let identity_digest = canonical_json_sha256(&json!({
+        "input_id": input_id,
+        "record_id": record_id,
+        "invocation_id": invocation_id,
+    }));
+    format!("query_structure_prepare__{}", &identity_digest[..16])
+}
+
 fn publish_pending_file(pending: &Path, output: &Path) -> Result<(), String> {
     if output.exists() {
         fs::remove_file(output)
@@ -4249,8 +6049,16 @@ fn compute_features(options: &ScienceOptions) -> Result<String, String> {
     if rows.is_empty() {
         return Err("normalized_input_missing_or_empty".to_string());
     }
+    let provenance =
+        read_conversion_provenance(&options.run_dir.join("input_normalized_manifest.tsv"))?;
+    let invocation_id = current_worker_invocation(options)?;
+    let query_structures =
+        load_validated_query_structure_artifacts(options, &rows, &provenance, &invocation_id)?;
     let mut text = format!("{FEATURE_MANIFEST_HEADER}\n");
     for input in rows {
+        let query_structure = query_structures
+            .get(&(input.input_id.clone(), input.record_id.clone()))
+            .ok_or_else(|| "query_structure_features_missing".to_string())?;
         let token_count = input.tokens.len();
         let length = input
             .primary_value
@@ -4292,6 +6100,35 @@ fn compute_features(options: &ScienceOptions) -> Result<String, String> {
                 clean_cell(&row.name),
                 clean_cell(&row.value),
                 clean_cell(&row.token),
+                clean_cell(&input.record_id),
+            ));
+        }
+        for row in &query_structure.feature_rows {
+            text.push_str(&format!(
+                "{}\t{}\t{}\t{}\t{}\tquery_structure_worker\t{}\t{}\n",
+                input.input_id,
+                input.kind.as_str(),
+                clean_cell(&row.family),
+                clean_cell(&row.name),
+                clean_cell(&row.value),
+                clean_cell(&row.token),
+                clean_cell(&input.record_id),
+            ));
+        }
+        for (name, value) in [
+            ("preparation_method", query_structure.method.clone()),
+            ("feature_digest", query_structure.feature_digest.clone()),
+            (
+                "coordinate_available",
+                (!query_structure.coordinate_artifact.trim().is_empty()).to_string(),
+            ),
+            ("preparation_status", query_structure.status.clone()),
+        ] {
+            text.push_str(&format!(
+                "{}\t{}\tquery_structure\t{name}\t{}\tquery_structure_worker\t\t{}\n",
+                input.input_id,
+                input.kind.as_str(),
+                clean_cell(&value),
                 clean_cell(&input.record_id),
             ));
         }
@@ -4365,8 +6202,10 @@ fn match_known(options: &ScienceOptions) -> Result<String, String> {
         }
         Ok(())
     })?;
-    append_chembl_onsite_matches(options, &normalized, &mut out)?;
-    append_bindingdb_onsite_matches(options, &normalized, &mut out)?;
+    if !append_ligand_similarity_matches(options, &mut out)? {
+        append_chembl_onsite_matches(options, &normalized, &mut out)?;
+        append_bindingdb_onsite_matches(options, &normalized, &mut out)?;
+    }
     let mut mmseqs = String::new();
     append_mmseqs_match_rows(options, "known", &mut mmseqs, true)?;
     out.write_all(mmseqs.as_bytes())
@@ -5491,11 +7330,35 @@ fn append_bound_known_rows<W: Write>(
     out: &mut W,
 ) -> Result<(), String> {
     let text = read_text(path)?;
+    let compact_publication = text
+        .lines()
+        .any(|line| {
+            let cols = split_tsv(line);
+            cols.get(8)
+                .is_some_and(|cell| compact_publication_marker(cell))
+                || cols
+                    .get(9)
+                    .is_some_and(|cell| compact_publication_marker(cell))
+        })
+        .then(|| current_ligand_similarity_publication(options))
+        .transpose()?;
     let mut bound = String::new();
     for line in text.lines().filter(|line| !line.trim().is_empty()) {
+        if line.starts_with("input_id\tsource\ttarget_id\t") {
+            continue;
+        }
         let mut cols = split_tsv(line);
-        if cols.len() < 10 {
+        if cols.len() != 14 {
             return Err("database_evidence_row_invalid".to_string());
+        }
+        if compact_publication_marker(&cols[8]) || compact_publication_marker(&cols[9]) {
+            validate_compact_known_row_publication(
+                &cols[8],
+                &cols[9],
+                compact_publication
+                    .as_ref()
+                    .ok_or_else(|| "ligand_similarity_publication_binding_missing".to_string())?,
+            )?;
         }
         cols[8] = bind_database_evidence(options, &cols[1], &cols[8])?;
         cols[9] = bind_database_evidence(options, &cols[1], &cols[9])?;
@@ -5504,6 +7367,349 @@ fn append_bound_known_rows<W: Write>(
     }
     out.write_all(bound.as_bytes())
         .map_err(|err| format!("database_evidence_append_failed:{err}"))
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct LigandSimilarityPublication {
+    database_sha256: String,
+    manifest_sha256: String,
+    schema_version: String,
+    build_identity: String,
+}
+
+fn compact_publication_marker(value: &str) -> bool {
+    value
+        .split(';')
+        .map(str::trim)
+        .any(|part| part == "ligand_similarity_index")
+}
+
+fn validate_compact_known_row_publication(
+    evidence: &str,
+    provenance: &str,
+    expected: &LigandSimilarityPublication,
+) -> Result<(), String> {
+    let evidence_fields = compact_known_row_publication_fields(evidence)?;
+    let provenance_fields = compact_known_row_publication_fields(provenance)?;
+    if evidence_fields != provenance_fields {
+        return Err("ligand_similarity_publication_binding_mismatch:duplicate_channel".to_string());
+    }
+    for (name, expected_value) in [
+        ("compact_database_sha256", expected.database_sha256.as_str()),
+        ("compact_manifest_sha256", expected.manifest_sha256.as_str()),
+        ("compact_schema_version", expected.schema_version.as_str()),
+        ("compact_build_identity", expected.build_identity.as_str()),
+    ] {
+        if evidence_fields.get(name).map(String::as_str) != Some(expected_value) {
+            return Err(format!(
+                "ligand_similarity_publication_binding_mismatch:{name}"
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn compact_known_row_publication_fields(value: &str) -> Result<BTreeMap<String, String>, String> {
+    if !compact_publication_marker(value) {
+        return Err("ligand_similarity_publication_marker_missing".to_string());
+    }
+    let names = [
+        "compact_database_sha256",
+        "compact_manifest_sha256",
+        "compact_schema_version",
+        "compact_build_identity",
+    ];
+    let mut fields = BTreeMap::new();
+    for part in value.split(';').map(str::trim) {
+        let Some((name, field_value)) = part.split_once('=') else {
+            continue;
+        };
+        let name = name.trim();
+        if names.contains(&name) {
+            let field_value = field_value.trim();
+            if field_value.is_empty()
+                || fields
+                    .insert(name.to_string(), field_value.to_string())
+                    .is_some()
+            {
+                return Err(format!(
+                    "ligand_similarity_publication_binding_invalid:{name}"
+                ));
+            }
+        }
+    }
+    if fields.len() != names.len() {
+        return Err("ligand_similarity_publication_binding_incomplete".to_string());
+    }
+    Ok(fields)
+}
+
+fn current_ligand_similarity_publication(
+    options: &ScienceOptions,
+) -> Result<LigandSimilarityPublication, String> {
+    let database = options
+        .science_store
+        .join(LIGAND_SIMILARITY_DATABASE_REL_PATH);
+    let manifest = options
+        .science_store
+        .join(LIGAND_SIMILARITY_MANIFEST_REL_PATH);
+    let manifest_identity = ligand_similarity_publication_file_identity(&manifest)?;
+    let manifest_bytes = fs::read(&manifest)
+        .map_err(|err| format!("ligand_similarity_publication_manifest_read_failed:{err}"))?;
+    if ligand_similarity_publication_file_identity(&manifest)? != manifest_identity {
+        return Err("ligand_similarity_publication_manifest_changed".to_string());
+    }
+    let manifest_value = serde_json::from_slice::<Value>(
+        manifest_bytes
+            .strip_prefix(&[0xef, 0xbb, 0xbf])
+            .unwrap_or(&manifest_bytes),
+    )
+    .map_err(|err| format!("ligand_similarity_publication_manifest_invalid:{err}"))?;
+    let schema_version = manifest_value
+        .get("schema_version")
+        .and_then(Value::as_str)
+        .filter(|value| *value == LIGAND_SIMILARITY_SCHEMA_VERSION)
+        .ok_or_else(|| "ligand_similarity_publication_schema_invalid".to_string())?
+        .to_string();
+    if manifest_value.get("status").and_then(Value::as_str) != Some("ready") {
+        return Err("ligand_similarity_publication_status_invalid".to_string());
+    }
+    let database_sha256 = cached_ligand_similarity_publication_sha256(&database)?;
+    let declared_database_sha256 = manifest_value
+        .pointer("/database/sha256")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    if declared_database_sha256 != database_sha256 {
+        return Err("ligand_similarity_publication_database_digest_mismatch".to_string());
+    }
+    if ligand_similarity_publication_file_identity(&manifest)? != manifest_identity {
+        return Err("ligand_similarity_publication_manifest_changed".to_string());
+    }
+    Ok(LigandSimilarityPublication {
+        database_sha256,
+        manifest_sha256: sha256_bytes_hex(&manifest_bytes),
+        schema_version,
+        build_identity: ligand_similarity_compact_build_identity(&manifest_value)?,
+    })
+}
+
+fn ligand_similarity_compact_build_identity(manifest: &Value) -> Result<String, String> {
+    let fingerprint = manifest
+        .get("fingerprint")
+        .and_then(Value::as_object)
+        .ok_or_else(|| "ligand_similarity_publication_fingerprint_missing".to_string())?;
+    let mut stable_fingerprint = serde_json::Map::new();
+    for name in [
+        "type",
+        "radius",
+        "bits",
+        "include_chirality",
+        "standardization",
+        "tautomer_max_tautomers",
+        "tautomer_max_transforms",
+        "lsh_bands",
+        "search_algorithm",
+        "bitbound_formula",
+        "reference",
+        "encoding",
+    ] {
+        stable_fingerprint.insert(
+            name.to_string(),
+            fingerprint.get(name).cloned().ok_or_else(|| {
+                format!("ligand_similarity_publication_fingerprint_field_missing:{name}")
+            })?,
+        );
+    }
+    let inputs = manifest
+        .get("inputs")
+        .and_then(Value::as_object)
+        .ok_or_else(|| "ligand_similarity_publication_inputs_missing".to_string())?;
+    let mut sources = serde_json::Map::new();
+    for source in ["chembl", "bindingdb"] {
+        let input = inputs
+            .get(source)
+            .and_then(Value::as_object)
+            .ok_or_else(|| format!("ligand_similarity_publication_input_missing:{source}"))?;
+        let source_digest = input
+            .get("source_digest")
+            .and_then(Value::as_str)
+            .filter(|value| valid_sha256_hex(value))
+            .ok_or_else(|| format!("ligand_similarity_publication_digest_invalid:{source}"))?;
+        let source_release = input
+            .get("source_release")
+            .and_then(Value::as_str)
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| format!("ligand_similarity_publication_release_missing:{source}"))?;
+        sources.insert(
+            source.to_string(),
+            json!({
+                "source_digest": source_digest,
+                "source_release": source_release,
+            }),
+        );
+    }
+    let identity = json!({
+        "schema_version": manifest.get("schema_version"),
+        "fingerprint": Value::Object(stable_fingerprint),
+        "sources": Value::Object(sources),
+    });
+    Ok(canonical_json_sha256(&identity))
+}
+
+fn ligand_similarity_publication_file_identity(path: &Path) -> Result<String, String> {
+    let canonical = path
+        .canonicalize()
+        .map_err(|err| format!("ligand_similarity_publication_path_invalid:{err}"))?;
+    let metadata = fs::metadata(&canonical)
+        .map_err(|err| format!("ligand_similarity_publication_metadata_failed:{err}"))?;
+    if !metadata.is_file() {
+        return Err("ligand_similarity_publication_file_required".to_string());
+    }
+    let modified_ns = metadata
+        .modified()
+        .map_err(|err| format!("ligand_similarity_publication_modified_failed:{err}"))?
+        .duration_since(UNIX_EPOCH)
+        .map_err(|err| format!("ligand_similarity_publication_modified_invalid:{err}"))?
+        .as_nanos();
+    Ok(format!(
+        "{}\0{}\0{}",
+        canonical.to_string_lossy(),
+        metadata.len(),
+        modified_ns
+    ))
+}
+
+fn cached_ligand_similarity_publication_sha256(path: &Path) -> Result<String, String> {
+    let cache =
+        LIGAND_SIMILARITY_PUBLICATION_HASH_CACHE.get_or_init(|| Mutex::new(BTreeMap::new()));
+    for _ in 0..3 {
+        let identity = ligand_similarity_publication_file_identity(path)?;
+        let cached = cache
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .get(&identity)
+            .cloned();
+        if let Some(digest) = cached {
+            if ligand_similarity_publication_file_identity(path)? == identity {
+                return Ok(digest);
+            }
+            continue;
+        }
+        let digest = sha256_file_hex(path)
+            .ok_or_else(|| "ligand_similarity_publication_hash_failed".to_string())?;
+        if ligand_similarity_publication_file_identity(path)? != identity {
+            continue;
+        }
+        let mut entries = cache
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        while entries.len() >= LIGAND_SIMILARITY_PUBLICATION_HASH_CACHE_LIMIT {
+            let Some(first) = entries.keys().next().cloned() else {
+                break;
+            };
+            entries.remove(&first);
+        }
+        entries.insert(identity, digest.clone());
+        return Ok(digest);
+    }
+    Err("ligand_similarity_publication_changed_during_hash".to_string())
+}
+
+fn append_ligand_similarity_matches<W: Write>(
+    options: &ScienceOptions,
+    out: &mut W,
+) -> Result<bool, String> {
+    let database = options
+        .science_store
+        .join(LIGAND_SIMILARITY_DATABASE_REL_PATH);
+    let manifest = options
+        .science_store
+        .join(LIGAND_SIMILARITY_MANIFEST_REL_PATH);
+    if !database.exists() && !manifest.exists() {
+        return Ok(false);
+    }
+    if !database.is_file() || !manifest.is_file() {
+        return Err(format!(
+            "ligand_similarity_index_contract_missing:database={}:manifest={}",
+            database.display(),
+            manifest.display()
+        ));
+    }
+    let query_manifest = options.run_dir.join("query_structure_manifest.tsv");
+    if !query_manifest.is_file() {
+        return Err("ligand_similarity_query_structure_manifest_missing".to_string());
+    }
+    let result_path = temporary_data_path(&options.run_dir, "ligand_similarity_matches", "tsv");
+    let python_root = options.workspace_root.join("python");
+    let mut errors = Vec::new();
+    let mut completed = false;
+    for candidate in python_command_candidates() {
+        let mut command = Command::new(&candidate[0]);
+        command.args(&candidate[1..]);
+        command
+            .arg("-m")
+            .arg("genoligand_workers.ligand_similarity_index")
+            .arg("query-targets")
+            .arg("--database")
+            .arg(python_script_arg(
+                &candidate,
+                &database.display().to_string(),
+            ))
+            .arg("--manifest")
+            .arg(python_script_arg(
+                &candidate,
+                &manifest.display().to_string(),
+            ))
+            .arg("--query-manifest")
+            .arg(python_script_arg(
+                &candidate,
+                &query_manifest.display().to_string(),
+            ))
+            .arg("--output-tsv")
+            .arg(python_script_arg(
+                &candidate,
+                &result_path.display().to_string(),
+            ))
+            .arg("--top-k")
+            .arg("256")
+            .arg("--threshold")
+            .arg("0.65");
+        if python_root.exists()
+            && let Some(joined) = worker_pythonpath_env(&candidate, &python_root)
+        {
+            command.env("PYTHONPATH", joined);
+            if is_wsl_python_wrapper(&candidate) {
+                command.env("WSLENV", wsl_env_with_pythonpath());
+            }
+        }
+        match command.output() {
+            Ok(output) if output.status.success() && result_path.is_file() => {
+                completed = true;
+                break;
+            }
+            Ok(output) => {
+                let stderr = String::from_utf8_lossy(&output.stderr);
+                let stdout = String::from_utf8_lossy(&output.stdout);
+                let detail = stderr
+                    .lines()
+                    .find(|line| !line.trim().is_empty())
+                    .or_else(|| stdout.lines().find(|line| !line.trim().is_empty()))
+                    .unwrap_or("ligand_similarity_query_failed");
+                errors.push(format!("{}:{detail}", candidate.join(" ")));
+            }
+            Err(err) => errors.push(format!("{}:{err}", candidate.join(" "))),
+        }
+    }
+    if !completed {
+        let _ = fs::remove_file(&result_path);
+        return Err(format!(
+            "ligand_similarity_query_launch_failed:{}",
+            clean_cell(&errors.join(" | "))
+        ));
+    }
+    let result = append_bound_known_rows(options, &result_path, out);
+    let _ = fs::remove_file(&result_path);
+    result.map(|()| true)
 }
 
 fn bindingdb_query_build_script() -> &'static str {
@@ -5993,8 +8199,7 @@ fn match_metagenome(options: &ScienceOptions) -> Result<String, String> {
 }
 
 fn evaluate_structure(options: &ScienceOptions) -> Result<String, String> {
-    start_worker_invocation(options)?;
-    clear_worker_task_outputs(options, &DOCKING_WORKER_TASK)?;
+    current_worker_invocation(options)?;
     let structure_matches = if options
         .run_dir
         .join("input_normalized_manifest.tsv")
@@ -6006,13 +8211,14 @@ fn evaluate_structure(options: &ScienceOptions) -> Result<String, String> {
         Vec::new()
     };
     let structure = options.run_dir.join("structure_patch_summary.tsv");
-    let mut structure_ready =
-        if copy_tool_output_if_available(options, "structure_patch_summary.tsv", &structure)? {
-            true
-        } else {
-            write_structure_summary_from_matches(&structure, &structure_matches)?;
-            !structure_matches.is_empty()
-        };
+    let copied_structure =
+        copy_tool_output_if_available(options, "structure_patch_summary.tsv", &structure)?;
+    let mut structure_ready = if copied_structure {
+        true
+    } else {
+        write_structure_summary_from_matches(&structure, &structure_matches)?;
+        !structure_matches.is_empty()
+    };
     run_single_worker_task(options, &STRUCTURE_ALIGNMENT_WORKER_TASK)?;
     if append_tool_match_rows_to_file(
         options,
@@ -6024,41 +8230,267 @@ fn evaluate_structure(options: &ScienceOptions) -> Result<String, String> {
     }
     let final_structure_matches =
         read_index_matches(&options.run_dir.join("structure_interaction_matches.tsv"))?;
-    let viewer_ready =
-        write_coordinate_backed_candidate_selection(options, &final_structure_matches)?
-            || copy_structure_viewer_artifact_if_available(options)?;
-    if append_selected_structure_match(
-        &options.run_dir.join("structure_interaction_matches.tsv"),
-        &options.run_dir.join("complex_candidate_selection.tsv"),
-    )? {
-        structure_ready = true;
+    if !copied_structure {
+        write_structure_summary_from_matches(&structure, &final_structure_matches)?;
     }
-    if append_selected_structure_summary(
-        &structure,
-        &options.run_dir.join("complex_candidate_selection.tsv"),
-    )? {
-        structure_ready = true;
-    }
-    if viewer_ready {
-        run_docking_candidate_workers(options)?;
-    }
-    let docking = options.run_dir.join("docking_summary.tsv");
-    let docking_ready = copy_tool_output_or_header(
-        options,
-        "docking_summary.tsv",
-        "candidate_id\tdocking_status\tdocking_score\tdocking_engine\tnotes\n",
-        &docking,
-    )?;
+    structure_ready |= !final_structure_matches.is_empty();
     Ok(format!(
-        "structure_evaluated\tstructure_artifact={}\tdocking_artifact={}\tviewer_artifact={}",
+        "structure_evaluated\tstructure_artifact={}\tmatch_count={}",
         if structure_ready {
             "ready"
         } else {
             "not_ready"
         },
-        if docking_ready { "ready" } else { "not_ready" },
-        if viewer_ready { "ready" } else { "not_ready" }
+        final_structure_matches.len(),
     ))
+}
+
+const CANDIDATE_SHORTLIST_HEADER: &str = "shortlist_rank\tcandidate_id\tidentity_namespace\tinput_id\trecord_id\ttarget_id\ttarget_name\torganism\ttarget_class\tcandidate_scope\tsource\tpreliminary_score\tknown_database_score\tmetagenome_score\tstructure_score\tshortlist_reason\tpdb_ids\tcoordinate_status\tselection_rank\treceptor_artifact\tcoordinate_sha256\tpdb_id\tinput_kind\tranking_policy\tpreliminary_known_database_weight\tpreliminary_metagenome_weight\tpreliminary_structure_weight\tknown_database_weight\tmetagenome_weight\tstructure_weight\tdocking_weight\tmd_weight";
+
+fn ligand_similarity_query_id(
+    input_id: &str,
+    record_id: &str,
+    feature_digest: &str,
+    source: &str,
+    target_id: &str,
+    canonical_smiles: &str,
+) -> String {
+    let mut hasher = Sha256::new();
+    for (index, value) in [
+        input_id,
+        record_id,
+        feature_digest,
+        source,
+        target_id,
+        canonical_smiles,
+    ]
+    .iter()
+    .enumerate()
+    {
+        if index > 0 {
+            hasher.update(b"\0");
+        }
+        hasher.update(value.as_bytes());
+    }
+    hasher
+        .finalize()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
+}
+
+fn validate_ligand_similarity_query_bindings(options: &ScienceOptions) -> Result<(), String> {
+    let path = options.run_dir.join("known_database_matches.tsv");
+    if !path.is_file() {
+        return Ok(());
+    }
+    let rows = read_simple_tsv_rows(&path)?;
+    let compact_rows = rows
+        .iter()
+        .enumerate()
+        .filter(|(_, row)| {
+            ["evidence", "source_row_provenance"]
+                .iter()
+                .filter_map(|field| row.get(*field))
+                .flat_map(|value| value.split(';'))
+                .any(|marker| marker.trim() == "ligand_similarity_index")
+        })
+        .collect::<Vec<_>>();
+    if compact_rows.is_empty() {
+        return Ok(());
+    }
+    let current_publication = current_ligand_similarity_publication(options)?;
+
+    let normalized_path = options.run_dir.join("input_normalized_manifest.tsv");
+    let inputs = read_normalized_inputs(&normalized_path)?;
+    let provenance = read_conversion_provenance(&normalized_path)?;
+    let invocation_path = options.run_dir.join(WORKER_INVOCATION_FILE);
+    if !invocation_path.is_file() {
+        return Err("ligand_similarity_query_invocation_missing".to_string());
+    }
+    let invocation_id = read_text(&invocation_path)?.trim().to_string();
+    if invocation_id.is_empty() {
+        return Err("ligand_similarity_query_invocation_missing".to_string());
+    }
+    let artifacts =
+        load_validated_query_structure_artifacts(options, &inputs, &provenance, &invocation_id)?;
+
+    for (line_index, row) in compact_rows {
+        let value = |field: &str| row.get(field).map(String::as_str).unwrap_or("").trim();
+        validate_compact_known_row_publication(
+            value("evidence"),
+            value("source_row_provenance"),
+            &current_publication,
+        )
+        .map_err(|err| {
+            format!(
+                "ligand_similarity_query_binding_mismatch:line={}:publication:{err}",
+                line_index + 2
+            )
+        })?;
+        let input_id = value("input_id");
+        let record_id = value("record_id");
+        let artifact = artifacts
+            .get(&(input_id.to_string(), record_id.to_string()))
+            .ok_or_else(|| {
+                format!(
+                    "ligand_similarity_query_binding_mismatch:line={}:identity",
+                    line_index + 2
+                )
+            })?;
+        let evidence = value("evidence");
+        let feature_digest = evidence_field(evidence, &["query_feature_digest"]);
+        if artifact.status != "ready"
+            || !valid_sha256_hex(&feature_digest)
+            || !feature_digest.eq_ignore_ascii_case(&artifact.feature_digest)
+        {
+            return Err(format!(
+                "ligand_similarity_query_binding_mismatch:line={}:feature_digest",
+                line_index + 2
+            ));
+        }
+        let canonical_smiles = evidence_field(value("matched_features"), &["canonical_smiles"]);
+        let source = value("source");
+        let target_id = value("target_id");
+        let query_id = value("current_run_query_id");
+        if canonical_smiles.is_empty() || source.is_empty() || target_id.is_empty() {
+            return Err(format!(
+                "ligand_similarity_query_binding_mismatch:line={}:query_identity",
+                line_index + 2
+            ));
+        }
+        let expected_query_id = ligand_similarity_query_id(
+            input_id,
+            record_id,
+            &artifact.feature_digest,
+            source,
+            target_id,
+            &canonical_smiles,
+        );
+        if query_id != expected_query_id {
+            return Err(format!(
+                "ligand_similarity_query_binding_mismatch:line={}:query_id",
+                line_index + 2
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn coarse_rank_candidates(options: &ScienceOptions) -> Result<String, String> {
+    let candidate_count = write_candidate_shortlist(options)?;
+    let structure_matches =
+        read_index_matches(&options.run_dir.join("structure_interaction_matches.tsv"))?;
+    let viewer_ready = write_coordinate_backed_candidate_selection(options, &structure_matches)?
+        || copy_structure_viewer_artifact_if_available(options)?;
+    let selected_count = selected_candidate_rows(options)?.len();
+    Ok(format!(
+        "candidates_coarse_ranked\tcandidate_count={candidate_count}\tcoordinate_candidate_count={selected_count}\tviewer_artifact={}",
+        if viewer_ready { "ready" } else { "not_ready" },
+    ))
+}
+
+fn write_candidate_shortlist(options: &ScienceOptions) -> Result<usize, String> {
+    validate_ligand_similarity_query_bindings(options)?;
+    let mut by_target = BTreeMap::<String, Candidate>::new();
+    merge_match_file(
+        &options.run_dir.join("known_database_matches.tsv"),
+        "known_database",
+        &mut by_target,
+    )?;
+    merge_match_file(
+        &options.run_dir.join("metagenome_potential_matches.tsv"),
+        "metagenome_potential",
+        &mut by_target,
+    )?;
+    merge_match_file(
+        &options.run_dir.join("structure_interaction_matches.tsv"),
+        "structure_interaction",
+        &mut by_target,
+    )?;
+    let mut candidates = by_target.into_values().collect::<Vec<_>>();
+    assign_collision_free_candidate_ids(&mut candidates);
+    bind_candidate_ranking_routes(options, &mut candidates)?;
+    candidates.sort_by(|left, right| {
+        left.input_id
+            .cmp(&right.input_id)
+            .then_with(|| left.record_id.cmp(&right.record_id))
+            .then_with(|| preliminary_score(right).total_cmp(&preliminary_score(left)))
+            .then_with(|| right.known_score.total_cmp(&left.known_score))
+            .then_with(|| right.metagenome_score.total_cmp(&left.metagenome_score))
+            .then_with(|| right.structure_score.total_cmp(&left.structure_score))
+            .then_with(|| right.metadata_quality.cmp(&left.metadata_quality))
+            .then_with(|| left.identity_namespace.cmp(&right.identity_namespace))
+            .then_with(|| left.target_id.cmp(&right.target_id))
+            .then_with(|| left.candidate_id.cmp(&right.candidate_id))
+    });
+
+    let mut text = format!("{CANDIDATE_SHORTLIST_HEADER}\n");
+    let mut ranks = BTreeMap::<(String, String), usize>::new();
+    for candidate in &candidates {
+        let route = ranking_route(&candidate.input_kind);
+        let (preliminary_known, preliminary_metagenome, preliminary_structure) =
+            route.preliminary_weights();
+        let rank = ranks
+            .entry((candidate.input_id.clone(), candidate.record_id.clone()))
+            .and_modify(|value| *value += 1)
+            .or_insert(1);
+        let reason = preliminary_reason(candidate);
+        text.push_str(&format!(
+            "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{:.4}\t{:.4}\t{:.4}\t{:.4}\t{}\t{}\tnot_prepared\t\t\t\t\t{}\t{}\t{:.4}\t{:.4}\t{:.4}\t{:.4}\t{:.4}\t{:.4}\t{:.4}\t{:.4}\n",
+            *rank,
+            clean_cell(&candidate.candidate_id),
+            clean_cell(&candidate.identity_namespace),
+            clean_cell(&candidate.input_id),
+            clean_cell(&candidate.record_id),
+            clean_cell(&candidate.target_id),
+            clean_cell(&candidate.target_name),
+            clean_cell(&candidate.organism),
+            clean_cell(&candidate.target_class),
+            clean_cell(&candidate.candidate_scope),
+            clean_cell(&candidate.sources.iter().cloned().collect::<Vec<_>>().join(",")),
+            preliminary_score(candidate),
+            candidate.known_score,
+            candidate.metagenome_score,
+            candidate.structure_score,
+            clean_cell(&reason),
+            clean_cell(&candidate.pdb_ids.iter().cloned().collect::<Vec<_>>().join(",")),
+            clean_cell(&candidate.input_kind),
+            clean_cell(&candidate.ranking_policy),
+            preliminary_known,
+            preliminary_metagenome,
+            preliminary_structure,
+            route.known,
+            route.metagenome,
+            route.structure,
+            route.docking,
+            route.md,
+        ));
+    }
+    write_text(&options.run_dir.join("candidate_shortlist.tsv"), &text)?;
+    Ok(candidates.len())
+}
+
+fn preliminary_score(candidate: &Candidate) -> f64 {
+    ranking_route(&candidate.input_kind).preliminary_score(candidate)
+}
+
+fn preliminary_reason(candidate: &Candidate) -> String {
+    let mut evidence = Vec::new();
+    if candidate.known_score > 0.0 {
+        evidence.push(format!("known_database={:.4}", candidate.known_score));
+    }
+    if candidate.metagenome_score > 0.0 {
+        evidence.push(format!("metagenome={:.4}", candidate.metagenome_score));
+    }
+    if candidate.structure_score > 0.0 {
+        evidence.push(format!("structure={:.4}", candidate.structure_score));
+    }
+    if evidence.is_empty() {
+        "no_positive_preliminary_evidence".to_string()
+    } else {
+        evidence.join(";")
+    }
 }
 
 fn write_empty_structure_interaction_matches(options: &ScienceOptions) -> Result<(), String> {
@@ -6478,6 +8910,7 @@ fn clear_worker_task_outputs(
             "tool_outputs/md_run_manifest.json",
             "tool_outputs/md_artifact_provenance.json",
             "tool_outputs/md_manifest_index.json",
+            "tool_outputs/md_outcomes.tsv",
         ],
         _ => &[],
     };
@@ -6558,6 +8991,31 @@ fn run_artifact_path_is_current(run_dir: &Path, artifact: &str) -> bool {
         .canonicalize()
         .ok()
         .is_some_and(|path| path.is_file() && path.starts_with(root))
+}
+
+fn read_current_run_json_artifact(run_dir: &Path, artifact: &str) -> Result<Value, String> {
+    let root = run_dir
+        .canonicalize()
+        .map_err(|err| format!("run_artifact_root_invalid:{}:{err}", run_dir.display()))?;
+    let path = if cfg!(windows) {
+        wsl_path_to_windows(artifact).unwrap_or_else(|| PathBuf::from(artifact))
+    } else {
+        PathBuf::from(artifact)
+    };
+    let candidate = if path.is_absolute() {
+        path
+    } else {
+        run_dir.join(path)
+    };
+    let resolved = candidate
+        .canonicalize()
+        .map_err(|err| format!("run_artifact_missing:{}:{err}", candidate.display()))?;
+    if !resolved.is_file() || !resolved.starts_with(&root) {
+        return Err(format!("run_artifact_outside_run:{}", resolved.display()));
+    }
+    let text = read_text(&resolved)?;
+    serde_json::from_str(text.trim_start_matches('\u{feff}'))
+        .map_err(|err| format!("run_artifact_json_invalid:{}:{err}", resolved.display()))
 }
 
 fn run_scientific_workers(options: &ScienceOptions) -> Result<String, String> {
@@ -6690,17 +9148,97 @@ fn run_single_worker_task(options: &ScienceOptions, task: &WorkerTask<'_>) -> Re
 fn selected_candidate_rows(
     options: &ScienceOptions,
 ) -> Result<Vec<BTreeMap<String, String>>, String> {
-    let path = options.run_dir.join("complex_candidate_selection.tsv");
+    let shortlist_path = options.run_dir.join("candidate_shortlist.tsv");
+    let path = if shortlist_path.is_file() {
+        shortlist_path
+    } else {
+        options.run_dir.join("complex_candidate_selection.tsv")
+    };
     if !path.is_file() {
         return Ok(Vec::new());
     }
     let mut rows = read_simple_tsv_rows(&path)?;
-    rows.sort_by_key(|row| {
-        row.get("selection_rank")
-            .and_then(|value| value.parse::<usize>().ok())
-            .unwrap_or(usize::MAX)
+    if path.file_name().and_then(|value| value.to_str()) == Some("candidate_shortlist.tsv") {
+        rows.retain(|row| {
+            row.get("coordinate_status").map(String::as_str) == Some("ready")
+                && row
+                    .get("receptor_artifact")
+                    .is_some_and(|value| !value.trim().is_empty())
+                && row
+                    .get("coordinate_sha256")
+                    .is_some_and(|value| valid_sha256_hex(value))
+        });
+    }
+    rows.sort_by(|left, right| {
+        left.get("input_id")
+            .cmp(&right.get("input_id"))
+            .then_with(|| left.get("record_id").cmp(&right.get("record_id")))
+            .then_with(|| candidate_selection_rank(left).cmp(&candidate_selection_rank(right)))
+            .then_with(|| left.get("candidate_id").cmp(&right.get("candidate_id")))
     });
-    Ok(rows)
+    let mut counts = BTreeMap::<(String, String), usize>::new();
+    Ok(rows
+        .into_iter()
+        .filter(|row| {
+            let key = (
+                row.get("input_id").cloned().unwrap_or_default(),
+                row.get("record_id").cloned().unwrap_or_default(),
+            );
+            let count = counts.entry(key).or_default();
+            if *count == COMPLEX_CANDIDATE_TOP_N {
+                return false;
+            }
+            *count += 1;
+            true
+        })
+        .collect())
+}
+
+fn selected_dynamics_candidate_rows(
+    options: &ScienceOptions,
+) -> Result<(Vec<BTreeMap<String, String>>, Vec<CandidateWorkerOutcome>), String> {
+    let input_kinds = ranking_input_kinds(options)?;
+    let invocation_id = current_worker_invocation(options)?;
+    let mut runnable = Vec::new();
+    let mut not_applicable = Vec::new();
+    for mut row in selected_candidate_rows(options)? {
+        let input_id = row.get("input_id").cloned().unwrap_or_default();
+        let record_id = row.get("record_id").cloned().unwrap_or_default();
+        let input_kind = row
+            .get("input_kind")
+            .filter(|value| !value.trim().is_empty())
+            .cloned()
+            .or_else(|| {
+                input_kinds
+                    .get(&(input_id.clone(), record_id.clone()))
+                    .cloned()
+            })
+            .ok_or_else(|| format!("ranking_input_kind_missing:{input_id}:{record_id}"))?;
+        row.insert("input_kind".to_string(), input_kind.clone());
+        if input_kind == "small_molecule" {
+            runnable.push(row);
+        } else {
+            let candidate_id = row.get("candidate_id").cloned().unwrap_or_default();
+            not_applicable.push(CandidateWorkerOutcome {
+                job_id: candidate_worker_job_id("dynamics_capability", &candidate_id),
+                candidate_id,
+                input_id,
+                record_id,
+                invocation_id: invocation_id.clone(),
+                status: "not_applicable".to_string(),
+                reason: format!("input_kind_not_supported_for_docking_md:{input_kind}"),
+                manifest: String::new(),
+            });
+        }
+    }
+    Ok((runnable, not_applicable))
+}
+
+fn candidate_selection_rank(row: &BTreeMap<String, String>) -> usize {
+    row.get("shortlist_rank")
+        .or_else(|| row.get("selection_rank"))
+        .and_then(|value| value.parse::<usize>().ok())
+        .unwrap_or(usize::MAX)
 }
 
 fn candidate_worker_job_id(worker: &str, candidate_id: &str) -> String {
@@ -6712,7 +9250,6 @@ fn candidate_worker_job_value(
     task: &WorkerTask<'_>,
     candidate: &BTreeMap<String, String>,
 ) -> Result<(Value, CurrentMdRunFacts), String> {
-    start_worker_invocation(options)?;
     let facts = selected_candidate_run_facts(options, candidate)?;
     let mut job = worker_job_value(options, task)?;
     job["run_id"] = json!(facts.run_id);
@@ -6725,7 +9262,13 @@ fn candidate_worker_job_value(
     if let Some(namespace) = candidate.get("identity_namespace") {
         job["identity_namespace"] = json!(namespace);
     }
-    job["candidate_selection"] = json!("complex_candidate_selection.tsv");
+    job["candidate_selection"] = json!(
+        if options.run_dir.join("candidate_shortlist.tsv").is_file() {
+            "candidate_shortlist.tsv"
+        } else {
+            "complex_candidate_selection.tsv"
+        }
+    );
     if let Some(receptor_artifact) = candidate.get("receptor_artifact") {
         job["receptor_artifact"] = json!(receptor_artifact);
     }
@@ -6977,14 +9520,23 @@ fn candidate_worker_summary_row(task: &WorkerTask<'_>, result: &Value, job_valid
 fn run_docking_candidate_workers(options: &ScienceOptions) -> Result<(), String> {
     remove_run_subdir_if_exists(&options.run_dir, "tool_outputs/docking")?;
     clear_candidate_worker_files(options, DOCKING_WORKER_TASK.job_id)?;
-    let rows = selected_candidate_rows(options)?;
-    if rows.is_empty() {
-        return Ok(());
-    }
+    reset_candidate_manifest_index(options, "docking")?;
+    let (rows, mut worker_outcomes) = selected_dynamics_candidate_rows(options)?;
     let mut outcomes = String::from(
         "candidate_id\tinput_id\trecord_id\tjob_id\tinvocation_id\tstatus\treason\tmanifest\n",
     );
-    let mut worker_outcomes = Vec::new();
+    for outcome in &worker_outcomes {
+        outcomes.push_str(&format!(
+            "{}\t{}\t{}\t{}\t{}\t{}\t{}\t\n",
+            clean_cell(&outcome.candidate_id),
+            clean_cell(&outcome.input_id),
+            clean_cell(&outcome.record_id),
+            clean_cell(&outcome.job_id),
+            clean_cell(&outcome.invocation_id),
+            clean_cell(&outcome.status),
+            clean_cell(&outcome.reason),
+        ));
+    }
     for candidate in rows {
         let candidate_id = candidate
             .get("candidate_id")
@@ -7091,10 +9643,33 @@ fn run_md_candidate_workers(options: &ScienceOptions) -> Result<String, String> 
     clear_worker_task_outputs(options, &base)?;
     remove_run_subdir_if_exists(&options.run_dir, "tool_outputs/md")?;
     clear_candidate_worker_files(options, base.job_id)?;
-    let rows = selected_candidate_rows(options)?;
+    reset_candidate_manifest_index(options, "md")?;
+    let (rows, not_applicable) = selected_dynamics_candidate_rows(options)?;
     let mut summary = String::from(
         "job_id\tworker\tstage\tjob_schema_valid\tlaunch_status\tresult_schema_valid\tresult_status\texecution_status\treason\toutcome_count\tengine_version\tprimitive_execution_only\tpython_owns_final_score\tpython_owns_report_semantics\n",
     );
+    let mut outcomes = String::from(
+        "candidate_id\tinput_id\trecord_id\tjob_id\tinvocation_id\tstatus\treason\tmanifest\n",
+    );
+    for outcome in &not_applicable {
+        summary.push_str(&format!(
+            "{}\t{}\t{}\tfalse\tnot_applicable\ttrue\tNOT_APPLICABLE\tnot_applicable\t{}\t0\tGenoLigand capability gate\ttrue\tfalse\tfalse\n",
+            clean_cell(&outcome.job_id),
+            base.worker,
+            base.stage,
+            clean_cell(&outcome.reason),
+        ));
+        outcomes.push_str(&format!(
+            "{}\t{}\t{}\t{}\t{}\t{}\t{}\t\n",
+            clean_cell(&outcome.candidate_id),
+            clean_cell(&outcome.input_id),
+            clean_cell(&outcome.record_id),
+            clean_cell(&outcome.job_id),
+            clean_cell(&outcome.invocation_id),
+            clean_cell(&outcome.status),
+            clean_cell(&outcome.reason),
+        ));
+    }
     for candidate in rows {
         let candidate_id = candidate
             .get("candidate_id")
@@ -7112,7 +9687,39 @@ fn run_md_candidate_workers(options: &ScienceOptions) -> Result<String, String> 
         let result = run_candidate_worker_task(options, &task, &job)?;
         ensure_manifest_index_entry(options, "md", &facts, &task, &result)?;
         summary.push_str(&candidate_worker_summary_row(&task, &result, job_valid));
+        outcomes.push_str(&format!(
+            "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\n",
+            clean_cell(&facts.candidate_id),
+            clean_cell(&facts.input_id),
+            clean_cell(&facts.record_id),
+            clean_cell(task.job_id),
+            clean_cell(
+                job.get("invocation_id")
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+            ),
+            clean_cell(
+                result
+                    .get("execution_status")
+                    .and_then(Value::as_str)
+                    .unwrap_or("failed")
+            ),
+            clean_cell(
+                result
+                    .get("reason")
+                    .and_then(Value::as_str)
+                    .unwrap_or("missing_reason")
+            ),
+            clean_cell(
+                &candidate_manifest_from_index(options, "md", &facts.candidate_id)
+                    .unwrap_or_default()
+            ),
+        ));
     }
+    write_text(
+        &options.run_dir.join("tool_outputs/md_outcomes.tsv"),
+        &outcomes,
+    )?;
     write_text(
         &options.run_dir.join("scientific_runtime_summary.tsv"),
         &summary,
@@ -7218,6 +9825,26 @@ fn ensure_manifest_index_entry(
             .cmp(&right.get("candidate_id").and_then(Value::as_str))
     });
     write_text(&path, &(index.to_string() + "\n"))
+}
+
+fn reset_candidate_manifest_index(options: &ScienceOptions, kind: &str) -> Result<(), String> {
+    let schema_version = match kind {
+        "docking" => "genoligand_docking_manifest_index_v1",
+        "md" => "genoligand_md_manifest_index_v1",
+        _ => return Err(format!("worker_manifest_index_kind_invalid:{kind}")),
+    };
+    write_text(
+        &options
+            .run_dir
+            .join(format!("tool_outputs/{kind}_manifest_index.json")),
+        &(json!({
+            "schema_version": schema_version,
+            "run_id": infer_run_id(&options.run_dir),
+            "entries": [],
+        })
+        .to_string()
+            + "\n"),
+    )
 }
 
 fn worker_job_value(options: &ScienceOptions, task: &WorkerTask<'_>) -> Result<Value, String> {
@@ -7511,12 +10138,14 @@ fn validate_worker_result_binding(
     if !validate_worker_result(value, task) {
         return false;
     }
+    if value.get("run_id").and_then(Value::as_str) != job.get("run_id").and_then(Value::as_str)
+        || value.get("invocation_id").and_then(Value::as_str)
+            != job.get("invocation_id").and_then(Value::as_str)
+    {
+        return false;
+    }
     if task.worker != "md_summary" {
         return true;
-    }
-    let expected_invocation = job.get("invocation_id").and_then(Value::as_str);
-    if value.get("invocation_id").and_then(Value::as_str) != expected_invocation {
-        return false;
     }
     ["artifact_path", "artifact_provenance"]
         .into_iter()
@@ -7664,7 +10293,7 @@ fn match_structure_interactions(options: &ScienceOptions) -> Result<Vec<IndexMat
 }
 
 fn structure_match_token_is_informative(token: &str) -> bool {
-    token.chars().count() >= MIN_STRUCTURE_MATCH_TOKEN_CHARS
+    !token.starts_with("qs_") && token.chars().count() >= MIN_STRUCTURE_MATCH_TOKEN_CHARS
 }
 
 fn structure_matched_tokens(input: &ComputedFeatureInput, row: &StoreRow) -> Vec<String> {
@@ -7886,6 +10515,25 @@ fn write_coordinate_backed_candidate_selection_impl(
     fetch_base_url: &str,
     python_command: Option<&[String]>,
 ) -> Result<bool, String> {
+    let shortlist_path = options.run_dir.join("candidate_shortlist.tsv");
+    if !shortlist_path.is_file() {
+        write_candidate_shortlist(options)?;
+    }
+    let shortlist_rows = read_simple_tsv_rows(&shortlist_path)?;
+    let shortlist_order = shortlist_rows
+        .iter()
+        .filter_map(|row| {
+            let candidate_id = row.get("candidate_id")?.clone();
+            Some((
+                candidate_id,
+                (
+                    row.get("input_id").cloned().unwrap_or_default(),
+                    row.get("record_id").cloned().unwrap_or_default(),
+                    candidate_selection_rank(row),
+                ),
+            ))
+        })
+        .collect::<BTreeMap<_, _>>();
     remove_run_subdir_if_exists(&options.run_dir, "structure_candidates")?;
     for relative in [
         "structure_viewer.json",
@@ -7966,10 +10614,11 @@ fn write_coordinate_backed_candidate_selection_impl(
             });
         }
     }
+    candidates.retain(|candidate| shortlist_order.contains_key(&candidate.selected.candidate_id));
     candidates.sort_by(|left, right| {
-        right
-            .priority
-            .cmp(&left.priority)
+        shortlist_order[&left.selected.candidate_id]
+            .cmp(&shortlist_order[&right.selected.candidate_id])
+            .then_with(|| right.priority.cmp(&left.priority))
             .then_with(|| right.score.total_cmp(&left.score))
             .then_with(|| left.selected.candidate_id.cmp(&right.selected.candidate_id))
             .then_with(|| left.selected.pdb_id.cmp(&right.selected.pdb_id))
@@ -7982,6 +10631,7 @@ fn write_coordinate_backed_candidate_selection_impl(
     });
 
     let mut selected_rows = Vec::new();
+    let mut selected_by_input = BTreeMap::<(String, String), usize>::new();
     let mut seen = BTreeSet::new();
     let mut audited_pdb_ids = BTreeSet::new();
     let mut audit_rows = Vec::new();
@@ -7989,8 +10639,17 @@ fn write_coordinate_backed_candidate_selection_impl(
     let mut fetch_count = 0usize;
     let mut policy_validated = false;
     for candidate in candidates {
-        if selected_rows.len() == COMPLEX_CANDIDATE_TOP_N {
-            break;
+        let input_key = (
+            candidate.selected.input_id.clone(),
+            candidate.selected.record_id.clone(),
+        );
+        if selected_by_input
+            .get(&input_key)
+            .copied()
+            .unwrap_or_default()
+            == COMPLEX_CANDIDATE_TOP_N
+        {
+            continue;
         }
         if seen.contains(&candidate.selected.candidate_id) {
             continue;
@@ -8060,6 +10719,9 @@ fn write_coordinate_backed_candidate_selection_impl(
         } else {
             false
         };
+        if selected {
+            *selected_by_input.entry(input_key).or_default() += 1;
+        }
         if (!initially_local || selected) && audited_pdb_ids.insert(pdb_id.clone()) {
             audit_rows.push(rcsb_fetch_audit_row(
                 &options.science_store,
@@ -8074,6 +10736,7 @@ fn write_coordinate_backed_candidate_selection_impl(
     }
     write_rcsb_fetch_audit(options, &audit_rows)?;
     write_selected_complex_candidates(options, &selected_rows)?;
+    write_candidate_shortlist_coordinates(options, &selected_rows)?;
     write_structure_viewer_status_rows(options, &selected_rows)?;
     Ok(!selected_rows.is_empty())
 }
@@ -8817,7 +11480,12 @@ fn write_selected_complex_candidates(
     let mut text = String::from(
         "candidate_id\tidentity_namespace\tinput_id\trecord_id\ttarget_id\ttarget_name\torganism\ttarget_class\tsource\tpdb_id\tevidence\tselection_rank\treceptor_artifact\tcoordinate_sha256\n",
     );
-    for (index, (selected, artifact, coordinate_sha256)) in rows.iter().enumerate() {
+    let mut ranks = BTreeMap::<(String, String), usize>::new();
+    for (selected, artifact, coordinate_sha256) in rows {
+        let rank = ranks
+            .entry((selected.input_id.clone(), selected.record_id.clone()))
+            .and_modify(|value| *value += 1)
+            .or_insert(1);
         text.push_str(&format!(
             "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\n",
             clean_cell(&selected.candidate_id),
@@ -8831,7 +11499,7 @@ fn write_selected_complex_candidates(
             clean_cell(&selected.source),
             clean_cell(&selected.pdb_id),
             clean_cell(&selected.evidence),
-            index + 1,
+            *rank,
             clean_cell(artifact),
             coordinate_sha256,
         ));
@@ -8842,103 +11510,71 @@ fn write_selected_complex_candidates(
     )
 }
 
-fn append_selected_structure_match(
-    match_path: &Path,
-    selected_path: &Path,
-) -> Result<bool, String> {
-    if !match_path.exists() || !selected_path.exists() {
-        return Ok(false);
+fn write_candidate_shortlist_coordinates(
+    options: &ScienceOptions,
+    selected_rows: &[(SelectedComplexCandidate, String, String)],
+) -> Result<(), String> {
+    let path = options.run_dir.join("candidate_shortlist.tsv");
+    let mut rows = read_simple_tsv_rows(&path)?;
+    let mut ranks = BTreeMap::<(String, String), usize>::new();
+    let mut selected =
+        BTreeMap::<String, (&SelectedComplexCandidate, &String, &String, usize)>::new();
+    for (candidate, artifact, coordinate_sha256) in selected_rows {
+        let rank = ranks
+            .entry((candidate.input_id.clone(), candidate.record_id.clone()))
+            .and_modify(|value| *value += 1)
+            .or_insert(1);
+        selected.insert(
+            candidate.candidate_id.clone(),
+            (candidate, artifact, coordinate_sha256, *rank),
+        );
     }
-    let selected_rows = read_simple_tsv_rows(selected_path)?;
-    let mut text = read_text(match_path)?;
-    let existing = read_simple_tsv_rows(match_path)?
-        .into_iter()
-        .map(|row| {
-            format!(
-                "{}\u{1f}{}\u{1f}{}",
-                row.get("input_id").map(String::as_str).unwrap_or(""),
-                row.get("record_id")
-                    .map(String::as_str)
-                    .unwrap_or("record_1"),
-                row.get("target_id").map(String::as_str).unwrap_or("")
-            )
-        })
-        .collect::<BTreeSet<_>>();
-    let mut appended = false;
-    for row in selected_rows {
-        let input_id = row.get("input_id").map(String::as_str).unwrap_or("");
-        let record_id = row.get("record_id").map(String::as_str).unwrap_or("");
-        let target_id = row.get("target_id").map(String::as_str).unwrap_or("");
-        let key = format!("{input_id}\u{1f}{record_id}\u{1f}{target_id}");
-        if input_id.is_empty()
-            || record_id.is_empty()
-            || target_id.is_empty()
-            || existing.contains(&key)
+    for row in &mut rows {
+        let candidate_id = row.get("candidate_id").cloned().unwrap_or_default();
+        if let Some((candidate, artifact, coordinate_sha256, selection_rank)) =
+            selected.get(&candidate_id)
         {
-            continue;
+            row.insert("coordinate_status".to_string(), "ready".to_string());
+            row.insert("selection_rank".to_string(), selection_rank.to_string());
+            row.insert("receptor_artifact".to_string(), (*artifact).clone());
+            row.insert(
+                "coordinate_sha256".to_string(),
+                (*coordinate_sha256).clone(),
+            );
+            row.insert("pdb_id".to_string(), candidate.pdb_id.clone());
+        } else {
+            let status = if row
+                .get("pdb_ids")
+                .is_some_and(|value| !value.trim().is_empty())
+            {
+                "not_selected_or_unavailable"
+            } else {
+                "not_available"
+            };
+            row.insert("coordinate_status".to_string(), status.to_string());
+            for field in [
+                "selection_rank",
+                "receptor_artifact",
+                "coordinate_sha256",
+                "pdb_id",
+            ] {
+                row.insert(field.to_string(), String::new());
+            }
         }
-        let source = row.get("source").map(String::as_str).unwrap_or("");
-        let pdb_id = row.get("pdb_id").map(String::as_str).unwrap_or("");
-        let evidence = row.get("evidence").map(String::as_str).unwrap_or("");
-        text.push_str(&format!(
-            "{}\t{}\t{}\t{}\t{}\t{}\t1.0000\t{}\t{}\t{}\t{}\t{}\n",
-            clean_cell(input_id),
-            clean_cell(source),
-            clean_cell(target_id),
-            clean_cell(row.get("target_name").map(String::as_str).unwrap_or("")),
-            clean_cell(row.get("organism").map(String::as_str).unwrap_or("")),
-            clean_cell(row.get("target_class").map(String::as_str).unwrap_or("")),
-            clean_cell(&format!("coordinate_backed pdb_id={pdb_id}")),
-            clean_cell(evidence),
-            clean_cell(source),
-            clean_cell(input_id),
-            clean_cell(record_id),
-        ));
-        appended = true;
     }
-    if appended {
-        write_text(match_path, &text)?;
+    let headers = CANDIDATE_SHORTLIST_HEADER.split('\t').collect::<Vec<_>>();
+    let mut text = format!("{CANDIDATE_SHORTLIST_HEADER}\n");
+    for row in rows {
+        text.push_str(
+            &headers
+                .iter()
+                .map(|header| clean_cell(row.get(*header).map(String::as_str).unwrap_or("")))
+                .collect::<Vec<_>>()
+                .join("\t"),
+        );
+        text.push('\n');
     }
-    Ok(appended)
-}
-
-fn append_selected_structure_summary(
-    selection_path: &Path,
-    selected_path: &Path,
-) -> Result<bool, String> {
-    if !selection_path.exists() || !selected_path.exists() {
-        return Ok(false);
-    }
-    let selected_rows = read_simple_tsv_rows(selected_path)?;
-    let mut text = read_text(selection_path)?;
-    let existing = read_simple_tsv_rows(selection_path)?
-        .into_iter()
-        .filter_map(|row| row.get("candidate_id").cloned())
-        .collect::<BTreeSet<_>>();
-    let mut appended = false;
-    for row in selected_rows {
-        let candidate_id = row.get("candidate_id").map(String::as_str).unwrap_or("");
-        if candidate_id.is_empty() || existing.contains(candidate_id) {
-            continue;
-        }
-        let source = row.get("source").map(String::as_str).unwrap_or("");
-        let pdb_id = row.get("pdb_id").map(String::as_str).unwrap_or("");
-        let evidence = row.get("evidence").map(String::as_str).unwrap_or("");
-        text.push_str(&format!(
-            "{}\t1.0000\t{}\t{}\t{}\t{}\t\t\t\t{}\n",
-            clean_cell(candidate_id),
-            clean_cell(&format!("{source} pdb_id={pdb_id}")),
-            "coordinate_backed",
-            clean_cell(row.get("target_class").map(String::as_str).unwrap_or("")),
-            clean_cell(evidence),
-            clean_cell(evidence),
-        ));
-        appended = true;
-    }
-    if appended {
-        write_text(selection_path, &text)?;
-    }
-    Ok(appended)
+    write_text(&path, &text)
 }
 
 fn write_structure_viewer_status_rows(
@@ -8951,7 +11587,12 @@ fn write_structure_viewer_status_rows(
     if rows.is_empty() {
         text.push_str("not_ready\t\t\t\t\tno coordinate-backed candidate for this run\t\t\t\t\t\n");
     }
-    for (index, (selected, artifact, coordinate_sha256)) in rows.iter().enumerate() {
+    let mut ranks = BTreeMap::<(String, String), usize>::new();
+    for (selected, artifact, coordinate_sha256) in rows {
+        let rank = ranks
+            .entry((selected.input_id.clone(), selected.record_id.clone()))
+            .and_modify(|value| *value += 1)
+            .or_insert(1);
         text.push_str(&format!(
             "ready\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\n",
             clean_cell(&selected.target_id),
@@ -8962,7 +11603,7 @@ fn write_structure_viewer_status_rows(
             clean_cell(&selected.candidate_id),
             clean_cell(&selected.input_id),
             clean_cell(&selected.record_id),
-            index + 1,
+            *rank,
             coordinate_sha256,
         ));
     }
@@ -9263,6 +11904,60 @@ fn screen_dynamics(options: &ScienceOptions) -> Result<String, String> {
         "dynamics_screened\tmd_artifact={}",
         if summary.ready { "ready" } else { "not_ready" }
     ))
+}
+
+fn execute_dynamics_screen(options: &ScienceOptions) -> Result<String, String> {
+    let (runnable, not_applicable) = selected_dynamics_candidate_rows(options)?;
+    clear_worker_task_outputs(options, &DOCKING_WORKER_TASK)?;
+    run_docking_candidate_workers(options)?;
+    copy_tool_output_or_header(
+        options,
+        "docking_summary.tsv",
+        "candidate_id\tdocking_status\tdocking_score\tdocking_engine\tnotes\n",
+        &options.run_dir.join("docking_summary.tsv"),
+    )?;
+    run_scientific_workers(options)?;
+    validate_dynamics_not_applicable_outcomes(options)?;
+    let result = screen_dynamics(options)?;
+    let status = if runnable.is_empty() && !not_applicable.is_empty() {
+        "not_applicable"
+    } else if !runnable.is_empty() {
+        "executed"
+    } else {
+        "no_candidate"
+    };
+    Ok(format!(
+        "{result}\tdynamics_status={status}\tnot_applicable_count={}",
+        not_applicable.len()
+    ))
+}
+
+fn validate_dynamics_not_applicable_outcomes(options: &ScienceOptions) -> Result<(), String> {
+    let (_, not_applicable) = selected_dynamics_candidate_rows(options)?;
+    let expected = not_applicable
+        .into_iter()
+        .map(|outcome| outcome.candidate_id)
+        .collect::<BTreeSet<_>>();
+    for kind in ["docking", "md"] {
+        let path = options
+            .run_dir
+            .join(format!("tool_outputs/{kind}_outcomes.tsv"));
+        let rows = read_simple_tsv_rows(&path)?;
+        let actual = rows
+            .into_iter()
+            .filter(|row| {
+                row.get("status").map(String::as_str) == Some("not_applicable")
+                    && row.get("reason").is_some_and(|reason| {
+                        reason.starts_with("input_kind_not_supported_for_docking_md:")
+                    })
+            })
+            .filter_map(|row| row.get("candidate_id").cloned())
+            .collect::<BTreeSet<_>>();
+        if actual != expected {
+            return Err(format!("{kind}_not_applicable_outcomes_incomplete"));
+        }
+    }
+    Ok(())
 }
 
 fn md_summary_header() -> &'static str {
@@ -9586,7 +12281,7 @@ fn validated_candidate_manifest_index(
     {
         return Err(format!("{kind}_manifest_index_identity_mismatch"));
     }
-    let selected_rows = selected_candidate_rows(options)?;
+    let (selected_rows, _) = selected_dynamics_candidate_rows(options)?;
     let mut selected = BTreeMap::new();
     for row in selected_rows {
         let facts = selected_candidate_run_facts(options, &row)?;
@@ -9759,7 +12454,7 @@ fn validated_candidate_manifest_index(
             || (!result_provenance.is_empty() && result_provenance != artifact_provenance)
             || (status == "completed" && manifest.is_empty())
             || (kind == "md"
-                && matches!(status.as_str(), "completed" | "not_ready")
+                && matches!(result_status, "completed" | "not_ready")
                 && artifact_provenance.is_empty())
         {
             return Err(format!(
@@ -10842,8 +13537,7 @@ fn job_run_identity_matches(job: &Value, options: &ScienceOptions) -> bool {
 }
 
 fn current_md_run_facts(options: &ScienceOptions) -> Result<CurrentMdRunFacts, String> {
-    let candidate_rows =
-        read_simple_tsv_rows(&options.run_dir.join("complex_candidate_selection.tsv"))?;
+    let candidate_rows = selected_candidate_rows(options)?;
     if candidate_rows.len() != 1 {
         return Err("candidate_manifest_mismatch".to_string());
     }
@@ -10876,7 +13570,18 @@ fn selected_candidate_run_facts(
         .filter(|value| !value.trim().is_empty())
         .ok_or_else(|| "candidate_manifest_mismatch".to_string())?
         .to_string();
-    let candidate_digest = canonical_json_sha256(&json!(candidate));
+    let candidate_digest = canonical_json_sha256(&json!({
+        "schema_version": "genoligand_candidate_selection_digest_v1",
+        "candidate_id": &candidate_id,
+        "identity_namespace": candidate.get("identity_namespace").map(String::as_str).unwrap_or(""),
+        "input_id": &input_id,
+        "record_id": &record_id,
+        "target_id": candidate.get("target_id").map(String::as_str).unwrap_or(""),
+        "pdb_id": candidate.get("pdb_id").map(String::as_str).unwrap_or(""),
+        "selection_rank": candidate.get("selection_rank").map(String::as_str).unwrap_or(""),
+        "receptor_artifact": candidate.get("receptor_artifact").map(String::as_str).unwrap_or(""),
+        "coordinate_sha256": candidate.get("coordinate_sha256").map(String::as_str).unwrap_or(""),
+    }));
 
     let input_rows = read_simple_tsv_rows(&options.run_dir.join("input_conversion_manifest.tsv"))?;
     let selected = input_rows
@@ -11504,7 +14209,139 @@ fn write_authenticity_gate_report(
     write_text(&options.run_dir.join("authenticity_gate.tsv"), &text)
 }
 
+fn ranking_route(input_kind: &str) -> RankingRoute {
+    match input_kind {
+        "small_molecule" => RankingRoute {
+            key: "small_molecule_route_v1",
+            known: 0.45,
+            metagenome: 0.0,
+            structure: 0.20,
+            docking: 0.15,
+            md: 0.20,
+        },
+        "peptide" => RankingRoute {
+            key: "peptide_route_v2",
+            known: 0.30,
+            metagenome: 0.20,
+            structure: 0.50,
+            docking: 0.0,
+            md: 0.0,
+        },
+        "protein_ligand" => RankingRoute {
+            key: "protein_ligand_route_v2",
+            known: 0.20,
+            metagenome: 0.10,
+            structure: 0.70,
+            docking: 0.0,
+            md: 0.0,
+        },
+        "complex" => RankingRoute {
+            key: "complex_route_v2",
+            known: 0.15,
+            metagenome: 0.05,
+            structure: 0.80,
+            docking: 0.0,
+            md: 0.0,
+        },
+        "genome_or_metagenome" => RankingRoute {
+            key: "genome_or_metagenome_route_v1",
+            known: 0.45,
+            metagenome: 0.55,
+            structure: 0.0,
+            docking: 0.0,
+            md: 0.0,
+        },
+        _ => RankingRoute {
+            key: "fallback_route_v2",
+            known: 0.50,
+            metagenome: 0.30,
+            structure: 0.20,
+            docking: 0.0,
+            md: 0.0,
+        },
+    }
+}
+
+fn ranking_input_kinds(
+    options: &ScienceOptions,
+) -> Result<BTreeMap<(String, String), String>, String> {
+    let path = options.run_dir.join("input_conversion_manifest.tsv");
+    if !path.is_file() {
+        return Ok(BTreeMap::new());
+    }
+    let mut kinds = BTreeMap::new();
+    for row in read_simple_tsv_rows(&path)? {
+        if row.get("conversion_status").map(String::as_str) != Some("converted") {
+            continue;
+        }
+        let input_id = row.get("input_id").cloned().unwrap_or_default();
+        let record_id = row.get("record_id").cloned().unwrap_or_default();
+        let input_kind = row.get("canonical_kind").cloned().unwrap_or_default();
+        if input_id.is_empty() || record_id.is_empty() || input_kind.is_empty() {
+            return Err("ranking_input_identity_incomplete".to_string());
+        }
+        if let Some(existing) = kinds.insert((input_id, record_id), input_kind.clone())
+            && existing != input_kind
+        {
+            return Err("ranking_input_kind_conflict".to_string());
+        }
+    }
+    Ok(kinds)
+}
+
+fn bind_candidate_ranking_routes(
+    options: &ScienceOptions,
+    candidates: &mut [Candidate],
+) -> Result<(), String> {
+    let input_kinds = ranking_input_kinds(options)?;
+    let conversion_manifest_exists = options
+        .run_dir
+        .join("input_conversion_manifest.tsv")
+        .is_file();
+    for candidate in candidates {
+        candidate.input_kind =
+            match input_kinds.get(&(candidate.input_id.clone(), candidate.record_id.clone())) {
+                Some(input_kind) => input_kind.clone(),
+                None if !conversion_manifest_exists => "unknown".to_string(),
+                None => {
+                    return Err(format!(
+                        "ranking_input_kind_missing:{}:{}",
+                        candidate.input_id, candidate.record_id
+                    ));
+                }
+            };
+        candidate.ranking_policy = ranking_route(&candidate.input_kind).key.to_string();
+    }
+    Ok(())
+}
+
+fn sort_ranked_candidates(candidates: &mut [Candidate]) {
+    candidates.sort_by(|left, right| {
+        left.input_id
+            .cmp(&right.input_id)
+            .then_with(|| left.record_id.cmp(&right.record_id))
+            .then_with(|| right.final_score.total_cmp(&left.final_score))
+            .then_with(|| left.identity_namespace.cmp(&right.identity_namespace))
+            .then_with(|| left.target_id.cmp(&right.target_id))
+            .then_with(|| left.candidate_id.cmp(&right.candidate_id))
+    });
+}
+
+fn candidate_group_ranks(candidates: &[Candidate]) -> Vec<usize> {
+    let mut ranks = BTreeMap::<(String, String), usize>::new();
+    candidates
+        .iter()
+        .map(|candidate| {
+            *ranks
+                .entry((candidate.input_id.clone(), candidate.record_id.clone()))
+                .and_modify(|value| *value += 1)
+                .or_insert(1)
+        })
+        .collect()
+}
+
 fn rank_targets(options: &ScienceOptions) -> Result<String, String> {
+    validate_ligand_similarity_query_bindings(options)?;
     ensure_final_artifacts_authentic(
         options,
         &[
@@ -11535,22 +14372,19 @@ fn rank_targets(options: &ScienceOptions) -> Result<String, String> {
     assign_collision_free_candidate_ids(&mut candidates);
     apply_docking_scores(&mut candidates, options)?;
     apply_md_scores(&mut candidates, options)?;
+    bind_candidate_ranking_routes(options, &mut candidates)?;
     for candidate in &mut candidates {
-        candidate.final_score = (candidate.known_score * KNOWN_SCORE_WEIGHT
-            + candidate.metagenome_score * METAGENOME_SCORE_WEIGHT
-            + candidate.structure_score * STRUCTURE_SCORE_WEIGHT
-            + candidate.docking_score * DOCKING_SCORE_WEIGHT
-            + candidate.dynamics_score * MD_SCORE_WEIGHT)
-            .min(1.0);
+        let route = ranking_route(&candidate.input_kind);
+        candidate.final_score = route.score(candidate);
     }
-    candidates.sort_by(|left, right| right.final_score.total_cmp(&left.final_score));
-    let mut text = String::from(
-        "rank\tcandidate_id\ttarget_id\ttarget_name\tcandidate_scope\torganism\tfinal_score\tknown_database_score\tmetagenome_score\tstructure_score\tdocking_score\tmd_score\tevidence_summary\tstatus\tinput_id\trecord_id\tidentity_namespace\n",
-    );
-    for (index, candidate) in candidates.iter().enumerate() {
+    sort_ranked_candidates(&mut candidates);
+    let mut text = format!("{TARGET_CANDIDATE_RANKING_HEADER}\n");
+    let ranks = candidate_group_ranks(&candidates);
+    for (candidate, rank) in candidates.iter().zip(ranks) {
+        let route = ranking_route(&candidate.input_kind);
         text.push_str(&format!(
-            "{}\t{}\t{}\t{}\t{}\t{}\t{:.4}\t{:.4}\t{:.4}\t{:.4}\t{:.4}\t{:.4}\t{}\tcomputed_prediction\t{}\t{}\t{}\n",
-            index + 1,
+            "{}\t{}\t{}\t{}\t{}\t{}\t{:.4}\t{:.4}\t{:.4}\t{:.4}\t{:.4}\t{:.4}\t{}\tcomputed_prediction\t{}\t{}\t{}\t{}\t{}\t{:.4}\t{:.4}\t{:.4}\t{:.4}\t{:.4}\n",
+            rank,
             candidate.candidate_id,
             candidate.target_id,
             clean_cell(&candidate.target_name),
@@ -11565,7 +14399,14 @@ fn rank_targets(options: &ScienceOptions) -> Result<String, String> {
             clean_cell(&candidate.evidence),
             clean_cell(&candidate.input_id),
             clean_cell(&candidate.record_id),
-            clean_cell(&candidate.identity_namespace)
+            clean_cell(&candidate.identity_namespace),
+            clean_cell(&candidate.input_kind),
+            clean_cell(&candidate.ranking_policy),
+            route.known,
+            route.metagenome,
+            route.structure,
+            route.docking,
+            route.md,
         ));
     }
     write_text(&options.run_dir.join("target_candidate_ranking.tsv"), &text)?;
@@ -12201,6 +15042,7 @@ fn build_evidence(options: &ScienceOptions) -> Result<String, String> {
         "artifact_source_map.tsv",
         "input_conversion_manifest.tsv",
         "input_normalized_manifest.tsv",
+        "query_structure_manifest.tsv",
         "feature_manifest.tsv",
         "tool_outputs/mmseqs_alignment_matches.tsv",
         "tool_outputs/mmseqs_alignment_status.tsv",
@@ -12209,6 +15051,7 @@ fn build_evidence(options: &ScienceOptions) -> Result<String, String> {
         "structure_interaction_matches.tsv",
         "tool_outputs/foldseek_structure_matches.tsv",
         "tool_outputs/foldseek_alignment_status.tsv",
+        "candidate_shortlist.tsv",
         "complex_candidate_selection.tsv",
         "scientific_runtime_summary.tsv",
         "structure_patch_summary.tsv",
@@ -12326,6 +15169,19 @@ fn artifact_evidence_status(
                 ("not_generated", "no normalized input rows".to_string())
             }
         }
+        "query_structure_manifest.tsv" => {
+            if rows > 0 {
+                (
+                    "available",
+                    format!("{rows} query-side structure preparation rows"),
+                )
+            } else {
+                (
+                    "not_generated",
+                    "no query-side structure preparation rows".to_string(),
+                )
+            }
+        }
         "feature_manifest.tsv" => {
             if rows > 0 {
                 ("available", format!("{rows} computed feature rows"))
@@ -12406,6 +15262,19 @@ fn artifact_evidence_status(
                 )
             }
         }
+        "candidate_shortlist.tsv" => {
+            if rows > 0 {
+                (
+                    "available",
+                    format!("{rows} candidates ranked before docking and dynamics"),
+                )
+            } else {
+                (
+                    "no_match",
+                    "no candidates passed preliminary retrieval".to_string(),
+                )
+            }
+        }
         "complex_candidate_selection.tsv" => {
             if rows > 0 {
                 (
@@ -12479,7 +15348,7 @@ fn artifact_evidence_status(
                 (
                     "available",
                     format!(
-                        "{rows} verified OpenMM complex MD rows for {candidates}; platform {platforms}; md_stability_score feeds md_score and final_score with weight {MD_SCORE_WEIGHT:.2}"
+                        "{rows} verified OpenMM complex MD rows for {candidates}; platform {platforms}; final-score contribution follows each candidate ranking_policy md_weight"
                     ),
                 )
             } else {
@@ -12623,12 +15492,24 @@ fn render_report(options: &ScienceOptions) -> Result<String, String> {
     if candidates.is_empty() {
         text.push_str("\u{5f53}\u{524d}\u{8fd0}\u{884c}\u{6ca1}\u{6709}\u{751f}\u{6210}\u{5019}\u{9009}\u{9776}\u{70b9}\u{3002}\u{53ef}\u{80fd}\u{539f}\u{56e0}\u{662f}\u{6ca1}\u{6709}\u{5339}\u{914d}\u{8bc1}\u{636e}\u{ff0c}\u{6216}\u{8ba1}\u{7b97}\u{5728}\u{5f00}\u{59cb}\u{524d}\u{88ab}\u{8fd0}\u{884c}\u{6761}\u{4ef6}\u{963b}\u{585e}\u{3002}\n");
     } else {
-        text.push_str("| \u{6392}\u{5e8f} | \u{9776}\u{70b9} | \u{5019}\u{9009}\u{8303}\u{56f4} | \u{7269}\u{79cd} | \u{7efc}\u{5408}\u{5206}\u{6570} | \u{8bc1}\u{636e}\u{6458}\u{8981} |\n");
-        text.push_str("| --- | --- | --- | --- | --- | --- |\n");
-        for (index, candidate) in candidates.iter().take(REPORT_CANDIDATE_LIMIT).enumerate() {
+        text.push_str("| \u{8f93}\u{5165} | \u{8bb0}\u{5f55} | \u{6392}\u{5e8f} | \u{9776}\u{70b9} | \u{5019}\u{9009}\u{8303}\u{56f4} | \u{7269}\u{79cd} | \u{7efc}\u{5408}\u{5206}\u{6570} | \u{8bc1}\u{636e}\u{6458}\u{8981} |\n");
+        text.push_str("| --- | --- | --- | --- | --- | --- | --- | --- |\n");
+        let mut group_counts = BTreeMap::<(String, String), usize>::new();
+        let mut displayed = 0usize;
+        for candidate in &candidates {
+            let rank = group_counts
+                .entry((candidate.input_id.clone(), candidate.record_id.clone()))
+                .or_default();
+            if *rank == REPORT_CANDIDATE_LIMIT {
+                continue;
+            }
+            *rank += 1;
+            displayed += 1;
             text.push_str(&format!(
-                "| {} | {} ({}) | {} | {} | {:.4} | {} |\n",
-                index + 1,
+                "| {} | {} | {} | {} ({}) | {} | {} | {:.4} | {} |\n",
+                clean_cell(&candidate.input_id),
+                clean_cell(&candidate.record_id),
+                *rank,
                 clean_cell(&candidate.target_name),
                 clean_cell(&candidate.target_id),
                 report_scope_label(&candidate.candidate_scope),
@@ -12637,9 +15518,9 @@ fn render_report(options: &ScienceOptions) -> Result<String, String> {
                 clean_cell(&candidate.evidence)
             ));
         }
-        if candidates.len() > REPORT_CANDIDATE_LIMIT {
+        if displayed < candidates.len() {
             text.push_str(&format!(
-                "\n\u{5171}\u{751f}\u{6210} {} \u{4e2a}\u{5019}\u{9009}\u{9776}\u{70b9}\u{ff1b}\u{62a5}\u{544a}\u{5c55}\u{793a}\u{524d} {} \u{4e2a}\u{ff0c}\u{5b8c}\u{6574}\u{6392}\u{540d}\u{53ef}\u{5728}\u{5bfc}\u{51fa}\u{7684}\u{5019}\u{9009}\u{6392}\u{5e8f}\u{8868}\u{4e2d}\u{67e5}\u{770b}\u{3002}\n",
+                "\n\u{5171}\u{751f}\u{6210} {} \u{4e2a}\u{5019}\u{9009}\u{9776}\u{70b9}\u{ff1b}\u{62a5}\u{544a}\u{5bf9}\u{6bcf}\u{4e2a}\u{8f93}\u{5165}\u{8bb0}\u{5f55}\u{5c55}\u{793a}\u{524d} {} \u{4e2a}\u{ff0c}\u{5b8c}\u{6574}\u{6392}\u{540d}\u{53ef}\u{5728}\u{5bfc}\u{51fa}\u{7684}\u{5019}\u{9009}\u{6392}\u{5e8f}\u{8868}\u{4e2d}\u{67e5}\u{770b}\u{3002}\n",
                 candidates.len(),
                 REPORT_CANDIDATE_LIMIT
             ));
@@ -12682,7 +15563,7 @@ fn report_md_score_summary(
             })
             .count();
         text.push_str(&format!(
-            "md_summary.tsv \u{4e2d}\u{7684} md_stability_score \u{5df2}\u{901a}\u{8fc7}\u{9010}\u{5019}\u{9009}\u{4ea7}\u{7269}\u{6821}\u{9a8c}\u{ff0c}\u{5171} {} \u{4e2a} receptor-ligand complex MD\u{ff1b}{ranked_md} \u{4e2a}\u{5019}\u{9009}\u{4ee5} {MD_SCORE_WEIGHT:.2} \u{6743}\u{91cd}\u{53c2}\u{4e0e} final_score\u{3002}\n\n",
+            "md_summary.tsv \u{4e2d}\u{7684} md_stability_score \u{5df2}\u{901a}\u{8fc7}\u{9010}\u{5019}\u{9009}\u{4ea7}\u{7269}\u{6821}\u{9a8c}\u{ff0c}\u{5171} {} \u{4e2a} receptor-ligand complex MD\u{ff1b}{ranked_md} \u{4e2a}\u{5019}\u{9009}\u{6309}\u{5404}\u{81ea} input_kind \u{8def}\u{7ebf}\u{7684} md_weight \u{53c2}\u{4e0e} final_score\u{3002}\n\n",
             complex.len()
         ));
         for facts in &complex {
@@ -12795,13 +15676,34 @@ fn report_scope_label(value: &str) -> &'static str {
 }
 
 fn ranking_policy_value() -> Value {
+    let route_value = |input_kind: &str| {
+        let route = ranking_route(input_kind);
+        let (preliminary_known, preliminary_metagenome, preliminary_structure) =
+            route.preliminary_weights();
+        json!({
+            "ranking_policy": route.key,
+            "known_database_weight": route.known,
+            "metagenome_weight": route.metagenome,
+            "structure_weight": route.structure,
+            "docking_weight": route.docking,
+            "md_weight": route.md,
+            "preliminary_known_database_weight": preliminary_known,
+            "preliminary_metagenome_weight": preliminary_metagenome,
+            "preliminary_structure_weight": preliminary_structure,
+        })
+    };
     json!({
         "schema_version": RANKING_POLICY_VERSION,
-        "known_database_weight": KNOWN_SCORE_WEIGHT,
-        "metagenome_weight": METAGENOME_SCORE_WEIGHT,
-        "structure_weight": STRUCTURE_SCORE_WEIGHT,
-        "docking_weight": DOCKING_SCORE_WEIGHT,
-        "md_weight": MD_SCORE_WEIGHT,
+        "score_semantics": "input_kind_route_weighted_sum",
+        "shortlist_score_semantics": "route_weights_renormalized_over_known_metagenome_structure",
+        "routes": {
+            "small_molecule": route_value("small_molecule"),
+            "peptide": route_value("peptide"),
+            "protein_ligand": route_value("protein_ligand"),
+            "complex": route_value("complex"),
+            "genome_or_metagenome": route_value("genome_or_metagenome"),
+            "fallback": route_value("unknown"),
+        },
     })
 }
 
@@ -12981,13 +15883,16 @@ fn write_candidate_detail(
     let rows = candidates
         .iter()
         .map(|candidate| {
+            let route = ranking_route(&candidate.input_kind);
             let mut source_artifacts = vec![
                 "input_conversion_manifest.tsv".to_string(),
                 "input_normalized_manifest.tsv".to_string(),
+                "query_structure_manifest.tsv".to_string(),
                 "feature_manifest.tsv".to_string(),
                 "known_database_matches.tsv".to_string(),
                 "metagenome_potential_matches.tsv".to_string(),
                 "structure_interaction_matches.tsv".to_string(),
+                "candidate_shortlist.tsv".to_string(),
                 "complex_candidate_selection.tsv".to_string(),
                 "target_candidate_ranking.tsv".to_string(),
                 "score_decomposition.tsv".to_string(),
@@ -13000,6 +15905,15 @@ fn write_candidate_detail(
                 "candidate_id": candidate.candidate_id,
                 "input_id": candidate.input_id,
                 "record_id": candidate.record_id,
+                "input_kind": candidate.input_kind,
+                "ranking_policy": candidate.ranking_policy,
+                "ranking_weights": {
+                    "known_database": route.known,
+                    "metagenome": route.metagenome,
+                    "structure": route.structure,
+                    "docking": route.docking,
+                    "md": route.md,
+                },
                 "identity_namespace": candidate.identity_namespace,
                 "target_id": candidate.target_id,
                 "target_name": candidate.target_name,
@@ -13045,7 +15959,12 @@ fn write_artifact_source_map(options: &ScienceOptions) -> Result<(), String> {
         (
             "input_normalized_manifest.tsv",
             "input_conversion_manifest.tsv",
-            "feature_manifest.tsv",
+            "query_structure_manifest.tsv;feature_manifest.tsv",
+        ),
+        (
+            "query_structure_manifest.tsv",
+            "input_conversion_manifest.tsv;query-side RDKit or coordinate structure preparation",
+            "feature_manifest.tsv;known_database_matches.tsv;evidence_ledger.tsv",
         ),
         (
             "input_conversion_manifest.tsv",
@@ -13054,7 +15973,7 @@ fn write_artifact_source_map(options: &ScienceOptions) -> Result<(), String> {
         ),
         (
             "feature_manifest.tsv",
-            "input_conversion_manifest.tsv;input_normalized_manifest.tsv",
+            "input_conversion_manifest.tsv;input_normalized_manifest.tsv;query_structure_manifest.tsv",
             "known_database_matches.tsv;metagenome_potential_matches.tsv;tool_outputs/mmseqs_alignment_matches.tsv",
         ),
         (
@@ -13069,7 +15988,7 @@ fn write_artifact_source_map(options: &ScienceOptions) -> Result<(), String> {
         ),
         (
             "known_database_matches.tsv",
-            "indexes/known_targets.tsv",
+            "indexes/known_targets.tsv;indexes/ligand_similarity/ligand_similarity.sqlite;query_structure_manifest.tsv",
             "target_candidate_ranking.tsv",
         ),
         (
@@ -13079,7 +15998,7 @@ fn write_artifact_source_map(options: &ScienceOptions) -> Result<(), String> {
         ),
         (
             "target_candidate_ranking.tsv",
-            "known_database_matches.tsv;metagenome_potential_matches.tsv;structure_interaction_matches.tsv;md_summary.tsv",
+            "input_conversion_manifest.tsv;known_database_matches.tsv;metagenome_potential_matches.tsv;structure_interaction_matches.tsv;docking_summary.tsv;md_summary.tsv",
             "candidate_detail.json;score_decomposition.tsv",
         ),
         (
@@ -13098,8 +16017,13 @@ fn write_artifact_source_map(options: &ScienceOptions) -> Result<(), String> {
             "evidence_ledger.tsv",
         ),
         (
+            "candidate_shortlist.tsv",
+            "input_conversion_manifest.tsv;known_database_matches.tsv;metagenome_potential_matches.tsv;structure_interaction_matches.tsv",
+            "complex_candidate_selection.tsv;docking_summary.tsv;md_summary.tsv;target_candidate_ranking.tsv",
+        ),
+        (
             "complex_candidate_selection.tsv",
-            "known_database_matches.tsv;structure_interaction_matches.tsv;local coordinate files",
+            "candidate_shortlist.tsv;local coordinate files",
             "structure_viewer_status.tsv;docking_summary.tsv;md_summary.tsv;target_candidate_ranking.tsv",
         ),
         (
@@ -13265,40 +16189,44 @@ fn write_score_decomposition(options: &ScienceOptions) -> Result<(), String> {
     let md_outcomes =
         candidate_index_statuses(&options.run_dir.join("tool_outputs/md_manifest_index.json"));
     let policy_digest = ranking_policy_digest();
-    let mut text =
-        String::from("candidate_id\tcomponent\tvalue\towner\tpolicy_version\tpolicy_digest\n");
+    let mut text = String::from(
+        "candidate_id\tcomponent\tvalue\towner\tpolicy_version\tpolicy_digest\tinput_kind\tranking_policy\n",
+    );
     for candidate in candidates {
+        let route = ranking_route(&candidate.input_kind);
+        let ranking_policy = if candidate.ranking_policy.is_empty() {
+            route.key
+        } else {
+            &candidate.ranking_policy
+        };
         let mut components = vec![
             ("known_database_score", candidate.known_score),
-            ("known_database_score_weight", KNOWN_SCORE_WEIGHT),
+            ("known_database_score_weight", route.known),
             (
                 "known_database_score_contribution",
-                candidate.known_score * KNOWN_SCORE_WEIGHT,
+                candidate.known_score * route.known,
             ),
             ("metagenome_score", candidate.metagenome_score),
-            ("metagenome_score_weight", METAGENOME_SCORE_WEIGHT),
+            ("metagenome_score_weight", route.metagenome),
             (
                 "metagenome_score_contribution",
-                candidate.metagenome_score * METAGENOME_SCORE_WEIGHT,
+                candidate.metagenome_score * route.metagenome,
             ),
             ("structure_score", candidate.structure_score),
-            ("structure_score_weight", STRUCTURE_SCORE_WEIGHT),
+            ("structure_score_weight", route.structure),
             (
                 "structure_score_contribution",
-                candidate.structure_score * STRUCTURE_SCORE_WEIGHT,
+                candidate.structure_score * route.structure,
             ),
             ("docking_score", candidate.docking_score),
-            ("docking_score_weight", DOCKING_SCORE_WEIGHT),
+            ("docking_score_weight", route.docking),
             (
                 "docking_score_contribution",
-                candidate.docking_score * DOCKING_SCORE_WEIGHT,
+                candidate.docking_score * route.docking,
             ),
             ("md_score", candidate.dynamics_score),
-            ("md_score_weight", MD_SCORE_WEIGHT),
-            (
-                "md_score_contribution",
-                candidate.dynamics_score * MD_SCORE_WEIGHT,
-            ),
+            ("md_score_weight", route.md),
+            ("md_score_contribution", candidate.dynamics_score * route.md),
             ("final_score", candidate.final_score),
         ];
         components.extend([
@@ -13350,8 +16278,12 @@ fn write_score_decomposition(options: &ScienceOptions) -> Result<(), String> {
         ]);
         for (component, value) in components {
             text.push_str(&format!(
-                "{}\t{component}\t{value:.4}\tGenoLigand\t{}\t{}\n",
-                candidate.candidate_id, RANKING_POLICY_VERSION, policy_digest
+                "{}\t{component}\t{value:.4}\tGenoLigand\t{}\t{}\t{}\t{}\n",
+                candidate.candidate_id,
+                RANKING_POLICY_VERSION,
+                policy_digest,
+                clean_cell(&candidate.input_kind),
+                clean_cell(ranking_policy),
             ));
         }
     }
@@ -14841,7 +17773,12 @@ fn score_row(input: &ComputedFeatureInput, row: &StoreRow) -> f64 {
     if matched.is_empty() {
         0.0
     } else {
-        (matched.len() as f64 / input.tokens.len().max(1) as f64).min(1.0)
+        let eligible_count = input
+            .tokens
+            .iter()
+            .filter(|token| legacy_match_token_is_eligible(token))
+            .count();
+        (matched.len() as f64 / eligible_count.max(1) as f64).min(1.0)
     }
 }
 
@@ -14852,8 +17789,13 @@ fn matched_tokens(input: &ComputedFeatureInput, row: &StoreRow) -> Vec<String> {
     input
         .tokens
         .intersection(&db_tokens)
+        .filter(|token| legacy_match_token_is_eligible(token))
         .cloned()
         .collect::<Vec<_>>()
+}
+
+fn legacy_match_token_is_eligible(token: &str) -> bool {
+    !token.starts_with("qs_")
 }
 
 fn initial_candidate_scope(scope: &str, organism: &str) -> String {
@@ -15049,11 +17991,16 @@ fn merge_match_file(
             candidate_id: candidate_id_for(&input_id, &record_id, &namespace, &target_id),
             input_id,
             record_id,
+            input_kind: String::new(),
+            ranking_policy: String::new(),
             identity_namespace: namespace,
-            target_id,
+            target_id: target_id.clone(),
             target_name: cols[3].clone(),
+            target_class: cols[5].clone(),
             candidate_scope: initial_candidate_scope(scope, &cols[4]),
             organism: cols[4].clone(),
+            sources: BTreeSet::new(),
+            pdb_ids: BTreeSet::new(),
             metadata_quality,
             known_score: 0.0,
             metagenome_score: 0.0,
@@ -15068,6 +18015,7 @@ fn merge_match_file(
                 && (&cols[3], &cols[4]) < (&entry.target_name, &entry.organism))
         {
             entry.target_name = cols[3].clone();
+            entry.target_class = cols[5].clone();
             entry.organism = cols[4].clone();
             entry.candidate_scope = initial_candidate_scope(scope, &cols[4]);
             entry.metadata_quality = metadata_quality;
@@ -15083,6 +18031,10 @@ fn merge_match_file(
             "structure_interaction" => entry.structure_score = entry.structure_score.max(score),
             _ => {}
         }
+        entry.sources.insert(source.clone());
+        entry
+            .pdb_ids
+            .extend(candidate_pdb_ids(&target_id, &cols[7], &evidence));
         append_candidate_evidence(
             &mut entry.evidence,
             &candidate_evidence_summary(&source, &evidence),
@@ -15119,6 +18071,27 @@ fn candidate_evidence_summary(source: &str, evidence: &str) -> String {
         parts.join(";")
     };
     format!("{source}:{summary}")
+}
+
+fn candidate_pdb_ids(target_id: &str, matched_features: &str, evidence: &str) -> Vec<String> {
+    let mut ids = BTreeSet::new();
+    if is_pdb_id(&target_id.to_ascii_uppercase()) {
+        ids.insert(target_id.to_ascii_uppercase());
+    }
+    for value in [matched_features, evidence] {
+        for part in value.split(';') {
+            let Some((key, raw_value)) = part.split_once('=') else {
+                continue;
+            };
+            if matches!(
+                key.trim().to_ascii_lowercase().as_str(),
+                "pdb_id" | "pdb_ids" | "target_chain_pdb_ids"
+            ) {
+                ids.extend(pdb_ids_from_text(raw_value));
+            }
+        }
+    }
+    ids.into_iter().collect()
 }
 
 fn summarize_pdb_id_cell(value: &str, max_ids: usize) -> String {
@@ -15158,11 +18131,16 @@ fn read_candidates(path: &Path) -> Result<Vec<Candidate>, String> {
             candidate_id: cols[1].clone(),
             input_id: cols.get(14).cloned().unwrap_or_default(),
             record_id: cols.get(15).cloned().unwrap_or_default(),
+            input_kind: cols.get(17).cloned().unwrap_or_default(),
+            ranking_policy: cols.get(18).cloned().unwrap_or_default(),
             identity_namespace: cols.get(16).cloned().unwrap_or_default(),
             target_id: cols[2].clone(),
             target_name: cols[3].clone(),
+            target_class: String::new(),
             candidate_scope: cols[4].clone(),
             organism: cols[5].clone(),
+            sources: BTreeSet::new(),
+            pdb_ids: BTreeSet::new(),
             metadata_quality: 0,
             final_score: cols[6].parse().unwrap_or(0.0),
             known_score: cols[7].parse().unwrap_or(0.0),

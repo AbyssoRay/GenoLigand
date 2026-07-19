@@ -446,6 +446,7 @@ fn worker_jobs_and_results_are_bound_to_current_run_invocation() {
         "schema_version": WORKER_SCHEMA_VERSION,
         "job_id": task.job_id,
         "worker": task.worker,
+        "run_id": "run-current",
         "status": "PASS",
         "engine_version": "OpenMM test",
         "execution_status": "completed",
@@ -480,6 +481,69 @@ fn worker_jobs_and_results_are_bound_to_current_run_invocation() {
     ));
 
     fs::remove_dir_all(&root).expect("cleanup temp root");
+}
+
+#[test]
+fn query_structure_jobs_and_results_are_invocation_bound() {
+    let root = temp_root("query_structure_invocation_binding");
+    let run = root.join("run-current");
+    let options = ScienceOptions {
+        workspace_root: root.clone(),
+        science_store: root.join("science_store"),
+        input_manifest: run.join("input.json"),
+        run_dir: run,
+    };
+    let stale_invocation = "invocation-stale";
+    let current_invocation = "invocation-current";
+    let stale_job_id = query_structure_job_id("input_1", "record_1", stale_invocation);
+    let current_job_id = query_structure_job_id("input_1", "record_1", current_invocation);
+    assert_ne!(stale_job_id, current_job_id);
+
+    let task = WorkerTask {
+        job_id: &current_job_id,
+        worker: "query_structure_prepare",
+        module: "genoligand_workers.query_structure_worker",
+        stage: "query_structure_prepare",
+    };
+    let job = json!({
+        "run_id": "run-current",
+        "invocation_id": current_invocation,
+    });
+    let mut result = json!({
+        "schema_version": WORKER_SCHEMA_VERSION,
+        "job_id": stale_job_id,
+        "worker": task.worker,
+        "run_id": "run-current",
+        "invocation_id": stale_invocation,
+        "status": "NOT_APPLICABLE",
+        "engine_version": "test query structure fixture",
+        "execution_status": "not_applicable",
+        "reason": "test_fixture_not_applicable",
+        "outcomes": [{
+            "status": "not_applicable",
+            "reason": "test_fixture_not_applicable",
+            "required": false,
+            "database_id": task.worker,
+            "row_count": 0
+        }],
+        "python_owns_final_score": false,
+        "python_owns_report_semantics": false,
+        "primitive_execution_only": true
+    });
+    assert!(!validate_worker_result_binding(
+        &result, &job, &options, &task
+    ));
+
+    result["job_id"] = json!(current_job_id);
+    assert!(!validate_worker_result_binding(
+        &result, &job, &options, &task
+    ));
+    result["invocation_id"] = json!(current_invocation);
+    assert!(validate_worker_result_binding(
+        &result, &job, &options, &task
+    ));
+
+    fs::remove_dir_all(&root).ok();
 }
 
 #[test]
@@ -841,6 +905,357 @@ fn identical_long_protein_uses_shared_database_and_query_tokens() {
     assert_eq!(rows.len(), 1);
     assert_eq!(score_row(&input, &rows[0]), 1.0);
     assert!(!matched_tokens(&input, &rows[0]).is_empty());
+}
+
+#[test]
+fn query_structure_contract_rejects_identity_path_digest_and_content_tampering() {
+    let root = temp_root("query_structure_contract_tampering");
+    let input = root.join("input.json");
+    let run = root.join("run");
+    write_text(
+        &input,
+        r#"{"inputs":[
+{"field":"small_molecule","value":"CCO"},
+{"field":"genome_or_metagenome","value":">contig\nATGAAATAA"}
+],"files":[]}"#,
+    )
+    .expect("write input");
+    let options = ScienceOptions {
+        workspace_root: root.clone(),
+        science_store: root.join("science_store"),
+        input_manifest: input,
+        run_dir: run,
+    };
+    normalize_input(&options).expect("normalize");
+
+    for field in [
+        "schema_version",
+        "status",
+        "run_id",
+        "job_id",
+        "invocation_id",
+        "input_id",
+        "record_id",
+        "input_kind",
+        "input_digest",
+        "source_content_sha256",
+        "method_version",
+        "features_json",
+        "feature_digest",
+        "coordinate_artifact",
+    ] {
+        let fixture = write_query_structure_contract_fixture(&options, 1).expect("fresh fixture");
+        let mut manifest = read_json_value_if_file(&fixture.ready.manifest).expect("manifest");
+        manifest[field] = json!(format!("tampered_{field}"));
+        write_text(&fixture.ready.manifest, &(manifest.to_string() + "\n")).expect("tamper");
+        assert!(
+            validate_query_structure_contract_fixture(&options).is_err(),
+            "manifest field accepted after tampering: {field}"
+        );
+    }
+
+    for field in [
+        "schema_version",
+        "status",
+        "run_id",
+        "job_id",
+        "invocation_id",
+        "input_id",
+        "record_id",
+        "input_kind",
+        "input_digest",
+        "source_content_sha256",
+        "method_version",
+        "conversion_manifest_sha256",
+        "coordinate_artifact",
+    ] {
+        let fixture = write_query_structure_contract_fixture(&options, 1).expect("fresh fixture");
+        let mut features = read_json_value_if_file(&fixture.ready.features).expect("features");
+        features[field] = json!(format!("tampered_{field}"));
+        write_text(&fixture.ready.features, &(features.to_string() + "\n")).expect("tamper");
+        assert!(
+            validate_query_structure_contract_fixture(&options).is_err(),
+            "feature field accepted after tampering: {field}"
+        );
+    }
+
+    for field in [
+        "run_id",
+        "job_id",
+        "invocation_id",
+        "input_id",
+        "record_id",
+        "input_digest",
+        "source_digest",
+        "status",
+        "manifest",
+        "artifact_path",
+    ] {
+        let fixture = write_query_structure_contract_fixture(&options, 1).expect("fresh fixture");
+        let mut result = read_json_value_if_file(&fixture.ready.result).expect("result");
+        result[field] = json!(format!("tampered_{field}"));
+        write_text(&fixture.ready.result, &(result.to_string() + "\n")).expect("tamper");
+        assert!(
+            validate_query_structure_contract_fixture(&options).is_err(),
+            "result field accepted after tampering: {field}"
+        );
+    }
+
+    let fixture = write_query_structure_contract_fixture(&options, 1).expect("fresh fixture");
+    let mut job = read_json_value_if_file(&fixture.ready.job).expect("job");
+    job["source_digest"] = json!("0".repeat(64));
+    write_text(&fixture.ready.job, &(job.to_string() + "\n")).expect("tamper job");
+    assert!(validate_query_structure_contract_fixture(&options).is_err());
+
+    let fixture = write_query_structure_contract_fixture(&options, 1).expect("fresh fixture");
+    let mut features = read_json_value_if_file(&fixture.ready.features).expect("features");
+    features["physicochemical"]["hydrogen_bond_donors"] = json!(9);
+    write_text(&fixture.ready.features, &(features.to_string() + "\n")).expect("tamper content");
+    assert!(validate_query_structure_contract_fixture(&options).is_err());
+
+    write_query_structure_contract_fixture(&options, 1).expect("fresh fixture");
+    let index = read_text(&options.run_dir.join("query_structure_manifest.tsv")).expect("index");
+    write_text(
+        &options.run_dir.join("query_structure_manifest.tsv"),
+        &index.replacen(QUERY_STRUCTURE_MANIFEST_HEADER, "input_id\trecord_id", 1),
+    )
+    .expect("tamper header");
+    assert!(validate_query_structure_contract_fixture(&options).is_err());
+
+    write_query_structure_contract_fixture(&options, 1).expect("fresh fixture");
+    let mut lines = read_text(&options.run_dir.join("query_structure_manifest.tsv"))
+        .expect("index")
+        .lines()
+        .map(ToOwned::to_owned)
+        .collect::<Vec<_>>();
+    lines[1].push_str("\textra");
+    write_text(
+        &options.run_dir.join("query_structure_manifest.tsv"),
+        &(lines.join("\n") + "\n"),
+    )
+    .expect("tamper columns");
+    assert!(validate_query_structure_contract_fixture(&options).is_err());
+    fs::remove_dir_all(root).expect("cleanup");
+}
+
+#[test]
+fn query_structure_ready_and_not_applicable_inputs_are_retained_with_bounded_tokens() {
+    let root = temp_root("query_structure_ready_and_na");
+    let input = root.join("input.json");
+    let run = root.join("run");
+    write_text(
+        &input,
+        r#"{"inputs":[
+{"field":"small_molecule","value":"CCO"},
+{"field":"genome_or_metagenome","value":">contig\nATGAAATAA"}
+],"files":[]}"#,
+    )
+    .expect("write input");
+    let options = ScienceOptions {
+        workspace_root: root.clone(),
+        science_store: root.join("science_store"),
+        input_manifest: input,
+        run_dir: run,
+    };
+    normalize_input(&options).expect("normalize");
+    let fixture = write_query_structure_contract_fixture(&options, 2).expect("query fixture");
+    let expected_query_tokens = query_structure_feature_rows(
+        &read_json_value_if_file(&fixture.ready.features).expect("features"),
+        "small_molecule",
+    )
+    .expect("compact features")
+    .into_iter()
+    .map(|row| row.token)
+    .collect::<BTreeSet<_>>();
+    compute_features(&options).expect("compute features");
+    let feature_path = options.run_dir.join("feature_manifest.tsv");
+    let feature_text = read_text(&feature_path).expect("feature text");
+    let computed = read_computed_feature_inputs(&feature_path).expect("computed features");
+    assert_eq!(computed.len(), 2);
+    let ready = computed
+        .iter()
+        .find(|input| input.input_kind == "small_molecule")
+        .expect("ready input");
+    assert!(expected_query_tokens.is_subset(&ready.tokens));
+    assert!(
+        computed
+            .iter()
+            .find(|input| input.input_kind == "genome_or_metagenome")
+            .is_some_and(|input| input.tokens.iter().all(|token| !token.starts_with("qs_")))
+    );
+    assert!(feature_text.contains("\tpreparation_status\tready\t"));
+    assert!(feature_text.contains("\tpreparation_status\tnot_applicable\t"));
+    assert!(!feature_text.contains("packed_hex"));
+    assert!(!feature_text.contains("representative_points"));
+    assert!(expected_query_tokens.len() <= MAX_QUERY_STRUCTURE_FEATURE_ROWS);
+    assert!(fs::metadata(&feature_path).expect("feature metadata").len() < 64 * 1024);
+
+    let sequence_rows = query_structure_feature_rows(
+        &json!({
+            "sequence_sha256": "f".repeat(64),
+            "sequence_features": {
+                "length": 4,
+                "composition": {"A": 2, "D": 1, "V": 1},
+                "estimated_net_charge_ph7": -1.0,
+                "mean_kyte_doolittle_hydropathy": 1.0,
+                "hydrophobic_fraction": 0.75,
+                "secondary_structure_propensity": {
+                    "method": "fixture",
+                    "alpha_helix": 1.1,
+                    "beta_sheet": 0.9,
+                    "turn": 0.8,
+                },
+            },
+        }),
+        "protein_ligand",
+    )
+    .expect("sequence-prior features");
+    assert!(sequence_rows.iter().any(|row| row.name == "alpha_helix"));
+    assert!(sequence_rows.len() <= MAX_QUERY_STRUCTURE_FEATURE_ROWS);
+
+    let coordinate_rows = query_structure_feature_rows(
+        &json!({
+            "source_content_sha256": "e".repeat(64),
+            "structure": {
+                "format": "pdb",
+                "atom_count": 4,
+                "heavy_atom_count": 4,
+                "chain_count": 1,
+                "residue_count": 2,
+                "element_counts": {"C": 2, "N": 1, "O": 1},
+                "residue_counts": {"ALA": 1, "GLY": 1},
+                "bounding_box_min_angstrom": [0.0, 0.0, 0.0],
+                "bounding_box_max_angstrom": [10.0, 5.0, 2.5],
+                "radius_of_gyration_angstrom": 3.5,
+                "coordinate_sha256": "e".repeat(64),
+            },
+        }),
+        "complex",
+    )
+    .expect("coordinate features");
+    assert!(
+        coordinate_rows
+            .iter()
+            .any(|row| row.name == "sorted_extent_3_angstrom")
+    );
+    assert!(coordinate_rows.len() <= MAX_QUERY_STRUCTURE_FEATURE_ROWS);
+    fs::remove_dir_all(root).expect("cleanup");
+}
+
+#[test]
+fn query_structure_tokens_are_excluded_from_legacy_match_scores() {
+    let query_rows =
+        query_structure_feature_rows(&query_structure_small_molecule_fixture(1), "small_molecule")
+            .expect("query structure features");
+    let query_token = query_rows
+        .iter()
+        .find(|row| row.name == "hydrogen_bond_donors")
+        .expect("query structure token")
+        .token
+        .clone();
+    assert!(query_token.starts_with("qs_"));
+    let input = ComputedFeatureInput {
+        input_id: "input_1".to_string(),
+        record_id: "record_1".to_string(),
+        input_kind: "small_molecule".to_string(),
+        tokens: BTreeSet::from(["ethanol".to_string(), query_token.clone()]),
+    };
+    let row = StoreRow {
+        source: "fixture".to_string(),
+        target_id: "TARGET".to_string(),
+        target_name: "TARGET".to_string(),
+        organism: "test".to_string(),
+        target_class: "structure_interaction".to_string(),
+        ligand_tokens: BTreeSet::from(["ethanol".to_string(), query_token.clone()]),
+        sequence_tokens: BTreeSet::new(),
+        structure_tokens: BTreeSet::from([query_token]),
+        evidence: "query_structure_feature_fixture".to_string(),
+    };
+    assert_eq!(matched_tokens(&input, &row), vec!["ethanol".to_string()]);
+    assert_eq!(score_row(&input, &row), 1.0);
+    assert_eq!(
+        input
+            .tokens
+            .iter()
+            .filter(|token| structure_match_token_is_informative(token))
+            .count(),
+        1
+    );
+    assert_eq!(
+        structure_matched_tokens(&input, &row),
+        vec!["ethanol".to_string()]
+    );
+}
+
+#[test]
+fn ligand_similarity_rows_bind_to_the_current_query_structure_features() {
+    let root = temp_root("ligand_similarity_current_query_binding");
+    let input = root.join("input.json");
+    let run = root.join("run");
+    write_text(
+        &input,
+        r#"{"inputs":[
+{"field":"small_molecule","value":"CCO"},
+{"field":"genome_or_metagenome","value":">contig\nATGAAATAA"}
+],"files":[]}"#,
+    )
+    .expect("write input");
+    let options = science_options(&root, &input, &run);
+    let publication = write_compact_ligand_similarity_publication_fixture(&options.science_store)
+        .expect("compact publication");
+    let publication_fields = compact_publication_fields_fixture(&publication);
+    normalize_input(&options).expect("normalize");
+    write_query_structure_contract_fixture(&options, 1).expect("initial query structure");
+    let initial = read_query_structure_index(&run.join("query_structure_manifest.tsv"))
+        .expect("initial query structure index")
+        .into_iter()
+        .find(|row| row.status == "ready")
+        .expect("ready query structure");
+    let query_id = ligand_similarity_query_id(
+        &initial.input_id,
+        &initial.record_id,
+        &initial.feature_digest,
+        "ChEMBL",
+        "CHEMBL_T1",
+        "CCO",
+    );
+    let current_row = format!(
+        "input_id\tsource\ttarget_id\ttarget_name\torganism\ttarget_class\tmatch_score\tmatched_features\tevidence\tsource_row_provenance\tactivity_value\tligand_identity\tcurrent_run_query_id\trecord_id\n{}\tChEMBL\tCHEMBL_T1\tTarget one\tHomo sapiens\tenzyme\t0.9000\tcanonical_smiles=CCO;tanimoto=1.0\tligand_similarity_index;query_feature_digest={};{}\tligand_similarity_index;{}\tKi=12 nM\tligand_smiles=CCO\t{}\t{}\n",
+        initial.input_id,
+        initial.feature_digest,
+        publication_fields,
+        publication_fields,
+        query_id,
+        initial.record_id,
+    );
+    write_text(&run.join("known_database_matches.tsv"), &current_row).expect("current match row");
+    validate_ligand_similarity_query_bindings(&options).expect("current row accepted");
+
+    let forged_query_id = "0".repeat(64);
+    write_text(
+        &run.join("known_database_matches.tsv"),
+        &current_row.replace(&query_id, &forged_query_id),
+    )
+    .expect("forged query id row");
+    let error = validate_ligand_similarity_query_bindings(&options)
+        .expect_err("forged query id must be rejected");
+    assert!(error.contains("query_id"), "unexpected error: {error}");
+
+    write_text(&run.join("known_database_matches.tsv"), &current_row).expect("restore old row");
+    write_query_structure_contract_fixture(&options, 4).expect("rerun query structure");
+    let current = read_query_structure_index(&run.join("query_structure_manifest.tsv"))
+        .expect("current query structure index")
+        .into_iter()
+        .find(|row| row.status == "ready")
+        .expect("current ready query structure");
+    assert_ne!(initial.feature_digest, current.feature_digest);
+    let error = validate_ligand_similarity_query_bindings(&options)
+        .expect_err("stale feature row must be rejected");
+    assert!(
+        error.contains("feature_digest"),
+        "unexpected stale-row error: {error}"
+    );
+    fs::remove_dir_all(root).expect("cleanup");
 }
 
 #[test]
@@ -3021,49 +3436,173 @@ fn known_matching_uses_bindingdb_query_index_after_source_archive_removal() {
 }
 
 #[test]
-fn prepare_science_store_publishes_source_bound_bindingdb_query_database() {
-    let root = temp_root("bindingdb_query_publish");
+fn prepare_science_store_migrates_legacy_ligand_queries_to_compact_authority() {
+    let root = temp_root("ligand_similarity_migration");
     let store = root.join("science_store");
-    let source = store.join(BINDINGDB_SOURCE_REL_PATH);
-    write_zip(
-        &source,
-        "BindingDB_All.tsv",
-        "Ligand SMILES\tBindingDB Ligand Name\tTarget Name\tTarget Source Organism According to Curator or DataSource\tKi (nM)\tUniProt (SwissProt) Primary ID of Target Chain 1\nCCO\tethanol\tTarget one\tHomo sapiens\t12\tP_ONE\n",
+    install_ligand_similarity_builder_fixture(&root, false).expect("similarity builder");
+    write_ligand_similarity_staging_fixture(&store).expect("legacy ligand staging");
+    let options = StoreOptions {
+        workspace_root: root.clone(),
+        science_store: store.clone(),
+    };
+    let chembl_database = store.join("downloads/chembl/chembl_query.sqlite");
+    let bindingdb_database = store.join(BINDINGDB_QUERY_DATABASE_REL_PATH);
+    let stale_paths = [
+        PathBuf::from(format!("{}-wal", chembl_database.display())),
+        PathBuf::from(format!("{}-shm", bindingdb_database.display())),
+        store.join("downloads/chembl/.chembl_query_stale.sqlite"),
+        store.join("indexes/bindingdb/.bindingdb_query_stale.sqlite"),
+        store.join("downloads/chembl/.chembl_query.sha256_cache/stale.json"),
+    ];
+    for path in &stale_paths {
+        write_text(path, "stale\n").expect("stale legacy artifact");
+    }
+
+    run_store_command(ScienceCommand::PrepareScienceStore, &options).expect("prepare store");
+
+    validate_ligand_similarity_runtime_contract(&options).expect("compact authority");
+    assert!(!superseded_ligand_query_artifacts_present(&store).expect("legacy scan"));
+    for path in superseded_ligand_query_fixed_paths(&store)
+        .into_iter()
+        .chain(stale_paths)
+    {
+        assert!(
+            !path.exists(),
+            "legacy artifact retained: {}",
+            path.display()
+        );
+    }
+    let build_manifest =
+        read_text(&store.join("index_build_manifest.tsv")).expect("build manifest");
+    assert!(build_manifest.contains("compact_ligand_similarity_used_by_onsite_matcher"));
+    assert!(build_manifest.contains("compact_ligand_similarity_is_authoritative"));
+    assert!(!build_manifest.contains("published_chembl_query_used_by_onsite_matcher"));
+    let known_targets = read_text(&store.join("indexes/known_targets.tsv")).expect("known targets");
+    assert!(!known_targets.contains("P_ONE"));
+    let status: Value = serde_json::from_str(
+        &read_text(&store.join("install_status.json")).expect("install status"),
     )
-    .expect("BindingDB zip");
-    write_test_source_manifest(&store, &["bindingdb"]).expect("BindingDB source manifest");
+    .expect("install status JSON");
+    assert_eq!(status["required_items"], 5);
+    assert_eq!(status["ligand_similarity_detail"], "ready");
+
+    let compact = store.join(LIGAND_SIMILARITY_DATABASE_REL_PATH);
+    let initial_digest = sha256_file_hex(&compact).expect("compact digest");
+    install_ligand_similarity_builder_fixture(&root, true).expect("failing builder sentinel");
+    prepare_ligand_similarity_authority(&options).expect("idempotent compact reuse");
+    assert_eq!(
+        sha256_file_hex(&compact).expect("reused compact digest"),
+        initial_digest
+    );
+    assert!(!store.join(BINDINGDB_QUERY_DATABASE_REL_PATH).exists());
+    fs::remove_dir_all(&root).expect("cleanup temp root");
+}
+
+#[test]
+fn failed_compact_ligand_build_keeps_all_legacy_staging() {
+    let root = temp_root("ligand_similarity_build_failure");
+    let store = root.join("science_store");
+    install_ligand_similarity_builder_fixture(&root, true).expect("failing builder");
+    write_ligand_similarity_staging_fixture(&store).expect("legacy ligand staging");
+    let sidecar = PathBuf::from(format!(
+        "{}-wal",
+        store.join(BINDINGDB_QUERY_DATABASE_REL_PATH).display()
+    ));
+    write_text(&sidecar, "recoverable staging\n").expect("staging sidecar");
     let options = StoreOptions {
         workspace_root: root.clone(),
         science_store: store.clone(),
     };
 
-    run_store_command(ScienceCommand::PrepareScienceStore, &options).expect("prepare store");
+    let out = run_store_command(ScienceCommand::PrepareScienceStore, &options)
+        .expect("prepare records repair state");
 
-    let database = store.join(BINDINGDB_QUERY_DATABASE_REL_PATH);
-    let manifest = store.join(BINDINGDB_QUERY_MANIFEST_REL_PATH);
-    let value: Value = serde_json::from_str(&read_text(&manifest).expect("query manifest"))
-        .expect("query manifest JSON");
-    assert!(database.is_file());
-    assert_eq!(
-        value["schema_version"],
-        BINDINGDB_QUERY_MANIFEST_SCHEMA_VERSION
-    );
-    assert_eq!(value["status"], "ready");
-    assert_eq!(value["table"], "genoligand_bindingdb_activity");
-    assert_eq!(value["rows"], 1);
-    assert_eq!(value["source_digest"], test_source_digest("bindingdb"));
-    assert_eq!(
-        value["source_archive_sha256"],
-        sha256_file_hex(&source).expect("source sha256")
-    );
-    assert_eq!(
-        value["database_sha256"],
-        sha256_file_hex(&database).expect("database sha256")
-    );
-    fs::remove_file(&source).expect("remove source archive");
-    validate_bindingdb_query_runtime_contract(&store, &database, &manifest)
-        .expect("published query database remains valid after source cleanup");
+    assert!(out.contains("status=needs_repair"));
+    for path in [
+        store.join("downloads/chembl/chembl_query.sqlite"),
+        store.join(CHEMBL_QUERY_MANIFEST_REL_PATH),
+        store.join(BINDINGDB_QUERY_DATABASE_REL_PATH),
+        store.join(BINDINGDB_QUERY_MANIFEST_REL_PATH),
+        sidecar,
+    ] {
+        assert!(
+            path.exists(),
+            "recoverable staging removed: {}",
+            path.display()
+        );
+    }
+    assert!(!store.join(LIGAND_SIMILARITY_DATABASE_REL_PATH).exists());
+    assert!(!store.join(LIGAND_SIMILARITY_MANIFEST_REL_PATH).exists());
+    let status = read_text(&store.join("install_status.json")).expect("install status");
+    assert!(status.contains("ligand_similarity_build_python_failed"));
     fs::remove_dir_all(&root).expect("cleanup temp root");
+}
+
+#[test]
+fn compact_known_rows_bind_to_the_current_database_and_manifest_publication() {
+    let root = temp_root("compact_known_row_publication");
+    let store = root.join("science_store");
+    let run = root.join("run");
+    let options = ScienceOptions {
+        workspace_root: root.clone(),
+        science_store: store.clone(),
+        input_manifest: root.join("input.json"),
+        run_dir: run.clone(),
+    };
+    write_test_source_manifest(&store, &["chembl"]).expect("source manifest");
+    write_text(&run.join(PIPELINE_INVOCATION_FILE), "publication-test\n")
+        .expect("pipeline invocation");
+    let publication =
+        write_compact_ligand_similarity_publication_fixture(&store).expect("publication fixture");
+    let result_path = run.join("compact_rows.tsv");
+    let write_row = |publication: &LigandSimilarityPublication| {
+        write_text(&result_path, &compact_known_row_fixture(publication))
+    };
+    let validate = || append_bound_known_rows(&options, &result_path, &mut Vec::new());
+
+    write_row(&publication).expect("valid row");
+    validate().expect("current publication accepted");
+
+    let database = store.join(LIGAND_SIMILARITY_DATABASE_REL_PATH);
+    std::thread::sleep(std::time::Duration::from_millis(2));
+    write_text(&database, "compact-publication-database-v2\n").expect("same-size database tamper");
+    let error = validate().expect_err("database content tamper rejected");
+    assert!(
+        error.contains("database_digest"),
+        "unexpected error: {error}"
+    );
+    std::thread::sleep(std::time::Duration::from_millis(2));
+    write_text(&database, "compact-publication-database-v1\n").expect("restore database");
+
+    let manifest = store.join(LIGAND_SIMILARITY_MANIFEST_REL_PATH);
+    let manifest_text = read_text(&manifest).expect("manifest");
+    write_text(&manifest, &(manifest_text.clone() + "\n")).expect("manifest byte tamper");
+    let error = validate().expect_err("manifest digest tamper rejected");
+    assert!(
+        error.contains("compact_manifest_sha256"),
+        "unexpected error: {error}"
+    );
+    write_text(&manifest, &manifest_text).expect("restore manifest");
+
+    let mut schema_tamper = publication.clone();
+    schema_tamper.schema_version = "genoligand_ligand_similarity_index_v1".to_string();
+    write_row(&schema_tamper).expect("schema tamper row");
+    let error = validate().expect_err("schema marker tamper rejected");
+    assert!(
+        error.contains("compact_schema_version"),
+        "unexpected error: {error}"
+    );
+
+    let mut identity_tamper = publication.clone();
+    identity_tamper.build_identity = "f".repeat(64);
+    write_row(&identity_tamper).expect("identity tamper row");
+    let error = validate().expect_err("build identity marker tamper rejected");
+    assert!(
+        error.contains("compact_build_identity"),
+        "unexpected error: {error}"
+    );
+
+    fs::remove_dir_all(root).expect("cleanup");
 }
 
 #[test]
@@ -3732,13 +4271,25 @@ fn known_matching_deduplicates_onsite_hits_and_downweights_token_noise() {
 
 #[test]
 fn bindingdb_complex_pdb_parser_ignores_target_chain_structures() {
-    let ids = bindingdb_complex_pdb_ids(
-        "ligand_code=AZM;pdb_ids=3HS4,2H4N;target_chain_pdb_ids=1YM3,2A5V",
-    );
+    let evidence = "ligand_code=AZM;pdb_ids=3HS4,2H4N;target_chain_pdb_ids=1YM3,2A5V";
+    let ids = bindingdb_complex_pdb_ids(evidence);
     assert_eq!(ids, vec!["2H4N".to_string(), "3HS4".to_string()]);
 
     let chain_only = bindingdb_complex_pdb_ids("pdb_ids=;target_chain_pdb_ids=1YM3,2A5V");
     assert!(chain_only.is_empty());
+
+    assert_eq!(
+        candidate_pdb_ids("P00918", "", evidence),
+        vec![
+            "1YM3".to_string(),
+            "2A5V".to_string(),
+            "2H4N".to_string(),
+            "3HS4".to_string(),
+        ]
+    );
+    let summary = candidate_evidence_summary("BindingDB", evidence);
+    assert!(summary.contains("pdb_ids=3HS4,2H4N"));
+    assert!(summary.contains("target_chain_pdb_ids=1YM3,2A5V"));
 }
 
 #[test]
@@ -3973,8 +4524,19 @@ fn structure_and_dynamics_reject_unbound_tool_outputs_from_prior_runs() {
     };
     run_science_command(ScienceCommand::InputNormalize, &options).expect("normalize");
     run_science_command(ScienceCommand::FeaturesCompute, &options).expect("features");
+    let invocation_before_structure =
+        read_text(&run.join(WORKER_INVOCATION_FILE)).expect("worker invocation");
     let structure =
         run_science_command(ScienceCommand::StructureEvaluate, &options).expect("structure");
+    assert_eq!(
+        read_text(&run.join(WORKER_INVOCATION_FILE)).expect("worker invocation after structure"),
+        invocation_before_structure
+    );
+    assert!(
+        read_text(&run.join("tool_outputs/docking_summary.tsv"))
+            .expect("preserved docking output")
+            .contains("worker_pose")
+    );
     let dynamics = run_science_command(ScienceCommand::DynamicsScreen, &options).expect("dynamics");
     let structure_text =
         read_text(&run.join("structure_patch_summary.tsv")).expect("structure summary");
@@ -3982,7 +4544,7 @@ fn structure_and_dynamics_reject_unbound_tool_outputs_from_prior_runs() {
     let md_text = read_text(&run.join("md_summary.tsv")).expect("md summary");
 
     assert!(structure.contains("structure_artifact=ready"));
-    assert!(structure.contains("docking_artifact=not_ready"));
+    assert!(!structure.contains("docking_artifact="));
     assert!(
         dynamics.contains("md_artifact=not_ready"),
         "unexpected dynamics result: {dynamics}"
@@ -4128,8 +4690,6 @@ fn md_summary_score_participates_in_ranking_and_report() {
     let evidence = read_text(&run.join("evidence_ledger.tsv")).expect("evidence");
     let score = read_text(&run.join("score_decomposition.tsv")).expect("score");
     let report = read_text(&run.join("research_report.md")).expect("report");
-    let source_map = read_text(&run.join("artifact_source_map.tsv")).expect("source map");
-
     assert!(finalized.contains(&format!("pipeline_invocation_id={invocation_id}")));
     assert_eq!(
         read_text(&run.join(PIPELINE_INVOCATION_FILE))
@@ -4148,7 +4708,10 @@ fn md_summary_score_participates_in_ranking_and_report() {
         assert_eq!(sha256_file_hex(&path).as_deref(), Some(digest.as_str()));
     }
     assert!(ranking.contains(&candidate_id));
-    assert!(ranking.contains("0.6050\t1.0000\t0.0000\t0.0000\t0.6667\t0.7167"));
+    assert!(ranking.contains("0.6933\t1.0000\t0.0000\t0.0000\t0.6667\t0.7167"));
+    assert!(ranking.contains(
+        "\tsmall_molecule\tsmall_molecule_route_v1\t0.4500\t0.0000\t0.2000\t0.1500\t0.2000"
+    ));
     for fact in [
         "ChEMBL:chembl_activity_row",
         "source_id=chembl",
@@ -4158,20 +4721,38 @@ fn md_summary_score_participates_in_ranking_and_report() {
         assert!(ranking.contains(fact), "ranking missing {fact}");
     }
     assert!(detail.contains("\"md\":0.7167"));
+    assert!(detail.contains("\"input_kind\":\"small_molecule\""));
+    assert!(detail.contains("\"ranking_policy\":\"small_molecule_route_v1\""));
+    assert!(detail.contains("\"metagenome\":0.0"));
+    assert!(score.contains("\tsmall_molecule\tsmall_molecule_route_v1"));
     assert!(detail.contains("tool_outputs/md/"));
     assert!(detail.contains("md_run_manifest.json"));
     assert!(detail.contains("complex_md_manifest.json"));
     assert!(detail.contains("ligand_placement.tsv"));
-    assert!(
-        evidence.contains("md_stability_score feeds md_score and final_score with weight 0.10")
-    );
+    assert!(evidence.contains("final-score contribution follows each candidate ranking_policy"));
     assert!(evidence.contains("1 rows include md_score from current run MD Summary"));
     assert!(score.contains(&format!(
-        "{candidate_id}\tmd_score_contribution\t0.0717\tGenoLigand"
+        "{candidate_id}\tmd_score_contribution\t0.1433\tGenoLigand"
     )));
     assert!(report.contains("md_stability_score"));
-    assert!(report.contains("0.10"));
-    assert!(source_map.contains("target_candidate_ranking.tsv\tknown_database_matches.tsv;metagenome_potential_matches.tsv;structure_interaction_matches.tsv;md_summary.tsv"));
+    assert!(report.contains("input_kind"));
+    assert!(report.contains("md_weight"));
+    let source_rows =
+        read_simple_tsv_rows(&run.join("artifact_source_map.tsv")).expect("source-map rows");
+    let ranking_source = source_rows
+        .iter()
+        .find(|row| row.get("artifact").map(String::as_str) == Some("target_candidate_ranking.tsv"))
+        .expect("ranking source-map row");
+    assert_eq!(
+        ranking_source.get("upstream_source").map(String::as_str),
+        Some(
+            "input_conversion_manifest.tsv;known_database_matches.tsv;metagenome_potential_matches.tsv;structure_interaction_matches.tsv;docking_summary.tsv;md_summary.tsv"
+        )
+    );
+    assert_eq!(
+        ranking_source.get("downstream_use").map(String::as_str),
+        Some("candidate_detail.json;score_decomposition.tsv")
+    );
     fs::remove_dir_all(&root).expect("cleanup temp root");
     assert!(!root.exists());
 }
@@ -4191,27 +4772,26 @@ fn ranking_policy_digest_is_bound_to_context_decomposition_and_report() {
     };
     write_text(
         &run.join("target_candidate_ranking.tsv"),
-        "rank\tcandidate_id\ttarget_id\ttarget_name\tcandidate_scope\torganism\tfinal_score\tknown_database_score\tmetagenome_score\tstructure_score\tdocking_score\tmd_score\tevidence_summary\tstatus\tinput_id\trecord_id\tidentity_namespace\n1\tcandidate_policy\tT1\tTarget 1\tknown_database\tHomo sapiens\t0.3500\t0.4000\t0.3000\t0.2000\t0.1000\t0.5000\tpolicy fixture\tPASS\tinput_1\trecord_1\tuniprot\n",
+        "rank\tcandidate_id\ttarget_id\ttarget_name\tcandidate_scope\torganism\tfinal_score\tknown_database_score\tmetagenome_score\tstructure_score\tdocking_score\tmd_score\tevidence_summary\tstatus\tinput_id\trecord_id\tidentity_namespace\tinput_kind\tranking_policy\tknown_database_weight\tmetagenome_weight\tstructure_weight\tdocking_weight\tmd_weight\n1\tcandidate_policy\tT1\tTarget 1\tknown_database\tHomo sapiens\t0.3350\t0.4000\t0.3000\t0.2000\t0.1000\t0.5000\tpolicy fixture\tPASS\tinput_1\trecord_1\tuniprot\tsmall_molecule\tsmall_molecule_route_v1\t0.4500\t0.0000\t0.2000\t0.1500\t0.2000\n",
     )
     .expect("ranking fixture");
 
     let expected_policy = json!({
-        "schema_version": "genoligand_target_ranking_v1",
-        "known_database_weight": 0.50,
-        "metagenome_weight": 0.25,
-        "structure_weight": 0.10,
-        "docking_weight": 0.05,
-        "md_weight": 0.10,
+        "schema_version": "genoligand_target_ranking_v3",
+        "score_semantics": "input_kind_route_weighted_sum",
+        "shortlist_score_semantics": "route_weights_renormalized_over_known_metagenome_structure",
+        "routes": {
+            "small_molecule": {"ranking_policy":"small_molecule_route_v1","known_database_weight":0.45,"metagenome_weight":0.0,"structure_weight":0.20,"docking_weight":0.15,"md_weight":0.20,"preliminary_known_database_weight":0.6923076923076923,"preliminary_metagenome_weight":0.0,"preliminary_structure_weight":0.3076923076923077},
+            "peptide": {"ranking_policy":"peptide_route_v2","known_database_weight":0.30,"metagenome_weight":0.20,"structure_weight":0.50,"docking_weight":0.0,"md_weight":0.0,"preliminary_known_database_weight":0.30,"preliminary_metagenome_weight":0.20,"preliminary_structure_weight":0.50},
+            "protein_ligand": {"ranking_policy":"protein_ligand_route_v2","known_database_weight":0.20,"metagenome_weight":0.10,"structure_weight":0.70,"docking_weight":0.0,"md_weight":0.0,"preliminary_known_database_weight":0.20,"preliminary_metagenome_weight":0.10,"preliminary_structure_weight":0.70},
+            "complex": {"ranking_policy":"complex_route_v2","known_database_weight":0.15,"metagenome_weight":0.05,"structure_weight":0.80,"docking_weight":0.0,"md_weight":0.0,"preliminary_known_database_weight":0.15,"preliminary_metagenome_weight":0.05,"preliminary_structure_weight":0.80},
+            "genome_or_metagenome": {"ranking_policy":"genome_or_metagenome_route_v1","known_database_weight":0.45,"metagenome_weight":0.55,"structure_weight":0.0,"docking_weight":0.0,"md_weight":0.0,"preliminary_known_database_weight":0.45,"preliminary_metagenome_weight":0.55,"preliminary_structure_weight":0.0},
+            "fallback": {"ranking_policy":"fallback_route_v2","known_database_weight":0.50,"metagenome_weight":0.30,"structure_weight":0.20,"docking_weight":0.0,"md_weight":0.0,"preliminary_known_database_weight":0.50,"preliminary_metagenome_weight":0.30,"preliminary_structure_weight":0.20},
+        },
     });
-    let expected_digest = "aacee02f2226d92881a901dd96d3cf040694d2530ad62e1028e7f590fa7f713d";
+    let expected_digest = canonical_json_sha256(&expected_policy);
     assert_eq!(ranking_policy_value(), expected_policy);
     assert_eq!(ranking_policy_digest(), expected_digest);
-    let weight_sum = KNOWN_SCORE_WEIGHT
-        + METAGENOME_SCORE_WEIGHT
-        + STRUCTURE_SCORE_WEIGHT
-        + DOCKING_SCORE_WEIGHT
-        + MD_SCORE_WEIGHT;
-    assert!((weight_sum - 1.0).abs() < f64::EPSILON);
 
     write_run_context(&options, "completed", &[]).expect("run context");
     write_score_decomposition(&options).expect("decomposition");
@@ -4227,24 +4807,122 @@ fn ranking_policy_digest_is_bound_to_context_decomposition_and_report() {
     assert!(!rows.is_empty());
     assert!(rows.iter().all(|row| {
         let columns = row.split('\t').collect::<Vec<_>>();
-        columns.get(4) == Some(&RANKING_POLICY_VERSION) && columns.get(5) == Some(&expected_digest)
+        columns.get(4) == Some(&RANKING_POLICY_VERSION)
+            && columns.get(5).copied() == Some(expected_digest.as_str())
+            && columns.get(6) == Some(&"small_molecule")
+            && columns.get(7) == Some(&"small_molecule_route_v1")
     }));
     for expected in [
-        "known_database_score_weight\t0.5000",
-        "metagenome_score_weight\t0.2500",
-        "structure_score_weight\t0.1000",
-        "docking_score_weight\t0.0500",
-        "md_score_weight\t0.1000",
-        "final_score\t0.3500",
+        "known_database_score_weight\t0.4500",
+        "metagenome_score_weight\t0.0000",
+        "structure_score_weight\t0.2000",
+        "docking_score_weight\t0.1500",
+        "md_score_weight\t0.2000",
+        "final_score\t0.3350",
     ] {
         assert!(decomposition.contains(expected), "missing {expected}");
     }
 
     let report = report_source_summary(&options, 1);
     assert!(report.contains(RANKING_POLICY_VERSION));
-    assert!(report.contains(expected_digest));
+    assert!(report.contains(&expected_digest));
     fs::remove_dir_all(&root).expect("cleanup temp root");
     assert!(!root.exists());
+}
+
+#[test]
+fn ranking_routes_sum_to_one_and_ignore_inapplicable_channels() {
+    for input_kind in [
+        "small_molecule",
+        "peptide",
+        "protein_ligand",
+        "complex",
+        "genome_or_metagenome",
+        "unknown",
+    ] {
+        let route = ranking_route(input_kind);
+        assert!(
+            (route.weight_sum() - 1.0).abs() < 1e-9,
+            "weights do not sum to one for {input_kind}"
+        );
+        let (known, metagenome, structure) = route.preliminary_weights();
+        assert!(
+            (known + metagenome + structure - 1.0).abs() < 1e-9,
+            "preliminary weights do not sum to one for {input_kind}"
+        );
+    }
+
+    let small_molecule = ranking_route("small_molecule");
+    assert_eq!(small_molecule.metagenome, 0.0);
+    assert_eq!(
+        small_molecule.score_components(0.8, 0.0, 0.6, 0.5, 0.4),
+        small_molecule.score_components(0.8, 1.0, 0.6, 0.5, 0.4),
+    );
+
+    let genome = ranking_route("genome_or_metagenome");
+    assert_eq!(
+        (genome.structure, genome.docking, genome.md),
+        (0.0, 0.0, 0.0)
+    );
+    assert_eq!(
+        genome.score_components(0.7, 0.6, 0.0, 0.0, 0.0),
+        genome.score_components(0.7, 0.6, 1.0, 1.0, 1.0),
+    );
+    for input_kind in ["peptide", "protein_ligand", "complex"] {
+        let route = ranking_route(input_kind);
+        assert_eq!((route.docking, route.md), (0.0, 0.0));
+        assert_eq!(route.score_components(1.0, 1.0, 1.0, 0.0, 0.0), 1.0);
+    }
+    assert_eq!(
+        small_molecule.score_components(1.0, 0.0, 1.0, 1.0, 1.0),
+        1.0
+    );
+    assert_eq!(genome.score_components(1.0, 1.0, 0.0, 0.0, 0.0), 1.0);
+    assert!(ranking_route("complex").structure > ranking_route("complex").known);
+    assert!(ranking_route("protein_ligand").structure > ranking_route("protein_ligand").known);
+}
+
+#[test]
+fn target_ranking_orders_by_input_record_and_resets_group_rank() {
+    let candidate = |candidate_id: &str, input_id: &str, final_score: f64| Candidate {
+        candidate_id: candidate_id.to_string(),
+        input_id: input_id.to_string(),
+        record_id: "record_1".to_string(),
+        input_kind: "small_molecule".to_string(),
+        ranking_policy: "small_molecule_route_v1".to_string(),
+        identity_namespace: "chembl".to_string(),
+        target_id: candidate_id.to_string(),
+        target_name: candidate_id.to_string(),
+        target_class: "enzyme".to_string(),
+        candidate_scope: "known_human_protein".to_string(),
+        organism: "Homo sapiens".to_string(),
+        sources: BTreeSet::new(),
+        pdb_ids: BTreeSet::new(),
+        metadata_quality: 0,
+        known_score: 0.0,
+        metagenome_score: 0.0,
+        structure_score: 0.0,
+        docking_score: 0.0,
+        dynamics_score: 0.0,
+        final_score,
+        evidence: String::new(),
+    };
+    let mut candidates = vec![
+        candidate("input_2_high", "input_2", 0.95),
+        candidate("input_1_low", "input_1", 0.20),
+        candidate("input_1_high", "input_1", 0.80),
+    ];
+
+    sort_ranked_candidates(&mut candidates);
+
+    assert_eq!(
+        candidates
+            .iter()
+            .map(|candidate| candidate.candidate_id.as_str())
+            .collect::<Vec<_>>(),
+        ["input_1_high", "input_1_low", "input_2_high"]
+    );
+    assert_eq!(candidate_group_ranks(&candidates), [1, 2, 1]);
 }
 
 #[test]
@@ -4397,18 +5075,21 @@ fn report_limits_candidate_table_to_readable_top_results() {
     let input = root.join("input.json");
     write_text(
         &input,
-        "{\"inputs\":[{\"field\":\"small_molecule\",\"value\":\"CCO\"}],\"files\":[]}\n",
+        "{\"inputs\":[{\"field\":\"small_molecule\",\"value\":\"CCO\"},{\"field\":\"small_molecule\",\"value\":\"CCN\"}],\"files\":[]}\n",
     )
     .expect("input");
     let mut ranking = String::from(
         "rank\tcandidate_id\ttarget_id\ttarget_name\tcandidate_scope\torganism\tfinal_score\tknown_database_score\tmetagenome_score\tstructure_score\tdocking_score\tmd_score\tevidence_summary\tstatus\tinput_id\trecord_id\tidentity_namespace\n",
     );
-    for index in 1..=60 {
-        let target_id = format!("T{index}");
-        let candidate_id = candidate_id_for("input_1", "record_1", "chembl", &target_id);
-        ranking.push_str(&format!(
-            "{index}\t{candidate_id}\t{target_id}\tTarget {index}\tknown_human_protein\tHomo sapiens\t0.1000\t0.2000\t0.0000\t0.0000\t0.0000\t0.0000\tChEMBL:activity\tcomputed_prediction\tinput_1\trecord_1\tchembl\n"
-        ));
+    for input_index in 1..=2 {
+        let input_id = format!("input_{input_index}");
+        for rank in 1..=60 {
+            let target_id = format!("T{input_index}_{rank}");
+            let candidate_id = candidate_id_for(&input_id, "record_1", "chembl", &target_id);
+            ranking.push_str(&format!(
+                "{rank}\t{candidate_id}\t{target_id}\tTarget {input_index}-{rank}\tknown_human_protein\tHomo sapiens\t0.1000\t0.2000\t0.0000\t0.0000\t0.0000\t0.0000\tChEMBL:activity\tcomputed_prediction\t{input_id}\trecord_1\tchembl\n"
+            ));
+        }
     }
     write_text(&run.join("target_candidate_ranking.tsv"), &ranking).expect("ranking");
     let options = ScienceOptions {
@@ -4418,16 +5099,18 @@ fn report_limits_candidate_table_to_readable_top_results() {
         run_dir: run.clone(),
     };
 
-    normalize_and_compute_fixture(&options, "small_molecule", "CCO")
-        .expect("normalized report input");
+    run_science_command(ScienceCommand::InputNormalize, &options).expect("normalize report inputs");
+    run_science_command(ScienceCommand::FeaturesCompute, &options).expect("compute report inputs");
     write_report_support(&options).expect("report support artifacts");
 
     render_report(&options).expect("report");
 
     let report = read_text(&run.join("research_report.md")).expect("report");
-    assert!(report.contains("共生成 60 个候选靶点"));
-    assert!(report.contains("Target 50"));
-    assert!(!report.contains("Target 51"));
+    assert!(report.contains("共生成 120 个候选靶点"));
+    assert!(report.contains("Target 1-50"));
+    assert!(report.contains("Target 2-50"));
+    assert!(!report.contains("Target 1-51"));
+    assert!(!report.contains("Target 2-51"));
     assert!(!report.contains("target_candidate_ranking.tsv"));
     fs::remove_dir_all(&root).expect("cleanup temp root");
     assert!(!root.exists());
@@ -4875,6 +5558,85 @@ fn authenticity_gate_binds_database_evidence_to_run_invocation_and_source_manife
 }
 
 #[test]
+fn direct_query_generation_rejects_stale_downstream_artifacts_until_match_reruns() {
+    let root = temp_root("direct_query_generation_invalidation");
+    let run = root.join("run");
+    let store = create_temporary_test_store(&root).expect("store");
+    let input = root.join("input.json");
+    let options = ScienceOptions {
+        workspace_root: root.clone(),
+        science_store: store,
+        input_manifest: input.clone(),
+        run_dir: run.clone(),
+    };
+
+    prepare_bound_rank_fixture(
+        &options,
+        "small_molecule",
+        "CCO",
+        "ChEMBL",
+        "T1",
+        "Target 1",
+        "chembl_activity_row",
+        1.0,
+    )
+    .expect("initial bound fixture");
+    run_science_command(ScienceCommand::TargetRank, &options).expect("initial target rank");
+    let initial_pipeline = current_pipeline_invocation_id(&options).expect("initial pipeline");
+    let initial_worker = current_worker_invocation(&options).expect("initial worker");
+
+    write_text(
+        &input,
+        "{\"inputs\":[{\"field\":\"small_molecule\",\"value\":\"CCN\"}],\"files\":[]}\n",
+    )
+    .expect("replacement input");
+    run_science_command(ScienceCommand::InputNormalize, &options).expect("replacement normalize");
+    let normalized_pipeline =
+        current_pipeline_invocation_id(&options).expect("normalized pipeline");
+    let normalized_worker = current_worker_invocation(&options).expect("normalized worker");
+    assert_ne!(normalized_pipeline, initial_pipeline);
+    assert_ne!(normalized_worker, initial_worker);
+
+    let normalize_error = run_science_command(ScienceCommand::TargetRank, &options)
+        .expect_err("normalization must invalidate the old match generation");
+    assert!(normalize_error.contains("authenticity_gate_failed"));
+    assert!(
+        read_text(&run.join("authenticity_gate.tsv"))
+            .expect("normalization authenticity gate")
+            .contains("pipeline_invocation_not_current")
+    );
+
+    run_science_command(ScienceCommand::FeaturesCompute, &options).expect("replacement features");
+    let feature_pipeline = current_pipeline_invocation_id(&options).expect("feature pipeline");
+    let feature_worker = current_worker_invocation(&options).expect("feature worker");
+    assert_ne!(feature_pipeline, normalized_pipeline);
+    assert_ne!(feature_worker, normalized_worker);
+    let feature_error = run_science_command(ScienceCommand::TargetRank, &options)
+        .expect_err("feature generation must keep old matches invalid");
+    assert!(feature_error.contains("authenticity_gate_failed"));
+
+    prepare_bound_rank_fixture(
+        &options,
+        "small_molecule",
+        "CCN",
+        "ChEMBL",
+        "T1",
+        "Target 1",
+        "chembl_activity_row",
+        1.0,
+    )
+    .expect("complete replacement generation");
+    run_science_command(ScienceCommand::TargetRank, &options)
+        .expect("complete rerun accepts current matches");
+    let ranking = read_text(&run.join("target_candidate_ranking.tsv")).expect("current ranking");
+    assert!(ranking.contains("input_1"));
+    assert!(ranking.contains("record_1"));
+
+    fs::remove_dir_all(&root).expect("cleanup temp root");
+    assert!(!root.exists());
+}
+
+#[test]
 fn structure_evaluate_writes_viewer_from_real_coordinate_file() {
     let root = temp_root("structure_viewer_real");
     install_not_applicable_worker_fixtures(&root).expect("worker fixtures");
@@ -4907,7 +5669,8 @@ fn structure_evaluate_writes_viewer_from_real_coordinate_file() {
         "input_id\tinput_kind\tfeature_family\tfeature_name\tfeature_value\tfeature_source\tfeature_token\trecord_id\ninput_1\tsmall_molecule\tligand\ttext\taspirin\tuser\taspirin\trecord_1\n",
     )
     .expect("features");
-    let out = run_science_command(ScienceCommand::StructureEvaluate, &options).expect("structure");
+    run_science_command(ScienceCommand::StructureEvaluate, &options).expect("structure");
+    let out = coarse_rank_candidates(&options).expect("coarse rank");
     let viewer = read_text(&run.join("structure_viewer.cif")).expect("viewer cif");
     let status = read_text(&run.join("structure_viewer_status.tsv")).expect("viewer status");
 
@@ -4968,9 +5731,10 @@ fn structure_evaluate_prefers_bindingdb_pdb_candidate_over_token_noise() {
         "input_id\tinput_kind\tfeature_family\tfeature_name\tfeature_value\tfeature_source\tfeature_token\trecord_id\ninput_1\tsmall_molecule\tligand\ttext\tazm\tuser\tazm\trecord_1\n",
     )
     .expect("features");
-    let out = run_science_command(ScienceCommand::StructureEvaluate, &options).expect("structure");
+    run_science_command(ScienceCommand::StructureEvaluate, &options).expect("structure");
+    let out = coarse_rank_candidates(&options).expect("coarse rank");
     let status = read_text(&run.join("structure_viewer_status.tsv")).expect("viewer status");
-    let summary = read_text(&run.join("structure_patch_summary.tsv")).expect("summary");
+    let shortlist = read_text(&run.join("candidate_shortlist.tsv")).expect("shortlist");
 
     assert!(out.contains("viewer_artifact=ready"));
     assert!(status.contains("ready\tP00918\t2H4N\tstructure_candidates"));
@@ -4981,7 +5745,7 @@ fn structure_evaluate_prefers_bindingdb_pdb_candidate_over_token_noise() {
     assert_eq!(selected_rows[0]["record_id"], "record_1");
     assert_eq!(selected_rows[0]["target_id"], "P00918");
     assert!(selected_rows[0]["candidate_id"].starts_with("target_P00918_"));
-    assert!(summary.contains("target_P00918_"));
+    assert!(shortlist.contains("target_P00918_"));
     fs::remove_dir_all(&root).expect("cleanup temp root");
     assert!(!root.exists());
 }
@@ -5026,12 +5790,14 @@ fn structure_evaluate_reads_canonical_index_rows_beyond_source_sampling_limit() 
         "input_id\tinput_kind\tfeature_family\tfeature_name\tfeature_value\tfeature_source\tfeature_token\trecord_id\ninput_1\tpeptide\tpeptide\tsequence_feature_token\tikv\tGenoLigand\tikv\trecord_1\n",
     )
     .expect("features");
-    let out = run_science_command(ScienceCommand::StructureEvaluate, &options).expect("structure");
+    let structure =
+        run_science_command(ScienceCommand::StructureEvaluate, &options).expect("structure");
+    let out = coarse_rank_candidates(&options).expect("coarse rank");
     let matches = read_text(&run.join("structure_interaction_matches.tsv")).expect("matches");
     let summary = read_text(&run.join("structure_patch_summary.tsv")).expect("summary");
     let status = read_text(&run.join("structure_viewer_status.tsv")).expect("viewer status");
 
-    assert!(out.contains("structure_artifact=ready"));
+    assert!(structure.contains("structure_artifact=ready"));
     assert!(out.contains("viewer_artifact=ready"));
     assert!(matches.contains("1IKV"));
     assert!(summary.contains("target_1IKV"));
@@ -5057,7 +5823,7 @@ fn dynamics_screen_aggregates_real_metric_artifacts() {
     .expect("indexed selection");
     write_indexed_md_fixture(&options, &rows[0], false).expect("indexed MD fixture");
 
-    let out = run_science_command(ScienceCommand::DynamicsScreen, &options).expect("dynamics");
+    let out = screen_dynamics(&options).expect("dynamics");
     let md = read_text(&options.run_dir.join("md_summary.tsv")).expect("md summary");
     let status = read_text(&options.run_dir.join("md_summary_status.tsv")).expect("md status");
 
@@ -5110,7 +5876,7 @@ fn dynamics_screen_rejects_provenance_with_identity_missing_on_both_sides() {
     write_text(&result_path, &(result.to_string() + "\n")).expect("write result");
     write_text(&provenance_path, &(provenance.to_string() + "\n")).expect("write provenance");
 
-    let out = run_science_command(ScienceCommand::DynamicsScreen, &options).expect("dynamics");
+    let out = screen_dynamics(&options).expect("dynamics");
     let status = read_text(&run.join("md_summary_status.tsv")).expect("status");
     assert!(out.contains("md_artifact=not_ready"));
     assert!(status.contains("result_identity_missing"));
@@ -5149,7 +5915,7 @@ fn dynamics_screen_rejects_job_run_identity_drift() {
     ensure_dir(&root.join("run-stale")).expect("stale run dir");
     write_text(&job_path, &(job.to_string() + "\n")).expect("drift job identity");
 
-    let out = run_science_command(ScienceCommand::DynamicsScreen, &options).expect("dynamics");
+    let out = screen_dynamics(&options).expect("dynamics");
     let status = read_text(&run.join("md_summary_status.tsv")).expect("status");
     assert!(out.contains("md_artifact=not_ready"));
     assert!(status.contains("job_run_identity_mismatch"));
@@ -5191,7 +5957,7 @@ fn dynamics_screen_rejects_candidate_manifest_changed_after_binding() {
     bind_current_md_artifacts(&options, &["md_summary.tsv"]).expect("bind MD summary");
     write_md_binding_manifests(&run, "C2", "input_1", "CCO").expect("replace candidate manifest");
 
-    let out = run_science_command(ScienceCommand::DynamicsScreen, &options).expect("dynamics");
+    let out = screen_dynamics(&options).expect("dynamics");
     let status = read_text(&run.join("md_summary_status.tsv")).expect("status");
     assert!(out.contains("md_artifact=not_ready"));
     assert!(status.contains("candidate_manifest_mismatch"));
@@ -5224,7 +5990,7 @@ fn dynamics_screen_rejects_input_manifest_changed_after_binding() {
     bind_current_md_artifacts(&options, &["md_summary.tsv"]).expect("bind MD summary");
     write_md_binding_manifests(&run, "C1", "input_1", "CCC").expect("replace input manifest");
 
-    let out = run_science_command(ScienceCommand::DynamicsScreen, &options).expect("dynamics");
+    let out = screen_dynamics(&options).expect("dynamics");
     let status = read_text(&run.join("md_summary_status.tsv")).expect("status");
     assert!(out.contains("md_artifact=not_ready"));
     assert!(status.contains("input_manifest_mismatch"));
@@ -5262,6 +6028,7 @@ fn dynamics_screen_uses_bound_non_pass_result_status_and_reason() {
             "schema_version": WORKER_SCHEMA_VERSION,
             "job_id": task.job_id,
             "worker": task.worker,
+            "run_id": job["run_id"],
             "invocation_id": invocation_id,
             "status": status,
             "engine_version": "test MD status 1",
@@ -5289,7 +6056,7 @@ fn dynamics_screen_uses_bound_non_pass_result_status_and_reason() {
         )
         .expect("stale not-ready artifact");
 
-        let out = run_science_command(ScienceCommand::DynamicsScreen, &options).expect("dynamics");
+        let out = screen_dynamics(&options).expect("dynamics");
         let summary_status = read_text(&run.join("md_summary_status.tsv")).expect("summary status");
         assert!(out.contains("md_artifact=not_ready"));
         assert!(summary_status.contains(&format!("{}\t{}", status.to_ascii_lowercase(), reason)));
@@ -5313,7 +6080,7 @@ fn dynamics_screen_records_missing_md_reason_without_rows() {
         run_dir: run.clone(),
     };
 
-    let out = run_science_command(ScienceCommand::DynamicsScreen, &options).expect("dynamics");
+    let out = screen_dynamics(&options).expect("dynamics");
     let md = read_text(&run.join("md_summary.tsv")).expect("md summary");
     let status = read_text(&run.join("md_summary_status.tsv")).expect("md status");
 
@@ -5364,9 +6131,12 @@ fn source_local_available_accepts_pruned_source_only_with_complete_retention_evi
         "missing_source_manifest",
         "missing_derived",
         "empty_derived",
+        "legacy_derived",
     ] {
         let root = temp_root(&format!("pruned_source_availability_{attack}"));
         let store = root.join("science_store");
+        install_ligand_similarity_builder_fixture(&root, false).expect("similarity builder");
+        write_ligand_similarity_staging_fixture(&store).expect("ligand staging");
         let source = REQUIRED_SOURCES
             .iter()
             .find(|source| source.id == "bindingdb")
@@ -5375,7 +6145,10 @@ fn source_local_available_accepts_pruned_source_only_with_complete_retention_evi
             workspace_root: root.clone(),
             science_store: store.clone(),
         };
-        let digest = "b".repeat(64);
+        prepare_ligand_similarity_authority(&options).expect("compact ligand authority");
+        fs::remove_file(store.join(BINDINGDB_SOURCE_REL_PATH))
+            .expect("remove retained BindingDB source payload");
+        let digest = test_source_digest("bindingdb");
         let source_id = if attack == "wrong_source_id" {
             "chembl"
         } else {
@@ -5421,28 +6194,40 @@ fn source_local_available_accepts_pruned_source_only_with_complete_retention_evi
         } else {
             "pruned"
         };
-        let derived = "indexes/bindingdb/bindingdb_query.sqlite";
-
-        if attack != "missing_derived" {
-            write_text(
-                &store.join(derived),
-                if attack == "empty_derived" {
-                    ""
-                } else {
-                    "sqlite-payload"
-                },
+        let derived = if attack == "legacy_derived" {
+            "indexes/bindingdb/bindingdb_query.sqlite".to_string()
+        } else {
+            format!(
+                "{};{}",
+                LIGAND_SIMILARITY_DATABASE_REL_PATH, LIGAND_SIMILARITY_MANIFEST_REL_PATH
             )
-            .expect("derived payload");
+        };
+
+        if attack == "missing_derived" {
+            fs::remove_file(store.join(LIGAND_SIMILARITY_DATABASE_REL_PATH))
+                .expect("remove compact database");
+        } else if attack == "empty_derived" {
+            write_text(&store.join(LIGAND_SIMILARITY_DATABASE_REL_PATH), "")
+                .expect("empty compact database");
+        } else if attack == "legacy_derived" {
+            write_text(
+                &store.join("indexes/bindingdb/bindingdb_query.sqlite"),
+                "legacy\n",
+            )
+            .expect("legacy derived payload");
         }
         if attack != "missing_source_manifest" {
             write_text(
                 &store.join("manifests/source_file_manifest.tsv"),
                 &format!(
-                    "source_id\tlocal_path\tstatus\tstorage_state\tsha256\trelease_identity\ttrust_source\n{}\t{}\tready\t{}\t{}\tbindingdb-test-release\tunit_test\n",
-                    source.id, source_path, storage_state, digest
+                    "source_id\tlocal_path\tstatus\tstorage_state\tsha256\trelease_identity\ttrust_source\nchembl\tdownloads/chembl/chembl_sqlite.tar.gz\tready\tindexed_source_pruned\t{}\tchembl-test-release\tunit_test\n{}\t{}\tready\t{}\t{}\tbindingdb-test-release\tunit_test\n",
+                    test_source_digest("chembl"), source.id, source_path, storage_state, digest
                 ),
             )
             .expect("source manifest");
+        } else {
+            fs::remove_file(store.join("manifests/source_file_manifest.tsv"))
+                .expect("remove source manifest");
         }
         if attack != "missing_retention" {
             write_text(
@@ -5796,8 +6581,12 @@ fn runtime_readiness_evidence_binds_small_manifests_without_large_database_hashe
     let root = temp_root("chembl_readiness_evidence");
     let store = root.join("science_store");
     let chembl_dir = store.join("downloads/chembl");
+    let ligand_similarity_dir = store.join("indexes/ligand_similarity");
+    let manifest_dir = store.join("manifests");
     let rcsb_index_dir = store.join("indexes/foldseek/rcsb_mmcif");
     ensure_dir(&chembl_dir).expect("ChEMBL directory");
+    ensure_dir(&ligand_similarity_dir).expect("ligand similarity directory");
+    ensure_dir(&manifest_dir).expect("manifest directory");
     ensure_dir(&rcsb_index_dir).expect("RCSB index directory");
     write_text(
         &chembl_dir.join("chembl_query.sqlite"),
@@ -5808,7 +6597,22 @@ fn runtime_readiness_evidence_binds_small_manifests_without_large_database_hashe
         &chembl_dir.join("chembl_query.manifest.json"),
         "{\"status\":\"ready\"}\n",
     )
-    .expect("query manifest");
+    .expect("superseded query manifest");
+    write_text(
+        &ligand_similarity_dir.join("ligand_similarity.sqlite"),
+        "large-compact-database-sentinel\n",
+    )
+    .expect("compact database sentinel");
+    write_text(
+        &ligand_similarity_dir.join("ligand_similarity.manifest.json"),
+        "{\"schema_version\":\"genoligand_ligand_similarity_index_v2\",\"status\":\"ready\"}\n",
+    )
+    .expect("compact manifest");
+    write_text(
+        &manifest_dir.join("source_retention_manifest.tsv"),
+        "schema_version\tsource_id\tstate\ngenoligand_source_retention_v1\tchembl\tpruned\n",
+    )
+    .expect("retention manifest");
     write_text(
         &rcsb_index_dir.join("indexed_pdb_ids.tsv"),
         "pdb_id\n1ABC\n",
@@ -5819,7 +6623,12 @@ fn runtime_readiness_evidence_binds_small_manifests_without_large_database_hashe
     assert!(
         evidence
             .iter()
-            .any(|row| row.path == CHEMBL_QUERY_MANIFEST_REL_PATH)
+            .any(|row| row.path == LIGAND_SIMILARITY_MANIFEST_REL_PATH)
+    );
+    assert!(
+        evidence
+            .iter()
+            .any(|row| row.path == "manifests/source_retention_manifest.tsv")
     );
     assert!(
         evidence
@@ -5827,13 +6636,18 @@ fn runtime_readiness_evidence_binds_small_manifests_without_large_database_hashe
             .any(|row| row.path == RCSB_INDEXED_PDB_IDS_REL_PATH)
     );
     assert!(!evidence.iter().any(|row| row.path.ends_with(".sqlite")));
+    assert!(
+        !evidence
+            .iter()
+            .any(|row| row.path == CHEMBL_QUERY_MANIFEST_REL_PATH)
+    );
 
     write_test_science_store_readiness(&store, &[]).expect("canonical readiness");
     write_text(
-        &chembl_dir.join("chembl_query.manifest.json"),
-        "{\"status\":\"changed\"}\n",
+        &ligand_similarity_dir.join("ligand_similarity.manifest.json"),
+        "{\"schema_version\":\"genoligand_ligand_similarity_index_v2\",\"status\":\"changed\"}\n",
     )
-    .expect("changed query manifest");
+    .expect("changed compact manifest");
     let stale = evaluate_science_store_readiness(&store).expect("stale readiness");
     assert_eq!(stale.blockers, ["science_store_readiness_stale"]);
     fs::remove_dir_all(&root).expect("cleanup temp root");
@@ -6373,8 +7187,8 @@ fn prepare_science_store_builds_known_index_from_chembl_sqlite_archive() {
 }
 
 #[test]
-fn on_demand_prepare_reuses_published_chembl_query_without_archive_reparse() {
-    let root = temp_root("reuse_published_chembl_query");
+fn prepare_science_store_does_not_treat_legacy_chembl_query_as_final_authority() {
+    let root = temp_root("reject_legacy_chembl_query_authority");
     let store = root.join("science_store");
     let chembl_dir = store.join("downloads/chembl");
     let source_sqlite = root.join("chembl_source.sqlite");
@@ -6402,9 +7216,9 @@ fn on_demand_prepare_reuses_published_chembl_query_without_archive_reparse() {
     let build_manifest =
         read_text(&store.join("index_build_manifest.tsv")).expect("build manifest");
     let known = read_text(&store.join("indexes/known_targets.tsv")).expect("known index");
-    assert!(build_manifest.contains("published_chembl_query_used_by_onsite_matcher"));
-    assert!(!build_manifest.contains("chembl_sqlite_archive_rows"));
-    assert!(!known.contains("CHEMBL_T1"));
+    assert!(!build_manifest.contains("published_chembl_query_used_by_onsite_matcher"));
+    assert!(build_manifest.contains("chembl_sqlite_archive_rows"));
+    assert!(known.contains("CHEMBL_T1"));
     fs::remove_dir_all(&root).expect("cleanup temp root");
 }
 
@@ -7080,6 +7894,259 @@ fn publish_test_store_bindingdb_query(store: &Path) -> Result<(), String> {
     Ok(())
 }
 
+fn write_ligand_similarity_staging_fixture(store: &Path) -> Result<(), String> {
+    write_test_source_manifest(store, &["chembl", "bindingdb"])?;
+    write_published_chembl_query_sqlite(&store.join("downloads/chembl/chembl_query.sqlite"))?;
+    write_zip(
+        &store.join(BINDINGDB_SOURCE_REL_PATH),
+        "BindingDB_All.tsv",
+        "Ligand SMILES\tBindingDB Ligand Name\tTarget Name\tTarget Source Organism According to Curator or DataSource\tKi (nM)\tUniProt (SwissProt) Primary ID of Target Chain 1\nCCO\tethanol\tTarget one\tHomo sapiens\t12\tP_ONE\n",
+    )?;
+    publish_test_store_bindingdb_query(store)
+}
+
+fn write_compact_ligand_similarity_publication_fixture(
+    store: &Path,
+) -> Result<LigandSimilarityPublication, String> {
+    let database = store.join(LIGAND_SIMILARITY_DATABASE_REL_PATH);
+    let manifest = store.join(LIGAND_SIMILARITY_MANIFEST_REL_PATH);
+    write_text(&database, "compact-publication-database-v1\n")?;
+    let database_sha256 = sha256_file_hex(&database)
+        .ok_or_else(|| "compact_publication_fixture_database_hash_failed".to_string())?;
+    let source_digest = "a".repeat(64);
+    let value = json!({
+        "schema_version": LIGAND_SIMILARITY_SCHEMA_VERSION,
+        "status": "ready",
+        "database": {
+            "path": database.display().to_string(),
+            "bytes": fs::metadata(&database).map_err(|err| err.to_string())?.len(),
+            "sha256": database_sha256,
+        },
+        "inputs": {
+            "chembl": {
+                "source_digest": source_digest,
+                "source_release": "test-release",
+            },
+            "bindingdb": {
+                "source_digest": source_digest,
+                "source_release": "test-release",
+            },
+        },
+        "fingerprint": {
+            "type": "morgan_ecfp4",
+            "radius": 2,
+            "bits": 2048,
+            "include_chirality": true,
+            "standardization": LIGAND_SIMILARITY_STANDARDIZATION,
+            "tautomer_max_tautomers": 100,
+            "tautomer_max_transforms": 100,
+            "lsh_bands": 0,
+            "search_algorithm": "popcount_bitbound_exact_tanimoto",
+            "bitbound_formula": "ceil(t*q_popcount) <= db_popcount <= floor(q_popcount/t)",
+            "reference": {"name":"FPSim2","license":"MIT","commit":"e03e669"},
+            "encoding": "zlib1_rdkit_binary_text",
+        },
+    });
+    write_text(
+        &manifest,
+        &(serde_json::to_string_pretty(&value).map_err(|err| err.to_string())? + "\n"),
+    )?;
+    current_ligand_similarity_publication(&ScienceOptions {
+        workspace_root: store.to_path_buf(),
+        science_store: store.to_path_buf(),
+        input_manifest: store.join("input.json"),
+        run_dir: store.join("run"),
+    })
+}
+
+fn compact_publication_fields_fixture(publication: &LigandSimilarityPublication) -> String {
+    format!(
+        "compact_database_sha256={};compact_manifest_sha256={};compact_schema_version={};compact_build_identity={}",
+        publication.database_sha256,
+        publication.manifest_sha256,
+        publication.schema_version,
+        publication.build_identity,
+    )
+}
+
+fn compact_known_row_fixture(publication: &LigandSimilarityPublication) -> String {
+    let fields = compact_publication_fields_fixture(publication);
+    format!(
+        "input_id\tsource\ttarget_id\ttarget_name\torganism\ttarget_class\tmatch_score\tmatched_features\tevidence\tsource_row_provenance\tactivity_value\tligand_identity\tcurrent_run_query_id\trecord_id\ninput_1\tChEMBL\tCHEMBL_T1\tTarget one\tHomo sapiens\tenzyme\t0.9000\tcanonical_smiles=CCO;tanimoto=1.0\tligand_similarity_index;{fields}\tligand_similarity_index;{fields}\tKi=12 nM\tligand_smiles=CCO\tquery_1\trecord_1\n"
+    )
+}
+
+fn install_ligand_similarity_builder_fixture(root: &Path, fail_build: bool) -> Result<(), String> {
+    let package = root.join("python/genoligand_workers");
+    write_text(&package.join("__init__.py"), "")?;
+    let mut script = format!(
+        "FAIL_BUILD = {}\n",
+        if fail_build { "True" } else { "False" }
+    );
+    script.push_str(
+        r#"import hashlib
+import json
+import os
+import sqlite3
+import sys
+from pathlib import Path
+
+if len(sys.argv) < 2 or sys.argv[1] != "build":
+    print("fixture_only_supports_build", file=sys.stderr)
+    raise SystemExit(2)
+if FAIL_BUILD:
+    print("intentional_ligand_similarity_build_failure", file=sys.stderr)
+    raise SystemExit(2)
+
+def option(name):
+    index = sys.argv.index(name)
+    return Path(sys.argv[index + 1]).resolve()
+
+chembl_db = option("--chembl-db")
+chembl_manifest = option("--chembl-manifest")
+bindingdb_db = option("--bindingdb-db")
+bindingdb_manifest = option("--bindingdb-manifest")
+output = option("--output-db")
+manifest_path = option("--manifest")
+output.parent.mkdir(parents=True, exist_ok=True)
+manifest_path.parent.mkdir(parents=True, exist_ok=True)
+output.unlink(missing_ok=True)
+
+def sha256(path):
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+def input_record(database, manifest):
+    payload = json.loads(manifest.read_text(encoding="utf-8-sig"))
+    return {
+        "path": str(database),
+        "bytes": database.stat().st_size,
+        "sha256": payload["database_sha256"],
+        "source_digest": payload["source_digest"],
+        "source_release": payload["source_release"],
+        "manifest_path": str(manifest),
+    }
+
+inputs = {
+    "chembl": input_record(chembl_db, chembl_manifest),
+    "bindingdb": input_record(bindingdb_db, bindingdb_manifest),
+}
+fingerprint = {
+    "type": "morgan_ecfp4",
+    "radius": 2,
+    "bits": 2048,
+    "include_chirality": True,
+    "standardization": "rdkit_cleanup_fragment_parent_reionize_canonical_tautomer_v1",
+    "tautomer_max_tautomers": 100,
+    "tautomer_max_transforms": 100,
+    "lsh_bands": 0,
+    "search_algorithm": "popcount_bitbound_exact_tanimoto",
+    "bitbound_formula": "ceil(t*q_popcount) <= db_popcount <= floor(q_popcount/t)",
+    "reference": {"name": "FPSim2", "license": "MIT", "commit": "e03e669"},
+    "encoding": "rdkit_binary_text",
+}
+counts = {"molecules": 1, "targets": 1, "evidence": 1, "hints": 1}
+source_identity = {
+    source: {
+        "source_digest": inputs[source]["source_digest"],
+        "source_release": inputs[source]["source_release"],
+    }
+    for source in ("chembl", "bindingdb")
+}
+connection = sqlite3.connect(output)
+try:
+    connection.execute("PRAGMA page_size=512")
+    connection.executescript("""
+        CREATE TABLE metadata (key TEXT PRIMARY KEY, value TEXT NOT NULL) WITHOUT ROWID;
+        CREATE TABLE molecule (
+            id INTEGER PRIMARY KEY,
+            canonical_smiles TEXT NOT NULL UNIQUE,
+            fingerprint BLOB NOT NULL,
+            popcount INTEGER NOT NULL
+        );
+        CREATE TABLE target (
+            id INTEGER PRIMARY KEY,
+            source TEXT NOT NULL,
+            target_id TEXT NOT NULL,
+            source_target_id TEXT NOT NULL,
+            target_name TEXT NOT NULL,
+            organism TEXT NOT NULL,
+            target_class TEXT NOT NULL,
+            source_release TEXT NOT NULL,
+            source_digest TEXT NOT NULL,
+            UNIQUE(source, target_id)
+        );
+        CREATE TABLE evidence (
+            molecule_id INTEGER NOT NULL REFERENCES molecule(id),
+            target_fk INTEGER NOT NULL REFERENCES target(id),
+            activity_score REAL NOT NULL,
+            activity TEXT NOT NULL,
+            relation_rank INTEGER NOT NULL,
+            numeric_rank REAL NOT NULL,
+            PRIMARY KEY(molecule_id, target_fk)
+        ) WITHOUT ROWID;
+        CREATE TABLE structure_hint (
+            molecule_id INTEGER NOT NULL REFERENCES molecule(id),
+            target_fk INTEGER NOT NULL REFERENCES target(id),
+            ligand_code TEXT NOT NULL,
+            pdb_ids TEXT NOT NULL,
+            target_chain_pdb_ids TEXT NOT NULL,
+            PRIMARY KEY(molecule_id, target_fk)
+        ) WITHOUT ROWID;
+        CREATE INDEX idx_molecule_popcount ON molecule(popcount, id);
+    """)
+    connection.execute("INSERT INTO molecule VALUES (1, 'CCO', ?, 1)", (b"\x01",))
+    connection.execute(
+        "INSERT INTO target VALUES (1, 'ChEMBL', 'CHEMBL_T1', 'CHEMBL_T1', "
+        "'Target one', 'Homo sapiens', 'known_human_protein', ?, ?)",
+        (inputs["chembl"]["source_release"], inputs["chembl"]["source_digest"]),
+    )
+    connection.execute("INSERT INTO evidence VALUES (1, 1, 0.9, 'Ki=12 nM', 0, 12.0)")
+    connection.execute("INSERT INTO structure_hint VALUES (1, 1, 'LIG', '1ABC', '1ABC')")
+    metadata = {
+        "schema_version": "genoligand_ligand_similarity_index_v2",
+        "status": "ready",
+        "counts": json.dumps(counts, sort_keys=True, separators=(",", ":")),
+        "fingerprint": json.dumps(fingerprint, sort_keys=True, separators=(",", ":")),
+        "source_identity": json.dumps(source_identity, sort_keys=True, separators=(",", ":")),
+    }
+    connection.executemany(
+        "INSERT INTO metadata(key, value) VALUES (?, ?)", sorted(metadata.items())
+    )
+    connection.commit()
+finally:
+    connection.close()
+
+output_bytes = output.stat().st_size
+input_bytes = sum(record["bytes"] for record in inputs.values())
+if not 0 < output_bytes < input_bytes:
+    print(f"fixture_compact_size_invalid:{output_bytes}>={input_bytes}", file=sys.stderr)
+    raise SystemExit(2)
+manifest = {
+    "schema_version": "genoligand_ligand_similarity_index_v2",
+    "status": "ready",
+    "database": {
+        "path": str(output),
+        "bytes": output_bytes,
+        "sha256": sha256(output),
+    },
+    "inputs": inputs,
+    "counts": counts,
+    "fingerprint": fingerprint,
+    "reclaimed_candidate_bytes": input_bytes - output_bytes,
+}
+manifest_path.write_text(
+    json.dumps(manifest, sort_keys=True, indent=2) + "\n", encoding="utf-8"
+)
+print(json.dumps({"status": "ready", "database": str(output)}, sort_keys=True))
+"#,
+    );
+    write_text(&package.join("ligand_similarity_index.py"), &script)
+}
+
 fn write_tar_gzip_file(path: &Path, member_name: &str, source_path: &Path) -> Result<(), String> {
     use flate2::Compression;
     use flate2::write::GzEncoder;
@@ -7484,7 +8551,9 @@ fn temp_root(label: &str) -> PathBuf {
         .duration_since(UNIX_EPOCH)
         .expect("time")
         .as_millis();
-    std::env::temp_dir().join(format!("genoligand_science_{label}_{millis}"))
+    let root = std::env::temp_dir().join(format!("genoligand_science_{label}_{millis}"));
+    install_query_structure_worker_fixture(&root).expect("query structure worker fixture");
+    root
 }
 
 fn write_md_binding_manifests(
@@ -7573,13 +8642,28 @@ fn coordinate_top_n_uses_independent_docking_and_md_jobs() {
                 .is_some_and(|digest| valid_sha256_hex(digest))
     }));
 
-    run_docking_candidate_workers(&options).expect("docking jobs");
-    run_md_candidate_workers(&options).expect("md jobs");
+    let result = run_science_command(ScienceCommand::DynamicsScreen, &options)
+        .expect("direct dynamics jobs");
+    assert!(result.contains("dynamics_status=executed"));
     let docking_index =
         read_json_value_if_file(&run.join("tool_outputs/docking_manifest_index.json"))
             .expect("docking index");
     let md_index = read_json_value_if_file(&run.join("tool_outputs/md_manifest_index.json"))
         .expect("md index");
+    let invocation_ids = [&docking_index, &md_index]
+        .into_iter()
+        .flat_map(|index| index["entries"].as_array().expect("entries"))
+        .filter_map(|entry| entry["invocation_id"].as_str())
+        .collect::<BTreeSet<_>>();
+    assert_eq!(invocation_ids.len(), 1);
+    assert_eq!(
+        invocation_ids.into_iter().next(),
+        Some(
+            read_text(&run.join(WORKER_INVOCATION_FILE))
+                .expect("worker invocation")
+                .trim()
+        )
+    );
     for (index, schema) in [
         (docking_index, "genoligand_docking_manifest_index_v1"),
         (md_index, "genoligand_md_manifest_index_v1"),
@@ -7587,6 +8671,14 @@ fn coordinate_top_n_uses_independent_docking_and_md_jobs() {
         assert_eq!(index["schema_version"], schema);
         let entries = index["entries"].as_array().expect("entries");
         assert_eq!(entries.len(), COMPLEX_CANDIDATE_TOP_N);
+        assert_eq!(
+            entries
+                .iter()
+                .filter_map(|entry| entry["job_id"].as_str())
+                .collect::<BTreeSet<_>>()
+                .len(),
+            COMPLEX_CANDIDATE_TOP_N
+        );
         assert!(entries.iter().all(|entry| {
             entry["status"] == "not_ready"
                 && entry["record_id"] == "record_1"
@@ -7630,6 +8722,324 @@ fn coordinate_top_n_uses_independent_docking_and_md_jobs() {
             decomposition.contains(&format!("{candidate_id}\tdocking_outcome_present\t1.0000"))
         );
         assert!(decomposition.contains(&format!("{candidate_id}\tmd_outcome_present\t1.0000")));
+    }
+    fs::remove_dir_all(&root).expect("cleanup temp root");
+}
+
+#[test]
+fn candidate_shortlist_is_stable_resets_rank_per_input_and_uses_preliminary_evidence_only() {
+    let root = temp_root("candidate_shortlist_stable");
+    let options = indexed_fixture_options(&root);
+    write_input_kind_manifest(
+        &options,
+        &[
+            ("input_1", "record_1", "small_molecule"),
+            ("input_2", "record_1", "small_molecule"),
+        ],
+    )
+    .expect("input kinds");
+    let header = "input_id\tsource\ttarget_id\ttarget_name\torganism\ttarget_class\tmatch_score\tmatched_features\tevidence\tsource_database_id\tcurrent_run_query_id\trecord_id\n";
+    let rows = [
+        "input_2\tKnown\tT9\tTarget 9\tHomo sapiens\tenzyme\t0.6000\tfeature\tknown evidence\tKnown\tquery\trecord_1",
+        "input_1\tKnown\tT2\tTarget 2\tHomo sapiens\tenzyme\t0.7000\tfeature\tknown evidence\tKnown\tquery\trecord_1",
+        "input_1\tKnown\tT1\tTarget 1\tHomo sapiens\tenzyme\t0.9000\tfeature\tknown evidence\tKnown\tquery\trecord_1",
+    ];
+    write_text(
+        &options.run_dir.join("known_database_matches.tsv"),
+        &format!("{header}{}\n", rows.join("\n")),
+    )
+    .expect("known matches");
+    for name in [
+        "metagenome_potential_matches.tsv",
+        "structure_interaction_matches.tsv",
+    ] {
+        write_text(&options.run_dir.join(name), header).expect("empty matches");
+    }
+
+    assert_eq!(write_candidate_shortlist(&options).expect("shortlist"), 3);
+    let first = read_text(&options.run_dir.join("candidate_shortlist.tsv")).expect("shortlist");
+    write_text(
+        &options.run_dir.join("known_database_matches.tsv"),
+        &format!(
+            "{header}{}\n",
+            rows.into_iter().rev().collect::<Vec<_>>().join("\n")
+        ),
+    )
+    .expect("reordered known matches");
+    assert_eq!(write_candidate_shortlist(&options).expect("rerank"), 3);
+    let second = read_text(&options.run_dir.join("candidate_shortlist.tsv")).expect("shortlist");
+    let shortlist = read_simple_tsv_rows(&options.run_dir.join("candidate_shortlist.tsv"))
+        .expect("shortlist rows");
+
+    assert_eq!(first, second);
+    assert_eq!(shortlist[0]["input_id"], "input_1");
+    assert_eq!(shortlist[0]["target_id"], "T1");
+    assert_eq!(shortlist[0]["shortlist_rank"], "1");
+    assert_eq!(shortlist[2]["input_id"], "input_2");
+    assert_eq!(shortlist[2]["shortlist_rank"], "1");
+    assert!(shortlist.iter().all(|row| {
+        row["shortlist_reason"].contains("known_database=")
+            && !row.contains_key("docking_score")
+            && !row.contains_key("md_score")
+            && row["input_kind"] == "small_molecule"
+            && row["ranking_policy"] == "small_molecule_route_v1"
+            && row["preliminary_metagenome_weight"] == "0.0000"
+    }));
+    fs::remove_dir_all(&root).expect("cleanup temp root");
+}
+
+#[test]
+fn candidate_coarse_rank_uses_complex_structure_route_before_top_n_selection() {
+    let root = temp_root("candidate_shortlist_complex_route");
+    let options = indexed_fixture_options(&root);
+    write_input_kind_manifest(&options, &[("input_1", "record_1", "complex")]).expect("input kind");
+    let header = "input_id\tsource\ttarget_id\ttarget_name\torganism\ttarget_class\tmatch_score\tmatched_features\tevidence\tsource_database_id\tcurrent_run_query_id\trecord_id\n";
+    write_text(
+        &options.run_dir.join("known_database_matches.tsv"),
+        &format!(
+            "{header}input_1\tKnown\tK1\tKnown 1\tHomo sapiens\tenzyme\t1.0000\tfeature\tknown evidence\tKnown\tquery\trecord_1\ninput_1\tKnown\tK2\tKnown 2\tHomo sapiens\tenzyme\t0.9500\tfeature\tknown evidence\tKnown\tquery\trecord_1\ninput_1\tKnown\tK3\tKnown 3\tHomo sapiens\tenzyme\t0.9000\tfeature\tknown evidence\tKnown\tquery\trecord_1\n"
+        ),
+    )
+    .expect("known matches");
+    write_text(
+        &options.run_dir.join("metagenome_potential_matches.tsv"),
+        header,
+    )
+    .expect("metagenome matches");
+    write_text(
+        &options.run_dir.join("structure_interaction_matches.tsv"),
+        &format!(
+            "{header}input_1\tRCSB\tS1\tStructure 1\tHomo sapiens\tstructure\t0.9000\tfeature\tstructure evidence\tRCSB\tquery\trecord_1\n"
+        ),
+    )
+    .expect("structure matches");
+
+    assert_eq!(
+        ScienceCommand::parse("candidate", "coarse-rank").expect("parse command"),
+        ScienceCommand::CandidateCoarseRank
+    );
+    run_science_command(ScienceCommand::CandidateCoarseRank, &options).expect("coarse rank");
+    let shortlist =
+        read_simple_tsv_rows(&options.run_dir.join("candidate_shortlist.tsv")).expect("shortlist");
+
+    assert_eq!(shortlist.len(), 4);
+    assert_eq!(shortlist[0]["target_id"], "S1");
+    assert_eq!(shortlist[0]["input_kind"], "complex");
+    assert_eq!(shortlist[0]["ranking_policy"], "complex_route_v2");
+    assert_eq!(shortlist[0]["preliminary_structure_weight"], "0.8000");
+    assert_eq!(shortlist[0]["docking_weight"], "0.0000");
+    assert_eq!(shortlist[0]["md_weight"], "0.0000");
+    fs::remove_dir_all(&root).expect("cleanup temp root");
+}
+
+#[test]
+fn candidate_shortlist_writes_header_when_retrieval_has_no_candidates() {
+    let root = temp_root("candidate_shortlist_empty");
+    let options = indexed_fixture_options(&root);
+    assert_eq!(
+        write_candidate_shortlist(&options).expect("empty shortlist"),
+        0
+    );
+    let text = read_text(&options.run_dir.join("candidate_shortlist.tsv")).expect("shortlist");
+    assert_eq!(text, format!("{CANDIDATE_SHORTLIST_HEADER}\n"));
+    assert!(
+        selected_candidate_rows(&options)
+            .expect("selected")
+            .is_empty()
+    );
+    fs::remove_dir_all(&root).expect("cleanup temp root");
+}
+
+#[test]
+fn shortlist_coordinate_top_n_isolated_per_input_record() {
+    let root = temp_root("candidate_shortlist_per_input");
+    let options = indexed_fixture_options(&root);
+    let receptor = "structure_candidates/shared.cif";
+    write_text(
+        &options.run_dir.join(receptor),
+        "data_1ABC\nATOM 1 N N . GLY A 1 1 ? 1.0 1.0 1.0 1.00 20.00 ? 1 GLY A N 1\n",
+    )
+    .expect("receptor");
+    let digest = sha256_file_hex(&options.run_dir.join(receptor)).expect("digest");
+    let mut shortlist = format!("{CANDIDATE_SHORTLIST_HEADER}\n");
+    for input_id in ["input_1", "input_2"] {
+        for rank in 1..=4 {
+            shortlist.push_str(&format!(
+                "{rank}\t{input_id}_candidate_{rank}\tuniprot\t{input_id}\trecord_1\tT{rank}\tTarget {rank}\tHomo sapiens\tenzyme\tknown_human_protein\tKnown\t0.5000\t0.5000\t0.0000\t0.0000\tknown_database=0.5000\t1ABC\tready\t{rank}\t{receptor}\t{digest}\t1ABC\n"
+            ));
+        }
+    }
+    write_text(&options.run_dir.join("candidate_shortlist.tsv"), &shortlist).expect("shortlist");
+
+    let selected = selected_candidate_rows(&options).expect("selected");
+    assert_eq!(selected.len(), COMPLEX_CANDIDATE_TOP_N * 2);
+    for input_id in ["input_1", "input_2"] {
+        let ranks = selected
+            .iter()
+            .filter(|row| row["input_id"] == input_id)
+            .map(candidate_selection_rank)
+            .collect::<Vec<_>>();
+        assert_eq!(ranks, [1, 2, 3]);
+    }
+    fs::remove_dir_all(&root).expect("cleanup temp root");
+}
+
+#[test]
+fn docking_and_md_prefer_ready_shortlist_over_legacy_selection() {
+    let root = temp_root("candidate_shortlist_downstream");
+    install_not_applicable_worker_fixtures(&root).expect("worker fixtures");
+    let options = indexed_fixture_options(&root);
+    let rows = write_indexed_fixture_selection(
+        &options,
+        &[(
+            "candidate_shortlisted",
+            "input_1",
+            "record_1",
+            "small_molecule",
+            "CCO",
+        )],
+    )
+    .expect("legacy selection fixture");
+    let row = &rows[0];
+    write_text(
+        &options.run_dir.join("candidate_shortlist.tsv"),
+        &format!(
+            "{CANDIDATE_SHORTLIST_HEADER}\n1\t{}\tuniprot\t{}\t{}\t{}\tTarget\tHomo sapiens\tenzyme\tknown_human_protein\tBindingDB\t0.9000\t0.9000\t0.0000\t0.0000\tknown_database=0.9000\t1ABC\tready\t1\t{}\t{}\t1ABC\n",
+            row["candidate_id"],
+            row["input_id"],
+            row["record_id"],
+            row["target_id"],
+            row["receptor_artifact"],
+            row["coordinate_sha256"],
+        ),
+    )
+    .expect("shortlist");
+    write_text(
+        &options.run_dir.join("complex_candidate_selection.tsv"),
+        "candidate_id\tinput_id\trecord_id\ttarget_id\ttarget_name\torganism\ttarget_class\tsource\tpdb_id\tevidence\tselection_rank\treceptor_artifact\tcoordinate_sha256\tidentity_namespace\ncandidate_legacy\tinput_1\trecord_1\tLEGACY\tLegacy\tunknown\tenzyme\tRCSB\t9ZZZ\tlegacy\t1\tmissing.cif\tinvalid\tuniprot\n",
+    )
+    .expect("conflicting legacy selection");
+
+    run_docking_candidate_workers(&options).expect("docking jobs");
+    run_md_candidate_workers(&options).expect("md jobs");
+    for kind in ["docking", "md"] {
+        let index = read_json_value_if_file(
+            &options
+                .run_dir
+                .join(format!("tool_outputs/{kind}_manifest_index.json")),
+        )
+        .expect("manifest index");
+        let entries = index["entries"].as_array().expect("entries");
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0]["candidate_id"], "candidate_shortlisted");
+    }
+    fs::remove_dir_all(&root).expect("cleanup temp root");
+}
+
+#[test]
+fn dynamics_all_unsupported_candidates_publish_empty_indexes_and_not_applicable_outcomes() {
+    let root = temp_root("dynamics_all_not_applicable");
+    let options = indexed_fixture_options(&root);
+    write_indexed_fixture_selection(
+        &options,
+        &[
+            (
+                "candidate_protein",
+                "input_1",
+                "record_1",
+                "protein_ligand",
+                "protein A",
+            ),
+            (
+                "candidate_complex",
+                "input_2",
+                "record_1",
+                "complex",
+                "protein A with ligand B",
+            ),
+        ],
+    )
+    .expect("selection");
+
+    let result = run_science_command(ScienceCommand::DynamicsScreen, &options)
+        .expect("not applicable dynamics");
+    assert!(result.contains("dynamics_status=not_applicable"));
+    assert!(result.contains("not_applicable_count=2"));
+    for (kind, task) in [
+        ("docking", &DOCKING_WORKER_TASK),
+        ("md", &SCIENTIFIC_WORKER_TASKS[0]),
+    ] {
+        let index = read_json_value_if_file(
+            &options
+                .run_dir
+                .join(format!("tool_outputs/{kind}_manifest_index.json")),
+        )
+        .expect("manifest index");
+        assert!(index["entries"].as_array().expect("entries").is_empty());
+        assert!(
+            validated_candidate_manifest_index(&options, kind, task)
+                .expect("valid empty index")
+                .is_empty()
+        );
+        let outcomes = read_text(
+            &options
+                .run_dir
+                .join(format!("tool_outputs/{kind}_outcomes.tsv")),
+        )
+        .expect("outcomes");
+        assert_eq!(outcomes.lines().count(), 3);
+        assert!(outcomes.contains("input_kind_not_supported_for_docking_md:protein_ligand"));
+        assert!(outcomes.contains("input_kind_not_supported_for_docking_md:complex"));
+    }
+    fs::remove_dir_all(&root).expect("cleanup temp root");
+}
+
+#[test]
+fn dynamics_mixed_routes_index_only_runnable_small_molecule() {
+    let root = temp_root("dynamics_mixed_applicability");
+    install_not_applicable_worker_fixtures(&root).expect("worker fixtures");
+    let options = indexed_fixture_options(&root);
+    write_indexed_fixture_selection(
+        &options,
+        &[
+            (
+                "candidate_small",
+                "input_1",
+                "record_1",
+                "small_molecule",
+                "CCO",
+            ),
+            (
+                "candidate_complex",
+                "input_2",
+                "record_1",
+                "complex",
+                "protein A with ligand B",
+            ),
+        ],
+    )
+    .expect("selection");
+
+    let result =
+        run_science_command(ScienceCommand::DynamicsScreen, &options).expect("mixed dynamics");
+    assert!(result.contains("dynamics_status=executed"));
+    assert!(result.contains("not_applicable_count=1"));
+    for (kind, task) in [
+        ("docking", &DOCKING_WORKER_TASK),
+        ("md", &SCIENTIFIC_WORKER_TASKS[0]),
+    ] {
+        let entries =
+            validated_candidate_manifest_index(&options, kind, task).expect("valid runnable index");
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].facts.candidate_id, "candidate_small");
+        let outcomes = read_text(
+            &options
+                .run_dir
+                .join(format!("tool_outputs/{kind}_outcomes.tsv")),
+        )
+        .expect("outcomes");
+        assert!(outcomes.contains("candidate_complex"));
+        assert!(outcomes.contains("input_kind_not_supported_for_docking_md:complex"));
     }
     fs::remove_dir_all(&root).expect("cleanup temp root");
 }
@@ -8263,6 +9673,24 @@ fn indexed_fixture_options(root: &Path) -> ScienceOptions {
         input_manifest: root.join("input.json"),
         run_dir: root.join("run"),
     }
+}
+
+fn write_input_kind_manifest(
+    options: &ScienceOptions,
+    rows: &[(&str, &str, &str)],
+) -> Result<(), String> {
+    let mut text = format!("{INPUT_CONVERSION_HEADER}\n");
+    for (input_id, record_id, input_kind) in rows {
+        let canonical_value = format!("{input_id}:{record_id}:{input_kind}");
+        let source_digest = format!("{:x}", Sha256::digest(canonical_value.as_bytes()));
+        text.push_str(&format!(
+            "{input_id}\t{record_id}\t{input_kind}\t{input_kind}\t{input_kind}\t{canonical_value}\tconverted\tidentity\tinline\tinline\t\t{source_digest}\t\t\t\t0\t0\t0\n"
+        ));
+    }
+    write_text(
+        &options.run_dir.join("input_conversion_manifest.tsv"),
+        &text,
+    )
 }
 
 fn write_indexed_fixture_selection(
@@ -9138,9 +10566,16 @@ fn indexed_artifact_peptide_conformer_never_becomes_md_score_or_openmm_claim() {
     .expect("indexed selection");
     write_indexed_md_fixture(&options, &rows[0], true).expect("peptide fixture");
 
+    let error = verified_indexed_md_computations(&options)
+        .expect_err("peptide conformer must stay outside the docking/MD route");
+    assert!(
+        error.contains("md_manifest_index_candidate_mismatch:candidate_peptide"),
+        "unexpected peptide route error: {error}"
+    );
+    reset_candidate_manifest_index(&options, "md").expect("discard unsupported MD index entry");
     let verified = verified_indexed_md_computations(&options).expect("verified peptide fixture");
     assert!(verified.complex.is_empty());
-    assert_eq!(verified.peptide.len(), 1);
+    assert!(verified.peptide.is_empty());
     let summary = materialize_current_md_summary(&options).expect("materialize peptide summary");
     assert!(!summary.ready);
     assert_eq!(
@@ -9235,10 +10670,30 @@ fn bind_current_md_artifacts(
     write_text(&result_path, &(result.to_string() + "\n"))
 }
 
+fn install_query_structure_worker_fixture(root: &Path) -> Result<(), String> {
+    install_not_applicable_worker_fixture_modules(root, &["query_structure_worker.py"])
+}
+
 fn install_not_applicable_worker_fixtures(root: &Path) -> Result<(), String> {
+    install_not_applicable_worker_fixture_modules(
+        root,
+        &[
+            "alignment_worker.py",
+            "docking_worker.py",
+            "md_summary_worker.py",
+            "query_structure_worker.py",
+        ],
+    )
+}
+
+fn install_not_applicable_worker_fixture_modules(
+    root: &Path,
+    modules: &[&str],
+) -> Result<(), String> {
     let package = root.join("python/genoligand_workers");
     write_text(&package.join("__init__.py"), "")?;
     let script = r#"import argparse
+import csv
 import json
 import os
 from pathlib import Path
@@ -9263,6 +10718,62 @@ if job["worker"] in headers:
     output_dir.mkdir(parents=True, exist_ok=True)
     name = "mmseqs_alignment_matches.tsv" if job["worker"] == "mmseqs_alignment" else "foldseek_structure_matches.tsv"
     (output_dir / name).write_text(headers[job["worker"]], encoding="utf-8")
+query_manifest_ref = ""
+if job["worker"] == "query_structure_prepare":
+    raw_run_dir = str(job["run_dir"])
+    if os.name != "nt" and len(raw_run_dir) >= 3 and raw_run_dir[1] == ":":
+        run_dir = Path("/mnt") / raw_run_dir[0].lower() / raw_run_dir[3:].replace("\\", "/")
+    else:
+        run_dir = Path(raw_run_dir)
+    entry_dir = run_dir / "tool_outputs" / "query_structure" / str(job["job_id"])
+    entry_dir.mkdir(parents=True, exist_ok=True)
+    source_digest = str(job["source_digest"])
+    manifest = {
+        "schema_version": "genoligand_query_structure_artifact_v1",
+        "status": "not_applicable",
+        "run_id": str(job["run_id"]),
+        "job_id": str(job["job_id"]),
+        "invocation_id": str(job["invocation_id"]),
+        "input_id": str(job["input_id"]),
+        "record_id": str(job["record_id"]),
+        "input_kind": str(job["input_kind"]),
+        "input_digest": str(job["input_digest"]),
+        "source_content_sha256": source_digest,
+        "source_artifact_digest": source_digest,
+        "method_version": "test_fixture_v1",
+        "reason": "test_fixture_not_applicable",
+    }
+    manifest_path = entry_dir / "manifest.json"
+    manifest_path.write_text(json.dumps(manifest, sort_keys=True) + "\n", encoding="utf-8")
+    query_manifest_ref = manifest_path.relative_to(run_dir).as_posix()
+
+    index_path = run_dir / "query_structure_manifest.tsv"
+    index_fields = [
+        "input_id", "record_id", "input_kind", "input_digest", "method",
+        "features_json", "coordinate_artifact", "feature_digest", "status",
+    ]
+    rows = {}
+    if index_path.is_file():
+        with index_path.open("r", encoding="utf-8-sig", newline="") as handle:
+            for row in csv.DictReader(handle, delimiter="\t"):
+                rows[(row["input_id"], row["record_id"])] = row
+    key = (str(job["input_id"]), str(job["record_id"]))
+    rows[key] = {
+        "input_id": key[0],
+        "record_id": key[1],
+        "input_kind": str(job["input_kind"]),
+        "input_digest": str(job["input_digest"]),
+        "method": "test_fixture_v1",
+        "features_json": "",
+        "coordinate_artifact": "",
+        "feature_digest": "",
+        "status": "not_applicable",
+    }
+    with index_path.open("w", encoding="utf-8", newline="") as handle:
+        writer = csv.DictWriter(handle, fieldnames=index_fields, delimiter="\t", lineterminator="\n")
+        writer.writeheader()
+        for key in sorted(rows):
+            writer.writerow(rows[key])
 reason = "test_fixture_not_applicable"
 result = {
     "schema_version": "genoligand_worker_current_v2",
@@ -9296,15 +10807,279 @@ for field in [
 ]:
     if field in job:
         result[field] = job[field]
+if query_manifest_ref:
+    result["manifest"] = query_manifest_ref
 with open(args.out, "w", encoding="utf-8") as handle:
     json.dump(result, handle)
 "#;
-    for module in [
-        "alignment_worker.py",
-        "docking_worker.py",
-        "md_summary_worker.py",
-    ] {
+    for module in modules {
         write_text(&package.join(module), script)?;
     }
     Ok(())
+}
+
+struct QueryContractFixtureEntry {
+    job: PathBuf,
+    result: PathBuf,
+    manifest: PathBuf,
+    features: PathBuf,
+}
+
+struct QueryContractFixture {
+    ready: QueryContractFixtureEntry,
+    #[allow(dead_code)]
+    not_applicable: QueryContractFixtureEntry,
+}
+
+fn query_structure_small_molecule_fixture(donor_count: u64) -> Value {
+    let mut packed = vec![0_u8; 256];
+    packed[0] = 0b0011_1111;
+    json!({
+        "canonical_smiles": "CCO",
+        "isomeric_smiles": "CCO",
+        "physicochemical": {
+            "molecular_weight": 46.069,
+            "exact_molecular_weight": 46.041865,
+            "logp": -0.0014,
+            "topological_polar_surface_area": 20.23,
+            "hydrogen_bond_donors": donor_count,
+            "hydrogen_bond_acceptors": 1,
+            "rotatable_bonds": 0,
+            "ring_count": 0,
+            "aromatic_ring_count": 0,
+            "fraction_csp3": 1.0,
+            "formal_charge": 0,
+            "heavy_atom_count": 3,
+            "qed": 0.406808,
+        },
+        "fingerprint": {
+            "algorithm": "morgan_ecfp4",
+            "radius": 2,
+            "n_bits": 2048,
+            "include_chirality": true,
+            "encoding": "rdkit_binary_text_hex_v1",
+            "packed_hex": packed.iter().map(|byte| format!("{byte:02x}")).collect::<String>(),
+            "population_count": 6,
+            "packed_sha256": sha256_bytes_hex(&packed),
+        },
+        "pharmacophore": {
+            "counts": {"Acceptor": 2, "Donor": donor_count},
+            "representative_points": [],
+            "point_count": donor_count + 2,
+            "points_truncated": false,
+        },
+        "conformers": {
+            "method": "fixture",
+            "retained_coordinate_count": 0,
+            "entries": [],
+        },
+        "engine_versions": {"fixture": "1"},
+    })
+}
+
+fn write_query_structure_contract_fixture(
+    options: &ScienceOptions,
+    donor_count: u64,
+) -> Result<QueryContractFixture, String> {
+    let inputs = read_normalized_inputs(&options.run_dir.join("input_normalized_manifest.tsv"))?;
+    let provenance =
+        read_conversion_provenance(&options.run_dir.join("input_normalized_manifest.tsv"))?;
+    let invocation_id = start_worker_invocation(options)?;
+    let run_id = infer_run_id(&options.run_dir);
+    let conversion_digest = sha256_file_hex(&options.run_dir.join("input_conversion_manifest.tsv"))
+        .ok_or_else(|| "fixture_conversion_digest_missing".to_string())?;
+    ensure_dir(&options.run_dir.join("worker_jobs"))?;
+    ensure_dir(&options.run_dir.join("worker_results"))?;
+    let mut index = format!("{QUERY_STRUCTURE_MANIFEST_HEADER}\n");
+    let mut ready = None;
+    let mut not_applicable = None;
+    for input in &inputs {
+        let identity = (input.input_id.clone(), input.record_id.clone());
+        let source = provenance
+            .get(&identity)
+            .ok_or_else(|| "fixture_provenance_missing".to_string())?;
+        let input_digest = query_structure_input_digest(input, source);
+        let job_id = query_structure_job_id(&input.input_id, &input.record_id, &invocation_id);
+        let task = WorkerTask {
+            job_id: &job_id,
+            worker: "query_structure_prepare",
+            module: "genoligand_workers.query_structure_worker",
+            stage: "query_structure_prepare",
+        };
+        let mut job_value = worker_job_value(options, &task)?;
+        job_value["input_id"] = json!(&input.input_id);
+        job_value["record_id"] = json!(&input.record_id);
+        job_value["input_kind"] = json!(input.kind.as_str());
+        job_value["input_digest"] = json!(&input_digest);
+        job_value["source_digest"] = json!(&source.content_sha256);
+        job_value["content_sha256"] = json!(&source.content_sha256);
+        let job_path = options
+            .run_dir
+            .join("worker_jobs")
+            .join(format!("{job_id}.json"));
+        write_text(&job_path, &(job_value.to_string() + "\n"))?;
+
+        let output_dir = options
+            .run_dir
+            .join("tool_outputs/query_structure")
+            .join(&job_id);
+        ensure_dir(&output_dir)?;
+        let manifest_path = output_dir.join("manifest.json");
+        let manifest_relative = manifest_path
+            .strip_prefix(&options.run_dir)
+            .map_err(|_| "fixture_manifest_relative_failed".to_string())?
+            .to_string_lossy()
+            .replace('\\', "/");
+        let method = "test_query_structure_contract_v1";
+        let is_ready = input.kind == InputKind::SmallMolecule;
+        let features_path = output_dir.join("features.json");
+        let mut manifest = json!({
+            "schema_version": QUERY_STRUCTURE_ARTIFACT_SCHEMA_VERSION,
+            "status": if is_ready { "ready" } else { "not_applicable" },
+            "run_id": run_id,
+            "job_id": job_id,
+            "invocation_id": invocation_id,
+            "input_id": input.input_id,
+            "record_id": input.record_id,
+            "input_kind": input.kind.as_str(),
+            "input_digest": input_digest,
+            "source_content_sha256": source.content_sha256,
+            "method_version": method,
+        });
+        let mut features_relative = String::new();
+        let mut feature_digest = String::new();
+        if is_ready {
+            let mut features = query_structure_small_molecule_fixture(donor_count);
+            for (key, value) in json!({
+                "schema_version": QUERY_STRUCTURE_FEATURE_SCHEMA_VERSION,
+                "status": "ready",
+                "run_id": run_id,
+                "job_id": job_id,
+                "invocation_id": invocation_id,
+                "input_id": input.input_id,
+                "record_id": input.record_id,
+                "input_kind": input.kind.as_str(),
+                "input_digest": input_digest,
+                "source_content_sha256": source.content_sha256,
+                "conversion_manifest_sha256": conversion_digest,
+                "method_version": method,
+                "coordinate_artifact": {
+                    "path": "",
+                    "sha256": "",
+                    "size_bytes": 0,
+                    "retention": "no_coordinate_artifact",
+                },
+            })
+            .as_object()
+            .expect("fixture common fields")
+            {
+                features[key] = value.clone();
+            }
+            write_text(&features_path, &(features.to_string() + "\n"))?;
+            features_relative = features_path
+                .strip_prefix(&options.run_dir)
+                .map_err(|_| "fixture_features_relative_failed".to_string())?
+                .to_string_lossy()
+                .replace('\\', "/");
+            feature_digest = sha256_file_hex(&features_path)
+                .ok_or_else(|| "fixture_features_digest_failed".to_string())?;
+            manifest["conversion_manifest_sha256"] = json!(&conversion_digest);
+            manifest["features_json"] = json!(&features_relative);
+            manifest["feature_digest"] = json!(&feature_digest);
+            manifest["coordinate_artifact"] = json!("");
+            manifest["coordinate_sha256"] = json!("");
+            manifest["coordinate_size_bytes"] = json!(0);
+            manifest["retention"] = json!("no_coordinate_artifact");
+        } else {
+            manifest["reason"] = json!("fixture_not_applicable");
+        }
+        write_text(&manifest_path, &(manifest.to_string() + "\n"))?;
+
+        let (result_status, execution_status, reason, required, row_count) = if is_ready {
+            ("PASS", "completed", "query_structure_prepared", true, 1)
+        } else {
+            (
+                "NOT_APPLICABLE",
+                "not_applicable",
+                "fixture_not_applicable",
+                false,
+                0,
+            )
+        };
+        let mut result = json!({
+            "schema_version": WORKER_SCHEMA_VERSION,
+            "job_id": job_id,
+            "worker": "query_structure_prepare",
+            "run_id": run_id,
+            "invocation_id": invocation_id,
+            "input_id": input.input_id,
+            "record_id": input.record_id,
+            "input_digest": input_digest,
+            "source_digest": source.content_sha256,
+            "status": result_status,
+            "engine_version": "test query structure fixture 1",
+            "execution_status": execution_status,
+            "reason": reason,
+            "outcomes": [{
+                "status": execution_status,
+                "reason": reason,
+                "required": required,
+                "database_id": "query_structure_prepare",
+                "row_count": row_count,
+            }],
+            "python_owns_final_score": false,
+            "python_owns_report_semantics": false,
+            "primitive_execution_only": true,
+            "manifest": manifest_relative,
+        });
+        if is_ready {
+            result["artifact_path"] = json!(&features_relative);
+        }
+        let result_path = options
+            .run_dir
+            .join("worker_results")
+            .join(format!("{job_id}.json"));
+        write_text(&result_path, &(result.to_string() + "\n"))?;
+        index.push_str(&format!(
+            "{}\t{}\t{}\t{}\t{}\t{}\t\t{}\t{}\n",
+            input.input_id,
+            input.record_id,
+            input.kind.as_str(),
+            input_digest,
+            method,
+            features_relative,
+            feature_digest,
+            if is_ready { "ready" } else { "not_applicable" },
+        ));
+        let entry = QueryContractFixtureEntry {
+            job: job_path,
+            result: result_path,
+            manifest: manifest_path,
+            features: features_path,
+        };
+        if is_ready {
+            ready = Some(entry);
+        } else {
+            not_applicable = Some(entry);
+        }
+    }
+    write_text(
+        &options.run_dir.join("query_structure_manifest.tsv"),
+        &index,
+    )?;
+    Ok(QueryContractFixture {
+        ready: ready.ok_or_else(|| "fixture_ready_input_missing".to_string())?,
+        not_applicable: not_applicable
+            .ok_or_else(|| "fixture_not_applicable_input_missing".to_string())?,
+    })
+}
+
+fn validate_query_structure_contract_fixture(
+    options: &ScienceOptions,
+) -> Result<BTreeMap<(String, String), QueryStructureArtifact>, String> {
+    let inputs = read_normalized_inputs(&options.run_dir.join("input_normalized_manifest.tsv"))?;
+    let provenance =
+        read_conversion_provenance(&options.run_dir.join("input_normalized_manifest.tsv"))?;
+    let invocation_id = current_worker_invocation(options)?;
+    load_validated_query_structure_artifacts(options, &inputs, &provenance, &invocation_id)
 }

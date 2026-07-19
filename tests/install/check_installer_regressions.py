@@ -68,6 +68,178 @@ def directory_bytes(root: Path) -> dict[str, bytes]:
     }
 
 
+def write_ligand_similarity_fixture(
+    installer,
+    store: Path,
+    *,
+    source_digests: dict[str, str] | None = None,
+) -> tuple[Path, Path, dict[str, object]]:
+    digests = source_digests or {"chembl": "a" * 64, "bindingdb": "b" * 64}
+    database = store / installer.LIGAND_SIMILARITY_DATABASE_REL_PATH
+    manifest = store / installer.LIGAND_SIMILARITY_MANIFEST_REL_PATH
+    database.parent.mkdir(parents=True, exist_ok=True)
+    database.unlink(missing_ok=True)
+    fingerprint = {
+        "type": "morgan_ecfp4",
+        "radius": 2,
+        "bits": 2048,
+        "include_chirality": True,
+        "standardization": "rdkit_cleanup_fragment_parent_reionize_canonical_tautomer_v1",
+        "tautomer_max_tautomers": 100,
+        "tautomer_max_transforms": 100,
+        "build_workers": 1,
+        "lsh_bands": 0,
+        "search_algorithm": "popcount_bitbound_exact_tanimoto",
+        "bitbound_formula": "ceil(t*q_popcount) <= db_popcount <= floor(q_popcount/t)",
+        "reference": {"name": "FPSim2", "license": "MIT", "commit": "e03e669"},
+        "encoding": "rdkit_binary_text",
+    }
+    stable_fingerprint = {
+        key: value for key, value in fingerprint.items() if key != "build_workers"
+    }
+    counts = {"molecules": 1, "targets": 1, "evidence": 1, "hints": 1}
+    source_identity = {
+        source_id: {
+            "source_digest": digest,
+            "source_release": "fixture-release",
+        }
+        for source_id, digest in digests.items()
+    }
+    with closing(sqlite3.connect(database)) as connection:
+        connection.executescript(
+            """
+            CREATE TABLE metadata (key TEXT PRIMARY KEY, value TEXT NOT NULL) WITHOUT ROWID;
+            CREATE TABLE molecule (
+                id INTEGER PRIMARY KEY,
+                canonical_smiles TEXT NOT NULL UNIQUE,
+                fingerprint BLOB NOT NULL,
+                popcount INTEGER NOT NULL CHECK(popcount BETWEEN 1 AND 2048)
+            );
+            CREATE TABLE target (
+                id INTEGER PRIMARY KEY,
+                source TEXT NOT NULL,
+                target_id TEXT NOT NULL,
+                source_target_id TEXT NOT NULL,
+                target_name TEXT NOT NULL,
+                organism TEXT NOT NULL,
+                target_class TEXT NOT NULL,
+                source_release TEXT NOT NULL,
+                source_digest TEXT NOT NULL,
+                UNIQUE(source, target_id)
+            );
+            CREATE TABLE evidence (
+                molecule_id INTEGER NOT NULL REFERENCES molecule(id),
+                target_fk INTEGER NOT NULL REFERENCES target(id),
+                activity_score REAL NOT NULL CHECK(activity_score BETWEEN 0.0 AND 1.0),
+                activity TEXT NOT NULL,
+                relation_rank INTEGER NOT NULL,
+                numeric_rank REAL NOT NULL,
+                PRIMARY KEY(molecule_id, target_fk)
+            ) WITHOUT ROWID;
+            CREATE TABLE structure_hint (
+                molecule_id INTEGER NOT NULL REFERENCES molecule(id),
+                target_fk INTEGER NOT NULL REFERENCES target(id),
+                ligand_code TEXT NOT NULL,
+                pdb_ids TEXT NOT NULL,
+                target_chain_pdb_ids TEXT NOT NULL,
+                PRIMARY KEY(molecule_id, target_fk)
+            ) WITHOUT ROWID;
+            CREATE INDEX idx_molecule_popcount ON molecule(popcount, id);
+            """
+        )
+        connection.execute(
+            "INSERT INTO molecule VALUES (?, ?, ?, ?)",
+            (1, "CCO", sqlite3.Binary(b"\x01" + b"\x00" * 255), 1),
+        )
+        connection.execute(
+            "INSERT INTO target VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                1,
+                "chembl",
+                "P12345",
+                "CHEMBL_T1",
+                "Target",
+                "Homo sapiens",
+                "protein",
+                "fixture-release",
+                digests["chembl"],
+            ),
+        )
+        connection.execute(
+            "INSERT INTO evidence VALUES (?, ?, ?, ?, ?, ?)",
+            (1, 1, 0.9, "IC50=1nM", 0, 1.0),
+        )
+        connection.execute(
+            "INSERT INTO structure_hint VALUES (?, ?, ?, ?, ?)",
+            (1, 1, "LIG", "1ABC", "1ABC:A"),
+        )
+        metadata = {
+            "schema_version": installer.LIGAND_SIMILARITY_SCHEMA_VERSION,
+            "status": "ready",
+            "counts": json.dumps(counts, sort_keys=True, separators=(",", ":")),
+            "fingerprint": json.dumps(stable_fingerprint, sort_keys=True, separators=(",", ":")),
+            "source_identity": json.dumps(source_identity, sort_keys=True, separators=(",", ":")),
+        }
+        connection.executemany(
+            "INSERT INTO metadata(key, value) VALUES (?, ?)",
+            sorted(metadata.items()),
+        )
+        connection.commit()
+    output_bytes = database.stat().st_size
+    input_bytes = output_bytes + 4096
+    payload: dict[str, object] = {
+        "schema_version": installer.LIGAND_SIMILARITY_SCHEMA_VERSION,
+        "status": "ready",
+        "database": {
+            "path": str(database.resolve()),
+            "bytes": output_bytes,
+            "sha256": installer.sha256_file(database),
+        },
+        "inputs": {
+            source_id: {
+                "path": str(store / ("downloads/chembl/chembl_query.sqlite" if source_id == "chembl" else "indexes/bindingdb/bindingdb_query.sqlite")),
+                "bytes": input_bytes,
+                "sha256": ("c" if source_id == "chembl" else "d") * 64,
+                "source_digest": digest,
+                "source_release": "fixture-release",
+                "manifest_path": str(store / ("downloads/chembl/chembl_query.manifest.json" if source_id == "chembl" else "indexes/bindingdb/bindingdb_query.manifest.json")),
+            }
+            for source_id, digest in digests.items()
+        },
+        "counts": counts,
+        "fingerprint": fingerprint,
+        "reclaimed_candidate_bytes": input_bytes * 2 - output_bytes,
+    }
+    installer.write_json_atomic(manifest, payload)
+    return database, manifest, payload
+
+
+def write_ligand_source_manifests(
+    installer,
+    store: Path,
+    source_digests: dict[str, str] | None = None,
+) -> dict[str, str]:
+    digests = source_digests or {"chembl": "a" * 64, "bindingdb": "b" * 64}
+    manifest = store / "manifests/source_file_manifest.tsv"
+    manifest.parent.mkdir(parents=True, exist_ok=True)
+    installer.write_simple_tsv(
+        manifest,
+        ["source_id", "status", "storage_state", "sha256", "release_identity", "trust_source"],
+        [
+            {
+                "source_id": source_id,
+                "status": "ready",
+                "storage_state": "indexed_source_pruned",
+                "sha256": digest,
+                "release_identity": "fixture-release",
+                "trust_source": "fixture_domain_validation",
+            }
+            for source_id, digest in digests.items()
+        ],
+    )
+    return digests
+
+
 def run_database_publish_crash_child(root: Path, stage: str) -> int:
     installer = load_installer()
     os.environ["GENOLIGAND_TEST_DATABASE_PUBLISH_HARD_EXIT_STAGE"] = stage
@@ -2053,7 +2225,7 @@ class InstallerRegressionTests(unittest.TestCase):
             installer.write_simple_tsv(sync_plan, list(row), [row])
             with mock.patch.object(installer, "html_links_inventory", return_value=items), mock.patch.object(
                 installer.time, "sleep"
-            ):
+            ), mock.patch.object(installer, "ligand_similarity_index_ready", return_value=True):
                 plan = installer.installation_capacity_plan(
                     store,
                     store / "missing-catalog.tsv",
@@ -2209,7 +2381,7 @@ class InstallerRegressionTests(unittest.TestCase):
                 "status": "ready",
                 "path": str(binary),
                 "sha256": hashlib.sha256(b"binary").hexdigest(),
-                "version": "0.9.74",
+                "version": "1.2.3",
                 "commit": "abc",
                 "build_profile": "release",
                 "smoke": "ready",
@@ -2225,6 +2397,8 @@ class InstallerRegressionTests(unittest.TestCase):
                 "source_manifests": {"status": "ready"},
                 "alignment_databases": {"status": "ready"},
                 "forcefields": {"status": "ready"},
+                "ligand_similarity_index": {"status": "ready"},
+                "source_retention": {"status": "ready"},
                 "runtime_binary_manifest": result,
                 "science_store_readiness": {"status": "ready"},
             }
@@ -2932,7 +3106,313 @@ class InstallerRegressionTests(unittest.TestCase):
                 self.assertTrue(path.is_file(), path)
                 self.assertEqual(path.read_bytes(), content, path)
 
-    def test_readiness_binds_chembl_database_and_manifest_identity(self) -> None:
+    def test_compact_ligand_index_supersedes_and_removes_legacy_query_databases(self) -> None:
+        installer = self.installer
+        with tempfile.TemporaryDirectory() as tmp:
+            store = Path(tmp) / "science_store"
+            digests = write_ligand_source_manifests(installer, store)
+            database, _manifest, _payload = write_ligand_similarity_fixture(
+                installer,
+                store,
+                source_digests=digests,
+            )
+            self.assertTrue(installer.ligand_similarity_index_ready(store))
+
+            legacy = [
+                store / "downloads/chembl/chembl_query.sqlite",
+                store / "downloads/chembl/chembl_query.manifest.json",
+                store / "indexes/bindingdb/bindingdb_query.sqlite",
+                store / "indexes/bindingdb/bindingdb_query.manifest.json",
+            ]
+            sidecars = [
+                Path(f"{legacy[0]}-wal"),
+                Path(f"{legacy[0]}-shm"),
+                Path(f"{legacy[0]}-journal"),
+                Path(f"{legacy[2]}-wal"),
+                Path(f"{legacy[2]}-shm"),
+                Path(f"{legacy[2]}-journal"),
+            ]
+            for sequence, path in enumerate([*legacy, *sidecars], start=1):
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_bytes(b"x" * sequence)
+            legacy[0].chmod(0o444)
+            expected_reclaimed = sum(path.stat().st_size for path in [*legacy, *sidecars])
+
+            readiness = installer.evaluate_installer_science_store_readiness(
+                store,
+                persist=False,
+                check_install_status=False,
+                check_source_retention=False,
+            )
+            self.assertIn(
+                "superseded_ligand_query_database_present",
+                {row["code"] for row in readiness["blockers"]},
+            )
+            cleanup = installer.prune_superseded_ligand_query_databases(store)
+            self.assertEqual(cleanup["status"], "ready")
+            self.assertEqual(cleanup["reclaimed_bytes"], expected_reclaimed)
+            self.assertTrue(database.is_file())
+            self.assertTrue(all(not path.exists() for path in [*legacy, *sidecars]))
+
+            sidecars[0].parent.mkdir(parents=True, exist_ok=True)
+            sidecars[0].write_bytes(b"orphaned-wal")
+            sidecar_only = installer.evaluate_installer_science_store_readiness(
+                store,
+                persist=False,
+                check_install_status=False,
+                check_source_retention=False,
+            )
+            self.assertIn(
+                "superseded_ligand_query_database_present",
+                {row["code"] for row in sidecar_only["blockers"]},
+            )
+            self.assertEqual(
+                installer.prune_superseded_ligand_query_databases(store)["status"],
+                "ready",
+            )
+            self.assertFalse(sidecars[0].exists())
+
+    def test_ligand_retention_migrates_both_sources_to_shared_compact_derivative(self) -> None:
+        installer = self.installer
+        with tempfile.TemporaryDirectory() as tmp:
+            store = Path(tmp) / "science_store"
+            digests = write_ligand_source_manifests(installer, store)
+            write_ligand_similarity_fixture(installer, store, source_digests=digests)
+            installer.write_source_retention_rows(
+                store,
+                [
+                    {
+                        "schema_version": installer.SOURCE_RETENTION_SCHEMA_VERSION,
+                        "source_id": source_id,
+                        "state": "pruned",
+                        "source_manifest_sha256": digest,
+                        "release_identity": "fixture-release",
+                        "trust_source": "fixture_domain_validation",
+                        "derived_paths": old_derived,
+                        "pruned_bytes": "100",
+                    }
+                    for source_id, digest, old_derived in (
+                        ("chembl", digests["chembl"], "downloads/chembl/chembl_query.sqlite"),
+                        ("bindingdb", digests["bindingdb"], "indexes/bindingdb/bindingdb_query.sqlite"),
+                    )
+                ],
+            )
+            migration = installer.migrate_ligand_source_retention(store)
+            self.assertEqual(migration["status"], "ready")
+            self.assertEqual(migration["updated"], 2)
+            expected = ";".join(
+                (
+                    installer.LIGAND_SIMILARITY_DATABASE_REL_PATH,
+                    installer.LIGAND_SIMILARITY_MANIFEST_REL_PATH,
+                )
+            )
+            rows = installer.source_retention_rows(store)
+            self.assertEqual({row["source_id"] for row in rows}, {"chembl", "bindingdb"})
+            self.assertTrue(all(row["derived_paths"] == expected for row in rows))
+            self.assertTrue(
+                all(installer.retained_source_derivatives_ready(store, row) for row in rows)
+            )
+
+            installer.write_source_retention_rows(store, [rows[0]])
+            incomplete = installer.migrate_ligand_source_retention(store)
+            self.assertEqual(incomplete["status"], "needs_repair")
+
+            for row in rows:
+                row["state"] = "pruning"
+            installer.write_source_retention_rows(store, rows)
+            recoverable = installer.migrate_ligand_source_retention(store)
+            self.assertEqual(recoverable["status"], "ready")
+
+    def test_pruned_ligand_retention_removes_restored_source_archives(self) -> None:
+        installer = self.installer
+        with tempfile.TemporaryDirectory() as tmp:
+            store = Path(tmp) / "science_store"
+            digests = write_ligand_source_manifests(installer, store)
+            write_ligand_similarity_fixture(installer, store, source_digests=digests)
+            payloads = {
+                "chembl": "downloads/chembl/chembl_sqlite.tar.gz",
+                "bindingdb": "downloads/bindingdb/bindingdb_all.tsv.zip",
+            }
+            restored_bytes = 0
+            retention_rows = []
+            for source_id, relative in payloads.items():
+                payload = store / relative
+                payload.parent.mkdir(parents=True, exist_ok=True)
+                payload.write_bytes(f"restored-{source_id}".encode("ascii"))
+                restored_bytes += payload.stat().st_size
+                retention_rows.append(
+                    {
+                        "schema_version": installer.SOURCE_RETENTION_SCHEMA_VERSION,
+                        "source_id": source_id,
+                        "state": "pruned",
+                        "source_manifest_sha256": digests[source_id],
+                        "release_identity": "fixture-release",
+                        "trust_source": "fixture_domain_validation",
+                        "payload_records_json": json.dumps(
+                            [{"path": relative, "kind": "file"}],
+                            separators=(",", ":"),
+                        ),
+                        "derived_paths": ";".join(
+                            (
+                                installer.LIGAND_SIMILARITY_DATABASE_REL_PATH,
+                                installer.LIGAND_SIMILARITY_MANIFEST_REL_PATH,
+                            )
+                        ),
+                        "pruned_bytes": "100",
+                    }
+                )
+            installer.write_source_retention_rows(store, retention_rows)
+            policies = {
+                source_id: {
+                    "payloads": (relative,),
+                    "derived": (
+                        installer.LIGAND_SIMILARITY_DATABASE_REL_PATH,
+                        installer.LIGAND_SIMILARITY_MANIFEST_REL_PATH,
+                    ),
+                }
+                for source_id, relative in payloads.items()
+            }
+            with mock.patch.object(installer, "INDEXED_SOURCE_RETENTION_POLICIES", policies):
+                result = installer.prune_indexed_source_payloads(store)
+            self.assertEqual(result["status"], "ready")
+            self.assertEqual(result["reclaimed_bytes"], restored_bytes)
+            self.assertTrue(all(not (store / relative).exists() for relative in payloads.values()))
+
+    def test_ligand_index_rejects_hash_manifest_and_internal_contract_corruption(self) -> None:
+        installer = self.installer
+        with tempfile.TemporaryDirectory() as tmp:
+            store = Path(tmp) / "science_store"
+            digests = write_ligand_source_manifests(installer, store)
+            database, manifest, payload = write_ligand_similarity_fixture(
+                installer,
+                store,
+                source_digests=digests,
+            )
+            input_bytes = sum(int(row["bytes"]) for row in payload["inputs"].values())
+            self.assertLess(database.stat().st_size, input_bytes)
+            self.assertEqual(
+                payload["reclaimed_candidate_bytes"],
+                input_bytes - database.stat().st_size,
+            )
+            self.assertTrue(installer.ligand_similarity_index_ready(store))
+
+            with database.open("ab") as handle:
+                handle.write(b"tampered")
+            self.assertFalse(installer.ligand_similarity_index_ready(store))
+
+            database, manifest, payload = write_ligand_similarity_fixture(
+                installer,
+                store,
+                source_digests=digests,
+            )
+            with closing(sqlite3.connect(database)) as connection:
+                connection.execute("UPDATE metadata SET value = 'corrupt' WHERE key = 'status'")
+                connection.commit()
+            payload["database"]["sha256"] = installer.sha256_file(database)
+            payload["database"]["bytes"] = database.stat().st_size
+            installer.write_json_atomic(manifest, payload)
+            self.assertFalse(installer.ligand_similarity_index_ready(store))
+
+            _database, manifest, payload = write_ligand_similarity_fixture(
+                installer,
+                store,
+                source_digests=digests,
+            )
+            payload["database"]["path"] = str(store / "wrong.sqlite")
+            installer.write_json_atomic(manifest, payload)
+            self.assertFalse(installer.ligand_similarity_index_ready(store))
+
+            _database, manifest, payload = write_ligand_similarity_fixture(
+                installer,
+                store,
+                source_digests=digests,
+            )
+            payload["fingerprint"]["encoding"] = "unsupported_encoding"
+            installer.write_json_atomic(manifest, payload)
+            self.assertFalse(installer.ligand_similarity_index_ready(store))
+
+    def test_ligand_capacity_does_not_spend_space_reclaimed_after_downloads(self) -> None:
+        installer = self.installer
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            store = root / "science_store"
+            digests = write_ligand_source_manifests(installer, store)
+            write_ligand_similarity_fixture(installer, store, source_digests=digests)
+            legacy = [
+                store / "downloads/chembl/chembl_query.sqlite",
+                store / "indexes/bindingdb/bindingdb_query.sqlite",
+            ]
+            for path in legacy:
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_bytes(b"x" * 1000)
+            catalog = root / "catalog.tsv"
+            catalog.write_text(
+                "source_id\turl\tlocal_path\tsha256\trelease_identity\ttrust_source\n"
+                "future\thttps://fixture.invalid/future.dat\tdownloads/future.dat\t\tfixture-release\tfixture_https\n",
+                encoding="utf-8",
+            )
+            required = installer.DISK_SAFETY_MARGIN_BYTES + 1500
+            with mock.patch.object(
+                installer,
+                "remote_resource_identity",
+                return_value={"content_length": 1500},
+            ), mock.patch.object(installer, "same_storage_volume", return_value=True):
+                plan = installer.installation_capacity_plan(
+                    store,
+                    catalog,
+                    root / "missing-sync.tsv",
+                    available_bytes=required - 1,
+                    scratch_dir=root / "scratch",
+                    resolve_remote=True,
+                )
+            self.assertEqual(plan["status"], "blocked")
+            self.assertEqual(plan["capacity_failures"], ["target"])
+            cleanup = next(row for row in plan["items"] if row["component"] == "ligand_similarity_index")
+            self.assertEqual(cleanup["action"], "remove_superseded_query_databases")
+            self.assertEqual(cleanup["reclaimable_bytes"], 0)
+
+    def test_ligand_capacity_reserves_compact_build_without_net_growth(self) -> None:
+        installer = self.installer
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            store = root / "science_store"
+            with mock.patch.object(installer, "same_storage_volume", return_value=True):
+                plan = installer.installation_capacity_plan(
+                    store,
+                    root / "missing-catalog.tsv",
+                    root / "missing-sync.tsv",
+                    available_bytes=100 * 1024 * 1024 * 1024,
+                    scratch_dir=root / "scratch",
+                )
+            item = next(row for row in plan["items"] if row["component"] == "ligand_similarity_index")
+            self.assertGreaterEqual(item["staging_bytes"], 5 * 1024 * 1024 * 1024)
+            self.assertFalse(item["net_growth_allowed"])
+            self.assertEqual(plan["status"], "ready")
+
+    def test_capacity_reuses_compact_index_without_budgeting_legacy_chembl_rebuild(self) -> None:
+        installer = self.installer
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            store = root / "science_store"
+            digests = write_ligand_source_manifests(installer, store)
+            write_ligand_similarity_fixture(installer, store, source_digests=digests)
+            archive = store / "downloads/chembl/chembl_sqlite.tar.gz"
+            archive.parent.mkdir(parents=True, exist_ok=True)
+            archive.write_bytes(b"published-source-archive")
+            with mock.patch.object(installer, "same_storage_volume", return_value=True):
+                plan = installer.installation_capacity_plan(
+                    store,
+                    root / "missing-catalog.tsv",
+                    root / "missing-sync.tsv",
+                    available_bytes=installer.DISK_SAFETY_MARGIN_BYTES + 1024,
+                    scratch_dir=root / "scratch",
+                )
+            components = {row["component"] for row in plan["items"]}
+            self.assertNotIn("chembl_query_database", components)
+            self.assertNotIn("ligand_similarity_index", components)
+            self.assertEqual(plan["status"], "ready")
+
+    def test_legacy_chembl_database_validator_binds_manifest_identity(self) -> None:
         installer = self.installer
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -2957,28 +3437,27 @@ class InstallerRegressionTests(unittest.TestCase):
                 "sha256_file_with_progress",
                 side_effect=AssertionError("unchanged ChEMBL database must use the persistent fingerprint cache"),
             ):
-                readiness = installer.evaluate_installer_science_store_readiness(
-                    store,
-                    persist=False,
-                    summary_cache=summary_cache,
+                self.assertTrue(
+                    installer.chembl_query_database_ready(
+                        chembl_dir / "chembl_query.sqlite",
+                        chembl_dir / "chembl_query.manifest.json",
+                        published["source_digest"],
+                        "CHEMBL37",
+                        summary_cache,
+                    )
                 )
-            codes = {item["code"] for item in readiness["blockers"]}
-            self.assertNotIn("chembl_query_database_not_ready", codes)
-            evidence_paths = {item["path"] for item in readiness["evidence_manifest"]}
-            self.assertIn("downloads/chembl/chembl_query.manifest.json", evidence_paths)
-            self.assertNotIn("downloads/chembl/chembl_query.sqlite", evidence_paths)
             query_db = chembl_dir / "chembl_query.sqlite"
             query_db.chmod(0o666)
             with query_db.open("ab") as handle:
                 handle.write(b"tampered")
-            readiness = installer.evaluate_installer_science_store_readiness(
-                store,
-                persist=False,
-                summary_cache=summary_cache,
-            )
-            self.assertIn(
-                "chembl_query_database_not_ready",
-                {item["code"] for item in readiness["blockers"]},
+            self.assertFalse(
+                installer.chembl_query_database_ready(
+                    query_db,
+                    query_db.with_suffix(".manifest.json"),
+                    published["source_digest"],
+                    "CHEMBL37",
+                    summary_cache,
+                )
             )
 
     def test_chembl_capacity_keeps_scratch_and_target_volumes_independent(self) -> None:
@@ -2992,7 +3471,6 @@ class InstallerRegressionTests(unittest.TestCase):
                 source_db.stat().st_size,
                 archive.stat().st_size,
             )
-            target_required = target_staging + installer.DISK_SAFETY_MARGIN_BYTES
 
             def capacity(target_available: int, scratch_available: int) -> dict[str, object]:
                 with mock.patch.object(installer, "same_storage_volume", return_value=False):
@@ -3005,6 +3483,8 @@ class InstallerRegressionTests(unittest.TestCase):
                         scratch_available_bytes=scratch_available,
                     )
 
+            reference = capacity(100 * 1024 * 1024 * 1024, 100 * 1024 * 1024 * 1024)
+            target_required = int(reference["required_peak_bytes"])
             scratch_blocked = capacity(target_required, scratch_required - 1)
             self.assertEqual(scratch_blocked["status"], "blocked")
             self.assertEqual(scratch_blocked["capacity_failures"], ["scratch"])

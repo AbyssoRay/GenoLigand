@@ -23,7 +23,13 @@
     "schema_version": { "const": "genoligand_worker_current_v2" },
     "job_id": { "type": "string", "minLength": 1 },
     "worker": {
-      "enum": ["mmseqs_alignment", "foldseek_alignment", "docking", "md_summary"]
+      "enum": [
+        "mmseqs_alignment",
+        "foldseek_alignment",
+        "query_structure_prepare",
+        "docking",
+        "md_summary"
+      ]
     },
     "run_id": { "type": "string", "minLength": 1 },
     "invocation_id": { "type": "string", "minLength": 1 },
@@ -66,6 +72,25 @@
     "artifact_provenance": { "type": "string", "minLength": 1 }
   },
   "allOf": [
+    {
+      "if": {
+        "properties": {
+          "worker": { "const": "query_structure_prepare" }
+        },
+        "required": ["worker"]
+      },
+      "then": {
+        "required": [
+          "run_id",
+          "invocation_id",
+          "input_id",
+          "record_id",
+          "input_digest",
+          "source_digest",
+          "manifest"
+        ]
+      }
+    },
     {
       "if": {
         "properties": {

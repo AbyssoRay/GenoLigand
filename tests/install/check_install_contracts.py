@@ -141,21 +141,220 @@ def write_ready_alignment_manifests(
         ),
     ]
     for _tool, source_id, source, db_path, manifest in specs:
-        write_database_fixture(db_path)
+        if _tool == "foldseek":
+            write_foldseek_database_fixture(db_path)
+        else:
+            write_database_fixture(db_path)
         summary = installer.resource_payload_summary(source)
         manifest.parent.mkdir(parents=True, exist_ok=True)
-        scope_digest = ""
         if _tool == "foldseek":
-            scope_digest = str(
-                installer.read_json_object(store / "downloads/rcsb/ligand_bound_pdb_scope.json").get(
-                    "scope_digest", ""
-                )
+            scope_row = installer.read_tsv(store / "downloads/rcsb/ligand_bound_pdb_scope.tsv")[0]
+            validated = store / "indexes/foldseek/rcsb_mmcif/indexed_pdb_ids.tsv"
+            installer.write_simple_tsv(
+                validated,
+                ["pdb_id", "coordinate_rel_path", "size_bytes", "sha256", "status"],
+                [
+                    {
+                        "pdb_id": scope_row["pdb_id"],
+                        "coordinate_rel_path": scope_row["coordinate_rel_path"],
+                        "size_bytes": scope_row["size_bytes"],
+                        "sha256": scope_row["sha256"],
+                        "status": "validated",
+                    }
+                ],
             )
-        manifest.write_text(
-            "source_id\tmanifest_schema_version\tsource_namespace\tsource_class\tsource_path\tsource_digest\tsource_files\tsource_bytes\tbuilder_version\tscope_digest\tdb_path\tstatus\tnotes\n"
-            f"{source_id}\t{installer.ALIGNMENT_MANIFEST_SCHEMA_VERSION}\t{'MGnify' if _tool == 'mmseqs' else 'RCSB'}\t{'metagenome' if _tool == 'mmseqs' else 'structure'}\t{installer.relative_path(store, source)}\t{summary['sha256']}\t{summary['file_count']}\t{summary['bytes']}\ttest-builder-1\t{scope_digest}\t{installer.relative_path(store, db_path)}\tready\talready_available\n",
-            encoding="utf-8",
+            listing_sha256 = installer.sha256_file(Path(f"{db_path}.source"))
+            validated_sha256 = installer.sha256_file(validated)
+            mapping = installer.foldseek_database_mapping_summary(db_path)
+            mapping_sha256 = str(mapping["mapping_sha256"])
+            indexed_entries = int(mapping["indexed_entries"])
+            coordinate_bytes = int(scope_row["size_bytes"])
+            subset_digest = installer.foldseek_subset_digest(
+                listing_sha256,
+                validated_sha256,
+                mapping_sha256,
+                indexed_entries,
+                1,
+                coordinate_bytes,
+            )
+            fields = [
+                "source_id", "manifest_schema_version", "source_namespace", "source_class",
+                "source_path", "source_digest", "source_files", "source_bytes", "builder_version",
+                "scope_digest", "scope_coordinate_digest", "scope_mode", "scope_status",
+                "scope_count", "scope_ready_count", "scope_missing_count", "scope_coverage",
+                "refresh_needed", "indexed_source_listing_sha256", "indexed_validated_ids_manifest",
+                "indexed_validated_ids_sha256", "indexed_mapping_sha256", "indexed_subset_digest",
+                "indexed_pdb_count", "indexed_entries", "db_path", "status", "notes",
+            ]
+            installer.write_simple_tsv(
+                manifest,
+                fields,
+                [
+                    {
+                        "source_id": source_id,
+                        "manifest_schema_version": installer.ALIGNMENT_MANIFEST_SCHEMA_VERSION,
+                        "source_namespace": "RCSB",
+                        "source_class": "structure",
+                        "source_path": installer.relative_path(store, source),
+                        "source_digest": subset_digest,
+                        "source_files": "1",
+                        "source_bytes": str(coordinate_bytes),
+                        "builder_version": "test-builder-1",
+                        "scope_digest": str(rcsb_snapshot["scope_digest"]),
+                        "scope_coordinate_digest": str(rcsb_snapshot["coordinate_digest"]),
+                        "scope_mode": "on_demand",
+                        "scope_status": "ready_partial_on_demand",
+                        "scope_count": str(rcsb_snapshot["scope_count"]),
+                        "scope_ready_count": str(rcsb_snapshot["ready_count"]),
+                        "scope_missing_count": str(rcsb_snapshot["missing_count"]),
+                        "scope_coverage": "1/1",
+                        "refresh_needed": "false",
+                        "indexed_source_listing_sha256": listing_sha256,
+                        "indexed_validated_ids_manifest": installer.relative_path(store, validated),
+                        "indexed_validated_ids_sha256": validated_sha256,
+                        "indexed_mapping_sha256": mapping_sha256,
+                        "indexed_subset_digest": subset_digest,
+                        "indexed_pdb_count": "1",
+                        "indexed_entries": str(indexed_entries),
+                        "db_path": installer.relative_path(store, db_path),
+                        "status": "ready",
+                        "notes": "ready_partial_on_demand:fixture",
+                    }
+                ],
+            )
+        else:
+            manifest.write_text(
+                "source_id\tmanifest_schema_version\tsource_namespace\tsource_class\tsource_path\tsource_digest\tsource_files\tsource_bytes\tbuilder_version\tdb_path\tstatus\tnotes\n"
+                f"{source_id}\t{installer.ALIGNMENT_MANIFEST_SCHEMA_VERSION}\tMGnify\tmetagenome\t{installer.relative_path(store, source)}\t{summary['sha256']}\t{summary['file_count']}\t{summary['bytes']}\ttest-builder-1\t{installer.relative_path(store, db_path)}\tready\talready_available\n",
+                encoding="utf-8",
+            )
+
+
+def write_ligand_similarity_fixture(installer, store: Path, source_digest: str = "a" * 64) -> None:
+    database = store / installer.LIGAND_SIMILARITY_DATABASE_REL_PATH
+    manifest = store / installer.LIGAND_SIMILARITY_MANIFEST_REL_PATH
+    database.parent.mkdir(parents=True, exist_ok=True)
+    fingerprint = {
+        "type": "morgan_ecfp4",
+        "radius": 2,
+        "bits": 2048,
+        "include_chirality": True,
+        "standardization": "rdkit_cleanup_fragment_parent_reionize_canonical_tautomer_v1",
+        "tautomer_max_tautomers": 100,
+        "tautomer_max_transforms": 100,
+        "build_workers": 1,
+        "lsh_bands": 0,
+        "search_algorithm": "popcount_bitbound_exact_tanimoto",
+        "bitbound_formula": "ceil(t*q_popcount) <= db_popcount <= floor(q_popcount/t)",
+        "reference": {"name": "FPSim2", "license": "MIT", "commit": "e03e669"},
+        "encoding": "rdkit_binary_text",
+    }
+    stable_fingerprint = {
+        key: value for key, value in fingerprint.items() if key != "build_workers"
+    }
+    counts = {"molecules": 1, "targets": 1, "evidence": 1, "hints": 1}
+    source_identity = {
+        source_id: {"source_digest": source_digest, "source_release": "fixture-release"}
+        for source_id in ("chembl", "bindingdb")
+    }
+    with closing(sqlite3.connect(database)) as connection:
+        connection.executescript(
+            """
+            CREATE TABLE metadata (key TEXT PRIMARY KEY, value TEXT NOT NULL) WITHOUT ROWID;
+            CREATE TABLE molecule (
+                id INTEGER PRIMARY KEY, canonical_smiles TEXT NOT NULL UNIQUE,
+                fingerprint BLOB NOT NULL,
+                popcount INTEGER NOT NULL CHECK(popcount BETWEEN 1 AND 2048)
+            );
+            CREATE TABLE target (
+                id INTEGER PRIMARY KEY, source TEXT NOT NULL, target_id TEXT NOT NULL,
+                source_target_id TEXT NOT NULL, target_name TEXT NOT NULL, organism TEXT NOT NULL,
+                target_class TEXT NOT NULL, source_release TEXT NOT NULL, source_digest TEXT NOT NULL,
+                UNIQUE(source, target_id)
+            );
+            CREATE TABLE evidence (
+                molecule_id INTEGER NOT NULL REFERENCES molecule(id),
+                target_fk INTEGER NOT NULL REFERENCES target(id),
+                activity_score REAL NOT NULL CHECK(activity_score BETWEEN 0.0 AND 1.0),
+                activity TEXT NOT NULL, relation_rank INTEGER NOT NULL, numeric_rank REAL NOT NULL,
+                PRIMARY KEY(molecule_id, target_fk)
+            ) WITHOUT ROWID;
+            CREATE TABLE structure_hint (
+                molecule_id INTEGER NOT NULL REFERENCES molecule(id),
+                target_fk INTEGER NOT NULL REFERENCES target(id),
+                ligand_code TEXT NOT NULL, pdb_ids TEXT NOT NULL,
+                target_chain_pdb_ids TEXT NOT NULL,
+                PRIMARY KEY(molecule_id, target_fk)
+            ) WITHOUT ROWID;
+            CREATE INDEX idx_molecule_popcount ON molecule(popcount, id);
+            """
         )
+        connection.execute(
+            "INSERT INTO molecule VALUES (?, ?, ?, ?)",
+            (1, "CCO", sqlite3.Binary(b"\x01" + b"\x00" * 255), 1),
+        )
+        connection.execute(
+            "INSERT INTO target VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                1,
+                "chembl",
+                "P12345",
+                "CHEMBL_T1",
+                "Target",
+                "Homo sapiens",
+                "protein",
+                "fixture-release",
+                source_digest,
+            ),
+        )
+        connection.execute(
+            "INSERT INTO evidence VALUES (?, ?, ?, ?, ?, ?)",
+            (1, 1, 0.9, "IC50=1nM", 0, 1.0),
+        )
+        connection.execute(
+            "INSERT INTO structure_hint VALUES (?, ?, ?, ?, ?)",
+            (1, 1, "LIG", "1ABC", "1ABC:A"),
+        )
+        metadata = {
+            "schema_version": installer.LIGAND_SIMILARITY_SCHEMA_VERSION,
+            "status": "ready",
+            "counts": json.dumps(counts, sort_keys=True, separators=(",", ":")),
+            "fingerprint": json.dumps(stable_fingerprint, sort_keys=True, separators=(",", ":")),
+            "source_identity": json.dumps(source_identity, sort_keys=True, separators=(",", ":")),
+        }
+        connection.executemany(
+            "INSERT INTO metadata(key, value) VALUES (?, ?)",
+            sorted(metadata.items()),
+        )
+        connection.commit()
+    output_bytes = database.stat().st_size
+    input_bytes = output_bytes + 4096
+    installer.write_json_atomic(
+        manifest,
+        {
+            "schema_version": installer.LIGAND_SIMILARITY_SCHEMA_VERSION,
+            "status": "ready",
+            "database": {
+                "path": str(database.resolve()),
+                "bytes": output_bytes,
+                "sha256": installer.sha256_file(database),
+            },
+            "inputs": {
+                source_id: {
+                    "path": str(store / ("downloads/chembl/chembl_query.sqlite" if source_id == "chembl" else "indexes/bindingdb/bindingdb_query.sqlite")),
+                    "bytes": input_bytes,
+                    "sha256": ("c" if source_id == "chembl" else "d") * 64,
+                    "source_digest": source_digest,
+                    "source_release": "fixture-release",
+                    "manifest_path": str(store / ("downloads/chembl/chembl_query.manifest.json" if source_id == "chembl" else "indexes/bindingdb/bindingdb_query.manifest.json")),
+                }
+                for source_id in ("chembl", "bindingdb")
+            },
+            "counts": counts,
+            "fingerprint": fingerprint,
+            "reclaimed_candidate_bytes": input_bytes * 2 - output_bytes,
+        },
+    )
 
 
 def write_ready_store_contract(installer, store: Path) -> None:
@@ -179,37 +378,7 @@ def write_ready_store_contract(installer, store: Path) -> None:
         "source_id\tstatus\tsha256\trelease_identity\ttrust_source\n" + source_manifest_rows + "\n",
         encoding="utf-8",
     )
-    chembl_database = store / "downloads/chembl/chembl_query.sqlite"
-    chembl_database.parent.mkdir(parents=True, exist_ok=True)
-    with closing(sqlite3.connect(chembl_database)) as connection:
-        connection.executescript(
-            """
-            CREATE TABLE genoligand_onsite_activity (
-                canonical_isomeric_smiles TEXT, target_id TEXT, source_target_id TEXT,
-                target_name TEXT, organism TEXT, compound_name TEXT, standard_type TEXT,
-                standard_relation TEXT, standard_value REAL, standard_units TEXT,
-                source_release TEXT, source_digest TEXT
-            );
-            INSERT INTO genoligand_onsite_activity VALUES
-                ('CCO', 'P12345', 'CHEMBL_T1', 'Target', 'Homo sapiens', 'Compound',
-                 'IC50', '=', 1.0, 'nM', 'fixture-release', 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa');
-            CREATE INDEX idx_genoligand_onsite_activity_smiles
-                ON genoligand_onsite_activity(canonical_isomeric_smiles);
-            """
-        )
-    installer.write_json_atomic(
-        chembl_database.with_suffix(".manifest.json"),
-        {
-            "schema_version": "genoligand_chembl_query_database_v1",
-            "status": "ready",
-            "source_digest": "a" * 64,
-            "source_release": "fixture-release",
-            "table": "genoligand_onsite_activity",
-            "rows": 1,
-            "database_bytes": chembl_database.stat().st_size,
-            "database_sha256": installer.sha256_file(chembl_database),
-        },
-    )
+    write_ligand_similarity_fixture(installer, store)
     for rel in [
         "indexes/known_targets.tsv",
         "indexes/metagenome_targets.tsv",
@@ -1130,6 +1299,23 @@ def main() -> int:
         "installer must consume the platform hashed lock catalog and immutable source lock",
     )
     installer = load_installer_module()
+    ready_install = {
+        "status": "ready",
+        "downloads": {"status": "ready"},
+        "external_sources": {"status": "ready"},
+        "resources": {"status": "ready"},
+        "tool_environment": {"status": "ready"},
+        "source_manifests": {"status": "ready"},
+        "alignment_databases": {"status": "ready"},
+        "forcefields": {"status": "ready"},
+        "ligand_similarity_index": {"status": "ready"},
+        "source_retention": {"status": "ready"},
+        "science_store_readiness": {"status": "ready"},
+        "runtime_binary_manifest": {"status": "ready"},
+    }
+    require(installer.install_ready(ready_install), "all final component gates must close installation")
+    missing_ligand = {**ready_install, "ligand_similarity_index": {"status": "needs_repair"}}
+    require(not installer.install_ready(missing_ligand), "compact ligand index must be a final readiness gate")
     check_database_readiness_contracts(installer)
     check_external_sync_closure(installer)
     check_external_download_result_closure(installer)

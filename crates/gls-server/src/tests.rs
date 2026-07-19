@@ -1009,7 +1009,8 @@ fn user_health_hides_backend_service_name() {
 
 #[test]
 fn health_and_setup_expose_canonical_readiness_blocker_evidence_and_repair() {
-    let root = std::env::temp_dir().join(format!("genoligand-canonical-readiness-{}", now_millis()));
+    let root =
+        std::env::temp_dir().join(format!("genoligand-canonical-readiness-{}", now_millis()));
     let options = server_options(root.clone());
     let store = science_store_path(&options);
     fs::create_dir_all(&store).expect("science store");
@@ -1044,23 +1045,23 @@ fn health_and_setup_expose_canonical_readiness_blocker_evidence_and_repair() {
 
     let health = user_health_json(&options);
     let setup = user_setup_status_json(&options);
-    for readiness in [
-        &health["science_store_readiness"],
-        &setup["readiness"],
-    ] {
+    for readiness in [&health["science_store_readiness"], &setup["readiness"]] {
         assert_eq!(readiness["status"], "needs_repair");
         assert_eq!(readiness["blockers"][0], "rcsb_scope_incomplete");
-        assert_eq!(readiness["blocker_details"][0]["evidence"], "ready=7 scope=9");
+        assert_eq!(
+            readiness["blocker_details"][0]["evidence"],
+            "ready=7 scope=9"
+        );
         assert_eq!(
             readiness["blocker_details"][0]["repair_action"],
             "sync_rcsb_ligand_bound_scope"
         );
-        assert_eq!(readiness["sources"][0]["logical_source"], "rcsb_ligand_bound");
-        assert_eq!(readiness["indexes"][0]["index"], "structure_targets");
         assert_eq!(
-            readiness["advisories"][0],
-            "rcsb_foldseek_refresh_needed"
+            readiness["sources"][0]["logical_source"],
+            "rcsb_ligand_bound"
         );
+        assert_eq!(readiness["indexes"][0]["index"], "structure_targets");
+        assert_eq!(readiness["advisories"][0], "rcsb_foldseek_refresh_needed");
         assert_eq!(
             readiness["advisory_details"][0]["action"],
             "refresh_foldseek_when_convenient"
@@ -2282,13 +2283,106 @@ fn running_run_marks_completed_prior_stages_and_current_stage() {
             .expect("stage id")
     };
 
-    assert_eq!(payload["current_stage"], "结构与口袋评估");
+    assert_eq!(payload["current_stage"], "结构候选检索");
+    assert_eq!(
+        stages
+            .iter()
+            .filter_map(|stage| stage.get("id").and_then(Value::as_str))
+            .collect::<Vec<_>>(),
+        [
+            "input",
+            "query_structure",
+            "features",
+            "sequence_alignment",
+            "known",
+            "metagenome",
+            "structure",
+            "shortlist",
+            "md",
+            "ranking",
+            "evidence",
+            "report",
+        ]
+    );
     assert_eq!(by_id("input")["status"], "ready");
+    assert_eq!(by_id("query_structure")["status"], "ready");
     assert_eq!(by_id("features")["status"], "ready");
+    assert_eq!(by_id("sequence_alignment")["status"], "ready");
     assert_eq!(by_id("known")["status"], "ready");
     assert_eq!(by_id("metagenome")["status"], "ready");
     assert_eq!(by_id("structure")["status"], "running");
+    assert_eq!(by_id("shortlist")["status"], "waiting");
     assert_eq!(by_id("md")["status"], "waiting");
+    assert_eq!(by_id("report")["status"], "waiting");
+
+    fs::remove_dir_all(&root).ok();
+}
+
+#[test]
+fn user_run_stages_track_sequence_alignment_and_report_render() {
+    let root = std::env::temp_dir().join(format!(
+        "genoligand-user-run-stage-contract-{}",
+        now_millis()
+    ));
+    let options = server_options(root.clone());
+    let run_dir = project_dir(&options, "project-1")
+        .join("runs")
+        .join("run-1");
+    fs::create_dir_all(&run_dir).expect("run dir");
+    fs::write(run_dir.join("run_state.txt"), "running\n").expect("state");
+
+    fs::write(
+        run_dir.join("current_stage.txt"),
+        "onsite_sequence_alignment\n",
+    )
+    .expect("sequence alignment stage");
+    let alignment = user_run_json(&options, "run-1");
+    assert_eq!(alignment["current_stage"], "本地序列比对");
+    let alignment_stages = alignment["stages"].as_array().expect("alignment stages");
+    assert_eq!(
+        alignment_stages
+            .iter()
+            .find(|stage| stage["id"] == "sequence_alignment")
+            .expect("sequence alignment")["status"],
+        "running"
+    );
+    assert_eq!(
+        alignment_stages
+            .iter()
+            .find(|stage| stage["id"] == "known")
+            .expect("known stage")["status"],
+        "waiting"
+    );
+
+    fs::write(run_dir.join("current_stage.txt"), "report_render\n").expect("report stage");
+    let report = user_run_json(&options, "run-1");
+    assert_eq!(report["current_stage"], "报告生成");
+    let report_stages = report["stages"].as_array().expect("report stages");
+    assert_eq!(
+        report_stages
+            .iter()
+            .find(|stage| stage["id"] == "evidence")
+            .expect("evidence stage")["status"],
+        "ready"
+    );
+    assert_eq!(
+        report_stages
+            .iter()
+            .find(|stage| stage["id"] == "report")
+            .expect("report stage")["status"],
+        "running"
+    );
+
+    let app_state = web_asset_text("state/app-state.js");
+    let features = app_state.find("\"结构特征编码\"").expect("features label");
+    let alignment = app_state.find("\"本地序列比对\"").expect("alignment label");
+    let known = app_state
+        .find("\"数据库精确与相似性检索\"")
+        .expect("known label");
+    let evidence = app_state.find("\"证据链整理\"").expect("evidence label");
+    let report = app_state.find("\"报告生成\"").expect("report label");
+    assert!(features < alignment && alignment < known);
+    assert!(evidence < report);
 
     fs::remove_dir_all(&root).ok();
 }
@@ -2606,6 +2700,16 @@ fn user_downloads_are_sanitized_exports() {
     )
     .expect("known");
     fs::write(
+        run_dir.join("query_structure_manifest.tsv"),
+        "input_id\trecord_id\tinput_kind\tinput_digest\tmethod\tfeatures_json\tcoordinate_artifact\tfeature_digest\tstatus\nI1\tR1\tsmall_molecule\tinternal-input-digest\tETKDGv3\ttool_outputs/query/features.json\ttool_outputs/query/representative.sdf\tinternal-feature-digest\tready\n",
+    )
+    .expect("query structure");
+    fs::write(
+        run_dir.join("candidate_shortlist.tsv"),
+        "shortlist_rank\tcandidate_id\tinput_id\trecord_id\ttarget_id\tpreliminary_score\tshortlist_reason\tcoordinate_status\tdebug_path\n1\tC1\tI1\tR1\tP00918\t0.9\tknown_database=0.9\tready\tD:/hidden\n",
+    )
+    .expect("candidate shortlist");
+    fs::write(
         run_dir.join("docking_summary.tsv"),
         "candidate_id\tdocking_status\tdocking_score\tdocking_engine\tnotes\tdebug_path\nC1\tcompleted\t-6.4\tvina\tpose ready\tD:/hidden\n",
     )
@@ -2628,6 +2732,8 @@ fn user_downloads_are_sanitized_exports() {
     write_passed_authenticity_gate(&run_dir);
 
     for artifact_id in [
+        "query_structure",
+        "candidate_shortlist",
         "candidate_ranking",
         "evidence",
         "structure_patch",
@@ -2647,6 +2753,14 @@ fn user_downloads_are_sanitized_exports() {
             "candidate_ranking" | "evidence" | "structure_patch" | "md_summary"
         ) {
             assert!(body.contains("输出材料"));
+        }
+        if artifact_id == "query_structure" {
+            assert!(body.contains("输入编号\t记录编号\t输入类型\t准备方法"));
+            assert!(body.contains("ETKDGv3"));
+        }
+        if artifact_id == "candidate_shortlist" {
+            assert!(body.contains("短名单排序\t候选编号\t输入编号"));
+            assert!(body.contains("known_database=0.9"));
         }
         assert!(!body.contains("sha256"));
         assert!(!body.contains("debug_path"));
@@ -2681,6 +2795,10 @@ fn candidate_detail_endpoint_uses_detail_artifact_without_internal_fields() {
     assert_eq!(payload["candidate_count"], 1);
     assert_eq!(payload["candidate_details"][0]["candidate_id"], "C1");
     assert_eq!(payload["candidate_details"][0]["target_id"], "P24941");
+    assert_eq!(payload["candidate_details"][0]["input_id"], "");
+    assert_eq!(payload["candidate_details"][0]["record_id"], "");
+    assert_eq!(payload["candidate_details"][0]["input_kind"], "");
+    assert_eq!(payload["candidate_details"][0]["ranking_policy"], "");
     assert_eq!(
         payload["candidate_details"][0]["final_score"]
             .as_f64()
@@ -2701,6 +2819,84 @@ fn candidate_detail_endpoint_uses_detail_artifact_without_internal_fields() {
     assert!(!text.contains("evidence_ledger.tsv"));
     assert!(!text.contains("sha256"));
     assert!(!text.contains("D:/hidden"));
+
+    fs::remove_dir_all(&root).ok();
+}
+
+#[test]
+fn candidate_identity_and_ranking_route_survive_api_download_and_webui() {
+    let root = std::env::temp_dir().join(format!(
+        "genoligand-candidate-identity-{}",
+        now_millis()
+    ));
+    let options = server_options(root.clone());
+    let run_dir = projects_root(&options)
+        .join("project-1")
+        .join("runs")
+        .join("run-1");
+    fs::create_dir_all(&run_dir).expect("create run dir");
+    fs::write(run_dir.join("run_state.txt"), "completed\n").expect("state");
+    fs::write(
+        run_dir.join("target_candidate_ranking.tsv"),
+        "rank\tcandidate_id\ttarget_id\ttarget_name\tcandidate_scope\torganism\tfinal_score\tknown_database_score\tmetagenome_score\tstructure_score\tdocking_score\tmd_score\tevidence_summary\tstatus\tinput_id\trecord_id\tidentity_namespace\tinput_kind\tranking_policy\tknown_database_weight\tmetagenome_weight\tstructure_weight\tdocking_weight\tmd_weight\n1\tC-input-1\tP24941\tCDK2\tknown_human_protein\tHomo sapiens\t0.80\t0.70\t0.00\t0.10\t0.20\t0.30\tinput one evidence\tcomputed_prediction\tinput_1\trecord_1\tinput_1:record_1\tsmall_molecule\tsmall_molecule_route_v1\t0.45\t0.00\t0.20\t0.15\t0.20\n1\tC-input-2\tP24941\tCDK2\tknown_human_protein\tHomo sapiens\t0.75\t0.50\t0.10\t0.40\t0.00\t0.00\tinput two evidence\tcomputed_prediction\tinput_2\trecord_2\tinput_2:record_2\tpeptide\tpeptide_route_v2\t0.30\t0.20\t0.50\t0.00\t0.00\n",
+    )
+    .expect("ranking");
+    fs::write(
+        run_dir.join("candidate_detail.json"),
+        r#"{"candidate_count":2,"candidates":[{"candidate_id":"C-input-1","input_id":"input_1","record_id":"record_1","input_kind":"small_molecule","ranking_policy":"small_molecule_route_v1","ranking_weights":{"known_database":0.45,"metagenome":0.0,"structure":0.2,"docking":0.15,"md":0.2},"target_id":"P24941","target_name":"CDK2","candidate_scope":"known_human_protein","organism":"Homo sapiens","scores":{"final":0.8,"known_database":0.7,"metagenome":0.0,"structure":0.1,"docking":0.2,"md":0.3},"evidence_summary":"input one evidence"},{"candidate_id":"C-input-2","input_id":"input_2","record_id":"record_2","input_kind":"peptide","ranking_policy":"peptide_route_v2","ranking_weights":{"known_database":0.3,"metagenome":0.2,"structure":0.5,"docking":0.0,"md":0.0},"target_id":"P24941","target_name":"CDK2","candidate_scope":"known_human_protein","organism":"Homo sapiens","scores":{"final":0.75,"known_database":0.5,"metagenome":0.1,"structure":0.4,"docking":0.0,"md":0.0},"evidence_summary":"input two evidence"}]}"#,
+    )
+    .expect("candidate detail");
+    write_passed_authenticity_gate(&run_dir);
+
+    let candidates = candidates_endpoint_json(&options, "run-1");
+    assert_eq!(candidates["row_count"], 2);
+    assert_eq!(candidates["candidates"][0]["target_id"], "P24941");
+    assert_eq!(candidates["candidates"][1]["target_id"], "P24941");
+    assert_eq!(candidates["candidates"][0]["input_id"], "input_1");
+    assert_eq!(candidates["candidates"][1]["record_id"], "record_2");
+    assert_eq!(candidates["candidates"][0]["input_kind"], "small_molecule");
+    assert_eq!(
+        candidates["candidates"][1]["ranking_policy"],
+        "peptide_route_v2"
+    );
+    assert_eq!(
+        candidates["candidates"][0]["known_database_weight"],
+        "0.45"
+    );
+
+    let detail = candidate_detail_json(&options, "run-1");
+    assert_eq!(detail["candidate_count"], 2);
+    assert_eq!(detail["candidate_details"][0]["input_id"], "input_1");
+    assert_eq!(detail["candidate_details"][1]["record_id"], "record_2");
+    assert_eq!(detail["candidate_details"][0]["input_kind"], "small_molecule");
+    assert_eq!(
+        detail["candidate_details"][1]["ranking_policy"],
+        "peptide_route_v2"
+    );
+    assert_eq!(
+        detail["candidate_details"][1]["structure_weight"]
+            .as_f64()
+            .unwrap(),
+        0.5
+    );
+
+    let (status, _, download) =
+        download_artifact_response(&options, "run-1", "candidate_ranking");
+    assert_eq!(status, 200);
+    assert_eq!(download.lines().count(), 3);
+    assert!(download.starts_with("排序\t输入编号\t记录编号\t输入类型\t排序路线\t"));
+    assert!(download.contains("input_1\trecord_1\tsmall_molecule\tsmall_molecule_route_v1"));
+    assert!(download.contains("input_2\trecord_2\tpeptide\tpeptide_route_v2"));
+
+    let common = web_asset_text("components/common.js");
+    let results = web_asset_text("pages/results.js");
+    for field in ["input_id", "record_id", "input_kind", "ranking_policy"] {
+        assert!(common.contains(field));
+    }
+    assert!(common.contains("rankingWeightSummary"));
+    assert!(results.contains("metricRow(\"输入编号\""));
+    assert!(results.contains("metricRow(\"排序路线\""));
+    assert!(results.contains("metricRow(\"路线权重\""));
 
     fs::remove_dir_all(&root).ok();
 }
@@ -2862,11 +3058,7 @@ impl std::io::BufRead for GeneratedTsvReader {
 fn large_tsv_late_page_uses_bounded_bufread_scan() {
     let read_calls = Arc::new(AtomicUsize::new(0));
     let max_buffered_bytes = Arc::new(AtomicUsize::new(0));
-    let reader = GeneratedTsvReader::new(
-        100_000,
-        read_calls.clone(),
-        max_buffered_bytes.clone(),
-    );
+    let reader = GeneratedTsvReader::new(100_000, read_calls.clone(), max_buffered_bytes.clone());
     let query = ResultQuery::parse("page=20000&page_size=3");
 
     let page = read_tsv_rows_page_from(reader, &query).expect("stream late page");
@@ -3108,7 +3300,10 @@ fn md_endpoint_reads_candidate_scoped_openmm_artifacts() {
     assert_eq!(rows.len(), 2);
     assert!(rows.iter().all(|row| row["trajectory_ready"] == true));
     assert!(rows.iter().all(|row| row["trajectory_frame_count"] == 51));
-    assert!(rows.iter().all(|row| row["trajectory_status"] == "轨迹数据已就绪（51 帧）"));
+    assert!(
+        rows.iter()
+            .all(|row| row["trajectory_status"] == "轨迹数据已就绪（51 帧）")
+    );
     assert!(!payload.to_string().contains(&root.display().to_string()));
 
     fs::remove_dir_all(&root).ok();

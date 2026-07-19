@@ -179,6 +179,7 @@ usage:
   gls-cli database match-known --workspace-root PATH --science-store PATH --input-manifest PATH --run-dir PATH
   gls-cli metagenome match-potential --workspace-root PATH --science-store PATH --input-manifest PATH --run-dir PATH
   gls-cli structure evaluate --workspace-root PATH --science-store PATH --input-manifest PATH --run-dir PATH
+  gls-cli candidate coarse-rank --workspace-root PATH --science-store PATH --input-manifest PATH --run-dir PATH
   gls-cli dynamics screen --workspace-root PATH --science-store PATH --input-manifest PATH --run-dir PATH
   gls-cli target rank --workspace-root PATH --science-store PATH --input-manifest PATH --run-dir PATH
   gls-cli evidence build --workspace-root PATH --science-store PATH --input-manifest PATH --run-dir PATH
@@ -191,12 +192,13 @@ usage:
 mod tests {
     use super::*;
 
-    const SCIENCE_COMMANDS: [ScienceCommand; 11] = [
+    const SCIENCE_COMMANDS: [ScienceCommand; 12] = [
         ScienceCommand::InputNormalize,
         ScienceCommand::FeaturesCompute,
         ScienceCommand::DatabaseMatchKnown,
         ScienceCommand::MetagenomeMatchPotential,
         ScienceCommand::StructureEvaluate,
+        ScienceCommand::CandidateCoarseRank,
         ScienceCommand::DynamicsScreen,
         ScienceCommand::TargetRank,
         ScienceCommand::EvidenceBuild,

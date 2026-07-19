@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import shutil
 import subprocess
 import tempfile
@@ -15,6 +16,7 @@ from genoligand_workers.alignment_worker import (
     StructureQuery,
     TargetDatabase,
     foldseek_lookup_names,
+    foldseek_query_identities,
     foldseek_rows,
     foldseek_target_databases,
     mmseqs_prefilter_options,
@@ -23,8 +25,16 @@ from genoligand_workers.alignment_worker import (
     run_foldseek_alignment,
     run_mmseqs_alignment,
     sequence_query_id,
+    structure_queries,
     structure_query,
+    structure_query_id,
     write_fasta,
+)
+from genoligand_workers.query_structure_worker import (
+    ARTIFACT_SCHEMA_VERSION as QUERY_STRUCTURE_ARTIFACT_SCHEMA_VERSION,
+    FEATURE_SCHEMA_VERSION as QUERY_STRUCTURE_FEATURE_SCHEMA_VERSION,
+    METHOD_VERSION as QUERY_STRUCTURE_METHOD_VERSION,
+    query_structure_input_digest,
 )
 from genoligand_workers.md_summary_worker import canonical_digest, run_md_summary_job
 
@@ -92,9 +102,147 @@ class AlignmentRecordIdentityTests(unittest.TestCase):
             query,
             "input-structure",
             "record-structure",
-            f"query_{digest}",
+            structure_query_id("input-structure", "record-structure", digest),
             digest,
         )
+
+    @staticmethod
+    def write_prepared_structure_queries(
+        run_dir: Path,
+        records: list[dict[str, str]],
+    ) -> list[StructureQuery]:
+        run_dir.mkdir(parents=True, exist_ok=True)
+        invocation_id = "invocation_alignment_test"
+        (run_dir / "worker_invocation_id.txt").write_text(
+            invocation_id + "\n", encoding="utf-8"
+        )
+        conversion_header = (
+            "input_id\trecord_id\toriginal_field\tinferred_kind\tcanonical_kind\t"
+            "canonical_value\tconversion_status\tconversion_method\tformat\tsource_kind\t"
+            "source_path\tcontent_sha256\treason\tartifact\trisk_flags\n"
+        )
+        conversion_rows: list[str] = []
+        prepared: list[tuple[dict[str, str], str, str]] = []
+        for record in records:
+            input_id = record["input_id"]
+            record_id = record["record_id"]
+            input_kind = record["input_kind"]
+            value = record["canonical_value"]
+            coordinate = Path(record["coordinate"])
+            input_format = record["format"]
+            source_digest = (
+                hashlib.sha256(coordinate.read_bytes()).hexdigest()
+                if input_format in {"pdb", "ent", "cif", "mmcif"}
+                else hashlib.sha256(value.encode("utf-8")).hexdigest()
+            )
+            source_path = str(coordinate.resolve()) if record.get("original") == "true" else ""
+            conversion_rows.append(
+                f"{input_id}\t{record_id}\t{input_kind}\t{input_kind}\t{input_kind}\t{value}\t"
+                f"converted\ttest\t{input_format}\tfile\t{source_path}\t{source_digest}\t"
+                "recognized\t\t\n"
+            )
+            input_digest = query_structure_input_digest(
+                input_id, record_id, input_kind, value, source_digest
+            )
+            prepared.append((record, source_digest, input_digest))
+        conversion = run_dir / "input_conversion_manifest.tsv"
+        conversion.write_text(conversion_header + "".join(conversion_rows), encoding="utf-8")
+        conversion_digest = hashlib.sha256(conversion.read_bytes()).hexdigest()
+
+        index_rows = [
+            "input_id\trecord_id\tinput_kind\tinput_digest\tmethod\tfeatures_json\t"
+            "coordinate_artifact\tfeature_digest\tstatus\n"
+        ]
+        queries: list[StructureQuery] = []
+        for record, source_digest, input_digest in prepared:
+            input_id = record["input_id"]
+            record_id = record["record_id"]
+            coordinate = Path(record["coordinate"]).resolve()
+            input_key = hashlib.sha256(input_id.encode("utf-8")).hexdigest()[:16]
+            record_key = hashlib.sha256(record_id.encode("utf-8")).hexdigest()[:16]
+            invocation_key = hashlib.sha256(invocation_id.encode("utf-8")).hexdigest()[:16]
+            artifact_dir = (
+                run_dir
+                / "tool_outputs/query_structure"
+                / input_key
+                / record_key
+                / f"inv_{invocation_key}"
+            )
+            artifact_dir.mkdir(parents=True)
+            if record.get("original") == "true":
+                coordinate_value = str(coordinate)
+                retention = "original_input_reference_only"
+            else:
+                local_coordinate = artifact_dir / coordinate.name
+                os.link(coordinate, local_coordinate)
+                coordinate = local_coordinate
+                coordinate_value = coordinate.relative_to(run_dir).as_posix()
+                retention = "single_representative_only"
+            coordinate_digest = hashlib.sha256(coordinate.read_bytes()).hexdigest()
+            coordinate_bytes = coordinate.stat().st_size
+            job_id = f"query_structure_prepare__{input_id}__{record_id}"
+            common = {
+                "status": "ready",
+                "run_id": run_dir.name,
+                "job_id": job_id,
+                "invocation_id": invocation_id,
+                "input_id": input_id,
+                "record_id": record_id,
+                "input_kind": record["input_kind"],
+                "input_digest": input_digest,
+                "source_content_sha256": source_digest,
+                "conversion_manifest_sha256": conversion_digest,
+                "method_version": QUERY_STRUCTURE_METHOD_VERSION,
+            }
+            features_path = artifact_dir / "features.json"
+            features = {
+                **common,
+                "schema_version": QUERY_STRUCTURE_FEATURE_SCHEMA_VERSION,
+                "coordinate_artifact": {
+                    "path": coordinate_value,
+                    "sha256": coordinate_digest,
+                    "size_bytes": coordinate_bytes,
+                    "retention": "single_representative_or_original_input",
+                },
+            }
+            features_path.write_text(
+                json.dumps(features, ensure_ascii=True, sort_keys=True) + "\n",
+                encoding="utf-8",
+            )
+            feature_digest = hashlib.sha256(features_path.read_bytes()).hexdigest()
+            features_value = features_path.relative_to(run_dir).as_posix()
+            manifest = {
+                **common,
+                "schema_version": QUERY_STRUCTURE_ARTIFACT_SCHEMA_VERSION,
+                "features_json": features_value,
+                "feature_digest": feature_digest,
+                "coordinate_artifact": coordinate_value,
+                "coordinate_sha256": coordinate_digest,
+                "coordinate_size_bytes": coordinate_bytes,
+                "retention": retention,
+            }
+            (artifact_dir / "manifest.json").write_text(
+                json.dumps(manifest, ensure_ascii=True, sort_keys=True) + "\n",
+                encoding="utf-8",
+            )
+            index_rows.append(
+                f"{input_id}\t{record_id}\t{record['input_kind']}\t{input_digest}\t"
+                f"{QUERY_STRUCTURE_METHOD_VERSION}\t{features_value}\t{coordinate_value}\t"
+                f"{feature_digest}\tready\n"
+            )
+            queries.append(
+                StructureQuery(
+                    coordinate,
+                    input_id,
+                    record_id,
+                    structure_query_id(input_id, record_id, coordinate_digest),
+                    coordinate_digest,
+                )
+            )
+        (run_dir / "query_structure_manifest.tsv").write_text(
+            "".join(index_rows), encoding="utf-8"
+        )
+        return queries
 
     @staticmethod
     def write_foldseek_database(prefix: Path) -> None:
@@ -264,14 +412,14 @@ class AlignmentRecordIdentityTests(unittest.TestCase):
                     return subprocess.CompletedProcess(command, 0, "Foldseek-test\n", "")
                 if command[1] == "createdb":
                     Path(f"{command[3]}.lookup").write_text(
-                        "0\tstructure_viewer_A\t0\n1\tstructure_viewer_B\t0\n",
+                        f"0\t{query.query_id}_A\t0\n1\t{query.query_id}_B\t0\n",
                         encoding="utf-8",
                     )
                 if command[1] == "convertalis":
                     target = Path(command[3]).parent.name
                     Path(command[5]).write_text(
-                        f"structure_viewer_A\t{target}_hit_A\t40\t0.8\t1e-8\t60\n"
-                        f"structure_viewer_B\t{target}_hit_B\t42\t0.7\t2e-8\t58\n",
+                        f"{query.query_id}_A\t{target}_hit_A\t40\t0.8\t1e-8\t60\n"
+                        f"{query.query_id}_B\t{target}_hit_B\t42\t0.7\t2e-8\t58\n",
                         encoding="utf-8",
                     )
                 return subprocess.CompletedProcess(command, 0, "", "")
@@ -302,7 +450,220 @@ class AlignmentRecordIdentityTests(unittest.TestCase):
             query_id_index = parsed[0].index("current_run_query_id")
             self.assertEqual(len(parsed), 5)
             self.assertEqual({row[query_id_index] for row in parsed[1:]}, {query.query_id})
-            self.assertNotIn("structure_viewer_A", {row[query_id_index] for row in parsed[1:]})
+            self.assertNotIn(f"{query.query_id}_A", {row[query_id_index] for row in parsed[1:]})
+
+    def test_foldseek_uses_prepared_generated_and_original_structures_in_one_query_database(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="genoligand_foldseek_prepared_multi_") as tmp:
+            root = Path(tmp)
+            run_dir = root / "run"
+            store = root / "store"
+            peptide = root / "peptide_representative.pdb"
+            peptide.write_text("ATOM peptide representative\n", encoding="utf-8")
+            original = root / "original_complex.cif"
+            original.write_text("data_original_complex\n_atom_site.id 1\n", encoding="utf-8")
+            queries = self.write_prepared_structure_queries(
+                run_dir,
+                [
+                    {
+                        "input_id": "input-peptide",
+                        "record_id": "record-generated",
+                        "input_kind": "peptide",
+                        "canonical_value": "ACDEFG",
+                        "coordinate": str(peptide),
+                        "format": "plain_text",
+                    },
+                    {
+                        "input_id": "input-complex",
+                        "record_id": "record-original",
+                        "input_kind": "complex",
+                        "canonical_value": "coordinate-content",
+                        "coordinate": str(original),
+                        "format": "mmcif",
+                        "original": "true",
+                    },
+                ],
+            )
+            self.write_foldseek_manifest(store, ("rcsb_primary",))
+            commands: list[list[str]] = []
+            query_sources: list[Path] = []
+
+            def fake_run(command, capture_output=True, text=True, timeout=None):
+                commands.append(command)
+                if command[1] == "version":
+                    return subprocess.CompletedProcess(command, 0, "Foldseek-test\n", "")
+                if command[1] == "createdb":
+                    source_dir = Path(command[2])
+                    query_sources.extend(sorted(source_dir.iterdir()))
+                    Path(f"{command[3]}.lookup").write_text(
+                        "".join(
+                            f"{index}\t{query.query_id}_A\t0\n"
+                            for index, query in enumerate(queries)
+                        ),
+                        encoding="utf-8",
+                    )
+                if command[1] == "convertalis":
+                    Path(command[5]).write_text(
+                        "".join(
+                            f"{query.query_id}_A\ttarget_{index}\t40\t0.8\t1e-8\t60\n"
+                            for index, query in enumerate(queries, start=1)
+                        ),
+                        encoding="utf-8",
+                    )
+                return subprocess.CompletedProcess(command, 0, "", "")
+
+            with patch("genoligand_workers.alignment_worker.shutil.which", return_value="foldseek"), patch(
+                "genoligand_workers.alignment_worker.subprocess.run", side_effect=fake_run
+            ):
+                execution = run_foldseek_alignment(run_dir, store)
+
+            self.assertEqual(execution.status, "completed")
+            self.assertEqual(len([command for command in commands if command[1] == "createdb"]), 1)
+            self.assertEqual(len(query_sources), 2)
+            for source in query_sources:
+                query_id = source.stem
+                expected = next(query.path for query in queries if query.query_id == query_id)
+                self.assertTrue(os.path.samefile(source, expected))
+            lines = (run_dir / "tool_outputs/foldseek_structure_matches.tsv").read_text(
+                encoding="utf-8"
+            ).splitlines()
+            header = lines[0].split("\t")
+            rows = [dict(zip(header, line.split("\t"), strict=True)) for line in lines[1:]]
+            self.assertEqual(
+                {(row["input_id"], row["record_id"]) for row in rows},
+                {
+                    ("input-peptide", "record-generated"),
+                    ("input-complex", "record-original"),
+                },
+            )
+            self.assertEqual(
+                {row["current_run_query_id"] for row in rows},
+                {query.query_id for query in queries},
+            )
+            self.assertEqual(
+                {
+                    (query.input_id, query.record_id): (query.path, query.query_id, query.query_digest)
+                    for query in structure_queries(run_dir)
+                },
+                {
+                    (query.input_id, query.record_id): (query.path, query.query_id, query.query_digest)
+                    for query in queries
+                },
+            )
+
+    def test_prepared_structure_query_rejects_coordinate_escape(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="genoligand_foldseek_prepared_escape_") as tmp:
+            root = Path(tmp)
+            run_dir = root / "run"
+            external = root / "external.pdb"
+            external.write_text("ATOM external\n", encoding="utf-8")
+            self.write_prepared_structure_queries(
+                run_dir,
+                [
+                    {
+                        "input_id": "input-peptide",
+                        "record_id": "record-peptide",
+                        "input_kind": "peptide",
+                        "canonical_value": "ACDEFG",
+                        "coordinate": str(external),
+                        "format": "plain_text",
+                    }
+                ],
+            )
+            manifest_path = next((run_dir / "tool_outputs/query_structure").glob("**/manifest.json"))
+            features_path = manifest_path.parent / "features.json"
+            features = json.loads(features_path.read_text(encoding="utf-8"))
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+            escaped = str(external.resolve())
+            features["coordinate_artifact"]["path"] = escaped
+            features_path.write_text(
+                json.dumps(features, ensure_ascii=True, sort_keys=True) + "\n", encoding="utf-8"
+            )
+            feature_digest = hashlib.sha256(features_path.read_bytes()).hexdigest()
+            manifest["features_json"] = features_path.relative_to(run_dir).as_posix()
+            manifest["feature_digest"] = feature_digest
+            manifest["coordinate_artifact"] = escaped
+            manifest_path.write_text(
+                json.dumps(manifest, ensure_ascii=True, sort_keys=True) + "\n", encoding="utf-8"
+            )
+            index = run_dir / "query_structure_manifest.tsv"
+            fields = index.read_text(encoding="utf-8").splitlines()
+            header = fields[0].split("\t")
+            row = fields[1].split("\t")
+            row[header.index("coordinate_artifact")] = escaped
+            row[header.index("feature_digest")] = feature_digest
+            index.write_text("\t".join(header) + "\n" + "\t".join(row) + "\n", encoding="utf-8")
+
+            with self.assertRaisesRegex(ValueError, "foldseek_query_coordinate_outside_run"):
+                structure_queries(run_dir)
+
+    def test_prepared_structure_query_fails_closed_on_binding_tampering(self) -> None:
+        cases = ("invocation", "feature_digest", "status")
+        for case in cases:
+            with self.subTest(case=case), tempfile.TemporaryDirectory(
+                prefix=f"genoligand_foldseek_prepared_tamper_{case}_"
+            ) as tmp:
+                root = Path(tmp)
+                run_dir = root / "run"
+                coordinate = root / "peptide.pdb"
+                coordinate.write_text("ATOM peptide\n", encoding="utf-8")
+                self.write_prepared_structure_queries(
+                    run_dir,
+                    [
+                        {
+                            "input_id": "input-peptide",
+                            "record_id": "record-peptide",
+                            "input_kind": "peptide",
+                            "canonical_value": "ACDEFG",
+                            "coordinate": str(coordinate),
+                            "format": "plain_text",
+                        }
+                    ],
+                )
+                if case == "invocation":
+                    (run_dir / "worker_invocation_id.txt").write_text(
+                        "invocation_replaced\n", encoding="utf-8"
+                    )
+                    expected = "foldseek_query_artifact_manifest_invalid"
+                elif case == "feature_digest":
+                    features = next(
+                        (run_dir / "tool_outputs/query_structure").glob("**/features.json")
+                    )
+                    features.write_text(
+                        features.read_text(encoding="utf-8") + " ", encoding="utf-8"
+                    )
+                    expected = "foldseek_query_feature_digest_mismatch"
+                else:
+                    index = run_dir / "query_structure_manifest.tsv"
+                    index.write_text(
+                        index.read_text(encoding="utf-8").replace("\tready\n", "\tnot_applicable\n"),
+                        encoding="utf-8",
+                    )
+                    expected = "foldseek_query_artifact_binding_invalid"
+                with self.assertRaisesRegex(ValueError, expected):
+                    structure_queries(run_dir)
+
+    def test_foldseek_query_lookup_maps_each_native_name_to_one_prepared_identity(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="genoligand_foldseek_query_lookup_map_") as tmp:
+            root = Path(tmp)
+            first = StructureQuery(
+                root / "first.pdb", "input-1", "record-1", "query_" + "a" * 64, "1" * 64
+            )
+            second = StructureQuery(
+                root / "second.pdb", "input-2", "record-2", "query_" + "b" * 64, "2" * 64
+            )
+            database = root / "query_db"
+            Path(f"{database}.lookup").write_text(
+                f"0\t{first.query_id}_A\t0\n1\t{second.query_id}_B\t0\n",
+                encoding="utf-8",
+            )
+            mapped = foldseek_query_identities(database, [first, second])
+            self.assertEqual(mapped[f"{first.query_id}_A"], first)
+            self.assertEqual(mapped[f"{second.query_id}_B"], second)
+            Path(f"{database}.lookup").write_text(
+                f"0\t{first.query_id}_A\t0\n", encoding="utf-8"
+            )
+            with self.assertRaisesRegex(ValueError, "foldseek_query_lookup_incomplete"):
+                foldseek_query_identities(database, [first, second])
 
     def test_foldseek_rejects_orphan_empty_and_unproven_databases(self) -> None:
         with tempfile.TemporaryDirectory(prefix="genoligand_foldseek_strict_") as tmp:
@@ -375,9 +736,8 @@ class AlignmentRecordIdentityTests(unittest.TestCase):
             rows = foldseek_rows(
                 raw,
                 target,
-                query,
                 "Foldseek-test",
-                {"query-current"},
+                {"query-current": query},
             )
             low = float(rows[0].split("\t")[6])
             high = float(rows[1].split("\t")[6])
@@ -403,7 +763,7 @@ class AlignmentRecordIdentityTests(unittest.TestCase):
             )
 
             with self.assertRaisesRegex(ValueError, "foldseek_query_identity_mismatch"):
-                foldseek_rows(raw, target, query, "Foldseek-test", {"query_native_A"})
+                foldseek_rows(raw, target, "Foldseek-test", {"query_native_A": query})
 
     def test_structure_query_is_bound_to_manifest_path_and_digest(self) -> None:
         with tempfile.TemporaryDirectory(prefix="genoligand_foldseek_query_binding_") as tmp:
@@ -427,7 +787,10 @@ class AlignmentRecordIdentityTests(unittest.TestCase):
             assert query is not None
             self.assertEqual(query.path, declared.resolve())
             self.assertEqual(query.query_digest, digest)
-            self.assertEqual(query.query_id, f"query_{digest}")
+            self.assertEqual(
+                query.query_id,
+                structure_query_id("input-current", "record-current", digest),
+            )
 
     def test_structure_query_rejects_manifest_digest_mismatch(self) -> None:
         with tempfile.TemporaryDirectory(prefix="genoligand_foldseek_query_digest_") as tmp:

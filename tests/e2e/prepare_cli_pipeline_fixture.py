@@ -20,7 +20,7 @@ EVIDENCE_PATHS = (
     "indexes/tool_versions.tsv",
     "indexes/mmseqs/mmseqs_target_databases.tsv",
     "indexes/foldseek/foldseek_target_databases.tsv",
-    "indexes/bindingdb/bindingdb_query.manifest.json",
+    "indexes/ligand_similarity/ligand_similarity.manifest.json",
     "downloads/rcsb/ligand_bound_pdb_scope.json",
     "downloads/rcsb/ligand_bound_pdb_scope.tsv",
 )
@@ -53,6 +53,246 @@ REQUIRED_TOOL_IDS = (
     "mdtraj",
     "mdanalysis",
 )
+
+QUERY_STRUCTURE_WORKER_SOURCE = r'''from __future__ import annotations
+
+import argparse
+import hashlib
+import json
+import os
+from pathlib import Path
+
+
+def runtime_path(raw: str) -> Path:
+    if os.name != "nt" and len(raw) >= 3 and raw[1] == ":":
+        return Path("/mnt") / raw[0].lower() / raw[3:].replace("\\", "/")
+    return Path(raw)
+
+
+def write_json(path: Path, value: dict) -> str:
+    payload = (json.dumps(value, sort_keys=True, separators=(",", ":")) + "\n").encode()
+    path.write_bytes(payload)
+    return hashlib.sha256(payload).hexdigest()
+
+
+parser = argparse.ArgumentParser()
+parser.add_argument("--job", required=True)
+parser.add_argument("--out", required=True)
+args = parser.parse_args()
+job = json.loads(runtime_path(args.job).read_text(encoding="utf-8-sig"))
+run_dir = runtime_path(str(job["run_dir"]))
+artifact_dir = run_dir / "tool_outputs" / "query_structure" / job["job_id"]
+artifact_dir.mkdir(parents=True, exist_ok=True)
+relative_dir = artifact_dir.relative_to(run_dir).as_posix()
+method = "genoligand_query_structure_prepare_v1"
+conversion_digest = hashlib.sha256(
+    (run_dir / "input_conversion_manifest.tsv").read_bytes()
+).hexdigest()
+
+coordinate = artifact_dir / "query.sdf"
+coordinate.write_text(
+    "unit-test-query\n  GenoLigand\n\n  0  0  0  0  0  0            999 V2000\n"
+    "M  END\n$$$$\n",
+    encoding="utf-8",
+)
+coordinate_relative = f"{relative_dir}/query.sdf"
+coordinate_bytes = coordinate.read_bytes()
+coordinate_digest = hashlib.sha256(coordinate_bytes).hexdigest()
+packed = bytes(256)
+common = {
+    "status": "ready",
+    "run_id": job["run_id"],
+    "job_id": job["job_id"],
+    "invocation_id": job["invocation_id"],
+    "input_id": job["input_id"],
+    "record_id": job["record_id"],
+    "input_kind": job["input_kind"],
+    "input_digest": job["input_digest"],
+    "source_content_sha256": job["source_digest"],
+    "method_version": method,
+}
+features = {
+    **common,
+    "schema_version": "genoligand_query_structure_features_v1",
+    "conversion_manifest_sha256": conversion_digest,
+    "canonical_smiles": "CCO",
+    "physicochemical": {
+        "molecular_weight": 46.07,
+        "logp": -0.3,
+        "topological_polar_surface_area": 20.23,
+        "hydrogen_bond_donors": 1,
+        "hydrogen_bond_acceptors": 1,
+        "rotatable_bonds": 0,
+        "ring_count": 0,
+        "aromatic_ring_count": 0,
+        "fraction_csp3": 1.0,
+        "formal_charge": 0,
+        "heavy_atom_count": 3,
+        "qed": 0.4,
+    },
+    "fingerprint": {
+        "algorithm": "morgan_ecfp4",
+        "radius": 2,
+        "n_bits": 2048,
+        "include_chirality": True,
+        "encoding": "rdkit_binary_text_hex_v1",
+        "packed_hex": packed.hex(),
+        "packed_sha256": hashlib.sha256(packed).hexdigest(),
+        "population_count": 0,
+    },
+    "pharmacophore": {"counts": {}, "point_count": 0},
+    "coordinate_artifact": {
+        "path": coordinate_relative,
+        "sha256": coordinate_digest,
+        "size_bytes": len(coordinate_bytes),
+        "retention": "current_run_query_coordinate",
+    },
+}
+features_path = artifact_dir / "features.json"
+feature_digest = write_json(features_path, features)
+features_relative = f"{relative_dir}/features.json"
+manifest = {
+    **common,
+    "schema_version": "genoligand_query_structure_artifact_v1",
+    "conversion_manifest_sha256": conversion_digest,
+    "features_json": features_relative,
+    "feature_digest": feature_digest,
+    "coordinate_artifact": coordinate_relative,
+    "coordinate_sha256": coordinate_digest,
+    "coordinate_size_bytes": len(coordinate_bytes),
+    "retention": "current_run_query_artifacts",
+}
+manifest_path = artifact_dir / "manifest.json"
+write_json(manifest_path, manifest)
+manifest_relative = f"{relative_dir}/manifest.json"
+
+(run_dir / "query_structure_manifest.tsv").write_text(
+    "input_id\trecord_id\tinput_kind\tinput_digest\tmethod\tfeatures_json\t"
+    "coordinate_artifact\tfeature_digest\tstatus\n"
+    f"{job['input_id']}\t{job['record_id']}\t{job['input_kind']}\t"
+    f"{job['input_digest']}\t{method}\t{features_relative}\t"
+    f"{coordinate_relative}\t{feature_digest}\tready\n",
+    encoding="utf-8",
+)
+reason = "query_structure_fixture_completed"
+result = {
+    "schema_version": "genoligand_worker_current_v2",
+    "job_id": job["job_id"],
+    "worker": "query_structure_prepare",
+    "run_id": job["run_id"],
+    "invocation_id": job["invocation_id"],
+    "status": "PASS",
+    "engine_version": "unit-test-query-structure-fixture",
+    "execution_status": "completed",
+    "reason": reason,
+    "outcomes": [{
+        "status": "completed",
+        "reason": reason,
+        "required": True,
+        "database_id": "query_structure_prepare",
+        "row_count": 1,
+    }],
+    "python_owns_final_score": False,
+    "python_owns_report_semantics": False,
+    "primitive_execution_only": True,
+    "input_id": job["input_id"],
+    "record_id": job["record_id"],
+    "input_digest": job["input_digest"],
+    "source_digest": job["source_digest"],
+    "artifact_path": features_relative,
+    "manifest": manifest_relative,
+}
+runtime_path(args.out).write_text(json.dumps(result), encoding="utf-8")
+'''
+
+
+LIGAND_SIMILARITY_WORKER_SOURCE = r'''from __future__ import annotations
+
+import argparse
+import csv
+import hashlib
+import json
+from pathlib import Path
+
+
+parser = argparse.ArgumentParser()
+subparsers = parser.add_subparsers(dest="command", required=True)
+query = subparsers.add_parser("query-targets")
+query.add_argument("--database", required=True)
+query.add_argument("--manifest", required=True)
+query.add_argument("--query-manifest", required=True)
+query.add_argument("--output-tsv", required=True)
+query.add_argument("--top-k", required=True)
+query.add_argument("--threshold", required=True)
+args = parser.parse_args()
+
+with Path(args.query_manifest).open("r", encoding="utf-8-sig", newline="") as handle:
+    row = next(csv.DictReader(handle, delimiter="\t"))
+feature_digest = row["feature_digest"]
+database_sha256 = hashlib.sha256(Path(args.database).read_bytes()).hexdigest()
+manifest_bytes = Path(args.manifest).read_bytes()
+manifest_sha256 = hashlib.sha256(manifest_bytes).hexdigest()
+manifest = json.loads(manifest_bytes.decode("utf-8-sig"))
+stable_fingerprint = {
+    name: manifest["fingerprint"][name]
+    for name in (
+        "type",
+        "radius",
+        "bits",
+        "include_chirality",
+        "standardization",
+        "tautomer_max_tautomers",
+        "tautomer_max_transforms",
+        "lsh_bands",
+        "search_algorithm",
+        "bitbound_formula",
+        "reference",
+        "encoding",
+    )
+}
+build_identity_payload = {
+    "schema_version": manifest["schema_version"],
+    "fingerprint": stable_fingerprint,
+    "sources": {
+        source: {
+            "source_digest": manifest["inputs"][source]["source_digest"],
+            "source_release": manifest["inputs"][source]["source_release"],
+        }
+        for source in ("chembl", "bindingdb")
+    },
+}
+build_identity = hashlib.sha256(
+    json.dumps(
+        build_identity_payload, sort_keys=True, separators=(",", ":")
+    ).encode("utf-8")
+).hexdigest()
+publication = (
+    "ligand_similarity_index;"
+    f"compact_database_sha256={database_sha256};"
+    f"compact_manifest_sha256={manifest_sha256};"
+    f"compact_schema_version={manifest['schema_version']};"
+    f"compact_build_identity={build_identity}"
+)
+query_id = hashlib.sha256(
+    "\0".join(
+        [row["input_id"], row["record_id"], feature_digest, "ChEMBL", "CHEMBL_T1", "CCO"]
+    ).encode()
+).hexdigest()
+header = (
+    "input_id\tsource\ttarget_id\ttarget_name\torganism\ttarget_class\tmatch_score\t"
+    "matched_features\tevidence\tsource_row_provenance\tactivity_value\tligand_identity\t"
+    "current_run_query_id\trecord_id\n"
+)
+result = (
+    f"{row['input_id']}\tChEMBL\tCHEMBL_T1\tCyclin-dependent kinase 2\t"
+    "Homo sapiens\tenzyme\t0.9500\tcanonical_smiles=CCO;tanimoto=1.0000;"
+    f"structural_compatibility=1.0000\t{publication};"
+    f"query_feature_digest={feature_digest}\t{publication}\tKi=12 nM\t"
+    f"ligand_smiles=CCO\t{query_id}\t{row['record_id']}\n"
+)
+Path(args.output_tsv).write_text(header + result, encoding="utf-8")
+'''
+
 
 WORKER_SOURCE = r'''from __future__ import annotations
 
@@ -130,81 +370,115 @@ def file_sha256(path: Path) -> str:
     return hashlib.sha256(path.read_bytes()).hexdigest()
 
 
-def write_bindingdb_query_fixture(store: Path) -> None:
-    database = store / "indexes/bindingdb/bindingdb_query.sqlite"
+def write_ligand_similarity_fixture(store: Path) -> None:
+    database = store / "indexes/ligand_similarity/ligand_similarity.sqlite"
     database.parent.mkdir(parents=True, exist_ok=True)
+    counts = {"molecules": 1, "targets": 1, "evidence": 1, "hints": 0}
+    fingerprint = {
+        "type": "morgan_ecfp4",
+        "radius": 2,
+        "bits": 2048,
+        "include_chirality": True,
+        "standardization": "rdkit_cleanup_fragment_parent_reionize_canonical_tautomer_v1",
+        "tautomer_max_tautomers": 100,
+        "tautomer_max_transforms": 100,
+        "lsh_bands": 0,
+        "search_algorithm": "popcount_bitbound_exact_tanimoto",
+        "bitbound_formula": (
+            "ceil(t*q_popcount) <= db_popcount <= floor(q_popcount/t)"
+        ),
+        "reference": {"name": "FPSim2", "license": "MIT", "commit": "e03e669"},
+        "encoding": "rdkit_binary_text",
+    }
+    source_identity = {
+        source_id: {
+            "source_digest": "a" * 64,
+            "source_release": "unit_test_release",
+        }
+        for source_id in ("chembl", "bindingdb")
+    }
     connection = sqlite3.connect(database)
     try:
         connection.execute(
-            """
-            CREATE TABLE genoligand_bindingdb_activity (
-                source_row_id INTEGER PRIMARY KEY,
-                canonical_smiles TEXT NOT NULL,
-                compact_smiles TEXT NOT NULL,
-                ligand_smiles TEXT NOT NULL,
-                ligand_name TEXT NOT NULL,
-                ligand_name_lower TEXT NOT NULL,
-                target_id TEXT NOT NULL,
-                target_name TEXT NOT NULL,
-                organism TEXT NOT NULL,
-                ligand_code TEXT NOT NULL,
-                pdb_ids TEXT NOT NULL,
-                target_chain_pdb_ids TEXT NOT NULL,
-                activity TEXT NOT NULL,
-                activity_type TEXT NOT NULL,
-                relation TEXT NOT NULL,
-                numeric_rank REAL NOT NULL,
-                relation_rank INTEGER NOT NULL,
-                activity_score REAL NOT NULL,
-                pubchem_cid TEXT NOT NULL
-            )
-            """
+            "CREATE TABLE molecule ("
+            "id INTEGER PRIMARY KEY, canonical_smiles TEXT NOT NULL UNIQUE, "
+            "fingerprint BLOB NOT NULL, popcount INTEGER NOT NULL)"
         )
         connection.execute(
-            "CREATE TABLE genoligand_bindingdb_metadata (key TEXT PRIMARY KEY, value TEXT NOT NULL)"
+            "CREATE TABLE target ("
+            "id INTEGER PRIMARY KEY, source TEXT NOT NULL, target_id TEXT NOT NULL, "
+            "source_target_id TEXT NOT NULL, target_name TEXT NOT NULL, "
+            "organism TEXT NOT NULL, target_class TEXT NOT NULL, "
+            "source_release TEXT NOT NULL, source_digest TEXT NOT NULL)"
+        )
+        connection.execute(
+            "CREATE TABLE evidence ("
+            "molecule_id INTEGER NOT NULL, target_fk INTEGER NOT NULL, "
+            "activity_score REAL NOT NULL, activity TEXT NOT NULL, "
+            "relation_rank INTEGER NOT NULL, numeric_rank REAL NOT NULL, "
+            "PRIMARY KEY (molecule_id, target_fk)) WITHOUT ROWID"
+        )
+        connection.execute(
+            "CREATE TABLE structure_hint ("
+            "molecule_id INTEGER NOT NULL, target_fk INTEGER NOT NULL, "
+            "ligand_code TEXT NOT NULL, pdb_ids TEXT NOT NULL, "
+            "target_chain_pdb_ids TEXT NOT NULL, "
+            "PRIMARY KEY (molecule_id, target_fk, ligand_code)) WITHOUT ROWID"
+        )
+        connection.execute(
+            "CREATE TABLE metadata (key TEXT PRIMARY KEY, value TEXT NOT NULL) WITHOUT ROWID"
+        )
+        connection.execute(
+            "CREATE INDEX idx_molecule_popcount ON molecule(popcount, id)"
+        )
+        connection.execute("INSERT INTO molecule VALUES (1, 'CCO', ?, 3)", (b"x",))
+        connection.execute(
+            "INSERT INTO target VALUES "
+            "(1, 'ChEMBL', 'CHEMBL_T1', 'CHEMBL_T1', "
+            "'Cyclin-dependent kinase 2', 'Homo sapiens', 'enzyme', "
+            "'unit_test_release', ?)",
+            ("a" * 64,),
+        )
+        connection.execute(
+            "INSERT INTO evidence VALUES (1, 1, 0.95, 'Ki=12 nM', 0, 12.0)"
         )
         connection.executemany(
-            "INSERT INTO genoligand_bindingdb_metadata VALUES (?, ?)",
+            "INSERT INTO metadata VALUES (?, ?)",
             [
-                ("schema_version", "genoligand_bindingdb_query_database_v1"),
-                ("source_digest", "a" * 64),
-                ("source_release", "unit_test_release"),
+                ("schema_version", "genoligand_ligand_similarity_index_v2"),
+                ("status", "ready"),
+                ("counts", json.dumps(counts, sort_keys=True)),
+                ("fingerprint", json.dumps(fingerprint, sort_keys=True)),
+                ("source_identity", json.dumps(source_identity, sort_keys=True)),
             ],
-        )
-        connection.execute(
-            "INSERT INTO genoligand_bindingdb_activity VALUES "
-            "(1, 'CCO', 'cco', 'CCO', 'ethanol', 'ethanol', 'P24941', "
-            "'Cyclin-dependent kinase 2', 'Homo sapiens', '', '', '', '12', "
-            "'Ki (nM)', '=', 12.0, 0, 0.95, '')"
-        )
-        connection.execute(
-            "CREATE INDEX idx_bindingdb_activity_canonical_smiles "
-            "ON genoligand_bindingdb_activity(canonical_smiles)"
-        )
-        connection.execute(
-            "CREATE INDEX idx_bindingdb_activity_compact_smiles "
-            "ON genoligand_bindingdb_activity(compact_smiles)"
         )
         connection.commit()
     finally:
         connection.close()
+    input_bytes = 1_000_000
+    database_bytes = database.stat().st_size
     manifest = {
-        "schema_version": "genoligand_bindingdb_query_database_v1",
+        "schema_version": "genoligand_ligand_similarity_index_v2",
         "status": "ready",
-        "table": "genoligand_bindingdb_activity",
-        "rows": 1,
-        "database_bytes": database.stat().st_size,
-        "database_sha256": file_sha256(database),
-        "source_path": "downloads/bindingdb/bindingdb_all.tsv.zip",
-        "source_bytes": 1,
-        "source_digest": "a" * 64,
-        "source_release": "unit_test_release",
-        "source_archive_sha256": "b" * 64,
-        "builder_version": "unit-test-fixture",
-        "indexes": [
-            "idx_bindingdb_activity_canonical_smiles",
-            "idx_bindingdb_activity_compact_smiles",
-        ],
+        "database": {
+            "path": str(database.resolve()),
+            "bytes": database_bytes,
+            "sha256": file_sha256(database),
+        },
+        "counts": counts,
+        "fingerprint": fingerprint,
+        "inputs": {
+            source_id: {
+                "path": f"superseded/{source_id}_query.sqlite",
+                "manifest_path": f"superseded/{source_id}_query.manifest.json",
+                "bytes": input_bytes,
+                "sha256": "b" * 64,
+                "source_digest": "a" * 64,
+                "source_release": "unit_test_release",
+            }
+            for source_id in ("chembl", "bindingdb")
+        },
+        "reclaimed_candidate_bytes": input_bytes * 2 - database_bytes,
     }
     database.with_suffix(".manifest.json").write_text(
         json.dumps(manifest, sort_keys=True) + "\n",
@@ -287,7 +561,7 @@ def write_ready_store(store: Path) -> None:
             encoding="utf-8",
         )
 
-    write_bindingdb_query_fixture(store)
+    write_ligand_similarity_fixture(store)
 
     evidence = []
     for relative in EVIDENCE_PATHS:
@@ -334,6 +608,12 @@ def prepare(root: Path, mode: str) -> None:
     package = root / "python" / "genoligand_workers"
     package.mkdir(parents=True, exist_ok=True)
     (package / "__init__.py").write_text("", encoding="utf-8")
+    (package / "query_structure_worker.py").write_text(
+        QUERY_STRUCTURE_WORKER_SOURCE, encoding="utf-8"
+    )
+    (package / "ligand_similarity_index.py").write_text(
+        LIGAND_SIMILARITY_WORKER_SOURCE, encoding="utf-8"
+    )
     for module in ("alignment_worker.py", "docking_worker.py", "md_summary_worker.py"):
         (package / module).write_text(WORKER_SOURCE, encoding="utf-8")
 

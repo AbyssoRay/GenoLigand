@@ -54,6 +54,112 @@ def assert_invalid(contract: Draft202012Validator, payload: object, label: str) 
         raise AssertionError(f"{label} was accepted")
 
 
+def query_structure_job() -> dict[str, Any]:
+    source_digest = "1" * 64
+    return {
+        "schema_version": "genoligand_worker_current_v2",
+        "pipeline_mode": "genoligand_scientific_pipeline",
+        "job_id": "query_structure_prepare__contract_fixture",
+        "worker": "query_structure_prepare",
+        "stage": "query_structure_prepare",
+        "run_id": "run-contract-fixture",
+        "invocation_id": "invocation-contract-fixture",
+        "rust_owned_decision_logic": True,
+        "decision_owner": "GenoLigand Rust core",
+        "input_manifest": "D:/fixture/input_manifest.tsv",
+        "run_dir": "D:/fixture/runs/run-contract-fixture",
+        "science_store": "D:/fixture/science_store",
+        "expected_result_schema": "genoligand_worker_current_v2",
+        "input_id": "input-contract-fixture",
+        "record_id": "record-contract-fixture",
+        "input_kind": "small_molecule",
+        "input_digest": "2" * 64,
+        "source_digest": source_digest,
+        "content_sha256": source_digest,
+    }
+
+
+def query_structure_result(job: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "schema_version": "genoligand_worker_current_v2",
+        "job_id": job["job_id"],
+        "worker": job["worker"],
+        "run_id": job["run_id"],
+        "invocation_id": job["invocation_id"],
+        "status": "PASS",
+        "engine_version": "genoligand_query_structure_prepare_v1",
+        "execution_status": "completed",
+        "reason": "query_structure_prepared",
+        "outcomes": [
+            {
+                "status": "completed",
+                "reason": "query_structure_prepared",
+                "required": True,
+                "database_id": "query_structure_prepare",
+                "row_count": 1,
+            }
+        ],
+        "python_owns_final_score": False,
+        "python_owns_report_semantics": False,
+        "primitive_execution_only": True,
+        "input_id": job["input_id"],
+        "record_id": job["record_id"],
+        "input_digest": job["input_digest"],
+        "source_digest": job["source_digest"],
+        "input_manifest_sha256": "3" * 64,
+        "artifact_path": "tool_outputs/query_structure/input/features.json",
+        "manifest": "tool_outputs/query_structure/input/manifest.json",
+    }
+
+
+def validate_query_structure_contracts(
+    job_contract: Draft202012Validator,
+    result_contract: Draft202012Validator,
+) -> None:
+    job = query_structure_job()
+    assert_valid(job_contract, job, "query structure job")
+    for field in (
+        "input_id",
+        "record_id",
+        "input_kind",
+        "input_digest",
+        "source_digest",
+        "content_sha256",
+    ):
+        invalid = copy.deepcopy(job)
+        invalid.pop(field)
+        assert_invalid(job_contract, invalid, f"query structure job without {field}")
+    unknown_job = copy.deepcopy(job)
+    unknown_job["unknown_query_field"] = True
+    assert_invalid(job_contract, unknown_job, "query structure job with unknown field")
+    for field in ("input_digest", "source_digest", "content_sha256"):
+        invalid = copy.deepcopy(job)
+        invalid[field] = "not-a-sha256"
+        assert_invalid(job_contract, invalid, f"query structure job with invalid {field}")
+
+    result = query_structure_result(job)
+    assert_valid(result_contract, result, "query structure result")
+    for field in (
+        "run_id",
+        "invocation_id",
+        "input_id",
+        "record_id",
+        "input_digest",
+        "source_digest",
+        "manifest",
+    ):
+        invalid = copy.deepcopy(result)
+        invalid.pop(field)
+        assert_invalid(result_contract, invalid, f"query structure result without {field}")
+    unknown_result = copy.deepcopy(result)
+    unknown_result["unknown_query_field"] = True
+    assert_invalid(result_contract, unknown_result, "query structure result with unknown field")
+    for field in ("input_digest", "source_digest", "input_manifest_sha256"):
+        invalid = copy.deepcopy(result)
+        invalid[field] = "not-a-sha256"
+        assert_invalid(result_contract, invalid, f"query structure result with invalid {field}")
+
+
 def source_has_symbols(source: str, language: str, symbols: list[str]) -> None:
     path = ROOT / source
     text = path.read_text(encoding="utf-8")
@@ -316,6 +422,7 @@ def validate_result_captures(
 def main() -> int:
     job_contract = validator("worker_job.schema.json")
     result_contract = validator("worker_result.schema.json")
+    validate_query_structure_contracts(job_contract, result_contract)
     jobs = validate_job_captures(job_contract)
     validate_result_captures(result_contract, jobs)
     print("worker_schema_contracts\tPASS")

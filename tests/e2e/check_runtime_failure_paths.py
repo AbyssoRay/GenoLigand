@@ -99,12 +99,11 @@ CASES = (
         "python_failure",
     ),
     FailureCase(
-        "worker_unavailable_fallback",
+        "worker_unavailable_query_structure",
         "worker_unavailable",
-        "onsite_sequence_alignment",
-        "features_compute",
-        "mmseqs_alignment_fail",
-        "rust_fallback_failure",
+        "query_structure_prepare",
+        "input_normalize",
+        "query_structure_prepare_launch_failed",
     ),
     FailureCase(
         "sorting_failure",

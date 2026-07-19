@@ -11,6 +11,12 @@ from pathlib import Path
 from typing import Any, NamedTuple
 
 from genoligand_workers.common import WorkerExecution, WorkerOutcome
+from genoligand_workers.query_structure_worker import (
+    ARTIFACT_SCHEMA_VERSION as QUERY_STRUCTURE_ARTIFACT_SCHEMA_VERSION,
+    FEATURE_SCHEMA_VERSION as QUERY_STRUCTURE_FEATURE_SCHEMA_VERSION,
+    INDEX_HEADER as QUERY_STRUCTURE_INDEX_HEADER,
+    METHOD_VERSION as QUERY_STRUCTURE_METHOD_VERSION,
+)
 from genoligand_workers.worker_io import parse_worker_args, read_job, write_result
 
 
@@ -20,6 +26,8 @@ FOLDSEEK_MATCH_HEADER = (
     "builder_version\tfoldseek_version\tcurrent_run_query_id\tquery_digest\ttm_score\n"
 )
 ALIGNMENT_MANIFEST_SCHEMA_VERSION = "genoligand_alignment_database_manifest_v2"
+FOLDSEEK_STRUCTURE_SUFFIXES = {".pdb", ".ent", ".cif", ".mmcif"}
+QUERY_STRUCTURE_FORMATS = {"pdb", "ent", "cif", "mmcif"}
 ALIGNMENT_MANIFEST_REQUIRED_FIELDS = {
     "source_id",
     "manifest_schema_version",
@@ -267,8 +275,8 @@ def run_foldseek_alignment(run_dir: Path, science_store: Path) -> WorkerExecutio
     status_path = out_dir / "foldseek_alignment_status.tsv"
     write_text(matches_path, FOLDSEEK_MATCH_HEADER)
 
-    query = structure_query(run_dir)
-    if query is None:
+    queries = structure_queries(run_dir)
+    if not queries:
         reason = "no_structure_query"
         write_status(status_path, "not_applicable", reason, 0)
         return WorkerExecution(
@@ -309,8 +317,13 @@ def run_foldseek_alignment(run_dir: Path, science_store: Path) -> WorkerExecutio
     tmp_root.mkdir(parents=True, exist_ok=True)
     query_db = out_dir / "foldseek_query_db"
     timeout = int(os.environ.get("GENOLIGAND_ALIGNMENT_TIMEOUT_SECONDS", "900"))
-    run_command([foldseek, "createdb", str(query.path), str(query_db)], timeout, "foldseek_createdb")
-    native_query_names = foldseek_lookup_names(query_db)
+    query_sources = prepare_foldseek_query_sources(run_dir, tmp_root, queries)
+    run_command(
+        [foldseek, "createdb", str(query_sources), str(query_db)],
+        timeout,
+        "foldseek_createdb",
+    )
+    query_identities = foldseek_query_identities(query_db, queries)
     rows: list[str] = []
     outcomes: list[WorkerOutcome] = []
     for index, target in enumerate(targets, start=1):
@@ -351,9 +364,8 @@ def run_foldseek_alignment(run_dir: Path, science_store: Path) -> WorkerExecutio
         target_rows = foldseek_rows(
             raw,
             target,
-            query,
             foldseek_version,
-            native_query_names,
+            query_identities,
         )
         rows.extend(target_rows)
         outcomes.append(
@@ -831,9 +843,8 @@ def validate_mmseqs_alignment(
 def foldseek_rows(
     path: Path,
     target_database: FoldseekTargetDatabase,
-    query_identity: StructureQuery,
     foldseek_version: str,
-    native_query_names: set[str],
+    query_identities: dict[str, StructureQuery],
 ) -> list[str]:
     if not path.exists():
         return []
@@ -844,7 +855,8 @@ def foldseek_rows(
             if len(cols) < 6:
                 raise ValueError("foldseek_alignment_row_invalid")
             query, target, pident, tm_score, evalue, bits = cols[:6]
-            if query not in native_query_names:
+            query_identity = query_identities.get(query)
+            if query_identity is None:
                 raise ValueError(f"foldseek_query_identity_mismatch:{safe_note(query)}")
             try:
                 identity_value = float(pident)
@@ -906,10 +918,91 @@ def foldseek_lookup_names(database: Path) -> set[str]:
     return names
 
 
+def foldseek_query_identities(
+    database: Path,
+    queries: list[StructureQuery],
+) -> dict[str, StructureQuery]:
+    by_query_id: dict[str, StructureQuery] = {}
+    for query in queries:
+        if query.query_id in by_query_id:
+            raise ValueError(f"foldseek_query_id_collision:{query.query_id}")
+        by_query_id[query.query_id] = query
+    identities: dict[str, StructureQuery] = {}
+    observed: set[str] = set()
+    for native_name in foldseek_lookup_names(database):
+        name = native_name.replace("\\", "/").rsplit("/", 1)[-1]
+        matches = [
+            query
+            for query_id, query in by_query_id.items()
+            if name == query_id
+            or name.startswith(f"{query_id}_")
+            or name.startswith(f"{query_id}.")
+        ]
+        if len(matches) != 1:
+            raise ValueError(f"foldseek_query_identity_mismatch:{safe_note(native_name)}")
+        identities[native_name] = matches[0]
+        observed.add(matches[0].query_id)
+    missing = set(by_query_id).difference(observed)
+    if missing:
+        raise ValueError(f"foldseek_query_lookup_incomplete:{safe_note(sorted(missing)[0])}")
+    return identities
+
+
+def prepare_foldseek_query_sources(
+    run_dir: Path,
+    tmp_root: Path,
+    queries: list[StructureQuery],
+) -> Path:
+    root = run_dir.resolve(strict=True)
+    resolved_tmp = tmp_root.resolve(strict=True)
+    try:
+        resolved_tmp.relative_to(root)
+    except ValueError as exc:
+        raise ValueError("foldseek_query_tmp_outside_run") from exc
+    sources = resolved_tmp / "query_sources"
+    if sources.exists() or sources.is_symlink():
+        if is_link_like(sources) or not sources.is_dir():
+            raise ValueError("foldseek_query_source_directory_invalid")
+        shutil.rmtree(sources)
+    sources.mkdir()
+    for query in queries:
+        suffix = structure_suffix(query.path)
+        reference = sources / f"{query.query_id}{suffix}"
+        try:
+            os.link(query.path, reference)
+        except OSError as hardlink_error:
+            try:
+                reference.symlink_to(query.path, target_is_directory=False)
+            except OSError as symlink_error:
+                raise ValueError(
+                    f"foldseek_query_reference_create_failed:{safe_note(str(hardlink_error))}:"
+                    f"{safe_note(str(symlink_error))}"
+                ) from symlink_error
+        if not reference.is_file() or not os.path.samefile(reference, query.path):
+            raise ValueError("foldseek_query_reference_binding_invalid")
+    return sources
+
+
+def structure_queries(run_dir: Path) -> list[StructureQuery]:
+    prepared_manifest = run_dir / "query_structure_manifest.tsv"
+    if prepared_manifest.exists() or prepared_manifest.is_symlink():
+        return prepared_structure_queries(run_dir, prepared_manifest)
+    return legacy_structure_queries(run_dir)
+
+
 def structure_query(run_dir: Path) -> StructureQuery | None:
+    queries = structure_queries(run_dir)
+    if not queries:
+        return None
+    if len(queries) != 1:
+        raise ValueError("foldseek_query_identity_missing")
+    return queries[0]
+
+
+def legacy_structure_queries(run_dir: Path) -> list[StructureQuery]:
     manifest = run_dir / "input_conversion_manifest.tsv"
     if not manifest.is_file():
-        return None
+        return []
     with manifest.open("r", encoding="utf-8-sig", newline="") as handle:
         candidates = [
             row
@@ -920,26 +1013,348 @@ def structure_query(run_dir: Path) -> StructureQuery | None:
             and str(row.get("record_id", "")).strip()
         ]
     if not candidates:
+        return []
+    queries: list[StructureQuery] = []
+    identities: set[tuple[str, str]] = set()
+    for row in candidates:
+        input_id = str(row.get("input_id", "")).strip()
+        record_id = str(row.get("record_id", "")).strip()
+        identity = (input_id, record_id)
+        if identity in identities:
+            raise ValueError("foldseek_query_identity_missing")
+        identities.add(identity)
+        declared_digest = str(row.get("content_sha256", "")).strip().lower()
+        if not valid_digest(declared_digest):
+            raise ValueError("foldseek_query_digest_invalid")
+        query_path = structure_query_path(run_dir, row)
+        if not query_path.is_file() or query_path.stat().st_size <= 0:
+            raise ValueError("foldseek_query_path_missing")
+        query_digest = sha256_path(query_path)
+        if query_digest != declared_digest:
+            raise ValueError("foldseek_query_digest_mismatch")
+        queries.append(
+            StructureQuery(
+                query_path,
+                input_id,
+                record_id,
+                structure_query_id(input_id, record_id, query_digest),
+                query_digest,
+            )
+        )
+    return queries
+
+
+def prepared_structure_queries(run_dir: Path, index_path: Path) -> list[StructureQuery]:
+    root = run_dir.resolve(strict=True)
+    if is_link_like(index_path):
+        raise ValueError("foldseek_query_manifest_link")
+    invocation_path = run_dir / "worker_invocation_id.txt"
+    if not invocation_path.is_file() or is_link_like(invocation_path):
+        raise ValueError("foldseek_query_invocation_missing")
+    invocation_id = invocation_path.read_text(encoding="utf-8-sig").strip()
+    if not invocation_id:
+        raise ValueError("foldseek_query_invocation_missing")
+    conversion_path = run_dir / "input_conversion_manifest.tsv"
+    conversion_rows = conversion_records(conversion_path)
+    conversion_digest = sha256_path(conversion_path)
+    with index_path.open("r", encoding="utf-8-sig", newline="") as handle:
+        reader = csv.DictReader(handle, delimiter="\t")
+        if reader.fieldnames != QUERY_STRUCTURE_INDEX_HEADER.rstrip("\n").split("\t"):
+            raise ValueError("foldseek_query_manifest_schema_invalid")
+        index_rows = list(reader)
+    indexed: dict[tuple[str, str], dict[str, str]] = {}
+    for row in index_rows:
+        identity = (
+            str(row.get("input_id", "")).strip(),
+            str(row.get("record_id", "")).strip(),
+        )
+        if not all(identity) or identity in indexed:
+            raise ValueError("foldseek_query_manifest_identity_invalid")
+        indexed[identity] = row
+    if set(indexed) != set(conversion_rows):
+        raise ValueError("foldseek_query_manifest_identity_mismatch")
+
+    queries: list[StructureQuery] = []
+    for identity in sorted(indexed):
+        row = indexed[identity]
+        source = conversion_rows[identity]
+        query = prepared_structure_query(
+            root,
+            row,
+            source,
+            invocation_id,
+            conversion_digest,
+        )
+        if query is not None:
+            queries.append(query)
+    return queries
+
+
+def conversion_records(path: Path) -> dict[tuple[str, str], dict[str, str]]:
+    if not path.is_file() or is_link_like(path):
+        raise ValueError("foldseek_query_conversion_manifest_missing")
+    required = {
+        "input_id",
+        "record_id",
+        "canonical_kind",
+        "conversion_status",
+        "format",
+        "source_path",
+        "content_sha256",
+        "artifact",
+    }
+    records: dict[tuple[str, str], dict[str, str]] = {}
+    with path.open("r", encoding="utf-8-sig", newline="") as handle:
+        reader = csv.DictReader(handle, delimiter="\t")
+        if reader.fieldnames is None or not required.issubset(reader.fieldnames):
+            raise ValueError("foldseek_query_conversion_manifest_schema_invalid")
+        for row in reader:
+            if str(row.get("conversion_status", "")).strip() != "converted":
+                continue
+            identity = (
+                str(row.get("input_id", "")).strip(),
+                str(row.get("record_id", "")).strip(),
+            )
+            if not all(identity) or identity in records:
+                raise ValueError("foldseek_query_conversion_identity_invalid")
+            records[identity] = row
+    return records
+
+
+def prepared_structure_query(
+    run_dir: Path,
+    row: dict[str, str],
+    source: dict[str, str],
+    invocation_id: str,
+    conversion_digest: str,
+) -> StructureQuery | None:
+    input_id = str(row.get("input_id", "")).strip()
+    record_id = str(row.get("record_id", "")).strip()
+    input_kind = str(row.get("input_kind", "")).strip()
+    input_digest = str(row.get("input_digest", "")).strip().lower()
+    status = str(row.get("status", "")).strip()
+    source_digest = str(source.get("content_sha256", "")).strip().lower()
+    if (
+        input_kind != str(source.get("canonical_kind", "")).strip()
+        or not valid_digest(input_digest)
+        or not valid_digest(source_digest)
+        or status not in {"ready", "not_applicable"}
+        or str(row.get("method", "")).strip() != QUERY_STRUCTURE_METHOD_VERSION
+    ):
+        raise ValueError("foldseek_query_manifest_binding_invalid")
+
+    artifact_dir = query_structure_artifact_dir(run_dir, input_id, record_id, invocation_id)
+    manifest_path = artifact_dir / "manifest.json"
+    manifest = read_bound_json(run_dir, manifest_path, "foldseek_query_artifact_manifest_invalid")
+    common = {
+        "run_id": run_dir.name,
+        "invocation_id": invocation_id,
+        "input_id": input_id,
+        "record_id": record_id,
+        "input_kind": input_kind,
+        "input_digest": input_digest,
+        "source_content_sha256": source_digest,
+        "method_version": QUERY_STRUCTURE_METHOD_VERSION,
+    }
+    if (
+        manifest.get("schema_version") != QUERY_STRUCTURE_ARTIFACT_SCHEMA_VERSION
+        or manifest.get("status") != status
+        or any(manifest.get(field) != value for field, value in common.items())
+        or not str(manifest.get("job_id", "")).strip()
+    ):
+        raise ValueError("foldseek_query_artifact_binding_invalid")
+
+    features_value = str(row.get("features_json", "")).strip()
+    coordinate_value = str(row.get("coordinate_artifact", "")).strip()
+    feature_digest = str(row.get("feature_digest", "")).strip().lower()
+    if status == "not_applicable":
+        if (
+            features_value
+            or coordinate_value
+            or feature_digest
+            or manifest.get("features_json")
+            or manifest.get("coordinate_artifact")
+            or not str(manifest.get("reason", "")).strip()
+        ):
+            raise ValueError("foldseek_query_terminal_artifact_invalid")
         return None
-    if len(candidates) != 1:
-        raise ValueError("foldseek_query_identity_missing")
-    row = candidates[0]
-    declared_digest = str(row.get("content_sha256", "")).strip().lower()
-    if not valid_digest(declared_digest):
-        raise ValueError("foldseek_query_digest_invalid")
-    query_path = structure_query_path(run_dir, row)
-    if not query_path.is_file() or query_path.stat().st_size <= 0:
-        raise ValueError("foldseek_query_path_missing")
-    query_digest = sha256_path(query_path)
-    if query_digest != declared_digest:
-        raise ValueError("foldseek_query_digest_mismatch")
-    return StructureQuery(
-        query_path,
-        str(row.get("input_id", "")).strip(),
-        str(row.get("record_id", "")).strip(),
-        f"query_{query_digest}",
-        query_digest,
+
+    features_path = resolve_run_artifact(run_dir, features_value, "foldseek_query_features_invalid")
+    if features_path.parent != artifact_dir.resolve(strict=True):
+        raise ValueError("foldseek_query_features_parent_mismatch")
+    if not valid_digest(feature_digest) or sha256_path(features_path) != feature_digest:
+        raise ValueError("foldseek_query_feature_digest_mismatch")
+    features = read_bound_json(run_dir, features_path, "foldseek_query_features_invalid")
+    feature_common = {**common, "conversion_manifest_sha256": conversion_digest}
+    if (
+        features.get("schema_version") != QUERY_STRUCTURE_FEATURE_SCHEMA_VERSION
+        or features.get("status") != "ready"
+        or any(features.get(field) != value for field, value in feature_common.items())
+        or features.get("job_id") != manifest.get("job_id")
+        or manifest.get("conversion_manifest_sha256") != conversion_digest
+        or manifest.get("features_json") != features_value
+        or manifest.get("feature_digest") != feature_digest
+        or manifest.get("coordinate_artifact") != coordinate_value
+    ):
+        raise ValueError("foldseek_query_features_binding_invalid")
+
+    feature_coordinate = features.get("coordinate_artifact")
+    if not isinstance(feature_coordinate, dict):
+        raise ValueError("foldseek_query_coordinate_metadata_invalid")
+    coordinate_digest = str(manifest.get("coordinate_sha256", "")).strip().lower()
+    coordinate_bytes = manifest.get("coordinate_size_bytes")
+    if (
+        feature_coordinate.get("path") != coordinate_value
+        or feature_coordinate.get("sha256") != coordinate_digest
+        or feature_coordinate.get("size_bytes") != coordinate_bytes
+    ):
+        raise ValueError("foldseek_query_coordinate_metadata_invalid")
+    if not coordinate_value:
+        if coordinate_digest or coordinate_bytes != 0:
+            raise ValueError("foldseek_query_coordinate_metadata_invalid")
+        return None
+    if (
+        not valid_digest(coordinate_digest)
+        or isinstance(coordinate_bytes, bool)
+        or not isinstance(coordinate_bytes, int)
+        or coordinate_bytes <= 0
+    ):
+        raise ValueError("foldseek_query_coordinate_metadata_invalid")
+    coordinate = resolve_query_coordinate(
+        run_dir,
+        artifact_dir,
+        coordinate_value,
+        source,
+        str(manifest.get("retention", "")),
     )
+    if coordinate.stat().st_size != coordinate_bytes or sha256_path(coordinate) != coordinate_digest:
+        raise ValueError("foldseek_query_coordinate_digest_mismatch")
+    if structure_suffix(coordinate) not in FOLDSEEK_STRUCTURE_SUFFIXES:
+        return None
+    return StructureQuery(
+        coordinate,
+        input_id,
+        record_id,
+        structure_query_id(input_id, record_id, coordinate_digest),
+        coordinate_digest,
+    )
+
+
+def query_structure_artifact_dir(
+    run_dir: Path,
+    input_id: str,
+    record_id: str,
+    invocation_id: str,
+) -> Path:
+    input_key = hashlib.sha256(input_id.encode("utf-8")).hexdigest()[:16]
+    record_key = hashlib.sha256(record_id.encode("utf-8")).hexdigest()[:16]
+    invocation_key = hashlib.sha256(invocation_id.encode("utf-8")).hexdigest()[:16]
+    return run_dir / "tool_outputs" / "query_structure" / input_key / record_key / f"inv_{invocation_key}"
+
+
+def read_bound_json(run_dir: Path, path: Path, error: str) -> dict[str, Any]:
+    try:
+        resolved = path.resolve(strict=True)
+        resolved.relative_to(run_dir.resolve(strict=True))
+        ensure_no_link_components(run_dir, path)
+        with resolved.open("r", encoding="utf-8-sig") as handle:
+            value = json.load(handle)
+    except (OSError, ValueError, json.JSONDecodeError) as exc:
+        raise ValueError(error) from exc
+    if not isinstance(value, dict):
+        raise ValueError(error)
+    return value
+
+
+def resolve_run_artifact(run_dir: Path, value: str, error: str) -> Path:
+    if not value:
+        raise ValueError(error)
+    candidate = runtime_path(value)
+    if candidate.is_absolute():
+        raise ValueError(error)
+    candidate = run_dir / candidate
+    try:
+        resolved = candidate.resolve(strict=True)
+        resolved.relative_to(run_dir.resolve(strict=True))
+        ensure_no_link_components(run_dir, candidate)
+    except (OSError, ValueError) as exc:
+        raise ValueError(error) from exc
+    if not resolved.is_file():
+        raise ValueError(error)
+    return resolved
+
+
+def resolve_query_coordinate(
+    run_dir: Path,
+    artifact_dir: Path,
+    value: str,
+    source: dict[str, str],
+    retention: str,
+) -> Path:
+    declared = runtime_path(value)
+    inside_run = not declared.is_absolute()
+    candidate = declared if declared.is_absolute() else run_dir / declared
+    if inside_run:
+        ensure_no_link_components(run_dir, candidate)
+    try:
+        coordinate = candidate.resolve(strict=True)
+    except OSError as exc:
+        raise ValueError("foldseek_query_coordinate_missing") from exc
+    if not coordinate.is_file():
+        raise ValueError("foldseek_query_coordinate_missing")
+    source_format = str(source.get("format", "")).strip().lower()
+    original: Path | None = None
+    if source_format in QUERY_STRUCTURE_FORMATS:
+        original = structure_query_path(run_dir, source)
+    if original is not None and os.path.samefile(coordinate, original):
+        if retention != "original_input_reference_only":
+            raise ValueError("foldseek_query_original_retention_invalid")
+        return coordinate
+    if not inside_run:
+        raise ValueError("foldseek_query_coordinate_outside_run")
+    if coordinate.parent != artifact_dir.resolve(strict=True) or retention != "single_representative_only":
+        raise ValueError("foldseek_query_generated_coordinate_binding_invalid")
+    return coordinate
+
+
+def ensure_no_link_components(run_dir: Path, path: Path) -> None:
+    lexical = path if path.is_absolute() else run_dir / path
+    try:
+        relative = lexical.relative_to(run_dir)
+    except ValueError as exc:
+        raise ValueError("foldseek_query_artifact_outside_run") from exc
+    current = run_dir
+    for part in relative.parts:
+        current = current / part
+        if is_link_like(current):
+            raise ValueError("foldseek_query_artifact_link")
+    try:
+        lexical.resolve(strict=True).relative_to(run_dir.resolve(strict=True))
+    except ValueError as exc:
+        raise ValueError("foldseek_query_artifact_outside_run") from exc
+
+
+def is_link_like(path: Path) -> bool:
+    if path.is_symlink():
+        return True
+    is_junction = getattr(path, "is_junction", None)
+    return bool(is_junction and is_junction())
+
+
+def structure_suffix(path: Path) -> str:
+    suffix = path.suffix.lower()
+    if suffix == ".gz":
+        suffix = Path(path.stem).suffix.lower()
+    return suffix
+
+
+def structure_query_id(input_id: str, record_id: str, query_digest: str) -> str:
+    payload = json.dumps(
+        [input_id, record_id, query_digest],
+        ensure_ascii=False,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    return f"query_{hashlib.sha256(payload).hexdigest()}"
 
 
 def structure_query_path(run_dir: Path, row: dict[str, str]) -> Path:

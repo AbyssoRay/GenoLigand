@@ -107,6 +107,11 @@ function candidateDetailSection(rows, pagination) {
         </div>
         <span class="status-pill ready">候选编号 ${escapeHtml(valueOrMissing(first.candidate_id))}</span>
       </div>
+      ${metricRow("输入编号", valueOrMissing(first.input_id))}
+      ${metricRow("记录编号", valueOrMissing(first.record_id))}
+      ${metricRow("输入类型", friendlyInputKind(first.input_kind))}
+      ${metricRow("排序路线", friendlyRankingPolicy(first.ranking_policy))}
+      ${metricRow("路线权重", rankingWeightSummary(first))}
       ${metricRow("目标名称", valueOrMissing(first.target_name))}
       ${metricRow("目标编号", valueOrMissing(first.target_id))}
       ${metricRow("候选范围", valueOrMissing(first.candidate_scope_label, friendlyScope(first.candidate_scope)))}

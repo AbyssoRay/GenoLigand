@@ -16,6 +16,7 @@ import re
 import shutil
 import sqlite3
 import ssl
+import stat
 import subprocess
 import sys
 import tarfile
@@ -178,6 +179,14 @@ OPENFF_FORCEFIELD_SHA256 = "1b24deb47970bae2d179a5b4e023d4a57c9c78614fe431f1670e
 OPENFF_FORCEFIELD_RELEASE = "openff-forcefields-2024.09.0"
 ALIGNMENT_MANIFEST_SCHEMA_VERSION = "genoligand_alignment_database_manifest_v2"
 SCIENCE_READINESS_SCHEMA_VERSION = "genoligand_science_store_readiness_v1"
+LIGAND_SIMILARITY_SCHEMA_VERSION = "genoligand_ligand_similarity_index_v2"
+LIGAND_SIMILARITY_DATABASE_REL_PATH = "indexes/ligand_similarity/ligand_similarity.sqlite"
+LIGAND_SIMILARITY_MANIFEST_REL_PATH = "indexes/ligand_similarity/ligand_similarity.manifest.json"
+LIGAND_SIMILARITY_STANDARDIZATION = (
+    "rdkit_cleanup_fragment_parent_reionize_canonical_tautomer_v1"
+)
+LIGAND_SIMILARITY_TAUTOMER_LIMIT = 100
+LIGAND_SIMILARITY_SQLITE_VALIDATION_CACHE: set[tuple[str, int, str]] = set()
 SCIENCE_READINESS_EVIDENCE_PATHS = (
     "source_requirements.tsv",
     "manifests/source_file_manifest.tsv",
@@ -193,8 +202,7 @@ SCIENCE_READINESS_EVIDENCE_PATHS = (
     "indexes/mmseqs/mmseqs_target_databases.tsv",
     "indexes/foldseek/foldseek_target_databases.tsv",
     "indexes/foldseek/rcsb_mmcif/indexed_pdb_ids.tsv",
-    "downloads/chembl/chembl_query.manifest.json",
-    "indexes/bindingdb/bindingdb_query.manifest.json",
+    LIGAND_SIMILARITY_MANIFEST_REL_PATH,
     "manifests/source_retention_manifest.tsv",
     "downloads/rcsb/ligand_bound_pdb_scope.json",
     "downloads/rcsb/ligand_bound_pdb_scope.tsv",
@@ -233,15 +241,15 @@ INDEXED_SOURCE_RETENTION_POLICIES: dict[str, dict[str, object]] = {
     "chembl": {
         "payloads": ("downloads/chembl/chembl_sqlite.tar.gz",),
         "derived": (
-            "downloads/chembl/chembl_query.sqlite",
-            "downloads/chembl/chembl_query.manifest.json",
+            LIGAND_SIMILARITY_DATABASE_REL_PATH,
+            LIGAND_SIMILARITY_MANIFEST_REL_PATH,
         ),
     },
     "bindingdb": {
         "payloads": ("downloads/bindingdb/bindingdb_all.tsv.zip",),
         "derived": (
-            "indexes/bindingdb/bindingdb_query.sqlite",
-            "indexes/bindingdb/bindingdb_query.manifest.json",
+            LIGAND_SIMILARITY_DATABASE_REL_PATH,
+            LIGAND_SIMILARITY_MANIFEST_REL_PATH,
         ),
     },
     "uniprot_human_reviewed": {
@@ -5047,6 +5055,181 @@ def bindingdb_query_database_ready(
         return False
 
 
+def ligand_similarity_index_ready(
+    science_store: Path,
+    source_manifests: dict[str, dict[str, str]] | None = None,
+    summary_cache: ResourceSummaryCache | None = None,
+) -> bool:
+    database = science_store / LIGAND_SIMILARITY_DATABASE_REL_PATH
+    manifest = science_store / LIGAND_SIMILARITY_MANIFEST_REL_PATH
+    payload = read_json_object(manifest)
+    sources = source_manifests or source_manifest_rows_by_id(science_store)
+    database_meta = payload.get("database", {})
+    inputs = payload.get("inputs", {})
+    counts = payload.get("counts", {})
+    fingerprint = payload.get("fingerprint", {})
+    if not all(isinstance(value, dict) for value in (database_meta, inputs, counts, fingerprint)):
+        return False
+    try:
+        summary = resource_payload_summary(database, cache=summary_cache)
+        declared_path = str(database_meta.get("path", "")).replace("\\", "/").casefold()
+        accepted_paths = {
+            str(database.resolve()).replace("\\", "/").casefold(),
+            wsl_path(database.resolve()).replace("\\", "/").casefold(),
+        }
+        if declared_path not in accepted_paths:
+            return False
+        input_bytes = 0
+        expected_source_identity: dict[str, dict[str, str]] = {}
+        for source_id in ("chembl", "bindingdb"):
+            source = sources.get(source_id, {})
+            source_input = inputs.get(source_id, {})
+            if not isinstance(source_input, dict) or not (
+                source.get("status") == "ready"
+                and source_input.get("source_digest") == source.get("sha256")
+                and source_input.get("source_release") == source.get("release_identity")
+                and re.fullmatch(r"[0-9a-f]{64}", str(source_input.get("sha256", "")).lower())
+                and type(source_input.get("bytes")) is int
+                and int(source_input.get("bytes", 0)) > 0
+            ):
+                return False
+            input_bytes += int(source_input["bytes"])
+            expected_source_identity[source_id] = {
+                "source_digest": str(source_input["source_digest"]),
+                "source_release": str(source_input["source_release"]),
+            }
+        output_bytes = int(database_meta.get("bytes", 0))
+        reclaimed = int(payload.get("reclaimed_candidate_bytes", -1))
+        reference = fingerprint.get("reference", {})
+        if not (
+            payload.get("schema_version") == LIGAND_SIMILARITY_SCHEMA_VERSION
+            and payload.get("status") == "ready"
+            and output_bytes == int(summary.get("bytes", 0))
+            and database_meta.get("sha256") == summary.get("content_sha256")
+            and 0 < output_bytes < input_bytes
+            and reclaimed == input_bytes - output_bytes
+            and all(
+                type(counts.get(name)) is int and int(counts[name]) > 0
+                for name in ("molecules", "targets", "evidence")
+            )
+            and type(counts.get("hints")) is int
+            and int(counts["hints"]) >= 0
+            and fingerprint.get("type") == "morgan_ecfp4"
+            and type(fingerprint.get("radius")) is int
+            and fingerprint.get("radius") == 2
+            and type(fingerprint.get("bits")) is int
+            and fingerprint.get("bits") == 2048
+            and fingerprint.get("include_chirality") is True
+            and fingerprint.get("standardization") == LIGAND_SIMILARITY_STANDARDIZATION
+            and type(fingerprint.get("tautomer_max_tautomers")) is int
+            and fingerprint.get("tautomer_max_tautomers") == LIGAND_SIMILARITY_TAUTOMER_LIMIT
+            and type(fingerprint.get("tautomer_max_transforms")) is int
+            and fingerprint.get("tautomer_max_transforms") == LIGAND_SIMILARITY_TAUTOMER_LIMIT
+            and type(fingerprint.get("lsh_bands")) is int
+            and fingerprint.get("lsh_bands") == 0
+            and fingerprint.get("search_algorithm") == "popcount_bitbound_exact_tanimoto"
+            and fingerprint.get("bitbound_formula")
+            == "ceil(t*q_popcount) <= db_popcount <= floor(q_popcount/t)"
+            and reference
+            == {"name": "FPSim2", "license": "MIT", "commit": "e03e669"}
+            and fingerprint.get("encoding")
+            in {"rdkit_binary_text", "zlib1_rdkit_binary_text"}
+            and type(fingerprint.get("build_workers")) is int
+            and 1 <= fingerprint.get("build_workers") <= 8
+        ):
+            return False
+        validation_key = (str(database.resolve()), output_bytes, str(database_meta["sha256"]))
+        if validation_key in LIGAND_SIMILARITY_SQLITE_VALIDATION_CACHE:
+            return True
+        uri = database.resolve().as_uri() + "?mode=ro&immutable=1"
+        with closing(sqlite3.connect(uri, uri=True)) as connection:
+            objects = {
+                (str(row[0]), str(row[1]))
+                for row in connection.execute(
+                    "SELECT type, name FROM sqlite_master WHERE type IN ('table', 'index')"
+                )
+            }
+            required_objects = {
+                ("table", "molecule"),
+                ("table", "target"),
+                ("table", "evidence"),
+                ("table", "structure_hint"),
+                ("table", "metadata"),
+                ("index", "idx_molecule_popcount"),
+            }
+            if not required_objects.issubset(objects) or any(
+                kind == "table" and name.startswith("_build_") for kind, name in objects
+            ):
+                return False
+            evidence_columns = {str(row[1]) for row in connection.execute("PRAGMA table_info(evidence)")}
+            if not {
+                "molecule_id",
+                "target_fk",
+                "activity_score",
+                "activity",
+                "relation_rank",
+                "numeric_rank",
+            }.issubset(evidence_columns):
+                return False
+            structure_hint_columns = {
+                str(row[1]) for row in connection.execute("PRAGMA table_info(structure_hint)")
+            }
+            if not {
+                "molecule_id",
+                "target_fk",
+                "ligand_code",
+                "pdb_ids",
+                "target_chain_pdb_ids",
+            }.issubset(structure_hint_columns):
+                return False
+            metadata = dict(connection.execute("SELECT key, value FROM metadata"))
+            stable_fingerprint = {
+                key: fingerprint[key]
+                for key in (
+                    "type",
+                    "radius",
+                    "bits",
+                    "include_chirality",
+                    "standardization",
+                    "tautomer_max_tautomers",
+                    "tautomer_max_transforms",
+                    "lsh_bands",
+                    "search_algorithm",
+                    "bitbound_formula",
+                    "reference",
+                    "encoding",
+                )
+            }
+            actual_counts = {
+                "molecules": int(connection.execute("SELECT COUNT(*) FROM molecule").fetchone()[0]),
+                "targets": int(connection.execute("SELECT COUNT(*) FROM target").fetchone()[0]),
+                "evidence": int(connection.execute("SELECT COUNT(*) FROM evidence").fetchone()[0]),
+                "hints": int(
+                    connection.execute("SELECT COUNT(*) FROM structure_hint").fetchone()[0]
+                ),
+            }
+            if not (
+                metadata.get("schema_version") == LIGAND_SIMILARITY_SCHEMA_VERSION
+                and metadata.get("status") == "ready"
+                and json.loads(metadata.get("counts", "{}")) == counts == actual_counts
+                and json.loads(metadata.get("fingerprint", "{}")) == stable_fingerprint
+                and json.loads(metadata.get("source_identity", "{}")) == expected_source_identity
+                and connection.execute("PRAGMA quick_check").fetchone() == ("ok",)
+                and connection.execute("PRAGMA foreign_key_check").fetchone() is None
+            ):
+                return False
+        LIGAND_SIMILARITY_SQLITE_VALIDATION_CACHE.add(validation_key)
+        return {
+            ("table", "molecule"),
+            ("table", "target"),
+            ("table", "evidence"),
+            ("table", "metadata"),
+            ("index", "idx_molecule_popcount"),
+        }.issubset(objects)
+    except (json.JSONDecodeError, KeyError, OSError, sqlite3.Error, TypeError, ValueError):
+        return False
+
+
 def indexed_source_derivatives_ready(
     science_store: Path,
     source_id: str,
@@ -5067,6 +5250,12 @@ def indexed_source_derivatives_ready(
     execution_sha256 = ""
     if payload_records:
         execution_sha256 = str(payload_records[0].get("content_sha256", ""))
+    if source_id in {"chembl", "bindingdb"} and ligand_similarity_index_ready(
+        science_store,
+        source_manifest_rows_by_id(science_store),
+        summary_cache,
+    ):
+        return True
     if source_id == "chembl":
         database = science_store / "downloads/chembl/chembl_query.sqlite"
         return chembl_query_database_ready(
@@ -5166,10 +5355,18 @@ def retained_source_derivatives_ready(
     row: dict[str, str],
     summary_cache: ResourceSummaryCache | None = None,
 ) -> bool:
-    return row.get("state") == "pruned" and retention_source_identity_and_derivatives_ready(
-        science_store,
-        row,
-        summary_cache,
+    return bool(
+        row.get("state") == "pruned"
+        and retention_source_identity_and_derivatives_ready(
+            science_store,
+            row,
+            summary_cache,
+        )
+        and all(
+            not path_has_payload(science_store / str(record.get("path", "")))
+            for record in retention_payload_records(row)
+            if str(record.get("path", "")).strip()
+        )
     )
 
 
@@ -10442,6 +10639,308 @@ def plinder_canonical_index_ready(
         return False
 
 
+def prepare_ligand_similarity_index(
+    workspace_root: Path,
+    science_store: Path,
+    python_command: str,
+    python_backend: str,
+    wsl_distro: str | None,
+    summary_cache: ResourceSummaryCache | None = None,
+) -> dict[str, object]:
+    database = science_store / LIGAND_SIMILARITY_DATABASE_REL_PATH
+    manifest = science_store / LIGAND_SIMILARITY_MANIFEST_REL_PATH
+    sources = source_manifest_rows_by_id(science_store)
+    if ligand_similarity_index_ready(science_store, sources, summary_cache):
+        payload = read_json_object(manifest)
+        return {
+            "status": "ready",
+            "rebuilt": False,
+            "reason": "ligand_similarity_index_reused",
+            "database": str(database),
+            "manifest": str(manifest),
+            "counts": payload.get("counts", {}),
+            "database_bytes": payload.get("database", {}).get("bytes", 0),
+            "reclaimed_candidate_bytes": payload.get("reclaimed_candidate_bytes", 0),
+        }
+    chembl_database = science_store / "downloads/chembl/chembl_query.sqlite"
+    chembl_manifest = chembl_database.with_suffix(".manifest.json")
+    bindingdb_database = science_store / "indexes/bindingdb/bindingdb_query.sqlite"
+    bindingdb_manifest = bindingdb_database.with_suffix(".manifest.json")
+    required = (chembl_database, chembl_manifest, bindingdb_database, bindingdb_manifest)
+    if any(not path.is_file() for path in required):
+        return {
+            "status": "failed",
+            "rebuilt": False,
+            "reason": "ligand_similarity_source_query_database_missing",
+            "missing": [str(path) for path in required if not path.is_file()],
+        }
+    worker = workspace_root / "python/genoligand_workers/ligand_similarity_index.py"
+    if not worker.is_file():
+        return {
+            "status": "failed",
+            "rebuilt": False,
+            "reason": "ligand_similarity_worker_missing",
+        }
+    database.parent.mkdir(parents=True, exist_ok=True)
+    arguments = [
+        "build",
+        "--chembl-db",
+        str(chembl_database),
+        "--chembl-manifest",
+        str(chembl_manifest),
+        "--bindingdb-db",
+        str(bindingdb_database),
+        "--bindingdb-manifest",
+        str(bindingdb_manifest),
+        "--output-db",
+        str(database),
+        "--manifest",
+        str(manifest),
+    ]
+    if python_backend == "wsl":
+        if not wsl_distro:
+            return {"status": "failed", "rebuilt": False, "reason": "ligand_similarity_wsl_distro_missing"}
+        home = wsl_home(wsl_distro)
+        if not home:
+            return {"status": "failed", "rebuilt": False, "reason": "ligand_similarity_wsl_home_missing"}
+        worker_python = f"{home}/.local/state/genoligand/python-worker-env/bin/python"
+        command = [
+            worker_python,
+            wsl_path(worker),
+            "build",
+            "--chembl-db",
+            wsl_path(chembl_database),
+            "--chembl-manifest",
+            wsl_path(chembl_manifest),
+            "--bindingdb-db",
+            wsl_path(bindingdb_database),
+            "--bindingdb-manifest",
+            wsl_path(bindingdb_manifest),
+            "--output-db",
+            wsl_path(database),
+            "--manifest",
+            wsl_path(manifest),
+        ]
+        temporary_root = wsl_path(database.parent)
+        script = (
+            f"SQLITE_TMPDIR={bash_words([temporary_root])} "
+            f"TMPDIR={bash_words([temporary_root])} "
+            f"PYTHONPATH={bash_words([wsl_path(workspace_root / 'python')])} "
+            f"{bash_words(command)}"
+        )
+        completed = run_wsl_user_shell(wsl_distro, script)
+    elif python_command:
+        env = dict(os.environ)
+        env["PYTHONPATH"] = str(workspace_root / "python")
+        env["SQLITE_TMPDIR"] = str(database.parent)
+        env["TMPDIR"] = str(database.parent)
+        completed = run_command([python_command, str(worker), *arguments], env=env)
+    else:
+        return {"status": "failed", "rebuilt": False, "reason": "ligand_similarity_python_missing"}
+    stale_validation_keys = {
+        key
+        for key in LIGAND_SIMILARITY_SQLITE_VALIDATION_CACHE
+        if key[0] == str(database.resolve())
+    }
+    LIGAND_SIMILARITY_SQLITE_VALIDATION_CACHE.difference_update(stale_validation_keys)
+    validated = completed.returncode == 0 and ligand_similarity_index_ready(
+        science_store,
+        sources,
+        summary_cache,
+    )
+    if not validated:
+        return {
+            "status": "failed",
+            "rebuilt": False,
+            "reason": (
+                process_note(completed)
+                if completed.returncode != 0
+                else "ligand_similarity_validation_failed"
+            ),
+        }
+    payload = read_json_object(manifest)
+    return {
+        "status": "ready",
+        "rebuilt": True,
+        "reason": "ligand_similarity_index_built",
+        "database": str(database),
+        "manifest": str(manifest),
+        "counts": payload.get("counts", {}),
+        "database_bytes": payload.get("database", {}).get("bytes", 0),
+        "reclaimed_candidate_bytes": payload.get("reclaimed_candidate_bytes", 0),
+    }
+
+
+def migrate_ligand_source_retention(
+    science_store: Path,
+    summary_cache: ResourceSummaryCache | None = None,
+) -> dict[str, object]:
+    if not ligand_similarity_index_ready(science_store, summary_cache=summary_cache):
+        return {"status": "needs_repair", "updated": 0, "reason": "ligand_similarity_index_not_ready"}
+    rows = source_retention_rows(science_store)
+    expected = ";".join((LIGAND_SIMILARITY_DATABASE_REL_PATH, LIGAND_SIMILARITY_MANIFEST_REL_PATH))
+    updated = 0
+    selected: list[dict[str, str]] = []
+    for row in rows:
+        if row.get("source_id") not in {"chembl", "bindingdb"}:
+            continue
+        selected.append(row)
+        if row.get("derived_paths") != expected:
+            row["derived_paths"] = expected
+            row["notes"] = "source_payload_removed_after_verified_compact_ligand_index_publish"
+            updated += 1
+    if updated:
+        write_source_retention_rows(science_store, rows)
+    selected_ids = {row.get("source_id", "") for row in selected}
+    if selected_ids and selected_ids != {"chembl", "bindingdb"}:
+        return {
+            "status": "needs_repair",
+            "updated": updated,
+            "rows": len(selected),
+            "reason": "ligand_source_retention_incomplete",
+        }
+    valid = all(
+        row.get("state") in {"pruned", "pruning", "cleanup_failed"}
+        and retention_source_identity_and_derivatives_ready(science_store, row, summary_cache)
+        for row in selected
+    )
+    return {
+        "status": "ready" if valid or not selected else "needs_repair",
+        "updated": updated,
+        "rows": len(selected),
+        "reason": "ligand_source_retention_migrated" if updated else "ligand_source_retention_current",
+    }
+
+
+def superseded_ligand_query_paths(science_store: Path) -> list[Path]:
+    chembl_database = science_store / "downloads/chembl/chembl_query.sqlite"
+    chembl_manifest = chembl_database.with_suffix(".manifest.json")
+    bindingdb_database = science_store / "indexes/bindingdb/bindingdb_query.sqlite"
+    bindingdb_manifest = bindingdb_database.with_suffix(".manifest.json")
+    compact_database = science_store / LIGAND_SIMILARITY_DATABASE_REL_PATH
+    compact_manifest = science_store / LIGAND_SIMILARITY_MANIFEST_REL_PATH
+    candidates: list[Path] = [
+        chembl_manifest.with_name(f"{chembl_manifest.name}.attempt.json"),
+        chembl_query_transaction_path(chembl_database),
+        chembl_database.parent / ".chembl_query.sha256_cache",
+        bindingdb_database.parent / ".chembl_query.sha256_cache",
+    ]
+    for base in (chembl_database, chembl_manifest, bindingdb_database, bindingdb_manifest):
+        candidates.extend(Path(f"{base}{suffix}") for suffix in ("", "-wal", "-shm", "-journal"))
+    prefixes = (
+        (chembl_database.parent, (f".{chembl_database.name}.", f".{chembl_manifest.name}.")),
+        (
+            bindingdb_database.parent,
+            (
+                ".bindingdb_query_",
+                ".bindingdb_query_manifest_",
+                f".{bindingdb_database.name}.",
+                f".{bindingdb_manifest.name}.",
+            ),
+        ),
+        (
+            compact_database.parent,
+            (f".{compact_database.name}.", f".{compact_manifest.name}."),
+        ),
+    )
+    for parent, names in prefixes:
+        if parent.is_dir():
+            candidates.extend(
+                path for path in parent.iterdir() if any(path.name.startswith(prefix) for prefix in names)
+            )
+    return [path for path in dict.fromkeys(candidates) if path.exists()]
+
+
+def make_cleanup_path_writable(path: Path) -> None:
+    if path.is_dir():
+        root = path.resolve()
+        for current, directories, files in os.walk(path, topdown=True, followlinks=False):
+            current_path = Path(current)
+            safe_directories: list[str] = []
+            for name in directories:
+                child = current_path / name
+                if child.is_symlink() or os.path.isjunction(child):
+                    raise OSError(f"superseded_ligand_nested_link_unsafe:{child}")
+                resolved = child.resolve()
+                if not resolved.is_relative_to(root):
+                    raise OSError(f"superseded_ligand_nested_path_unsafe:{child}")
+                child.chmod(child.stat().st_mode | stat.S_IWRITE | stat.S_IREAD)
+                safe_directories.append(name)
+            directories[:] = safe_directories
+            for name in files:
+                child = current_path / name
+                if child.is_symlink() or os.path.isjunction(child):
+                    raise OSError(f"superseded_ligand_nested_link_unsafe:{child}")
+                resolved = child.resolve()
+                if not resolved.is_relative_to(root):
+                    raise OSError(f"superseded_ligand_nested_path_unsafe:{child}")
+                child.chmod(child.stat().st_mode | stat.S_IWRITE | stat.S_IREAD)
+    path.chmod(path.stat().st_mode | stat.S_IWRITE | stat.S_IREAD)
+
+
+def prune_superseded_ligand_query_databases(
+    science_store: Path,
+    summary_cache: ResourceSummaryCache | None = None,
+) -> dict[str, object]:
+    if not ligand_similarity_index_ready(science_store, summary_cache=summary_cache):
+        return {"status": "needs_repair", "reclaimed_bytes": 0, "reason": "ligand_similarity_index_not_ready"}
+    root = science_store.resolve()
+    candidates = superseded_ligand_query_paths(science_store)
+    reclaimed = 0
+    removed: list[str] = []
+    try:
+        for path in dict.fromkeys(candidates):
+            if not path.exists():
+                continue
+            resolved = path.resolve()
+            if (
+                resolved == root
+                or not resolved.is_relative_to(root)
+                or path.is_symlink()
+                or os.path.isjunction(path)
+            ):
+                raise OSError(f"superseded_ligand_path_unsafe:{path}")
+            make_cleanup_path_writable(path)
+            if path.is_dir():
+                reclaimed += sum(item.stat().st_size for item in path.rglob("*") if item.is_file())
+                shutil.rmtree(path)
+            elif path.is_file():
+                reclaimed += path.stat().st_size
+                path.unlink()
+            else:
+                raise OSError(f"superseded_ligand_path_invalid:{path}")
+            removed.append(str(path))
+            if summary_cache is not None:
+                prefix = str(resolved).casefold()
+                for key in [
+                    key
+                    for key in summary_cache
+                    if key.casefold() == prefix or key.casefold().startswith(f"{prefix}{os.sep}")
+                ]:
+                    summary_cache.pop(key, None)
+    except OSError as err:
+        return {
+            "status": "needs_repair",
+            "reclaimed_bytes": reclaimed,
+            "removed": removed,
+            "reason": exception_note(err),
+        }
+    for parent in (
+        science_store / "downloads/chembl",
+        science_store / "indexes/bindingdb",
+    ):
+        if parent.is_dir() and not any(parent.iterdir()):
+            parent.rmdir()
+    remaining = [str(path) for path in superseded_ligand_query_paths(science_store)]
+    return {
+        "status": "ready" if not remaining else "needs_repair",
+        "reclaimed_bytes": reclaimed,
+        "removed": removed,
+        "remaining": remaining,
+        "reason": "superseded_ligand_query_databases_removed",
+    }
+
+
 def prepare_plinder_canonical_index(
     workspace_root: Path,
     science_store: Path,
@@ -10662,7 +11161,10 @@ def authoritative_metagenome_mmseqs_databases(
     return validated
 
 
-def refresh_science_index_authority_manifest(science_store: Path) -> dict[str, object]:
+def refresh_science_index_authority_manifest(
+    science_store: Path,
+    summary_cache: ResourceSummaryCache | None = None,
+) -> dict[str, object]:
     build_manifest = science_store / "index_build_manifest.tsv"
     build_rows = read_tsv(build_manifest)
     database_manifest_rel = "indexes/mmseqs/mmseqs_target_databases.tsv"
@@ -10692,6 +11194,45 @@ def refresh_science_index_authority_manifest(science_store: Path) -> dict[str, o
         ):
             authorities.append(row)
     updated_rows = 0
+    legacy_ligand_paths = {
+        "downloads/chembl/chembl_query.sqlite",
+        "downloads/chembl/chembl_query.manifest.json",
+        "indexes/bindingdb/bindingdb_query.sqlite",
+        "indexes/bindingdb/bindingdb_query.manifest.json",
+    }
+    retained_build_rows = [
+        row
+        for row in build_rows
+        if str(row.get("input_path", "")).replace("\\", "/") not in legacy_ligand_paths
+        and str(row.get("output_path", "")).replace("\\", "/") not in legacy_ligand_paths
+    ]
+    updated_rows += len(build_rows) - len(retained_build_rows)
+    build_rows = retained_build_rows
+    if ligand_similarity_index_ready(science_store, summary_cache=summary_cache):
+        compact_manifest = read_json_object(science_store / LIGAND_SIMILARITY_MANIFEST_REL_PATH)
+        compact_inputs = compact_manifest.get("inputs", {})
+        source_note = ";".join(
+            f"{source}_digest={str(compact_inputs.get(source, {}).get('source_digest', ''))}"
+            for source in ("chembl", "bindingdb")
+        )
+        compact_row = {
+            "index": "ligand_similarity",
+            "input_path": "manifests/source_file_manifest.tsv",
+            "status": "used",
+            "rows": str(compact_manifest.get("counts", {}).get("evidence", 0)),
+            "output_path": LIGAND_SIMILARITY_DATABASE_REL_PATH,
+            "notes": (
+                "compact_exact_tanimoto_authority;consumer=ligand_similarity_index;"
+                f"{source_note}"
+            ),
+        }
+        existing = next((row for row in build_rows if row.get("index") == "ligand_similarity"), None)
+        if existing is None:
+            build_rows.append(compact_row)
+            updated_rows += 1
+        elif any(existing.get(key, "") != value for key, value in compact_row.items()):
+            existing.update(compact_row)
+            updated_rows += 1
     for row in build_rows:
         if row.get("index") != "metagenome_targets":
             continue
@@ -11024,44 +11565,27 @@ def evaluate_installer_science_store_readiness(
                 REQUIRED_LOGICAL_SOURCES[logical],
             )
 
-    chembl_database = science_store / "downloads/chembl/chembl_query.sqlite"
-    chembl_manifest = chembl_database.with_suffix(".manifest.json")
-    chembl_source = source_manifest_rows.get("chembl", {})
-    chembl_source_digest = chembl_source.get("sha256", "").strip().lower()
-    chembl_source_release = chembl_source.get("release_identity", "").strip()
-    if not chembl_query_database_ready(
-        chembl_database,
-        chembl_manifest,
-        chembl_source_digest,
-        chembl_source_release,
-        summary_cache,
-    ):
-        block(
-            "chembl_query_database_not_ready",
-            "chembl_query_database",
-            "downloads/chembl/chembl_query.sqlite and manifest failed identity or schema validation",
-            "publish_chembl_query_database",
-        )
-    transaction = chembl_query_transaction_path(chembl_database)
-    if transaction.exists():
-        block(
-            "chembl_query_transaction_pending",
-            "chembl_query_database",
-            str(transaction),
-            "reconcile_chembl_query_transaction",
-        )
-
-    if not bindingdb_query_database_ready(
+    ligand_similarity_ready = ligand_similarity_index_ready(
         science_store,
-        source_manifest_rows.get("bindingdb", {}),
-        summary_cache=summary_cache,
-    ):
+        source_manifest_rows,
+        summary_cache,
+    )
+    if not ligand_similarity_ready:
         block(
-            "bindingdb_query_database_not_ready",
-            "bindingdb_query_database",
-            "indexes/bindingdb/bindingdb_query.sqlite and manifest failed identity or schema validation",
-            "publish_bindingdb_query_database",
+            "ligand_similarity_index_not_ready",
+            "ligand_similarity_index",
+            f"{LIGAND_SIMILARITY_DATABASE_REL_PATH} and manifest failed identity, schema, or compactness validation",
+            "prepare_ligand_similarity_index",
         )
+    else:
+        superseded = [str(path.relative_to(science_store)) for path in superseded_ligand_query_paths(science_store)]
+        if superseded:
+            block(
+                "superseded_ligand_query_database_present",
+                "ligand_similarity_index",
+                ";".join(superseded),
+                "prune_superseded_ligand_query_databases",
+            )
 
     retention_manifest = source_retention_manifest_path(science_store)
     retention_required = any(
@@ -11452,7 +11976,7 @@ def install_ready(payload: dict[str, object]) -> bool:
     source_manifests = payload.get("source_manifests")
     alignment_databases = payload.get("alignment_databases")
     forcefields = payload.get("forcefields")
-    chembl_query_database = payload.get("chembl_query_database")
+    ligand_similarity_index = payload.get("ligand_similarity_index")
     source_retention = payload.get("source_retention")
     science_store_readiness = payload.get("science_store_readiness")
     runtime_binary_manifest = payload.get("runtime_binary_manifest")
@@ -11463,8 +11987,8 @@ def install_ready(payload: dict[str, object]) -> bool:
     source_manifest_status = source_manifests.get("status") if isinstance(source_manifests, dict) else None
     alignment_status = alignment_databases.get("status") if isinstance(alignment_databases, dict) else None
     forcefield_status = forcefields.get("status") if isinstance(forcefields, dict) else None
-    chembl_query_status = (
-        chembl_query_database.get("status") if isinstance(chembl_query_database, dict) else None
+    ligand_similarity_status = (
+        ligand_similarity_index.get("status") if isinstance(ligand_similarity_index, dict) else None
     )
     source_retention_status = (
         source_retention.get("status") if isinstance(source_retention, dict) else None
@@ -11488,7 +12012,7 @@ def install_ready(payload: dict[str, object]) -> bool:
         and tool_status == "ready"
         and alignment_status == "ready"
         and forcefield_status == "ready"
-        and chembl_query_status == "ready"
+        and ligand_similarity_status == "ready"
         and source_retention_status == "ready"
         and readiness_status == "ready"
         and runtime_status == "ready"
@@ -12212,6 +12736,7 @@ def installation_capacity_plan(
         else:
             items.append(capacity_item(f"alignment:{source_id}", action, 0, staging, 0, available))
 
+    ligand_ready = ligand_similarity_index_ready(science_store, summary_cache=summary_cache)
     chembl_archive = science_store / "downloads/chembl/chembl_sqlite.tar.gz"
     chembl_query = science_store / "downloads/chembl/chembl_query.sqlite"
     chembl_manifest = chembl_query.with_suffix(".manifest.json")
@@ -12227,7 +12752,12 @@ def installation_capacity_plan(
             source_release,
             summary_cache,
         )
-    if chembl_archive.is_file() and chembl_archive.stat().st_size > 0 and not chembl_ready:
+    if (
+        not ligand_ready
+        and chembl_archive.is_file()
+        and chembl_archive.stat().st_size > 0
+        and not chembl_ready
+    ):
         source_staging = 0
         try:
             with tarfile.open(chembl_archive, "r:gz") as archive:
@@ -12262,6 +12792,43 @@ def installation_capacity_plan(
             }
         )
         items.append(chembl_item)
+
+    ligand_sources = [
+        science_store / "downloads/chembl/chembl_query.sqlite",
+        science_store / "indexes/bindingdb/bindingdb_query.sqlite",
+    ]
+    legacy_ligand_bytes = sum(path.stat().st_size for path in ligand_sources if path.is_file())
+    if not ligand_ready:
+        staging = max(legacy_ligand_bytes * 2, 5 * 1024 * 1024 * 1024)
+        item = capacity_item(
+            "ligand_similarity_index",
+            "build_compact_index_then_remove_legacy_query_databases",
+            0,
+            staging,
+            0,
+            available,
+        )
+        item.update(
+            {
+                "source_query_bytes": legacy_ligand_bytes,
+                "post_publish_reclaimable_bytes": legacy_ligand_bytes,
+                "target_staging_bytes": staging,
+                "target_required_peak_bytes": staging + DISK_SAFETY_MARGIN_BYTES,
+                "net_growth_allowed": False,
+            }
+        )
+        items.append(item)
+    elif legacy_ligand_bytes:
+        item = capacity_item(
+            "ligand_similarity_index",
+            "remove_superseded_query_databases",
+            0,
+            0,
+            0,
+            available,
+        )
+        item["post_publish_reclaimable_bytes"] = legacy_ligand_bytes
+        items.append(item)
 
     unresolved = [item for item in items if item["action"] == "resolve_remote_size_before_download"]
     known_download = sum(
@@ -12620,8 +13187,18 @@ def main() -> int:
     alignment_database_result["consumer_smoke"] = alignment_consumer_result
     if alignment_consumer_result.get("status") != "ready":
         alignment_database_result["status"] = "needs_repair"
+    existing_ligand_similarity_ready = ligand_similarity_index_ready(
+        science_store,
+        summary_cache=resource_summary_cache,
+    )
     chembl_query_result = (
-        publish_chembl_query_database(
+        {
+            "status": "ready",
+            "reason": "chembl_query_superseded_by_compact_ligand_index",
+            "database": str(science_store / LIGAND_SIMILARITY_DATABASE_REL_PATH),
+        }
+        if existing_ligand_similarity_ready
+        else publish_chembl_query_database(
             science_store,
             source_catalog,
             resource_summary_cache,
@@ -12640,7 +13217,6 @@ def main() -> int:
         python_backend,
         selected_wsl,
     )
-    index_authority_refresh = refresh_science_index_authority_manifest(science_store)
     write_install_progress(
         science_store,
         status="running",
@@ -12676,6 +13252,46 @@ def main() -> int:
         science_store,
         status="running",
         stage="构建索引",
+        current_resource="紧凑配体相似性索引",
+        completed_steps=5,
+        total_steps=6,
+        message="正在合并去重配体库并建立精确相似性索引",
+    )
+    ligand_similarity_result = (
+        prepare_ligand_similarity_index(
+            workspace_root,
+            science_store,
+            tool_python,
+            python_backend,
+            selected_wsl,
+            resource_summary_cache,
+        )
+        if completed.returncode == 0 and chembl_query_result.get("status") == "ready"
+        else {
+            "status": "failed",
+            "rebuilt": False,
+            "reason": "ligand_similarity_deferred_until_source_indexes_ready",
+        }
+    )
+    ligand_retention_migration = (
+        migrate_ligand_source_retention(science_store, resource_summary_cache)
+        if ligand_similarity_result.get("status") == "ready"
+        else {"status": "needs_repair", "updated": 0, "reason": "ligand_similarity_index_not_ready"}
+    )
+    ligand_query_cleanup = (
+        prune_superseded_ligand_query_databases(science_store, resource_summary_cache)
+        if ligand_similarity_result.get("status") == "ready"
+        and ligand_retention_migration.get("status") == "ready"
+        else {"status": "needs_repair", "reclaimed_bytes": 0, "reason": "ligand_storage_migration_not_ready"}
+    )
+    index_authority_refresh = refresh_science_index_authority_manifest(
+        science_store,
+        resource_summary_cache,
+    )
+    write_install_progress(
+        science_store,
+        status="running",
+        stage="构建索引",
         current_resource="OpenFF 小分子力场",
         completed_steps=5,
         total_steps=6,
@@ -12697,6 +13313,9 @@ def main() -> int:
         if completed.returncode == 0
         and alignment_database_result.get("status") == "ready"
         and chembl_query_result.get("status") == "ready"
+        and ligand_similarity_result.get("status") == "ready"
+        and ligand_retention_migration.get("status") == "ready"
+        and ligand_query_cleanup.get("status") == "ready"
         and forcefield_result.get("status") == "ready"
         and pre_retention_readiness.get("status") == "ready"
         else {
@@ -12717,10 +13336,18 @@ def main() -> int:
         }
     )
     source_retention_result["rcsb_cache"] = rcsb_cache_result
+    source_retention_result["ligand_query_cleanup"] = ligand_query_cleanup
+    source_retention_result["ligand_retention_migration"] = ligand_retention_migration
     source_retention_result["reclaimed_bytes"] = int(
         source_retention_result.get("reclaimed_bytes", 0) or 0
-    ) + int(rcsb_cache_result.get("reclaimed_bytes", 0) or 0)
-    if rcsb_cache_result.get("status") != "ready":
+    ) + int(rcsb_cache_result.get("reclaimed_bytes", 0) or 0) + int(
+        ligand_query_cleanup.get("reclaimed_bytes", 0) or 0
+    )
+    if (
+        rcsb_cache_result.get("status") != "ready"
+        or ligand_query_cleanup.get("status") != "ready"
+        or ligand_retention_migration.get("status") != "ready"
+    ):
         source_retention_result["status"] = "needs_repair"
     save_resource_summary_cache(fingerprint_cache_path, resource_summary_cache)
     external_source_summary = source_sync_summary(
@@ -12759,7 +13386,8 @@ def main() -> int:
         worker_wrapper,
     )
     if (
-        chembl_query_result.get("status") != "ready"
+        ligand_similarity_result.get("status") != "ready"
+        or ligand_query_cleanup.get("status") != "ready"
         or source_retention_result.get("status") != "ready"
         or science_store_readiness.get("status") != "ready"
         or runtime_binary_manifest.get("status") != "ready"
@@ -12782,6 +13410,11 @@ def main() -> int:
         "plinder_index": plinder_index_result,
         "forcefields": forcefield_result,
         "chembl_query_database": chembl_query_result,
+        "ligand_similarity_index": ligand_similarity_result,
+        "ligand_storage_migration": {
+            "retention": ligand_retention_migration,
+            "cleanup": ligand_query_cleanup,
+        },
         "source_retention": source_retention_result,
         "index_authority_refresh": index_authority_refresh,
         "science_store_readiness": science_store_readiness,

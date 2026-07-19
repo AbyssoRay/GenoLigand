@@ -1803,17 +1803,25 @@ fn user_run_json(options: &ServerOptions, run_id: &str) -> Value {
 fn user_run_stages(run_dir: &Path, state: &str) -> Vec<Value> {
     let specs = [
         ("input", "输入归一化", "input_normalize"),
-        ("features", "特征计算", "features_compute"),
-        ("known", "已知数据库比对", "database_match_known"),
+        ("query_structure", "输入结构准备", "query_structure_prepare"),
+        ("features", "结构特征编码", "features_compute"),
+        (
+            "sequence_alignment",
+            "本地序列比对",
+            "onsite_sequence_alignment",
+        ),
+        ("known", "数据库精确与相似性检索", "database_match_known"),
         (
             "metagenome",
             "宏基因组潜在序列比对",
             "metagenome_match_potential",
         ),
-        ("structure", "结构与口袋评估", "structure_evaluate"),
-        ("md", "对接与短动力学筛选", "dynamics_screen"),
-        ("ranking", "联合排序", "target_rank"),
-        ("evidence", "证据链与报告", "evidence_build"),
+        ("structure", "结构候选检索", "structure_evaluate"),
+        ("shortlist", "候选粗排与短名单", "candidate_coarse_rank"),
+        ("md", "对接与短动力学精筛", "dynamics_screen"),
+        ("ranking", "分路线联合排序", "target_rank"),
+        ("evidence", "证据链整理", "evidence_build"),
+        ("report", "报告生成", "report_render"),
     ];
     let current = read_trimmed(&run_dir.join("current_stage.txt")).unwrap_or_default();
     let current_index = specs
@@ -1995,6 +2003,10 @@ fn download_artifact_response(
             user_candidate_rows(&run_dir),
             &[
                 ("\u{6392}\u{5e8f}", "rank"),
+                ("\u{8f93}\u{5165}\u{7f16}\u{53f7}", "input_id"),
+                ("\u{8bb0}\u{5f55}\u{7f16}\u{53f7}", "record_id"),
+                ("\u{8f93}\u{5165}\u{7c7b}\u{578b}", "input_kind"),
+                ("\u{6392}\u{5e8f}\u{8def}\u{7ebf}", "ranking_policy"),
                 ("\u{5019}\u{9009}\u{7f16}\u{53f7}", "candidate_id"),
                 ("\u{76ee}\u{6807}\u{7f16}\u{53f7}", "target_id"),
                 ("\u{76ee}\u{6807}\u{540d}\u{79f0}", "target_name"),
@@ -2012,6 +2024,17 @@ fn download_artifact_response(
                 ("\u{7ed3}\u{6784}\u{5206}\u{6570}", "structure_score"),
                 ("\u{5bf9}\u{63a5}\u{5206}\u{6570}", "docking_score"),
                 ("\u{52a8}\u{529b}\u{5b66}\u{5206}\u{6570}", "md_score"),
+                (
+                    "\u{5df2}\u{77e5}\u{5e93}\u{6743}\u{91cd}",
+                    "known_database_weight",
+                ),
+                (
+                    "\u{5b8f}\u{57fa}\u{56e0}\u{7ec4}\u{6743}\u{91cd}",
+                    "metagenome_weight",
+                ),
+                ("\u{7ed3}\u{6784}\u{6743}\u{91cd}", "structure_weight"),
+                ("\u{5bf9}\u{63a5}\u{6743}\u{91cd}", "docking_weight"),
+                ("\u{52a8}\u{529b}\u{5b66}\u{6743}\u{91cd}", "md_weight"),
                 (
                     "\u{52a8}\u{529b}\u{5b66}\u{652f}\u{6301}",
                     "md_support_label",
@@ -2078,6 +2101,32 @@ fn download_artifact_response(
                 ("\u{5339}\u{914d}\u{5206}\u{6570}", "match_score"),
                 ("\u{5339}\u{914d}\u{7279}\u{5f81}", "matched_features"),
                 ("\u{8bc1}\u{636e}", "evidence"),
+            ],
+        ),
+        "query_structure" => user_tsv_download(
+            read_tsv_rows(&run_dir.join("query_structure_manifest.tsv")),
+            &[
+                ("输入编号", "input_id"),
+                ("记录编号", "record_id"),
+                ("输入类型", "input_kind"),
+                ("准备方法", "method"),
+                ("结构特征", "features_json"),
+                ("代表结构", "coordinate_artifact"),
+                ("特征摘要", "feature_digest"),
+                ("状态", "status"),
+            ],
+        ),
+        "candidate_shortlist" => user_tsv_download(
+            read_tsv_rows(&run_dir.join("candidate_shortlist.tsv")),
+            &[
+                ("短名单排序", "shortlist_rank"),
+                ("候选编号", "candidate_id"),
+                ("输入编号", "input_id"),
+                ("记录编号", "record_id"),
+                ("目标编号", "target_id"),
+                ("粗排分数", "preliminary_score"),
+                ("入选原因", "shortlist_reason"),
+                ("坐标状态", "coordinate_status"),
             ],
         ),
         "docking_summary" => user_tsv_download(
@@ -2981,6 +3030,10 @@ fn user_candidate_row(row: &Value) -> Value {
     json!({
         "rank": row_text(row, "rank"),
         "candidate_id": row_text(row, "candidate_id"),
+        "input_id": row_text(row, "input_id"),
+        "record_id": row_text(row, "record_id"),
+        "input_kind": row_text(row, "input_kind"),
+        "ranking_policy": row_text(row, "ranking_policy"),
         "target_id": row_text(row, "target_id"),
         "target_name": row_text(row, "target_name"),
         "candidate_scope": scope,
@@ -2992,6 +3045,11 @@ fn user_candidate_row(row: &Value) -> Value {
         "structure_score": row_text(row, "structure_score"),
         "docking_score": row_text(row, "docking_score"),
         "md_score": row_text(row, "md_score"),
+        "known_database_weight": row_text(row, "known_database_weight"),
+        "metagenome_weight": row_text(row, "metagenome_weight"),
+        "structure_weight": row_text(row, "structure_weight"),
+        "docking_weight": row_text(row, "docking_weight"),
+        "md_weight": row_text(row, "md_weight"),
         "md_support_label": md_support_label(md_score),
         "risk_note": candidate_risk_note(scope, md_score),
         "evidence_summary": row_text(row, "evidence_summary"),
@@ -3016,6 +3074,7 @@ fn user_genome_row(row: &Value) -> Value {
 
 fn user_candidate_detail_row(row: &Value) -> Value {
     let scores = row.get("scores").unwrap_or(&Value::Null);
+    let ranking_weights = row.get("ranking_weights").unwrap_or(&Value::Null);
     let scope = row
         .get("candidate_scope")
         .and_then(Value::as_str)
@@ -3023,6 +3082,10 @@ fn user_candidate_detail_row(row: &Value) -> Value {
     let md_score = json_number(scores.get("md"));
     json!({
         "candidate_id": row.get("candidate_id").cloned().unwrap_or_else(|| json!("")),
+        "input_id": row.get("input_id").cloned().unwrap_or_else(|| json!("")),
+        "record_id": row.get("record_id").cloned().unwrap_or_else(|| json!("")),
+        "input_kind": row.get("input_kind").cloned().unwrap_or_else(|| json!("")),
+        "ranking_policy": row.get("ranking_policy").cloned().unwrap_or_else(|| json!("")),
         "target_id": row.get("target_id").cloned().unwrap_or_else(|| json!("")),
         "target_name": row.get("target_name").cloned().unwrap_or_else(|| json!("")),
         "candidate_scope": scope,
@@ -3034,6 +3097,11 @@ fn user_candidate_detail_row(row: &Value) -> Value {
         "structure_score": scores.get("structure").cloned().unwrap_or_else(|| json!("")),
         "docking_score": scores.get("docking").cloned().unwrap_or_else(|| json!("")),
         "md_score": scores.get("md").cloned().unwrap_or_else(|| json!("")),
+        "known_database_weight": ranking_weights.get("known_database").cloned().unwrap_or_else(|| json!("")),
+        "metagenome_weight": ranking_weights.get("metagenome").cloned().unwrap_or_else(|| json!("")),
+        "structure_weight": ranking_weights.get("structure").cloned().unwrap_or_else(|| json!("")),
+        "docking_weight": ranking_weights.get("docking").cloned().unwrap_or_else(|| json!("")),
+        "md_weight": ranking_weights.get("md").cloned().unwrap_or_else(|| json!("")),
         "md_support_label": md_support_label(md_score),
         "risk_note": candidate_risk_note(scope, md_score),
         "evidence_summary": row.get("evidence_summary").cloned().unwrap_or_else(|| json!("")),
@@ -3326,6 +3394,7 @@ fn evidence_type_label(claim: &str, artifact: &str) -> &'static str {
         "input_normalized_manifest.tsv" | "input_normalized_manifest" => {
             "\u{8f93}\u{5165}\u{89c4}\u{8303}\u{5316}"
         }
+        "query_structure_manifest.tsv" | "query_structure_manifest" => "输入结构准备",
         "feature_manifest.tsv" | "feature_manifest" => "\u{7279}\u{5f81}\u{8ba1}\u{7b97}",
         "known_database_matches.tsv" | "known_database_matches" => {
             "\u{5df2}\u{77e5}\u{6570}\u{636e}\u{5e93}\u{6bd4}\u{5bf9}"
@@ -3357,6 +3426,7 @@ fn evidence_type_label(claim: &str, artifact: &str) -> &'static str {
         "target_candidate_ranking.tsv" | "target_candidate_ranking" => {
             "\u{5019}\u{9009}\u{6392}\u{5e8f}"
         }
+        "candidate_shortlist.tsv" | "candidate_shortlist" => "候选粗排与短名单",
         "score_decomposition.tsv" | "score_decomposition" => "\u{5206}\u{6570}\u{62c6}\u{89e3}",
         "candidate_detail.json" | "candidate_detail" => "\u{5019}\u{9009}\u{8be6}\u{60c5}",
         "research_report.md" | "research_report" => "\u{79d1}\u{7814}\u{62a5}\u{544a}",
@@ -5256,9 +5326,19 @@ fn authenticity_gate_allows_results(run_dir: &Path) -> bool {
 fn artifact_specs() -> &'static [(&'static str, &'static str, &'static str)] {
     &[
         (
+            "query_structure",
+            "输入结构准备",
+            "query_structure_manifest.tsv",
+        ),
+        (
             "onsite_search",
             "\u{73b0}\u{573a}\u{641c}\u{7d22}\u{7ed3}\u{679c}",
             "known_database_matches.tsv",
+        ),
+        (
+            "candidate_shortlist",
+            "候选粗排与短名单",
+            "candidate_shortlist.tsv",
         ),
         (
             "docking_summary",
@@ -5391,12 +5471,15 @@ fn stage_user_label(stage: &str) -> &'static str {
     match stage {
         "pipeline_run" => "完整流程",
         "input_normalize" => "输入归一化",
-        "features_compute" => "特征计算",
-        "database_match_known" => "已知数据库比对",
+        "query_structure_prepare" => "输入结构准备",
+        "features_compute" => "结构特征编码",
+        "onsite_sequence_alignment" => "本地序列比对",
+        "database_match_known" => "数据库精确与相似性检索",
         "metagenome_match_potential" => "宏基因组潜在序列比对",
-        "structure_evaluate" => "结构与口袋评估",
-        "dynamics_screen" => "短动力学筛选",
-        "target_rank" => "候选排序",
+        "structure_evaluate" => "结构候选检索",
+        "candidate_coarse_rank" => "候选粗排与短名单",
+        "dynamics_screen" => "对接与短动力学精筛",
+        "target_rank" => "分路线候选排序",
         "evidence_build" => "证据链整理",
         "report_render" => "报告生成",
         _ => "运行准备",
