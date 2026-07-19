@@ -2145,13 +2145,28 @@ fn validate_ligand_similarity_runtime_contract(options: &StoreOptions) -> Result
 }
 
 fn ligand_similarity_declared_path_matches(database: &Path, declared: &str) -> bool {
-    let Ok(database) = database.canonicalize() else {
-        return false;
-    };
     let declared = wsl_path_to_windows(declared).unwrap_or_else(|| PathBuf::from(declared));
-    declared
-        .canonicalize()
-        .is_ok_and(|declared| declared == database)
+    if let (Ok(database), Ok(declared)) = (database.canonicalize(), declared.canonicalize()) {
+        return declared == database;
+    }
+    if !database.is_absolute()
+        || !declared.is_absolute()
+        || database
+            .components()
+            .any(|component| matches!(component, std::path::Component::ParentDir))
+        || declared
+            .components()
+            .any(|component| matches!(component, std::path::Component::ParentDir))
+    {
+        return false;
+    }
+    let expected = database.to_string_lossy().replace('\\', "/");
+    let declared = declared.to_string_lossy().replace('\\', "/");
+    if cfg!(windows) {
+        declared.eq_ignore_ascii_case(&expected)
+    } else {
+        declared == expected
+    }
 }
 
 fn ligand_similarity_sqlite_contract_script() -> &'static str {

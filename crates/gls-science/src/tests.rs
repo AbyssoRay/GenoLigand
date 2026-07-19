@@ -8096,6 +8096,26 @@ fn prepare_science_store_builds_structure_index_from_downloaded_sources() {
 }
 
 #[test]
+fn declared_pruned_source_path_matches_without_materialized_file() {
+    let root = temp_root("pruned_declared_path");
+    let expected = root.join("downloads/plinder/index/annotation_table.parquet");
+    fs::create_dir_all(expected.parent().expect("parent")).expect("create parent");
+    let declared = windows_path_to_wsl(&expected.display().to_string())
+        .unwrap_or_else(|| expected.display().to_string());
+    assert!(ligand_similarity_declared_path_matches(
+        &expected, &declared
+    ));
+    assert!(!ligand_similarity_declared_path_matches(
+        &expected,
+        &root
+            .join("downloads/plinder/index/other.parquet")
+            .display()
+            .to_string(),
+    ));
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
 fn plinder_canonical_and_structure_publications_reject_same_size_tampering() {
     let root = temp_root("structure_publication_tampering");
     let store = root.join("science_store");
