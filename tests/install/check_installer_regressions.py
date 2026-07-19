@@ -2211,6 +2211,49 @@ class InstallerRegressionTests(unittest.TestCase):
                 ):
                     self.assertIn(field, item)
 
+    def test_capacity_reuses_verified_biolip_projection_with_partial_recovery_payload(self) -> None:
+        installer = self.installer
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            store = root / "science_store"
+            recovered = store / "downloads/biolip2/BioLiP.txt.gz"
+            recovered.parent.mkdir(parents=True, exist_ok=True)
+            recovered.write_bytes(b"recovered-annotation")
+            sync_plan = root / "source_sync.tsv"
+            sync_plan.write_text(
+                "source_id\ttarget_rel_path\tready_marker\tsync_method\n"
+                "biolip2\tdownloads/biolip2\tdownloads/biolip2\thtml_links\n",
+                encoding="utf-8",
+            )
+            retention = {
+                "schema_version": installer.SOURCE_RETENTION_SCHEMA_VERSION,
+                "source_id": "biolip2",
+            }
+            with mock.patch.object(
+                installer,
+                "source_retention_rows",
+                return_value=[retention],
+            ), mock.patch.object(
+                installer,
+                "retention_source_identity_and_derivatives_ready",
+                return_value=True,
+            ) as retained_ready, mock.patch.object(
+                installer,
+                "external_plan_row_ready",
+                side_effect=AssertionError("verified retained projection must win capacity reuse"),
+            ), mock.patch.object(installer, "same_storage_volume", return_value=True):
+                plan = installer.installation_capacity_plan(
+                    store,
+                    root / "missing-catalog.tsv",
+                    sync_plan,
+                    available_bytes=100 * 1024 * 1024 * 1024,
+                    scratch_dir=root / "scratch",
+                )
+            biolip = next(item for item in plan["items"] if item["component"] == "biolip2")
+            self.assertEqual(biolip["action"], "reuse_verified_index")
+            self.assertNotIn("biolip2", plan["unresolved_components"])
+            retained_ready.assert_called_once_with(store, retention, None)
+
     def test_rcsb_capacity_uses_observed_aggregate_size_instead_of_largest_file(self) -> None:
         installer = self.installer
         with tempfile.TemporaryDirectory() as tmp:

@@ -13340,11 +13340,24 @@ def installation_capacity_plan(
         row.get("source_id", ""): row
         for row in read_tsv(science_store / "external_sync_execution_manifest.tsv")
     }
+    retained_external = {
+        row.get("source_id", ""): row
+        for row in source_retention_rows(science_store)
+        if row.get("source_id")
+    }
     for row in read_tsv(source_sync_plan):
         source_id = row.get("source_id", "external_source")
         target = science_store / row.get("target_rel_path", "")
         marker = science_store / (row.get("ready_marker") or row.get("target_rel_path", ""))
         method = row.get("sync_method", "direct").strip().lower()
+        retained_row = retained_external.get(source_id, {})
+        if retained_row and retention_source_identity_and_derivatives_ready(
+            science_store,
+            retained_row,
+            summary_cache,
+        ):
+            items.append(capacity_item(source_id, "reuse_verified_index", 0, 0, 0, available))
+            continue
         if external_plan_row_ready(
             row,
             target,
