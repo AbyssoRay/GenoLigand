@@ -1816,6 +1816,43 @@ class InstallerRegressionTests(unittest.TestCase):
             self.assertIn(("downloads/bindingdb/bindingdb_all.tsv.zip", "full_index"), statuses)
             self.assertIn(("downloads/chembl/chembl_query.sqlite", "full_index"), statuses)
 
+    def test_bindingdb_superseded_rows_require_exact_compact_authority(self) -> None:
+        installer = self.installer
+        with tempfile.TemporaryDirectory() as tmp:
+            store = Path(tmp)
+            manifest = store / "index_build_manifest.tsv"
+            fields = ["index", "input_path", "status", "rows", "output_path", "notes"]
+            compact = {
+                "index": "ligand_similarity",
+                "input_path": "manifests/source_file_manifest.tsv",
+                "status": "used",
+                "rows": "100",
+                "output_path": installer.LIGAND_SIMILARITY_DATABASE_REL_PATH,
+                "notes": "compact_exact_tanimoto_authority;consumer=ligand_similarity_index",
+            }
+            superseded = {
+                "index": "known_targets",
+                "input_path": "downloads/bindingdb/bindingdb_all.tsv.zip",
+                "status": "superseded",
+                "rows": "0",
+                "output_path": installer.LIGAND_SIMILARITY_DATABASE_REL_PATH,
+                "notes": "compact_ligand_similarity_is_authoritative",
+            }
+            installer.write_simple_tsv(manifest, fields, [compact, superseded])
+            rows = installer.science_index_readiness_rows(store)
+            statuses = {row["input_path"]: row["readiness_status"] for row in rows}
+            self.assertEqual(statuses[superseded["input_path"]], "not_selected")
+
+            for changed in (
+                {**compact, "status": "missing"},
+                {**compact, "notes": "unbound"},
+                {**compact, "output_path": "indexes/other.sqlite"},
+            ):
+                installer.write_simple_tsv(manifest, fields, [changed, superseded])
+                rows = installer.science_index_readiness_rows(store)
+                status = next(row for row in rows if row["input_path"] == superseded["input_path"])
+                self.assertEqual(status["readiness_status"], "incomplete")
+
     def test_rcsb_on_demand_replaces_stale_scope_from_validated_files_and_discards_untrusted_parts(self) -> None:
         installer = self.installer
         with tempfile.TemporaryDirectory() as tmp:
@@ -2018,6 +2055,24 @@ class InstallerRegressionTests(unittest.TestCase):
                     "scope_count": 2,
                 },
             )
+            explicit_scope.write_text("1ABC\n2DEF\n3GHI\n", encoding="utf-8")
+            changed_scope = installer.rcsb_scope_snapshot_validation(
+                store,
+                execution=execution,
+                source_summary=installer.resource_payload_summary(target),
+                check_current_scope=True,
+            )
+            self.assertEqual(changed_scope["status"], "ready_partial_on_demand")
+            self.assertTrue(changed_scope["refresh_needed"])
+            explicit_scope.write_text("1ABC\n", encoding="utf-8")
+            reduced_scope = installer.rcsb_scope_snapshot_validation(
+                store,
+                execution=execution,
+                source_summary=installer.resource_payload_summary(target),
+                check_current_scope=True,
+            )
+            self.assertEqual(reduced_scope["status"], "ready_partial_on_demand")
+            self.assertTrue(reduced_scope["refresh_needed"])
             explicit_scope.write_text("1ABC\n2DEF\n3GHI\n", encoding="utf-8")
             summary = installer.source_sync_summary(
                 plan,
@@ -3806,6 +3861,135 @@ class InstallerRegressionTests(unittest.TestCase):
                 installer.LEGACY_STRUCTURE_TARGETS_PUBLICATION_SCHEMA_VERSION,
             )
             self.assertTrue(source.is_file())
+
+    def test_required_live_structure_input_is_scoped_to_requested_source(self) -> None:
+        installer = self.installer
+        with tempfile.TemporaryDirectory() as tmp:
+            store = Path(tmp) / "science_store"
+            moad = store / "downloads/binding_moad/bindingmoad.csv"
+            moad.parent.mkdir(parents=True)
+            moad.write_bytes(b"pdb_id,ligand\n1abc,ATP\n")
+            indexes = store / "indexes"
+            indexes.mkdir(parents=True)
+            table = indexes / "structure_targets.tsv"
+            table.write_text(
+                "source\ttarget_id\ttarget_name\torganism\ttarget_class\tligand_tokens\t"
+                "sequence_tokens\tstructure_tokens\tevidence\n"
+                "Binding MOAD\t1ABC\tMOAD complex\tunknown\tstructure_record\tatp\tchain_a\t"
+                "1abc\tbinding_moad\n"
+                "BioLiP2\t2DEF\tBioLiP target\tunknown\tstructure_record\tadp\tchain_b\t"
+                "2def\tbiolip2\n",
+                encoding="utf-8",
+            )
+            moad_summary = installer.resource_payload_summary(moad)
+            moad_input = installer.structure_contribution_input_summary(
+                store,
+                ["downloads/binding_moad/bindingmoad.csv"],
+            )
+            bio_digest = "b" * 64
+            installer.write_simple_tsv(
+                store / "manifests/source_file_manifest.tsv",
+                [
+                    "source_id",
+                    "local_path",
+                    "status",
+                    "storage_state",
+                    "file_count",
+                    "bytes",
+                    "sha256",
+                    "release_identity",
+                    "trust_source",
+                ],
+                [
+                    {
+                        "source_id": "binding_moad",
+                        "local_path": "downloads/binding_moad/bindingmoad.csv",
+                        "status": "ready",
+                        "storage_state": "materialized",
+                        "file_count": str(moad_summary["file_count"]),
+                        "bytes": str(moad_summary["bytes"]),
+                        "sha256": str(moad_summary["sha256"]),
+                        "release_identity": "moad-v1",
+                        "trust_source": "moad-trust",
+                    },
+                    {
+                        "source_id": "biolip2",
+                        "local_path": "downloads/biolip2",
+                        "status": "ready",
+                        "storage_state": "indexed_source_pruned",
+                        "file_count": "1",
+                        "bytes": "10",
+                        "sha256": bio_digest,
+                        "release_identity": "bio-v1",
+                        "trust_source": "bio-trust",
+                    },
+                ],
+            )
+            (store / "index_build_manifest.tsv").write_text(
+                "index\tinput_path\tstatus\trows\toutput_path\tnotes\n"
+                "structure_targets\tdownloads/binding_moad/bindingmoad.csv\tused\t1\t"
+                "indexes/structure_targets.tsv\tbinding_moad_complex_rows;complete_source_scan\n"
+                "structure_targets\tdownloads/biolip2/BioLiP.txt.gz\tused\t1\t"
+                "indexes/structure_targets.tsv\tbiolip2_interaction_rows;complete_source_scan\n",
+                encoding="utf-8",
+            )
+            bio_input_digest = "c" * 64
+            write_structure_publication_fixture(
+                installer,
+                store,
+                [
+                    {
+                        "source": "Binding MOAD",
+                        "source_id": "binding_moad",
+                        "source_digest": moad_summary["sha256"],
+                        "release_identity": "moad-v1",
+                        "trust_source": "moad-trust",
+                        "rows": 1,
+                        "source_paths": ["downloads/binding_moad/bindingmoad.csv"],
+                        "input_bytes": moad_input["input_bytes"],
+                        "input_digest": moad_input["input_digest"],
+                    },
+                    {
+                        "source": "BioLiP2",
+                        "source_id": "biolip2",
+                        "source_digest": bio_digest,
+                        "release_identity": "bio-v1",
+                        "trust_source": "bio-trust",
+                        "rows": 1,
+                        "source_paths": ["downloads/biolip2/BioLiP.txt.gz"],
+                        "input_bytes": 10,
+                        "input_digest": bio_input_digest,
+                    },
+                ],
+            )
+            installer.write_source_retention_rows(
+                store,
+                [
+                    {
+                        "schema_version": installer.SOURCE_RETENTION_SCHEMA_VERSION,
+                        "source_id": "biolip2",
+                        "state": "pruned",
+                        "source_manifest_sha256": bio_digest,
+                        "release_identity": "bio-v1",
+                        "trust_source": "bio-trust",
+                        "structure_input_bytes": "10",
+                        "structure_input_digest": bio_input_digest,
+                    }
+                ],
+            )
+            self.assertTrue(
+                installer.structure_targets_publication_ready(
+                    store,
+                    "Binding MOAD",
+                    require_live_inputs=True,
+                )
+            )
+            self.assertFalse(
+                installer.structure_targets_publication_ready(
+                    store,
+                    require_live_inputs=True,
+                )
+            )
 
     def test_replaced_structure_payload_is_preserved_by_cleanup(self) -> None:
         installer = self.installer

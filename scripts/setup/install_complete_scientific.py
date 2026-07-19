@@ -5599,7 +5599,9 @@ def structure_targets_publication_ready(
                 and str(live_input.get("input_digest", "")).lower() == input_digest
             ):
                 return False
-        elif require_live_inputs or not retention_identity_ready:
+        elif (
+            require_live_inputs and (not required_source or source == required_source)
+        ) or not retention_identity_ready:
             return False
         contribution_sources.add(source)
     if set(build_contributions) != contribution_sources:
@@ -8222,15 +8224,13 @@ def rcsb_scope_snapshot_validation(
     source_sha256 = source_digest.hexdigest()
 
     current_scope_count = scope_count
+    scope_changed = False
     if check_current_scope:
         current_scope = ligand_bound_pdb_scope(science_store)
-        if not current_scope or (
-            not manifest_scope.issubset(current_scope)
-            if mode == "on-demand"
-            else manifest_scope != current_scope
-        ):
+        if not current_scope or (mode == "complete" and manifest_scope != current_scope):
             return failed("rcsb_scope_snapshot_stale")
         current_scope_count = len(current_scope)
+        scope_changed = manifest_scope != current_scope
 
     if mode == "on-demand":
         policy = read_json_object(science_store / "downloads/rcsb/on_demand_policy.json")
@@ -8287,7 +8287,7 @@ def rcsb_scope_snapshot_validation(
         "coordinate_bytes": coordinate_bytes,
         "coordinate_digest": coordinate_sha256,
         "source_digest": source_sha256,
-        "refresh_needed": current_scope_count > scope_count,
+        "refresh_needed": scope_changed,
     }
 
 
@@ -8536,6 +8536,7 @@ def external_plan_row_ready(
     *,
     rcsb_mode: str = "on-demand",
 ) -> bool:
+    method = (row.get("sync_method") or "direct").strip().lower()
     if verified_external_retention(science_store, row, summary_cache):
         return True
     if execution.get("status") != "ready" or execution.get("target_rel_path", "") != row.get("target_rel_path", ""):
@@ -8561,7 +8562,7 @@ def external_plan_row_ready(
         return True
     if not marker or not path_has_payload(marker):
         return False
-    if (row.get("sync_method") or "direct").strip().lower() == "rcsb_ligand_bound_scope":
+    if method == "rcsb_ligand_bound_scope":
         mode = normalize_rcsb_mode(rcsb_mode)
         coordinate_summary = (
             resource_payload_summary(target, cache=summary_cache)
@@ -12258,6 +12259,18 @@ def science_index_readiness_rows(
     known_alignment_authorities = known_alignment_authorities or set()
     metagenome_alignment_authorities = metagenome_alignment_authorities or set()
     source_rows = read_tsv(science_store / "index_build_manifest.tsv")
+    compact_ligand_authority = any(
+        row.get("index") == "ligand_similarity"
+        and row.get("status") == "used"
+        and row.get("output_path", "").replace("\\", "/")
+        == LIGAND_SIMILARITY_DATABASE_REL_PATH
+        and "compact_exact_tanimoto_authority" in row.get("notes", "").split(";")
+        for row in source_rows
+    )
+    superseded_bindingdb_inputs = {
+        f"downloads/bindingdb/bindingdb_all.{suffix}"
+        for suffix in ("tsv", "tsv.gz", "tsv.zip", "txt", "txt.gz", "txt.zip")
+    }
     selected_indexes = {
         str(row.get("index", ""))
         for row in source_rows
@@ -12294,12 +12307,23 @@ def science_index_readiness_rows(
         source_scope = "full_searchable_source" if large_index_source(source) else "summary_source"
         index_kind = "ui_projection_tsv" if output_path.endswith(".tsv") else "derived_index"
         raw_status = str(row.get("status", ""))
+        compact_superseded = bool(
+            compact_ligand_authority
+            and raw_status == "superseded"
+            and row.get("index") == "known_targets"
+            and input_path.replace("\\", "/").casefold() in superseded_bindingdb_inputs
+            and output_path.replace("\\", "/") == LIGAND_SIMILARITY_DATABASE_REL_PATH
+            and "compact_ligand_similarity_is_authoritative" in notes.split(";")
+        )
         optional_missing = bool(
             raw_status
             in {"missing", "not_found", "not_present", "not_applicable", "not_selected", "empty"}
             and str(row.get("index", "")) in selected_indexes
         )
-        if optional_missing:
+        if compact_superseded:
+            readiness_status = "not_selected"
+            reason = "superseded_by_compact_ligand_similarity"
+        elif optional_missing:
             readiness_status = "not_selected"
             reason = "alternate_candidate_selected"
         elif raw_status == "alignment_database_used":
