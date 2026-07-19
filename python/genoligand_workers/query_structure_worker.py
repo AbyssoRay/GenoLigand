@@ -1482,3 +1482,7 @@ def _engine_version(record: InputRecord) -> str:
     else:
         retention = "single_representative_only"
     return f"{METHOD_VERSION}; {engine}; retention={retention}"
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

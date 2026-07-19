@@ -3,7 +3,10 @@ from __future__ import annotations
 import csv
 import hashlib
 import json
+import os
 import shutil
+import subprocess
+import sys
 import tempfile
 import unittest
 from pathlib import Path
@@ -121,6 +124,46 @@ class QueryStructureWorkerTests(unittest.TestCase):
         if len(rows) != 1:
             raise AssertionError(f"expected one query structure row, found {len(rows)}")
         return rows[0]
+
+    def test_module_entrypoint_writes_worker_result(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="genoligand_query_entrypoint_") as tmp:
+            root = Path(tmp)
+            job = self.make_run(
+                root,
+                input_kind="genome_or_metagenome",
+                canonical_value="ACGT",
+            )
+            job_path = root / "job.json"
+            result_path = root / "result.json"
+            job_path.write_text(json.dumps(job, sort_keys=True) + "\n", encoding="utf-8")
+            env = os.environ.copy()
+            python_root = str(Path(__file__).resolve().parents[1])
+            env["PYTHONPATH"] = os.pathsep.join(
+                value for value in (python_root, env.get("PYTHONPATH", "")) if value
+            )
+            completed = subprocess.run(
+                [
+                    sys.executable,
+                    "-m",
+                    "genoligand_workers.query_structure_worker",
+                    "--job",
+                    str(job_path),
+                    "--out",
+                    str(result_path),
+                ],
+                capture_output=True,
+                check=False,
+                env=env,
+                text=True,
+            )
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+            result = json.loads(result_path.read_text(encoding="utf-8"))
+            self.assertEqual(result["status"], "NOT_APPLICABLE")
+            self.assertEqual(result["execution_status"], "not_applicable")
+            self.assertEqual(
+                result["reason"],
+                "nucleotide_input_has_no_direct_3d_query_structure",
+            )
 
     def test_small_molecule_is_deterministic_compact_and_retains_one_coordinate(self) -> None:
         with tempfile.TemporaryDirectory(prefix="genoligand_query_molecule_") as tmp:
