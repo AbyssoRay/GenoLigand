@@ -6451,7 +6451,6 @@ def prune_rcsb_on_demand_cache(
         science_store,
         "RCSB",
         summary_cache,
-        require_live_inputs=True,
     ):
         return {
             "status": "needs_repair",
@@ -6459,13 +6458,28 @@ def prune_rcsb_on_demand_cache(
             "reason": "rcsb_structure_publication_identity_mismatch",
         }
     rcsb_contribution = structure_targets_publication_contribution(science_store, "RCSB")
+    scope = ligand_bound_pdb_scope(science_store)
+    if not scope:
+        return {
+            "status": "needs_repair",
+            "reclaimed_bytes": 0,
+            "reason": "rcsb_scope_missing_before_cache_prune",
+        }
     files: list[tuple[Path, int, int]] = []
+    discarded: list[tuple[Path, int, int]] = []
     for path in cache_root.rglob("*.cif.gz"):
         if not path.is_file() or path.is_symlink():
             continue
         stat = path.stat()
-        if stat.st_size > 0:
+        pdb_id = path.name[:-7].upper() if path.name.lower().endswith(".cif.gz") else ""
+        if (
+            stat.st_size > 0
+            and pdb_id in scope
+            and valid_rcsb_coordinate(path, pdb_id)
+        ):
             files.append((path, stat.st_size, stat.st_mtime_ns))
+        else:
+            discarded.append((path, stat.st_size, stat.st_mtime_ns))
     if not files:
         return {"status": "needs_repair", "reclaimed_bytes": 0, "reason": "rcsb_cache_empty"}
     files.sort(key=lambda item: (item[2], item[0].as_posix()), reverse=True)
@@ -6481,7 +6495,7 @@ def prune_rcsb_on_demand_cache(
         retained_bytes += size
     removed_bytes = 0
     cache_resolved = cache_root.resolve()
-    for path, size, _mtime in files:
+    for path, size, _mtime in [*files, *discarded]:
         if path in retained:
             continue
         try:
@@ -6507,13 +6521,6 @@ def prune_rcsb_on_demand_cache(
         prefix = str(cache_resolved).casefold()
         for key in [key for key in summary_cache if key.casefold() == prefix or key.casefold().startswith(f"{prefix}{os.sep}")]:
             summary_cache.pop(key, None)
-    scope = ligand_bound_pdb_scope(science_store)
-    if not scope:
-        return {
-            "status": "needs_repair",
-            "reclaimed_bytes": removed_bytes,
-            "reason": "rcsb_scope_missing_after_cache_prune",
-        }
     snapshot = write_rcsb_scope_manifest(
         science_store,
         cache_root,
@@ -8545,7 +8552,11 @@ def external_plan_row_ready(
     rcsb_mode: str = "on-demand",
 ) -> bool:
     method = (row.get("sync_method") or "direct").strip().lower()
-    if verified_external_retention(science_store, row, summary_cache):
+    rcsb_scope_source = method == "rcsb_ligand_bound_scope"
+    if (
+        not rcsb_scope_source
+        and verified_external_retention(science_store, row, summary_cache)
+    ):
         return True
     if execution.get("status") != "ready" or execution.get("target_rel_path", "") != row.get("target_rel_path", ""):
         return False
@@ -8566,11 +8577,11 @@ def external_plan_row_ready(
         expected_release_identity=row.get("release_or_date", ""),
         expected_trust_source=row.get("trust_source", ""),
     )
-    if retained:
+    if retained and not rcsb_scope_source:
         return True
     if not marker or not path_has_payload(marker):
         return False
-    if method == "rcsb_ligand_bound_scope":
+    if rcsb_scope_source:
         mode = normalize_rcsb_mode(rcsb_mode)
         coordinate_summary = (
             resource_payload_summary(target, cache=summary_cache)

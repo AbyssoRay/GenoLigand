@@ -2069,6 +2069,63 @@ class InstallerRegressionTests(unittest.TestCase):
             self.assertIn("partial_on_demand", execution["notes"])
             self.assertEqual(estimate["download_bytes"], 0)
             self.assertEqual(estimate["action"], "reuse_partial_scope_on_demand")
+            second = target / "de/2def.cif.gz"
+            second.parent.mkdir(parents=True)
+            with gzip.open(second, "wt", encoding="utf-8") as handle:
+                handle.write(rcsb_mmcif_text("2DEF"))
+            plan_row = installer.read_tsv(plan)[0]
+            retained = {"source_id": "rcsb_ligand_bound", "state": "runtime_cache_bounded"}
+            with mock.patch.object(
+                installer,
+                "verified_external_retention",
+                return_value=retained,
+            ), mock.patch.object(
+                installer,
+                "retained_source_ready",
+                return_value=retained,
+            ):
+                self.assertFalse(
+                    installer.external_plan_row_ready(
+                        plan_row,
+                        target,
+                        target,
+                        store,
+                        execution,
+                        rcsb_mode="on-demand",
+                    ),
+                    "runtime cache growth must refresh the RCSB snapshot",
+                )
+            with mock.patch.object(
+                installer,
+                "ligand_bound_pdb_scope",
+                return_value=scope,
+            ), mock.patch.object(
+                installer,
+                "copy_or_download",
+                side_effect=AssertionError("cache refresh must not download the scope"),
+            ):
+                refreshed = installer.sync_external_sources(
+                    plan,
+                    store,
+                    True,
+                    rcsb_mode="on-demand",
+                )
+            self.assertEqual(refreshed["status"], "ready")
+            execution = installer.read_tsv(
+                store / "external_sync_execution_manifest.tsv"
+            )[0]
+            self.assertEqual(execution["scope_ready_count"], "2")
+            self.assertEqual(execution["scope_missing_count"], "0")
+            self.assertTrue(
+                installer.external_plan_row_ready(
+                    plan_row,
+                    target,
+                    target,
+                    store,
+                    execution,
+                    rcsb_mode="on-demand",
+                )
+            )
             policy = json.loads(
                 (store / "downloads/rcsb/on_demand_policy.json").read_text(encoding="utf-8")
             )
@@ -2085,7 +2142,7 @@ class InstallerRegressionTests(unittest.TestCase):
                     "max_cache_bytes": 2 * 1024 * 1024 * 1024,
                     "max_cache_files": 4096,
                     "validation": "gzip_mmcif_entry_and_atom_site",
-                    "cached_ready_count": 1,
+                    "cached_ready_count": 2,
                     "scope_count": 2,
                 },
             )
@@ -4946,8 +5003,10 @@ class InstallerRegressionTests(unittest.TestCase):
             second = store / "downloads/rcsb/mmcif/de/2def.cif.gz"
             first.parent.mkdir(parents=True)
             second.parent.mkdir(parents=True)
-            first.write_bytes(b"rcsb-1abc")
-            second.write_bytes(b"rcsb-2def")
+            with gzip.open(first, "wt", encoding="utf-8") as handle:
+                handle.write(rcsb_mmcif_text("1ABC"))
+            with gzip.open(second, "wt", encoding="utf-8") as handle:
+                handle.write(rcsb_mmcif_text("2DEF"))
             indexes = store / "indexes"
             indexes.mkdir(parents=True)
             table = indexes / "structure_targets.tsv"
@@ -5048,6 +5107,68 @@ class InstallerRegressionTests(unittest.TestCase):
                     require_live_inputs=True,
                 )
             )
+            outsider = store / "downloads/rcsb/mmcif/gh/3ghi.cif.gz"
+            outsider.parent.mkdir(parents=True)
+            with gzip.open(outsider, "wt", encoding="utf-8") as handle:
+                handle.write(rcsb_mmcif_text("3GHI"))
+            outsider_bytes = outsider.stat().st_size
+            installer.write_json_atomic(
+                store / "downloads/rcsb/on_demand_policy.json",
+                {"mode": "on_demand"},
+            )
+            installer.write_simple_tsv(
+                store / "external_sync_execution_manifest.tsv",
+                [
+                    "source_id",
+                    "source_label",
+                    "target_rel_path",
+                    "status",
+                    "bytes",
+                    "sha256",
+                    "plan_digest",
+                    "release_identity",
+                    "trust_source",
+                    "scope_mode",
+                    "scope_digest",
+                    "scope_ready_count",
+                    "scope_count",
+                    "scope_missing_count",
+                    "notes",
+                ],
+                [
+                    {
+                        "source_id": "rcsb_ligand_bound",
+                        "source_label": "RCSB ligand-bound structures",
+                        "target_rel_path": "downloads/rcsb/mmcif",
+                        "status": "ready",
+                        "release_identity": "rcsb-build-snapshot",
+                        "trust_source": "publisher_https_mmcif_parse",
+                    }
+                ],
+            )
+            installer.write_simple_tsv(
+                store / "manifests/hash_manifest.tsv",
+                ["source_id", "local_path", "status", "bytes", "sha256"],
+                [
+                    {
+                        "source_id": "rcsb_ligand_bound",
+                        "local_path": "downloads/rcsb/mmcif",
+                        "status": "ready",
+                    }
+                ],
+            )
+            with mock.patch.object(
+                installer,
+                "ligand_bound_pdb_scope",
+                return_value={"1ABC"},
+            ):
+                first_prune = installer.prune_rcsb_on_demand_cache(store)
+                second_prune = installer.prune_rcsb_on_demand_cache(store)
+            self.assertEqual(first_prune["status"], "ready")
+            self.assertEqual(first_prune["reclaimed_bytes"], outsider_bytes)
+            self.assertFalse(outsider.exists())
+            self.assertEqual(second_prune["status"], "ready")
+            self.assertEqual(second_prune["reclaimed_bytes"], 0)
             retention["trust_source"] = "different_trust"
             installer.write_source_retention_rows(store, [retention])
             self.assertFalse(installer.structure_targets_publication_ready(store, "RCSB"))
