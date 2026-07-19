@@ -8311,6 +8311,35 @@ def external_evidence_digest(
     return str(summary.get("sha256", ""))
 
 
+def verified_external_retention(
+    science_store: Path,
+    plan_row: dict[str, str],
+    summary_cache: ResourceSummaryCache | None = None,
+) -> dict[str, str]:
+    source_id = plan_row.get("source_id", "")
+    matches = [
+        row
+        for row in source_retention_rows(science_store)
+        if row.get("source_id") == source_id
+    ]
+    if len(matches) != 1:
+        return {}
+    retained = matches[0]
+    if not (
+        retained.get("source_local_path", "").replace("\\", "/")
+        == plan_row.get("target_rel_path", "").replace("\\", "/")
+        and retained.get("release_identity") == plan_row.get("release_or_date")
+        and retained.get("trust_source") == plan_row.get("trust_source")
+        and retention_source_identity_and_derivatives_ready(
+            science_store,
+            retained,
+            summary_cache,
+        )
+    ):
+        return {}
+    return retained
+
+
 def external_plan_row_ready(
     row: dict[str, str],
     target: Path | None,
@@ -8321,6 +8350,8 @@ def external_plan_row_ready(
     *,
     rcsb_mode: str = "on-demand",
 ) -> bool:
+    if verified_external_retention(science_store, row, summary_cache):
+        return True
     if execution.get("status") != "ready" or execution.get("target_rel_path", "") != row.get("target_rel_path", ""):
         return False
     if execution.get("plan_digest", "") != external_plan_digest(row):
@@ -8470,6 +8501,8 @@ def sync_external_sources(
             )
             if marker_ready:
                 retained = retained_source_ready(science_store, source_id, target_rel, summary_cache)
+                if not retained:
+                    retained = verified_external_retention(science_store, row, summary_cache)
                 evidence = external_evidence_path(row, target, marker)
                 evidence_bytes = (
                     int(retained.get("source_bytes", "0") or 0)
@@ -13340,22 +13373,12 @@ def installation_capacity_plan(
         row.get("source_id", ""): row
         for row in read_tsv(science_store / "external_sync_execution_manifest.tsv")
     }
-    retained_external = {
-        row.get("source_id", ""): row
-        for row in source_retention_rows(science_store)
-        if row.get("source_id")
-    }
     for row in read_tsv(source_sync_plan):
         source_id = row.get("source_id", "external_source")
         target = science_store / row.get("target_rel_path", "")
         marker = science_store / (row.get("ready_marker") or row.get("target_rel_path", ""))
         method = row.get("sync_method", "direct").strip().lower()
-        retained_row = retained_external.get(source_id, {})
-        if retained_row and retention_source_identity_and_derivatives_ready(
-            science_store,
-            retained_row,
-            summary_cache,
-        ):
+        if verified_external_retention(science_store, row, summary_cache):
             items.append(capacity_item(source_id, "reuse_verified_index", 0, 0, 0, available))
             continue
         if external_plan_row_ready(

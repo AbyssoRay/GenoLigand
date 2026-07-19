@@ -2221,13 +2221,18 @@ class InstallerRegressionTests(unittest.TestCase):
             recovered.write_bytes(b"recovered-annotation")
             sync_plan = root / "source_sync.tsv"
             sync_plan.write_text(
-                "source_id\ttarget_rel_path\tready_marker\tsync_method\n"
-                "biolip2\tdownloads/biolip2\tdownloads/biolip2\thtml_links\n",
+                "source_id\tsource_label\ttarget_rel_path\tready_marker\tsync_method\trelease_or_date\ttrust_source\n"
+                "biolip2\tBioLiP2\tdownloads/biolip2\tdownloads/biolip2\thtml_links\tfixture-release\tfixture-trust\n",
                 encoding="utf-8",
             )
             retention = {
                 "schema_version": installer.SOURCE_RETENTION_SCHEMA_VERSION,
                 "source_id": "biolip2",
+                "source_local_path": "downloads/biolip2",
+                "source_bytes": "123",
+                "execution_sha256": "a" * 64,
+                "release_identity": "fixture-release",
+                "trust_source": "fixture-trust",
             }
             with mock.patch.object(
                 installer,
@@ -2238,10 +2243,8 @@ class InstallerRegressionTests(unittest.TestCase):
                 "retention_source_identity_and_derivatives_ready",
                 return_value=True,
             ) as retained_ready, mock.patch.object(
-                installer,
-                "external_plan_row_ready",
-                side_effect=AssertionError("verified retained projection must win capacity reuse"),
-            ), mock.patch.object(installer, "same_storage_volume", return_value=True):
+                installer, "same_storage_volume", return_value=True
+            ):
                 plan = installer.installation_capacity_plan(
                     store,
                     root / "missing-catalog.tsv",
@@ -2249,10 +2252,19 @@ class InstallerRegressionTests(unittest.TestCase):
                     available_bytes=100 * 1024 * 1024 * 1024,
                     scratch_dir=root / "scratch",
                 )
+                sync = installer.sync_external_sources(
+                    sync_plan,
+                    store,
+                    skip_downloads=True,
+                )
             biolip = next(item for item in plan["items"] if item["component"] == "biolip2")
             self.assertEqual(biolip["action"], "reuse_verified_index")
             self.assertNotIn("biolip2", plan["unresolved_components"])
-            retained_ready.assert_called_once_with(store, retention, None)
+            self.assertEqual(sync["status"], "ready")
+            external_row = installer.read_tsv(store / "external_sync_execution_manifest.tsv")[0]
+            self.assertEqual(external_row["status"], "ready")
+            self.assertEqual(external_row["notes"], "verified_index_reused_source_payload_remains_pruned")
+            self.assertGreaterEqual(retained_ready.call_count, 2)
 
     def test_rcsb_capacity_uses_observed_aggregate_size_instead_of_largest_file(self) -> None:
         installer = self.installer
