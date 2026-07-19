@@ -2266,6 +2266,78 @@ class InstallerRegressionTests(unittest.TestCase):
             self.assertEqual(external_row["notes"], "verified_index_reused_source_payload_remains_pruned")
             self.assertGreaterEqual(retained_ready.call_count, 2)
 
+    def test_pruned_alignment_authority_survives_without_unrelated_projection_checks(self) -> None:
+        installer = self.installer
+        with tempfile.TemporaryDirectory() as tmp:
+            store = Path(tmp) / "science_store"
+            source_manifest = store / "manifests/source_file_manifest.tsv"
+            installer.write_simple_tsv(
+                source_manifest,
+                [
+                    "source_id",
+                    "local_path",
+                    "status",
+                    "storage_state",
+                    "file_count",
+                    "bytes",
+                    "sha256",
+                    "release_identity",
+                    "trust_source",
+                ],
+                [
+                    {
+                        "source_id": "biolip2",
+                        "local_path": "downloads/biolip2",
+                        "status": "ready",
+                        "storage_state": "indexed_source_pruned",
+                        "file_count": "4",
+                        "bytes": "100",
+                        "sha256": "a" * 64,
+                        "release_identity": "fixture-release",
+                        "trust_source": "fixture-trust",
+                    }
+                ],
+            )
+            mmseqs_manifest = store / "indexes/mmseqs/mmseqs_target_databases.tsv"
+            mmseqs_manifest.parent.mkdir(parents=True, exist_ok=True)
+            mmseqs_manifest.write_text("source_id\nfixture\n", encoding="utf-8")
+            installer.write_source_retention_rows(
+                store,
+                [
+                    {
+                        "schema_version": installer.SOURCE_RETENTION_SCHEMA_VERSION,
+                        "source_id": "biolip2",
+                        "source_local_path": "downloads/biolip2",
+                        "state": "pruned",
+                        "source_files": "4",
+                        "source_bytes": "100",
+                        "source_manifest_sha256": "a" * 64,
+                        "release_identity": "fixture-release",
+                        "trust_source": "fixture-trust",
+                        "payload_records_json": json.dumps(
+                            [
+                                {
+                                    "path": "downloads/biolip2",
+                                    "kind": "directory",
+                                    "file_count": 4,
+                                    "bytes": 100,
+                                    "sha256": "a" * 64,
+                                    "content_sha256": "",
+                                }
+                            ],
+                            separators=(",", ":"),
+                        ),
+                        "derived_paths": "indexes/mmseqs/mmseqs_target_databases.tsv",
+                    }
+                ],
+            )
+            source_path = "downloads/biolip2/protein.fasta.gz"
+            self.assertTrue(installer.retention_covers_alignment_source_path(store, source_path))
+            restored = store / source_path
+            restored.parent.mkdir(parents=True, exist_ok=True)
+            restored.write_bytes(b"restored")
+            self.assertFalse(installer.retention_covers_alignment_source_path(store, source_path))
+
     def test_rcsb_capacity_uses_observed_aggregate_size_instead_of_largest_file(self) -> None:
         installer = self.installer
         with tempfile.TemporaryDirectory() as tmp:
@@ -3620,6 +3692,8 @@ class InstallerRegressionTests(unittest.TestCase):
                 "indexes/plinder_targets.tsv;indexes/plinder_targets.manifest.json;"
                 "indexes/structure_targets.tsv"
             )
+            retained["structure_input_bytes"] = ""
+            retained["structure_input_digest"] = ""
             installer.write_source_retention_rows(store, [retained])
             canonical.write_bytes(canonical_bytes)
             canonical_manifest.write_bytes(canonical_manifest_bytes)
@@ -3632,6 +3706,15 @@ class InstallerRegressionTests(unittest.TestCase):
                 installer.source_retention_row(store, "plinder")["derived_paths"],
                 "indexes/structure_targets.tsv;indexes/structure_targets.manifest.json;"
                 "index_build_manifest.tsv",
+            )
+            migrated_retention = installer.source_retention_row(store, "plinder")
+            self.assertEqual(
+                migrated_retention["structure_input_bytes"],
+                str(input_summary["input_bytes"]),
+            )
+            self.assertEqual(
+                migrated_retention["structure_input_digest"],
+                str(input_summary["input_digest"]),
             )
             reused = installer.prepare_plinder_canonical_index(root, store, "", "local", None)
             self.assertEqual(reused["status"], "ready")

@@ -197,7 +197,7 @@ STRUCTURE_CONTRIBUTION_SOURCE_IDS = {
     "RCSB": "rcsb_ligand_bound",
 }
 STRUCTURE_TARGETS_PUBLICATION_VALIDATION_CACHE: dict[
-    tuple[str, int, int, str, str], frozenset[str]
+    tuple[str, int, int, str, str, str, str, str], frozenset[str]
 ] = {}
 SCIENCE_READINESS_EVIDENCE_PATHS = (
     "source_requirements.tsv",
@@ -309,6 +309,23 @@ INDEXED_SOURCE_RETENTION_POLICIES: dict[str, dict[str, object]] = {
             "indexes/mmseqs/mmseqs_target_databases.tsv",
         ),
     },
+}
+LEGACY_STRUCTURE_RETENTION_DERIVED_PATHS = {
+    "binding_moad": frozenset(("indexes/structure_targets.tsv",)),
+    "biolip2": frozenset(
+        (
+            "indexes/known_targets.tsv",
+            "indexes/structure_targets.tsv",
+            "indexes/mmseqs/mmseqs_target_databases.tsv",
+        )
+    ),
+    "plinder": frozenset(
+        (
+            "indexes/plinder_targets.tsv",
+            "indexes/plinder_targets.manifest.json",
+            "indexes/structure_targets.tsv",
+        )
+    ),
 }
 RCSB_CAPACITY_REMOTE_SAMPLE_SIZE = 32
 RCSB_CAPACITY_AGGREGATE_MARGIN_NUMERATOR = 3
@@ -5469,6 +5486,7 @@ def structure_targets_publication_ready(
     summary_cache: ResourceSummaryCache | None = None,
     *,
     require_live_inputs: bool = False,
+    retention_overrides: dict[str, dict[str, str]] | None = None,
 ) -> bool:
     table = science_store / "indexes/structure_targets.tsv"
     manifest_path = science_store / STRUCTURE_TARGETS_MANIFEST_REL_PATH
@@ -5516,6 +5534,8 @@ def structure_targets_publication_ready(
         for row in source_retention_rows(science_store)
         if row.get("source_id")
     }
+    if retention_overrides:
+        retention_rows.update(retention_overrides)
     contribution_sources: set[str] = set()
     for contribution in contributions:
         if not isinstance(contribution, dict):
@@ -5594,6 +5614,20 @@ def structure_targets_publication_ready(
             table_stat.st_mtime_ns,
             declared_sha256,
             sha256_file(manifest_path),
+            sha256_file(science_store / "manifests/source_file_manifest.tsv")
+            if (science_store / "manifests/source_file_manifest.tsv").is_file()
+            else "",
+            sha256_file(source_retention_manifest_path(science_store))
+            if source_retention_manifest_path(science_store).is_file()
+            else "",
+            hashlib.sha256(
+                json.dumps(
+                    retention_overrides or {},
+                    ensure_ascii=True,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                ).encode("utf-8")
+            ).hexdigest(),
         )
         cached_sources = STRUCTURE_TARGETS_PUBLICATION_VALIDATION_CACHE.get(cache_key)
         if cached_sources is not None:
@@ -5713,6 +5747,8 @@ def indexed_source_derivatives_ready(
     payload_records: list[dict[str, object]],
     derived_paths: tuple[str, ...] | list[str],
     summary_cache: ResourceSummaryCache | None = None,
+    *,
+    retention_overrides: dict[str, dict[str, str]] | None = None,
 ) -> bool:
     if (
         source_manifest.get("status") != "ready"
@@ -5750,6 +5786,7 @@ def indexed_source_derivatives_ready(
             structure_sources[source_id],
             summary_cache,
             require_live_inputs=live_payload,
+            retention_overrides=retention_overrides,
         ):
             return False
         if source_id == "plinder":
@@ -5837,6 +5874,8 @@ def retention_source_identity_and_derivatives_ready(
     science_store: Path,
     row: dict[str, str],
     summary_cache: ResourceSummaryCache | None = None,
+    *,
+    retention_overrides: dict[str, dict[str, str]] | None = None,
 ) -> bool:
     if (
         row.get("schema_version") != SOURCE_RETENTION_SCHEMA_VERSION
@@ -5859,7 +5898,90 @@ def retention_source_identity_and_derivatives_ready(
         retention_payload_records(row),
         derived,
         summary_cache,
+        retention_overrides=retention_overrides,
     )
+
+
+def legacy_pruned_structure_retention_candidates(
+    science_store: Path,
+    summary_cache: ResourceSummaryCache | None = None,
+) -> dict[str, dict[str, str]]:
+    source_rows = source_manifest_rows_by_id(science_store)
+    retention_rows = {
+        row.get("source_id", ""): row
+        for row in source_retention_rows(science_store)
+        if row.get("source_id")
+    }
+    contribution_names = {
+        "binding_moad": "Binding MOAD",
+        "biolip2": "BioLiP2",
+        "plinder": "PLINDER",
+    }
+    candidates: dict[str, dict[str, str]] = {}
+    for source_id, legacy_derived in LEGACY_STRUCTURE_RETENTION_DERIVED_PATHS.items():
+        policy = INDEXED_SOURCE_RETENTION_POLICIES.get(source_id)
+        if policy is None:
+            continue
+        retained = retention_rows.get(source_id, {})
+        source = source_rows.get(source_id, {})
+        records = retention_payload_records(retained)
+        contribution = structure_targets_publication_contribution(
+            science_store,
+            contribution_names[source_id],
+        )
+        expected_payloads = {str(value).replace("\\", "/") for value in policy["payloads"]}
+        current_derived = frozenset(str(value) for value in policy["derived"])
+        recorded_derived = frozenset(filter(None, retained.get("derived_paths", "").split(";")))
+        if not (
+            retained.get("schema_version") == SOURCE_RETENTION_SCHEMA_VERSION
+            and retained.get("state") == "pruned"
+            and source.get("status") == "ready"
+            and source.get("storage_state") == "indexed_source_pruned"
+            and source.get("local_path", "").replace("\\", "/")
+            == retained.get("source_local_path", "").replace("\\", "/")
+            and source.get("sha256", "").lower()
+            == retained.get("source_manifest_sha256", "").lower()
+            and source.get("release_identity") == retained.get("release_identity")
+            and source.get("trust_source") == retained.get("trust_source")
+            and source.get("file_count") == retained.get("source_files")
+            and source.get("bytes") == retained.get("source_bytes")
+            and len(records) == 1
+            and {str(records[0].get("path", "")).replace("\\", "/")} == expected_payloads
+            and retention_payload_record_valid(records[0])
+            and str(records[0].get("file_count", "")) == retained.get("source_files")
+            and str(records[0].get("bytes", "")) == retained.get("source_bytes")
+            and str(records[0].get("sha256", "")).lower()
+            == retained.get("source_manifest_sha256", "").lower()
+            and not path_has_payload(science_store / str(records[0].get("path", "")))
+            and recorded_derived in {legacy_derived, current_derived}
+            and contribution.get("source_id") == source_id
+            and contribution.get("source") == contribution_names[source_id]
+        ):
+            continue
+        candidate = dict(retained)
+        candidate["derived_paths"] = ";".join(str(value) for value in policy["derived"])
+        candidate["structure_input_bytes"] = str(contribution.get("input_bytes", ""))
+        candidate["structure_input_digest"] = str(contribution.get("input_digest", ""))
+        candidate["notes"] = "legacy_pruned_structure_projection_migrated"
+        if structure_contribution_retention_identity_matches(contribution, candidate):
+            candidates[source_id] = candidate
+    if not candidates or not structure_targets_publication_ready(
+        science_store,
+        summary_cache=summary_cache,
+        retention_overrides=candidates,
+    ):
+        return {}
+    if any(
+        not retention_source_identity_and_derivatives_ready(
+            science_store,
+            candidate,
+            summary_cache,
+            retention_overrides=candidates,
+        )
+        for candidate in candidates.values()
+    ):
+        return {}
+    return candidates
 
 
 def retained_source_derivatives_ready(
@@ -5883,6 +6005,45 @@ def retained_source_derivatives_ready(
             if str(record.get("path", "")).strip()
         )
     )
+
+
+def retention_covers_alignment_source_path(science_store: Path, source_path: str) -> bool:
+    normalized = source_path.replace("\\", "/").strip("/").casefold()
+    if not normalized:
+        return False
+    source_rows = source_manifest_rows_by_id(science_store)
+    for retained in source_retention_rows(science_store):
+        source_id = retained.get("source_id", "")
+        policy = INDEXED_SOURCE_RETENTION_POLICIES.get(source_id, {})
+        source = source_rows.get(source_id, {})
+        records = retention_payload_records(retained)
+        if not (
+            retained.get("schema_version") == SOURCE_RETENTION_SCHEMA_VERSION
+            and retained.get("state") == "pruned"
+            and source.get("status") == "ready"
+            and source.get("storage_state") == "indexed_source_pruned"
+            and source.get("sha256", "").lower()
+            == retained.get("source_manifest_sha256", "").lower()
+            and source.get("release_identity") == retained.get("release_identity")
+            and source.get("trust_source") == retained.get("trust_source")
+            and records
+            and all(retention_payload_record_valid(record) for record in records)
+            and all(
+                not path_has_payload(science_store / str(record.get("path", "")))
+                for record in records
+            )
+            and "indexes/mmseqs/mmseqs_target_databases.tsv"
+            in {str(value).replace("\\", "/") for value in policy.get("derived", ())}
+            and path_has_payload(science_store / "indexes/mmseqs/mmseqs_target_databases.tsv")
+        ):
+            continue
+        for record in records:
+            payload = str(record.get("path", "")).replace("\\", "/").strip("/").casefold()
+            if normalized == payload or (
+                record.get("kind") == "directory" and normalized.startswith(f"{payload}/")
+            ):
+                return True
+    return False
 
 
 def retained_source_ready(
@@ -6066,6 +6227,10 @@ def prune_indexed_source_payloads(
         row.get("source_id", ""): row
         for row in read_tsv(science_store / "external_sync_execution_manifest.tsv")
     }
+    legacy_structure_candidates = legacy_pruned_structure_retention_candidates(
+        science_store,
+        summary_cache,
+    )
     prepared: list[dict[str, str]] = []
     preserved = [
         dict(row)
@@ -6075,9 +6240,25 @@ def prune_indexed_source_payloads(
     failures: list[str] = []
     for source_id, policy in INDEXED_SOURCE_RETENTION_POLICIES.items():
         old = previous.get(source_id, {})
+        if source_id in legacy_structure_candidates:
+            prepared.append(dict(legacy_structure_candidates[source_id]))
+            continue
         if old:
             migrated = dict(old)
             migrated["derived_paths"] = ";".join(str(value) for value in policy["derived"])
+            structure_source = {
+                "binding_moad": "Binding MOAD",
+                "biolip2": "BioLiP2",
+                "plinder": "PLINDER",
+            }.get(source_id, "")
+            contribution = (
+                structure_targets_publication_contribution(science_store, structure_source)
+                if structure_source
+                else {}
+            )
+            if contribution:
+                migrated["structure_input_bytes"] = str(contribution.get("input_bytes", ""))
+                migrated["structure_input_digest"] = str(contribution.get("input_digest", ""))
             if retained_source_derivatives_ready(science_store, migrated, summary_cache):
                 prepared.append(migrated)
                 continue
@@ -8325,19 +8506,24 @@ def verified_external_retention(
     if len(matches) != 1:
         return {}
     retained = matches[0]
-    if not (
+    plan_identity_ready = bool(
         retained.get("source_local_path", "").replace("\\", "/")
         == plan_row.get("target_rel_path", "").replace("\\", "/")
         and retained.get("release_identity") == plan_row.get("release_or_date")
         and retained.get("trust_source") == plan_row.get("trust_source")
-        and retention_source_identity_and_derivatives_ready(
-            science_store,
-            retained,
-            summary_cache,
-        )
-    ):
+    )
+    if not plan_identity_ready:
         return {}
-    return retained
+    if retention_source_identity_and_derivatives_ready(
+        science_store,
+        retained,
+        summary_cache,
+    ):
+        return retained
+    return legacy_pruned_structure_retention_candidates(
+        science_store,
+        summary_cache,
+    ).get(source_id, {})
 
 
 def external_plan_row_ready(
@@ -8999,7 +9185,7 @@ def build_mmseqs_target_databases(
         )
     current_ids = {row.get("source_id", "") for row in rows}
     for source_id, previous in previous_rows.items():
-        if source_id in current_ids or not retention_covers_source_path(
+        if source_id in current_ids or not retention_covers_alignment_source_path(
             science_store, previous.get("source_path", "")
         ):
             continue
@@ -11815,7 +12001,9 @@ def authoritative_mmseqs_databases(
             db_path = resolve_manifest_path(science_store, db_path_text)
             if source is None or db_path is None:
                 continue
-            if not path_has_payload(source) and retention_covers_source_path(science_store, source_path):
+            if not path_has_payload(source) and retention_covers_alignment_source_path(
+                science_store, source_path
+            ):
                 if (
                     row.get("builder_version") != builder_version
                     or not re.fullmatch(r"[0-9a-f]{64}", source_digest)
