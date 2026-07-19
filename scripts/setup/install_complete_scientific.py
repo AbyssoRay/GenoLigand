@@ -6524,9 +6524,15 @@ def prune_rcsb_on_demand_cache(
     write_rcsb_on_demand_policy(science_store, snapshot)
     foldseek_manifest = science_store / "indexes/foldseek/foldseek_target_databases.tsv"
     foldseek_rows = read_tsv(foldseek_manifest)
+    scope_rows = read_tsv(science_store / "downloads/rcsb/ligand_bound_pdb_scope.tsv")
+    current_scope_ids = {
+        row.get("pdb_id", "").upper()
+        for row in scope_rows
+        if row.get("pdb_id")
+    }
     cached_ids = {
         row.get("pdb_id", "").upper()
-        for row in read_tsv(science_store / "downloads/rcsb/ligand_bound_pdb_scope.tsv")
+        for row in scope_rows
         if row.get("status") == "ready"
     }
     for row in foldseek_rows:
@@ -6552,7 +6558,9 @@ def prune_rcsb_on_demand_cache(
                 "scope_ready_count": str(snapshot["ready_count"]),
                 "scope_missing_count": str(snapshot["missing_count"]),
                 "scope_coverage": f"{row.get('indexed_pdb_count', 0)}/{snapshot['scope_count']}",
-                "refresh_needed": str(bool(cached_ids - indexed_ids)).lower(),
+                "refresh_needed": str(
+                    bool((cached_ids - indexed_ids) or (indexed_ids - current_scope_ids))
+                ).lower(),
             }
         )
     if foldseek_rows:
@@ -9448,8 +9456,7 @@ def foldseek_partial_manifest_validation(
         if set(mapping["pdb_ids"]) != set(indexed_by_id):
             return {"status": "failed", "reason": "foldseek_partial_source_validated_ids_mismatch"}
         scope_rows = rcsb_scope_rows_for_ids(science_store, set(indexed_by_id))
-        if set(scope_rows) != set(indexed_by_id):
-            return {"status": "failed", "reason": "foldseek_partial_scope_binding_missing"}
+        retired_indexed_ids = set(indexed_by_id) - set(scope_rows)
         indexed_entries = int(mapping["indexed_entries"])
         indexed_pdb_count = len(indexed_by_id)
         subset_digest = foldseek_subset_digest(
@@ -9493,7 +9500,9 @@ def foldseek_partial_manifest_validation(
             "indexed_pdb_count": indexed_pdb_count,
             "indexed_entries": indexed_entries,
             "indexed_coordinate_bytes": coordinate_bytes,
-            "refresh_needed": bool(cached_ids - set(indexed_by_id)),
+            "refresh_needed": bool(
+                (cached_ids - set(indexed_by_id)) or retired_indexed_ids
+            ),
         }
     except (OSError, UnicodeError, ValueError) as err:
         return {"status": "failed", "reason": f"foldseek_partial_validation_failed:{exception_note(err)}"}

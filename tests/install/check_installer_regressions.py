@@ -1097,6 +1097,40 @@ class InstallerRegressionTests(unittest.TestCase):
             self.assertEqual(reused["status"], "ready")
             self.assertIn("manifest_database_probe_reused", reused["notes"])
 
+            retired_scope = {"1ABC", "3GHI"}
+            explicit_scope.write_text("\n".join(sorted(retired_scope)) + "\n", encoding="utf-8")
+            retired_snapshot = installer.write_rcsb_scope_manifest(
+                store,
+                coordinate_root,
+                retired_scope,
+                scope_mode="on-demand",
+            )
+            installer.write_rcsb_on_demand_policy(store, retired_snapshot)
+            retired_row = {
+                **row,
+                "scope_digest": str(retired_snapshot["scope_digest"]),
+                "scope_coordinate_digest": str(retired_snapshot["coordinate_digest"]),
+                "scope_count": str(retired_snapshot["scope_count"]),
+                "scope_ready_count": str(retired_snapshot["ready_count"]),
+                "scope_missing_count": str(retired_snapshot["missing_count"]),
+            }
+            retired_validation = installer.foldseek_partial_manifest_validation(
+                store,
+                retired_row,
+                db,
+                probe_database=False,
+            )
+            self.assertEqual(retired_validation["status"], "ready")
+            self.assertTrue(retired_validation["refresh_needed"])
+            explicit_scope.write_text("\n".join(sorted(scope)) + "\n", encoding="utf-8")
+            snapshot = installer.write_rcsb_scope_manifest(
+                store,
+                coordinate_root,
+                scope,
+                scope_mode="on-demand",
+            )
+            installer.write_rcsb_on_demand_policy(store, snapshot)
+
             def validate_partial(candidate: dict[str, str] | None = None) -> dict[str, object]:
                 return installer.foldseek_partial_manifest_validation(
                     store,
