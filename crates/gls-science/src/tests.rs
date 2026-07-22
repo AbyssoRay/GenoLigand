@@ -6497,6 +6497,92 @@ fn dynamics_screen_aggregates_real_metric_artifacts() {
 }
 
 #[test]
+fn dynamics_screen_fails_with_each_reason_when_all_selected_md_results_are_invalid() {
+    let root = temp_root("md_all_selected_invalid");
+    let options = indexed_fixture_options(&root);
+    let rows = write_indexed_fixture_selection(
+        &options,
+        &[
+            (
+                "candidate_A",
+                "input_1",
+                "record_1",
+                "small_molecule",
+                "CCO",
+            ),
+            (
+                "candidate_B",
+                "input_2",
+                "record_2",
+                "small_molecule",
+                "CCO",
+            ),
+        ],
+    )
+    .expect("indexed selection");
+    reset_candidate_manifest_index(&options, "md").expect("reset MD index");
+    let base = SCIENTIFIC_WORKER_TASKS[0];
+    for (row, reason) in rows.iter().zip([
+        "openmm_platform_unavailable",
+        "no_receptor_chain_within_pose_contact_cutoff",
+    ]) {
+        let candidate_id = row.get("candidate_id").expect("candidate id");
+        let job_id = candidate_worker_job_id(base.job_id, candidate_id);
+        let task = WorkerTask {
+            job_id: &job_id,
+            worker: base.worker,
+            module: base.module,
+            stage: base.stage,
+        };
+        let (job, facts) = candidate_worker_job_value(&options, &task, row).expect("candidate job");
+        let mut result = candidate_fixture_result(&task, &job, "", None);
+        result["status"] = json!("FAIL");
+        result["execution_status"] = json!("failed");
+        result["reason"] = json!(reason);
+        result["outcomes"] = json!([{
+            "status": "failed",
+            "reason": reason,
+            "required": true,
+            "database_id": "md_summary",
+            "row_count": 0,
+        }]);
+        write_text(
+            &options
+                .run_dir
+                .join("worker_jobs")
+                .join(format!("{job_id}.json")),
+            &(job.to_string() + "\n"),
+        )
+        .expect("candidate job file");
+        write_text(
+            &options
+                .run_dir
+                .join("worker_results")
+                .join(format!("{job_id}.json")),
+            &(result.to_string() + "\n"),
+        )
+        .expect("candidate result file");
+        ensure_manifest_index_entry(&options, "md", &facts, &task, &result)
+            .expect("failed MD index entry");
+    }
+
+    let summary = screen_dynamics(&options).expect("materialize invalid MD summary");
+    let error = ensure_selected_md_results(&options, rows.len())
+        .expect_err("all invalid MD candidates must fail");
+    let status = read_text(&options.run_dir.join("md_summary_status.tsv")).expect("MD status");
+
+    assert!(summary.contains("md_artifact=not_ready"));
+    assert!(error.starts_with("all_selected_md_candidates_failed:"));
+    assert!(error.contains("candidate_A:openmm_platform_unavailable"));
+    assert!(error.contains("candidate_B:no_receptor_chain_within_pose_contact_cutoff"));
+    assert!(status.starts_with("status\treason\nfail\t"));
+    assert!(status.contains("candidate_A:openmm_platform_unavailable"));
+    assert!(status.contains("candidate_B:no_receptor_chain_within_pose_contact_cutoff"));
+    fs::remove_dir_all(&root).expect("cleanup temp root");
+    assert!(!root.exists());
+}
+
+#[test]
 fn dynamics_screen_rejects_provenance_with_identity_missing_on_both_sides() {
     let root = temp_root("md_missing_identity");
     let run = root.join("run");
@@ -9642,9 +9728,9 @@ fn coordinate_top_n_uses_independent_docking_and_md_jobs() {
                 .is_some_and(|digest| valid_sha256_hex(digest))
     }));
 
-    let result = run_science_command(ScienceCommand::DynamicsScreen, &options)
-        .expect("direct dynamics jobs");
-    assert!(result.contains("dynamics_status=executed"));
+    let error = run_science_command(ScienceCommand::DynamicsScreen, &options)
+        .expect_err("all not-applicable MD fixtures must fail dynamics");
+    assert!(error.contains("all_selected_md_candidates_failed:"));
     let docking_index =
         read_json_value_if_file(&run.join("tool_outputs/docking_manifest_index.json"))
             .expect("docking index");
@@ -10020,10 +10106,9 @@ fn dynamics_mixed_routes_index_only_runnable_small_molecule() {
     )
     .expect("selection");
 
-    let result =
-        run_science_command(ScienceCommand::DynamicsScreen, &options).expect("mixed dynamics");
-    assert!(result.contains("dynamics_status=executed"));
-    assert!(result.contains("not_applicable_count=1"));
+    let error = run_science_command(ScienceCommand::DynamicsScreen, &options)
+        .expect_err("runnable small molecule without an MD result must fail dynamics");
+    assert!(error.contains("all_selected_md_candidates_failed:candidate_small:"));
     for (kind, task) in [
         ("docking", &DOCKING_WORKER_TASK),
         ("md", &SCIENTIFIC_WORKER_TASKS[0]),
@@ -10168,6 +10253,8 @@ fn p1_integrity_structure_index_excludes_wrong_or_missing_cached_identity() {
         "ATOM 1 N N 1.0 2.0 3.0\n",
     )
     .expect("identity-free cached coordinate");
+    write_test_source_manifest(&store, &["rcsb_ligand_bound"])
+        .expect("RCSB source identity fixture");
     let options = StoreOptions {
         workspace_root: root.clone(),
         science_store: store.clone(),

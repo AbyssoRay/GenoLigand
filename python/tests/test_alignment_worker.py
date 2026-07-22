@@ -37,6 +37,7 @@ from genoligand_workers.query_structure_worker import (
     query_structure_input_digest,
 )
 from genoligand_workers.md_summary_worker import canonical_digest, run_md_summary_job
+from genoligand_workers.worker_io import candidate_selection_digest
 
 
 class AlignmentRecordIdentityTests(unittest.TestCase):
@@ -1171,7 +1172,7 @@ class AlignmentRecordIdentityTests(unittest.TestCase):
                 f"{candidate_id}\t{input_id}\trecord-current\n",
                 encoding="utf-8",
             )
-            candidate_digest = canonical_digest(
+            candidate_digest = candidate_selection_digest(
                 {
                     "candidate_id": candidate_id,
                     "input_id": input_id,

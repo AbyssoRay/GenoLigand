@@ -126,6 +126,24 @@ class MdArtifactProvenanceTests(unittest.TestCase):
     def tearDown(self) -> None:
         self.temp_dir.cleanup()
 
+    def test_candidate_digest_matches_rust_selection_contract(self) -> None:
+        expected = canonical_digest(
+            {
+                "schema_version": "genoligand_candidate_selection_digest_v1",
+                "candidate_id": self.candidate_id,
+                "identity_namespace": "",
+                "input_id": self.input_id,
+                "record_id": "record-current",
+                "target_id": "T1",
+                "pdb_id": "1ABC",
+                "selection_rank": "",
+                "receptor_artifact": "",
+                "coordinate_sha256": "",
+            }
+        )
+
+        self.assertEqual(worker.selected_md_candidate(self.run_dir)[1], expected)
+
     def md_relative(self, name: str) -> str:
         return (self.md_outputs / name).relative_to(self.run_dir).as_posix()
 

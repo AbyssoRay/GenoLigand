@@ -1,14 +1,44 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
+from collections.abc import Mapping
 from pathlib import Path
 from typing import Any
 
 
 PIPELINE_MODE = "genoligand_scientific_pipeline"
 SCHEMA_VERSION = "genoligand_worker_current_v2"
+CANDIDATE_SELECTION_DIGEST_FIELDS = (
+    "candidate_id",
+    "identity_namespace",
+    "input_id",
+    "record_id",
+    "target_id",
+    "pdb_id",
+    "selection_rank",
+    "receptor_artifact",
+    "coordinate_sha256",
+)
+
+
+def candidate_selection_digest(selection: Mapping[str, Any]) -> str:
+    payload = {
+        "schema_version": "genoligand_candidate_selection_digest_v1",
+        **{
+            field: str(selection.get(field, "") or "").strip()
+            for field in CANDIDATE_SELECTION_DIGEST_FIELDS
+        },
+    }
+    encoded = json.dumps(
+        payload,
+        ensure_ascii=True,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
 
 
 def runtime_artifact_path(value: str | Path) -> Path:

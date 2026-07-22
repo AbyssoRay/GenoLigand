@@ -2946,6 +2946,9 @@ fn read_status_reason(path: &Path, fallback: &str) -> String {
 }
 
 fn user_artifact_reason(reason: &str) -> String {
+    if let Some(details) = reason.strip_prefix("all_selected_md_candidates_failed:") {
+        return format!("全部选中的 MD 候选均未产生有效结果：{details}");
+    }
     let lower = reason.to_ascii_lowercase();
     if lower.contains("no small_molecule input available for md summary") {
         return "当前 MD worker 需要可参数化的 SMILES/SDF 小分子配体或复合物坐标；序列类输入（包括短肽）已用于候选和序列匹配，尚未转换为 MD 配体/复合物输入。".to_string();
@@ -5392,6 +5395,13 @@ fn friendly_failure_summary(raw: Option<&str>) -> String {
     let Some(raw) = raw.map(str::trim).filter(|value| !value.is_empty()) else {
         return String::new();
     };
+    if let Some(reason) = raw
+        .lines()
+        .find_map(|line| line.trim().strip_prefix("reason="))
+        .filter(|value| !value.trim().is_empty())
+    {
+        return user_artifact_reason(reason);
+    }
     raw.split([',', '\n'])
         .filter_map(|item| {
             let value = item.trim();

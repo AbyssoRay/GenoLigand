@@ -4,9 +4,11 @@ import math
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 import numpy as np
 from openmm import Vec3, app, unit
+from pdbfixer import PDBFixer
 from rdkit import Chem
 
 from genoligand_workers import md_summary_worker as worker
@@ -154,6 +156,23 @@ class MdScientificContractTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "ambiguous_receptor_chain_contacts:A,B"):
                 worker.select_receptor_chain_from_pose(ambiguous, self.ligand_at(4.0), unit)
 
+            multi_contact = self.write_receptor(root, [("A", 0.0), ("B", 6.0)])
+            nearest = worker.select_receptor_chain_from_pose(multi_contact, self.ligand_at(2.0), unit)
+            self.assertEqual(nearest["selected_chain_id"], "A")
+            self.assertEqual(nearest["selected_chain_ordinal"], 0)
+
+    def test_md_defaults_preserve_duration_with_stable_one_femtosecond_steps(self) -> None:
+        self.assertEqual(worker.DEFAULT_TIMESTEP_PS, 0.001)
+        self.assertEqual(worker.DEFAULT_EQUILIBRATION_STEPS * worker.DEFAULT_TIMESTEP_PS, 20.0)
+        self.assertEqual(
+            worker.DEFAULT_PRODUCTION_SEGMENTS
+            * worker.DEFAULT_PRODUCTION_STEPS_PER_SEGMENT
+            * worker.DEFAULT_TIMESTEP_PS,
+            100.0,
+        )
+        self.assertEqual(worker.DEFAULT_MINIMIZATION_ITERATIONS, 2000)
+        self.assertEqual(worker.DEFAULT_SOLVENT_BOX_SHAPE, "dodecahedron")
+
     def test_receptor_metals_are_structured_before_pdbfixer_can_remove_them(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
             path = self.write_receptor(Path(temp), [("A", 0.0)], zinc=True)
@@ -172,6 +191,26 @@ class MdScientificContractTests(unittest.TestCase):
                     }
                 ],
             )
+
+            observed_missing_residues = []
+            original_find_missing_atoms = PDBFixer.findMissingAtoms
+
+            def inject_missing_residue(fixer: PDBFixer) -> None:
+                fixer.missingResidues = {(0, 0): ["GLY"]}
+
+            def capture_missing_residues(fixer: PDBFixer) -> None:
+                observed_missing_residues.append(dict(fixer.missingResidues))
+                fixer.missingResidues = {}
+                original_find_missing_atoms(fixer)
+
+            with (
+                mock.patch.object(PDBFixer, "findMissingResidues", inject_missing_residue),
+                mock.patch.object(PDBFixer, "findMissingAtoms", capture_missing_residues),
+            ):
+                receptor = worker.load_receptor_with_pdbfixer(path, unit, selected_chain_ordinal=0)
+
+            self.assertEqual(observed_missing_residues, [{}])
+            self.assertEqual(receptor.preparation, "pdbfixer_observed_residues_prepared_receptor")
 
     def test_openmm_finite_gate_reports_the_exact_stage(self) -> None:
         class Quantity:

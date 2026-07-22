@@ -13887,6 +13887,29 @@ fn screen_dynamics(options: &ScienceOptions) -> Result<String, String> {
     ))
 }
 
+fn ensure_selected_md_results(
+    options: &ScienceOptions,
+    selected_count: usize,
+) -> Result<(), String> {
+    if selected_count == 0 {
+        return Ok(());
+    }
+    let row = read_simple_tsv_rows(&options.run_dir.join("md_summary_status.tsv"))?
+        .into_iter()
+        .next()
+        .ok_or_else(|| "md_summary_status_missing".to_string())?;
+    if row.get("status").map(String::as_str) == Some("ready") {
+        return Ok(());
+    }
+    let reason = row
+        .get("reason")
+        .filter(|value| !value.trim().is_empty())
+        .cloned()
+        .unwrap_or_else(|| "selected_md_candidates_produced_no_valid_result".to_string());
+    write_md_summary_status(options, "fail", &reason)?;
+    Err(format!("all_selected_md_candidates_failed:{reason}"))
+}
+
 fn execute_dynamics_screen(options: &ScienceOptions) -> Result<String, String> {
     let (runnable, not_applicable) = selected_dynamics_candidate_rows(options)?;
     clear_worker_task_outputs(options, &DOCKING_WORKER_TASK)?;
@@ -13900,6 +13923,7 @@ fn execute_dynamics_screen(options: &ScienceOptions) -> Result<String, String> {
     run_scientific_workers(options)?;
     validate_dynamics_not_applicable_outcomes(options)?;
     let result = screen_dynamics(options)?;
+    ensure_selected_md_results(options, runnable.len())?;
     let status = if runnable.is_empty() && !not_applicable.is_empty() {
         "not_applicable"
     } else if !runnable.is_empty() {

@@ -13,6 +13,7 @@ from typing import Any
 
 from genoligand_workers.common import WorkerExecution, WorkerOutcome
 from genoligand_workers.worker_io import (
+    candidate_selection_digest,
     parse_worker_args,
     read_job,
     runtime_artifact_path,
@@ -24,11 +25,12 @@ MAX_PEPTIDE_RESIDUES = 80
 PEPTIDE_CONFORMER_COUNT = 12
 SIMULATION_SEED = 20260629
 STANDARD_AMINO_ACIDS = set("ACDEFGHIKLMNPQRSTVWY")
-DEFAULT_EQUILIBRATION_STEPS = 10000
+DEFAULT_EQUILIBRATION_STEPS = 20000
 DEFAULT_PRODUCTION_SEGMENTS = 50
-DEFAULT_PRODUCTION_STEPS_PER_SEGMENT = 1000
-DEFAULT_MINIMIZATION_ITERATIONS = 200
-DEFAULT_TIMESTEP_PS = 0.002
+DEFAULT_PRODUCTION_STEPS_PER_SEGMENT = 2000
+DEFAULT_MINIMIZATION_ITERATIONS = 2000
+DEFAULT_TIMESTEP_PS = 0.001
+DEFAULT_SOLVENT_BOX_SHAPE = "dodecahedron"
 DEFAULT_GPU_TELEMETRY_POLL_SECONDS = 1.0
 GAS_CONSTANT_KJ_PER_MOL_K = 0.00831446261815324
 MINIMUM_MD_PRODUCTION_SAMPLES = 10
@@ -42,7 +44,7 @@ COMPLEX_MD_METRIC_UNITS = {
 RMSD_SCORE_SCALE_ANGSTROM = 4.0
 LIGAND_DRIFT_SCORE_SCALE_ANGSTROM = 3.0
 CONTACT_CUTOFF_ANGSTROM = 4.5
-RECEPTOR_CHAIN_SELECTION_VERSION = "pose_heavy_atom_contact_v1"
+RECEPTOR_CHAIN_SELECTION_VERSION = "pose_heavy_atom_contact_v2"
 RECEPTOR_CHAIN_CONTACT_CUTOFF_ANGSTROM = 4.5
 RECEPTOR_SELECTION_FIELDS = (
     "receptor_chain_selection_algorithm",
@@ -918,7 +920,7 @@ def selected_md_candidate(
         or not row.get("record_id")
     ):
         raise MdProvenanceError("selected_md_candidate_binding_incomplete")
-    return row, canonical_digest(row)
+    return row, candidate_selection_digest(row)
 
 
 def selected_md_input(
@@ -2207,8 +2209,19 @@ def select_receptor_chain_from_pose(path: Path, mol: Any, unit: Any) -> dict[str
     eligible = [row for row in protein_chains if row[2] <= RECEPTOR_CHAIN_CONTACT_CUTOFF_ANGSTROM]
     if not eligible:
         raise ValueError("no_receptor_chain_within_pose_contact_cutoff")
-    if len(eligible) != 1:
-        identities = ",".join(str(row[1].id) for row in sorted(eligible, key=lambda row: row[0]))
+    eligible.sort(key=lambda row: (row[2], row[0]))
+    if len(eligible) > 1 and math.isclose(
+        eligible[0][2],
+        eligible[1][2],
+        rel_tol=0.0,
+        abs_tol=1e-6,
+    ):
+        nearest_distance = eligible[0][2]
+        identities = ",".join(
+            str(row[1].id)
+            for row in eligible
+            if math.isclose(row[2], nearest_distance, rel_tol=0.0, abs_tol=1e-6)
+        )
         raise ValueError(f"ambiguous_receptor_chain_contacts:{identities}")
     selected_ordinal, selected_chain, minimum = eligible[0]
     coordinate_rows = []
@@ -2270,6 +2283,7 @@ def load_receptor_with_pdbfixer(
             raise ValueError("selected_receptor_chain_ordinal_invalid")
         fixer.removeChains([index for index in range(chain_count) if index != selected_chain_ordinal])
     fixer.findMissingResidues()
+    fixer.missingResidues = {}
     fixer.findNonstandardResidues()
     fixer.replaceNonstandardResidues()
     fixer.removeHeterogens(keepWater=False)
@@ -2283,7 +2297,7 @@ def load_receptor_with_pdbfixer(
         atoms=atoms,
         positions=fixer.positions,
         positions_angstrom=np.asarray(positions, dtype=float),
-        preparation="pdbfixer_prepared_receptor",
+        preparation="pdbfixer_observed_residues_prepared_receptor",
         risk_flags=[],
     )
 
@@ -2536,6 +2550,7 @@ def build_complex_system(
             forcefield,
             model="tip3p",
             padding=padding_nm * unit.nanometer,
+            boxShape=DEFAULT_SOLVENT_BOX_SHAPE,
             ionicStrength=ionic_strength * unit.molar,
         )
         nonbonded_method = app.PME
@@ -2553,6 +2568,7 @@ def build_complex_system(
         "water_forcefield": water_forcefield,
         "small_molecule_forcefield": forcefield_name,
         "solvent_mode": solvent_mode,
+        "solvent_box_shape": DEFAULT_SOLVENT_BOX_SHAPE if solvent_mode == "explicit" else "",
         "solvent_atom_count": solvent_atom_count,
         "total_atom_count": system.getNumParticles(),
         "nonbonded_method": "PME" if nonbonded_method == app.PME else "NoCutoff",

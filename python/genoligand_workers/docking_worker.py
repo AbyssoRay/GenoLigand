@@ -12,6 +12,7 @@ from pathlib import Path
 from typing import Any
 
 from genoligand_workers.worker_io import (
+    candidate_selection_digest,
     parse_worker_args,
     read_job,
     runtime_artifact_path,
@@ -702,7 +703,7 @@ def resolve_docking_binding(
         source_content_sha256=source_digest,
         receptor_coordinate=receptor_coordinate,
         selection=selection,
-        candidate_digest=canonical_digest(selection),
+        candidate_digest=candidate_selection_digest(selection),
         input_digest=input_digest,
         receptor_digest=receptor_digest,
     )

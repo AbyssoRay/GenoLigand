@@ -69,6 +69,26 @@ class DockingBindingContractTests(unittest.TestCase):
             self.assertEqual(binding.ligand_smiles, "C[C@@H](O)N")
             self.assertEqual(binding.source_content_sha256, "b" * 64)
             self.assertEqual(binding.receptor_coordinate, run_dir / "structure_viewer.pdb")
+            expected_candidate_digest = hashlib.sha256(
+                json.dumps(
+                    {
+                        "schema_version": "genoligand_candidate_selection_digest_v1",
+                        "candidate_id": "candidate_2",
+                        "identity_namespace": "",
+                        "input_id": "input_2",
+                        "record_id": "record_2",
+                        "target_id": "TARGET_2",
+                        "pdb_id": "2XYZ",
+                        "selection_rank": "",
+                        "receptor_artifact": "structure_viewer.pdb",
+                        "coordinate_sha256": receptor_digest,
+                    },
+                    ensure_ascii=True,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                ).encode("utf-8")
+            ).hexdigest()
+            self.assertEqual(binding.candidate_digest, expected_candidate_digest)
 
     def test_explicit_candidate_job_selects_one_row_from_top_n_without_cross_binding(self) -> None:
         with tempfile.TemporaryDirectory(prefix="genoligand_docking_topn_") as tmp:

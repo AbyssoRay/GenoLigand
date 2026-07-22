@@ -1758,6 +1758,13 @@ fn failure_summary_hides_internal_resource_names() {
     assert!(!summary.contains("manifest"));
     assert!(!summary.contains("tool_versions"));
     assert!(!summary.contains("science_store"));
+
+    let md_summary = friendly_failure_summary(Some(
+        "schema_version=genoligand_pipeline_failure_v1\nstate=failed\nreason=all_selected_md_candidates_failed:candidate_A:openmm_platform_unavailable;candidate_B:no_receptor_chain_within_pose_contact_cutoff\n",
+    ));
+    assert!(md_summary.starts_with("全部选中的 MD 候选均未产生有效结果："));
+    assert!(md_summary.contains("candidate_A:openmm_platform_unavailable"));
+    assert!(md_summary.contains("candidate_B:no_receptor_chain_within_pose_contact_cutoff"));
 }
 
 #[test]
