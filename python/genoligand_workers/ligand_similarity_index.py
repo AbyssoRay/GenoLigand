@@ -44,7 +44,11 @@ EVIDENCE_BATCH_SIZE = 100_000
 BUILD_CACHE_KIB = 512 * 1024
 PROGRESS_INTERVAL_SECONDS = 30.0
 STRUCTURAL_CANDIDATE_BATCH_SIZE = 200
+STRUCTURE_SCORING_METHOD = "rdkit_usr_usrcat_v1"
 RUNTIME_PUBLICATION_CACHE_SIZE = 8
+CHEMBL_ACTIVITY_PATTERN = re.compile(
+    r"^(?:Ki|Kd|IC50|EC50)=([+]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d+)?) nM$"
+)
 KNOWN_DATABASE_HEADER = (
     "input_id\tsource\ttarget_id\ttarget_name\torganism\ttarget_class\tmatch_score\t"
     "matched_features\tevidence\tsource_row_provenance\tactivity_value\tligand_identity\t"
@@ -250,7 +254,11 @@ def query_targets(
                 candidate = candidate_by_id[int(row[0])]
                 similarity = float(candidate["similarity"])
                 structural_compatibility = float(candidate["structural_compatibility"])
-                activity_score = float(row[8])
+                activity_score = _validated_activity_score(
+                    str(row[1]), str(row[9]), row[8]
+                )
+                if activity_score is None:
+                    continue
                 result = {
                     "source": str(row[1]),
                     "target_id": str(row[2]),
@@ -260,6 +268,9 @@ def query_targets(
                     "canonical_smiles": candidate["canonical_smiles"],
                     "similarity": similarity,
                     "structural_compatibility": structural_compatibility,
+                    "structural_compatibility_method": str(
+                        candidate.get("structural_compatibility_method", "fingerprint_only")
+                    ),
                     "activity_score": activity_score,
                     "match_score": (
                         0.85 * similarity + 0.15 * structural_compatibility
@@ -748,6 +759,11 @@ def _populate_evidence(connection: sqlite3.Connection) -> None:
         JOIN molecule AS m ON m.canonical_smiles = sm.canonical_smiles
         JOIN target AS t ON t.source = 'ChEMBL' AND t.target_id = a.target_id
         WHERE a.rowid > ? AND a.rowid <= ?
+          AND TRIM(COALESCE(a.standard_relation, '')) = '='
+          AND LOWER(TRIM(COALESCE(a.standard_units, ''))) = 'nm'
+          AND TYPEOF(a.standard_value) IN ('integer', 'real')
+          AND CAST(a.standard_value AS REAL) > 0.0
+          AND CAST(a.standard_value AS REAL) < 1.0e308
         """ + upsert_tail
     bindingdb_sql = """
         INSERT INTO evidence(
@@ -1238,15 +1254,51 @@ def _candidate_activity_upper_bounds(
 ) -> dict[int, float]:
     result: dict[int, float] = {}
     with _read_connection(database) as connection:
+        connection.create_function(
+            "validated_activity_score", 3, _validated_activity_score, deterministic=True
+        )
         for batch in _batches(molecule_ids, MAX_SQL_PARAMETERS):
             placeholders = ",".join("?" for _ in batch)
             for molecule_id, score in connection.execute(
-                f"SELECT molecule_id, MAX(activity_score) FROM evidence "
-                f"WHERE molecule_id IN ({placeholders}) GROUP BY molecule_id",
+                f"SELECT e.molecule_id, MAX(validated_activity_score("
+                f"t.source, e.activity, e.activity_score)) "
+                f"FROM evidence AS e JOIN target AS t ON t.id=e.target_fk "
+                f"WHERE e.molecule_id IN ({placeholders}) GROUP BY e.molecule_id",
                 batch,
             ):
-                result[int(molecule_id)] = float(score)
+                if score is not None:
+                    result[int(molecule_id)] = float(score)
     return result
+
+
+def _validated_activity_score(
+    source: str, activity: str, stored_score: object
+) -> float | None:
+    try:
+        score = float(stored_score)
+    except (TypeError, ValueError):
+        return None
+    if not math.isfinite(score) or not 0.0 <= score <= 1.0:
+        return None
+    if source != "ChEMBL":
+        return score
+    matched = CHEMBL_ACTIVITY_PATTERN.fullmatch(activity.strip())
+    if matched is None:
+        return None
+    value = float(matched.group(1))
+    if not math.isfinite(value) or value <= 0.0:
+        return None
+    if value <= 10.0:
+        return 1.0
+    if value <= 100.0:
+        return 0.95
+    if value <= 1_000.0:
+        return 0.85
+    if value <= 10_000.0:
+        return 0.70
+    if value <= 100_000.0:
+        return 0.55
+    return 0.40
 
 
 def _rank_structural_candidates(
@@ -1290,11 +1342,20 @@ def _structural_top_k_is_complete(
 def _apply_structure_compatibility(
     candidates: list[dict[str, Any]], query_features: dict[str, Any]
 ) -> None:
+    _shape_descriptors(query_features, required=True)
     for candidate in candidates:
-        summary = _lightweight_structure_summary(candidate["canonical_smiles"])
+        summary = _three_dimensional_structure_summary(candidate["canonical_smiles"])
+        if summary is None:
+            summary = _lightweight_structure_summary(candidate["canonical_smiles"])
+            candidate["structural_compatibility"] = _two_dimensional_compatibility(
+                query_features, summary, float(candidate["similarity"])
+            )
+            candidate["structural_compatibility_method"] = "2d_candidate_3d_unavailable"
+            continue
         candidate["structural_compatibility"] = _structure_compatibility(
             query_features, summary, float(candidate["similarity"])
         )
+        candidate["structural_compatibility_method"] = STRUCTURE_SCORING_METHOD
 
 
 @lru_cache(maxsize=4096)
@@ -1329,6 +1390,62 @@ def _lightweight_structure_summary(smiles: str) -> dict[str, Any]:
     }
 
 
+@lru_cache(maxsize=4096)
+def _three_dimensional_structure_summary(smiles: str) -> dict[str, Any] | None:
+    Chem, _DataStructs, _rdBase, _generator = _rdkit()
+    molecule = _standardized_smiles_molecule(smiles, Chem, _standardization_tools())
+    if molecule is None:
+        return None
+    from rdkit.Chem import AllChem, rdMolDescriptors
+
+    embedded = Chem.AddHs(Chem.Mol(molecule))
+    parameters = AllChem.ETKDGv3()
+    parameters.randomSeed = _three_dimensional_seed(smiles)
+    parameters.numThreads = 1
+    if AllChem.EmbedMolecule(embedded, parameters) != 0:
+        return None
+    if AllChem.MMFFHasAllMoleculeParams(embedded):
+        status = AllChem.MMFFOptimizeMolecule(
+            embedded,
+            confId=0,
+            maxIters=300,
+            mmffVariant="MMFF94s",
+        )
+    elif AllChem.UFFHasAllMoleculeParams(embedded):
+        status = AllChem.UFFOptimizeMolecule(embedded, confId=0, maxIters=300)
+    else:
+        return None
+    if int(status) != 0:
+        return None
+    try:
+        usr = [float(value) for value in rdMolDescriptors.GetUSR(embedded, confId=0)]
+        usrcat = [
+            float(value)
+            for value in rdMolDescriptors.GetUSRCAT(embedded, confId=0)
+        ]
+    except (RuntimeError, ValueError):
+        return None
+    if (
+        len(usr) != 12
+        or len(usrcat) != 60
+        or not all(math.isfinite(value) for value in (*usr, *usrcat))
+    ):
+        return None
+    return {
+        **_lightweight_structure_summary(smiles),
+        "shape": {
+            "method": STRUCTURE_SCORING_METHOD,
+            "usr": usr,
+            "usrcat": usrcat,
+        },
+    }
+
+
+def _three_dimensional_seed(smiles: str) -> int:
+    value = int(hashlib.sha256(smiles.encode("utf-8")).hexdigest()[:8], 16) & 0x7FFFFFFF
+    return value or 1
+
+
 @lru_cache(maxsize=1)
 def _chemical_feature_factory() -> Any:
     from rdkit import RDConfig
@@ -1340,6 +1457,58 @@ def _chemical_feature_factory() -> Any:
 
 
 def _structure_compatibility(
+    query: dict[str, Any], candidate: dict[str, Any], fallback: float
+) -> float:
+    from rdkit.Chem import rdMolDescriptors
+
+    query_usr, query_usrcat = _shape_descriptors(query, required=True)
+    candidate_usr, candidate_usrcat = _shape_descriptors(candidate, required=False)
+    if candidate_usr is None or candidate_usrcat is None:
+        return _two_dimensional_compatibility(query, candidate, fallback)
+    shape_score = float(rdMolDescriptors.GetUSRScore(query_usr, candidate_usr))
+    pharmacophore_score = float(
+        rdMolDescriptors.GetUSRScore(
+            query_usrcat,
+            candidate_usrcat,
+            [0.0, 1.0, 1.0, 1.0, 1.0],
+        )
+    )
+    if not math.isfinite(shape_score) or not math.isfinite(pharmacophore_score):
+        raise LigandSimilarityIndexError("candidate_structure_score_invalid")
+    two_dimensional = _two_dimensional_compatibility(query, candidate, fallback)
+    compatibility = (
+        0.45 * shape_score + 0.35 * pharmacophore_score + 0.20 * two_dimensional
+    )
+    return min(1.0, max(0.0, compatibility))
+
+
+def _shape_descriptors(
+    summary: dict[str, Any], *, required: bool
+) -> tuple[list[float] | None, list[float] | None]:
+    shape = summary.get("shape")
+    if not isinstance(shape, dict) or shape.get("method") != STRUCTURE_SCORING_METHOD:
+        if required:
+            raise LigandSimilarityIndexError("query_structure_3d_descriptor_missing")
+        return None, None
+    try:
+        usr = [float(value) for value in shape["usr"]]
+        usrcat = [float(value) for value in shape["usrcat"]]
+    except (KeyError, TypeError, ValueError) as exc:
+        if required:
+            raise LigandSimilarityIndexError("query_structure_3d_descriptor_invalid") from exc
+        return None, None
+    if (
+        len(usr) != 12
+        or len(usrcat) != 60
+        or not all(math.isfinite(value) for value in (*usr, *usrcat))
+    ):
+        if required:
+            raise LigandSimilarityIndexError("query_structure_3d_descriptor_invalid")
+        return None, None
+    return usr, usrcat
+
+
+def _two_dimensional_compatibility(
     query: dict[str, Any], candidate: dict[str, Any], fallback: float
 ) -> float:
     query_physical = query.get("physicochemical")
@@ -1428,6 +1597,7 @@ def _target_evidence(result: dict[str, Any]) -> str:
         "ligand_similarity_index;"
         f"activity_score={float(result['activity_score']):.4f};"
         f"structural_compatibility={float(result['structural_compatibility']):.6f};"
+        f"structural_compatibility_method={result.get('structural_compatibility_method', '')};"
         f"tanimoto={float(result['similarity']):.6f};"
         f"ligand_code={result.get('ligand_code', '')};"
         f"pdb_ids={result.get('pdb_ids', '')};"
@@ -1503,6 +1673,7 @@ def _write_known_database_rows(
                         f"canonical_smiles={result['canonical_smiles']};"
                         f"tanimoto={result['similarity']:.6f};"
                         f"structural_compatibility={result['structural_compatibility']:.6f};"
+                        f"structural_compatibility_method={result.get('structural_compatibility_method', '')};"
                         f"activity_score={result['activity_score']:.4f};"
                         f"ligand_code={result.get('ligand_code', '')};"
                         f"pdb_ids={result.get('pdb_ids', '')};"
@@ -1554,9 +1725,7 @@ def _write_known_database_rows(
 
 
 def _read_query_manifest(path: Path) -> list[dict[str, Any]]:
-    records: list[dict[str, Any]] = []
-    seen_identities: set[tuple[str, str]] = set()
-    seen_features: set[Path] = set()
+    conversion_digest, expected_inputs, current_invocation = _current_query_inputs(path.parent)
     with path.open("r", encoding="utf-8-sig", newline="") as handle:
         reader = csv.DictReader(handle, delimiter="\t")
         required = {
@@ -1571,104 +1740,169 @@ def _read_query_manifest(path: Path) -> list[dict[str, Any]]:
         }
         if reader.fieldnames is None or not required.issubset(reader.fieldnames):
             raise LigandSimilarityIndexError("query_structure_manifest_schema_invalid")
-        for row in reader:
-            if str(row.get("status", "")).strip() != "ready":
-                continue
-            if str(row.get("input_kind", "")).strip() != "small_molecule":
-                continue
-            if str(row.get("method", "")).strip() != QUERY_METHOD_VERSION:
-                raise LigandSimilarityIndexError("query_structure_manifest_method_invalid")
-            feature_path = Path(str(row.get("features_json", "")).strip())
-            if not feature_path.is_absolute():
-                feature_path = path.parent / feature_path
-            feature_path = feature_path.resolve(strict=True)
-            try:
-                feature_path.relative_to(path.parent.resolve())
-            except ValueError as exc:
-                raise LigandSimilarityIndexError(
-                    "query_structure_features_path_outside_run_dir"
-                ) from exc
-            feature = _read_json(feature_path)
-            input_id = str(row.get("input_id", "")).strip()
-            record_id = str(row.get("record_id", "")).strip()
-            identity = (input_id, record_id)
-            if identity in seen_identities or feature_path in seen_features:
-                raise LigandSimilarityIndexError("query_structure_feature_identity_duplicate")
-            seen_identities.add(identity)
-            seen_features.add(feature_path)
-            feature_digest = str(row.get("feature_digest", "")).strip()
-            if not _is_sha256(feature_digest) or _sha256_file(feature_path) != feature_digest:
-                raise LigandSimilarityIndexError("query_structure_feature_digest_mismatch")
-            expected = {
-                "schema_version": QUERY_FEATURE_SCHEMA_VERSION,
-                "status": "ready",
+        rows = list(reader)
+
+    query_rows: dict[tuple[str, str], dict[str, str]] = {}
+    for row in rows:
+        if str(row.get("input_kind", "")).strip() != "small_molecule":
+            continue
+        identity = (
+            str(row.get("input_id", "")).strip(),
+            str(row.get("record_id", "")).strip(),
+        )
+        if identity in query_rows:
+            raise LigandSimilarityIndexError("query_structure_feature_identity_duplicate")
+        query_rows[identity] = row
+    if set(query_rows) != set(expected_inputs):
+        raise LigandSimilarityIndexError("query_structure_expected_identity_mismatch")
+
+    records: list[dict[str, Any]] = []
+    seen_features: set[Path] = set()
+    for identity in sorted(expected_inputs):
+        row = query_rows[identity]
+        status = str(row.get("status", "")).strip()
+        if status != "ready":
+            raise LigandSimilarityIndexError(
+                f"query_structure_expected_record_not_ready:{identity[0]}:{identity[1]}:{status or 'missing'}"
+            )
+        if str(row.get("method", "")).strip() != QUERY_METHOD_VERSION:
+            raise LigandSimilarityIndexError("query_structure_manifest_method_invalid")
+        feature_path = Path(str(row.get("features_json", "")).strip())
+        if not feature_path.is_absolute():
+            feature_path = path.parent / feature_path
+        feature_path = feature_path.resolve(strict=True)
+        try:
+            feature_path.relative_to(path.parent.resolve())
+        except ValueError as exc:
+            raise LigandSimilarityIndexError(
+                "query_structure_features_path_outside_run_dir"
+            ) from exc
+        if feature_path in seen_features:
+            raise LigandSimilarityIndexError("query_structure_feature_identity_duplicate")
+        seen_features.add(feature_path)
+        feature = _read_json(feature_path)
+        input_id, record_id = identity
+        feature_digest = str(row.get("feature_digest", "")).strip()
+        if not _is_sha256(feature_digest) or _sha256_file(feature_path) != feature_digest:
+            raise LigandSimilarityIndexError("query_structure_feature_digest_mismatch")
+        source_digest = expected_inputs[identity]
+        expected = {
+            "schema_version": QUERY_FEATURE_SCHEMA_VERSION,
+            "status": "ready",
+            "input_id": input_id,
+            "record_id": record_id,
+            "input_kind": "small_molecule",
+            "input_digest": str(row.get("input_digest", "")).strip(),
+            "source_content_sha256": source_digest,
+            "conversion_manifest_sha256": conversion_digest,
+            "invocation_id": current_invocation,
+            "method_version": QUERY_METHOD_VERSION,
+        }
+        if any(feature.get(key) != value for key, value in expected.items()):
+            raise LigandSimilarityIndexError("query_structure_feature_identity_mismatch")
+        _shape_descriptors(feature, required=True)
+        artifact_path = (feature_path.parent / "manifest.json").resolve(strict=True)
+        try:
+            artifact_path.relative_to(path.parent.resolve())
+        except ValueError as exc:
+            raise LigandSimilarityIndexError(
+                "query_structure_artifact_path_outside_run_dir"
+            ) from exc
+        artifact = _read_json(artifact_path)
+        artifact_expected = {
+            **expected,
+            "schema_version": QUERY_ARTIFACT_SCHEMA_VERSION,
+            "feature_digest": feature_digest,
+            "run_id": feature.get("run_id"),
+            "job_id": feature.get("job_id"),
+        }
+        if any(artifact.get(key) != value for key, value in artifact_expected.items()):
+            raise LigandSimilarityIndexError("query_structure_artifact_identity_mismatch")
+        artifact_feature = Path(str(artifact.get("features_json", "")))
+        if not artifact_feature.is_absolute():
+            artifact_feature = path.parent / artifact_feature
+        if artifact_feature.resolve(strict=True) != feature_path:
+            raise LigandSimilarityIndexError("query_structure_artifact_feature_path_mismatch")
+        if not all(
+            _is_sha256(value)
+            for value in (
+                expected["input_digest"],
+                source_digest,
+                conversion_digest,
+                feature_digest,
+            )
+        ):
+            raise LigandSimilarityIndexError("query_structure_feature_identity_digest_invalid")
+        if not all(
+            isinstance(feature.get(key), str) and str(feature.get(key)).strip()
+            for key in ("run_id", "job_id", "invocation_id")
+        ):
+            raise LigandSimilarityIndexError("query_structure_feature_run_binding_invalid")
+        canonical = str(feature.get("isomeric_smiles") or feature.get("canonical_smiles") or "")
+        if not canonical:
+            raise LigandSimilarityIndexError("query_structure_canonical_smiles_missing")
+        fingerprint = _validate_query_fingerprint(feature.get("fingerprint"))
+        query_fp, standardized = _fingerprint_from_smiles(canonical)
+        _Chem, DataStructs, _rdBase, _generator = _rdkit()
+        recomputed = bytes(DataStructs.BitVectToBinaryText(query_fp))
+        if (
+            hashlib.sha256(recomputed).hexdigest() != fingerprint["packed_sha256"]
+            or standardized != canonical
+        ):
+            raise LigandSimilarityIndexError("query_structure_fingerprint_smiles_mismatch")
+        records.append(
+            {
                 "input_id": input_id,
                 "record_id": record_id,
-                "input_kind": str(row.get("input_kind", "")).strip(),
-                "input_digest": str(row.get("input_digest", "")).strip(),
-                "method_version": QUERY_METHOD_VERSION,
-            }
-            if any(feature.get(key) != value for key, value in expected.items()):
-                raise LigandSimilarityIndexError("query_structure_feature_identity_mismatch")
-            artifact_path = (feature_path.parent / "manifest.json").resolve(strict=True)
-            try:
-                artifact_path.relative_to(path.parent.resolve())
-            except ValueError as exc:
-                raise LigandSimilarityIndexError(
-                    "query_structure_artifact_path_outside_run_dir"
-                ) from exc
-            artifact = _read_json(artifact_path)
-            artifact_expected = {
-                **expected,
-                "schema_version": QUERY_ARTIFACT_SCHEMA_VERSION,
+                "canonical_smiles": canonical,
                 "feature_digest": feature_digest,
-                "source_content_sha256": feature.get("source_content_sha256"),
-                "run_id": feature.get("run_id"),
-                "invocation_id": feature.get("invocation_id"),
+                "query_structure": feature,
             }
-            if any(artifact.get(key) != value for key, value in artifact_expected.items()):
-                raise LigandSimilarityIndexError("query_structure_artifact_identity_mismatch")
-            artifact_feature = Path(str(artifact.get("features_json", "")))
-            if not artifact_feature.is_absolute():
-                artifact_feature = path.parent / artifact_feature
-            if artifact_feature.resolve(strict=True) != feature_path:
-                raise LigandSimilarityIndexError("query_structure_artifact_feature_path_mismatch")
-            if not all(
-                _is_sha256(value)
-                for value in (
-                    expected["input_digest"],
-                    feature.get("source_content_sha256"),
-                    feature_digest,
-                )
-            ):
-                raise LigandSimilarityIndexError("query_structure_feature_identity_digest_invalid")
-            if not all(
-                isinstance(feature.get(key), str) and str(feature.get(key)).strip()
-                for key in ("run_id", "job_id", "invocation_id")
-            ):
-                raise LigandSimilarityIndexError("query_structure_feature_run_binding_invalid")
-            canonical = str(feature.get("isomeric_smiles") or feature.get("canonical_smiles") or "")
-            if not canonical:
-                raise LigandSimilarityIndexError("query_structure_canonical_smiles_missing")
-            fingerprint = _validate_query_fingerprint(feature.get("fingerprint"))
-            query_fp, standardized = _fingerprint_from_smiles(canonical)
-            _Chem, DataStructs, _rdBase, _generator = _rdkit()
-            recomputed = bytes(DataStructs.BitVectToBinaryText(query_fp))
-            if (
-                hashlib.sha256(recomputed).hexdigest() != fingerprint["packed_sha256"]
-                or standardized != canonical
-            ):
-                raise LigandSimilarityIndexError("query_structure_fingerprint_smiles_mismatch")
-            records.append(
-                {
-                    "input_id": input_id,
-                    "record_id": record_id,
-                    "canonical_smiles": canonical,
-                    "feature_digest": feature_digest,
-                    "query_structure": feature,
-                }
-            )
+        )
     return records
+
+
+def _current_query_inputs(
+    run_dir: Path,
+) -> tuple[str, dict[tuple[str, str], str], str]:
+    conversion = run_dir / "input_conversion_manifest.tsv"
+    if not conversion.is_file():
+        raise LigandSimilarityIndexError("query_structure_conversion_manifest_missing")
+    with conversion.open("r", encoding="utf-8-sig", newline="") as handle:
+        reader = csv.DictReader(handle, delimiter="\t")
+        required = {
+            "input_id",
+            "record_id",
+            "canonical_kind",
+            "conversion_status",
+            "content_sha256",
+        }
+        if reader.fieldnames is None or not required.issubset(reader.fieldnames):
+            raise LigandSimilarityIndexError("query_structure_conversion_manifest_schema_invalid")
+        expected: dict[tuple[str, str], str] = {}
+        for row in reader:
+            if (
+                str(row.get("conversion_status", "")).strip() != "converted"
+                or str(row.get("canonical_kind", "")).strip() != "small_molecule"
+            ):
+                continue
+            identity = (
+                str(row.get("input_id", "")).strip(),
+                str(row.get("record_id", "")).strip(),
+            )
+            source_digest = str(row.get("content_sha256", "")).strip().lower()
+            if not all(identity) or not _is_sha256(source_digest):
+                raise LigandSimilarityIndexError("query_structure_conversion_identity_invalid")
+            if identity in expected:
+                raise LigandSimilarityIndexError("query_structure_conversion_identity_duplicate")
+            expected[identity] = source_digest
+    invocation_path = run_dir / "worker_invocation_id.txt"
+    if not invocation_path.is_file():
+        raise LigandSimilarityIndexError("query_structure_worker_invocation_missing")
+    current_invocation = invocation_path.read_text(encoding="utf-8").strip()
+    if not current_invocation:
+        raise LigandSimilarityIndexError("query_structure_worker_invocation_missing")
+    return _sha256_file(conversion), expected, current_invocation
 
 
 def _validate_query_fingerprint(value: Any) -> dict[str, Any]:

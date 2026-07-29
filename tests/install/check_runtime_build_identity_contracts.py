@@ -70,6 +70,20 @@ class RuntimeBuildIdentityContracts(unittest.TestCase):
         self.assertEqual(observed, binary)
         return binary
 
+    def test_repository_version_surfaces_match_workspace_release(self) -> None:
+        version = self.installer.workspace_release_version(ROOT)
+        self.assertEqual(version, "0.9.76")
+        self.assertIn(f"Product Version: {version}", (ROOT / "EULA.txt").read_text(encoding="utf-8"))
+        for relative in (
+            "README.md",
+            "docs/local_webui_user_guide.md",
+            "docs/windows_wsl2_installation_guide.md",
+            "docs/linux_server_installation_guide.md",
+        ):
+            text = (ROOT / relative).read_text(encoding="utf-8")
+            self.assertIn(version, text, relative)
+            self.assertIn(f"v{version}", text, relative)
+
     def test_modified_staged_and_untracked_sources_block_build_and_publish(self) -> None:
         installer = self.installer
         for state in ("modified", "staged", "untracked"):
@@ -119,6 +133,7 @@ class RuntimeBuildIdentityContracts(unittest.TestCase):
                 "status": "ready",
                 "version": "1.2.3",
                 "commit": commit,
+                "build_id": f"1.2.3+{commit}",
                 "notes": "fixture identity",
             }
             with mock.patch.object(installer, "runtime_binary_smoke", return_value=smoke) as identity:
@@ -130,6 +145,8 @@ class RuntimeBuildIdentityContracts(unittest.TestCase):
             self.assertTrue(status["published"])
             self.assertEqual(status["commit"], commit)
             self.assertEqual(status["expected_commit"], commit)
+            self.assertEqual(status["build_id"], f"1.2.3+{commit}")
+            self.assertEqual(status["expected_build_id"], f"1.2.3+{commit}")
             self.assertEqual(Path(command[0]).read_bytes(), source.read_bytes())
             self.assertEqual(identity.call_count, 2)
 
@@ -149,6 +166,7 @@ class RuntimeBuildIdentityContracts(unittest.TestCase):
                 "status": "failed",
                 "version": "1.2.3",
                 "commit": old_commit,
+                "build_id": f"1.2.3+{old_commit}",
                 "notes": "old fixture identity",
             }
             runtime = root / "work/runtime"
@@ -160,6 +178,82 @@ class RuntimeBuildIdentityContracts(unittest.TestCase):
 
             self.assertEqual(identity.call_args.args[2], new_commit)
             self.assertFalse((runtime / "bin" / installer.runtime_executable_name("gls-cli")).exists())
+
+    def test_archive_prebuilt_replaces_stale_runtime_without_git_metadata(self) -> None:
+        installer = self.installer
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "release"
+            runtime = Path(tmp) / "runtime"
+            packaged = root / "bin" / installer.runtime_executable_name("gls-cli")
+            target = runtime / "bin" / installer.runtime_executable_name("gls-cli")
+            packaged.parent.mkdir(parents=True)
+            target.parent.mkdir(parents=True)
+            (root / "Cargo.toml").write_text(
+                '[workspace]\nmembers = []\n\n[workspace.package]\nversion = "1.2.3"\n',
+                encoding="utf-8",
+            )
+            packaged.write_bytes(b"new release binary")
+            target.write_bytes(b"stale installed binary")
+            commit = "a" * 40
+            smoke = {
+                "status": "ready",
+                "version": "1.2.3",
+                "commit": commit,
+                "build_id": f"1.2.3+{commit}",
+                "notes": "packaged release identity",
+            }
+
+            with mock.patch.object(installer, "runtime_binary_smoke", return_value=smoke):
+                command = installer.resolve_binary_command(
+                    None, "GENOLIGAND_TEST_GLS_CLI", "gls-cli", "gls-cli", root
+                )
+                published, status = installer.publish_runtime_binary(
+                    command, runtime, "gls-cli", root
+                )
+
+            self.assertEqual(command, [str(packaged)])
+            self.assertEqual(published, [str(target)])
+            self.assertEqual(target.read_bytes(), b"new release binary")
+            self.assertEqual(status["commit"], commit)
+            self.assertEqual(status["expected_commit"], commit)
+            self.assertEqual(status["build_id"], f"1.2.3+{commit}")
+
+    def test_runtime_manifest_v2_publishes_one_canonical_identity(self) -> None:
+        installer = self.installer
+        with tempfile.TemporaryDirectory() as tmp:
+            runtime = Path(tmp)
+            commit = "b" * 40
+            build_id = f"1.2.3+{commit}"
+            rows = []
+            for binary in ("gls-cli", "gls-server"):
+                path = runtime / installer.runtime_executable_name(binary)
+                path.write_bytes(binary.encode("ascii"))
+                rows.append(
+                    {
+                        "binary": binary,
+                        "status": "ready",
+                        "path": str(path),
+                        "sha256": installer.sha256_file(path),
+                        "version": "1.2.3",
+                        "expected_version": "1.2.3",
+                        "commit": commit,
+                        "expected_commit": commit,
+                        "build_id": build_id,
+                        "expected_build_id": build_id,
+                        "build_profile": "release",
+                        "smoke": "ready",
+                    }
+                )
+            wrapper = runtime / "python-worker"
+            wrapper.write_text("worker", encoding="utf-8")
+
+            manifest = installer.write_runtime_binary_manifest(runtime, rows, wrapper)
+
+            self.assertEqual(manifest["schema_version"], "genoligand_runtime_binary_manifest_v2")
+            self.assertEqual(manifest["status"], "ready")
+            self.assertEqual(manifest["version"], "1.2.3")
+            self.assertEqual(manifest["commit"], commit)
+            self.assertEqual(manifest["build_id"], build_id)
 
 
 if __name__ == "__main__":

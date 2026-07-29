@@ -25,5 +25,7 @@ fn main() {
         .map(|value| value.trim().to_ascii_lowercase())
         .filter(|value| value.len() == 40 && value.chars().all(|ch| ch.is_ascii_hexdigit()))
         .unwrap_or_else(|| "unknown".to_string());
+    let build_id = format!("{}+{commit}", env!("CARGO_PKG_VERSION"));
     println!("cargo:rustc-env=GENOLIGAND_BUILD_COMMIT={commit}");
+    println!("cargo:rustc-env=GENOLIGAND_BUILD_ID={build_id}");
 }

@@ -17,6 +17,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 pub const PRODUCT_NAME: &str = "GenoLigand Local WebUI";
 pub const PRODUCT_VERSION: &str = env!("CARGO_PKG_VERSION");
 pub const PRODUCT_COMMIT: &str = env!("GENOLIGAND_BUILD_COMMIT");
+pub const PRODUCT_BUILD_ID: &str = env!("GENOLIGAND_BUILD_ID");
 const RESULT_PAGE_SIZE: usize = 500;
 const RUN_LOG_MAX_BYTES: usize = 1024 * 1024;
 const RUN_LOG_READ_BYTES: usize = 128 * 1024;
@@ -169,7 +170,14 @@ fn route(
         ("GET", "/api/health") => user_health_json(options),
         ("GET", "/api/user/health") => user_health_json(options),
         ("GET", "/api/version") => {
-            json!({"name":PRODUCT_NAME,"version":PRODUCT_VERSION,"science_flow":"scientific_pipeline"})
+            json!({
+                "name":PRODUCT_NAME,
+                "version":PRODUCT_VERSION,
+                "commit":PRODUCT_COMMIT,
+                "build_id":PRODUCT_BUILD_ID,
+                "runtime":runtime_binary_identity(),
+                "science_flow":"scientific_pipeline"
+            })
         }
         ("GET", "/api/user/projects") => user_projects_json(options),
         ("GET", "/api/user/workspace-summary") => user_workspace_summary_json(options),
@@ -432,7 +440,7 @@ fn route_run(
         ("GET", "structure") => structure_endpoint_json_with_query(options, &run_id, &result_query),
         ("GET", "md-summary") => md_endpoint_json_with_query(options, &run_id, &result_query),
         ("POST", "cancel") => cancel_run(options, &run_id),
-        ("POST", "resume") => update_run_state(options, &run_id, "resumable"),
+        ("POST", "resume") => resume_run(options, &run_id),
         _ => {
             if method == "GET"
                 && let Some(file) = suffix.strip_prefix("download/")
@@ -1585,7 +1593,12 @@ fn finish_run_process(run_dir: &Path, log_lock: &Mutex<()>, result: Result<ExitS
         ),
         Err(err) => ("failed", err),
     };
-    if !compare_and_set_run_state(run_dir, &["running"], state) {
+    let state_before_finalize = run_state(run_dir);
+    if state_before_finalize == "running" {
+        if !compare_and_set_run_state(run_dir, &["running"], state) {
+            return;
+        }
+    } else if state_before_finalize != state {
         return;
     }
     let _ = write_text(
@@ -3537,13 +3550,19 @@ fn databases_json(options: &ServerOptions) -> Value {
 }
 
 fn user_health_json(options: &ServerOptions) -> Value {
+    let runtime = runtime_binary_identity();
+    let status = if runtime.get("status").and_then(Value::as_str) == Some("mismatch") {
+        "needs_repair"
+    } else {
+        "ready"
+    };
     json!({
-        "status":"ready",
+        "status":status,
         "application":PRODUCT_NAME,
         "version":PRODUCT_VERSION,
         "commit":PRODUCT_COMMIT,
-        "build_id":PRODUCT_COMMIT,
-        "runtime":runtime_binary_identity(),
+        "build_id":PRODUCT_BUILD_ID,
+        "runtime":runtime,
         "science_store_readiness":science_store_readiness_json(options)
     })
 }
@@ -3647,24 +3666,24 @@ fn runtime_binary_manifest_path() -> Option<PathBuf> {
             return Some(path);
         }
     }
-    std::env::var_os("LOCALAPPDATA")
-        .map(PathBuf::from)
-        .map(|path| {
-            path.join("GenoLigand")
-                .join("runtime")
-                .join("runtime_binary_manifest.json")
-        })
-        .filter(|path| path.is_file())
+    None
 }
 
 fn runtime_binary_identity() -> Value {
     let Some(manifest_path) = runtime_binary_manifest_path() else {
         return json!({
             "status":"unpublished",
+            "version":PRODUCT_VERSION,
             "commit":PRODUCT_COMMIT,
+            "build_id":PRODUCT_BUILD_ID,
+            "instance":{"status":"untracked"},
             "manifest_digest":""
         });
     };
+    let instance = manifest_path
+        .parent()
+        .map(reconcile_runtime_instance_record)
+        .unwrap_or_else(|| json!({"status":"untracked"}));
     let manifest = read_json_or(&manifest_path, json!({}));
     let manifest_digest = manifest
         .get("manifest_digest")
@@ -3685,8 +3704,11 @@ fn runtime_binary_identity() -> Value {
                 .find(|row| row.get("binary").and_then(Value::as_str) == Some("gls-server"))
         });
     let verified = manifest.get("schema_version").and_then(Value::as_str)
-        == Some("genoligand_runtime_binary_manifest_v1")
+        == Some("genoligand_runtime_binary_manifest_v2")
         && manifest.get("status").and_then(Value::as_str) == Some("ready")
+        && manifest.get("version").and_then(Value::as_str) == Some(PRODUCT_VERSION)
+        && manifest.get("commit").and_then(Value::as_str) == Some(PRODUCT_COMMIT)
+        && manifest.get("build_id").and_then(Value::as_str) == Some(PRODUCT_BUILD_ID)
         && manifest_digest.len() == 64
         && tsv_path
             .as_ref()
@@ -3703,6 +3725,7 @@ fn runtime_binary_identity() -> Value {
                 && record.get("smoke").and_then(Value::as_str) == Some("ready")
                 && record.get("version").and_then(Value::as_str) == Some(PRODUCT_VERSION)
                 && record.get("commit").and_then(Value::as_str) == Some(PRODUCT_COMMIT)
+                && record.get("build_id").and_then(Value::as_str) == Some(PRODUCT_BUILD_ID)
                 && recorded_path == current_executable
                 && current_executable
                     .as_ref()
@@ -3712,9 +3735,43 @@ fn runtime_binary_identity() -> Value {
         });
     json!({
         "status":if verified {"verified"} else {"mismatch"},
+        "version":PRODUCT_VERSION,
         "commit":PRODUCT_COMMIT,
+        "build_id":PRODUCT_BUILD_ID,
+        "instance":instance,
         "manifest_digest":manifest_digest,
         "manifest":manifest_path.display().to_string()
+    })
+}
+
+fn reconcile_runtime_instance_record(runtime_dir: &Path) -> Value {
+    let path = runtime_dir.join("gls-server.instance.json");
+    if !path.is_file() {
+        return json!({"status":"missing","pid":0});
+    }
+    let record = read_json_or(&path, json!({}));
+    let pid = record
+        .get("pid")
+        .and_then(Value::as_u64)
+        .and_then(|value| u32::try_from(value).ok())
+        .unwrap_or(0);
+    let valid = record
+        .get("instance_id")
+        .and_then(Value::as_str)
+        .is_some_and(|value| !value.is_empty())
+        && record.get("binary").and_then(Value::as_str) == Some("gls-server")
+        && pid > 0;
+    if valid && process_is_alive(pid) {
+        return json!({
+            "status":if pid == std::process::id() {"running"} else {"other_live"},
+            "pid":pid,
+            "instance_id":record.get("instance_id").cloned().unwrap_or(Value::Null)
+        });
+    }
+    let removed = fs::remove_file(&path).is_ok() || !path.exists();
+    json!({
+        "status":if removed {"stale_removed"} else {"stale_remove_failed"},
+        "pid":pid
     })
 }
 
@@ -4343,13 +4400,37 @@ fn friendly_resource_status(status: &str) -> &'static str {
     }
 }
 
-fn update_run_state(options: &ServerOptions, run_id: &str, state: &str) -> Value {
-    if let Some(run_dir) = find_run_dir(options, run_id) {
-        let _ = write_text(&run_dir.join("run_state.txt"), &(state.to_string() + "\n"));
-        json!({"status":state,"run_id":run_id})
-    } else {
-        json!({"status":"not_found","run_id":run_id})
+fn resume_run(options: &ServerOptions, run_id: &str) -> Value {
+    let Some(run_dir) = find_run_dir(options, run_id) else {
+        return json!({"status":"not_found","run_id":run_id});
+    };
+    let Some(project) = run_dir.parent().and_then(Path::parent) else {
+        return json!({"status":"failed","run_id":run_id,"error":"run_project_missing"});
+    };
+    let Some(project_id) = project
+        .file_name()
+        .and_then(|value| value.to_str())
+        .map(str::to_string)
+    else {
+        return json!({"status":"failed","run_id":run_id,"error":"run_project_id_invalid"});
+    };
+    let project_lock = project_operation_lock(project);
+    let project_guard = lock_unpoisoned(&project_lock);
+    let state = run_state(&run_dir);
+    if !matches!(state.as_str(), "failed" | "resumable") {
+        return json!({
+            "status":"conflict",
+            "run_id":run_id,
+            "state":state,
+            "error":"run_not_resumable"
+        });
     }
+    drop(project_guard);
+    let mut response = start_run(options, &project_id);
+    if let Some(object) = response.as_object_mut() {
+        object.insert("resumed_from_run_id".to_string(), json!(run_id));
+    }
+    response
 }
 
 fn cancel_run(options: &ServerOptions, run_id: &str) -> Value {
@@ -4364,11 +4445,35 @@ fn cancel_run(options: &ServerOptions, run_id: &str) -> Value {
     let process = registered_run_process(&run_dir);
     let state_before = run_state(&run_dir);
     if state_before == "running" && process.is_none() {
+        let process_id = read_trimmed(&run_dir.join("process_id.txt"))
+            .and_then(|value| value.parse::<u32>().ok());
+        if let Some(process_id) = process_id.filter(|process_id| process_is_alive(*process_id)) {
+            terminate_process_tree(process_id);
+            let cancelled = compare_and_set_run_state(&run_dir, &["running"], "cancelled");
+            if cancelled {
+                let _ = append_bounded_log(
+                    &run_dir.join("run.log"),
+                    b"state\tcancelled\n",
+                    RUN_LOG_MAX_BYTES,
+                );
+            }
+            let status = if cancelled {
+                "cancelled".to_string()
+            } else {
+                run_state(&run_dir)
+            };
+            return json!({
+                "status":status,
+                "run_id":run_id,
+                "process_stopped":true
+            });
+        }
+        let _ = disk_run_is_active(&run_dir);
         return json!({
-            "status":"failed",
+            "status":run_state(&run_dir),
             "run_id":run_id,
-            "error":"active_run_handle_missing",
-            "process_stopped":false
+            "error":"stale_run_recovered",
+            "process_stopped":true
         });
     }
     let cancelled = compare_and_set_run_state(&run_dir, &["running"], "cancelled");
@@ -5136,19 +5241,79 @@ fn active_project_run_id(project: &Path) -> Option<String> {
     {
         return Some(run_id);
     }
-    if let Some(run_id) = read_trimmed(&project.join("latest_run_id.txt"))
-        && run_state(&project.join("runs").join(&run_id)) == "running"
-    {
-        return Some(run_id);
+    if let Some(run_id) = read_trimmed(&project.join("latest_run_id.txt")) {
+        let run_dir = project.join("runs").join(&run_id);
+        if disk_run_is_active(&run_dir) {
+            return Some(run_id);
+        }
     }
-    fs::read_dir(project.join("runs"))
-        .ok()?
-        .flatten()
-        .find_map(|entry| {
-            let path = entry.path();
-            (path.is_dir() && run_state(&path) == "running")
-                .then(|| entry.file_name().to_string_lossy().to_string())
-        })
+    for entry in fs::read_dir(project.join("runs")).ok()?.flatten() {
+        let path = entry.path();
+        if path.is_dir() && disk_run_is_active(&path) {
+            return Some(entry.file_name().to_string_lossy().to_string());
+        }
+    }
+    None
+}
+
+fn disk_run_is_active(run_dir: &Path) -> bool {
+    if run_state(run_dir) != "running" {
+        return false;
+    }
+    if registered_run_process(run_dir).is_some() {
+        return true;
+    }
+    let process_id =
+        read_trimmed(&run_dir.join("process_id.txt")).and_then(|value| value.parse::<u32>().ok());
+    if process_id.is_some_and(process_is_alive) {
+        return true;
+    }
+    if compare_and_set_run_state(run_dir, &["running"], "failed") {
+        let reason = "pipeline_process_missing_after_server_restart";
+        let _ = write_text(
+            &run_dir.join("failure_reason.txt"),
+            &(reason.to_string() + "\n"),
+        );
+        let _ = append_bounded_log(
+            &run_dir.join("run.log"),
+            format!("state\tfailed\nerror\t{reason}\n").as_bytes(),
+            RUN_LOG_MAX_BYTES,
+        );
+    }
+    false
+}
+
+#[cfg(windows)]
+fn process_is_alive(process_id: u32) -> bool {
+    if process_id == 0 {
+        return false;
+    }
+    let Ok(output) = Command::new("tasklist")
+        .args(["/FI", &format!("PID eq {process_id}"), "/FO", "CSV", "/NH"])
+        .output()
+    else {
+        return false;
+    };
+    if !output.status.success() {
+        return false;
+    }
+    String::from_utf8_lossy(&output.stdout).lines().any(|line| {
+        line.split(',')
+            .nth(1)
+            .map(|value| value.trim().trim_matches('"') == process_id.to_string())
+            .unwrap_or(false)
+    })
+}
+
+#[cfg(unix)]
+fn process_is_alive(process_id: u32) -> bool {
+    process_id != 0
+        && Command::new("kill")
+            .args(["-0", &process_id.to_string()])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .is_ok_and(|status| status.success())
 }
 
 fn find_run_dir(options: &ServerOptions, run_id: &str) -> Option<PathBuf> {
@@ -5828,6 +5993,11 @@ mod tests {
         fs::write(project.join("input_manifest.json"), original).expect("original manifest");
         fs::write(project.join("latest_run_id.txt"), "run-active\n").expect("latest run");
         fs::write(run_dir.join("run_state.txt"), "running\n").expect("run state");
+        fs::write(
+            run_dir.join("process_id.txt"),
+            format!("{}\n", std::process::id()),
+        )
+        .expect("process id");
 
         let response = write_input_manifest(
             &options,
@@ -5928,7 +6098,7 @@ mod tests {
     }
 
     #[test]
-    fn cancel_without_registered_child_fails_closed() {
+    fn cancel_without_registered_child_recovers_stale_run() {
         let root =
             std::env::temp_dir().join(format!("genoligand-cancel-missing-handle-{}", now_millis()));
         let options = server_options(root.clone());
@@ -5941,9 +6111,74 @@ mod tests {
         let response = cancel_run(&options, "run-missing-handle");
 
         assert_eq!(response["status"], "failed");
-        assert_eq!(response["error"], "active_run_handle_missing");
-        assert_eq!(response["process_stopped"], false);
-        assert_eq!(run_state(&run_dir), "running");
+        assert_eq!(response["error"], "stale_run_recovered");
+        assert_eq!(response["process_stopped"], true);
+        assert_eq!(run_state(&run_dir), "failed");
+        assert_eq!(
+            read_trimmed(&run_dir.join("failure_reason.txt")).as_deref(),
+            Some("pipeline_process_missing_after_server_restart")
+        );
+
+        fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn dead_process_id_is_recovered_before_project_locking() {
+        let root = std::env::temp_dir().join(format!("genoligand-dead-run-{}", now_millis()));
+        let options = server_options(root.clone());
+        let project = project_dir(&options, "project-dead-run");
+        let run_dir = project.join("runs").join("run-dead");
+        fs::create_dir_all(&run_dir).expect("run dir");
+        fs::write(project.join("latest_run_id.txt"), "run-dead\n").expect("latest run");
+        fs::write(run_dir.join("run_state.txt"), "running\n").expect("run state");
+        fs::write(run_dir.join("process_id.txt"), format!("{}\n", u32::MAX)).expect("process id");
+
+        assert_eq!(active_project_run_id(&project), None);
+        assert_eq!(run_state(&run_dir), "failed");
+        assert_eq!(
+            read_trimmed(&run_dir.join("failure_reason.txt")).as_deref(),
+            Some("pipeline_process_missing_after_server_restart")
+        );
+
+        fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn resume_rejects_active_and_completed_runs_and_allocates_a_new_run_from_failed() {
+        let root = std::env::temp_dir().join(format!("genoligand-resume-state-{}", now_millis()));
+        let options = server_options(root.clone());
+        for (project_id, run_id, state) in [
+            ("project-completed", "run-completed", "completed"),
+            ("project-running", "run-running", "running"),
+        ] {
+            let run_dir = project_dir(&options, project_id).join("runs").join(run_id);
+            fs::create_dir_all(&run_dir).expect("run dir");
+            fs::write(run_dir.join("run_state.txt"), format!("{state}\n")).expect("run state");
+
+            let response = resume_run(&options, run_id);
+
+            assert_eq!(response["status"], "conflict");
+            assert_eq!(response["state"], state);
+            assert_eq!(response["error"], "run_not_resumable");
+            assert_eq!(run_state(&run_dir), state);
+        }
+
+        let failed_project = project_dir(&options, "project-failed");
+        let failed_run = failed_project.join("runs").join("run-failed");
+        fs::create_dir_all(&failed_run).expect("failed run dir");
+        fs::write(failed_run.join("run_state.txt"), "failed\n").expect("failed state");
+
+        let response = resume_run(&options, "run-failed");
+        let new_run_id = response["run"]["run_id"].as_str().expect("new run id");
+
+        assert_eq!(response["resumed_from_run_id"], "run-failed");
+        assert_ne!(new_run_id, "run-failed");
+        assert_eq!(run_state(&failed_run), "failed");
+        assert_eq!(
+            read_trimmed(&failed_project.join("latest_run_id.txt")).as_deref(),
+            Some(new_run_id)
+        );
+        assert!(failed_project.join("runs").join(new_run_id).is_dir());
 
         fs::remove_dir_all(&root).ok();
     }

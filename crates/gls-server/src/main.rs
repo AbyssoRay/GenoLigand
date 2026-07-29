@@ -16,9 +16,10 @@ fn run() -> Result<(), String> {
     }
     if args.len() == 1 && matches!(args[0].as_str(), "--version" | "-V") {
         println!(
-            "gls-server {} commit {}",
+            "gls-server {} commit {} build_id {}",
             env!("CARGO_PKG_VERSION"),
-            env!("GENOLIGAND_BUILD_COMMIT")
+            env!("GENOLIGAND_BUILD_COMMIT"),
+            env!("GENOLIGAND_BUILD_ID")
         );
         return Ok(());
     }

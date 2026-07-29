@@ -172,6 +172,15 @@ class MdArtifactProvenanceTests(unittest.TestCase):
             "pose_sdf": "tool_outputs/docking_pose.sdf",
             "log": "tool_outputs/docking_vina.log",
             "seed_provenance": {"input_digest": self.input_digest},
+            "retained_receptor_components": [],
+            "receptor_contact_chains": [
+                {
+                    "chain_id": "A",
+                    "chain_ordinal": 0,
+                    "chain_signature_sha256": "c" * 64,
+                    "minimum_distance_angstrom": 2.5,
+                }
+            ],
         }
         manifest.update(updates)
         artifact_fields = {
@@ -335,10 +344,18 @@ class MdArtifactProvenanceTests(unittest.TestCase):
         self.assertEqual(binding.input_id, self.input_id)
         self.assertEqual(binding.input_digest, self.input_digest)
         self.assertEqual(binding.source_digest, self.source_digest)
-        self.assertEqual(binding.receptor_coordinate, self.receptor.resolve())
+        self.assertEqual(
+            binding.receptor_coordinate,
+            (self.tool_outputs / "docking_receptor.pdb").resolve(),
+        )
         self.assertEqual(
             binding.docking_pose_sdf,
             (self.tool_outputs / "docking_pose.sdf").resolve(),
+        )
+        self.assertEqual(binding.docking_receptor_components, ())
+        self.assertEqual(
+            binding.docking_receptor_contact_chains[0]["chain_signature_sha256"],
+            "c" * 64,
         )
 
     def test_same_input_id_records_bind_their_own_canonical_source(self) -> None:
@@ -469,7 +486,10 @@ class MdArtifactProvenanceTests(unittest.TestCase):
 
         binding = worker.resolve_md_invocation(self.job)
 
-        self.assertEqual(binding.receptor_coordinate, receptor.resolve())
+        self.assertEqual(
+            binding.receptor_coordinate,
+            (self.tool_outputs / "docking_receptor.pdb").resolve(),
+        )
         self.assertEqual(
             binding.docking_ligand_sdf,
             (self.tool_outputs / "docking_ligand.sdf").resolve(),
@@ -522,6 +542,14 @@ class MdArtifactProvenanceTests(unittest.TestCase):
             (
                 {"seed_provenance": {"input_digest": "e" * 64}},
                 "docking_input_digest_mismatch",
+            ),
+            (
+                {"retained_receptor_components": None},
+                "docking_receptor_components_invalid",
+            ),
+            (
+                {"receptor_contact_chains": []},
+                "docking_receptor_contact_chains_invalid",
             ),
         ]
         for updates, reason in cases:

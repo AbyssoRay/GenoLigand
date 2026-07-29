@@ -7,10 +7,10 @@ use std::ffi::OsString;
 use std::fs::{self, OpenOptions};
 use std::io::{BufRead, BufReader, BufWriter, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
-use std::process::{Command, Output};
+use std::process::{Command, Output, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, OnceLock};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use zip::ZipArchive;
 
 mod input_conversion;
@@ -31,7 +31,7 @@ const LARGE_METAGENOME_FASTA_TSV_MAX_BYTES: u64 = 1_000_000_000;
 const ALIGNMENT_DATABASE_MANIFEST_SCHEMA_VERSION: &str =
     "genoligand_alignment_database_manifest_v2";
 const SOURCE_ROW_BATCH_SIZE: usize = 512;
-const RANKING_POLICY_VERSION: &str = "genoligand_target_ranking_v3";
+const RANKING_POLICY_VERSION: &str = "genoligand_target_ranking_v4";
 const SCIENCE_READINESS_SCHEMA_VERSION: &str = "genoligand_science_store_readiness_v1";
 const CHEMBL_QUERY_MANIFEST_SCHEMA_VERSION: &str = "genoligand_chembl_query_database_v1";
 const CHEMBL_QUERY_MANIFEST_REL_PATH: &str = "downloads/chembl/chembl_query.manifest.json";
@@ -93,6 +93,10 @@ const LIGAND_SIMILARITY_PUBLICATION_HASH_CACHE_LIMIT: usize = 8;
 static CHEMBL_QUERY_TEST_HASH_COUNTS: OnceLock<Mutex<BTreeMap<String, u64>>> = OnceLock::new();
 const WORKER_INVOCATION_FILE: &str = "worker_invocation_id.txt";
 const PIPELINE_INVOCATION_FILE: &str = "pipeline_invocation_id.txt";
+const WORKER_TIMEOUT_ENV: &str = "GENOLIGAND_WORKER_TIMEOUT_SECONDS";
+const DEFAULT_WORKER_TIMEOUT_SECONDS: u64 = 21_600;
+const WORKER_PROCESS_POLL_INTERVAL: Duration = Duration::from_millis(25);
+const WORKER_PROCESS_TERMINATION_GRACE: Duration = Duration::from_millis(250);
 
 #[derive(Clone, Debug)]
 pub struct ScienceOptions {
@@ -401,15 +405,41 @@ fn foldseek_refresh_advisory(science_store: &Path) -> Option<ScienceStoreReadine
                 && row.get("scope_mode").map(String::as_str) == Some("on_demand")
                 && row.get("status").map(String::as_str) == Some("ready")
         })?;
-    let indexed_ids = read_simple_tsv_rows(&science_store.join(RCSB_INDEXED_PDB_IDS_REL_PATH))
-        .ok()?
-        .into_iter()
-        .filter_map(|row| {
-            row.get("pdb_id")
-                .map(|value| value.trim().to_ascii_uppercase())
-        })
-        .filter(|pdb_id| is_pdb_id(pdb_id))
-        .collect::<BTreeSet<_>>();
+    let indexed_rows =
+        match read_simple_tsv_rows(&science_store.join(RCSB_INDEXED_PDB_IDS_REL_PATH)) {
+            Ok(rows) if !rows.is_empty() => rows,
+            _ => {
+                return Some(ScienceStoreReadinessAdvisory {
+                    code: "rcsb_foldseek_refresh_needed".to_string(),
+                    component: "rcsb".to_string(),
+                    evidence: "indexed_identity_manifest_missing_or_invalid".to_string(),
+                    action: "migrate_or_rebuild_alignment_database".to_string(),
+                });
+            }
+        };
+    let mut indexed_ids = BTreeSet::new();
+    for indexed in indexed_rows {
+        let Some(pdb_id) = indexed
+            .get("pdb_id")
+            .map(|value| value.trim().to_ascii_uppercase())
+            .filter(|pdb_id| is_pdb_id(pdb_id))
+        else {
+            return Some(ScienceStoreReadinessAdvisory {
+                code: "rcsb_foldseek_refresh_needed".to_string(),
+                component: "rcsb".to_string(),
+                evidence: "indexed_identity_manifest_missing_or_invalid".to_string(),
+                action: "migrate_or_rebuild_alignment_database".to_string(),
+            });
+        };
+        if !indexed_ids.insert(pdb_id) {
+            return Some(ScienceStoreReadinessAdvisory {
+                code: "rcsb_foldseek_refresh_needed".to_string(),
+                component: "rcsb".to_string(),
+                evidence: "indexed_identity_manifest_missing_or_invalid".to_string(),
+                action: "migrate_or_rebuild_alignment_database".to_string(),
+            });
+        }
+    }
     let cached_ids = current_valid_rcsb_cache_ids(science_store)?;
     let unindexed_ids = cached_ids
         .difference(&indexed_ids)
@@ -695,7 +725,7 @@ const QUERY_STRUCTURE_FEATURE_SCHEMA_VERSION: &str = "genoligand_query_structure
 const MAX_QUERY_STRUCTURE_FEATURE_BYTES: u64 = 256 * 1024;
 const MAX_QUERY_STRUCTURE_MANIFEST_BYTES: u64 = 64 * 1024;
 const MAX_QUERY_STRUCTURE_FEATURE_ROWS: usize = 96;
-const TARGET_CANDIDATE_RANKING_HEADER: &str = "rank\tcandidate_id\ttarget_id\ttarget_name\tcandidate_scope\torganism\tfinal_score\tknown_database_score\tmetagenome_score\tstructure_score\tdocking_score\tmd_score\tevidence_summary\tstatus\tinput_id\trecord_id\tidentity_namespace\tinput_kind\tranking_policy\tknown_database_weight\tmetagenome_weight\tstructure_weight\tdocking_weight\tmd_weight";
+const TARGET_CANDIDATE_RANKING_HEADER: &str = "rank\tcandidate_id\ttarget_id\ttarget_name\tcandidate_scope\torganism\tfinal_score\tknown_database_score\tmetagenome_score\tstructure_score\tdocking_score\tmd_score\tevidence_summary\tstatus\tinput_id\trecord_id\tidentity_namespace\tinput_kind\tranking_policy\tknown_database_weight\tmetagenome_weight\tstructure_weight\tdocking_weight\tmd_weight\tdocking_evaluation_status\tmd_evaluation_status";
 const INPUT_SEQUENCE_SPOOL_FILE: &str = "input_sequence_spool.bin";
 const INPUT_SEQUENCE_SPOOL_PENDING_FILE: &str = "input_sequence_spool.bin.pending";
 
@@ -736,7 +766,7 @@ const DOCKING_WORKER_TASK: WorkerTask<'static> = WorkerTask {
 };
 
 const REPORT_CANDIDATE_LIMIT: usize = 50;
-const COMPLEX_CANDIDATE_TOP_N: usize = 3;
+const ADAPTIVE_SHORTLIST_SCORE_EPSILON: f64 = 0.0001;
 const STRUCTURE_MATCH_TOP_K_PER_INPUT_RECORD: usize = 256;
 const MIN_STRUCTURE_MATCH_TOKEN_CHARS: usize = 3;
 const RCSB_ON_DEMAND_POLICY_SCHEMA_VERSION: &str = "genoligand_rcsb_on_demand_policy_v1";
@@ -837,6 +867,8 @@ struct Candidate {
     structure_score: f64,
     docking_score: f64,
     dynamics_score: f64,
+    docking_evaluation_status: String,
+    md_evaluation_status: String,
     final_score: f64,
     evidence: String,
 }
@@ -995,6 +1027,8 @@ struct CandidateWorkerOutcome {
     reason: String,
     manifest: String,
 }
+
+type DynamicsCandidateSelection = (Vec<BTreeMap<String, String>>, Vec<CandidateWorkerOutcome>);
 
 #[derive(Clone, Copy, Debug)]
 struct RequiredTool {
@@ -2419,6 +2453,8 @@ fn remove_controlled_store_artifact(science_store: &Path, path: &Path) -> Result
         #[cfg(windows)]
         if metadata.permissions().readonly() {
             let mut permissions = metadata.permissions();
+            // Windows has no Unix-style owner-write bit; clearing readonly is required here.
+            #[allow(clippy::permissions_set_readonly_false)]
             permissions.set_readonly(false);
             fs::set_permissions(&resolved, permissions).map_err(|err| {
                 format!(
@@ -7929,7 +7965,7 @@ fn query_token_component(value: &str) -> Option<String> {
 }
 
 fn decode_lower_hex(value: &str) -> Option<Vec<u8>> {
-    if value.len() % 2 != 0
+    if !value.len().is_multiple_of(2)
         || value
             .bytes()
             .any(|byte| !byte.is_ascii_hexdigit() || byte.is_ascii_uppercase())
@@ -10200,6 +10236,19 @@ fn evaluate_structure(options: &ScienceOptions) -> Result<String, String> {
         write_structure_summary_from_matches(&structure, &structure_matches)?;
         !structure_matches.is_empty()
     };
+    let has_structure_query =
+        read_simple_tsv_rows(&options.run_dir.join("query_structure_manifest.tsv"))?
+            .iter()
+            .any(|row| {
+                row.get("status").map(String::as_str) == Some("ready")
+                    && row
+                        .get("coordinate_artifact")
+                        .is_some_and(|value| !value.trim().is_empty())
+            });
+    if has_structure_query {
+        write_candidate_shortlist(options)?;
+        write_coordinate_backed_candidate_selection(options, &structure_matches)?;
+    }
     run_single_worker_task(options, &STRUCTURE_ALIGNMENT_WORKER_TASK)?;
     if append_tool_match_rows_to_file(
         options,
@@ -11157,27 +11206,101 @@ fn selected_candidate_rows(
             .then_with(|| candidate_selection_rank(left).cmp(&candidate_selection_rank(right)))
             .then_with(|| left.get("candidate_id").cmp(&right.get("candidate_id")))
     });
-    let mut counts = BTreeMap::<(String, String), usize>::new();
-    Ok(rows
-        .into_iter()
-        .filter(|row| {
-            let key = (
+    let adaptive_ids = adaptive_shortlist_candidate_ids(&rows)?;
+    rows.retain(|row| {
+        row.get("candidate_id")
+            .is_some_and(|candidate_id| adaptive_ids.contains(candidate_id))
+    });
+    Ok(rows)
+}
+
+fn adaptive_shortlist_candidate_ids(
+    rows: &[BTreeMap<String, String>],
+) -> Result<BTreeSet<String>, String> {
+    let mut groups = BTreeMap::<(String, String), Vec<&BTreeMap<String, String>>>::new();
+    for row in rows {
+        if row
+            .get("candidate_id")
+            .is_none_or(|value| value.trim().is_empty())
+        {
+            return Err("candidate_shortlist_identity_missing".to_string());
+        }
+        groups
+            .entry((
                 row.get("input_id").cloned().unwrap_or_default(),
                 row.get("record_id").cloned().unwrap_or_default(),
+            ))
+            .or_default()
+            .push(row);
+    }
+
+    let mut selected = BTreeSet::new();
+    for ((input_id, record_id), group) in groups {
+        let Some(input_kind) = group
+            .first()
+            .and_then(|row| row.get("input_kind"))
+            .filter(|value| !value.trim().is_empty())
+        else {
+            selected.extend(
+                group
+                    .iter()
+                    .filter_map(|row| row.get("candidate_id").cloned()),
             );
-            let count = counts.entry(key).or_default();
-            if *count == COMPLEX_CANDIDATE_TOP_N {
-                return false;
+            continue;
+        };
+        if group
+            .iter()
+            .any(|row| row.get("input_kind") != Some(input_kind))
+        {
+            return Err(format!(
+                "candidate_shortlist_input_kind_conflict:{input_id}:{record_id}"
+            ));
+        }
+        if group
+            .iter()
+            .any(|row| !row.contains_key("preliminary_score"))
+        {
+            selected.extend(
+                group
+                    .iter()
+                    .filter_map(|row| row.get("candidate_id").cloned()),
+            );
+            continue;
+        }
+
+        let route = ranking_route(input_kind);
+        let base_weight = route.known + route.metagenome + route.structure;
+        let simulation_weight = route.docking + route.md;
+        let scored = group
+            .iter()
+            .map(|row| {
+                let candidate_id = row.get("candidate_id").cloned().unwrap_or_default();
+                let score = row
+                    .get("preliminary_score")
+                    .and_then(|value| value.parse::<f64>().ok())
+                    .filter(|value| value.is_finite() && (0.0..=1.0).contains(value))
+                    .ok_or_else(|| format!("candidate_shortlist_score_invalid:{candidate_id}"))?;
+                Ok((candidate_id, score))
+            })
+            .collect::<Result<Vec<_>, String>>()?;
+        let best_base_score = scored
+            .iter()
+            .map(|(_, score)| score * base_weight)
+            .max_by(f64::total_cmp)
+            .unwrap_or_default();
+        for (candidate_id, score) in scored {
+            let best_possible_score = score * base_weight + simulation_weight;
+            if best_possible_score + ADAPTIVE_SHORTLIST_SCORE_EPSILON >= best_base_score {
+                selected.insert(candidate_id);
             }
-            *count += 1;
-            true
-        })
-        .collect())
+        }
+    }
+    Ok(selected)
 }
 
 fn selected_dynamics_candidate_rows(
     options: &ScienceOptions,
-) -> Result<(Vec<BTreeMap<String, String>>, Vec<CandidateWorkerOutcome>), String> {
+) -> Result<DynamicsCandidateSelection, String> {
     let input_kinds = ranking_input_kinds(options)?;
     let invocation_id = current_worker_invocation(options)?;
     let mut runnable = Vec::new();
@@ -11301,7 +11424,7 @@ fn md_platform_policy(options: &ScienceOptions) -> Result<String, String> {
                     .map(str::to_string)
             })
         })
-        .unwrap_or_else(|| "disabled".to_string())
+        .unwrap_or_else(|| "preferred".to_string())
         .to_ascii_lowercase();
     if matches!(configured.as_str(), "required" | "preferred" | "disabled") {
         Ok(configured)
@@ -11884,6 +12007,7 @@ fn run_worker_task(
     result_path: &Path,
 ) -> Result<(), String> {
     let python_root = options.workspace_root.join("python");
+    let timeout = worker_timeout()?;
     let mut errors = Vec::new();
     for candidate in python_command_candidates() {
         let mut command = Command::new(&candidate[0]);
@@ -11909,7 +12033,7 @@ fn run_worker_task(
                 command.env("WSLENV", wsl_env_with_pythonpath());
             }
         }
-        match command.output() {
+        match command_output_with_timeout(&mut command, timeout) {
             Ok(output) if output.status.success() => return Ok(()),
             Ok(output) => {
                 if worker_result_file_is_valid(result_path, task) {
@@ -11924,6 +12048,9 @@ fn run_worker_task(
                     .unwrap_or("worker_exit_nonzero");
                 errors.push(format!("{}:{detail}", candidate.join(" ")));
             }
+            Err(TimedCommandError::TimedOut) => {
+                return Err(prepare_worker_timeout_failure(task, result_path, timeout)?);
+            }
             Err(err) => errors.push(format!("{}:{err}", candidate.join(" "))),
         }
     }
@@ -11932,6 +12059,220 @@ fn run_worker_task(
         task.worker,
         clean_cell(&errors.join(" | "))
     ))
+}
+
+fn prepare_worker_timeout_failure(
+    task: &WorkerTask<'_>,
+    result_path: &Path,
+    timeout: Duration,
+) -> Result<String, String> {
+    let reason = format!(
+        "{}_worker_timed_out:timeout_seconds={}",
+        task.worker,
+        timeout.as_secs()
+    );
+    remove_file_if_exists(result_path)
+        .map_err(|err| format!("{reason};partial_result_cleanup_failed:{err}"))?;
+    Ok(reason)
+}
+
+#[derive(Debug)]
+enum TimedCommandError {
+    Launch(std::io::Error),
+    Wait(std::io::Error),
+    Capture(&'static str, std::io::Error),
+    CaptureThread(&'static str),
+    TimedOut,
+}
+
+impl std::fmt::Display for TimedCommandError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Launch(error) => write!(formatter, "worker_process_launch_failed:{error}"),
+            Self::Wait(error) => write!(formatter, "worker_process_wait_failed:{error}"),
+            Self::Capture(stream, error) => {
+                write!(formatter, "worker_process_{stream}_capture_failed:{error}")
+            }
+            Self::CaptureThread(stream) => {
+                write!(formatter, "worker_process_{stream}_capture_thread_failed")
+            }
+            Self::TimedOut => formatter.write_str("worker_process_timed_out"),
+        }
+    }
+}
+
+fn worker_timeout() -> Result<Duration, String> {
+    match env::var(WORKER_TIMEOUT_ENV) {
+        Ok(value) => worker_timeout_from_value(Some(&value)),
+        Err(env::VarError::NotPresent) => worker_timeout_from_value(None),
+        Err(env::VarError::NotUnicode(_)) => Err(format!(
+            "worker_timeout_invalid:{WORKER_TIMEOUT_ENV}=non_unicode"
+        )),
+    }
+}
+
+fn worker_timeout_from_value(value: Option<&str>) -> Result<Duration, String> {
+    let seconds = match value {
+        None => DEFAULT_WORKER_TIMEOUT_SECONDS,
+        Some(value) => value
+            .trim()
+            .parse::<u64>()
+            .ok()
+            .filter(|value| *value > 0)
+            .ok_or_else(|| {
+                format!(
+                    "worker_timeout_invalid:{WORKER_TIMEOUT_ENV}={}",
+                    clean_cell(value)
+                )
+            })?,
+    };
+    Ok(Duration::from_secs(seconds))
+}
+
+fn command_output_with_timeout(
+    command: &mut Command,
+    timeout: Duration,
+) -> Result<Output, TimedCommandError> {
+    command.stdout(Stdio::piped()).stderr(Stdio::piped());
+    configure_worker_process_group(command);
+    let mut child = command.spawn().map_err(TimedCommandError::Launch)?;
+    let process_id = child.id();
+    let stdout = child
+        .stdout
+        .take()
+        .expect("piped worker stdout must be available after spawn");
+    let stderr = child
+        .stderr
+        .take()
+        .expect("piped worker stderr must be available after spawn");
+    let (stdout_sender, stdout_receiver) = std::sync::mpsc::sync_channel(1);
+    let (stderr_sender, stderr_receiver) = std::sync::mpsc::sync_channel(1);
+    std::thread::spawn(move || {
+        let mut reader = stdout;
+        let mut bytes = Vec::new();
+        let result = reader.read_to_end(&mut bytes).map(|_| bytes);
+        let _ = stdout_sender.send(result);
+    });
+    std::thread::spawn(move || {
+        let mut reader = stderr;
+        let mut bytes = Vec::new();
+        let result = reader.read_to_end(&mut bytes).map(|_| bytes);
+        let _ = stderr_sender.send(result);
+    });
+
+    let started = Instant::now();
+    let mut status = None;
+    let mut stdout = None;
+    let mut stderr = None;
+    loop {
+        if status.is_none() {
+            status = child.try_wait().map_err(|error| {
+                terminate_worker_process_tree(process_id, &mut child);
+                TimedCommandError::Wait(error)
+            })?;
+        }
+        if let Err(error) = receive_worker_output(&stdout_receiver, &mut stdout, "stdout") {
+            terminate_worker_process_tree(process_id, &mut child);
+            return Err(error);
+        }
+        if let Err(error) = receive_worker_output(&stderr_receiver, &mut stderr, "stderr") {
+            terminate_worker_process_tree(process_id, &mut child);
+            return Err(error);
+        }
+        if let (Some(status), Some(stdout), Some(stderr)) =
+            (status.as_ref(), stdout.as_ref(), stderr.as_ref())
+        {
+            return Ok(Output {
+                status: *status,
+                stdout: stdout.clone(),
+                stderr: stderr.clone(),
+            });
+        }
+        if started.elapsed() >= timeout {
+            terminate_worker_process_tree(process_id, &mut child);
+            return Err(TimedCommandError::TimedOut);
+        }
+        std::thread::sleep(WORKER_PROCESS_POLL_INTERVAL);
+    }
+}
+
+fn receive_worker_output(
+    receiver: &std::sync::mpsc::Receiver<Result<Vec<u8>, std::io::Error>>,
+    output: &mut Option<Vec<u8>>,
+    stream: &'static str,
+) -> Result<(), TimedCommandError> {
+    if output.is_some() {
+        return Ok(());
+    }
+    match receiver.try_recv() {
+        Ok(Ok(bytes)) => {
+            *output = Some(bytes);
+            Ok(())
+        }
+        Ok(Err(error)) => Err(TimedCommandError::Capture(stream, error)),
+        Err(std::sync::mpsc::TryRecvError::Empty) => Ok(()),
+        Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+            Err(TimedCommandError::CaptureThread(stream))
+        }
+    }
+}
+
+fn configure_worker_process_group(command: &mut Command) {
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        command.process_group(0);
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
+        command.creation_flags(CREATE_NEW_PROCESS_GROUP);
+    }
+}
+
+fn wait_for_worker_process_exit(child: &mut std::process::Child, timeout: Duration) -> bool {
+    let started = Instant::now();
+    while started.elapsed() < timeout {
+        match child.try_wait() {
+            Ok(Some(_)) | Err(_) => return true,
+            Ok(None) => std::thread::sleep(WORKER_PROCESS_POLL_INTERVAL),
+        }
+    }
+    child.try_wait().is_ok_and(|status| status.is_some())
+}
+
+#[cfg(windows)]
+fn terminate_worker_process_tree(process_id: u32, child: &mut std::process::Child) {
+    let _ = Command::new("taskkill")
+        .args(["/PID", &process_id.to_string(), "/T", "/F"])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status();
+    if !wait_for_worker_process_exit(child, WORKER_PROCESS_TERMINATION_GRACE) {
+        let _ = child.kill();
+    }
+    let _ = child.wait();
+}
+
+#[cfg(unix)]
+fn terminate_worker_process_tree(process_id: u32, child: &mut std::process::Child) {
+    let process_group = format!("-{process_id}");
+    let _ = Command::new("kill")
+        .args(["-TERM", "--", &process_group])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status();
+    let _ = wait_for_worker_process_exit(child, WORKER_PROCESS_TERMINATION_GRACE);
+    let _ = Command::new("kill")
+        .args(["-KILL", "--", &process_group])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status();
+    if child.try_wait().is_ok_and(|status| status.is_none()) {
+        let _ = child.kill();
+    }
+    let _ = child.wait();
 }
 
 fn worker_result_file_is_valid(path: &Path, task: &WorkerTask<'_>) -> bool {
@@ -12501,6 +12842,7 @@ fn write_coordinate_backed_candidate_selection_impl(
         write_candidate_shortlist(options)?;
     }
     let shortlist_rows = read_simple_tsv_rows(&shortlist_path)?;
+    let adaptive_shortlist_ids = adaptive_shortlist_candidate_ids(&shortlist_rows)?;
     let shortlist_order = shortlist_rows
         .iter()
         .filter_map(|row| {
@@ -12595,7 +12937,10 @@ fn write_coordinate_backed_candidate_selection_impl(
             });
         }
     }
-    candidates.retain(|candidate| shortlist_order.contains_key(&candidate.selected.candidate_id));
+    candidates.retain(|candidate| {
+        shortlist_order.contains_key(&candidate.selected.candidate_id)
+            && adaptive_shortlist_ids.contains(&candidate.selected.candidate_id)
+    });
     candidates.sort_by(|left, right| {
         shortlist_order[&left.selected.candidate_id]
             .cmp(&shortlist_order[&right.selected.candidate_id])
@@ -12612,7 +12957,6 @@ fn write_coordinate_backed_candidate_selection_impl(
     });
 
     let mut selected_rows = Vec::new();
-    let mut selected_by_input = BTreeMap::<(String, String), usize>::new();
     let mut seen = BTreeSet::new();
     let mut audited_pdb_ids = BTreeSet::new();
     let mut audit_rows = Vec::new();
@@ -12620,18 +12964,6 @@ fn write_coordinate_backed_candidate_selection_impl(
     let mut fetch_count = 0usize;
     let mut policy_validated = false;
     for candidate in candidates {
-        let input_key = (
-            candidate.selected.input_id.clone(),
-            candidate.selected.record_id.clone(),
-        );
-        if selected_by_input
-            .get(&input_key)
-            .copied()
-            .unwrap_or_default()
-            == COMPLEX_CANDIDATE_TOP_N
-        {
-            continue;
-        }
         if seen.contains(&candidate.selected.candidate_id) {
             continue;
         }
@@ -12700,9 +13032,6 @@ fn write_coordinate_backed_candidate_selection_impl(
         } else {
             false
         };
-        if selected {
-            *selected_by_input.entry(input_key).or_default() += 1;
-        }
         if (!initially_local || selected) && audited_pdb_ids.insert(pdb_id.clone()) {
             audit_rows.push(rcsb_fetch_audit_row(
                 &options.science_store,
@@ -13268,7 +13597,7 @@ fn known_structure_hints(path: &Path) -> Result<Vec<KnownStructureHint>, String>
     }
     let text = read_text(path)?;
     let mut by_target = BTreeMap::<String, KnownStructureHint>::new();
-    for line in text.lines().skip(1) {
+    for (line_index, line) in text.lines().skip(1).enumerate() {
         let cols = split_tsv(line);
         if cols.len() < 9 || !cols[8].contains("bindingdb_onsite_activity_row") {
             continue;
@@ -13277,6 +13606,12 @@ fn known_structure_hints(path: &Path) -> Result<Vec<KnownStructureHint>, String>
         if pdb_ids.is_empty() {
             continue;
         }
+        let match_score = parse_finite_number(&cols[6]).ok_or_else(|| {
+            format!(
+                "known_structure_match_score_invalid:line={}",
+                line_index + 2
+            )
+        })?;
         let hint = KnownStructureHint {
             input_id: cols[0].clone(),
             record_id: cols
@@ -13288,7 +13623,7 @@ fn known_structure_hints(path: &Path) -> Result<Vec<KnownStructureHint>, String>
             target_name: cols[3].clone(),
             organism: cols[4].clone(),
             target_class: cols[5].clone(),
-            match_score: cols[6].parse().unwrap_or(0.0),
+            match_score,
             evidence: cols[8].clone(),
             pdb_ids,
         };
@@ -13497,6 +13832,7 @@ fn write_candidate_shortlist_coordinates(
 ) -> Result<(), String> {
     let path = options.run_dir.join("candidate_shortlist.tsv");
     let mut rows = read_simple_tsv_rows(&path)?;
+    let adaptive_shortlist_ids = adaptive_shortlist_candidate_ids(&rows)?;
     let mut ranks = BTreeMap::<(String, String), usize>::new();
     let mut selected =
         BTreeMap::<String, (&SelectedComplexCandidate, &String, &String, usize)>::new();
@@ -13524,7 +13860,9 @@ fn write_candidate_shortlist_coordinates(
             );
             row.insert("pdb_id".to_string(), candidate.pdb_id.clone());
         } else {
-            let status = if row
+            let status = if !adaptive_shortlist_ids.contains(&candidate_id) {
+                "outside_adaptive_simulation_window"
+            } else if row
                 .get("pdb_ids")
                 .is_some_and(|value| !value.trim().is_empty())
             {
@@ -13811,15 +14149,22 @@ fn read_index_matches(path: &Path) -> Result<Vec<IndexMatch>, String> {
         return Ok(Vec::new());
     }
     let rows = read_simple_tsv_rows(path)?;
-    Ok(rows
-        .into_iter()
-        .filter_map(|row| {
+    rows.into_iter()
+        .enumerate()
+        .filter_map(|(row_index, row)| {
             let input_id = row.get("input_id")?.trim().to_string();
             let target_id = row.get("target_id")?.trim().to_string();
             if input_id.is_empty() || target_id.is_empty() {
                 return None;
             }
-            Some(IndexMatch {
+            Some((row_index, row, input_id, target_id))
+        })
+        .map(|(row_index, row, input_id, target_id)| {
+            let match_score = row
+                .get("match_score")
+                .and_then(|value| parse_finite_number(value))
+                .ok_or_else(|| format!("structure_match_score_invalid:line={}", row_index + 2))?;
+            Ok(IndexMatch {
                 input_id,
                 record_id: row
                     .get("record_id")
@@ -13831,15 +14176,12 @@ fn read_index_matches(path: &Path) -> Result<Vec<IndexMatch>, String> {
                 target_name: row.get("target_name").cloned().unwrap_or_default(),
                 organism: row.get("organism").cloned().unwrap_or_default(),
                 target_class: row.get("target_class").cloned().unwrap_or_default(),
-                match_score: row
-                    .get("match_score")
-                    .and_then(|value| value.parse::<f64>().ok())
-                    .unwrap_or_default(),
+                match_score,
                 matched_features: row.get("matched_features").cloned().unwrap_or_default(),
                 evidence: row.get("evidence").cloned().unwrap_or_default(),
             })
         })
-        .collect())
+        .collect()
 }
 
 fn read_maybe_gz_text(path: &Path) -> Result<String, String> {
@@ -16379,8 +16721,29 @@ fn rank_targets(options: &ScienceOptions) -> Result<String, String> {
     apply_md_scores(&mut candidates, options)?;
     bind_candidate_ranking_routes(options, &mut candidates)?;
     for candidate in &mut candidates {
+        if [
+            candidate.known_score,
+            candidate.metagenome_score,
+            candidate.structure_score,
+            candidate.docking_score,
+            candidate.dynamics_score,
+        ]
+        .into_iter()
+        .any(|score| !score.is_finite())
+        {
+            return Err(format!(
+                "candidate_component_score_non_finite:{}",
+                candidate.candidate_id
+            ));
+        }
         let route = ranking_route(&candidate.input_kind);
         candidate.final_score = route.score(candidate);
+        if !candidate.final_score.is_finite() {
+            return Err(format!(
+                "candidate_final_score_non_finite:{}",
+                candidate.candidate_id
+            ));
+        }
     }
     sort_ranked_candidates(&mut candidates);
     let mut text = format!("{TARGET_CANDIDATE_RANKING_HEADER}\n");
@@ -16388,7 +16751,7 @@ fn rank_targets(options: &ScienceOptions) -> Result<String, String> {
     for (candidate, rank) in candidates.iter().zip(ranks) {
         let route = ranking_route(&candidate.input_kind);
         text.push_str(&format!(
-            "{}\t{}\t{}\t{}\t{}\t{}\t{:.4}\t{:.4}\t{:.4}\t{:.4}\t{:.4}\t{:.4}\t{}\tcomputed_prediction\t{}\t{}\t{}\t{}\t{}\t{:.4}\t{:.4}\t{:.4}\t{:.4}\t{:.4}\n",
+            "{}\t{}\t{}\t{}\t{}\t{}\t{:.4}\t{:.4}\t{:.4}\t{:.4}\t{:.4}\t{:.4}\t{}\tcomputed_prediction\t{}\t{}\t{}\t{}\t{}\t{:.4}\t{:.4}\t{:.4}\t{:.4}\t{:.4}\t{}\t{}\n",
             rank,
             candidate.candidate_id,
             candidate.target_id,
@@ -16412,6 +16775,8 @@ fn rank_targets(options: &ScienceOptions) -> Result<String, String> {
             route.structure,
             route.docking,
             route.md,
+            clean_cell(&candidate.docking_evaluation_status),
+            clean_cell(&candidate.md_evaluation_status),
         ));
     }
     write_text(&options.run_dir.join("target_candidate_ranking.tsv"), &text)?;
@@ -16426,6 +16791,16 @@ fn apply_docking_scores(
     candidates: &mut [Candidate],
     options: &ScienceOptions,
 ) -> Result<(), String> {
+    let evaluation_statuses = candidate_index_statuses(
+        &options
+            .run_dir
+            .join("tool_outputs/docking_manifest_index.json"),
+    );
+    for candidate in &mut *candidates {
+        if let Some(status) = evaluation_statuses.get(&candidate.candidate_id) {
+            candidate.docking_evaluation_status = status.clone();
+        }
+    }
     let docking_scores =
         read_docking_scores(options, &options.run_dir.join("docking_summary.tsv"))?;
     if docking_scores.is_empty() {
@@ -16434,6 +16809,7 @@ fn apply_docking_scores(
     for candidate in candidates {
         if let Some(score) = docking_scores.get(&candidate.candidate_id) {
             candidate.docking_score = *score;
+            candidate.docking_evaluation_status = "completed".to_string();
             append_evidence_once(&mut candidate.evidence, "Docking:vina_completed");
         }
     }
@@ -16484,6 +16860,11 @@ fn read_docking_scores(
         if !manifest.contains(&pose_relative) {
             return Err(format!(
                 "docking_pose_not_bound_by_manifest:{candidate_id}:{pose_relative}"
+            ));
+        }
+        if !docking_pose_content_valid(&options.run_dir.join(&pose_relative)) {
+            return Err(format!(
+                "docking_pose_content_invalid:{candidate_id}:{pose_relative}"
             ));
         }
         if let Some(score) = docking_score_from_affinity(&cell(&cols, score_idx)) {
@@ -16763,16 +17144,118 @@ fn validated_indexed_docking_manifests(
                 ));
             }
         }
+        for artifact_name in ["pose", "pose_sdf"] {
+            let relative = named_paths
+                .get(artifact_name)
+                .ok_or_else(|| format!("docking_pose_missing:{candidate_id}:{artifact_name}"))?;
+            if !docking_pose_content_valid(&options.run_dir.join(relative)) {
+                return Err(format!(
+                    "docking_pose_content_invalid:{candidate_id}:{artifact_name}"
+                ));
+            }
+        }
         manifests.insert(candidate_id.to_string(), artifacts);
     }
     Ok(manifests)
 }
 
-fn docking_score_from_affinity(value: &str) -> Option<f64> {
-    let raw = value.trim().parse::<f64>().ok()?;
-    if !raw.is_finite() {
-        return None;
+fn docking_pose_content_valid(path: &Path) -> bool {
+    let Ok(text) = read_text(path) else {
+        return false;
+    };
+    match path
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .map(str::to_ascii_lowercase)
+        .as_deref()
+    {
+        Some("pdbqt") | Some("pdb") => pdb_pose_content_valid(&text),
+        Some("sdf") | Some("mol") => sdf_pose_content_valid(&text),
+        _ => false,
     }
+}
+
+fn pdb_pose_content_valid(text: &str) -> bool {
+    let mut atom_count = 0usize;
+    for line in text.lines() {
+        if !(line.starts_with("ATOM  ") || line.starts_with("HETATM")) {
+            continue;
+        }
+        let bytes = line.as_bytes();
+        if bytes.len() < 54 {
+            return false;
+        }
+        let coordinates_finite = [(30, 38), (38, 46), (46, 54)]
+            .into_iter()
+            .all(|(start, end)| {
+                std::str::from_utf8(&bytes[start..end])
+                    .ok()
+                    .and_then(parse_finite_number)
+                    .is_some()
+            });
+        if !coordinates_finite {
+            return false;
+        }
+        atom_count += 1;
+    }
+    atom_count > 0
+}
+
+fn sdf_pose_content_valid(text: &str) -> bool {
+    if !text.lines().any(|line| line.trim() == "M  END") || !text.contains("$$$$") {
+        return false;
+    }
+    let lines = text.lines().collect::<Vec<_>>();
+    if let Some((counts_index, atom_count)) = lines.iter().enumerate().find_map(|(index, line)| {
+        line.contains("V2000").then(|| {
+            line.get(..3)
+                .and_then(|value| value.trim().parse::<usize>().ok())
+                .map(|count| (index, count))
+        })?
+    }) {
+        if atom_count == 0 || counts_index + atom_count >= lines.len() {
+            return false;
+        }
+        return lines[counts_index + 1..=counts_index + atom_count]
+            .iter()
+            .all(|line| {
+                line.split_whitespace()
+                    .take(3)
+                    .filter_map(parse_finite_number)
+                    .count()
+                    == 3
+            });
+    }
+    let Some(atom_count) = lines.iter().find_map(|line| {
+        let fields = line.split_whitespace().collect::<Vec<_>>();
+        (fields.first() == Some(&"M")
+            && fields.get(1) == Some(&"V30")
+            && fields.get(2) == Some(&"COUNTS"))
+        .then(|| fields.get(3)?.parse::<usize>().ok())?
+    }) else {
+        return false;
+    };
+    let atoms = lines
+        .iter()
+        .filter(|line| {
+            let fields = line.split_whitespace().collect::<Vec<_>>();
+            fields.first() == Some(&"M")
+                && fields.get(1) == Some(&"V30")
+                && fields
+                    .get(2)
+                    .and_then(|value| value.parse::<usize>().ok())
+                    .is_some()
+                && fields.len() >= 7
+                && fields[4..7]
+                    .iter()
+                    .all(|value| parse_finite_number(value).is_some())
+        })
+        .count();
+    atom_count > 0 && atoms == atom_count
+}
+
+fn docking_score_from_affinity(value: &str) -> Option<f64> {
+    let raw = parse_finite_number(value)?;
     if (0.0..=1.0).contains(&raw) {
         Some(clamp_score(raw))
     } else if raw < 0.0 {
@@ -16783,6 +17266,13 @@ fn docking_score_from_affinity(value: &str) -> Option<f64> {
 }
 
 fn apply_md_scores(candidates: &mut [Candidate], options: &ScienceOptions) -> Result<(), String> {
+    let evaluation_statuses =
+        candidate_index_statuses(&options.run_dir.join("tool_outputs/md_manifest_index.json"));
+    for candidate in &mut *candidates {
+        if let Some(status) = evaluation_statuses.get(&candidate.candidate_id) {
+            candidate.md_evaluation_status = status.clone();
+        }
+    }
     let current_summary = materialize_current_md_summary(options)?;
     if !current_summary.ready {
         return Ok(());
@@ -16805,6 +17295,7 @@ fn apply_md_scores(candidates: &mut [Candidate], options: &ScienceOptions) -> Re
                 && let Some(score) = md_scores.get(&candidate.candidate_id)
             {
                 candidate.dynamics_score = *score;
+                candidate.md_evaluation_status = "completed".to_string();
                 append_evidence_once(&mut candidate.evidence, "MD:manifest_bound_stability_score");
             }
         }
@@ -16827,6 +17318,7 @@ fn apply_md_scores(candidates: &mut [Candidate], options: &ScienceOptions) -> Re
         }
         if let Some(score) = md_scores.get(&candidate.candidate_id) {
             candidate.dynamics_score = *score;
+            candidate.md_evaluation_status = "completed".to_string();
             append_evidence_once(&mut candidate.evidence, "MD:md_summary_stability_score");
         }
     }
@@ -17001,13 +17493,16 @@ fn md_score_from_row(
     })
 }
 
+fn parse_finite_number(value: &str) -> Option<f64> {
+    value
+        .trim()
+        .parse::<f64>()
+        .ok()
+        .filter(|value| value.is_finite())
+}
+
 fn parse_score_cell(value: &str) -> Option<f64> {
-    let score = value.trim().parse::<f64>().ok()?;
-    if score.is_finite() {
-        Some(clamp_score(score))
-    } else {
-        None
-    }
+    parse_finite_number(value).map(clamp_score)
 }
 
 fn clamp_score(value: f64) -> f64 {
@@ -17695,12 +18190,17 @@ fn ranking_policy_value() -> Value {
             "preliminary_known_database_weight": preliminary_known,
             "preliminary_metagenome_weight": preliminary_metagenome,
             "preliminary_structure_weight": preliminary_structure,
+            "non_simulation_weight": route.known + route.metagenome + route.structure,
+            "maximum_simulation_gain": route.docking + route.md,
         })
     };
     json!({
         "schema_version": RANKING_POLICY_VERSION,
         "score_semantics": "input_kind_route_weighted_sum",
         "shortlist_score_semantics": "route_weights_renormalized_over_known_metagenome_structure",
+        "shortlist_selection_semantics": "include_when_perfect_docking_and_md_can_reach_the_best_current_non_simulation_score_per_input_record",
+        "simulation_availability_semantics": "evaluation_status_distinguishes_not_evaluated_not_ready_and_completed_zero",
+        "shortlist_score_epsilon": ADAPTIVE_SHORTLIST_SCORE_EPSILON,
         "routes": {
             "small_molecule": route_value("small_molecule"),
             "peptide": route_value("peptide"),
@@ -17957,6 +18457,10 @@ fn write_candidate_detail(
                     "structure": candidate.structure_score,
                     "docking": candidate.docking_score,
                     "md": candidate.dynamics_score
+                },
+                "score_availability": {
+                    "docking": candidate.docking_evaluation_status,
+                    "md": candidate.md_evaluation_status,
                 },
                 "evidence_summary": candidate.evidence,
                 "source_artifacts": source_artifacts,
@@ -19986,7 +20490,7 @@ fn merge_match_file(
     let source_database_idx = find_header(&headers, &["source_database_id"]);
     let input_idx = find_header(&headers, &["input_id"]);
     let record_idx = find_header(&headers, &["record_id"]);
-    for line in lines {
+    for (line_index, line) in lines.enumerate() {
         let cols = split_tsv(line);
         if cols.len() < 9 {
             continue;
@@ -20015,7 +20519,8 @@ fn merge_match_file(
             namespace.trim().to_ascii_lowercase(),
             target_id
         );
-        let score = cols[6].parse::<f64>().unwrap_or(0.0);
+        let score = parse_finite_number(&cols[6])
+            .ok_or_else(|| format!("candidate_match_score_non_finite:line={}", line_index + 2))?;
         let metadata_quality =
             candidate_metadata_quality(&target_id, &cols[3], &cols[4], &cols[5], &evidence);
         let entry = by_target.entry(identity_key).or_insert(Candidate {
@@ -20038,6 +20543,8 @@ fn merge_match_file(
             structure_score: 0.0,
             docking_score: 0.0,
             dynamics_score: 0.0,
+            docking_evaluation_status: "not_evaluated".to_string(),
+            md_evaluation_status: "not_evaluated".to_string(),
             final_score: 0.0,
             evidence: String::new(),
         });
@@ -20153,11 +20660,19 @@ fn read_candidates(path: &Path) -> Result<Vec<Candidate>, String> {
     }
     let text = read_text(path)?;
     let mut out = Vec::new();
-    for line in text.lines().skip(1) {
+    for (line_index, line) in text.lines().skip(1).enumerate() {
         let cols = split_tsv(line);
         if cols.len() < 14 {
             continue;
         }
+        let score = |index: usize, field: &str| {
+            parse_finite_number(&cols[index]).ok_or_else(|| {
+                format!(
+                    "candidate_score_non_finite:line={}:field={field}",
+                    line_index + 2
+                )
+            })
+        };
         out.push(Candidate {
             candidate_id: cols[1].clone(),
             input_id: cols.get(14).cloned().unwrap_or_default(),
@@ -20173,12 +20688,20 @@ fn read_candidates(path: &Path) -> Result<Vec<Candidate>, String> {
             sources: BTreeSet::new(),
             pdb_ids: BTreeSet::new(),
             metadata_quality: 0,
-            final_score: cols[6].parse().unwrap_or(0.0),
-            known_score: cols[7].parse().unwrap_or(0.0),
-            metagenome_score: cols[8].parse().unwrap_or(0.0),
-            structure_score: cols[9].parse().unwrap_or(0.0),
-            docking_score: cols[10].parse().unwrap_or(0.0),
-            dynamics_score: cols[11].parse().unwrap_or(0.0),
+            final_score: score(6, "final_score")?,
+            known_score: score(7, "known_score")?,
+            metagenome_score: score(8, "metagenome_score")?,
+            structure_score: score(9, "structure_score")?,
+            docking_score: score(10, "docking_score")?,
+            dynamics_score: score(11, "dynamics_score")?,
+            docking_evaluation_status: cols
+                .get(24)
+                .cloned()
+                .unwrap_or_else(|| "not_evaluated".to_string()),
+            md_evaluation_status: cols
+                .get(25)
+                .cloned()
+                .unwrap_or_else(|| "not_evaluated".to_string()),
             evidence: cols[12].clone(),
         });
     }

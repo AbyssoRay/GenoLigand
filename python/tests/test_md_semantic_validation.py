@@ -116,6 +116,13 @@ class MdSemanticValidationTests(unittest.TestCase):
             "md_protocol.tsv",
             "candidate_id\tinput_id\tstage\tparameter\tvalue\tunit\tsource\n"
             f"{candidate}\t{input_id}\tplatform\topenmm_platform\tCPU\t\tOpenMM\n"
+            f"{candidate}\t{input_id}\tplatform\tplatform_policy\tdisabled\t\tGenoLigand job\n"
+            f"{candidate}\t{input_id}\tplatform\tavailable_openmm_platforms\tReference,CPU,CUDA\t\tOpenMM\n"
+            f"{candidate}\t{input_id}\tplatform\tcuda_platform_detected\ttrue\t\tOpenMM\n"
+            f"{candidate}\t{input_id}\tplatform\tcontext_creation_failures\t\t\tOpenMM Context\n"
+            f"{candidate}\t{input_id}\tplatform\tfallback_reason\tcuda_disabled_by_policy\t\tOpenMM Context\n"
+            f"{candidate}\t{input_id}\tsampling_policy\tpolicy_id\t{worker.SHORT_MD_POLICY_ID}\t\tGenoLigand\n"
+            f"{candidate}\t{input_id}\tsampling_policy\tpurpose\tcandidate_local_stability_screen\t\tGenoLigand\n"
             f"{candidate}\t{input_id}\tintegrator\ttime_step\t0.002\tps\tOpenMM\n"
             f"{candidate}\t{input_id}\tproduction\ttotal_steps\t100\tsteps\tOpenMM\n"
             f"{candidate}\t{input_id}\toutput\tframe_count\t10\tframes\tmd_trajectory.tsv\n"
@@ -143,6 +150,16 @@ class MdSemanticValidationTests(unittest.TestCase):
             "method": "openmm_receptor_ligand_complex_dynamics",
             "platform": "CPU",
             "platform_policy": "disabled",
+            "platform_context_failures": [],
+            "available_openmm_platforms": ["Reference", "CPU", "CUDA"],
+            "cuda_platform_detected": True,
+            "platform_fallback_reason": "cuda_disabled_by_policy",
+            "sampling_policy": {
+                "policy_id": worker.SHORT_MD_POLICY_ID,
+                "purpose": "candidate_local_stability_screen",
+                "timestep_ps": 0.002,
+                "production_steps_total": 100,
+            },
             "frame_count": 10,
             "state_row_count": 2,
             "trajectory": "tool_outputs/md_trajectory.tsv",
@@ -380,6 +397,24 @@ class MdSemanticValidationTests(unittest.TestCase):
                     worker.validate_completed_md_semantics(self.binding)
 
     def test_platform_policy_uses_real_context_creation_and_honors_cpu_mode(self) -> None:
+        self.assertEqual(worker.md_platform_policy({}), "preferred")
+
+        preferred_cuda = FakeOpenMM(set())
+        _context, name, properties, attempts = worker.create_openmm_context(
+            preferred_cuda, object(), object(), worker.md_platform_policy({})
+        )
+        self.assertEqual(name, "CUDA")
+        self.assertEqual(preferred_cuda.context_attempts, ["CUDA"])
+        evidence = worker.openmm_platform_execution_evidence(
+            "preferred",
+            name,
+            worker.available_openmm_platforms(preferred_cuda),
+            properties,
+            attempts,
+        )
+        self.assertTrue(evidence["cuda_platform_detected"])
+        self.assertEqual(evidence["fallback_reason"], "")
+
         disabled = FakeOpenMM(set())
         _context, name, _properties, attempts = worker.create_openmm_context(
             disabled, object(), object(), "disabled"
@@ -387,6 +422,14 @@ class MdSemanticValidationTests(unittest.TestCase):
         self.assertEqual(name, "CPU")
         self.assertEqual(disabled.context_attempts, ["CPU"])
         self.assertEqual(attempts, [])
+        evidence = worker.openmm_platform_execution_evidence(
+            "disabled",
+            name,
+            worker.available_openmm_platforms(disabled),
+            {},
+            attempts,
+        )
+        self.assertEqual(evidence["fallback_reason"], "cuda_disabled_by_policy")
 
         preferred = FakeOpenMM({"CUDA"})
         _context, name, _properties, attempts = worker.create_openmm_context(
@@ -394,11 +437,36 @@ class MdSemanticValidationTests(unittest.TestCase):
         )
         self.assertEqual(name, "CPU")
         self.assertEqual(preferred.context_attempts, ["CUDA", "CPU"])
-        self.assertEqual(attempts, ["CUDA:RuntimeError"])
+        self.assertEqual(attempts, ["CUDA:RuntimeError:CUDA unavailable"])
+        evidence = worker.openmm_platform_execution_evidence(
+            "preferred",
+            name,
+            worker.available_openmm_platforms(preferred),
+            {},
+            attempts,
+        )
+        self.assertEqual(evidence["fallback_reason"], "CUDA:RuntimeError:CUDA unavailable")
+
+        missing_cuda = worker.openmm_platform_execution_evidence(
+            "preferred",
+            "CPU",
+            ["Reference", "CPU"],
+            {},
+            [],
+        )
+        self.assertEqual(missing_cuda["fallback_reason"], "CUDA_platform_missing")
 
         required = FakeOpenMM({"CUDA"})
         with self.assertRaisesRegex(ValueError, "gpu_required_context_unavailable"):
             worker.create_openmm_context(required, object(), object(), "required")
+
+    def test_short_md_sampling_policy_records_the_effective_budget(self) -> None:
+        policy = worker.build_md_sampling_policy(0.001, 20_000, 50, 2_000)
+        self.assertEqual(policy["policy_id"], worker.SHORT_MD_POLICY_ID)
+        self.assertEqual(policy["equilibration_time_ps"], 20.0)
+        self.assertEqual(policy["production_steps_total"], 100_000)
+        self.assertEqual(policy["production_time_ps"], 100.0)
+        self.assertEqual(policy["expected_frame_count"], 51)
 
 
 if __name__ == "__main__":

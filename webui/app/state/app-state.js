@@ -34,6 +34,7 @@
   inputInspectionGeneration: 0,
   inputSavePending: false,
   inputSaveGeneration: 0,
+  runCancelPending: false,
   alert: "",
 };
 

@@ -14,6 +14,7 @@
         </div>
         <div class="actions">
           <button class="button" data-action="start-run" ${canStartRun() ? "" : "disabled"}>开始运行</button>
+          <button class="button secondary" data-action="cancel-run" ${runState === "running" && !state.runCancelPending ? "" : "disabled"}>${state.runCancelPending ? "正在取消" : "取消运行"}</button>
           <button class="button secondary" data-action="refresh-run">刷新</button>
           <button class="button ghost" data-action="to-results" ${canViewResults() ? "" : "disabled"}>查看结果</button>
         </div>
@@ -38,6 +39,7 @@
       </section>
     </div>`;
   page.querySelector("[data-action='start-run']")?.addEventListener("click", startRun);
+  page.querySelector("[data-action='cancel-run']")?.addEventListener("click", cancelRun);
   page.querySelector("[data-action='refresh-run']").addEventListener("click", refreshAll);
   page.querySelector("[data-action='to-results']")?.addEventListener("click", () => setStep("results"));
 }

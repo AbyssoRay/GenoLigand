@@ -12,6 +12,12 @@ from pathlib import Path
 from typing import Any
 
 from genoligand_workers.common import WorkerExecution, WorkerOutcome
+from genoligand_workers.receptor_contract import (
+    BIOLOGICAL_METALS,
+    RECEPTOR_CHAIN_CONTACT_CUTOFF_ANGSTROM,
+    STANDARD_PROTEIN_RESIDUES,
+    chain_signature,
+)
 from genoligand_workers.worker_io import (
     candidate_selection_digest,
     parse_worker_args,
@@ -30,6 +36,7 @@ DEFAULT_PRODUCTION_SEGMENTS = 50
 DEFAULT_PRODUCTION_STEPS_PER_SEGMENT = 2000
 DEFAULT_MINIMIZATION_ITERATIONS = 2000
 DEFAULT_TIMESTEP_PS = 0.001
+SHORT_MD_POLICY_ID = "short_complex_md_screen_v1"
 DEFAULT_SOLVENT_BOX_SHAPE = "dodecahedron"
 DEFAULT_GPU_TELEMETRY_POLL_SECONDS = 1.0
 GAS_CONSTANT_KJ_PER_MOL_K = 0.00831446261815324
@@ -45,7 +52,6 @@ RMSD_SCORE_SCALE_ANGSTROM = 4.0
 LIGAND_DRIFT_SCORE_SCALE_ANGSTROM = 3.0
 CONTACT_CUTOFF_ANGSTROM = 4.5
 RECEPTOR_CHAIN_SELECTION_VERSION = "pose_heavy_atom_contact_v2"
-RECEPTOR_CHAIN_CONTACT_CUTOFF_ANGSTROM = 4.5
 RECEPTOR_SELECTION_FIELDS = (
     "receptor_chain_selection_algorithm",
     "receptor_chain_atom_policy",
@@ -86,11 +92,7 @@ RECEPTOR_SELECTION_PROTOCOL_FIELDS = (
     ("selected_chain_minimum_distance", "selected_chain_minimum_distance_angstrom", "angstrom"),
     ("receptor_chain_selection_digest", "receptor_chain_selection_digest", ""),
 )
-STANDARD_PROTEIN_RESIDUES = {
-    "ALA", "ARG", "ASN", "ASP", "CYS", "GLN", "GLU", "GLY", "HIS", "ILE",
-    "LEU", "LYS", "MET", "PHE", "PRO", "SER", "THR", "TRP", "TYR", "VAL",
-}
-UNSUPPORTED_METAL_ELEMENTS = {"CA", "CO", "CU", "FE", "MG", "MN", "NI", "ZN"}
+UNSUPPORTED_METAL_ELEMENTS = BIOLOGICAL_METALS
 HBOND_DISTANCE_CUTOFF_NM = 0.25
 HBOND_ANGLE_CUTOFF_DEGREES = 120.0
 MD_JOB_ID = "md_summary_ligand_dynamics"
@@ -175,6 +177,8 @@ class MdInvocationBinding:
     docking_pose_pdbqt: Path | None
     docking_pose_sdf: Path | None
     output_dir: Path
+    docking_receptor_components: tuple[dict[str, Any], ...] = ()
+    docking_receptor_contact_chains: tuple[dict[str, Any], ...] = ()
 
 
 def main() -> int:
@@ -350,7 +354,12 @@ def run_md_summary_job(job: dict[str, Any]) -> WorkerExecution:
                 binding=binding,
             )
             return md_execution("not_ready", reason, openmm_version_text(openmm, "not_ready", reason), True)
-        chain_selection = select_receptor_chain_from_pose(receptor_path, mol, unit)
+        chain_selection = select_receptor_chain_from_pose(
+            receptor_path,
+            mol,
+            unit,
+            binding.docking_receptor_contact_chains,
+        )
         chain_selection["source_receptor_sha256"] = sha256_file(receptor_path)
         chain_selection["docking_pose_sha256"] = sha256_file(binding.docking_pose_sdf)
         selection_binding = {
@@ -375,6 +384,7 @@ def run_md_summary_job(job: dict[str, Any]) -> WorkerExecution:
             "no_receptor_chain_within_pose_contact_cutoff",
             "ambiguous_receptor_chain_contacts",
             "docking_pose_heavy_atom_coordinates_invalid",
+            "docking_receptor_contact_chain_mismatch",
             "selected_receptor_chain_ordinal_invalid",
         )
         reason = next((code for code in stable_reasons if message.startswith(code)), "receptor_coordinate_preparation_failed")
@@ -409,6 +419,12 @@ def run_md_summary_job(job: dict[str, Any]) -> WorkerExecution:
             openmm_version_text(openmm, "not_ready", sampling_reason),
             True,
         )
+    sampling_policy = build_md_sampling_policy(
+        timestep_ps,
+        equilibration_steps,
+        production_segments,
+        production_steps_per_segment,
+    )
 
     conformer = mol.GetConformer()
     initial_angstrom = np.array(
@@ -435,6 +451,7 @@ def run_md_summary_job(job: dict[str, Any]) -> WorkerExecution:
         ligand_positions,
         science_store,
     )
+    model_metadata["sampling_policy"] = sampling_policy
     integrator = openmm.LangevinMiddleIntegrator(
         300 * unit.kelvin,
         1 / unit.picosecond,
@@ -454,6 +471,14 @@ def run_md_summary_job(job: dict[str, Any]) -> WorkerExecution:
         write_md_not_ready(run_dir, reason, [reason], binding=binding)
         return md_execution("not_ready", reason, openmm_version_text(openmm, "not_ready", reason), True)
     sample_gpu_telemetry(gpu_telemetry, "after_openmm_context")
+    device_evidence = openmm_platform_execution_evidence(
+        platform_policy,
+        platform_name,
+        available_openmm_platforms(openmm),
+        platform_properties,
+        platform_failures,
+    )
+    model_metadata["execution_device"] = device_evidence
     context.setPositions(context_positions)
     assert_openmm_state_finite(context, unit, "set_positions")
     sample_gpu_telemetry(gpu_telemetry, "after_positions_set")
@@ -529,6 +554,8 @@ def run_md_summary_job(job: dict[str, Any]) -> WorkerExecution:
     del integrator
 
     gpu_status = summarize_gpu_telemetry(platform_name, gpu_telemetry)
+    device_evidence["nvidia_smi_available"] = bool(gpu_status["nvidia_smi_available"])
+    device_evidence["gpu_observed"] = bool(gpu_status["gpu_observed"])
     protocol_rows = build_md_protocol_rows(
         candidate_id,
         input_id,
@@ -549,24 +576,14 @@ def run_md_summary_job(job: dict[str, Any]) -> WorkerExecution:
         gpu_status,
         model_metadata,
     )
-    protocol_rows.extend(
-        [
-            [candidate_id, input_id, "platform", "platform_policy", platform_policy, "", "GenoLigand job"],
-            [
-                candidate_id,
-                input_id,
-                "platform",
-                "context_creation_failures",
-                ";".join(platform_failures),
-                "",
-                "OpenMM Context",
-            ],
-        ]
-    )
     risk_flags = [
         *receptor.risk_flags,
         *parameter_flags,
-        *(f"platform_fallback:{failure}" for failure in platform_failures),
+        *(
+            [f"platform_fallback:{device_evidence['fallback_reason']}"]
+            if device_evidence["fallback_reason"]
+            else []
+        ),
         "ligand_placement_from_autodock_vina_pose",
         "standard_openmm_forcefield_complex",
     ]
@@ -1004,7 +1021,7 @@ def validate_docking_binding(
     source_digest: str,
     input_digest: str,
     manifest_artifact: str = "tool_outputs/docking_manifest.json",
-) -> dict[str, Path]:
+) -> dict[str, Any]:
     manifest_path = resolve_run_artifact(run_dir, manifest_artifact)
     if not valid_sha256(docking_manifest_digest) or sha256_file(manifest_path) != docking_manifest_digest:
         raise MdProvenanceError("docking_manifest_sha256_mismatch")
@@ -1042,7 +1059,7 @@ def validate_docking_binding(
     if manifest.get("input_digest") != input_digest:
         raise MdProvenanceError("docking_input_digest_mismatch")
 
-    resolved: dict[str, Path] = {}
+    resolved: dict[str, Any] = {}
     for field_name in DOCKING_ARTIFACT_FIELDS:
         value = manifest.get(field_name)
         if value in {None, ""}:
@@ -1097,6 +1114,39 @@ def validate_docking_binding(
         or sha256_file(receptor) != receptor_digest
     ):
         raise MdProvenanceError("docking_receptor_sha256_mismatch")
+    components = manifest.get("retained_receptor_components")
+    contact_chains = manifest.get("receptor_contact_chains")
+    if not isinstance(components, list) or not all(isinstance(row, dict) for row in components):
+        raise MdProvenanceError("docking_receptor_components_invalid")
+    if not isinstance(contact_chains, list) or not contact_chains:
+        raise MdProvenanceError("docking_receptor_contact_chains_invalid")
+    identities: set[tuple[str, int, str]] = set()
+    for row in contact_chains:
+        if not isinstance(row, dict):
+            raise MdProvenanceError("docking_receptor_contact_chains_invalid")
+        chain_id = row.get("chain_id")
+        chain_ordinal = row.get("chain_ordinal")
+        signature = row.get("chain_signature_sha256")
+        minimum = row.get("minimum_distance_angstrom")
+        if (
+            not isinstance(chain_id, str)
+            or isinstance(chain_ordinal, bool)
+            or not isinstance(chain_ordinal, int)
+            or chain_ordinal < 0
+            or not isinstance(signature, str)
+            or not valid_sha256(signature)
+            or isinstance(minimum, bool)
+            or not isinstance(minimum, (int, float))
+            or not math.isfinite(float(minimum))
+            or float(minimum) < 0.0
+        ):
+            raise MdProvenanceError("docking_receptor_contact_chains_invalid")
+        identity = (chain_id, chain_ordinal, signature)
+        if identity in identities:
+            raise MdProvenanceError("docking_receptor_contact_chain_duplicate")
+        identities.add(identity)
+    resolved["receptor_components"] = tuple(components)
+    resolved["receptor_contact_chains"] = tuple(contact_chains)
     return resolved
 
 
@@ -1162,7 +1212,7 @@ def resolve_md_invocation(job: dict[str, Any]) -> MdInvocationBinding:
             input_digest,
             docking_manifest,
         )
-        receptor_coordinate = docking_artifacts["receptor_coordinate"]
+        receptor_coordinate = docking_artifacts["receptor_pdb"]
         docking_ligand_sdf = docking_artifacts["ligand_sdf"]
         docking_ligand_pdbqt = docking_artifacts["ligand_pdbqt"]
         docking_pose_pdbqt = docking_artifacts["pose"]
@@ -1186,6 +1236,16 @@ def resolve_md_invocation(job: dict[str, Any]) -> MdInvocationBinding:
         docking_pose_pdbqt=docking_pose_pdbqt,
         docking_pose_sdf=docking_pose_sdf,
         output_dir=md_output_dir(run_dir, candidate_id, invocation_id).resolve(),
+        docking_receptor_components=tuple(
+            docking_artifacts.get("receptor_components", ())
+            if input_row["canonical_kind"] == "small_molecule"
+            else ()
+        ),
+        docking_receptor_contact_chains=tuple(
+            docking_artifacts.get("receptor_contact_chains", ())
+            if input_row["canonical_kind"] == "small_molecule"
+            else ()
+        ),
     )
 
 
@@ -1637,6 +1697,13 @@ def validate_complex_md_semantics(
         protocol[key] = row
     required_protocol = {
         ("platform", "openmm_platform"): "",
+        ("platform", "platform_policy"): "",
+        ("platform", "available_openmm_platforms"): "",
+        ("platform", "cuda_platform_detected"): "",
+        ("platform", "context_creation_failures"): "",
+        ("platform", "fallback_reason"): "",
+        ("sampling_policy", "policy_id"): "",
+        ("sampling_policy", "purpose"): "",
         ("integrator", "time_step"): "ps",
         ("production", "total_steps"): "steps",
         ("output", "frame_count"): "frames",
@@ -1648,6 +1715,60 @@ def validate_complex_md_semantics(
             raise MdProvenanceError("md_protocol_parameter_missing")
         if row.get("unit", "") != unit:
             raise MdProvenanceError("md_protocol_unit_invalid")
+    selected_platform = protocol[("platform", "openmm_platform")].get("value", "")
+    platform_policy = protocol[("platform", "platform_policy")].get("value", "")
+    fallback_reason = protocol[("platform", "fallback_reason")].get("value", "")
+    available_platforms = manifest.get("available_openmm_platforms")
+    context_failures = manifest.get("platform_context_failures")
+    if (
+        selected_platform != manifest.get("platform")
+        or platform_policy != manifest.get("platform_policy")
+        or platform_policy not in {"required", "preferred", "disabled"}
+        or not isinstance(available_platforms, list)
+        or not all(isinstance(name, str) and name for name in available_platforms)
+        or selected_platform not in available_platforms
+        or not isinstance(context_failures, list)
+        or not all(isinstance(reason, str) and reason for reason in context_failures)
+        or protocol[("platform", "available_openmm_platforms")].get("value", "")
+        != ",".join(available_platforms)
+        or protocol[("platform", "context_creation_failures")].get("value", "")
+        != ";".join(context_failures)
+    ):
+        raise MdProvenanceError("md_platform_evidence_invalid")
+    cuda_detected = "CUDA" in available_platforms
+    if (
+        manifest.get("cuda_platform_detected") is not cuda_detected
+        or protocol[("platform", "cuda_platform_detected")].get("value", "")
+        != bool_text(cuda_detected)
+        or manifest.get("platform_fallback_reason") != fallback_reason
+        or (selected_platform == "CUDA" and fallback_reason)
+        or (selected_platform != "CUDA" and not fallback_reason)
+        or (platform_policy == "required" and selected_platform != "CUDA")
+        or (platform_policy == "disabled" and selected_platform == "CUDA")
+        or (
+            platform_policy == "preferred"
+            and selected_platform != "CUDA"
+            and cuda_detected
+            and not any(reason.startswith("CUDA:") for reason in context_failures)
+        )
+        or (
+            platform_policy == "preferred"
+            and selected_platform != "CUDA"
+            and not cuda_detected
+            and "CUDA_platform_missing" not in fallback_reason.split(";")
+        )
+    ):
+        raise MdProvenanceError("md_platform_fallback_evidence_invalid")
+    sampling_policy = manifest.get("sampling_policy")
+    if (
+        not isinstance(sampling_policy, dict)
+        or sampling_policy.get("policy_id") != SHORT_MD_POLICY_ID
+        or protocol[("sampling_policy", "policy_id")].get("value", "")
+        != sampling_policy.get("policy_id")
+        or protocol[("sampling_policy", "purpose")].get("value", "")
+        != sampling_policy.get("purpose")
+    ):
+        raise MdProvenanceError("md_sampling_policy_invalid")
     validate_receptor_selection_semantics(binding, manifest, protocol)
     timestep = finite_float(protocol[("integrator", "time_step")].get("value"), "md_timestep_invalid")
     production_steps = int(
@@ -1663,6 +1784,18 @@ def validate_complex_md_semantics(
         raise MdProvenanceError("md_timestep_invalid")
     if production_steps <= 0:
         raise MdProvenanceError("md_production_steps_invalid")
+    if (
+        abs(finite_float(sampling_policy.get("timestep_ps"), "md_sampling_policy_invalid") - timestep)
+        > 1e-12
+        or int(
+            finite_float(
+                sampling_policy.get("production_steps_total"),
+                "md_sampling_policy_invalid",
+            )
+        )
+        != production_steps
+    ):
+        raise MdProvenanceError("md_sampling_policy_invalid")
     if frame_count < MINIMUM_MD_PRODUCTION_SAMPLES:
         raise MdProvenanceError("md_frame_count_invalid")
     if state_row_count < 2:
@@ -2131,15 +2264,6 @@ def read_receptor_structure(path: Path, app: Any) -> Any:
     return app.PDBFile(str(path)) if path.suffix.lower() in {".pdb", ".ent"} else app.PDBxFile(str(path))
 
 
-def chain_signature(chain: Any) -> str:
-    residues = [
-        [residue.name.upper(), str(residue.id), [atom.name for atom in residue.atoms() if getattr(atom, "element", None) is not None]]
-        for residue in chain.residues()
-        if residue.name.upper() in STANDARD_PROTEIN_RESIDUES
-    ]
-    return hashlib.sha256(json.dumps(residues, separators=(",", ":")).encode("utf-8")).hexdigest()
-
-
 def receptor_metal_components(path: Path, unit: Any) -> list[dict[str, Any]]:
     from openmm import app
 
@@ -2169,7 +2293,12 @@ def receptor_metal_components(path: Path, unit: Any) -> list[dict[str, Any]]:
     return sorted(components, key=lambda row: (row["chain_ordinal"], row["atom_index"], row["identity"]))
 
 
-def select_receptor_chain_from_pose(path: Path, mol: Any, unit: Any) -> dict[str, Any]:
+def select_receptor_chain_from_pose(
+    path: Path,
+    mol: Any,
+    unit: Any,
+    expected_contact_chains: tuple[dict[str, Any], ...] = (),
+) -> dict[str, Any]:
     import numpy as np
     from openmm import app
 
@@ -2206,7 +2335,29 @@ def select_receptor_chain_from_pose(path: Path, mol: Any, unit: Any) -> dict[str
             np.sqrt(((chain_positions[:, None, :] - ligand_positions[None, :, :]) ** 2).sum(axis=2)).min()
         )
         protein_chains.append((chain_ordinal, chain, minimum))
-    eligible = [row for row in protein_chains if row[2] <= RECEPTOR_CHAIN_CONTACT_CUTOFF_ANGSTROM]
+    expected_identities = {
+        (
+            str(row.get("chain_id", "")),
+            int(row.get("chain_ordinal", -1)),
+            str(row.get("chain_signature_sha256", "")),
+        )
+        for row in expected_contact_chains
+    }
+    actual_identities = {
+        (str(chain.id), chain_ordinal, chain_signature(chain))
+        for chain_ordinal, chain, _minimum in protein_chains
+    }
+    if expected_identities and not expected_identities <= actual_identities:
+        raise ValueError("docking_receptor_contact_chain_mismatch")
+    eligible = [
+        row
+        for row in protein_chains
+        if row[2] <= RECEPTOR_CHAIN_CONTACT_CUTOFF_ANGSTROM
+        and (
+            not expected_identities
+            or (str(row[1].id), row[0], chain_signature(row[1])) in expected_identities
+        )
+    ]
     if not eligible:
         raise ValueError("no_receptor_chain_within_pose_contact_cutoff")
     eligible.sort(key=lambda row: (row[2], row[0]))
@@ -2399,10 +2550,31 @@ def prepare_openff_ligand(mol: Any) -> tuple[Any, str, list[str]]:
 
 
 def md_platform_policy(job: dict[str, Any]) -> str:
-    policy = str(job.get("platform_policy", "")).strip().lower()
+    policy = str(job.get("platform_policy", "")).strip().lower() or "preferred"
     if policy not in {"required", "preferred", "disabled"}:
         raise ValueError("openmm_platform_policy_invalid")
     return policy
+
+
+def build_md_sampling_policy(
+    timestep_ps: float,
+    equilibration_steps: int,
+    production_segments: int,
+    production_steps_per_segment: int,
+) -> dict[str, Any]:
+    production_steps = production_segments * production_steps_per_segment
+    return {
+        "policy_id": SHORT_MD_POLICY_ID,
+        "purpose": "candidate_local_stability_screen",
+        "timestep_ps": timestep_ps,
+        "equilibration_steps": equilibration_steps,
+        "equilibration_time_ps": equilibration_steps * timestep_ps,
+        "production_segments": production_segments,
+        "production_steps_per_segment": production_steps_per_segment,
+        "production_steps_total": production_steps,
+        "production_time_ps": production_steps * timestep_ps,
+        "expected_frame_count": production_segments + 1,
+    }
 
 
 def available_openmm_platforms(openmm: Any) -> list[str]:
@@ -2455,7 +2627,12 @@ def create_openmm_context(
             else:
                 context = openmm.Context(system, integrator, platform)
         except Exception as exc:  # noqa: BLE001 - each policy defines deterministic fallback
-            failures.append(f"{name}:{type(exc).__name__}")
+            detail = safe_note(str(exc))
+            failures.append(
+                f"{name}:{type(exc).__name__}:{detail}"
+                if detail
+                else f"{name}:{type(exc).__name__}"
+            )
             continue
         return context, name, properties, failures
     if policy == "required":
@@ -2463,6 +2640,32 @@ def create_openmm_context(
         raise ValueError(f"gpu_required_context_unavailable:{detail}")
     detail = ";".join(failures) or "no_allowed_platform"
     raise ValueError(f"openmm_{policy}_context_unavailable:{detail}")
+
+
+def openmm_platform_execution_evidence(
+    policy: str,
+    selected_platform: str,
+    available_platforms: list[str],
+    platform_properties: dict[str, str],
+    context_failures: list[str],
+) -> dict[str, Any]:
+    if selected_platform == "CUDA":
+        fallback_reason = ""
+    elif policy == "disabled":
+        fallback_reason = ";".join(["cuda_disabled_by_policy", *context_failures])
+    elif "CUDA" not in available_platforms:
+        fallback_reason = ";".join(["CUDA_platform_missing", *context_failures])
+    else:
+        fallback_reason = ";".join(context_failures) or "CUDA_context_unavailable"
+    return {
+        "platform_policy": policy,
+        "available_openmm_platforms": available_platforms,
+        "cuda_platform_detected": "CUDA" in available_platforms,
+        "selected_platform": selected_platform,
+        "platform_properties": platform_properties,
+        "context_creation_failures": context_failures,
+        "fallback_reason": fallback_reason,
+    }
 
 
 def openmm_platform_properties(platform_name: str, platform: Any) -> dict[str, str]:
@@ -2909,6 +3112,9 @@ def build_md_protocol_rows(
     model_metadata: dict[str, Any],
 ) -> list[list[str]]:
     properties = ",".join(f"{key}={value}" for key, value in sorted(platform_properties.items()))
+    sampling_policy = model_metadata.get("sampling_policy", {})
+    device_evidence = model_metadata.get("execution_device", {})
+    available_platforms = ",".join(device_evidence.get("available_openmm_platforms", []))
     production_steps = production_segments * production_steps_per_segment
     equilibration_time_ps = equilibration_steps * timestep_ps
     production_time_ps = production_steps * timestep_ps
@@ -2937,6 +3143,13 @@ def build_md_protocol_rows(
         [candidate_id, input_id, "system", "nonbonded_method", str(model_metadata.get("nonbonded_method", "")), "", "OpenMM"],
         [candidate_id, input_id, "platform", "openmm_platform", platform_name, "", "OpenMM"],
         [candidate_id, input_id, "platform", "openmm_platform_properties", properties, "", "OpenMM"],
+        [candidate_id, input_id, "platform", "platform_policy", str(device_evidence.get("platform_policy", "")), "", "GenoLigand job"],
+        [candidate_id, input_id, "platform", "available_openmm_platforms", available_platforms, "", "OpenMM"],
+        [candidate_id, input_id, "platform", "cuda_platform_detected", bool_text(bool(device_evidence.get("cuda_platform_detected", False))), "", "OpenMM"],
+        [candidate_id, input_id, "platform", "context_creation_failures", ";".join(device_evidence.get("context_creation_failures", [])), "", "OpenMM Context"],
+        [candidate_id, input_id, "platform", "fallback_reason", str(device_evidence.get("fallback_reason", "")), "", "OpenMM Context"],
+        [candidate_id, input_id, "sampling_policy", "policy_id", str(sampling_policy.get("policy_id", "")), "", "GenoLigand"],
+        [candidate_id, input_id, "sampling_policy", "purpose", str(sampling_policy.get("purpose", "")), "", "GenoLigand"],
         [candidate_id, input_id, "integrator", "integrator", "LangevinMiddleIntegrator", "", "OpenMM"],
         [candidate_id, input_id, "integrator", "temperature", "300", "K", "OpenMM"],
         [candidate_id, input_id, "integrator", "friction", "1", "1/ps", "OpenMM"],
@@ -3299,6 +3512,8 @@ def write_md_artifacts(
     ensure_md_output_binding(run_dir, candidate_id, input_id, binding)
     tool_outputs = binding.output_dir
     tool_outputs.mkdir(parents=True, exist_ok=True)
+    device_evidence = model_metadata["execution_device"]
+    sampling_policy = model_metadata["sampling_policy"]
     score_note = "score_decomposition.tsv records Rust-owned candidate scores"
     risk_text = ";".join(risk_flags)
     summary_header = [
@@ -3420,6 +3635,10 @@ def write_md_artifacts(
             "platform_policy": platform_policy,
             "platform_context_failures": platform_failures,
             "platform_properties": platform_properties,
+            "available_openmm_platforms": device_evidence["available_openmm_platforms"],
+            "cuda_platform_detected": device_evidence["cuda_platform_detected"],
+            "platform_fallback_reason": device_evidence["fallback_reason"],
+            "sampling_policy": sampling_policy,
             "cuda_ready": platform_name == "CUDA" and bool(gpu_status["gpu_observed"]),
             "gpu_observed": bool(gpu_status["gpu_observed"]),
             "gpu_telemetry_artifact": md_artifact_relative(binding, "gpu_telemetry.tsv"),
@@ -3480,6 +3699,10 @@ def write_md_artifacts(
             "platform_policy": platform_policy,
             "platform_context_failures": platform_failures,
             "platform_properties": platform_properties,
+            "available_openmm_platforms": device_evidence["available_openmm_platforms"],
+            "cuda_platform_detected": device_evidence["cuda_platform_detected"],
+            "platform_fallback_reason": device_evidence["fallback_reason"],
+            "sampling_policy": sampling_policy,
             "system": model_metadata,
             "placement_method": placement_method,
             "protocol": bound_protocol_rows,
@@ -3712,6 +3935,7 @@ def write_complex_md_manifest(
 ) -> None:
     ensure_md_output_binding(binding.run_dir, candidate_id, input_id, binding)
     path = resolve_run_artifact(binding.run_dir, path, must_exist=False)
+    device_evidence = model_metadata["execution_device"]
     write_json(
         path,
         {
@@ -3721,6 +3945,10 @@ def write_complex_md_manifest(
             "platform_policy": platform_policy,
             "platform_context_failures": platform_failures,
             "platform_properties": platform_properties,
+            "available_openmm_platforms": device_evidence["available_openmm_platforms"],
+            "cuda_platform_detected": device_evidence["cuda_platform_detected"],
+            "platform_fallback_reason": device_evidence["fallback_reason"],
+            "sampling_policy": model_metadata["sampling_policy"],
             "system": model_metadata,
             "cuda_ready": platform_name == "CUDA" and bool(gpu_status["gpu_observed"]),
             "gpu_observed": bool(gpu_status["gpu_observed"]),

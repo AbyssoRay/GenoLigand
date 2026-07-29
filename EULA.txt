@@ -1,6 +1,7 @@
 GENOLIGAND END USER LICENSE AGREEMENT
 
-Version: 0.1.0
+Product Version: 0.9.76
+EULA Revision: 1
 
 This End User License Agreement ("EULA") governs use of the GenoLigand software and related materials ("Software"). By using the Software, you agree to this EULA.
 

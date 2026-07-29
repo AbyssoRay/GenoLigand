@@ -2,6 +2,8 @@
 
 GenoLigand 是本地运行的科研软件，用于从小分子、多肽、蛋白质配体、复合物结构或自定义基因组/宏基因组输入出发，计算相互作用特征，并在已知蛋白数据库与潜在序列空间中排序候选靶点。
 
+当前产品版本为 `0.9.76`，对应发布标签 `v0.9.76`。CLI、服务端、运行时 manifest 与健康接口同时公开 `version`、`commit` 和 `build_id`；`build_id` 的格式为 `<version>+<40 位 commit>`。
+
 ## 安装并启动
 
 Windows / WSL2：
@@ -17,6 +19,8 @@ Linux：
 ```
 
 安装入口会准备 `gls-cli`、`gls-server`、Python worker、科学工具、数据库仓库和索引。完成后打开本地 WebUI，输入自己的研究对象，按 `Input -> Configure -> Check -> Run -> Results -> Export` 完成一次运行。
+
+更新代码或换用新发行包后重新执行同一个安装命令。安装器会核对构建身份并替换旧运行时二进制，科学数据库和已完成索引继续复用。可通过 `gls-cli --version`、`gls-server --version` 或 `/api/user/health` 核对当前运行版本。
 
 ## 用户流程
 

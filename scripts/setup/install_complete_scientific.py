@@ -221,7 +221,7 @@ SCIENCE_READINESS_EVIDENCE_PATHS = (
     "downloads/rcsb/ligand_bound_pdb_scope.tsv",
     "downloads/rcsb/on_demand_policy.json",
 )
-RUNTIME_BINARY_MANIFEST_SCHEMA_VERSION = "genoligand_runtime_binary_manifest_v1"
+RUNTIME_BINARY_MANIFEST_SCHEMA_VERSION = "genoligand_runtime_binary_manifest_v2"
 SOURCE_FINGERPRINT_CACHE_SCHEMA_VERSION = "genoligand_source_fingerprint_cache_v1"
 SOURCE_PAYLOAD_VALIDATION_SCHEMA_VERSION = "genoligand_source_payload_validation_v1"
 PUBLISHER_INVENTORY_CACHE_SCHEMA_VERSION = "genoligand_publisher_inventory_cache_v1"
@@ -676,14 +676,19 @@ def resolve_binary_command(
     if env_value:
         return command_from_string(env_value)
     executable = f"{binary_name}.exe" if os.name == "nt" else binary_name
+    packaged = [
+        root / "bin" / executable,
+        root / "tools" / "bin" / executable,
+    ]
+    if not workspace_commit(root):
+        for candidate in packaged:
+            if candidate.is_file():
+                return [str(candidate)]
     built = build_release_binary(root, binary_name, cargo_package)
     if built:
         return [str(built)]
-    for candidate in [
-        root / "bin" / executable,
-        root / "tools" / "bin" / executable,
-    ]:
-        if candidate.exists():
+    for candidate in packaged:
+        if candidate.is_file():
             return [str(candidate)]
     release_binary = root / "target" / "release" / executable
     if release_binary.exists():
@@ -706,6 +711,38 @@ def runtime_instance_record_path(runtime_dir: Path, binary_name: str) -> Path:
     return runtime_dir / f"{binary_name}.instance.json"
 
 
+def reconcile_runtime_instance_record(runtime_dir: Path, binary_name: str) -> dict[str, object]:
+    record_path = runtime_instance_record_path(runtime_dir, binary_name)
+    if not record_path.is_file():
+        return {"status": "missing", "path": str(record_path), "pid": 0, "returncode": 0}
+    record = read_json_object(record_path)
+    try:
+        pid = int(record.get("pid", 0) or 0)
+    except (TypeError, ValueError):
+        pid = 0
+    valid = (
+        bool(record.get("instance_id"))
+        and record.get("binary") == binary_name
+        and pid > 0
+    )
+    if valid and process_identity_matches(pid, record.get("started_at")):
+        return {
+            "status": "running",
+            "path": str(record_path),
+            "instance_id": str(record.get("instance_id", "")),
+            "pid": pid,
+            "returncode": 0,
+        }
+    record_path.unlink(missing_ok=True)
+    return {
+        "status": "stale_instance_removed",
+        "path": str(record_path),
+        "instance_id": str(record.get("instance_id", "")),
+        "pid": pid,
+        "returncode": 0,
+    }
+
+
 def terminate_runtime_pid(pid: int) -> tuple[list[str], subprocess.CompletedProcess[str]]:
     if os.name == "nt":
         command = ["taskkill", "/PID", str(pid), "/T", "/F"]
@@ -716,6 +753,9 @@ def terminate_runtime_pid(pid: int) -> tuple[list[str], subprocess.CompletedProc
 
 
 def stop_runtime_binary_process(runtime_dir: Path, binary_name: str) -> dict[str, object]:
+    reconciliation = reconcile_runtime_instance_record(runtime_dir, binary_name)
+    if reconciliation.get("status") != "running":
+        return reconciliation
     record_path = runtime_instance_record_path(runtime_dir, binary_name)
     record = read_json_object(record_path)
     instance_id = str(record.get("instance_id", ""))
@@ -732,15 +772,6 @@ def stop_runtime_binary_process(runtime_dir: Path, binary_name: str) -> dict[str
             "returncode": 1,
             "stdout": "",
             "stderr": "runtime instance record is missing or invalid",
-        }
-    if not process_identity_matches(pid, record.get("started_at")):
-        return {
-            "status": "stale_instance_record",
-            "instance_id": instance_id,
-            "pid": pid,
-            "returncode": 1,
-            "stdout": "",
-            "stderr": "recorded runtime process no longer exists",
         }
     command, completed = terminate_runtime_pid(pid)
     return {
@@ -790,6 +821,10 @@ def workspace_commit(workspace_root: Path) -> str:
     return value if completed.returncode == 0 and re.fullmatch(r"[0-9a-f]{40}", value) else ""
 
 
+def release_build_id(version: str, commit: str) -> str:
+    return f"{version}+{commit}" if version and commit else ""
+
+
 def runtime_binary_smoke(
     command: list[str], expected_version: str, expected_commit: str
 ) -> dict[str, str]:
@@ -800,6 +835,7 @@ def runtime_binary_smoke(
             "status": "failed",
             "version": "",
             "commit": "",
+            "build_id": "",
             "notes": exception_note(err),
         }
     output = f"{completed.stdout}\n{completed.stderr}".strip()
@@ -807,17 +843,23 @@ def runtime_binary_smoke(
     version = version_match.group(1) if version_match else ""
     commit_match = re.search(r"\b([0-9a-f]{40})\b", output.lower())
     commit = commit_match.group(1) if commit_match else ""
+    build_id_match = re.search(r"\bbuild_id\s+([^\s]+)", output)
+    build_id = build_id_match.group(1) if build_id_match else ""
+    expected_build_id = release_build_id(expected_version or version, expected_commit or commit)
     ready = (
         completed.returncode == 0
         and bool(version)
         and bool(commit)
+        and bool(build_id)
         and (not expected_version or version == expected_version)
         and (not expected_commit or commit == expected_commit)
+        and build_id == expected_build_id
     )
     return {
         "status": "ready" if ready else "failed",
         "version": version,
         "commit": commit,
+        "build_id": build_id,
         "notes": output.replace("\t", " ").replace("\n", " ")[:240],
     }
 
@@ -831,8 +873,9 @@ def publish_runtime_binary(
     expected_commit = ""
     expected_version = ""
     if workspace_root is not None:
-        expected_commit = require_clean_workspace_commit(workspace_root)
         expected_version = workspace_release_version(workspace_root)
+        if workspace_commit(workspace_root):
+            expected_commit = require_clean_workspace_commit(workspace_root)
     bin_dir = runtime_dir / "bin"
     bin_dir.mkdir(parents=True, exist_ok=True)
     executable = runtime_executable_name(binary_name)
@@ -851,7 +894,9 @@ def publish_runtime_binary(
             source_smoke = runtime_binary_smoke([str(source)], expected_version, expected_commit)
             if source_smoke["status"] != "ready":
                 raise BinaryBuildError("runtime_binary_identity_mismatch")
-            if require_clean_workspace_commit(workspace_root) != expected_commit:
+            if not expected_commit:
+                expected_commit = source_smoke["commit"]
+            if workspace_commit(workspace_root) and require_clean_workspace_commit(workspace_root) != expected_commit:
                 raise BinaryBuildError("runtime_source_commit_changed_before_publish")
         target = bin_dir / executable
         stop_result = None
@@ -876,6 +921,8 @@ def publish_runtime_binary(
                     "expected_version": expected_version,
                     "commit": smoke["commit"],
                     "expected_commit": expected_commit,
+                    "build_id": smoke["build_id"],
+                    "expected_build_id": release_build_id(expected_version, expected_commit),
                     "smoke": smoke["status"],
                     "smoke_notes": smoke["notes"],
                 }
@@ -904,19 +951,34 @@ def write_runtime_binary_manifest(
                 "version": "worker-v2",
                 "expected_version": "worker-v2",
                 "commit": records[0].get("commit", "") if records else "",
+                "expected_commit": records[0].get("expected_commit", "") if records else "",
+                "build_id": records[0].get("build_id", "") if records else "",
+                "expected_build_id": records[0].get("expected_build_id", "") if records else "",
                 "build_profile": "generated-wrapper",
                 "smoke": "ready" if exists else "failed",
             }
         )
     required = {"gls-cli", "gls-server", "python_worker_wrapper"}
     by_name = {str(row.get("binary", "")): row for row in records}
-    ready = all(
+    release_rows = [by_name.get("gls-cli", {}), by_name.get("gls-server", {})]
+    version = str(release_rows[0].get("version", ""))
+    commit = str(release_rows[0].get("commit", ""))
+    build_id = str(release_rows[0].get("build_id", ""))
+    identity_ready = all(
+        row.get("version") == version
+        and row.get("commit") == commit
+        and row.get("build_id") == build_id
+        for row in release_rows
+    )
+    ready = identity_ready and all(
         name in by_name
         and by_name[name].get("status") == "ready"
         and by_name[name].get("sha256")
         and by_name[name].get("version")
         and by_name[name].get("commit")
         and by_name[name].get("commit") == by_name[name].get("expected_commit", by_name[name].get("commit"))
+        and by_name[name].get("build_id")
+        and by_name[name].get("build_id") == by_name[name].get("expected_build_id", by_name[name].get("build_id"))
         and by_name[name].get("smoke") == "ready"
         for name in required
     )
@@ -929,6 +991,8 @@ def write_runtime_binary_manifest(
         "expected_version",
         "commit",
         "expected_commit",
+        "build_id",
+        "expected_build_id",
         "build_profile",
         "smoke",
         "smoke_notes",
@@ -943,6 +1007,9 @@ def write_runtime_binary_manifest(
     payload = {
         "schema_version": RUNTIME_BINARY_MANIFEST_SCHEMA_VERSION,
         "status": "ready" if ready else "needs_repair",
+        "version": version,
+        "commit": commit,
+        "build_id": build_id,
         "manifest": str(manifest),
         "manifest_digest": digest,
         "binaries": records,
@@ -987,6 +1054,7 @@ def run_runtime_instance(
     binary_name: str,
     env: dict[str, str],
 ) -> int:
+    reconcile_runtime_instance_record(runtime_dir, binary_name)
     process = subprocess.Popen(command, env=env)
     record_path, instance_id = write_runtime_instance_record(runtime_dir, binary_name, process)
     try:
@@ -1063,12 +1131,42 @@ def write_runtime_launch_environment(
                 f"configured_env = {env!r}",
                 f"path_prepend = {path_prepend!r}",
                 f"runtime_dir = Path({str(runtime_dir)!r})",
+                "def process_alive(pid):",
+                "    if pid <= 0:",
+                "        return False",
+                "    if os.name == 'nt':",
+                "        try:",
+                "            import ctypes",
+                "            handle = ctypes.windll.kernel32.OpenProcess(0x1000, False, pid)",
+                "            if handle:",
+                "                ctypes.windll.kernel32.CloseHandle(handle)",
+                "                return True",
+                "            return ctypes.get_last_error() == 5",
+                "        except (AttributeError, OSError, ValueError):",
+                "            return False",
+                "    try:",
+                "        os.kill(pid, 0)",
+                "        return True",
+                "    except PermissionError:",
+                "        return True",
+                "    except OSError:",
+                "        return False",
+                "record_path = runtime_dir / 'gls-server.instance.json'",
+                "try:",
+                "    previous = json.loads(record_path.read_text(encoding='utf-8'))",
+                "except (OSError, json.JSONDecodeError):",
+                "    previous = {}",
+                "try:",
+                "    previous_pid = int(previous.get('pid', 0) or 0)",
+                "except (TypeError, ValueError):",
+                "    previous_pid = 0",
+                "if record_path.is_file() and not process_alive(previous_pid):",
+                "    record_path.unlink(missing_ok=True)",
                 "environment = os.environ.copy()",
                 "environment.update(configured_env)",
                 "environment['PATH'] = os.pathsep.join([*path_prepend, environment.get('PATH', '')])",
                 "process = subprocess.Popen(command, env=environment)",
                 "instance_id = uuid.uuid4().hex",
-                "record_path = runtime_dir / 'gls-server.instance.json'",
                 "record = {'instance_id': instance_id, 'binary': 'gls-server', 'pid': process.pid, 'started_at': time.time(), 'created_at': time.time()}",
                 "temporary = record_path.with_name(f'.{record_path.name}.{instance_id}.tmp')",
                 "temporary.write_text(json.dumps(record, indent=2) + '\\n', encoding='utf-8')",
@@ -4815,9 +4913,9 @@ def publish_chembl_query_database(
                     td.organism AS organism,
                     md.pref_name AS compound_name,
                     act.standard_type AS standard_type,
-                    act.standard_relation AS standard_relation,
+                    '=' AS standard_relation,
                     act.standard_value AS standard_value,
-                    COALESCE(act.standard_units, '') AS standard_units
+                    'nM' AS standard_units
                 FROM chembl_source.activities AS act
                 JOIN chembl_source.assays AS assay ON assay.assay_id = act.assay_id
                 JOIN chembl_source.target_dictionary AS td ON td.tid = assay.tid
@@ -4843,7 +4941,12 @@ def publish_chembl_query_database(
                   AND td.chembl_id IS NOT NULL
                   AND act.standard_type IN ('Ki', 'Kd', 'IC50', 'EC50')
                   AND act.standard_value IS NOT NULL
-                  AND (act.standard_units IS NULL OR act.standard_units = '' OR act.standard_units = 'nM')
+                  AND TYPEOF(act.standard_value) IN ('integer', 'real')
+                  AND act.standard_value > 0.0
+                  AND act.standard_value < 1.0e308
+                  AND TRIM(COALESCE(act.standard_relation, '')) = '='
+                  AND LOWER(TRIM(COALESCE(act.standard_units, ''))) = 'nm'
+                  AND LOWER(TRIM(COALESCE(act.data_validity_comment, ''))) IN ('', 'manually validated')
                 """,
             )
             if target_disk_guard():
@@ -6531,16 +6634,10 @@ def prune_rcsb_on_demand_cache(
     write_rcsb_on_demand_policy(science_store, snapshot)
     foldseek_manifest = science_store / "indexes/foldseek/foldseek_target_databases.tsv"
     foldseek_rows = read_tsv(foldseek_manifest)
-    scope_rows = read_tsv(science_store / "downloads/rcsb/ligand_bound_pdb_scope.tsv")
-    current_scope_ids = {
-        row.get("pdb_id", "").upper()
-        for row in scope_rows
-        if row.get("pdb_id")
-    }
     cached_ids = {
-        row.get("pdb_id", "").upper()
-        for row in scope_rows
-        if row.get("status") == "ready"
+        path.name[:-7].upper()
+        for path in cache_root.rglob("*.cif.gz")
+        if valid_pdb_id(path.name[:-7].upper())
     }
     for row in foldseek_rows:
         if row.get("source_id") != "rcsb_mmcif" or row.get("status") != "ready":
@@ -6566,7 +6663,7 @@ def prune_rcsb_on_demand_cache(
                 "scope_missing_count": str(snapshot["missing_count"]),
                 "scope_coverage": f"{row.get('indexed_pdb_count', 0)}/{snapshot['scope_count']}",
                 "refresh_needed": str(
-                    bool((cached_ids - indexed_ids) or (indexed_ids - current_scope_ids))
+                    cached_ids != indexed_ids
                 ).lower(),
             }
         )
@@ -9466,8 +9563,6 @@ def foldseek_partial_manifest_validation(
             return {"status": "failed", "reason": "foldseek_partial_validated_ids_empty"}
         if set(mapping["pdb_ids"]) != set(indexed_by_id):
             return {"status": "failed", "reason": "foldseek_partial_source_validated_ids_mismatch"}
-        scope_rows = rcsb_scope_rows_for_ids(science_store, set(indexed_by_id))
-        retired_indexed_ids = set(indexed_by_id) - set(scope_rows)
         indexed_entries = int(mapping["indexed_entries"])
         indexed_pdb_count = len(indexed_by_id)
         subset_digest = foldseek_subset_digest(
@@ -9495,10 +9590,11 @@ def foldseek_partial_manifest_validation(
             return {"status": "failed", "reason": "foldseek_partial_manifest_binding_mismatch"}
         if probe_database and not database_prefix_ready("foldseek", db_path, command, env, wsl_distro):
             return {"status": "failed", "reason": "foldseek_partial_database_smoke_failed"}
+        cache_root = science_store / "downloads/rcsb/mmcif"
         cached_ids = {
-            row.get("pdb_id", "").upper()
-            for row in read_tsv(science_store / "downloads/rcsb/ligand_bound_pdb_scope.tsv")
-            if row.get("status") == "ready"
+            path.name[:-7].upper()
+            for path in cache_root.rglob("*.cif.gz")
+            if valid_pdb_id(path.name[:-7].upper())
         }
         return {
             "status": "ready",
@@ -9511,9 +9607,7 @@ def foldseek_partial_manifest_validation(
             "indexed_pdb_count": indexed_pdb_count,
             "indexed_entries": indexed_entries,
             "indexed_coordinate_bytes": coordinate_bytes,
-            "refresh_needed": bool(
-                (cached_ids - set(indexed_by_id)) or retired_indexed_ids
-            ),
+            "refresh_needed": cached_ids != set(indexed_by_id),
         }
     except (OSError, UnicodeError, ValueError) as err:
         return {"status": "failed", "reason": f"foldseek_partial_validation_failed:{exception_note(err)}"}
@@ -9551,8 +9645,18 @@ def foldseek_legacy_partial_migration(
     if not pdb_ids:
         return {"status": "failed", "reason": "legacy_foldseek_source_listing_empty"}
     scope_rows = rcsb_scope_rows_for_ids(science_store, pdb_ids)
-    if set(scope_rows) != pdb_ids:
-        return {"status": "failed", "reason": "legacy_foldseek_indexed_ids_outside_scope"}
+    cache_root = science_store / "downloads/rcsb/mmcif"
+    for pdb_id in pdb_ids - set(scope_rows):
+        coordinate = cache_root / pdb_id[1:3].lower() / f"{pdb_id.lower()}.cif.gz"
+        if not valid_rcsb_coordinate(coordinate, pdb_id):
+            return {"status": "failed", "reason": "legacy_foldseek_indexed_ids_outside_cache"}
+        scope_rows[pdb_id] = {
+            "pdb_id": pdb_id,
+            "status": "ready",
+            "coordinate_rel_path": relative_path(science_store, coordinate),
+            "size_bytes": str(coordinate.stat().st_size),
+            "sha256": sha256_file(coordinate),
+        }
 
     rows: list[dict[str, str]] = []
     coordinate_bytes = 0
@@ -9726,13 +9830,14 @@ def build_foldseek_target_database(
             source_summary,
             builder_version,
         )
-        force_rebuild = database_artifacts_present(db_path) and not (
-            alignment_source_manifest_matches(previous, source_summary, builder_version) or migrated
+        force_rebuild = database_artifacts_present(db_path) and (
+            (mode == "on-demand" and partial.get("status") != "ready")
+            or not (alignment_source_manifest_matches(previous, source_summary, builder_version) or migrated)
         )
         scope_validation = rcsb_scope_snapshot_validation(
             science_store,
             expected_mode=mode,
-            source_summary=source_summary,
+            source_summary=None if mode == "on-demand" else source_summary,
             check_current_scope=True,
         )
         scope_usable = scope_validation.get("status") == (
@@ -9759,17 +9864,40 @@ def build_foldseek_target_database(
             except (OSError, UnicodeError, ValueError) as err:
                 status = "failed"
                 notes = f"foldseek_database_index_invalid:{exception_note(err)}"
-        partial = {
-            "indexed_source_listing_sha256": "",
-            "indexed_validated_ids_manifest": "",
-            "indexed_validated_ids_sha256": "",
-            "indexed_mapping_sha256": "",
-            "indexed_subset_digest": source_fields["source_digest"],
-            "indexed_pdb_count": source_fields["source_files"],
-            "indexed_entries": indexed_entries,
-            "indexed_coordinate_bytes": source_fields["source_bytes"],
-            "refresh_needed": False,
-        }
+        if status == "ready" and mode == "on-demand":
+            partial = foldseek_legacy_partial_migration(
+                science_store,
+                db_path,
+                command,
+                env,
+                wsl_distro,
+                scope_snapshot,
+                validated_subset_manifest,
+            )
+            if partial.get("status") == "ready":
+                source_fields = {
+                    "manifest_schema_version": ALIGNMENT_MANIFEST_SCHEMA_VERSION,
+                    "source_digest": str(partial["indexed_subset_digest"]),
+                    "source_files": str(partial["indexed_pdb_count"]),
+                    "source_bytes": str(partial["indexed_coordinate_bytes"]),
+                    "builder_version": builder_version,
+                }
+                notes = f"{notes};ready_partial_on_demand:validated_index_identity_published"
+            else:
+                status = "failed"
+                notes = str(partial.get("reason", "foldseek_partial_identity_publish_failed"))
+        else:
+            partial = {
+                "indexed_source_listing_sha256": "",
+                "indexed_validated_ids_manifest": "",
+                "indexed_validated_ids_sha256": "",
+                "indexed_mapping_sha256": "",
+                "indexed_subset_digest": source_fields["source_digest"],
+                "indexed_pdb_count": source_fields["source_files"],
+                "indexed_entries": indexed_entries,
+                "indexed_coordinate_bytes": source_fields["source_bytes"],
+                "refresh_needed": False,
+            }
     rows = [
         {
             "source_id": "rcsb_mmcif",
@@ -9998,17 +10126,16 @@ def rebuild_foldseek_database(
         if not database_prefix_ready("foldseek", scratch_db, command, env, wsl_distro):
             return "failed", "rebuild_failed_previous_preserved:foldseek_scratch_database_smoke_failed"
 
-        publish_note = "precomputed_index_retained"
+        removed_precomputed = remove_foldseek_precomputed_index(scratch_db)
+        if removed_precomputed and not database_prefix_ready("foldseek", scratch_db, command, env, wsl_distro):
+            return "failed", "rebuild_failed_previous_preserved:foldseek_compact_database_smoke_failed"
+        publish_note = (
+            "precomputed_index_removed_for_compact_publish"
+            if removed_precomputed
+            else "precomputed_index_absent"
+        )
         target_available = int(shutil.disk_usage(existing_path_for_disk_usage(db_path.parent)).free)
         staged_bytes = directory_size(scratch_parent)
-        if staged_bytes + DISK_SAFETY_MARGIN_BYTES > target_available:
-            if not remove_foldseek_precomputed_index(scratch_db):
-                return "failed", "rebuild_failed_previous_preserved:insufficient_target_disk_for_compact_publish"
-            if not database_prefix_ready("foldseek", scratch_db, command, env, wsl_distro):
-                return "failed", "rebuild_failed_previous_preserved:foldseek_compact_database_smoke_failed"
-            publish_note = "precomputed_index_removed_for_target_capacity"
-            staged_bytes = directory_size(scratch_parent)
-            target_available = int(shutil.disk_usage(existing_path_for_disk_usage(db_path.parent)).free)
         if staged_bytes + DISK_SAFETY_MARGIN_BYTES > target_available:
             return "failed", "rebuild_failed_previous_preserved:insufficient_target_disk_for_compact_publish"
 
@@ -10128,10 +10255,13 @@ def foldseek_staging_estimate(
 
 
 def remove_foldseek_precomputed_index(db_path: Path) -> bool:
-    index_prefix = f"{db_path.name}.idx"
+    index_prefixes = (f"{db_path.name}.idx", f"{db_path.name}_ss.idx")
     removed = False
     for path in foldseek_database_artifact_files(db_path):
-        if path.name != index_prefix and not path.name.startswith(f"{index_prefix}."):
+        if not any(
+            path.name == prefix or path.name.startswith(f"{prefix}.")
+            for prefix in index_prefixes
+        ):
             continue
         path.unlink(missing_ok=True)
         removed = True
@@ -11128,6 +11258,11 @@ def write_science_resource_manifests(
                 "execution_validation_reason": "external_sync_evidence_validated",
             }
         )
+    rcsb_scope_mode = str(
+        read_json_object(science_store / "downloads/rcsb/ligand_bound_pdb_scope.json").get(
+            "scope_mode", ""
+        )
+    ).replace("_", "-")
     total = 0
     ready = 0
     hash_ready = 0
@@ -11216,7 +11351,7 @@ def write_science_resource_manifests(
                 rcsb_scope_snapshot_validation(
                     science_store,
                     execution=external_executions.get(source_id, {}),
-                    source_summary=summary,
+                    source_summary=None if rcsb_scope_mode == "on-demand" else summary,
                 )
                 if source_id == "rcsb_ligand_bound" and row["source_class"] != "direct_download"
                 else {"status": "not_applicable"}
@@ -12478,6 +12613,11 @@ def evaluate_installer_science_store_readiness(
         for row in read_tsv(science_store / "external_sync_execution_manifest.tsv")
         if row.get("source_id", "")
     }
+    rcsb_scope_mode = str(
+        read_json_object(science_store / "downloads/rcsb/ligand_bound_pdb_scope.json").get(
+            "scope_mode", ""
+        )
+    ).replace("_", "-")
     grouped: dict[str, list[dict[str, str]]] = {}
     for row in source_rows:
         logical = row.get("logical_source") or row.get("source_id") or "unknown_source"
@@ -12509,11 +12649,15 @@ def evaluate_installer_science_store_readiness(
             rcsb_scope_snapshot_validation(
                 science_store,
                 execution=external_execution_rows.get("rcsb_ligand_bound", {}),
-                source_summary={
-                    "file_count": source_manifest.get("file_count", ""),
-                    "bytes": source_manifest.get("bytes", ""),
-                    "sha256": source_digest,
-                },
+                source_summary=(
+                    None
+                    if rcsb_scope_mode == "on-demand"
+                    else {
+                        "file_count": source_manifest.get("file_count", ""),
+                        "bytes": source_manifest.get("bytes", ""),
+                        "sha256": source_digest,
+                    }
+                ),
             )
             if logical == "rcsb_ligand_bound"
             else {"status": "not_applicable"}
@@ -12759,6 +12903,8 @@ def evaluate_installer_science_store_readiness(
         if tool_id not in tool_rows or tool_rows[tool_id].get("status") != "ready":
             block(f"tool_required:{tool_id}", "tools", tool_id, "install_or_repair_scientific_tools")
 
+    foldseek_refresh_evidence = ""
+    foldseek_refresh_action = "refresh_foldseek_when_convenient"
     for tool, rel_path in [
         ("mmseqs", "indexes/mmseqs/mmseqs_target_databases.tsv"),
         ("foldseek", "indexes/foldseek/foldseek_target_databases.tsv"),
@@ -12766,6 +12912,9 @@ def evaluate_installer_science_store_readiness(
         rows = read_tsv(science_store / rel_path)
         if not rows:
             block(f"alignment_manifest_empty:{tool}", "alignment", rel_path, "build_alignment_database")
+            if tool == "foldseek":
+                foldseek_refresh_evidence = "indexed_identity_manifest_missing_or_invalid"
+                foldseek_refresh_action = "migrate_or_rebuild_alignment_database"
             continue
         for row in rows:
             required = [
@@ -12805,6 +12954,13 @@ def evaluate_installer_science_store_readiness(
                     "migrate_or_rebuild_alignment_database",
                 )
                 continue
+            if (
+                tool == "foldseek"
+                and row.get("scope_mode") == "on_demand"
+                and row.get("scope_status") != "ready_partial_on_demand"
+            ):
+                foldseek_refresh_evidence = "indexed_identity_manifest_missing_or_invalid"
+                foldseek_refresh_action = "migrate_or_rebuild_alignment_database"
             if tool == "foldseek" and row.get("scope_status") == "ready_partial_on_demand":
                 db_path = resolve_manifest_path(science_store, row.get("db_path", ""))
                 validation = (
@@ -12824,6 +12980,8 @@ def evaluate_installer_science_store_readiness(
                         str(validation.get("reason", "foldseek_partial_validation_failed")),
                         "migrate_or_rebuild_alignment_database",
                     )
+                elif validation.get("refresh_needed"):
+                    foldseek_refresh_evidence = "cached coordinate set is not covered by the validated Foldseek identity"
 
     rcsb_root = science_store / "downloads/rcsb/mmcif"
     rcsb_snapshot = read_json_object(science_store / "downloads/rcsb/ligand_bound_pdb_scope.json")
@@ -12855,15 +13013,20 @@ def evaluate_installer_science_store_readiness(
         and int(rcsb_source_summary.get("file_count", 0) or 0) >= rcsb_ready_count
         and int(rcsb_source_summary.get("bytes", 0) or 0) >= int(rcsb_snapshot.get("coordinate_bytes", 0) or 0)
     )
-    rcsb_refresh_needed = bool(
-        snapshot_common_valid
-        and (
-            rcsb_validation.get("refresh_needed")
-            or rcsb_snapshot.get("coordinate_files") != rcsb_source_summary.get("file_count")
-            or rcsb_snapshot.get("coordinate_bytes") != rcsb_source_summary.get("bytes")
-            or rcsb_validation.get("source_digest") != rcsb_source_summary.get("sha256")
+    if rcsb_mode == "on-demand":
+        rcsb_refresh_needed = bool(
+            rcsb_validation.get("refresh_needed") or foldseek_refresh_evidence
         )
-    )
+    else:
+        rcsb_refresh_needed = bool(
+            snapshot_common_valid
+            and (
+                rcsb_validation.get("refresh_needed")
+                or rcsb_snapshot.get("coordinate_files") != rcsb_source_summary.get("file_count")
+                or rcsb_snapshot.get("coordinate_bytes") != rcsb_source_summary.get("bytes")
+                or rcsb_validation.get("source_digest") != rcsb_source_summary.get("sha256")
+            )
+        ) or bool(foldseek_refresh_evidence)
     if rcsb_mode == "on-demand":
         rcsb_scope_valid = snapshot_common_valid and rcsb_validation.get("status") == "ready_partial_on_demand"
     else:
@@ -12886,8 +13049,9 @@ def evaluate_installer_science_store_readiness(
             {
                 "code": "rcsb_foldseek_refresh_needed",
                 "component": "rcsb",
-                "evidence": "cached coordinate set changed after the published snapshot",
-                "action": "refresh_foldseek_when_convenient",
+                "evidence": foldseek_refresh_evidence
+                or "cached coordinate set changed after the published snapshot",
+                "action": foldseek_refresh_action,
             }
         )
     if rcsb_resumable_partials and rcsb_mode == "on-demand":
@@ -13127,17 +13291,24 @@ def forcefield_user_summary(forcefield_result: dict[str, object]) -> dict[str, o
 
 def runtime_user_summary(payload: dict[str, object]) -> dict[str, object]:
     binaries = payload.get("runtime_binaries")
+    manifest = payload.get("runtime_binary_manifest")
     launch_environment = payload.get("launch_environment")
     if not isinstance(binaries, dict):
         binaries = {}
     if not isinstance(launch_environment, dict):
         launch_environment = {}
+    if not isinstance(manifest, dict):
+        manifest = {}
     def binary_ready(name: str) -> bool:
         item = binaries.get(name)
         return isinstance(item, dict) and item.get("status") == "ready"
 
     launcher = str(launch_environment.get("launcher", ""))
     return {
+        "status": str(manifest.get("status", "needs_repair")),
+        "version": str(manifest.get("version", "")),
+        "commit": str(manifest.get("commit", "")),
+        "build_id": str(manifest.get("build_id", "")),
         "gls_cli_ready": binary_ready("gls_cli"),
         "gls_server_ready": binary_ready("gls_server"),
         "launcher": Path(launcher).name if launcher else "",

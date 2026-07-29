@@ -121,6 +121,11 @@ function discardStaleInputSave(saveGeneration) {
   return false;
 }
 
+function resetResultViewState() {
+  state.resultTab = "ranking";
+  state.resultQueries = {};
+}
+
 function scheduleInputInspection() {
   invalidateInputInspection();
   if (!filledInputs().length) return;
@@ -237,6 +242,7 @@ async function saveInput() {
     }
     state.project = savedProject;
     state.savedInputs = inputPayload;
+    resetResultViewState();
     state.run = null;
     state.runData = null;
     state.preflight = null;
@@ -268,6 +274,7 @@ async function saveInput() {
 async function createNewProject() {
   projectOpenGeneration += 1;
   cancelResultRequest();
+  resetResultViewState();
   state.alert = "";
   invalidateInputInspection();
   const created = await api("/api/user/projects", { method: "POST", body: "{}" });
@@ -285,6 +292,7 @@ async function openExistingProject(projectId) {
   projectOpenGeneration = generation;
   state.alert = "";
   cancelResultRequest();
+  resetResultViewState();
   stopRunProgressPolling();
   resetInputForm();
   state.preflight = null;
@@ -316,6 +324,7 @@ async function deleteExistingProject(projectId) {
   if (state.project?.project_id === projectId) {
     projectOpenGeneration += 1;
     cancelResultRequest();
+    resetResultViewState();
     invalidateInputInspection();
   }
   const deleted = await api(`/api/user/projects/${projectId}`, { method: "DELETE" });
@@ -338,6 +347,19 @@ async function deleteExistingProject(projectId) {
 async function refreshProjects() {
   const projectList = await api("/api/user/projects");
   state.projects = projectList.projects || [];
+}
+
+async function refreshCurrentProject() {
+  const projectId = state.project?.project_id;
+  if (!projectId) return null;
+  const [project, projectList] = await Promise.all([
+    api(`/api/user/projects/${projectId}`),
+    api("/api/user/projects"),
+  ]);
+  if (state.project?.project_id !== projectId) return null;
+  state.project = project;
+  state.projects = projectList.projects || [];
+  return project;
 }
 
 function resetInputForm() {
@@ -388,7 +410,11 @@ function refreshRunProgress() {
       const run = await api(`/api/user/runs/${runId}`);
       if (state.run?.run_id !== runId) return null;
       state.run = run;
-      await loadRunData();
+      if (run.state === "running") {
+        await loadRunData();
+      } else {
+        await Promise.all([loadRunData(), refreshCurrentProject()]);
+      }
       return run;
     } catch (error) {
       state.alert = `无法刷新运行进度：${error.message}`;
@@ -514,6 +540,7 @@ async function startRun() {
   }
   state.alert = "";
   cancelResultRequest();
+  resetResultViewState();
   setStep("run");
   state.run = {
     state: "running",
@@ -543,6 +570,29 @@ async function startRun() {
     stopRunProgressPolling();
   }
   setStep("run");
+}
+
+async function cancelRun() {
+  const runId = state.run?.run_id;
+  if (!runId || state.run?.state !== "running" || state.runCancelPending) return;
+  state.runCancelPending = true;
+  state.alert = "";
+  render();
+  try {
+    const result = await api(`/api/user/runs/${runId}/cancel`, { method: "POST" });
+    if (state.run?.run_id !== runId) return;
+    state.run = await api(`/api/user/runs/${runId}`);
+    await Promise.all([loadRunData(), refreshCurrentProject()]);
+    if (result.status === "failed" || result.process_stopped === false) {
+      state.alert = result.error || "运行取消失败，请重试。";
+    }
+  } catch (error) {
+    state.alert = `运行取消失败：${error.message}`;
+  } finally {
+    state.runCancelPending = false;
+    if (state.run?.state !== "running") stopRunProgressPolling();
+    render();
+  }
 }
 
 function resultRequestAborted(error) {
@@ -577,6 +627,36 @@ function runResultRequest(task, { replace = false } = {}) {
   return tracked;
 }
 
+function parseTsvRows(text, headers) {
+  const lines = String(text || "")
+    .replace(/^\uFEFF/, "")
+    .split(/\r?\n/)
+    .filter((line) => line.trim());
+  if (lines.length < 2) return [];
+  const keys = lines[0].split("\t").map((label) => headers[label] || label);
+  return lines.slice(1).map((line) => {
+    const values = line.split("\t");
+    return keys.reduce((row, key, index) => {
+      row[key] = values[index] || "";
+      return row;
+    }, {});
+  });
+}
+
+async function loadOptionalArtifactRows(runId, artifactId, headers, signal) {
+  try {
+    const text = await apiText(
+      `/api/user/runs/${encodeURIComponent(runId)}/download/${encodeURIComponent(artifactId)}`,
+      { signal },
+    );
+    return parseTsvRows(text, headers);
+  } catch (error) {
+    if (resultRequestAborted(error)) throw error;
+    if (error.status === 404) return [];
+    throw error;
+  }
+}
+
 async function loadRunData() {
   if (!state.run?.run_id) {
     cancelResultRequest();
@@ -593,8 +673,70 @@ async function loadRunData() {
     const md = await api(`/api/user/runs/${runId}/md-summary`, { signal });
     const logs = await api(`/api/user/runs/${runId}/logs`, { signal });
     const artifacts = await api(`/api/user/runs/${runId}/artifacts`, { signal });
+    let onsite = [];
+    let shortlist = [];
+    let docking = [];
+    if (state.run?.state === "completed") {
+      [onsite, shortlist, docking] = await Promise.all([
+        loadOptionalArtifactRows(
+          runId,
+          "onsite_search",
+          {
+            输入编号: "input_id",
+            来源: "source",
+            目标编号: "target_id",
+            目标名称: "target_name",
+            物种: "organism",
+            目标类型: "target_class",
+            匹配分数: "match_score",
+            匹配特征: "matched_features",
+            证据: "evidence",
+          },
+          signal,
+        ),
+        loadOptionalArtifactRows(
+          runId,
+          "candidate_shortlist",
+          {
+            短名单排序: "shortlist_rank",
+            候选编号: "candidate_id",
+            输入编号: "input_id",
+            记录编号: "record_id",
+            目标编号: "target_id",
+            粗排分数: "preliminary_score",
+            入选原因: "shortlist_reason",
+            坐标状态: "coordinate_status",
+          },
+          signal,
+        ),
+        loadOptionalArtifactRows(
+          runId,
+          "docking_summary",
+          {
+            候选编号: "candidate_id",
+            对接状态: "docking_status",
+            对接分数: "docking_score",
+            对接引擎: "docking_engine",
+            说明: "notes",
+          },
+          signal,
+        ),
+      ]);
+    }
     if (signal.aborted || state.run?.run_id !== runId) return null;
-    state.runData = { candidates, detail, evidence, genome, structure, md, logs, artifacts };
+    state.runData = {
+      candidates,
+      detail,
+      evidence,
+      genome,
+      onsite: { rows: onsite },
+      shortlist: { rows: shortlist },
+      docking: { rows: docking },
+      structure,
+      md,
+      logs,
+      artifacts,
+    };
     return state.runData;
   });
 }

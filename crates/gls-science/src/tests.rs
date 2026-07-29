@@ -5,7 +5,11 @@ use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+
+const WORKER_TIMEOUT_FIXTURE_MODE: &str = "GENOLIGAND_WORKER_TIMEOUT_FIXTURE_MODE";
+const WORKER_TIMEOUT_FIXTURE_READY: &str = "GENOLIGAND_WORKER_TIMEOUT_FIXTURE_READY";
+const WORKER_TIMEOUT_FIXTURE_SENTINEL: &str = "GENOLIGAND_WORKER_TIMEOUT_FIXTURE_SENTINEL";
 
 #[derive(Clone)]
 struct TestHttpResponse {
@@ -231,6 +235,107 @@ fn worker_python_candidates_prefer_installed_genoligand_runtime() {
             .any(|candidate| candidate == &vec!["python".to_string()])
     );
     fs::remove_dir_all(root).ok();
+}
+
+#[test]
+fn worker_timeout_configuration_is_strict() {
+    assert_eq!(
+        worker_timeout_from_value(None).expect("default worker timeout"),
+        Duration::from_secs(DEFAULT_WORKER_TIMEOUT_SECONDS)
+    );
+    assert_eq!(
+        worker_timeout_from_value(Some(" 45 ")).expect("configured worker timeout"),
+        Duration::from_secs(45)
+    );
+    assert_eq!(
+        worker_timeout_from_value(Some("0")).expect_err("zero timeout must fail"),
+        "worker_timeout_invalid:GENOLIGAND_WORKER_TIMEOUT_SECONDS=0"
+    );
+    assert_eq!(
+        worker_timeout_from_value(Some("invalid")).expect_err("invalid timeout must fail"),
+        "worker_timeout_invalid:GENOLIGAND_WORKER_TIMEOUT_SECONDS=invalid"
+    );
+}
+
+#[test]
+fn worker_timeout_failure_removes_partial_result() {
+    let root = temp_root("worker_timeout_partial_result");
+    let result = root.join("worker_results/partial.json");
+    write_text(&result, "{\"status\":\"partial\"}\n").expect("partial worker result");
+
+    let reason =
+        prepare_worker_timeout_failure(&DOCKING_WORKER_TASK, &result, Duration::from_secs(45))
+            .expect("prepare worker timeout failure");
+
+    assert_eq!(reason, "docking_worker_timed_out:timeout_seconds=45");
+    assert!(!result.exists());
+    fs::remove_dir_all(root).expect("cleanup partial worker result fixture");
+}
+
+#[test]
+fn worker_timeout_descendant_fixture() {
+    let Ok(mode) = std::env::var(WORKER_TIMEOUT_FIXTURE_MODE) else {
+        return;
+    };
+    if mode == "descendant" {
+        let sentinel = std::env::var_os(WORKER_TIMEOUT_FIXTURE_SENTINEL)
+            .map(PathBuf::from)
+            .expect("timeout fixture sentinel path");
+        thread::sleep(Duration::from_secs(2));
+        fs::write(sentinel, b"survived").expect("write timeout fixture sentinel");
+        return;
+    }
+    assert_eq!(mode, "parent");
+    let ready = std::env::var_os(WORKER_TIMEOUT_FIXTURE_READY)
+        .map(PathBuf::from)
+        .expect("timeout fixture ready path");
+    let sentinel =
+        std::env::var_os(WORKER_TIMEOUT_FIXTURE_SENTINEL).expect("timeout fixture sentinel path");
+    // The parent fixture is killed as a process tree; waiting here would defeat that test.
+    #[allow(clippy::zombie_processes)]
+    Command::new(std::env::current_exe().expect("current test executable"))
+        .args([
+            "tests::worker_timeout_descendant_fixture",
+            "--exact",
+            "--nocapture",
+        ])
+        .env(WORKER_TIMEOUT_FIXTURE_MODE, "descendant")
+        .env(WORKER_TIMEOUT_FIXTURE_SENTINEL, sentinel)
+        .spawn()
+        .expect("spawn timeout fixture descendant");
+    fs::write(ready, b"ready").expect("write timeout fixture ready marker");
+    thread::sleep(Duration::from_secs(30));
+}
+
+#[test]
+fn worker_timeout_terminates_the_process_tree() {
+    let root = temp_root("worker_timeout_process_tree");
+    let ready = root.join("descendant.ready");
+    let sentinel = root.join("descendant.survived");
+    let mut command = Command::new(std::env::current_exe().expect("current test executable"));
+    command
+        .args([
+            "tests::worker_timeout_descendant_fixture",
+            "--exact",
+            "--nocapture",
+        ])
+        .env(WORKER_TIMEOUT_FIXTURE_MODE, "parent")
+        .env(WORKER_TIMEOUT_FIXTURE_READY, &ready)
+        .env(WORKER_TIMEOUT_FIXTURE_SENTINEL, &sentinel);
+
+    let started = Instant::now();
+    let error = command_output_with_timeout(&mut command, Duration::from_secs(1))
+        .expect_err("hanging worker must time out");
+
+    assert!(matches!(error, TimedCommandError::TimedOut));
+    assert!(started.elapsed() < Duration::from_secs(4));
+    assert!(ready.is_file(), "descendant fixture did not start");
+    thread::sleep(Duration::from_secs(2));
+    assert!(
+        !sentinel.exists(),
+        "worker descendant survived process-tree termination"
+    );
+    fs::remove_dir_all(root).expect("cleanup timeout fixture");
 }
 
 #[test]
@@ -5439,16 +5544,19 @@ fn ranking_policy_digest_is_bound_to_context_decomposition_and_report() {
     .expect("ranking fixture");
 
     let expected_policy = json!({
-        "schema_version": "genoligand_target_ranking_v3",
+        "schema_version": "genoligand_target_ranking_v4",
         "score_semantics": "input_kind_route_weighted_sum",
         "shortlist_score_semantics": "route_weights_renormalized_over_known_metagenome_structure",
+        "shortlist_selection_semantics": "include_when_perfect_docking_and_md_can_reach_the_best_current_non_simulation_score_per_input_record",
+        "simulation_availability_semantics": "evaluation_status_distinguishes_not_evaluated_not_ready_and_completed_zero",
+        "shortlist_score_epsilon": 0.0001,
         "routes": {
-            "small_molecule": {"ranking_policy":"small_molecule_route_v1","known_database_weight":0.45,"metagenome_weight":0.0,"structure_weight":0.20,"docking_weight":0.15,"md_weight":0.20,"preliminary_known_database_weight":0.6923076923076923,"preliminary_metagenome_weight":0.0,"preliminary_structure_weight":0.3076923076923077},
-            "peptide": {"ranking_policy":"peptide_route_v2","known_database_weight":0.30,"metagenome_weight":0.20,"structure_weight":0.50,"docking_weight":0.0,"md_weight":0.0,"preliminary_known_database_weight":0.30,"preliminary_metagenome_weight":0.20,"preliminary_structure_weight":0.50},
-            "protein_ligand": {"ranking_policy":"protein_ligand_route_v2","known_database_weight":0.20,"metagenome_weight":0.10,"structure_weight":0.70,"docking_weight":0.0,"md_weight":0.0,"preliminary_known_database_weight":0.20,"preliminary_metagenome_weight":0.10,"preliminary_structure_weight":0.70},
-            "complex": {"ranking_policy":"complex_route_v2","known_database_weight":0.15,"metagenome_weight":0.05,"structure_weight":0.80,"docking_weight":0.0,"md_weight":0.0,"preliminary_known_database_weight":0.15,"preliminary_metagenome_weight":0.05,"preliminary_structure_weight":0.80},
-            "genome_or_metagenome": {"ranking_policy":"genome_or_metagenome_route_v1","known_database_weight":0.45,"metagenome_weight":0.55,"structure_weight":0.0,"docking_weight":0.0,"md_weight":0.0,"preliminary_known_database_weight":0.45,"preliminary_metagenome_weight":0.55,"preliminary_structure_weight":0.0},
-            "fallback": {"ranking_policy":"fallback_route_v2","known_database_weight":0.50,"metagenome_weight":0.30,"structure_weight":0.20,"docking_weight":0.0,"md_weight":0.0,"preliminary_known_database_weight":0.50,"preliminary_metagenome_weight":0.30,"preliminary_structure_weight":0.20},
+            "small_molecule": {"ranking_policy":"small_molecule_route_v1","known_database_weight":0.45,"metagenome_weight":0.0,"structure_weight":0.20,"docking_weight":0.15,"md_weight":0.20,"preliminary_known_database_weight":0.6923076923076923,"preliminary_metagenome_weight":0.0,"preliminary_structure_weight":0.3076923076923077,"non_simulation_weight":0.65,"maximum_simulation_gain":0.35},
+            "peptide": {"ranking_policy":"peptide_route_v2","known_database_weight":0.30,"metagenome_weight":0.20,"structure_weight":0.50,"docking_weight":0.0,"md_weight":0.0,"preliminary_known_database_weight":0.30,"preliminary_metagenome_weight":0.20,"preliminary_structure_weight":0.50,"non_simulation_weight":1.0,"maximum_simulation_gain":0.0},
+            "protein_ligand": {"ranking_policy":"protein_ligand_route_v2","known_database_weight":0.20,"metagenome_weight":0.10,"structure_weight":0.70,"docking_weight":0.0,"md_weight":0.0,"preliminary_known_database_weight":0.20,"preliminary_metagenome_weight":0.10,"preliminary_structure_weight":0.70,"non_simulation_weight":1.0,"maximum_simulation_gain":0.0},
+            "complex": {"ranking_policy":"complex_route_v2","known_database_weight":0.15,"metagenome_weight":0.05,"structure_weight":0.80,"docking_weight":0.0,"md_weight":0.0,"preliminary_known_database_weight":0.15,"preliminary_metagenome_weight":0.05,"preliminary_structure_weight":0.80,"non_simulation_weight":1.0,"maximum_simulation_gain":0.0},
+            "genome_or_metagenome": {"ranking_policy":"genome_or_metagenome_route_v1","known_database_weight":0.45,"metagenome_weight":0.55,"structure_weight":0.0,"docking_weight":0.0,"md_weight":0.0,"preliminary_known_database_weight":0.45,"preliminary_metagenome_weight":0.55,"preliminary_structure_weight":0.0,"non_simulation_weight":1.0,"maximum_simulation_gain":0.0},
+            "fallback": {"ranking_policy":"fallback_route_v2","known_database_weight":0.50,"metagenome_weight":0.30,"structure_weight":0.20,"docking_weight":0.0,"md_weight":0.0,"preliminary_known_database_weight":0.50,"preliminary_metagenome_weight":0.30,"preliminary_structure_weight":0.20,"non_simulation_weight":1.0,"maximum_simulation_gain":0.0},
         },
     });
     let expected_digest = canonical_json_sha256(&expected_policy);
@@ -5566,6 +5674,8 @@ fn target_ranking_orders_by_input_record_and_resets_group_rank() {
         structure_score: 0.0,
         docking_score: 0.0,
         dynamics_score: 0.0,
+        docking_evaluation_status: "not_evaluated".to_string(),
+        md_evaluation_status: "not_evaluated".to_string(),
         final_score,
         evidence: String::new(),
     };
@@ -5585,6 +5695,27 @@ fn target_ranking_orders_by_input_record_and_resets_group_rank() {
         ["input_1_high", "input_1_low", "input_2_high"]
     );
     assert_eq!(candidate_group_ranks(&candidates), [1, 2, 1]);
+}
+
+#[test]
+fn completed_zero_simulation_score_is_distinct_from_not_evaluated() {
+    let root = temp_root("completed_zero_simulation_status");
+    let path = root.join("target_candidate_ranking.tsv");
+    write_text(
+        &path,
+        &format!(
+            "{TARGET_CANDIDATE_RANKING_HEADER}\n1\tcandidate_completed\tT1\tTarget 1\tknown_human_protein\tHomo sapiens\t0.4500\t1.0000\t0.0000\t0.0000\t0.0000\t0.0000\tevidence\tcomputed_prediction\tinput_1\trecord_1\tuniprot\tsmall_molecule\tsmall_molecule_route_v1\t0.4500\t0.0000\t0.2000\t0.1500\t0.2000\tcompleted\tnot_evaluated\n2\tcandidate_missing\tT2\tTarget 2\tknown_human_protein\tHomo sapiens\t0.4500\t1.0000\t0.0000\t0.0000\t0.0000\t0.0000\tevidence\tcomputed_prediction\tinput_1\trecord_1\tuniprot\tsmall_molecule\tsmall_molecule_route_v1\t0.4500\t0.0000\t0.2000\t0.1500\t0.2000\tnot_evaluated\tnot_evaluated\n"
+        ),
+    )
+    .expect("ranking fixture");
+
+    let candidates = read_candidates(&path).expect("ranking candidates");
+    assert_eq!(candidates.len(), 2);
+    assert_eq!(candidates[0].docking_score, 0.0);
+    assert_eq!(candidates[1].docking_score, 0.0);
+    assert_eq!(candidates[0].docking_evaluation_status, "completed");
+    assert_eq!(candidates[1].docking_evaluation_status, "not_evaluated");
+    fs::remove_dir_all(&root).expect("cleanup temp root");
 }
 
 #[test]
@@ -6402,7 +6533,7 @@ fn structure_evaluate_prefers_bindingdb_pdb_candidate_over_token_noise() {
     assert!(status.contains("ready\tP00918\t2H4N\tstructure_candidates"));
     let selected_rows =
         read_simple_tsv_rows(&run.join("complex_candidate_selection.tsv")).expect("selected rows");
-    assert_eq!(selected_rows.len(), COMPLEX_CANDIDATE_TOP_N);
+    assert!(!selected_rows.is_empty());
     assert_eq!(selected_rows[0]["input_id"], "input_1");
     assert_eq!(selected_rows[0]["record_id"], "record_1");
     assert_eq!(selected_rows[0]["target_id"], "P00918");
@@ -7212,6 +7343,31 @@ fn canonical_readiness_reports_foldseek_refresh_advisory_without_blocking() {
     let current = evaluate_science_store_readiness(&store).expect("current readiness");
     assert!(current.ready, "{:?}", current.blockers);
     assert!(current.advisories.is_empty());
+
+    fs::remove_file(store.join(RCSB_INDEXED_PDB_IDS_REL_PATH))
+        .expect("remove indexed PDB identifiers");
+    write_test_science_store_readiness(&store, &[]).expect("readiness without indexed identity");
+    let missing_identity =
+        evaluate_science_store_readiness(&store).expect("readiness without indexed identity");
+    assert!(missing_identity.ready, "{:?}", missing_identity.blockers);
+    assert_eq!(
+        missing_identity.advisories,
+        ["rcsb_foldseek_refresh_needed"]
+    );
+    assert_eq!(
+        missing_identity.advisory_details[0].evidence,
+        "indexed_identity_manifest_missing_or_invalid"
+    );
+    assert_eq!(
+        missing_identity.advisory_details[0].action,
+        "migrate_or_rebuild_alignment_database"
+    );
+    write_text(
+        &store.join(RCSB_INDEXED_PDB_IDS_REL_PATH),
+        "pdb_id\tstatus\n1ABC\tvalidated\n",
+    )
+    .expect("restore indexed PDB identifiers");
+    write_test_science_store_readiness(&store, &[]).expect("rebound indexed identity");
 
     write_gzip(
         &rcsb_coordinate_cache_path(&store, "2BBB"),
@@ -9668,8 +9824,8 @@ fn write_md_binding_manifests(
 }
 
 #[test]
-fn coordinate_top_n_uses_independent_docking_and_md_jobs() {
-    let root = temp_root("coordinate_top_n_jobs");
+fn coordinate_adaptive_shortlist_uses_independent_docking_and_md_jobs() {
+    let root = temp_root("coordinate_adaptive_jobs");
     install_not_applicable_worker_fixtures(&root).expect("worker fixtures");
     let run = root.join("run");
     let store = root.join("science_store");
@@ -9717,7 +9873,7 @@ fn coordinate_top_n_uses_independent_docking_and_md_jobs() {
     assert!(write_coordinate_backed_candidate_selection(&options, &[]).expect("selection"));
     let selection =
         read_simple_tsv_rows(&run.join("complex_candidate_selection.tsv")).expect("selection rows");
-    assert_eq!(selection.len(), COMPLEX_CANDIDATE_TOP_N);
+    assert_eq!(selection.len(), 4);
     assert!(selection.iter().all(|row| {
         row.get("record_id").map(String::as_str) == Some("record_1")
             && row
@@ -9756,14 +9912,14 @@ fn coordinate_top_n_uses_independent_docking_and_md_jobs() {
     ] {
         assert_eq!(index["schema_version"], schema);
         let entries = index["entries"].as_array().expect("entries");
-        assert_eq!(entries.len(), COMPLEX_CANDIDATE_TOP_N);
+        assert_eq!(entries.len(), 4);
         assert_eq!(
             entries
                 .iter()
                 .filter_map(|entry| entry["job_id"].as_str())
                 .collect::<BTreeSet<_>>()
                 .len(),
-            COMPLEX_CANDIDATE_TOP_N
+            4
         );
         assert!(entries.iter().all(|entry| {
             entry["status"] == "not_ready"
@@ -9778,11 +9934,11 @@ fn coordinate_top_n_uses_independent_docking_and_md_jobs() {
     }
     assert_eq!(
         rows_in_tsv(&run.join("tool_outputs/docking_outcomes.tsv")).expect("outcomes"),
-        COMPLEX_CANDIDATE_TOP_N
+        4
     );
     assert_eq!(
         rows_in_tsv(&run.join("tool_outputs/docking_summary.tsv")).expect("summary"),
-        COMPLEX_CANDIDATE_TOP_N
+        4
     );
 
     let mut ranking = String::from(
@@ -9875,7 +10031,7 @@ fn candidate_shortlist_is_stable_resets_rank_per_input_and_uses_preliminary_evid
 }
 
 #[test]
-fn candidate_coarse_rank_uses_complex_structure_route_before_top_n_selection() {
+fn candidate_coarse_rank_uses_complex_structure_route_before_adaptive_selection() {
     let root = temp_root("candidate_shortlist_complex_route");
     let options = indexed_fixture_options(&root);
     write_input_kind_manifest(&options, &[("input_1", "record_1", "complex")]).expect("input kind");
@@ -9937,8 +10093,8 @@ fn candidate_shortlist_writes_header_when_retrieval_has_no_candidates() {
 }
 
 #[test]
-fn shortlist_coordinate_top_n_isolated_per_input_record() {
-    let root = temp_root("candidate_shortlist_per_input");
+fn shortlist_coordinate_selection_adapts_per_input_record() {
+    let root = temp_root("candidate_shortlist_adaptive_per_input");
     let options = indexed_fixture_options(&root);
     let receptor = "structure_candidates/shared.cif";
     write_text(
@@ -9948,25 +10104,30 @@ fn shortlist_coordinate_top_n_isolated_per_input_record() {
     .expect("receptor");
     let digest = sha256_file_hex(&options.run_dir.join(receptor)).expect("digest");
     let mut shortlist = format!("{CANDIDATE_SHORTLIST_HEADER}\n");
-    for input_id in ["input_1", "input_2"] {
-        for rank in 1..=4 {
+    for (input_id, scores) in [
+        ("input_1", [0.90, 0.80, 0.70, 0.60]),
+        ("input_2", [0.90, 0.40, 0.30, 0.10]),
+    ] {
+        for (offset, score) in scores.into_iter().enumerate() {
+            let rank = offset + 1;
             shortlist.push_str(&format!(
-                "{rank}\t{input_id}_candidate_{rank}\tuniprot\t{input_id}\trecord_1\tT{rank}\tTarget {rank}\tHomo sapiens\tenzyme\tknown_human_protein\tKnown\t0.5000\t0.5000\t0.0000\t0.0000\tknown_database=0.5000\t1ABC\tready\t{rank}\t{receptor}\t{digest}\t1ABC\n"
+                "{rank}\t{input_id}_candidate_{rank}\tuniprot\t{input_id}\trecord_1\tT{rank}\tTarget {rank}\tHomo sapiens\tenzyme\tknown_human_protein\tKnown\t{score:.4}\t{score:.4}\t0.0000\t0.0000\tknown_database={score:.4}\t1ABC\tready\t{rank}\t{receptor}\t{digest}\t1ABC\tsmall_molecule\tsmall_molecule_route_v1\t0.6923\t0.0000\t0.3077\t0.4500\t0.0000\t0.2000\t0.1500\t0.2000\n"
             ));
         }
     }
     write_text(&options.run_dir.join("candidate_shortlist.tsv"), &shortlist).expect("shortlist");
 
     let selected = selected_candidate_rows(&options).expect("selected");
-    assert_eq!(selected.len(), COMPLEX_CANDIDATE_TOP_N * 2);
-    for input_id in ["input_1", "input_2"] {
-        let ranks = selected
+    assert_eq!(selected.len(), 6);
+    let ranks_for = |input_id: &str| {
+        selected
             .iter()
             .filter(|row| row["input_id"] == input_id)
             .map(candidate_selection_rank)
-            .collect::<Vec<_>>();
-        assert_eq!(ranks, [1, 2, 3]);
-    }
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(ranks_for("input_1"), [1, 2, 3, 4]);
+    assert_eq!(ranks_for("input_2"), [1, 2]);
     fs::remove_dir_all(&root).expect("cleanup temp root");
 }
 
@@ -10366,7 +10527,7 @@ fn rcsb_on_demand_prioritizes_missing_known_hint_over_lower_ranked_local_candida
     assert_eq!(server.requests(), ["/7ZUB.cif.gz"]);
     let selection =
         read_simple_tsv_rows(&run.join("complex_candidate_selection.tsv")).expect("selection");
-    assert_eq!(selection.len(), COMPLEX_CANDIDATE_TOP_N);
+    assert_eq!(selection.len(), 1);
     assert!(
         selection
             .iter()
@@ -10929,10 +11090,16 @@ fn write_indexed_docking_fixture(
         ("log", "docking_vina.log"),
     ];
     for (artifact_name, file_name) in internal_artifacts {
-        write_text(
-            &output_dir.join(file_name),
-            &format!("indexed docking fixture {artifact_name}\n"),
-        )?;
+        let content = match artifact_name {
+            "pose" => {
+                "REMARK VINA RESULT: -8.000 0.000 0.000\nATOM      1  C1  LIG A   1       1.000   2.000   3.000  1.00  0.00     0.000 C\n"
+            }
+            "pose_sdf" => {
+                "GenoLigand pose\n  GenoLigand\n\n  1  0  0  0  0  0  0  0  0  0999 V2000\n    1.0000    2.0000    3.0000 C   0  0  0  0  0  0  0  0  0  0  0  0\nM  END\n$$$$\n"
+            }
+            _ => "indexed docking fixture\n",
+        };
+        write_text(&output_dir.join(file_name), content)?;
     }
     let manifest_path = output_dir.join("docking_manifest.json");
     let manifest_relative = manifest_path
@@ -11418,6 +11585,89 @@ fn indexed_artifact_docking_rejects_external_and_tampered_poses() {
         assert!(error.contains(expected), "{label}: {error}");
         fs::remove_dir_all(&root).expect("cleanup fixture");
     }
+}
+
+#[test]
+fn indexed_artifact_docking_rejects_digest_bound_fake_pose() {
+    let root = temp_root("indexed_docking_fake_pose");
+    let options = indexed_fixture_options(&root);
+    let rows = write_indexed_fixture_selection(
+        &options,
+        &[(
+            "candidate_A",
+            "input_1",
+            "record_1",
+            "small_molecule",
+            "CCO",
+        )],
+    )
+    .expect("indexed selection");
+    let fixture = write_indexed_docking_fixture(&options, &rows[0]).expect("docking fixture");
+    let pose_path = fixture.output_dir.join("docking_pose.sdf");
+    write_text(&pose_path, "digest-bound fake pose\n").expect("fake pose");
+    let manifest_path = fixture.output_dir.join("docking_manifest.json");
+    let mut manifest: Value =
+        serde_json::from_str(&read_text(&manifest_path).expect("docking manifest"))
+            .expect("manifest json");
+    let digest = sha256_file_hex(&pose_path).expect("fake pose digest");
+    for artifact in manifest["artifacts"].as_array_mut().expect("artifact rows") {
+        if artifact["artifact_name"].as_str() == Some("pose_sdf") {
+            artifact["artifact_sha256"] = json!(digest.clone());
+        }
+    }
+    write_text(&manifest_path, &(manifest.to_string() + "\n")).expect("updated manifest");
+
+    let error = read_docking_scores(
+        &options,
+        &options.run_dir.join("tool_outputs/docking_summary.tsv"),
+    )
+    .expect_err("fake pose content must fail");
+
+    assert!(
+        error.contains("docking_pose_content_invalid:candidate_A:pose_sdf"),
+        "{error}"
+    );
+    fs::remove_dir_all(&root).expect("cleanup fixture");
+}
+
+#[test]
+fn scientific_score_parser_rejects_non_finite_values() {
+    for value in ["NaN", "nan", "inf", "-inf", "Infinity", "-Infinity"] {
+        assert!(parse_finite_number(value).is_none(), "{value}");
+        assert!(docking_score_from_affinity(value).is_none(), "{value}");
+    }
+    assert_eq!(parse_finite_number("0.75"), Some(0.75));
+    assert_eq!(docking_score_from_affinity("-6.0"), Some(0.5));
+}
+
+#[test]
+fn candidate_match_ingestion_rejects_non_finite_scores() {
+    let root = temp_root("candidate_non_finite_score");
+    let path = root.join("known_database_matches.tsv");
+    write_text(
+        &path,
+        "input_id\tsource\ttarget_id\ttarget_name\torganism\ttarget_class\tmatch_score\tmatched_features\tevidence\trecord_id\ninput_1\tBindingDB\tT1\tTarget 1\tHomo sapiens\tenzyme\tInf\tligand_identity\tbound\trecord_1\n",
+    )
+    .expect("non-finite match fixture");
+    let mut candidates = BTreeMap::new();
+
+    let error = merge_match_file(&path, "known_database", &mut candidates)
+        .expect_err("non-finite score must fail");
+
+    assert_eq!(error, "candidate_match_score_non_finite:line=2");
+    write_text(
+        &path,
+        "input_id\tsource\ttarget_id\ttarget_name\torganism\ttarget_class\tmatch_score\tmatched_features\tevidence\trecord_id\ninput_1\tBindingDB\tT1\tTarget 1\tHomo sapiens\tenzyme\t0.75\tligand_identity\tbound\trecord_1\n",
+    )
+    .expect("finite match fixture");
+    merge_match_file(&path, "known_database", &mut candidates).expect("finite score");
+    assert_eq!(candidates.len(), 1);
+    assert!(
+        candidates
+            .values()
+            .all(|candidate| candidate.known_score.is_finite())
+    );
+    fs::remove_dir_all(root).expect("cleanup fixture");
 }
 
 #[test]

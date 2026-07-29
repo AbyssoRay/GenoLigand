@@ -44,6 +44,7 @@ MAX_MMCIF_SOURCE_BYTES = 64 * 1024 * 1024
 MAX_STRUCTURE_ATOMS = 500_000
 MAX_STRUCTURE_RESIDUES = 200_000
 MAX_PHARMACOPHORE_POINTS = 64
+SHAPE_METHOD = "rdkit_usr_usrcat_v1"
 STANDARD_AMINO_ACIDS = set("ACDEFGHIKLMNPQRSTVWY")
 STRUCTURE_FORMATS = {"pdb", "ent", "cif", "mmcif"}
 SPOOL_PATTERN = re.compile(r"^([^#]+)#offset=(\d+)&length=(\d+)$")
@@ -573,6 +574,7 @@ def _prepare_small_molecule(record: InputRecord, output_dir: Path) -> tuple[dict
         ChemicalFeatures,
         Path(RDConfig.RDDataDir) / "BaseFeatures.fdef",
     )
+    shape = _shape_summary(embedded, representative, rdMolDescriptors)
     formal_charge = sum(atom.GetFormalCharge() for atom in molecule.GetAtoms())
     return {
         "canonical_smiles": canonical_smiles,
@@ -595,6 +597,7 @@ def _prepare_small_molecule(record: InputRecord, output_dir: Path) -> tuple[dict
             "qed": _round(QED.qed(molecule)),
         },
         "pharmacophore": pharmacophore,
+        "shape": shape,
         "conformers": ensemble,
         "engine_versions": {"rdkit": rdBase.rdkitVersion},
     }, coordinate_name
@@ -965,6 +968,26 @@ def _pharmacophore_summary(
     }
 
 
+def _shape_summary(molecule: Any, conformer_id: int, descriptors: Any) -> dict[str, Any]:
+    usr = [float(value) for value in descriptors.GetUSR(molecule, confId=conformer_id)]
+    usrcat = [
+        float(value)
+        for value in descriptors.GetUSRCAT(molecule, confId=conformer_id)
+    ]
+    if (
+        len(usr) != 12
+        or len(usrcat) != 60
+        or not all(math.isfinite(value) for value in (*usr, *usrcat))
+    ):
+        raise QueryStructureError("query_structure_shape_descriptor_invalid")
+    return {
+        "method": SHAPE_METHOD,
+        "conformer_id": int(conformer_id),
+        "usr": [_round(value) for value in usr],
+        "usrcat": [_round(value) for value in usrcat],
+    }
+
+
 def _write_representative_sdf(
     path: Path,
     molecule: Any,
@@ -1149,6 +1172,10 @@ def _valid_existing_artifact(
             for key, expected_value in feature_expected.items()
         ):
             return None
+        if record.input_kind == "small_molecule" and not _valid_shape_summary(
+            feature_value.get("shape")
+        ):
+            return None
         coordinate = str(value.get("coordinate_artifact", ""))
         coordinate_digest = str(value.get("coordinate_sha256", ""))
         coordinate_bytes = int(value.get("coordinate_size_bytes", -1))
@@ -1186,6 +1213,21 @@ def _valid_existing_artifact(
         )
     except (OSError, ValueError, json.JSONDecodeError, QueryStructureError):
         return None
+
+
+def _valid_shape_summary(value: Any) -> bool:
+    if not isinstance(value, dict) or value.get("method") != SHAPE_METHOD:
+        return False
+    try:
+        usr = [float(item) for item in value["usr"]]
+        usrcat = [float(item) for item in value["usrcat"]]
+    except (KeyError, TypeError, ValueError):
+        return False
+    return (
+        len(usr) == 12
+        and len(usrcat) == 60
+        and all(math.isfinite(item) for item in (*usr, *usrcat))
+    )
 
 
 def _publish_terminal_artifact(

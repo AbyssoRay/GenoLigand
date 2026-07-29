@@ -24,9 +24,10 @@ fn run_cli(args: &[String]) -> Result<String, String> {
     }
     if args.len() == 1 && matches!(args[0].as_str(), "--version" | "-V") {
         return Ok(format!(
-            "gls-cli {} commit {}",
+            "gls-cli {} commit {} build_id {}",
             env!("CARGO_PKG_VERSION"),
-            env!("GENOLIGAND_BUILD_COMMIT")
+            env!("GENOLIGAND_BUILD_COMMIT"),
+            env!("GENOLIGAND_BUILD_ID")
         ));
     }
     let group = args[0].as_str();
@@ -266,9 +267,10 @@ mod tests {
         assert_eq!(
             output,
             format!(
-                "gls-cli {} commit {}",
+                "gls-cli {} commit {} build_id {}",
                 env!("CARGO_PKG_VERSION"),
-                env!("GENOLIGAND_BUILD_COMMIT")
+                env!("GENOLIGAND_BUILD_COMMIT"),
+                env!("GENOLIGAND_BUILD_ID")
             )
         );
     }

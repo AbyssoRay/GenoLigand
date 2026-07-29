@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 import csv
+import gzip
 import hashlib
 import json
 import math
 import os
+import re
 import shutil
 import subprocess
 from pathlib import Path
@@ -28,6 +30,8 @@ FOLDSEEK_MATCH_HEADER = (
 ALIGNMENT_MANIFEST_SCHEMA_VERSION = "genoligand_alignment_database_manifest_v2"
 FOLDSEEK_STRUCTURE_SUFFIXES = {".pdb", ".ent", ".cif", ".mmcif"}
 QUERY_STRUCTURE_FORMATS = {"pdb", "ent", "cif", "mmcif"}
+PDB_ID_PATTERN = re.compile(r"(?<![A-Za-z0-9])([0-9][A-Za-z0-9]{3})(?![A-Za-z0-9])")
+PDB_EVIDENCE_PATTERN = re.compile(r"(?i)(?:pdb_ids?|structure_id|rcsb_id)=([^;]+)")
 ALIGNMENT_MANIFEST_REQUIRED_FIELDS = {
     "source_id",
     "manifest_schema_version",
@@ -80,6 +84,11 @@ class FoldseekTargetDatabase(NamedTuple):
     source_bytes: int
     builder_version: str
     path: Path
+    scope_mode: str = ""
+    scope_status: str = ""
+    scope_count: int = 0
+    indexed_pdb_count: int = 0
+    refresh_needed: bool = False
 
 
 class StructureQuery(NamedTuple):
@@ -324,6 +333,16 @@ def run_foldseek_alignment(run_dir: Path, science_store: Path) -> WorkerExecutio
         "foldseek_createdb",
     )
     query_identities = foldseek_query_identities(query_db, queries)
+    supplemental, incomplete_ids, current_candidate_count = prepare_current_candidate_foldseek_target(
+        foldseek,
+        run_dir,
+        science_store,
+        tmp_root,
+        targets,
+        timeout,
+    )
+    if supplemental is not None:
+        targets.append(supplemental)
     rows: list[str] = []
     outcomes: list[WorkerOutcome] = []
     for index, target in enumerate(targets, start=1):
@@ -382,12 +401,32 @@ def run_foldseek_alignment(run_dir: Path, science_store: Path) -> WorkerExecutio
             f"{foldseek_version}; targets={len(targets)}; matches={len(rows)}",
             tuple(outcomes),
         )
+    if incomplete_ids:
+        missing = ",".join(sorted(incomplete_ids)[:12])
+        coverage = ",".join(
+            f"{target.database_id}={target.indexed_pdb_count}/{target.scope_count}"
+            for target in targets
+            if foldseek_target_scope_is_partial(target)
+        )
+        reason = f"incomplete_coverage:missing={missing};persistent={coverage or 'unknown'}"
+        outcomes.append(WorkerOutcome("not_ready", reason, True, "foldseek_candidate_coverage", 0))
+        write_status(status_path, "not_ready", reason, len(rows))
+        return WorkerExecution(
+            "not_ready",
+            reason,
+            f"{foldseek_version}; targets={len(targets)}; matches={len(rows)}; "
+            f"current_candidates={current_candidate_count}",
+            tuple(outcomes),
+        )
     reason = "search_completed" if rows else "search_completed_no_hits"
+    if any(foldseek_target_scope_is_partial(target) for target in targets):
+        reason = f"{reason}_current_candidate_coverage"
     write_status(status_path, "completed", reason, len(rows))
     return WorkerExecution(
         "completed",
         reason,
-        f"{foldseek_version}; targets={len(targets)}; matches={len(rows)}",
+        f"{foldseek_version}; targets={len(targets)}; matches={len(rows)}; "
+        f"current_candidates={current_candidate_count}",
         tuple(outcomes),
     )
 
@@ -454,13 +493,15 @@ def read_sequence_inputs(run_dir: Path) -> list[SequenceInput]:
                 "gbk",
             }:
                 continue
-            value = decode_tsv_cell(str(row.get("canonical_value", ""))).strip().upper()
-            sequence = "".join(ch for ch in value if ch.isalpha())
-            if len(sequence) < 2:
-                continue
             input_id = str(row.get("input_id", "input_1")).strip() or "input_1"
             record_id = str(row.get("record_id", "record_1")).strip() or "record_1"
-            query_id = sequence_query_id(input_id, record_id)
+            value = sequence_row_value(run_dir, row).strip().upper()
+            sequence = "".join(ch for ch in value if ch.isalpha())
+            if not sequence:
+                raise ValueError(f"sequence_input_empty:{input_id}:{record_id}")
+            if len(sequence) < 2:
+                raise ValueError(f"sequence_input_too_short:{input_id}:{record_id}")
+            query_id = sequence_query_id(input_id, record_id, sequence)
             identity = (input_id, record_id, kind)
             if query_id in query_identities and query_identities[query_id] != identity:
                 raise ValueError(f"sequence_query_identity_collision:{query_id}")
@@ -469,8 +510,45 @@ def read_sequence_inputs(run_dir: Path) -> list[SequenceInput]:
     return rows
 
 
-def sequence_query_id(input_id: str, record_id: str, variant: str = "") -> str:
-    identity = [input_id, record_id]
+def sequence_row_value(run_dir: Path, row: dict[str, str]) -> str:
+    value = decode_tsv_cell(str(row.get("canonical_value", "")))
+    if value.strip():
+        return value
+    artifact = decode_tsv_cell(str(row.get("artifact", ""))).strip()
+    prefix = "input_sequence_spool.bin#offset="
+    if not artifact.startswith(prefix):
+        raise ValueError("sequence_input_value_missing")
+    offset_text, separator, length_text = artifact[len(prefix):].partition("&length=")
+    if not separator or not offset_text.isdigit() or not length_text.isdigit():
+        raise ValueError("sequence_input_spool_reference_invalid")
+    offset = int(offset_text)
+    length = int(length_text)
+    if length <= 0:
+        raise ValueError("sequence_input_empty")
+    try:
+        with (run_dir / "input_sequence_spool.bin").open("rb") as handle:
+            handle.seek(offset)
+            data = handle.read(length)
+    except OSError as exc:
+        raise ValueError(f"sequence_input_spool_read_failed:{exc}") from exc
+    if len(data) != length:
+        raise ValueError("sequence_input_spool_truncated")
+    expected_digest = str(row.get("content_sha256", "")).strip().lower()
+    if hashlib.sha256(data).hexdigest() != expected_digest:
+        raise ValueError("sequence_input_spool_digest_mismatch")
+    try:
+        return data.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        raise ValueError("sequence_input_spool_utf8_invalid") from exc
+
+
+def sequence_query_id(
+    input_id: str,
+    record_id: str,
+    sequence: str,
+    variant: str = "",
+) -> str:
+    identity = [input_id, record_id, hashlib.sha256(sequence.encode("utf-8")).hexdigest()]
     if variant:
         identity.append(variant)
     payload = json.dumps(
@@ -493,7 +571,7 @@ def sequence_query_batches(sequences: list[SequenceInput]) -> list[QueryBatch]:
         sequence = record.sequence.replace("U", "T")
         nucleotide.append(
             SequenceInput(
-                sequence_query_id(record.input_id, record.record_id, "nucleotide"),
+                sequence_query_id(record.input_id, record.record_id, sequence, "nucleotide"),
                 record.input_id,
                 record.record_id,
                 "nucleotide",
@@ -504,7 +582,7 @@ def sequence_query_batches(sequences: list[SequenceInput]) -> list[QueryBatch]:
             variant = f"translated_protein:{strand}:{frame}:{start}:{len(peptide)}"
             translated.append(
                 SequenceInput(
-                    sequence_query_id(record.input_id, record.record_id, variant),
+                    sequence_query_id(record.input_id, record.record_id, peptide, variant),
                     record.input_id,
                     record.record_id,
                     "translated_protein",
@@ -593,6 +671,17 @@ def foldseek_target_databases(science_store: Path) -> list[FoldseekTargetDatabas
         path = resolved_manifest_database_path(science_store, row["db_path"])
         if not foldseek_database_ready(path):
             raise ValueError(f"foldseek_target_database_not_ready:{database_id}")
+        scope_mode = row.get("scope_mode", "").lower()
+        if scope_mode and scope_mode not in {"complete", "on_demand"}:
+            raise ValueError(f"foldseek_target_scope_mode_invalid:{database_id}")
+        scope_count = optional_manifest_count(row, "scope_count", database_id)
+        indexed_pdb_count = optional_manifest_count(
+            row,
+            "indexed_pdb_count",
+            database_id,
+            fallback=int(row["source_files"]),
+        )
+        refresh_needed = optional_manifest_bool(row, "refresh_needed", database_id)
         targets.append(
             FoldseekTargetDatabase(
                 database_id,
@@ -601,6 +690,11 @@ def foldseek_target_databases(science_store: Path) -> list[FoldseekTargetDatabas
                 int(row["source_bytes"]),
                 row["builder_version"],
                 path,
+                scope_mode,
+                row.get("scope_status", "").lower(),
+                scope_count,
+                indexed_pdb_count,
+                refresh_needed,
             )
         )
     deduped: dict[str, FoldseekTargetDatabase] = {}
@@ -610,6 +704,33 @@ def foldseek_target_databases(science_store: Path) -> list[FoldseekTargetDatabas
             raise ValueError(f"foldseek_target_database_duplicate:{target.database_id}")
         deduped[key] = target
     return sorted(deduped.values(), key=lambda target: (target.database_id, str(target.path)))
+
+
+def optional_manifest_count(
+    row: dict[str, str],
+    field: str,
+    database_id: str,
+    fallback: int = 0,
+) -> int:
+    value = row.get(field, "").strip()
+    if not value:
+        return fallback
+    try:
+        parsed = int(value)
+    except ValueError as exc:
+        raise ValueError(f"foldseek_target_{field}_invalid:{database_id}") from exc
+    if parsed < 0:
+        raise ValueError(f"foldseek_target_{field}_invalid:{database_id}")
+    return parsed
+
+
+def optional_manifest_bool(row: dict[str, str], field: str, database_id: str) -> bool:
+    value = row.get(field, "").strip().lower()
+    if not value:
+        return False
+    if value not in {"true", "false"}:
+        raise ValueError(f"foldseek_target_{field}_invalid:{database_id}")
+    return value == "true"
 
 
 def validated_alignment_manifest_rows(
@@ -670,6 +791,163 @@ def foldseek_target_database(science_store: Path) -> tuple[str, Path] | None:
     if len(targets) != 1:
         return None
     return targets[0].database_id, targets[0].path
+
+
+def foldseek_target_scope_is_partial(target: FoldseekTargetDatabase) -> bool:
+    if target.refresh_needed:
+        return True
+    if target.scope_mode != "on_demand":
+        return False
+    return target.scope_count <= 0 or target.indexed_pdb_count < target.scope_count
+
+
+def pdb_ids_from_text(value: str) -> set[str]:
+    return {match.group(1).upper() for match in PDB_ID_PATTERN.finditer(value)}
+
+
+def pdb_ids_from_evidence(value: str) -> set[str]:
+    ids: set[str] = set()
+    for match in PDB_EVIDENCE_PATTERN.finditer(value):
+        ids.update(pdb_ids_from_text(match.group(1)))
+    return ids
+
+
+def current_foldseek_candidate_ids(run_dir: Path) -> set[str]:
+    ids: set[str] = set()
+    fetches = run_dir / "rcsb_on_demand_fetch.tsv"
+    if fetches.is_file():
+        with fetches.open("r", encoding="utf-8-sig", newline="") as handle:
+            for row in csv.DictReader(handle, delimiter="\t"):
+                pdb_id = str(row.get("pdb_id", "")).strip().upper()
+                if re.fullmatch(r"[0-9][A-Z0-9]{3}", pdb_id):
+                    ids.add(pdb_id)
+        return ids
+    matches = run_dir / "structure_interaction_matches.tsv"
+    if matches.is_file():
+        with matches.open("r", encoding="utf-8-sig", newline="") as handle:
+            for row in csv.DictReader(handle, delimiter="\t"):
+                ids.update(pdb_ids_from_text(str(row.get("target_id", ""))))
+                ids.update(pdb_ids_from_evidence(str(row.get("evidence", ""))))
+    return ids
+
+
+def foldseek_indexed_pdb_ids(targets: list[FoldseekTargetDatabase]) -> set[str]:
+    ids: set[str] = set()
+    for target in targets:
+        for name in foldseek_lookup_names(target.path):
+            ids.update(pdb_ids_from_text(Path(name.replace("\\", "/")).name))
+    return ids
+
+
+def valid_rcsb_coordinate(path: Path, pdb_id: str) -> bool:
+    if not path.is_file() or path.stat().st_size <= 0:
+        return False
+    try:
+        opener = gzip.open if path.name.lower().endswith(".gz") else open
+        with opener(path, "rt", encoding="utf-8", errors="replace") as handle:
+            text = handle.read(8 * 1024 * 1024)
+    except (OSError, UnicodeError):
+        return False
+    lowered = text.lower()
+    identity = f"data_{pdb_id.lower()}" in lowered or re.search(
+        rf"(?im)^_entry\.id\s+['\"]?{re.escape(pdb_id)}['\"]?\s*$", text
+    )
+    return bool(identity and "_atom_site." in lowered)
+
+
+def current_candidate_coordinates(
+    run_dir: Path,
+    science_store: Path,
+    candidate_ids: set[str],
+) -> dict[str, Path]:
+    coordinates: dict[str, Path] = {}
+    fetches = run_dir / "rcsb_on_demand_fetch.tsv"
+    if fetches.is_file():
+        store_root = science_store.resolve()
+        with fetches.open("r", encoding="utf-8-sig", newline="") as handle:
+            for row in csv.DictReader(handle, delimiter="\t"):
+                pdb_id = str(row.get("pdb_id", "")).strip().upper()
+                if pdb_id not in candidate_ids or row.get("status") not in {"fetched", "reused"}:
+                    continue
+                raw_path = Path(str(row.get("path", "")).strip().replace("\\", "/"))
+                path = raw_path if raw_path.is_absolute() else science_store / raw_path
+                try:
+                    resolved = path.resolve(strict=True)
+                except OSError:
+                    continue
+                expected_digest = str(row.get("sha256", "")).strip().lower()
+                if (
+                    not resolved.is_file()
+                    or not resolved.is_relative_to(store_root)
+                    or not valid_digest(expected_digest)
+                    or sha256_path(resolved) != expected_digest
+                    or not valid_rcsb_coordinate(resolved, pdb_id)
+                ):
+                    continue
+                coordinates[pdb_id] = resolved
+    for pdb_id in sorted(candidate_ids.difference(coordinates)):
+        lower = pdb_id.lower()
+        path = science_store / "downloads" / "rcsb" / "mmcif" / lower[1:3] / f"{lower}.cif.gz"
+        if valid_rcsb_coordinate(path, pdb_id):
+            coordinates[pdb_id] = path.resolve()
+    return coordinates
+
+
+def prepare_current_candidate_foldseek_target(
+    foldseek: str,
+    run_dir: Path,
+    science_store: Path,
+    tmp_root: Path,
+    targets: list[FoldseekTargetDatabase],
+    timeout: int,
+) -> tuple[FoldseekTargetDatabase | None, set[str], int]:
+    partial = any(foldseek_target_scope_is_partial(target) for target in targets)
+    if not partial:
+        return None, set(), 0
+    candidate_ids = current_foldseek_candidate_ids(run_dir)
+    indexed_ids = foldseek_indexed_pdb_ids(targets)
+    missing_ids = candidate_ids.difference(indexed_ids)
+    coordinates = current_candidate_coordinates(run_dir, science_store, missing_ids)
+    unresolved = missing_ids.difference(coordinates)
+    if not coordinates:
+        return None, unresolved or ({"UNKNOWN"} if not candidate_ids else set()), len(candidate_ids)
+
+    digest = hashlib.sha256()
+    source_dir = tmp_root / "on_demand_sources"
+    if source_dir.exists():
+        shutil.rmtree(source_dir)
+    source_dir.mkdir(parents=True)
+    total_bytes = 0
+    for pdb_id, coordinate in sorted(coordinates.items()):
+        file_digest = sha256_path(coordinate)
+        digest.update(f"{pdb_id}\0{file_digest}\n".encode("ascii"))
+        total_bytes += coordinate.stat().st_size
+        suffix = ".cif.gz" if coordinate.name.lower().endswith(".gz") else ".cif"
+        destination = source_dir / f"{pdb_id.lower()}{suffix}"
+        try:
+            os.link(coordinate, destination)
+        except OSError:
+            shutil.copy2(coordinate, destination)
+    source_digest = digest.hexdigest()
+    database = tmp_root / f"on_demand_target_{source_digest[:16]}"
+    for artifact in database.parent.glob(f"{database.name}*"):
+        if artifact.is_dir():
+            shutil.rmtree(artifact)
+        elif artifact.is_file():
+            artifact.unlink()
+    run_command([foldseek, "createdb", str(source_dir), str(database)], timeout, "foldseek_on_demand_createdb")
+    return (
+        FoldseekTargetDatabase(
+            "rcsb_on_demand_run",
+            source_digest,
+            len(coordinates),
+            total_bytes,
+            "runtime-current-candidates-v1",
+            database,
+        ),
+        unresolved,
+        len(candidate_ids),
+    )
 
 
 def dedupe_target_databases(targets: list[TargetDatabase]) -> list[TargetDatabase]:

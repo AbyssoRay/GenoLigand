@@ -1891,14 +1891,16 @@ def main() -> int:
     require(health.get("version") == args.expected_version, f"version mismatch: {health}")
     require(
         health.get("commit") == args.expected_commit
-        and health.get("build_id") == args.expected_commit,
+        and health.get("build_id") == f"{args.expected_version}+{args.expected_commit}",
         f"commit mismatch: {health}",
     )
     runtime = health.get("runtime")
     require(
         isinstance(runtime, dict)
         and runtime.get("status") == "verified"
+        and runtime.get("version") == args.expected_version
         and runtime.get("commit") == args.expected_commit
+        and runtime.get("build_id") == f"{args.expected_version}+{args.expected_commit}"
         and valid_sha256(runtime.get("manifest_digest")),
         f"runtime binary identity is not verified: {runtime}",
     )

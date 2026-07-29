@@ -128,8 +128,10 @@ class LigandSimilarityIndexTests(unittest.TestCase):
             {"id": 1, "canonical_smiles": "CCO", "similarity": 0.60},
             {"id": 2, "canonical_smiles": "c1ccccc1", "similarity": 0.60},
         ]
-        ethanol_query = similarity._lightweight_structure_summary("CCO")
-        ring_query = similarity._lightweight_structure_summary("c1ccccc1")
+        ethanol_query = similarity._three_dimensional_structure_summary("CCO")
+        ring_query = similarity._three_dimensional_structure_summary("c1ccccc1")
+        self.assertIsNotNone(ethanol_query)
+        self.assertIsNotNone(ring_query)
 
         ethanol_ranked = [dict(row) for row in candidates]
         similarity._apply_structure_compatibility(ethanol_ranked, ethanol_query)
@@ -304,6 +306,60 @@ class LigandSimilarityIndexTests(unittest.TestCase):
             self.assertGreater(near["match_score"], exact["match_score"])
             self.assertIn("1.0", near["activity"])
 
+    def test_query_rejects_invalid_legacy_chembl_activity_without_rebuild(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="genoligand_similarity_activity_") as tmp:
+            root = Path(tmp)
+            built = _build(root, _write_source_databases(root), "index")
+            validated_manifest = similarity._runtime_manifest(
+                built["database"], built["manifest_path"]
+            )
+            with sqlite3.connect(built["database"]) as connection:
+                molecule_id = int(
+                    connection.execute(
+                        "SELECT id FROM molecule WHERE canonical_smiles='CCO'"
+                    ).fetchone()[0]
+                )
+                target_id = int(connection.execute("SELECT MAX(id) FROM target").fetchone()[0])
+                activities = [
+                    ("ZERO", "IC50=0 nM"),
+                    ("NEGATIVE", "IC50=-1 nM"),
+                    ("MISSING_UNIT", "IC50=5"),
+                    ("CENSORED", "IC50<5 nM"),
+                    ("NON_FINITE", "IC50=inf nM"),
+                    ("VALID", "IC50=5 nM"),
+                ]
+                for offset, (identifier, activity) in enumerate(activities, start=1):
+                    connection.execute(
+                        "INSERT INTO target VALUES (?, 'ChEMBL', ?, ?, ?, 'Homo sapiens', "
+                        "'known_human_protein', 'fixture-release', ?)",
+                        (
+                            target_id + offset,
+                            identifier,
+                            identifier,
+                            identifier,
+                            "c" * 64,
+                        ),
+                    )
+                    connection.execute(
+                        "INSERT INTO evidence VALUES (?, ?, 1.0, ?, 0, 1.0)",
+                        (molecule_id, target_id + offset, activity),
+                    )
+
+            rows = similarity.query_targets(
+                built["database"],
+                "CCO",
+                top_k=50,
+                threshold=0.3,
+                _validated_manifest=validated_manifest,
+            )
+            by_target = {row["target_id"]: row for row in rows}
+            self.assertEqual(
+                {"ZERO", "NEGATIVE", "MISSING_UNIT", "CENSORED", "NON_FINITE"}
+                & by_target.keys(),
+                set(),
+            )
+            self.assertEqual(by_target["VALID"]["activity_score"], 1.0)
+
     def test_query_manifest_is_validated_once_and_publishes_known_database_contract(self) -> None:
         with tempfile.TemporaryDirectory(prefix="genoligand_similarity_cli_") as tmp:
             root = Path(tmp)
@@ -400,6 +456,10 @@ class LigandSimilarityIndexTests(unittest.TestCase):
             root = Path(tmp)
             run_dir = root / "run"
             run_dir.mkdir()
+            _write_query_context(
+                run_dir,
+                [("input_1", "record_1", "a" * 64)],
+            )
             outside = root / "outside.json"
             outside.write_text("{}\n", encoding="utf-8")
             query_manifest = run_dir / "query_structure_manifest.tsv"
@@ -414,6 +474,56 @@ class LigandSimilarityIndexTests(unittest.TestCase):
             with self.assertRaisesRegex(
                 similarity.LigandSimilarityIndexError,
                 "query_structure_features_path_outside_run_dir",
+            ):
+                similarity._read_query_manifest(query_manifest)
+
+    def test_failed_small_molecule_query_structure_is_rejected(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="genoligand_similarity_failed_query_") as tmp:
+            root = Path(tmp)
+            query_manifest = _write_query_manifest(root, ["CCO"])
+            with query_manifest.open("r", encoding="utf-8", newline="") as handle:
+                reader = csv.DictReader(handle, delimiter="\t")
+                fieldnames = list(reader.fieldnames or [])
+                rows = list(reader)
+            rows[0]["status"] = "failed"
+            rows[0]["features_json"] = ""
+            rows[0]["feature_digest"] = ""
+            with query_manifest.open("w", encoding="utf-8", newline="") as handle:
+                writer = csv.DictWriter(
+                    handle, fieldnames=fieldnames, delimiter="\t", lineterminator="\n"
+                )
+                writer.writeheader()
+                writer.writerows(rows)
+
+            with self.assertRaisesRegex(
+                similarity.LigandSimilarityIndexError,
+                "query_structure_expected_record_not_ready",
+            ):
+                similarity._read_query_manifest(query_manifest)
+
+    def test_query_structure_is_bound_to_current_invocation_and_conversion_manifest(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="genoligand_similarity_current_query_") as tmp:
+            root = Path(tmp)
+            query_manifest = _write_query_manifest(root, ["CCO"])
+            invocation = root / "worker_invocation_id.txt"
+            invocation.write_text("new_invocation\n", encoding="utf-8")
+            with self.assertRaisesRegex(
+                similarity.LigandSimilarityIndexError,
+                "query_structure_feature_identity_mismatch",
+            ):
+                similarity._read_query_manifest(query_manifest)
+
+        with tempfile.TemporaryDirectory(prefix="genoligand_similarity_conversion_query_") as tmp:
+            root = Path(tmp)
+            query_manifest = _write_query_manifest(root, ["CCO"])
+            conversion = root / "input_conversion_manifest.tsv"
+            conversion.write_text(
+                conversion.read_text(encoding="utf-8") + "\n",
+                encoding="utf-8",
+            )
+            with self.assertRaisesRegex(
+                similarity.LigandSimilarityIndexError,
+                "query_structure_feature_identity_mismatch",
             ):
                 similarity._read_query_manifest(query_manifest)
 
@@ -673,23 +783,42 @@ def _build(root: Path, sources: dict[str, object], name: str) -> dict[str, objec
 
 def _write_query_manifest(root: Path, smiles_values: list[str]) -> Path:
     query_manifest = root / "query_structure_manifest.tsv"
+    prepared = []
+    for index, smiles in enumerate(smiles_values, start=1):
+        fingerprint, canonical = similarity._fingerprint_from_smiles(smiles)
+        prepared.append(
+            (
+                index,
+                fingerprint,
+                canonical,
+                f"input_{index}",
+                f"record_{index}",
+                hashlib.sha256(f"record_{index}".encode()).hexdigest(),
+            )
+        )
+    invocation_id = "invocation_fixture"
+    _write_query_context(
+        root,
+        [(input_id, record_id, source_digest) for _, _, _, input_id, record_id, source_digest in prepared],
+        invocation_id=invocation_id,
+    )
+    conversion_digest = _sha256(root / "input_conversion_manifest.tsv")
     lines = [
         "input_id\trecord_id\tinput_kind\tinput_digest\tmethod\tfeatures_json\t"
         "coordinate_artifact\tfeature_digest\tstatus"
     ]
-    for index, smiles in enumerate(smiles_values, start=1):
-        fingerprint, canonical = similarity._fingerprint_from_smiles(smiles)
+    for index, fingerprint, canonical, input_id, record_id, source_digest in prepared:
         packed = bytes(DataStructs.BitVectToBinaryText(fingerprint))
         feature_dir = root / f"query_{index}"
         feature_dir.mkdir()
         feature_name = f"query_{index}/features.json"
-        input_id = f"input_{index}"
-        record_id = f"record_{index}"
         input_digest = hashlib.sha256(input_id.encode()).hexdigest()
-        source_digest = hashlib.sha256(record_id.encode()).hexdigest()
         run_id = "run_fixture"
-        invocation_id = "invocation_fixture"
         structure = similarity._lightweight_structure_summary(canonical)
+        three_dimensional = similarity._three_dimensional_structure_summary(canonical)
+        if three_dimensional is None:
+            raise AssertionError(f"fixture conformer generation failed: {canonical}")
+        structure["shape"] = three_dimensional["shape"]
         feature = {
             "schema_version": similarity.QUERY_FEATURE_SCHEMA_VERSION,
             "status": "ready",
@@ -701,6 +830,7 @@ def _write_query_manifest(root: Path, smiles_values: list[str]) -> Path:
             "input_kind": "small_molecule",
             "input_digest": input_digest,
             "source_content_sha256": source_digest,
+            "conversion_manifest_sha256": conversion_digest,
             "method_version": similarity.QUERY_METHOD_VERSION,
             "canonical_smiles": canonical,
             "isomeric_smiles": canonical,
@@ -734,6 +864,7 @@ def _write_query_manifest(root: Path, smiles_values: list[str]) -> Path:
                     "input_kind": "small_molecule",
                     "input_digest": input_digest,
                     "source_content_sha256": source_digest,
+                    "conversion_manifest_sha256": conversion_digest,
                     "method_version": similarity.QUERY_METHOD_VERSION,
                     "features_json": feature_name,
                     "feature_digest": feature_digest,
@@ -749,6 +880,29 @@ def _write_query_manifest(root: Path, smiles_values: list[str]) -> Path:
         )
     query_manifest.write_text("\n".join(lines) + "\n", encoding="utf-8")
     return query_manifest
+
+
+def _write_query_context(
+    root: Path,
+    identities: list[tuple[str, str, str]],
+    *,
+    invocation_id: str = "invocation_fixture",
+) -> None:
+    lines = [
+        "input_id\trecord_id\tcanonical_kind\tconversion_status\tcontent_sha256"
+    ]
+    lines.extend(
+        f"{input_id}\t{record_id}\tsmall_molecule\tconverted\t{source_digest}"
+        for input_id, record_id, source_digest in identities
+    )
+    (root / "input_conversion_manifest.tsv").write_text(
+        "\n".join(lines) + "\n",
+        encoding="utf-8",
+    )
+    (root / "worker_invocation_id.txt").write_text(
+        invocation_id + "\n",
+        encoding="utf-8",
+    )
 
 
 def _sha256(path: Path) -> str:

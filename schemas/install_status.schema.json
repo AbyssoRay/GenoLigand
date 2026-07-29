@@ -193,9 +193,13 @@
     "forcefields": { "$ref": "#/$defs/countSummary" },
     "runtime": {
       "type": "object",
-      "required": ["gls_cli_ready", "gls_server_ready", "launcher", "next_action"],
+      "required": ["status", "version", "commit", "build_id", "gls_cli_ready", "gls_server_ready", "launcher", "next_action"],
       "additionalProperties": false,
       "properties": {
+        "status": { "type": "string" },
+        "version": { "type": "string" },
+        "commit": { "type": "string" },
+        "build_id": { "type": "string" },
         "gls_cli_ready": { "type": "boolean" },
         "gls_server_ready": { "type": "boolean" },
         "launcher": { "type": "string" },

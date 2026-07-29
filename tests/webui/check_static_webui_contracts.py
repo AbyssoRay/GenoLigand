@@ -69,6 +69,7 @@ def main() -> int:
         require(term not in user_text, f"user web assets expose developer term: {term}")
 
     common = read(WEB / "components/common.js")
+    client = read(WEB / "api/client.js")
     require(
         'known_nonhuman_protein: "已知非人源蛋白数据库"' in common,
         "known_nonhuman_protein must render as a user-readable scope label",
@@ -149,6 +150,33 @@ def main() -> int:
     require("报告材料" in report_page, "report view must use report wording")
     require("当前运行还没有可下载报告材料" in report_page, "report view must keep empty downloads honest")
     require(
+        'data-download-artifact' in report_page and "downloadFile(" in report_page,
+        "report downloads must use the controlled artifact download action",
+    )
+    require(
+        "artifactDownloadName" in report_page and "${runName}-${names[artifactId]" in report_page,
+        "report downloads must derive a stable run-scoped filename",
+    )
+    for filename in [
+        "onsite-search.tsv",
+        "candidate-shortlist.tsv",
+        "docking-summary.tsv",
+        "candidate-ranking.tsv",
+        "research-report.md",
+    ]:
+        require(filename in report_page, f"report download filename must remain stable: {filename}")
+    require(
+        '<a class="button secondary" href=' not in report_page,
+        "report downloads must not navigate directly to an artifact URL",
+    )
+    for contract in [
+        "response.blob()",
+        "URL.createObjectURL",
+        "link.download = filename",
+        "URL.revokeObjectURL",
+    ]:
+        require(contract in client, f"download client is missing Blob contract: {contract}")
+    require(
         "runStageRows().map(renderStage).join(\"\")" in run_page,
         "run view must render backend stage readiness instead of fixed completed labels",
     )
@@ -173,11 +201,24 @@ def main() -> int:
         "check view start-run button must share the central run-start predicate",
     )
     require(
+        'data-action="cancel-run"' in run_page,
+        "running view must expose a cancel action",
+    )
+    require(
         "if (!canStartRun())" in actions,
         "startRun action must reject duplicate start attempts before posting to the server",
     )
     load_run_data = actions[actions.index("async function loadRunData()") :]
-    require("Promise.all([" not in load_run_data, "run data loading must avoid concurrent browser fetch bursts")
+    optional_artifact_start = load_run_data.find("let onsite")
+    base_result_reads = (
+        load_run_data
+        if optional_artifact_start < 0
+        else load_run_data[:optional_artifact_start]
+    )
+    require(
+        "Promise.all([" not in base_result_reads,
+        "base run data loading must avoid concurrent browser fetch bursts",
+    )
     require("/candidate-detail" in load_run_data and "/md-summary" in load_run_data, "run data loading must still read all result endpoints")
     require(
         'class="stage-main"' in run_page and 'class="stage-reason"' in run_page,
@@ -190,6 +231,24 @@ def main() -> int:
     for removed in ["资源计划", "当前资源", "恢复建议", "可导出结果"]:
         require(removed not in run_page, f"run view must not render {removed}")
     results_page = read(WEB / "pages/results.js")
+    for tab, label in [
+        ("onsite", "现场检索"),
+        ("shortlist", "结构短名单"),
+        ("docking", "对接摘要"),
+    ]:
+        require(f'"{tab}"' in results_page, f"results view must expose the {tab} tab")
+        require(label in results_page, f"results view must label the {tab} tab")
+        require(
+            f"state.runData?.{tab}?.rows" in results_page,
+            f"results view must render current-run {tab} rows",
+        )
+        require(f'kind === "{tab}"' in common, f"results table must define {tab} columns")
+    for artifact_id in ["onsite_search", "candidate_shortlist", "docking_summary"]:
+        require(artifact_id in actions, f"run data must load visible artifact: {artifact_id}")
+    require(
+        "failure_summary" in results_page and 'metricRow("失败摘要"' in results_page,
+        "results trace must show the current run failure summary",
+    )
     require("cuda_monitoring" in results_page, "MD results must read CUDA production monitoring summary")
     require("mdRuntimeStatus" in results_page, "MD results must render protocol/state/CUDA runtime status")
     require("OpenMM 平台" in results_page, "MD results must show the OpenMM platform")
@@ -203,6 +262,10 @@ def main() -> int:
     require("loadResultPage" in results_page, "result page controls must load paginated API data")
     require("URLSearchParams" in results_page, "result page controls must pass page/filter query parameters")
     require("data-result-filter" in results_page, "result pages must expose a filter input")
+    require(
+        "本页首个候选摘要" in results_page and "第一候选摘要" not in results_page,
+        "candidate detail summary must describe the first row of the current page",
+    )
     components = read(WEB / "styles/components.css")
     require(".stage-main" in components, "stage text column must have a stable width")
     require(".stage-reason" in components, "stage reasons must wrap as normal text")

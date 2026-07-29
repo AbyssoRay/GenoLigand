@@ -225,18 +225,25 @@ function updateStepNavigation() {
 
 function nextActionText() {
   if (!state.project) return "填写并保存输入";
+  if (state.run?.state === "running") return "等待当前阶段完成";
+  if (state.run?.state === "completed") return "查看结果或报告";
+  if (state.run?.state === "blocked") return "查看阻塞原因";
+  if (state.run?.state === "failed") return "查看日志并修复";
+  if (state.run?.state === "cancelled") return "检查输入后重新运行";
+  if (state.run?.state === "resumable") return "恢复运行或重新开始";
   if (!state.preflight) return "执行预检查";
   if (!canStartRun()) return "处理预检查阻塞项";
   if (!state.run) return "开始运行";
-  if (state.run.state === "completed") return "查看结果或报告";
-  if (state.run.state === "blocked") return "查看阻塞原因";
-  if (state.run.state === "failed") return "查看日志并修复";
-  return "等待当前阶段完成";
+  return "开始运行";
 }
 
 function candidateCountText() {
-  const count = candidateRows().length;
-  if (count > 0) return `${count}`;
+  const count = state.runData?.candidates?.pagination?.total_rows;
+  if (Number.isFinite(count)) return `${count}`;
+  const rowCount = state.runData?.candidates?.row_count;
+  if (Number.isFinite(rowCount)) return `${rowCount}`;
+  const traceCount = state.run?.trace?.candidate_count;
+  if (Number.isFinite(traceCount)) return `${traceCount}`;
   if (state.run?.state === "completed") return "0";
   return "运行完成后计算";
 }

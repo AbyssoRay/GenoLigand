@@ -492,6 +492,30 @@ class InstallerRuntimeContracts(unittest.TestCase):
             self.assertNotIn("/IM", result["command"])
             self.assertNotIn("pkill", result["command"])
 
+    def test_dead_runtime_instance_record_is_removed_before_launch(self) -> None:
+        installer = self.installer
+        with tempfile.TemporaryDirectory() as tmp:
+            runtime = Path(tmp)
+            record = runtime / "gls-server.instance.json"
+            record.write_text(
+                json.dumps(
+                    {
+                        "instance_id": "dead-instance",
+                        "binary": "gls-server",
+                        "pid": 4242,
+                        "started_at": 100.0,
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            with mock.patch.object(installer, "process_identity_matches", return_value=False):
+                result = installer.reconcile_runtime_instance_record(runtime, "gls-server")
+
+            self.assertEqual(result["status"], "stale_instance_removed")
+            self.assertEqual(result["pid"], 4242)
+            self.assertFalse(record.exists())
+
 
 if __name__ == "__main__":
     unittest.main(testRunner=unittest.TextTestRunner(stream=sys.stdout, verbosity=2))

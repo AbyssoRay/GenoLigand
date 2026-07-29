@@ -5,12 +5,22 @@ import hashlib
 import json
 import math
 import os
+import signal
 import shutil
 import subprocess
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from genoligand_workers.receptor_contract import (
+    BIOLOGICAL_METALS,
+    COFACTOR_RESIDUES,
+    POLYMER_RESIDUES,
+    RECEPTOR_CHAIN_CONTACT_CUTOFF_ANGSTROM,
+    WATER_RESIDUES,
+    receptor_contact_chains,
+)
 from genoligand_workers.worker_io import (
     candidate_selection_digest,
     parse_worker_args,
@@ -23,24 +33,14 @@ from genoligand_workers.worker_io import (
 BOX_SIZE_ANGSTROM = 22.0
 VINA_EXHAUSTIVENESS = 8
 VINA_NUM_MODES = 5
-WATER_RESIDUES = {"HOH", "WAT", "DOD"}
-POLYMER_RESIDUES = {
-    "ALA", "ARG", "ASN", "ASP", "CYS", "GLN", "GLU", "GLY", "HIS", "ILE",
-    "LEU", "LYS", "MET", "PHE", "PRO", "SER", "THR", "TRP", "TYR", "VAL",
-    "A", "C", "G", "U", "I", "DA", "DC", "DG", "DT", "DI", "N", "UNK",
-}
-BIOLOGICAL_METALS = {
-    "CA", "CO", "CU", "FE", "MG", "MN", "MO", "NI", "V", "W", "ZN",
-}
-COFACTOR_RESIDUES = {
-    "ADP", "ATP", "COA", "FAD", "FMN", "HEA", "HEB", "HEC", "HEM", "NAD",
-    "NAP", "NDP", "PQQ", "PLP", "SAM", "SAH", "SF4", "F3S", "FES", "MOLY",
-}
 COMMON_ADDITIVES = {
     "ACT", "BME", "BOG", "CIT", "DMS", "EDO", "EOH", "FMT", "GOL", "MPD",
     "PEG", "PG4", "PO4", "SO4", "TRS",
 }
 DOCKING_ARTIFACT_SCHEMA_VERSION = "genoligand_docking_artifacts_v1"
+WORKER_TIMEOUT_ENV = "GENOLIGAND_WORKER_TIMEOUT_SECONDS"
+DEFAULT_WORKER_TIMEOUT_SECONDS = 21_600
+PROCESS_TERMINATION_GRACE_SECONDS = 5.0
 
 
 class DockingNotReady(ValueError):
@@ -57,6 +57,10 @@ class DockingBinding:
     ligand_record_id: str
     source_content_sha256: str
     receptor_coordinate: Path
+    query_structure_coordinate: Path
+    query_structure_coordinate_digest: str
+    query_feature_digest: str
+    docking_ligand_smiles: str
     selection: dict[str, str]
     candidate_digest: str = ""
     input_digest: str = ""
@@ -75,6 +79,7 @@ class ReceptorComponent:
     kind: str
     atom_names: tuple[str, ...] = ()
     elements: tuple[str, ...] = ()
+    coordinates: tuple[tuple[float, float, float], ...] = ()
 
 
 @dataclass(frozen=True)
@@ -84,6 +89,7 @@ class SearchBox:
     source_id: str
     provenance: str
     excluded_component_key: str | None = None
+    contact_points: tuple[tuple[float, float, float], ...] = ()
 
 
 @dataclass(frozen=True)
@@ -91,6 +97,7 @@ class ReceptorPreparation:
     box: SearchBox
     receptor_sha256: str
     retained_components: list[dict[str, Any]]
+    contact_chains: list[dict[str, Any]]
 
 
 @dataclass(frozen=True)
@@ -150,6 +157,7 @@ def main() -> int:
 
 
 def run_docking_job(job: dict[str, Any]) -> str:
+    deadline = time.monotonic() + worker_timeout_seconds()
     run_dir = runtime_path(str(job["run_dir"])).resolve(strict=True)
     if not run_dir.is_dir():
         raise DockingNotReady("run_dir_not_directory")
@@ -203,23 +211,28 @@ def run_docking_job(job: dict[str, Any]) -> str:
         return "docking=not_ready;reason=missing_obabel"
 
     from rdkit import Chem, rdBase
-    from rdkit.Chem import AllChem
-
     seed = derive_docking_seed(
         job,
         binding,
         preparation.receptor_sha256,
         preparation.box,
     )
-    write_ligand_sdf(
-        binding.ligand_smiles,
+    copy_query_ligand_sdf(
+        binding.query_structure_coordinate,
         ligand_sdf,
         Chem,
-        AllChem,
-        seed=seed.seed,
+        binding.docking_ligand_smiles,
     )
-    run_checked([obabel, str(receptor_pdb), "-O", str(receptor_pdbqt), "-xr"], "obabel_receptor")
-    run_checked([obabel, str(ligand_sdf), "-O", str(ligand_pdbqt)], "obabel_ligand")
+    run_checked(
+        [obabel, str(receptor_pdb), "-O", str(receptor_pdbqt), "-xr"],
+        "obabel_receptor",
+        deadline=deadline,
+    )
+    run_checked(
+        [obabel, str(ligand_sdf), "-O", str(ligand_pdbqt), "-xp", "-xn"],
+        "obabel_ligand",
+        deadline=deadline,
+    )
     vina_command = build_vina_command(
         vina,
         receptor_pdbqt,
@@ -228,10 +241,19 @@ def run_docking_job(job: dict[str, Any]) -> str:
         preparation.box.center,
         seed.seed,
     )
-    run_checked(vina_command, "vina", log_path)
-    run_checked([obabel, str(pose_pdbqt), "-O", str(pose_sdf)], "obabel_pose")
+    run_checked(vina_command, "vina", log_path, deadline=deadline)
+    pose_atom_map = write_pose_sdf_from_vina(
+        ligand_sdf,
+        ligand_pdbqt,
+        pose_pdbqt,
+        pose_sdf,
+        Chem,
+    )
+    validate_docking_pose_artifacts(pose_pdbqt, pose_sdf, Chem)
 
     affinity = parse_vina_affinity(log_path, pose_pdbqt)
+    if not math.isfinite(affinity):
+        raise ValueError("vina_affinity_non_finite")
     center_text = ",".join(fmt(value) for value in preparation.box.center)
     retained_ids = ",".join(
         str(item.get("component_id", ""))
@@ -326,9 +348,15 @@ def run_docking_job(job: dict[str, Any]) -> str:
                 "receptor_pdb": receptor_pdb_relative,
                 "receptor_pdbqt": receptor_pdbqt_relative,
                 "ligand_smiles": binding.ligand_smiles,
+                "docking_ligand_smiles": binding.docking_ligand_smiles,
                 "ligand_record_id": binding.ligand_record_id,
                 "source_content_sha256": binding.source_content_sha256,
                 "input_digest": seed.input_digest,
+                "query_structure_coordinate": relative_run_path(
+                    run_dir, binding.query_structure_coordinate
+                ),
+                "query_structure_coordinate_sha256": binding.query_structure_coordinate_digest,
+                "query_structure_feature_digest": binding.query_feature_digest,
                 "ligand_sdf": ligand_sdf_relative,
                 "ligand_pdbqt": ligand_pdbqt_relative,
                 "pose": pose_pdbqt_relative,
@@ -345,6 +373,8 @@ def run_docking_job(job: dict[str, Any]) -> str:
                     "provenance": preparation.box.provenance,
                 },
                 "retained_receptor_components": preparation.retained_components,
+                "receptor_contact_chains": preparation.contact_chains,
+                "pose_atom_map": pose_atom_map,
                 "seed": seed.seed,
                 "seed_provenance": {
                     "algorithm": seed.algorithm,
@@ -650,8 +680,30 @@ def resolve_docking_binding(
     ligand_row = ligand_rows[0]
     ligand_smiles = decode_tsv_cell(str(ligand_row.get("canonical_value", ""))).strip()
     source_digest = str(ligand_row.get("content_sha256", "")).strip().lower()
-    if len(source_digest) != 64 or any(ch not in "0123456789abcdef" for ch in source_digest):
-        source_digest = hashlib.sha256(ligand_smiles.encode("utf-8")).hexdigest()
+    if not valid_sha256(source_digest):
+        raise DockingNotReady("selected_input_source_provenance_missing")
+    ligand_record_id = str(ligand_row.get("record_id", "")).strip()
+    input_digest = canonical_digest(
+        {
+            "input_id": input_id,
+            "record_id": ligand_record_id,
+            "canonical_kind": "small_molecule",
+            "canonical_value": ligand_smiles,
+            "source_content_sha256": source_digest,
+        }
+    )
+    (
+        query_structure_coordinate,
+        query_structure_coordinate_digest,
+        query_feature_digest,
+        docking_ligand_smiles,
+    ) = resolve_query_structure_ligand(
+        run_dir,
+        input_id,
+        ligand_record_id,
+        input_digest,
+        source_digest,
+    )
 
     status_path = run_dir / "structure_viewer_status.tsv"
     if not status_path.exists():
@@ -683,16 +735,6 @@ def resolve_docking_binding(
     if sha256_file(receptor_coordinate) != receptor_digest:
         raise DockingNotReady("selected_candidate_receptor_digest_mismatch")
 
-    ligand_record_id = str(ligand_row.get("record_id", "")).strip()
-    input_digest = canonical_digest(
-        {
-            "input_id": input_id,
-            "record_id": ligand_record_id,
-            "canonical_kind": "small_molecule",
-            "canonical_value": ligand_smiles,
-            "source_content_sha256": source_digest,
-        }
-    )
     return DockingBinding(
         candidate_id=candidate_id,
         input_id=input_id,
@@ -702,11 +744,82 @@ def resolve_docking_binding(
         ligand_record_id=ligand_record_id,
         source_content_sha256=source_digest,
         receptor_coordinate=receptor_coordinate,
+        query_structure_coordinate=query_structure_coordinate,
+        query_structure_coordinate_digest=query_structure_coordinate_digest,
+        query_feature_digest=query_feature_digest,
+        docking_ligand_smiles=docking_ligand_smiles,
         selection=selection,
         candidate_digest=candidate_selection_digest(selection),
         input_digest=input_digest,
         receptor_digest=receptor_digest,
     )
+
+
+def resolve_query_structure_ligand(
+    run_dir: Path,
+    input_id: str,
+    record_id: str,
+    input_digest: str,
+    source_digest: str,
+) -> tuple[Path, str, str, str]:
+    index_path = run_dir / "query_structure_manifest.tsv"
+    if not index_path.is_file():
+        raise DockingNotReady("query_structure_manifest_missing")
+    with index_path.open("r", encoding="utf-8-sig", newline="") as handle:
+        rows = [
+            row
+            for row in csv.DictReader(handle, delimiter="\t")
+            if str(row.get("input_id", "")).strip() == input_id
+            and str(row.get("record_id", "")).strip() == record_id
+            and str(row.get("input_kind", "")).strip() == "small_molecule"
+            and str(row.get("input_digest", "")).strip() == input_digest
+            and str(row.get("status", "")).strip() == "ready"
+        ]
+    if len(rows) != 1:
+        raise DockingNotReady("query_structure_ligand_binding_invalid")
+    row = rows[0]
+    feature_digest = str(row.get("feature_digest", "")).strip().lower()
+    if not valid_sha256(feature_digest):
+        raise DockingNotReady("query_structure_feature_digest_invalid")
+    features_path = resolve_run_artifact(run_dir, str(row.get("features_json", "")))
+    if sha256_file(features_path) != feature_digest:
+        raise DockingNotReady("query_structure_feature_digest_mismatch")
+    try:
+        features = json.loads(features_path.read_text(encoding="utf-8-sig"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise DockingNotReady("query_structure_features_invalid") from exc
+    if (
+        features.get("status") != "ready"
+        or features.get("input_id") != input_id
+        or features.get("record_id") != record_id
+        or features.get("input_kind") != "small_molecule"
+        or features.get("input_digest") != input_digest
+        or features.get("source_content_sha256") != source_digest
+    ):
+        raise DockingNotReady("query_structure_feature_binding_mismatch")
+    standardization = features.get("standardization")
+    docking_smiles = str(features.get("isomeric_smiles", "")).strip()
+    if (
+        not isinstance(standardization, dict)
+        or standardization.get("selected_isomeric_smiles") != docking_smiles
+        or not docking_smiles
+    ):
+        raise DockingNotReady("query_structure_standardized_ligand_invalid")
+    coordinate = resolve_run_artifact(run_dir, str(row.get("coordinate_artifact", "")))
+    coordinate_value = features.get("coordinate_artifact")
+    coordinate_digest = (
+        str(coordinate_value.get("sha256", "")).strip().lower()
+        if isinstance(coordinate_value, dict)
+        else ""
+    )
+    if (
+        coordinate.suffix.lower() != ".sdf"
+        or not valid_sha256(coordinate_digest)
+        or sha256_file(coordinate) != coordinate_digest
+        or str(coordinate_value.get("path", "")) != str(row.get("coordinate_artifact", ""))
+    ):
+        raise DockingNotReady("query_structure_coordinate_binding_invalid")
+    return coordinate, coordinate_digest, feature_digest, docking_smiles
 
 
 def choose_search_box(
@@ -743,6 +856,7 @@ def choose_search_box(
             source="selected_pocket",
             source_id=source_id,
             provenance=provenance,
+            contact_points=((center[0], center[1], center[2]),),
         )
 
     ligand_codes = selected_ligand_codes(selection)
@@ -755,9 +869,9 @@ def choose_search_box(
             if component.residue_name.upper() in ligand_codes
             and component.kind not in {"water", "polymer", "additive"}
         ]
-        if not matches:
+        if len(matches) != 1:
             raise DockingNotReady("no_trusted_binding_pocket")
-        ligand = min(matches, key=lambda component: component.key)
+        ligand = matches[0]
     else:
         matches = [component for component in components if component.kind == "ligand_candidate"]
         if len(matches) != 1:
@@ -769,6 +883,7 @@ def choose_search_box(
         source_id=ligand.key,
         provenance=f"coordinate_residue={ligand.key}",
         excluded_component_key=ligand.key,
+        contact_points=ligand.coordinates,
     )
 
 
@@ -847,6 +962,9 @@ def derive_docking_seed(
             "input_id": binding.input_id,
             "target_id": binding.target_id,
             "pdb_id": binding.pdb_id,
+            "query_structure_feature_digest": binding.query_feature_digest,
+            "query_structure_coordinate_sha256": binding.query_structure_coordinate_digest,
+            "docking_ligand_smiles": binding.docking_ligand_smiles,
             "receptor_sha256": receptor_sha256,
             "box_center": list(box.center),
             "box_source": box.source,
@@ -924,6 +1042,7 @@ def prepare_receptor_for_docking(
     receptor_sha256 = sha256_file(path)
     fixer = PDBFixer(filename=str(path))
     fixer.findMissingResidues()
+    fixer.missingResidues = {}
     fixer.findNonstandardResidues()
     fixer.replaceNonstandardResidues()
 
@@ -950,6 +1069,14 @@ def prepare_receptor_for_docking(
     fixer.findMissingAtoms()
     fixer.addMissingAtoms()
     fixer.addMissingHydrogens(7.0)
+    contact_chains = receptor_contact_chains(
+        fixer.topology,
+        fixer.positions.value_in_unit(unit.angstrom),
+        box.contact_points,
+        RECEPTOR_CHAIN_CONTACT_CUTOFF_ANGSTROM,
+    )
+    if not contact_chains:
+        raise DockingNotReady("no_receptor_chain_within_pocket_contact_cutoff")
     heavy_atom_count = sum(
         1
         for atom in fixer.topology.atoms()
@@ -975,6 +1102,7 @@ def prepare_receptor_for_docking(
         box=box,
         receptor_sha256=receptor_sha256,
         retained_components=retained,
+        contact_chains=contact_chains,
     )
 
 
@@ -1015,6 +1143,10 @@ def receptor_components(topology: Any, positions: Any, unit: Any) -> list[Recept
                 ),
                 atom_names=tuple(str(atom.name) for atom in heavy_atoms),
                 elements=elements,
+                coordinates=tuple(
+                    tuple(float(coordinates[atom.index][axis]) for axis in range(3))
+                    for atom in heavy_atoms
+                ),
             )
         )
     return components
@@ -1086,37 +1218,236 @@ def decode_tsv_cell(value: str) -> str:
     return "".join(out)
 
 
-def write_ligand_sdf(
-    smiles: str,
+def copy_query_ligand_sdf(
+    source: Path,
     path: Path,
     Chem: Any,
-    AllChem: Any,
-    *,
-    seed: int,
+    expected_smiles: str,
 ) -> None:
-    mol = Chem.MolFromSmiles(smiles)
-    if mol is None:
-        raise ValueError("RDKit could not parse ligand smiles")
-    mol = Chem.AddHs(mol)
-    status = AllChem.EmbedMolecule(mol, randomSeed=seed)
-    if status != 0:
-        raise ValueError("RDKit ligand embedding failed")
-    try:
-        AllChem.MMFFOptimizeMolecule(mol, maxIters=250)
-    except Exception:
-        AllChem.UFFOptimizeMolecule(mol, maxIters=250)
+    supplier = Chem.SDMolSupplier(str(source), removeHs=False)
+    molecules = [molecule for molecule in supplier if molecule is not None]
+    if len(molecules) != 1 or molecules[0].GetNumConformers() != 1:
+        raise DockingNotReady("query_structure_ligand_coordinate_invalid")
+    molecule = molecules[0]
+    actual_smiles = Chem.MolToSmiles(
+        Chem.RemoveHs(Chem.Mol(molecule)), canonical=True, isomericSmiles=True
+    )
+    if actual_smiles != expected_smiles:
+        raise DockingNotReady("query_structure_ligand_smiles_mismatch")
+    conformer = molecule.GetConformer()
+    if any(
+        not all(math.isfinite(float(value)) for value in (
+            conformer.GetAtomPosition(index).x,
+            conformer.GetAtomPosition(index).y,
+            conformer.GetAtomPosition(index).z,
+        ))
+        for index in range(molecule.GetNumAtoms())
+    ):
+        raise DockingNotReady("query_structure_ligand_coordinates_nonfinite")
     writer = Chem.SDWriter(str(path))
-    writer.write(mol)
-    writer.close()
+    try:
+        writer.write(molecule)
+    finally:
+        writer.close()
+    if not path.is_file() or path.stat().st_size == 0:
+        raise DockingNotReady("query_structure_ligand_copy_failed")
 
 
-def run_checked(command: list[str], label: str, log_path: Path | None = None) -> None:
-    completed = subprocess.run(command, text=True, capture_output=True)
+def write_pose_sdf_from_vina(
+    ligand_sdf: Path,
+    ligand_pdbqt: Path,
+    pose_pdbqt: Path,
+    pose_sdf: Path,
+    Chem: Any,
+) -> dict[str, Any]:
+    supplier = Chem.SDMolSupplier(str(ligand_sdf), removeHs=False)
+    molecules = [molecule for molecule in supplier if molecule is not None]
+    if len(molecules) != 1:
+        raise DockingNotReady("docking_ligand_template_invalid")
+    template = molecules[0]
+    input_atoms = {row["serial"]: row for row in read_pdbqt_atoms(ligand_pdbqt, False)}
+    pose_atoms = {row["serial"]: row for row in read_pdbqt_atoms(pose_pdbqt, True)}
+    if len(input_atoms) == 0 or len(pose_atoms) == 0:
+        raise DockingNotReady("docking_pose_atom_map_missing")
+    heavy_template = Chem.RemoveHs(Chem.Mol(template))
+    heavy_original_indices = [
+        atom.GetIdx() for atom in template.GetAtoms() if atom.GetAtomicNum() > 1
+    ]
+    if heavy_template.GetNumAtoms() != len(heavy_original_indices):
+        raise DockingNotReady("docking_pose_atom_map_invalid")
+    conformer = Chem.Conformer(heavy_template.GetNumAtoms())
+    atom_map: list[dict[str, Any]] = []
+    for heavy_index, original_index in enumerate(heavy_original_indices):
+        serial = original_index + 1
+        source = input_atoms.get(serial)
+        pose = pose_atoms.get(serial)
+        element = template.GetAtomWithIdx(original_index).GetSymbol()
+        if (
+            source is None
+            or pose is None
+            or source["element"] != element
+            or pose["element"] != element
+        ):
+            raise DockingNotReady(f"docking_pose_atom_map_mismatch:{serial}:{element}")
+        x, y, z = pose["coord"]
+        if not all(math.isfinite(value) for value in (x, y, z)):
+            raise DockingNotReady("docking_pose_coordinates_nonfinite")
+        conformer.SetAtomPosition(heavy_index, (x, y, z))
+        atom_map.append(
+            {
+                "pdbqt_serial": serial,
+                "rdkit_heavy_atom_index": heavy_index,
+                "element": element,
+            }
+        )
+    heavy_template.RemoveAllConformers()
+    heavy_template.AddConformer(conformer, assignId=True)
+    placed = Chem.AddHs(heavy_template, addCoords=True)
+    Chem.SanitizeMol(placed)
+    writer = Chem.SDWriter(str(pose_sdf))
+    try:
+        writer.write(placed)
+    finally:
+        writer.close()
+    if not pose_sdf.is_file() or pose_sdf.stat().st_size == 0:
+        raise DockingNotReady("docking_pose_sdf_invalid")
+    map_digest = canonical_digest({"atom_map": atom_map})
+    return {
+        "algorithm": "pdbqt_preserved_serial_to_rdkit_heavy_atom_v1",
+        "heavy_atom_count": len(atom_map),
+        "atom_map_sha256": map_digest,
+        "atoms": atom_map,
+    }
+
+
+def read_pdbqt_atoms(path: Path, first_model_only: bool) -> list[dict[str, Any]]:
+    atoms: list[dict[str, Any]] = []
+    seen_model = False
+    for line in path.read_text(encoding="utf-8", errors="replace").splitlines():
+        if line.startswith("MODEL"):
+            if seen_model and first_model_only:
+                break
+            seen_model = True
+            continue
+        if line.startswith("ENDMDL") and first_model_only:
+            break
+        if not line.startswith(("ATOM  ", "HETATM")):
+            continue
+        try:
+            serial = int(line[6:11])
+            coord = (float(line[30:38]), float(line[38:46]), float(line[46:54]))
+        except (ValueError, IndexError) as exc:
+            raise DockingNotReady("docking_pdbqt_atom_invalid") from exc
+        fields = line.split()
+        atom_type = fields[-1] if fields else ""
+        element = pdbqt_atom_element(atom_type)
+        if not element:
+            raise DockingNotReady(f"docking_pdbqt_atom_type_unsupported:{atom_type}")
+        atoms.append({"serial": serial, "element": element, "coord": coord})
+    serials = [row["serial"] for row in atoms]
+    if len(serials) != len(set(serials)):
+        raise DockingNotReady("docking_pdbqt_atom_serial_duplicate")
+    return atoms
+
+
+def pdbqt_atom_element(atom_type: str) -> str:
+    normalized = atom_type.strip()
+    mapped = {
+        "A": "C",
+        "NA": "N",
+        "OA": "O",
+        "SA": "S",
+        "HD": "H",
+        "HS": "H",
+        "Cl": "Cl",
+        "CL": "Cl",
+        "Br": "Br",
+        "BR": "Br",
+    }.get(normalized)
+    if mapped:
+        return mapped
+    if normalized in {"B", "C", "N", "O", "P", "S", "F", "I", "H"}:
+        return normalized
+    if normalized.upper() in BIOLOGICAL_METALS:
+        text = normalized.lower().capitalize()
+        return text
+    return ""
+
+
+def worker_timeout_seconds() -> int:
+    value = os.environ.get(WORKER_TIMEOUT_ENV)
+    if value is None:
+        return DEFAULT_WORKER_TIMEOUT_SECONDS
+    try:
+        seconds = int(value.strip())
+    except ValueError as exc:
+        raise ValueError(f"worker_timeout_invalid:{WORKER_TIMEOUT_ENV}={value}") from exc
+    if seconds <= 0:
+        raise ValueError(f"worker_timeout_invalid:{WORKER_TIMEOUT_ENV}={value}")
+    return seconds
+
+
+def run_checked(
+    command: list[str],
+    label: str,
+    log_path: Path | None = None,
+    *,
+    deadline: float | None = None,
+) -> None:
+    if deadline is None:
+        deadline = time.monotonic() + worker_timeout_seconds()
+    remaining = deadline - time.monotonic()
+    if remaining <= 0:
+        raise ValueError(f"{label}_timed_out")
+    options: dict[str, Any] = {
+        "text": True,
+        "stdout": subprocess.PIPE,
+        "stderr": subprocess.PIPE,
+    }
+    if os.name == "nt":
+        options["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP
+    else:
+        options["start_new_session"] = True
+    process = subprocess.Popen(command, **options)
+    try:
+        stdout, stderr = process.communicate(timeout=remaining)
+    except subprocess.TimeoutExpired as exc:
+        terminate_process_tree(process)
+        stdout, stderr = process.communicate()
+        if log_path is not None:
+            log_path.write_text((stdout or "") + (stderr or ""), encoding="utf-8")
+        raise ValueError(f"{label}_timed_out") from exc
     if log_path is not None:
-        log_path.write_text((completed.stdout or "") + (completed.stderr or ""), encoding="utf-8")
-    if completed.returncode != 0:
-        detail = first_nonempty_line(completed.stderr) or first_nonempty_line(completed.stdout) or "command failed"
+        log_path.write_text((stdout or "") + (stderr or ""), encoding="utf-8")
+    if process.returncode != 0:
+        detail = first_nonempty_line(stderr) or first_nonempty_line(stdout) or "command failed"
         raise ValueError(f"{label}_failed:{detail}")
+
+
+def terminate_process_tree(process: Any) -> None:
+    if os.name == "nt":
+        subprocess.run(
+            ["taskkill", "/PID", str(process.pid), "/T", "/F"],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            check=False,
+        )
+    else:
+        try:
+            os.killpg(process.pid, signal.SIGTERM)
+        except ProcessLookupError:
+            pass
+        try:
+            process.wait(timeout=PROCESS_TERMINATION_GRACE_SECONDS)
+        except subprocess.TimeoutExpired:
+            pass
+        try:
+            os.killpg(process.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+    if process.poll() is None:
+        process.kill()
+    process.wait()
 
 
 def parse_vina_affinity(log_path: Path, pose_path: Path) -> float:
@@ -1130,17 +1461,70 @@ def parse_vina_affinity(log_path: Path, pose_path: Path) -> float:
             fields = line.split()
             if len(fields) >= 2 and fields[0].isdigit():
                 try:
-                    return float(fields[1])
+                    affinity = float(fields[1])
                 except ValueError:
                     continue
+                if not math.isfinite(affinity):
+                    raise ValueError("vina_affinity_non_finite")
+                return affinity
             if line.startswith("REMARK VINA RESULT:"):
                 parts = line.split()
                 for value in parts:
                     try:
-                        return float(value)
+                        affinity = float(value)
                     except ValueError:
                         continue
+                    if not math.isfinite(affinity):
+                        raise ValueError("vina_affinity_non_finite")
+                    return affinity
     raise ValueError("vina affinity not found in output")
+
+
+def validate_docking_pose_artifacts(pose_pdbqt: Path, pose_sdf: Path, Chem: Any) -> None:
+    validate_pdbqt_pose(pose_pdbqt)
+    validate_sdf_pose(pose_sdf, Chem)
+
+
+def validate_pdbqt_pose(path: Path) -> None:
+    if not path.is_file() or path.stat().st_size == 0:
+        raise ValueError("docking_pose_pdbqt_missing_or_empty")
+    atoms = read_pdbqt_atoms(path, True)
+    if not atoms:
+        raise ValueError("docking_pose_pdbqt_has_no_atoms")
+    if not all(
+        math.isfinite(value)
+        for atom in atoms
+        for value in atom["coord"]
+    ):
+        raise ValueError("docking_pose_pdbqt_coordinates_invalid")
+
+
+def validate_sdf_pose(path: Path, Chem: Any) -> None:
+    if not path.is_file() or path.stat().st_size == 0:
+        raise ValueError("docking_pose_sdf_missing_or_empty")
+    try:
+        supplier = Chem.SDMolSupplier(
+            str(path), sanitize=False, removeHs=False, strictParsing=True
+        )
+        molecule = next(iter(supplier), None)
+    except Exception as exc:
+        raise ValueError("docking_pose_sdf_parse_failed") from exc
+    if molecule is None or molecule.GetNumAtoms() == 0:
+        raise ValueError("docking_pose_sdf_has_no_molecule")
+    if molecule.GetNumConformers() == 0:
+        raise ValueError("docking_pose_sdf_has_no_coordinates")
+    conformer = molecule.GetConformer()
+    try:
+        finite = all(
+            math.isfinite(float(value))
+            for atom_index in range(molecule.GetNumAtoms())
+            for point in (conformer.GetAtomPosition(atom_index),)
+            for value in (point.x, point.y, point.z)
+        )
+    except Exception as exc:
+        raise ValueError("docking_pose_sdf_coordinates_invalid") from exc
+    if not finite:
+        raise ValueError("docking_pose_sdf_coordinates_invalid")
 
 
 def write_docking_not_ready(
@@ -1218,6 +1602,7 @@ def write_docking_not_ready(
                     "provenance": preparation.box.provenance,
                 },
                 "retained_receptor_components": preparation.retained_components,
+                "receptor_contact_chains": preparation.contact_chains,
             }
         )
     manifest_path = tool_outputs / "docking_manifest.json"
@@ -1258,9 +1643,10 @@ def first_nonempty_line(text: str) -> str:
 
 
 def fmt(value: float) -> str:
-    if not math.isfinite(float(value)):
-        return "nan"
-    return f"{float(value):.4f}"
+    number = float(value)
+    if not math.isfinite(number):
+        raise ValueError("non_finite_numeric_output")
+    return f"{number:.4f}"
 
 
 if __name__ == "__main__":

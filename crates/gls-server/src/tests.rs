@@ -185,6 +185,11 @@ fn start_run_reuses_existing_running_run() {
     .expect("input");
     fs::write(project.join("latest_run_id.txt"), "run-existing\n").expect("latest run");
     fs::write(run_dir.join("run_state.txt"), "running\n").expect("state");
+    fs::write(
+        run_dir.join("process_id.txt"),
+        format!("{}\n", std::process::id()),
+    )
+    .expect("process id");
     fs::write(run_dir.join("current_stage.txt"), "features_compute\n").expect("stage");
 
     let response = start_run(&options, project_id);
@@ -993,17 +998,51 @@ fn user_health_hides_backend_service_name() {
     assert_eq!(payload["application"], PRODUCT_NAME);
     assert_eq!(payload["version"], PRODUCT_VERSION);
     assert_eq!(payload["commit"], PRODUCT_COMMIT);
-    assert_eq!(payload["build_id"], PRODUCT_COMMIT);
+    assert_eq!(payload["build_id"], PRODUCT_BUILD_ID);
     assert!(payload["runtime"].is_object());
+    assert_eq!(payload["runtime"]["version"], PRODUCT_VERSION);
+    assert_eq!(payload["runtime"]["commit"], PRODUCT_COMMIT);
+    assert_eq!(payload["runtime"]["build_id"], PRODUCT_BUILD_ID);
     assert_eq!(
         payload["science_store_readiness"]["schema_version"],
         "genoligand_science_store_readiness_v1"
     );
     assert!(payload["science_store_readiness"]["ready"].is_boolean());
     assert!(payload["science_store_readiness"]["blockers"].is_array());
+    let (status, _, version_body) = route("GET", "/api/version", &server_options(root.clone()), "");
+    let version: Value = serde_json::from_str(&version_body).expect("version json");
+    assert_eq!(status, 200);
+    assert_eq!(version["version"], PRODUCT_VERSION);
+    assert_eq!(version["commit"], PRODUCT_COMMIT);
+    assert_eq!(version["build_id"], PRODUCT_BUILD_ID);
+    assert_eq!(version["runtime"]["version"], PRODUCT_VERSION);
     assert!(!text.contains("gls-server"));
     assert!(!text.contains("route"));
     assert!(!text.contains("debug"));
+    fs::remove_dir_all(root).ok();
+}
+
+#[test]
+fn runtime_health_removes_dead_instance_record() {
+    let root = std::env::temp_dir().join(format!("genoligand-dead-instance-{}", now_millis()));
+    fs::create_dir_all(&root).expect("runtime root");
+    let record = root.join("gls-server.instance.json");
+    fs::write(
+        &record,
+        json!({
+            "instance_id":"dead-instance",
+            "binary":"gls-server",
+            "pid":u32::MAX,
+            "started_at":1
+        })
+        .to_string(),
+    )
+    .expect("dead instance record");
+
+    let status = reconcile_runtime_instance_record(&root);
+
+    assert_eq!(status["status"], "stale_removed");
+    assert!(!record.exists());
     fs::remove_dir_all(root).ok();
 }
 

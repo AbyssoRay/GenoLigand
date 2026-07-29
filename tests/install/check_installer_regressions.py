@@ -304,7 +304,8 @@ def create_chembl_fixture(root: Path) -> tuple[Path, Path, Path, Path, Path]:
         connection.executescript(
             """
             CREATE TABLE activities (assay_id INTEGER, molregno INTEGER, standard_type TEXT,
-                standard_relation TEXT, standard_value REAL, standard_units TEXT);
+                standard_relation TEXT, standard_value REAL, standard_units TEXT,
+                data_validity_comment TEXT);
             CREATE TABLE assays (assay_id INTEGER, tid INTEGER);
             CREATE TABLE target_dictionary (tid INTEGER, chembl_id TEXT, pref_name TEXT, organism TEXT);
             CREATE TABLE molecule_dictionary (molregno INTEGER, pref_name TEXT);
@@ -312,22 +313,31 @@ def create_chembl_fixture(root: Path) -> tuple[Path, Path, Path, Path, Path]:
             CREATE TABLE target_components (tid INTEGER, component_id INTEGER);
             CREATE TABLE component_sequences (component_id INTEGER, accession TEXT);
             INSERT INTO activities VALUES
-                (1, 1, 'IC50', '=', 7.0, 'nM'),
-                (2, 2, 'Ki', '<', 8.0, NULL),
-                (1, 3, 'Kd', '=', 9.0, ''),
-                (1, 4, 'AC50', '=', 10.0, 'nM'),
-                (1, 5, 'IC50', '=', 11.0, 'uM'),
-                (1, 6, 'IC50', '=', NULL, 'nM');
+                (1, 1, 'IC50', '=', 7.0, 'nM', NULL),
+                (2, 2, 'Ki', '=', 8.0, 'nM', 'Manually validated'),
+                (1, 3, 'Kd', '=', 9.0, 'nM', NULL),
+                (1, 4, 'AC50', '=', 10.0, 'nM', NULL),
+                (1, 5, 'IC50', '=', 11.0, 'uM', NULL),
+                (1, 6, 'IC50', '=', NULL, 'nM', NULL),
+                (1, 7, 'IC50', '=', 0.0, 'nM', NULL),
+                (1, 8, 'IC50', '=', -1.0, 'nM', NULL),
+                (1, 9, 'IC50', '<', 5.0, 'nM', NULL),
+                (1, 10, 'IC50', '=', 5.0, NULL, NULL),
+                (1, 11, 'IC50', '=', 5.0, 'nM', 'Potential transcription error'),
+                (1, 12, 'IC50', '=', 1e999, 'nM', NULL);
             INSERT INTO assays VALUES (1, 1), (2, 2);
             INSERT INTO target_dictionary VALUES
                 (1, 'CHEMBL_T1', 'Target 1', 'Homo sapiens'),
                 (2, 'CHEMBL_T2', 'Target 2', 'Homo sapiens');
             INSERT INTO molecule_dictionary VALUES
                 (1, 'Compound 1'), (2, 'Compound 2'), (3, 'Compound 3'),
-                (4, 'Compound 4'), (5, 'Compound 5'), (6, 'Compound 6');
+                (4, 'Compound 4'), (5, 'Compound 5'), (6, 'Compound 6'),
+                (7, 'Compound 7'), (8, 'Compound 8'), (9, 'Compound 9'),
+                (10, 'Compound 10'), (11, 'Compound 11'), (12, 'Compound 12');
             INSERT INTO compound_structures VALUES
                 (1, 'CCO'), (2, 'CCN'), (3, 'CCC'), (4, 'CCCl'), (5, 'CCBr'),
-                (6, 'CCF');
+                (6, 'CCF'), (7, 'CO'), (8, 'CN'), (9, 'CCl'), (10, 'CBr'),
+                (11, 'CF'), (12, 'CS');
             INSERT INTO target_components VALUES (1, 10), (1, 11), (2, 20), (2, 21);
             INSERT INTO component_sequences VALUES
                 (10, 'P12345'), (11, 'P12345'), (20, 'P22222'), (21, 'P33333');
@@ -1114,6 +1124,9 @@ class InstallerRegressionTests(unittest.TestCase):
                 "scope_ready_count": str(retired_snapshot["ready_count"]),
                 "scope_missing_count": str(retired_snapshot["missing_count"]),
             }
+            retired_coordinate = coordinate_root / "de/2def.cif.gz"
+            retired_coordinate_bytes = retired_coordinate.read_bytes()
+            retired_coordinate.unlink()
             retired_validation = installer.foldseek_partial_manifest_validation(
                 store,
                 retired_row,
@@ -1122,6 +1135,8 @@ class InstallerRegressionTests(unittest.TestCase):
             )
             self.assertEqual(retired_validation["status"], "ready")
             self.assertTrue(retired_validation["refresh_needed"])
+            retired_coordinate.parent.mkdir(parents=True, exist_ok=True)
+            retired_coordinate.write_bytes(retired_coordinate_bytes)
             explicit_scope.write_text("\n".join(sorted(scope)) + "\n", encoding="utf-8")
             snapshot = installer.write_rcsb_scope_manifest(
                 store,
@@ -1214,6 +1229,118 @@ class InstallerRegressionTests(unittest.TestCase):
                 db.parent / "bad-evidence.tsv",
             )
             self.assertIn("foldseek_source_pdb_id_invalid", malformed["reason"])
+            listing.write_text(source_text, encoding="utf-8")
+            lookup.write_text(lookup_text, encoding="utf-8")
+            index.write_text(index_text, encoding="ascii")
+            current_snapshot = installer.write_rcsb_scope_manifest(
+                store,
+                coordinate_root,
+                scope,
+                scope_mode="on-demand",
+            )
+            installer.write_rcsb_on_demand_policy(store, current_snapshot)
+            with mock.patch.object(
+                installer, "database_prefix_ready", return_value=True
+            ), mock.patch.object(
+                installer,
+                "build_foldseek_database",
+                return_value=("failed", "fixture_rebuild_attempted"),
+            ) as rebuild:
+                rebuilt = installer.build_foldseek_target_database(
+                    store,
+                    {},
+                    None,
+                    rcsb_mode="on-demand",
+                )[0]
+            self.assertTrue(rebuild.call_args.kwargs["force_rebuild"])
+            self.assertEqual(rebuilt["status"], "failed")
+
+    def test_foldseek_on_demand_fresh_build_publishes_validated_index_identity(self) -> None:
+        installer = self.installer
+        with tempfile.TemporaryDirectory() as tmp:
+            store = Path(tmp) / "science_store"
+            coordinate_root = store / "downloads/rcsb/mmcif"
+            scope = {"1ABC", "2DEF"}
+            explicit_scope = store / "downloads/rcsb/ligand_bound_pdb_ids.txt"
+            explicit_scope.parent.mkdir(parents=True, exist_ok=True)
+            explicit_scope.write_text("\n".join(sorted(scope)) + "\n", encoding="utf-8")
+            for pdb_id in sorted(scope):
+                coordinate = coordinate_root / pdb_id[1:3].lower() / f"{pdb_id.lower()}.cif.gz"
+                coordinate.parent.mkdir(parents=True, exist_ok=True)
+                with gzip.open(coordinate, "wt", encoding="utf-8") as handle:
+                    handle.write(rcsb_mmcif_text(pdb_id))
+            snapshot = installer.write_rcsb_scope_manifest(
+                store,
+                coordinate_root,
+                scope,
+                scope_mode="on-demand",
+            )
+            installer.write_rcsb_on_demand_policy(store, snapshot)
+            runtime_cached_id = "9XYZ"
+            runtime_coordinate = (
+                coordinate_root
+                / runtime_cached_id[1:3].lower()
+                / f"{runtime_cached_id.lower()}.cif.gz"
+            )
+            runtime_coordinate.parent.mkdir(parents=True, exist_ok=True)
+            with gzip.open(runtime_coordinate, "wt", encoding="utf-8") as handle:
+                handle.write(rcsb_mmcif_text(runtime_cached_id))
+            db = store / "indexes/foldseek/rcsb_mmcif/target"
+
+            def build_fixture(*_args, **_kwargs):
+                create_database_directory_fixture(db, b"fresh-foldseek", entries=3)
+                Path(f"{db}.source").write_text(
+                    "0\t1abc_MODEL_1\n1\t2def_MODEL_1\n2\t9xyz_MODEL_1\n",
+                    encoding="utf-8",
+                )
+                Path(f"{db}.lookup").write_text(
+                    "0\t1abc_A\t0\n1\t2def_A\t1\n2\t9xyz_A\t2\n",
+                    encoding="utf-8",
+                )
+                Path(f"{db}.index").write_text(
+                    "0\t0\t1\n1\t1\t1\n2\t2\t1\n", encoding="ascii"
+                )
+                return "ready", "fixture_build_completed"
+
+            with mock.patch.object(
+                installer, "database_builder_version", return_value="builder-1"
+            ), mock.patch.object(
+                installer, "database_prefix_ready", return_value=True
+            ), mock.patch.object(
+                installer, "build_foldseek_database", side_effect=build_fixture
+            ):
+                rows = installer.build_foldseek_target_database(
+                    store,
+                    {},
+                    None,
+                    rcsb_mode="on-demand",
+                )
+
+            row = rows[0]
+            self.assertEqual(row["status"], "ready", row)
+            self.assertEqual(row["scope_status"], "ready_partial_on_demand")
+            self.assertEqual(row["indexed_pdb_count"], "3")
+            self.assertEqual(row["refresh_needed"], "false")
+            self.assertEqual(row["source_digest"], row["indexed_subset_digest"])
+            for field in (
+                "indexed_source_listing_sha256",
+                "indexed_validated_ids_sha256",
+                "indexed_mapping_sha256",
+                "indexed_subset_digest",
+            ):
+                self.assertRegex(row[field], r"^[0-9a-f]{64}$")
+            validated = store / row["indexed_validated_ids_manifest"]
+            validated_rows = installer.read_tsv(validated)
+            self.assertEqual(
+                [item["pdb_id"] for item in validated_rows], ["1ABC", "2DEF", "9XYZ"]
+            )
+            self.assertTrue(all(item["status"] == "validated" for item in validated_rows))
+            self.assertTrue(
+                all(
+                    item["sha256"] == installer.sha256_file(store / item["coordinate_rel_path"])
+                    for item in validated_rows
+                )
+            )
 
     def test_foldseek_cross_volume_publish_trims_index_and_preserves_previous_on_failure(self) -> None:
         installer = self.installer
@@ -1237,7 +1364,7 @@ class InstallerRegressionTests(unittest.TestCase):
             return "ready", "fixture_createdb_createindex_completed"
 
         cases = [
-            ("cross_volume_success", 1 << 50, [True, True], False, "ready", True),
+            ("cross_volume_success", 1 << 50, [True, True, True], False, "ready", False),
             (
                 "compact_after_index_trim",
                 installer.DISK_SAFETY_MARGIN_BYTES + 512,
@@ -1246,8 +1373,8 @@ class InstallerRegressionTests(unittest.TestCase):
                 "ready",
                 False,
             ),
-            ("copy_failure", 1 << 50, [True], True, "failed", None),
-            ("target_probe_failure", 1 << 50, [True, False], False, "failed", None),
+            ("copy_failure", 1 << 50, [True, True], True, "failed", None),
+            ("target_probe_failure", 1 << 50, [True, True, False], False, "failed", None),
         ]
         for name, target_free, probes, copy_failure, expected_status, expect_index in cases:
             with self.subTest(name=name), tempfile.TemporaryDirectory() as tmp:
@@ -1318,6 +1445,29 @@ class InstallerRegressionTests(unittest.TestCase):
                 self.assertEqual(list(scratch.glob("foldseek-rcsb-rebuild-*")), [])
                 self.assertEqual(list(db.parent.parent.glob(".rcsb_mmcif.rebuild-*")), [])
                 self.assertEqual(list(db.parent.parent.glob(".rcsb_mmcif.previous-*")), [])
+
+    def test_remove_foldseek_precomputed_index_removes_all_index_components(self) -> None:
+        installer = self.installer
+        with tempfile.TemporaryDirectory() as tmp:
+            db = Path(tmp) / "target"
+            removable = [
+                Path(f"{db}{suffix}")
+                for suffix in (
+                    ".idx",
+                    ".idx.dbtype",
+                    ".idx.index",
+                    "_ss.idx",
+                    "_ss.idx.dbtype",
+                    "_ss.idx.index",
+                )
+            ]
+            preserved = [db, Path(f"{db}.index"), Path(f"{db}_ss"), Path(f"{db}_h.idx")]
+            for path in [*removable, *preserved]:
+                path.write_bytes(b"fixture")
+
+            self.assertTrue(installer.remove_foldseek_precomputed_index(db))
+            self.assertTrue(all(not path.exists() for path in removable))
+            self.assertTrue(all(path.is_file() for path in preserved))
 
     def test_database_directory_hard_interruptions_reconcile_without_losing_last_good(self) -> None:
         installer = self.installer
@@ -2864,6 +3014,8 @@ class InstallerRegressionTests(unittest.TestCase):
             self.assertEqual(payload["path_prepend"], [str(runtime / "bin"), *additions])
             launcher = (runtime / "run-genoligand-webui.py").read_text(encoding="utf-8")
             self.assertNotIn(str(root / "inherited-cache"), launcher)
+            self.assertIn("def process_alive(pid):", launcher)
+            self.assertIn("record_path.unlink(missing_ok=True)", launcher)
 
     def test_openff_requires_fixed_digest_xml_and_loader(self) -> None:
         installer = self.installer
@@ -3431,8 +3583,8 @@ class InstallerRegressionTests(unittest.TestCase):
                 rows,
                 {
                     ("CCO", "P12345", "CHEMBL_T1", "IC50", "nM", "CHEMBL37", digest),
-                    ("CCC", "P12345", "CHEMBL_T1", "Kd", "", "CHEMBL37", digest),
-                    ("CCN", "CHEMBL_T2", "CHEMBL_T2", "Ki", "", "CHEMBL37", digest),
+                    ("CCC", "P12345", "CHEMBL_T1", "Kd", "nM", "CHEMBL37", digest),
+                    ("CCN", "CHEMBL_T2", "CHEMBL_T2", "Ki", "nM", "CHEMBL37", digest),
                 },
             )
             defaults = {str(row[1]): row[4] for row in table_info}

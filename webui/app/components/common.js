@@ -82,6 +82,40 @@ function columnsFor(kind) {
       { key: "result_source", label: "输出材料" },
     ];
   }
+  if (kind === "onsite") {
+    return [
+      { key: "input_id", label: "输入编号" },
+      { key: "source", label: "来源" },
+      { key: "target_id", label: "目标编号" },
+      { key: "target_name", label: "目标名称" },
+      { key: "organism", label: "物种" },
+      { key: "target_class", label: "目标类型" },
+      { key: "match_score", label: "匹配分数" },
+      { key: "matched_features", label: "匹配特征" },
+      { key: "evidence", label: "证据" },
+    ];
+  }
+  if (kind === "shortlist") {
+    return [
+      { key: "shortlist_rank", label: "短名单排序" },
+      { key: "candidate_id", label: "候选编号" },
+      { key: "input_id", label: "输入编号" },
+      { key: "record_id", label: "记录编号" },
+      { key: "target_id", label: "目标编号" },
+      { key: "preliminary_score", label: "粗排分数" },
+      { key: "shortlist_reason", label: "入选原因" },
+      { key: "coordinate_status", label: "坐标状态" },
+    ];
+  }
+  if (kind === "docking") {
+    return [
+      { key: "candidate_id", label: "候选编号" },
+      { key: "docking_status", label: "对接状态" },
+      { key: "docking_score", label: "对接分数" },
+      { key: "docking_engine", label: "对接引擎" },
+      { key: "notes", label: "说明" },
+    ];
+  }
   if (kind === "structure") {
     return [
       { key: "candidate_id", label: "候选编号" },
@@ -166,8 +200,15 @@ function runStateClass(value) {
 
 function friendlyArtifact(name) {
   return {
+    query_structure: "输入结构准备",
+    onsite_search: "现场检索结果",
+    candidate_shortlist: "结构候选短名单",
+    docking_summary: "对接摘要",
     structure_patch: "结构与口袋摘要",
     md_summary: "动力学摘要",
+    md_protocol: "MD 运行协议",
+    md_state: "MD 状态序列",
+    gpu_telemetry: "CUDA 监测",
     candidate_ranking: "候选排序",
     evidence: "证据链",
     research_report: "科研报告",

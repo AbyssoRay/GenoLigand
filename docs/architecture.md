@@ -30,3 +30,5 @@ GenoLigand 的产品职责是从用户输入的物质、序列或结构出发，
 ## 发布边界
 
 仓库只保存代码、配置规则、schema、文档和测试。安装后生成的数据库 manifest、工具版本、hash、索引和运行产物进入用户 science store 或项目运行目录，不写入仓库配置目录。发布前必须执行 `python tests/clean_release/check_clean_release.py --workspace-root <repo> --science-store <store> --runtime-dir <runtime>`，确认仓库没有构建与运行缓存，science store 没有无身份 partial 或旧 staging，runtime 没有失效 PID 或旧验收项目。门禁按 manifest 引用关系分类候选，并保留有效下载源、MMseqs/Foldseek 数据库及力场文件。
+
+产品发布身份由 Cargo workspace 的 `version`、Git `commit` 和 `<version>+<commit>` 形式的 `build_id` 共同确定。CLI、服务端、运行时 manifest 和健康接口必须给出同一组值；发布标签使用 `v<version>` 并指向最终发布提交。

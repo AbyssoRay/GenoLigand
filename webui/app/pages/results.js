@@ -4,7 +4,7 @@
   page.innerHTML = `
     ${resultTracePanel()}
     <div class="tabs">
-      ${["ranking", "detail", "evidence", "genome", "structure", "md"]
+      ${["ranking", "detail", "evidence", "genome", "onsite", "shortlist", "docking", "structure", "md"]
         .map((tab) => `<button class="tab ${activeTab === tab ? "active" : ""}" data-result-tab="${tab}">${resultTabLabel(tab)}</button>`)
         .join("")}
     </div>
@@ -27,6 +27,9 @@ function resultTabLabel(tab) {
     detail: "候选详情",
     evidence: "证据链",
     genome: "基因组/ORF",
+    onsite: "现场检索",
+    shortlist: "结构短名单",
+    docking: "对接摘要",
     structure: "结构/口袋",
     md: "动力学摘要",
   }[tab] || tab;
@@ -37,6 +40,9 @@ function renderResultTab(tab) {
   if (tab === "detail") return candidateDetailSection(state.runData?.detail?.candidate_details || [], state.runData?.detail?.pagination);
   if (tab === "evidence") return resultSection("证据链", state.runData?.evidence?.evidence || [], "evidence", state.runData?.evidence?.pagination);
   if (tab === "genome") return resultSection("基因组/ORF", state.runData?.genome?.genome_context || [], "genome", state.runData?.genome?.pagination);
+  if (tab === "onsite") return artifactResultSection("现场检索", state.runData?.onsite?.rows || [], "onsite", "当前运行没有现场检索输出。");
+  if (tab === "shortlist") return artifactResultSection("结构候选短名单", state.runData?.shortlist?.rows || [], "shortlist", "当前运行没有结构候选短名单输出。");
+  if (tab === "docking") return artifactResultSection("对接摘要", state.runData?.docking?.rows || [], "docking", "当前运行没有对接摘要输出。");
   if (tab === "structure") return structureSection(state.runData?.structure?.structure_rows || [], state.runData?.structure?.pagination);
   if (tab === "md") return mdSection(state.runData?.md?.md_rows || [], state.runData?.md?.pagination);
   return resultSection("候选排序", candidateRows(), "ranking", state.runData?.candidates?.pagination);
@@ -53,6 +59,7 @@ function resultTracePanel() {
     : "暂无输出";
   const candidateText = trace.candidate_status || (candidateRows().length ? "已生成候选排序" : "暂无候选排序");
   const evidenceText = trace.evidence_status || (state.runData?.evidence?.has_output ? "已生成证据链" : "暂无证据链");
+  const failureText = state.run?.failure_summary || "无";
   return `
     <section class="panel full">
       <div class="panel-header">
@@ -69,6 +76,21 @@ function resultTracePanel() {
       ${metricRow("输出材料", outputText)}
       ${metricRow("候选来源", candidateText)}
       ${metricRow("证据来源", evidenceText)}
+      ${metricRow("失败摘要", failureText)}
+    </section>`;
+}
+
+function artifactResultSection(title, rows, kind, emptyText) {
+  return `
+    <section class="panel full">
+      <div class="panel-header">
+        <div>
+          <h2>${title}</h2>
+          <p>${rows.length ? "数据来自当前运行输出。" : emptyText}</p>
+        </div>
+        <span class="status-pill ${outputStatusClass(rows)}">${rows.length ? `${rows.length} 行` : "空"}</span>
+      </div>
+      ${rows.length ? table(rows, columnsFor(kind)) : `<div class="empty">${emptyText}</div>`}
     </section>`;
 }
 
@@ -102,8 +124,8 @@ function candidateDetailSection(rows, pagination) {
     <section class="panel full">
       <div class="panel-header">
         <div>
-          <h2>第一候选摘要</h2>
-          <p>摘要来自当前运行的候选详情输出；下方表格显示全部候选详情。</p>
+          <h2>本页首个候选摘要</h2>
+          <p>摘要来自当前筛选页的第一行；下方表格显示本页候选详情。</p>
         </div>
         <span class="status-pill ready">候选编号 ${escapeHtml(valueOrMissing(first.candidate_id))}</span>
       </div>

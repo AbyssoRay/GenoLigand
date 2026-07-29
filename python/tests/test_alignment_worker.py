@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import gzip
 import hashlib
 import json
 import os
@@ -57,7 +58,7 @@ class AlignmentRecordIdentityTests(unittest.TestCase):
     @staticmethod
     def write_sequence_manifest(run_dir: Path) -> str:
         run_dir.mkdir(parents=True, exist_ok=True)
-        query_id = sequence_query_id("input_1", "record_1")
+        query_id = sequence_query_id("input_1", "record_1", "MKTAYI")
         (run_dir / "input_conversion_manifest.tsv").write_text(
             "input_id\trecord_id\toriginal_field\tinferred_kind\tcanonical_kind\t"
             "canonical_value\tconversion_status\tconversion_method\tformat\tsource_kind\t"
@@ -271,6 +272,23 @@ class AlignmentRecordIdentityTests(unittest.TestCase):
             )
         manifest.write_text("".join(rows), encoding="utf-8")
 
+    @classmethod
+    def write_partial_foldseek_manifest(cls, store: Path) -> None:
+        manifest = store / "indexes/foldseek/foldseek_target_databases.tsv"
+        manifest.parent.mkdir(parents=True, exist_ok=True)
+        prefix = store / "indexes/foldseek/rcsb_mmcif/target"
+        cls.write_foldseek_database(prefix)
+        manifest.write_text(
+            "manifest_schema_version\tsource_id\tsource_namespace\tsource_class\t"
+            "source_digest\tsource_files\tsource_bytes\tbuilder_version\tdb_path\tstatus\t"
+            "scope_mode\tscope_status\tscope_count\tindexed_pdb_count\trefresh_needed\n"
+            "genoligand_alignment_database_manifest_v2\trcsb_mmcif\tRCSB\tstructure\t"
+            + "a" * 64
+            + "\t1\t8\tfoldseek-test\tindexes/foldseek/rcsb_mmcif/target\tready\t"
+            "on_demand\tready_partial_on_demand\t10\t1\tfalse\n",
+            encoding="utf-8",
+        )
+
     def test_multi_record_queries_keep_input_and_record_identity(self) -> None:
         with tempfile.TemporaryDirectory(prefix="genoligand_alignment_identity_") as tmp:
             run_dir = Path(tmp)
@@ -295,9 +313,68 @@ class AlignmentRecordIdentityTests(unittest.TestCase):
             text = query.read_text(encoding="utf-8")
 
             self.assertEqual(len(rows), 2)
-            self.assertIn(f">{sequence_query_id('input_1', 'alpha')}\nMKTAYI\n", text)
-            self.assertIn(f">{sequence_query_id('input_1', 'beta')}\nACDEFG\n", text)
+            self.assertIn(f">{sequence_query_id('input_1', 'alpha', 'MKTAYI')}\nMKTAYI\n", text)
+            self.assertIn(f">{sequence_query_id('input_1', 'beta', 'ACDEFG')}\nACDEFG\n", text)
             self.assertEqual(text.count(">"), 2)
+
+    def test_spooled_file_sequences_reach_mmseqs_with_content_bound_ids(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="genoligand_alignment_spool_") as tmp:
+            run_dir = Path(tmp)
+            records = [
+                ("fasta", "alpha", "MKTAYI"),
+                ("fastq", "beta", "ACDEFG"),
+                ("gbk", "gamma", "ATGCGT"),
+            ]
+            spool = b""
+            rows = []
+            for input_format, record_id, sequence in records:
+                encoded = sequence.encode("utf-8")
+                offset = len(spool)
+                spool += encoded
+                rows.append(
+                    f"input_1\t{record_id}\tprotein_ligand\tprotein_ligand\tprotein_ligand\t\t"
+                    f"converted\tstandard_sequence\t{input_format}\tfile\tquery.{input_format}\t"
+                    f"{hashlib.sha256(encoded).hexdigest()}\trecognized\t"
+                    f"input_sequence_spool.bin#offset={offset}&length={len(encoded)}\t\n"
+                )
+            (run_dir / "input_sequence_spool.bin").write_bytes(spool)
+            (run_dir / "input_conversion_manifest.tsv").write_text(
+                "input_id\trecord_id\toriginal_field\tinferred_kind\tcanonical_kind\t"
+                "canonical_value\tconversion_status\tconversion_method\tformat\tsource_kind\t"
+                "source_path\tcontent_sha256\treason\tartifact\trisk_flags\n"
+                + "".join(rows),
+                encoding="utf-8",
+            )
+
+            loaded = read_sequence_inputs(run_dir)
+
+            self.assertEqual([row.sequence for row in loaded], [record[2] for record in records])
+            self.assertEqual(
+                [row.query_id for row in loaded],
+                [sequence_query_id("input_1", record_id, sequence) for _, record_id, sequence in records],
+            )
+            self.assertNotEqual(
+                sequence_query_id("input_1", "alpha", "MKTAYI"),
+                sequence_query_id("input_1", "alpha", "MKTAYV"),
+            )
+
+    def test_empty_converted_sequence_fails_explicitly(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="genoligand_alignment_empty_") as tmp:
+            run_dir = Path(tmp)
+            (run_dir / "input_conversion_manifest.tsv").write_text(
+                "input_id\trecord_id\toriginal_field\tinferred_kind\tcanonical_kind\t"
+                "canonical_value\tconversion_status\tconversion_method\tformat\tsource_kind\t"
+                "source_path\tcontent_sha256\treason\tartifact\trisk_flags\n"
+                "input_1\tempty\tprotein_ligand\tprotein_ligand\tprotein_ligand\t\t"
+                "converted\tstandard_sequence\tfasta\tfile\tquery.fasta\t"
+                + hashlib.sha256(b"").hexdigest()
+                + "\trecognized\tinput_sequence_spool.bin#offset=0&length=0\t\n",
+                encoding="utf-8",
+            )
+            (run_dir / "input_sequence_spool.bin").write_bytes(b"")
+
+            with self.assertRaisesRegex(ValueError, "sequence_input_empty"):
+                read_sequence_inputs(run_dir)
 
     def test_mmseqs_rows_restore_separate_record_identity(self) -> None:
         with tempfile.TemporaryDirectory(prefix="genoligand_mmseqs_identity_") as tmp:
@@ -452,6 +529,64 @@ class AlignmentRecordIdentityTests(unittest.TestCase):
             self.assertEqual(len(parsed), 5)
             self.assertEqual({row[query_id_index] for row in parsed[1:]}, {query.query_id})
             self.assertNotIn(f"{query.query_id}_A", {row[query_id_index] for row in parsed[1:]})
+
+    def test_partial_foldseek_uses_cached_current_candidate_or_reports_incomplete(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="genoligand_foldseek_ondemand_") as tmp:
+            root = Path(tmp)
+            run_dir = root / "run"
+            store = root / "store"
+            query = self.write_structure_query(run_dir)
+            self.write_partial_foldseek_manifest(store)
+            (run_dir / "structure_interaction_matches.tsv").write_text(
+                "input_id\tsource\ttarget_id\tevidence\n"
+                "input-structure\tRCSB\t2XYZ\tpdb_id=2XYZ\n"
+                "input-structure\tRCSB\t3ABC\tpdb_id=3ABC\n",
+                encoding="utf-8",
+            )
+            coordinate = store / "downloads/rcsb/mmcif/xy/2xyz.cif.gz"
+            coordinate.parent.mkdir(parents=True)
+            with gzip.open(coordinate, "wt", encoding="utf-8") as handle:
+                handle.write("data_2xyz\n_atom_site.Cartn_x\n")
+            coordinate_digest = hashlib.sha256(coordinate.read_bytes()).hexdigest()
+            (run_dir / "rcsb_on_demand_fetch.tsv").write_text(
+                "pdb_id\tstatus\turl\tpath\tbytes\tsha256\treason\n"
+                f"2XYZ\treused\thttps://files.rcsb.org/download/2XYZ.cif.gz\t"
+                f"downloads/rcsb/mmcif/xy/2xyz.cif.gz\t{coordinate.stat().st_size}\t"
+                f"{coordinate_digest}\tvalid_cached_coordinate_reused\n",
+                encoding="utf-8",
+            )
+            commands: list[list[str]] = []
+
+            def fake_run(command, capture_output=True, text=True, timeout=None):
+                commands.append(command)
+                if command[1] == "version":
+                    return subprocess.CompletedProcess(command, 0, "Foldseek-test\n", "")
+                if command[1] == "createdb" and Path(command[3]).name == "foldseek_query_db":
+                    Path(f"{command[3]}.lookup").write_text(
+                        f"0\t{query.query_id}_A\t0\n",
+                        encoding="utf-8",
+                    )
+                if command[1] == "convertalis":
+                    Path(command[5]).write_text("", encoding="utf-8")
+                return subprocess.CompletedProcess(command, 0, "", "")
+
+            with patch("genoligand_workers.alignment_worker.shutil.which", return_value="foldseek"), patch(
+                "genoligand_workers.alignment_worker.subprocess.run", side_effect=fake_run
+            ):
+                covered = run_foldseek_alignment(run_dir, store)
+                coordinate.unlink()
+                incomplete = run_foldseek_alignment(run_dir, store)
+
+            self.assertEqual(covered.status, "completed")
+            self.assertEqual(covered.reason, "search_completed_no_hits_current_candidate_coverage")
+            self.assertIn("rcsb_on_demand_run", {row.database_id for row in covered.outcomes})
+            self.assertEqual(incomplete.status, "not_ready")
+            self.assertIn("incomplete_coverage:missing=2XYZ", incomplete.reason)
+            self.assertNotIn("3ABC", incomplete.reason)
+            self.assertEqual(
+                len([command for command in commands if command[1] == "createdb" and "on_demand_target" in command[3]]),
+                1,
+            )
 
     def test_foldseek_uses_prepared_generated_and_original_structures_in_one_query_database(self) -> None:
         with tempfile.TemporaryDirectory(prefix="genoligand_foldseek_prepared_multi_") as tmp:
