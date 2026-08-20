@@ -1,0 +1,902 @@
+[
+  {
+    "gene": "PTGS2",
+    "target_id": "P35354",
+    "target_name": "Prostaglandin G/H synthase 2",
+    "smiles": "Clc1ccc(-c2cn[se]c2-c2ccc(Cl)cc2)cc1",
+    "score": 1.0,
+    "popcount": 23,
+    "source": "ChEMBL",
+    "description": "COX-2"
+  },
+  {
+    "gene": "PTGS2",
+    "target_id": "P35354",
+    "target_name": "Dimer of Prostaglandin G/H synthase 2",
+    "smiles": "CC(=O)Oc1ccccc1C(=O)O",
+    "score": 1.0,
+    "popcount": 24,
+    "source": "BindingDB",
+    "description": "COX-2"
+  },
+  {
+    "gene": "PTGS2",
+    "target_id": "P35354",
+    "target_name": "Prostaglandin G/H synthase 2",
+    "smiles": "Fc1ccc(-c2[nH]c(-c3ccc(F)cc3)c3c2C2CCC3CC2)cc1",
+    "score": 1.0,
+    "popcount": 24,
+    "source": "ChEMBL",
+    "description": "COX-2"
+  },
+  {
+    "gene": "PTGS1",
+    "target_id": "P23219",
+    "target_name": "Prostaglandin G/H synthase 1",
+    "smiles": "Fc1ccc(-c2[nH]c(-c3ccc(F)cc3)c3c2C2CCC3C2)cc1",
+    "score": 1.0,
+    "popcount": 26,
+    "source": "ChEMBL",
+    "description": "COX-1"
+  },
+  {
+    "gene": "PTGS1",
+    "target_id": "P23219",
+    "target_name": "Prostaglandin G/H synthase 1",
+    "smiles": "Fc1ccc(-c2[nH]c(-c3ccc(F)cc3)c3c2C2CCC3C2)cc1",
+    "score": 1.0,
+    "popcount": 26,
+    "source": "BindingDB",
+    "description": "COX-1"
+  },
+  {
+    "gene": "PTGS1",
+    "target_id": "P23219",
+    "target_name": "Prostaglandin G/H synthase 1",
+    "smiles": "CC(C(=O)O)c1cccc(C(=O)c2ccccc2)c1",
+    "score": 1.0,
+    "popcount": 28,
+    "source": "ChEMBL",
+    "description": "COX-1"
+  },
+  {
+    "gene": "ACE",
+    "target_id": "P12821",
+    "target_name": "Angiotensin-converting enzyme",
+    "smiles": "CC(NP(=O)(O)O)C(=O)C1CCCC1C(=O)O",
+    "score": 1.0,
+    "popcount": 30,
+    "source": "ChEMBL",
+    "description": "Angiotensin-converting enzyme"
+  },
+  {
+    "gene": "ACE",
+    "target_id": "P12821",
+    "target_name": "Angiotensin-converting enzyme",
+    "smiles": "CC(NP(=O)(O)O)C(=O)C1CCCC1C(=O)O",
+    "score": 1.0,
+    "popcount": 30,
+    "source": "BindingDB",
+    "description": "Angiotensin-converting enzyme"
+  },
+  {
+    "gene": "ACE",
+    "target_id": "P12821",
+    "target_name": "Angiotensin-converting enzyme",
+    "smiles": "CC(CS)C(=O)N1CCCC1C(=O)O",
+    "score": 1.0,
+    "popcount": 31,
+    "source": "ChEMBL",
+    "description": "Angiotensin-converting enzyme"
+  },
+  {
+    "gene": "HMGCR",
+    "target_id": "P04035",
+    "target_name": "3-hydroxy-3-methylglutaryl-coenzyme A reductase",
+    "smiles": "O=C(O)C[C@H](O)C[C@H](O)CCc1c(Cl)cc(Cl)cc1OCc1ccccc1",
+    "score": 1.0,
+    "popcount": 46,
+    "source": "ChEMBL",
+    "description": "HMG-CoA reductase"
+  },
+  {
+    "gene": "HMGCR",
+    "target_id": "P04035",
+    "target_name": "3-hydroxy-3-methylglutaryl-coenzyme A reductase",
+    "smiles": "O=C(O)C[C@H](O)C[C@H](O)CCc1c(Cl)cc(Cl)cc1OCc1ccccc1",
+    "score": 1.0,
+    "popcount": 46,
+    "source": "BindingDB",
+    "description": "HMG-CoA reductase"
+  },
+  {
+    "gene": "HMGCR",
+    "target_id": "P04035",
+    "target_name": "3-hydroxy-3-methylglutaryl-coenzyme A reductase",
+    "smiles": "CC(C)c1cc(-c2ccc(F)cc2)c(-c2ccc(F)cc2)n1/C=C/[C@@H](O)C[C@@H](O)CC(=O)O",
+    "score": 1.0,
+    "popcount": 47,
+    "source": "ChEMBL",
+    "description": "HMG-CoA reductase"
+  },
+  {
+    "gene": "ADRB1",
+    "target_id": "P08588",
+    "target_name": "Beta-1 adrenergic receptor",
+    "smiles": "CC(C)NCC(O)c1ccc(O)c(O)c1",
+    "score": 1.0,
+    "popcount": 28,
+    "source": "ChEMBL",
+    "description": "Beta-1 adrenergic receptor"
+  },
+  {
+    "gene": "ADRB1",
+    "target_id": "P08588",
+    "target_name": "Beta-1 adrenergic receptor",
+    "smiles": "CC(C)NCC(O)c1ccc(O)c(O)c1",
+    "score": 1.0,
+    "popcount": 28,
+    "source": "BindingDB",
+    "description": "Beta-1 adrenergic receptor"
+  },
+  {
+    "gene": "ADRB1",
+    "target_id": "P08588",
+    "target_name": "Beta-1 adrenergic receptor",
+    "smiles": "CC(C)NC[C@H](O)c1ccc(O)c(O)c1",
+    "score": 1.0,
+    "popcount": 28,
+    "source": "ChEMBL",
+    "description": "Beta-1 adrenergic receptor"
+  },
+  {
+    "gene": "ADRB2",
+    "target_id": "P07550",
+    "target_name": "Beta-2 adrenergic receptor",
+    "smiles": "CC(C)(C)NCC(O)c1cc(O)cc(O)c1",
+    "score": 1.0,
+    "popcount": 26,
+    "source": "BindingDB",
+    "description": "Beta-2 adrenergic receptor"
+  },
+  {
+    "gene": "ADRB2",
+    "target_id": "P07550",
+    "target_name": "Beta-2 adrenergic receptor",
+    "smiles": "CNC(C)Cc1ccccc1OC",
+    "score": 1.0,
+    "popcount": 27,
+    "source": "BindingDB",
+    "description": "Beta-2 adrenergic receptor"
+  },
+  {
+    "gene": "ADRB2",
+    "target_id": "P07550",
+    "target_name": "Beta-2 adrenergic receptor",
+    "smiles": "CC(C)NCC(O)c1ccc(O)c(O)c1",
+    "score": 1.0,
+    "popcount": 28,
+    "source": "ChEMBL",
+    "description": "Beta-2 adrenergic receptor"
+  },
+  {
+    "gene": "DRD2",
+    "target_id": "P14416",
+    "target_name": "D(2) dopamine receptor",
+    "smiles": "CN1CCc2ccccc2Cc2ccccc2CC1",
+    "score": 1.0,
+    "popcount": 20,
+    "source": "ChEMBL",
+    "description": "D2 dopamine receptor"
+  },
+  {
+    "gene": "DRD2",
+    "target_id": "P14416",
+    "target_name": "D(2) dopamine receptor",
+    "smiles": "CN1CCc2ccccc2Cc2ccccc2CC1",
+    "score": 1.0,
+    "popcount": 20,
+    "source": "BindingDB",
+    "description": "D2 dopamine receptor"
+  },
+  {
+    "gene": "DRD2",
+    "target_id": "P14416",
+    "target_name": "D(2) dopamine receptor",
+    "smiles": "NCCc1ccc(O)c(O)c1",
+    "score": 1.0,
+    "popcount": 21,
+    "source": "ChEMBL",
+    "description": "D2 dopamine receptor"
+  },
+  {
+    "gene": "DRD1",
+    "target_id": "P21728",
+    "target_name": "D(1A) dopamine receptor",
+    "smiles": "O=C(O)c1ccc(O)cc1",
+    "score": 1.0,
+    "popcount": 16,
+    "source": "ChEMBL",
+    "description": "D1 dopamine receptor"
+  },
+  {
+    "gene": "DRD1",
+    "target_id": "P21728",
+    "target_name": "D(1A) dopamine receptor",
+    "smiles": "O=C(O)c1ccc(O)cc1",
+    "score": 1.0,
+    "popcount": 16,
+    "source": "BindingDB",
+    "description": "D1 dopamine receptor"
+  },
+  {
+    "gene": "DRD1",
+    "target_id": "P21728",
+    "target_name": "D(1A) dopamine receptor",
+    "smiles": "CN1CCc2ccccc2Cc2ccccc2CC1",
+    "score": 1.0,
+    "popcount": 20,
+    "source": "ChEMBL",
+    "description": "D1 dopamine receptor"
+  },
+  {
+    "gene": "SLC6A4",
+    "target_id": "P31645",
+    "target_name": "Sodium-dependent serotonin transporter",
+    "smiles": "CC(N)CCc1ccccc1Cl",
+    "score": 1.0,
+    "popcount": 25,
+    "source": "BindingDB",
+    "description": "Serotonin transporter"
+  },
+  {
+    "gene": "SLC6A4",
+    "target_id": "P31645",
+    "target_name": "Sodium-dependent serotonin transporter",
+    "smiles": "[C]N([C])[C][C][C]=C1c2ccccc2[C][C]c2ccccc21",
+    "score": 1.0,
+    "popcount": 27,
+    "source": "BindingDB",
+    "description": "Serotonin transporter"
+  },
+  {
+    "gene": "SLC6A4",
+    "target_id": "P31645",
+    "target_name": "Sodium-dependent serotonin transporter",
+    "smiles": "CN(C)Cc1ccccc1Sc1ccccc1N",
+    "score": 1.0,
+    "popcount": 28,
+    "source": "ChEMBL",
+    "description": "Serotonin transporter"
+  },
+  {
+    "gene": "HRH1",
+    "target_id": "P35367",
+    "target_name": "Histamine H1 receptor",
+    "smiles": "CN1CCN(C(c2ccccc2)c2ccccc2)CC1",
+    "score": 1.0,
+    "popcount": 23,
+    "source": "ChEMBL",
+    "description": "Histamine H1 receptor"
+  },
+  {
+    "gene": "HRH1",
+    "target_id": "P35367",
+    "target_name": "Histamine H1 receptor",
+    "smiles": "O=C(O)C=CC(=O)Oc1ccc(Cl)cc1",
+    "score": 1.0,
+    "popcount": 25,
+    "source": "BindingDB",
+    "description": "Histamine H1 receptor"
+  },
+  {
+    "gene": "HRH1",
+    "target_id": "P35367",
+    "target_name": "Histamine H1 receptor",
+    "smiles": "CN(C)CCC1c2ccccc2Cc2ccccc21",
+    "score": 1.0,
+    "popcount": 27,
+    "source": "ChEMBL",
+    "description": "Histamine H1 receptor"
+  },
+  {
+    "gene": "HRH2",
+    "target_id": "P25021",
+    "target_name": "Histamine H2 receptor",
+    "smiles": "CN1CC2c3ccccc3Oc3ccc(Cl)cc3C2C1",
+    "score": 1.0,
+    "popcount": 34,
+    "source": "ChEMBL",
+    "description": "Histamine H2 receptor"
+  },
+  {
+    "gene": "HRH2",
+    "target_id": "P25021",
+    "target_name": "Histamine H2 receptor",
+    "smiles": "CN1C[C@H]2c3ccccc3Oc3ccc(Cl)cc3[C@@H]2C1",
+    "score": 1.0,
+    "popcount": 34,
+    "source": "BindingDB",
+    "description": "Histamine H2 receptor"
+  },
+  {
+    "gene": "HRH2",
+    "target_id": "P25021",
+    "target_name": "Histamine H2 receptor",
+    "smiles": "CCCCCNC(=O)N=C(N)NCCCc1nnc(N)s1",
+    "score": 1.0,
+    "popcount": 41,
+    "source": "ChEMBL",
+    "description": "Histamine H2 receptor"
+  },
+  {
+    "gene": "AGTR1",
+    "target_id": "P30556",
+    "target_name": "Dimer of Type-1 angiotensin II receptor",
+    "smiles": "Cc1cc(NCc2ccc(-c3ccccc3-c3nn[nH]n3)cc2)c(Cl)c(C)n1",
+    "score": 1.0,
+    "popcount": 47,
+    "source": "BindingDB",
+    "description": "Angiotensin II receptor type 1"
+  },
+  {
+    "gene": "AGTR1",
+    "target_id": "P30556",
+    "target_name": "Dimer of Type-1 angiotensin II receptor",
+    "smiles": "Cc1cc(NCc2ccc(-c3ccccc3-c3nn[nH]n3)cc2)c(I)c(C)n1",
+    "score": 1.0,
+    "popcount": 48,
+    "source": "BindingDB",
+    "description": "Angiotensin II receptor type 1"
+  },
+  {
+    "gene": "AGTR1",
+    "target_id": "P30556",
+    "target_name": "Dimer of Type-1 angiotensin II receptor",
+    "smiles": "CCc1cc(NCc2ccc(-c3ccccc3-c3nn[nH]n3)cc2)c(Cl)c(CC)n1",
+    "score": 1.0,
+    "popcount": 49,
+    "source": "BindingDB",
+    "description": "Angiotensin II receptor type 1"
+  },
+  {
+    "gene": "ADRA2A",
+    "target_id": "P08913",
+    "target_name": "Alpha-2A adrenergic receptor",
+    "smiles": "Clc1cccc(Cl)c1N=C1[N][C][C][N]1",
+    "score": 1.0,
+    "popcount": 23,
+    "source": "BindingDB",
+    "description": "Alpha-2A adrenergic receptor"
+  },
+  {
+    "gene": "ADRA2A",
+    "target_id": "P08913",
+    "target_name": "Alpha-2A adrenergic receptor",
+    "smiles": "[C]c1ccccc1N=C1[N][C][C][N]1",
+    "score": 1.0,
+    "popcount": 24,
+    "source": "BindingDB",
+    "description": "Alpha-2A adrenergic receptor"
+  },
+  {
+    "gene": "ADRA2A",
+    "target_id": "P08913",
+    "target_name": "Alpha-2A adrenergic receptor",
+    "smiles": "C1CCCC(N=C2NCCO2)CC1",
+    "score": 1.0,
+    "popcount": 25,
+    "source": "ChEMBL",
+    "description": "Alpha-2A adrenergic receptor"
+  },
+  {
+    "gene": "CHRM2",
+    "target_id": "P08172",
+    "target_name": "Muscarinic acetylcholine receptor M1/M2",
+    "smiles": "O=C(O)C(O)(c1ccccc1)c1ccccc1",
+    "score": 1.0,
+    "popcount": 18,
+    "source": "BindingDB",
+    "description": "Muscarinic M2 receptor"
+  },
+  {
+    "gene": "CHRM2",
+    "target_id": "P08172",
+    "target_name": "Muscarinic acetylcholine receptor M2",
+    "smiles": "CC(=O)OCC[N+](C)(C)C",
+    "score": 1.0,
+    "popcount": 19,
+    "source": "ChEMBL",
+    "description": "Muscarinic M2 receptor"
+  },
+  {
+    "gene": "CHRM2",
+    "target_id": "P08172",
+    "target_name": "Muscarinic acetylcholine receptor M1/M2",
+    "smiles": "CC(=O)OCC[N+](C)(C)C",
+    "score": 1.0,
+    "popcount": 19,
+    "source": "BindingDB",
+    "description": "Muscarinic M2 receptor"
+  },
+  {
+    "gene": "CHRM1",
+    "target_id": "P11229",
+    "target_name": "Muscarinic acetylcholine receptor M1",
+    "smiles": "O=C(O)C(O)(c1ccccc1)c1ccccc1",
+    "score": 1.0,
+    "popcount": 18,
+    "source": "BindingDB",
+    "description": "Muscarinic M1 receptor"
+  },
+  {
+    "gene": "CHRM1",
+    "target_id": "P11229",
+    "target_name": "Muscarinic acetylcholine receptor M1",
+    "smiles": "CC(=O)OCC[N+](C)(C)C",
+    "score": 1.0,
+    "popcount": 19,
+    "source": "ChEMBL",
+    "description": "Muscarinic M1 receptor"
+  },
+  {
+    "gene": "CHRM1",
+    "target_id": "P11229",
+    "target_name": "Muscarinic acetylcholine receptor M1",
+    "smiles": "CC(=O)OCC[N+](C)(C)C",
+    "score": 1.0,
+    "popcount": 19,
+    "source": "BindingDB",
+    "description": "Muscarinic M1 receptor"
+  },
+  {
+    "gene": "HTR2A",
+    "target_id": "P28223",
+    "target_name": "5-hydroxytryptamine receptor 2A",
+    "smiles": "NCC(c1ccccc1)c1ccc(Br)cc1",
+    "score": 1.0,
+    "popcount": 22,
+    "source": "ChEMBL",
+    "description": "5-HT2A receptor"
+  },
+  {
+    "gene": "HTR2A",
+    "target_id": "P28223",
+    "target_name": "5-hydroxytryptamine receptor 2A",
+    "smiles": "CCc1cc(OC)c(CCN)cc1OC",
+    "score": 1.0,
+    "popcount": 24,
+    "source": "BindingDB",
+    "description": "5-HT2A receptor"
+  },
+  {
+    "gene": "HTR2A",
+    "target_id": "P28223",
+    "target_name": "5-hydroxytryptamine receptor 2A",
+    "smiles": "NCCc1c[nH]c2ccccc12",
+    "score": 1.0,
+    "popcount": 25,
+    "source": "ChEMBL",
+    "description": "5-HT2A receptor"
+  },
+  {
+    "gene": "HTR1A",
+    "target_id": "P08908",
+    "target_name": "5-hydroxytryptamine receptor 1A",
+    "smiles": "c1ccc2c(N3CCNCC3)cccc2c1",
+    "score": 1.0,
+    "popcount": 26,
+    "source": "ChEMBL",
+    "description": "5-HT1A receptor"
+  },
+  {
+    "gene": "HTR1A",
+    "target_id": "P08908",
+    "target_name": "5-hydroxytryptamine receptor 1A",
+    "smiles": "c1ccc2c(N3CCNCC3)cccc2c1",
+    "score": 1.0,
+    "popcount": 26,
+    "source": "BindingDB",
+    "description": "5-HT1A receptor"
+  },
+  {
+    "gene": "HTR1A",
+    "target_id": "P08908",
+    "target_name": "5-hydroxytryptamine receptor 1A",
+    "smiles": "COc1cc(/C=C/C(=O)O)cc(OC)c1OC",
+    "score": 1.0,
+    "popcount": 27,
+    "source": "BindingDB",
+    "description": "5-HT1A receptor"
+  },
+  {
+    "gene": "HTR2C",
+    "target_id": "P28335",
+    "target_name": "5-hydroxytryptamine receptor 2C",
+    "smiles": "NC[C@H]1C[C@@H]1c1ccccc1",
+    "score": 1.0,
+    "popcount": 22,
+    "source": "ChEMBL",
+    "description": "5-HT2C receptor"
+  },
+  {
+    "gene": "HTR2C",
+    "target_id": "P28335",
+    "target_name": "5-hydroxytryptamine receptor 2C",
+    "smiles": "NC[C@H]1C[C@@H]1c1ccccc1",
+    "score": 1.0,
+    "popcount": 22,
+    "source": "BindingDB",
+    "description": "5-HT2C receptor"
+  },
+  {
+    "gene": "HTR2C",
+    "target_id": "P28335",
+    "target_name": "5-hydroxytryptamine receptor 2C",
+    "smiles": "CCc1cc(OC)c(CCN)cc1OC",
+    "score": 1.0,
+    "popcount": 24,
+    "source": "BindingDB",
+    "description": "5-HT2C receptor"
+  },
+  {
+    "gene": "ACHE",
+    "target_id": "P22303",
+    "target_name": "Acetylcholinesterase",
+    "smiles": "CN(CP(=O)(O)O)CP(=O)(O)O",
+    "score": 1.0,
+    "popcount": 15,
+    "source": "BindingDB",
+    "description": "Acetylcholinesterase"
+  },
+  {
+    "gene": "ACHE",
+    "target_id": "P22303",
+    "target_name": "Acetylcholinesterase",
+    "smiles": "CCN(CP(=O)(O)O)CP(=O)(O)O",
+    "score": 1.0,
+    "popcount": 17,
+    "source": "BindingDB",
+    "description": "Acetylcholinesterase"
+  },
+  {
+    "gene": "ACHE",
+    "target_id": "P22303",
+    "target_name": "Acetylcholinesterase",
+    "smiles": "CC(C)N(CP(=O)(O)O)CP(=O)(O)O",
+    "score": 1.0,
+    "popcount": 18,
+    "source": "BindingDB",
+    "description": "Acetylcholinesterase"
+  },
+  {
+    "gene": "F2",
+    "target_id": "Q5BJF2",
+    "target_name": "Sigma intracellular receptor 2",
+    "smiles": "CC(C)C(=O)OCC(O)CNC(C)(C)C",
+    "score": 1.0,
+    "popcount": 27,
+    "source": "BindingDB",
+    "description": "Thrombin"
+  },
+  {
+    "gene": "F2",
+    "target_id": "Q5BJF2",
+    "target_name": "Sigma intracellular receptor 2",
+    "smiles": "CN1CCN(CCc2ccc(Cl)c(Cl)c2)CC1",
+    "score": 1.0,
+    "popcount": 29,
+    "source": "ChEMBL",
+    "description": "Thrombin"
+  },
+  {
+    "gene": "F2",
+    "target_id": "Q5BJF2",
+    "target_name": "Sigma intracellular receptor 2",
+    "smiles": "CN1CCN(CCc2ccc(Cl)c(Cl)c2)CC1",
+    "score": 1.0,
+    "popcount": 29,
+    "source": "BindingDB",
+    "description": "Thrombin"
+  },
+  {
+    "gene": "DHFR",
+    "target_id": "P00374",
+    "target_name": "Dihydrofolate reductase",
+    "smiles": "CCc1nc(N)nc(N)c1-c1ccccc1",
+    "score": 1.0,
+    "popcount": 28,
+    "source": "BindingDB",
+    "description": "Dihydrofolate reductase"
+  },
+  {
+    "gene": "DHFR",
+    "target_id": "P00374",
+    "target_name": "Dihydrofolate reductase",
+    "smiles": "Nc1nc(N)c2c(ccc3[nH]ccc32)n1",
+    "score": 1.0,
+    "popcount": 29,
+    "source": "ChEMBL",
+    "description": "Dihydrofolate reductase"
+  },
+  {
+    "gene": "DHFR",
+    "target_id": "P00374",
+    "target_name": "Dihydrofolate reductase",
+    "smiles": "Nc1nc(N)c2c(ccc3[nH]ccc32)n1",
+    "score": 1.0,
+    "popcount": 29,
+    "source": "BindingDB",
+    "description": "Dihydrofolate reductase"
+  },
+  {
+    "gene": "CYP2D6",
+    "target_id": "P10635",
+    "target_name": "Cytochrome P450 2D6",
+    "smiles": "CC(C)N1CCC(c2ccccc2)(c2ccccc2)CC1",
+    "score": 1.0,
+    "popcount": 25,
+    "source": "ChEMBL",
+    "description": "Cytochrome P450 2D6"
+  },
+  {
+    "gene": "CYP2D6",
+    "target_id": "P10635",
+    "target_name": "Cytochrome P450",
+    "smiles": "CC(C)N1CCC(c2ccccc2)(c2ccccc2)CC1",
+    "score": 1.0,
+    "popcount": 25,
+    "source": "BindingDB",
+    "description": "Cytochrome P450 2D6"
+  },
+  {
+    "gene": "CYP2D6",
+    "target_id": "P10635",
+    "target_name": "Cytochrome P450 2D6",
+    "smiles": "c1ccc(N(Cc2ccc3ccccc3c2)C2CNC2)cc1",
+    "score": 1.0,
+    "popcount": 34,
+    "source": "ChEMBL",
+    "description": "Cytochrome P450 2D6"
+  },
+  {
+    "gene": "CYP1A2",
+    "target_id": "P05177",
+    "target_name": "Cytochrome P450 1A2",
+    "smiles": "CCOc1ccc(NC(C)=O)cc1",
+    "score": 1.0,
+    "popcount": 26,
+    "source": "ChEMBL",
+    "description": "Cytochrome P450 1A2"
+  },
+  {
+    "gene": "CYP1A2",
+    "target_id": "P05177",
+    "target_name": "Cytochrome P450 1A2",
+    "smiles": "CCOc1ccc(NC(C)=O)cc1",
+    "score": 1.0,
+    "popcount": 26,
+    "source": "BindingDB",
+    "description": "Cytochrome P450 1A2"
+  },
+  {
+    "gene": "CYP1A2",
+    "target_id": "P05177",
+    "target_name": "Cytochrome P450 1A2",
+    "smiles": "CCCCOc1ccc(-n2ccnc2)cc1",
+    "score": 1.0,
+    "popcount": 31,
+    "source": "ChEMBL",
+    "description": "Cytochrome P450 1A2"
+  },
+  {
+    "gene": "VKORC1",
+    "target_id": "Q9BQB6",
+    "target_name": "Vitamin K epoxide reductase complex subunit 1",
+    "smiles": "CC(=O)CC(c1ccccc1)c1c(O)c2ccccc2oc1=O",
+    "score": 1.0,
+    "popcount": 37,
+    "source": "ChEMBL",
+    "description": "Vitamin K epoxide reductase"
+  },
+  {
+    "gene": "VKORC1",
+    "target_id": "Q9BQB6",
+    "target_name": "Vitamin K epoxide reductase complex subunit 1",
+    "smiles": "CC(=O)CC(c1ccccc1)c1c(O)c2ccccc2oc1=O",
+    "score": 1.0,
+    "popcount": 37,
+    "source": "BindingDB",
+    "description": "Vitamin K epoxide reductase"
+  },
+  {
+    "gene": "VKORC1",
+    "target_id": "Q9BQB6",
+    "target_name": "Vitamin K epoxide reductase complex subunit 1",
+    "smiles": "CC(=O)C[C@H](c1ccccc1)c1c(O)c2ccccc2oc1=O",
+    "score": 1.0,
+    "popcount": 37,
+    "source": "BindingDB",
+    "description": "Vitamin K epoxide reductase"
+  },
+  {
+    "gene": "BACE1",
+    "target_id": "P56817",
+    "target_name": "Beta-secretase 1",
+    "smiles": "C#Cc1cc(-c2cccc(O)c2)cc(-c2cccc(O)c2)c1",
+    "score": 1.0,
+    "popcount": 25,
+    "source": "BindingDB",
+    "description": "Beta-secretase 1"
+  },
+  {
+    "gene": "BACE1",
+    "target_id": "P56817",
+    "target_name": "Beta-secretase 1",
+    "smiles": "O=C(C=Cc1ccccc1O)c1c(O)cccc1O",
+    "score": 1.0,
+    "popcount": 26,
+    "source": "BindingDB",
+    "description": "Beta-secretase 1"
+  },
+  {
+    "gene": "BACE1",
+    "target_id": "P56817",
+    "target_name": "Beta-secretase 1",
+    "smiles": "O=C(C=Cc1ccc(O)cc1)c1ccc(O)cc1O",
+    "score": 1.0,
+    "popcount": 28,
+    "source": "BindingDB",
+    "description": "Beta-secretase 1"
+  },
+  {
+    "gene": "EGFR",
+    "target_id": "P00533",
+    "target_name": "Epidermal growth factor receptor",
+    "smiles": "Nc1ccc2cncnc2c1",
+    "score": 1.0,
+    "popcount": 24,
+    "source": "ChEMBL",
+    "description": "EGF receptor"
+  },
+  {
+    "gene": "EGFR",
+    "target_id": "P00533",
+    "target_name": "Epidermal growth factor receptor",
+    "smiles": "Nc1ccc2cncnc2c1",
+    "score": 1.0,
+    "popcount": 24,
+    "source": "BindingDB",
+    "description": "EGF receptor"
+  },
+  {
+    "gene": "EGFR",
+    "target_id": "P00533",
+    "target_name": "Epidermal growth factor receptor",
+    "smiles": "Nc1ccc2ncncc2c1",
+    "score": 1.0,
+    "popcount": 24,
+    "source": "ChEMBL",
+    "description": "EGF receptor"
+  },
+  {
+    "gene": "PDE5A",
+    "target_id": "O76074",
+    "target_name": "Cone cGMP-specific 3',5'-cyclic phosphodiesterase subunit alpha'/cGMP-specific 3',5'-cyclic phosphodiesterase",
+    "smiles": "OCCN(CCO)c1nc(N2CCCCC2)c2nc(N(CCO)CCO)nc(N3CCCCC3)c2n1",
+    "score": 1.0,
+    "popcount": 30,
+    "source": "BindingDB",
+    "description": "cGMP-specific PDE 5A"
+  },
+  {
+    "gene": "PDE5A",
+    "target_id": "O76074",
+    "target_name": "cGMP-specific 3',5'-cyclic phosphodiesterase",
+    "smiles": "Brc1ccc2nc(-n3ccnc3)nc(NCc3ccccc3)c2c1",
+    "score": 1.0,
+    "popcount": 43,
+    "source": "ChEMBL",
+    "description": "cGMP-specific PDE 5A"
+  },
+  {
+    "gene": "PDE5A",
+    "target_id": "O76074",
+    "target_name": "Cone cGMP-specific 3',5'-cyclic phosphodiesterase subunit alpha'/cGMP-specific 3',5'-cyclic phosphodiesterase",
+    "smiles": "Brc1ccc2nc(-n3ccnc3)nc(NCc3ccccc3)c2c1",
+    "score": 1.0,
+    "popcount": 43,
+    "source": "BindingDB",
+    "description": "cGMP-specific PDE 5A"
+  },
+  {
+    "gene": "ATP4A",
+    "target_id": "P20648",
+    "target_name": "Potassium-transporting ATPase alpha chain 1",
+    "smiles": "Cc1nc2c(OCc3ccccc3)cccn2c1CC#N",
+    "score": 0.95,
+    "popcount": 41,
+    "source": "BindingDB",
+    "description": "H+/K+ ATPase"
+  },
+  {
+    "gene": "ATP4A",
+    "target_id": "P20648",
+    "target_name": "Potassium-transporting ATPase alpha chain 1",
+    "smiles": "CCN(CC)CCCOc1ccc(-c2csc(-c3ccccc3)n2)cc1",
+    "score": 0.95,
+    "popcount": 42,
+    "source": "BindingDB",
+    "description": "H+/K+ ATPase"
+  },
+  {
+    "gene": "ATP4A",
+    "target_id": "P20648",
+    "target_name": "Potassium-transporting ATPase alpha chain 1",
+    "smiles": "c1ccc(-c2nc(-c3ccc(OCCCN4CCCCC4)cc3)cs2)cc1",
+    "score": 0.95,
+    "popcount": 44,
+    "source": "BindingDB",
+    "description": "H+/K+ ATPase"
+  },
+  {
+    "gene": "CACNA1C",
+    "target_id": "Q13936",
+    "target_name": "Voltage-dependent L-type calcium channel subunit alpha-1C",
+    "smiles": "COC(=O)C1=C(C)N=C(C)C(C(=O)OCC(C)C)C1c1ccccc1",
+    "score": 1.0,
+    "popcount": 44,
+    "source": "BindingDB",
+    "description": "L-type Ca channel"
+  },
+  {
+    "gene": "CACNA1C",
+    "target_id": "Q13936",
+    "target_name": "Voltage-dependent L-type calcium channel subunit alpha-1C",
+    "smiles": "COC(=O)C1=C(C)N=C(C)C(C(=O)OC)C1c1ccccc1[N+](=O)[O-]",
+    "score": 1.0,
+    "popcount": 44,
+    "source": "ChEMBL",
+    "description": "L-type Ca channel"
+  },
+  {
+    "gene": "CACNA1C",
+    "target_id": "Q13936",
+    "target_name": "Voltage-dependent L-type calcium channel subunit alpha-1C",
+    "smiles": "COC(=O)C1=C(C)N=C(C)C(C(=O)OC)C1c1ccccc1[N+](=O)[O-]",
+    "score": 1.0,
+    "popcount": 44,
+    "source": "BindingDB",
+    "description": "L-type Ca channel"
+  },
+  {
+    "gene": "SLC6A2",
+    "target_id": "P23975",
+    "target_name": "Sodium-dependent noradrenaline transporter",
+    "smiles": "C[C@H](N)Cc1ccccc1",
+    "score": 1.0,
+    "popcount": 19,
+    "source": "ChEMBL",
+    "description": "Norepinephrine transporter"
+  },
+  {
+    "gene": "SLC6A2",
+    "target_id": "P23975",
+    "target_name": "Sodium-dependent noradrenaline transporter",
+    "smiles": "C[C@H](N)Cc1ccccc1",
+    "score": 1.0,
+    "popcount": 19,
+    "source": "BindingDB",
+    "description": "Norepinephrine transporter"
+  },
+  {
+    "gene": "SLC6A2",
+    "target_id": "P23975",
+    "target_name": "Sodium-dependent noradrenaline transporter",
+    "smiles": "NCCc1ccc(O)c(O)c1",
+    "score": 1.0,
+    "popcount": 21,
+    "source": "ChEMBL",
+    "description": "Norepinephrine transporter"
+  }
+]

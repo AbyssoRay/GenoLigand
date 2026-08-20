@@ -5475,7 +5475,7 @@ fn md_summary_score_participates_in_ranking_and_report() {
         assert_eq!(sha256_file_hex(&path).as_deref(), Some(digest.as_str()));
     }
     assert!(ranking.contains(&candidate_id));
-    assert!(ranking.contains("0.6933\t1.0000\t0.0000\t0.0000\t0.6667\t0.7167"));
+    assert!(ranking.contains("0.8667\t1.0000\t0.0000\t0.0000\t0.6667\t0.7167"));
     assert!(ranking.contains(
         "\tsmall_molecule\tsmall_molecule_route_v1\t0.4500\t0.0000\t0.2000\t0.1500\t0.2000"
     ));
@@ -5549,7 +5549,7 @@ fn ranking_policy_digest_is_bound_to_context_decomposition_and_report() {
         "shortlist_score_semantics": "route_weights_renormalized_over_known_metagenome_structure",
         "shortlist_selection_semantics": "include_when_perfect_docking_and_md_can_reach_the_best_current_non_simulation_score_per_input_record",
         "simulation_availability_semantics": "evaluation_status_distinguishes_not_evaluated_not_ready_and_completed_zero",
-        "shortlist_score_epsilon": 0.0001,
+        "shortlist_score_epsilon": 0.02,
         "routes": {
             "small_molecule": {"ranking_policy":"small_molecule_route_v1","known_database_weight":0.45,"metagenome_weight":0.0,"structure_weight":0.20,"docking_weight":0.15,"md_weight":0.20,"preliminary_known_database_weight":0.6923076923076923,"preliminary_metagenome_weight":0.0,"preliminary_structure_weight":0.3076923076923077,"non_simulation_weight":0.65,"maximum_simulation_gain":0.35},
             "peptide": {"ranking_policy":"peptide_route_v2","known_database_weight":0.30,"metagenome_weight":0.20,"structure_weight":0.50,"docking_weight":0.0,"md_weight":0.0,"preliminary_known_database_weight":0.30,"preliminary_metagenome_weight":0.20,"preliminary_structure_weight":0.50,"non_simulation_weight":1.0,"maximum_simulation_gain":0.0},

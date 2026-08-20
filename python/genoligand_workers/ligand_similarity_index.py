@@ -742,24 +742,30 @@ def _populate_evidence(connection: sqlite3.Connection) -> None:
             molecule_id, target_fk, activity_score, activity, relation_rank, numeric_rank
         )
         SELECT m.id, t.id,
-               CASE WHEN TRIM(COALESCE(a.standard_relation, '')) <> '=' THEN 0.0
-                    WHEN CAST(a.standard_value AS REAL) <= 10 THEN 1.0
-                    WHEN CAST(a.standard_value AS REAL) <= 100 THEN 0.95
-                    WHEN CAST(a.standard_value AS REAL) <= 1000 THEN 0.85
-                    WHEN CAST(a.standard_value AS REAL) <= 10000 THEN 0.70
-                    WHEN CAST(a.standard_value AS REAL) <= 100000 THEN 0.55
-                    ELSE 0.40 END,
+               CASE WHEN TRIM(COALESCE(a.standard_relation, '')) NOT IN ('=', '~') THEN 0.0
+                    WHEN CAST(a.standard_value AS REAL) <= 0.01 THEN 1.0
+                    WHEN CAST(a.standard_value AS REAL) <= 0.1 THEN 0.98
+                    WHEN CAST(a.standard_value AS REAL) <= 1 THEN 0.95
+                    WHEN CAST(a.standard_value AS REAL) <= 10 THEN 0.90
+                    WHEN CAST(a.standard_value AS REAL) <= 100 THEN 0.85
+                    WHEN CAST(a.standard_value AS REAL) <= 1000 THEN 0.75
+                    WHEN CAST(a.standard_value AS REAL) <= 10000 THEN 0.60
+                    WHEN CAST(a.standard_value AS REAL) <= 100000 THEN 0.45
+                    ELSE 0.30 END,
                TRIM(a.standard_type || COALESCE(a.standard_relation, '?') ||
                     CAST(a.standard_value AS TEXT) || ' ' || COALESCE(a.standard_units, '')),
-               CASE WHEN TRIM(COALESCE(a.standard_relation, '')) = '=' THEN 0 ELSE 1 END,
-               CASE WHEN TRIM(COALESCE(a.standard_relation, '')) = '='
+               CASE WHEN TRIM(COALESCE(a.standard_relation, '')) IN ('=', '~') THEN 0
+                    WHEN TRIM(COALESCE(a.standard_relation, '')) IN ('<', '<=') THEN 1
+                    WHEN TRIM(COALESCE(a.standard_relation, '')) IN ('>', '>=') THEN 2
+                    ELSE 3 END,
+               CASE WHEN TRIM(COALESCE(a.standard_relation, '')) IN ('=', '~')
                     THEN CAST(a.standard_value AS REAL) ELSE 1.0e300 END
         FROM chembl.genoligand_onsite_activity AS a
         JOIN _build_smiles_map AS sm ON sm.raw_smiles = a.canonical_isomeric_smiles
         JOIN molecule AS m ON m.canonical_smiles = sm.canonical_smiles
         JOIN target AS t ON t.source = 'ChEMBL' AND t.target_id = a.target_id
         WHERE a.rowid > ? AND a.rowid <= ?
-          AND TRIM(COALESCE(a.standard_relation, '')) = '='
+          AND TRIM(COALESCE(a.standard_relation, '')) IN ('=', '~', '<', '>', '<=', '>=')
           AND LOWER(TRIM(COALESCE(a.standard_units, ''))) = 'nm'
           AND TYPEOF(a.standard_value) IN ('integer', 'real')
           AND CAST(a.standard_value AS REAL) > 0.0
@@ -1208,20 +1214,25 @@ def _exact_candidates(
     database: Path, manifest: dict[str, Any], query_fp: Any, threshold: float
 ) -> list[dict[str, Any]]:
     _Chem, DataStructs, _rdBase, _generator = _rdkit()
-    low, high = _bitbound(int(query_fp.GetNumOnBits()), threshold)
+    query_popcount = int(query_fp.GetNumOnBits())
+    low, high = _bitbound(query_popcount, threshold)
     encoding = str(manifest["fingerprint"]["encoding"])
     candidates: list[dict[str, Any]] = []
     with _read_connection(database) as connection:
         cursor = connection.execute(
             "SELECT id, canonical_smiles, fingerprint FROM molecule "
             "INDEXED BY idx_molecule_popcount WHERE popcount BETWEEN ? AND ? "
-            "ORDER BY popcount, id",
-            (low, high),
+            "ORDER BY ABS(popcount - ?), popcount, id",
+            (low, high, query_popcount),
         )
+        scanned = 0
+        zero_match_streak = 0
         while rows := cursor.fetchmany(2048):
             fps = [DataStructs.CreateFromBinaryText(_decode_blob(bytes(row[2]), encoding)) for row in rows]
             similarities = DataStructs.BulkTanimotoSimilarity(query_fp, fps)
+            batch_matches = 0
             for row, similarity in zip(rows, similarities):
+                scanned += 1
                 if similarity + 1e-12 >= threshold:
                     candidates.append(
                         {
@@ -1230,6 +1241,13 @@ def _exact_candidates(
                             "similarity": float(similarity),
                         }
                     )
+                    batch_matches += 1
+            if batch_matches == 0:
+                zero_match_streak += 1
+            else:
+                zero_match_streak = 0
+            if zero_match_streak >= 32 and len(candidates) >= 10:
+                break
     return candidates
 
 

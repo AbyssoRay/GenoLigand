@@ -766,7 +766,7 @@ const DOCKING_WORKER_TASK: WorkerTask<'static> = WorkerTask {
 };
 
 const REPORT_CANDIDATE_LIMIT: usize = 50;
-const ADAPTIVE_SHORTLIST_SCORE_EPSILON: f64 = 0.0001;
+const ADAPTIVE_SHORTLIST_SCORE_EPSILON: f64 = 0.02;
 const STRUCTURE_MATCH_TOP_K_PER_INPUT_RECORD: usize = 256;
 const MIN_STRUCTURE_MATCH_TOKEN_CHARS: usize = 3;
 const RCSB_ON_DEMAND_POLICY_SCHEMA_VERSION: &str = "genoligand_rcsb_on_demand_policy_v1";
@@ -778,6 +778,14 @@ const RCSB_ON_DEMAND_FETCH_LIMIT: usize = 12;
 const RCSB_ON_DEMAND_CACHE_MAX_BYTES: u64 = 2 * 1024 * 1024 * 1024;
 const RCSB_ON_DEMAND_CACHE_MAX_FILES: usize = 4096;
 const RCSB_ON_DEMAND_FETCH_MANIFEST: &str = "rcsb_on_demand_fetch.tsv";
+
+fn rcsb_fetch_limit() -> usize {
+    std::env::var("GENOLIGAND_RCSB_FETCH_LIMIT")
+        .ok()
+        .and_then(|value| value.trim().parse::<usize>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(RCSB_ON_DEMAND_FETCH_LIMIT)
+}
 
 #[derive(Clone, Debug)]
 struct ComputedFeatureInput {
@@ -903,11 +911,24 @@ impl RankingRoute {
         md: f64,
     ) -> f64 {
         debug_assert!((self.weight_sum() - 1.0).abs() < 1e-9);
-        (known * self.known
+        let scores = [known, metagenome, structure, docking, md];
+        let weights = [self.known, self.metagenome, self.structure, self.docking, self.md];
+        let mut active = 0.0f64;
+        for i in 0..5 {
+            if scores[i] > 0.0 {
+                active += weights[i];
+            }
+        }
+        if active <= 0.0 {
+            return 0.0;
+        }
+        let scale = 1.0 / active;
+        ((known * self.known
             + metagenome * self.metagenome
             + structure * self.structure
             + docking * self.docking
             + md * self.md)
+            * scale)
             .clamp(0.0, 1.0)
     }
 
@@ -9774,9 +9795,12 @@ def activity_relation(value):
     return "="
 
 def activity_score(value):
-    if activity_relation(value) != "=":
-        return 0.0
+    relation = activity_relation(value)
     numeric = numeric_activity(value)
+    if numeric >= 1.0e299:
+        return 0.0
+    if relation not in ("=", "~") and numeric <= 0.0:
+        return 0.0
     if numeric <= 10:
         return 1.0
     if numeric <= 100:
@@ -12985,7 +13009,7 @@ fn write_coordinate_backed_candidate_selection_impl(
             }
         } else if let Some(result) = fetch_results.get(&pdb_id) {
             result.clone()
-        } else if fetch_count == RCSB_ON_DEMAND_FETCH_LIMIT {
+        } else if fetch_count == rcsb_fetch_limit() {
             RcsbFetchResult {
                 status: "skipped".to_string(),
                 path: rcsb_coordinate_cache_path(&options.science_store, &pdb_id),

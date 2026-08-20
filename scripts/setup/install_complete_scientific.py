@@ -4913,8 +4913,14 @@ def publish_chembl_query_database(
                     td.organism AS organism,
                     md.pref_name AS compound_name,
                     act.standard_type AS standard_type,
-                    '=' AS standard_relation,
-                    act.standard_value AS standard_value,
+                    TRIM(COALESCE(act.standard_relation, '=')) AS standard_relation,
+                    CASE
+                        WHEN LOWER(TRIM(COALESCE(act.standard_units, ''))) IN ('um', 'μm', 'µm')
+                        THEN act.standard_value * 1000.0
+                        WHEN LOWER(TRIM(COALESCE(act.standard_units, ''))) = 'mm'
+                        THEN act.standard_value * 1000000.0
+                        ELSE act.standard_value
+                    END AS standard_value,
                     'nM' AS standard_units
                 FROM chembl_source.activities AS act
                 JOIN chembl_source.assays AS assay ON assay.assay_id = act.assay_id
@@ -4944,8 +4950,8 @@ def publish_chembl_query_database(
                   AND TYPEOF(act.standard_value) IN ('integer', 'real')
                   AND act.standard_value > 0.0
                   AND act.standard_value < 1.0e308
-                  AND TRIM(COALESCE(act.standard_relation, '')) = '='
-                  AND LOWER(TRIM(COALESCE(act.standard_units, ''))) = 'nm'
+                  AND TRIM(COALESCE(act.standard_relation, '')) IN ('=', '~', '<', '>', '<=', '>=')
+                  AND LOWER(TRIM(COALESCE(act.standard_units, ''))) IN ('nm', 'um', 'μm', 'µm', 'mm')
                   AND LOWER(TRIM(COALESCE(act.data_validity_comment, ''))) IN ('', 'manually validated')
                 """,
             )
