@@ -161,14 +161,14 @@ class MdScientificContractTests(unittest.TestCase):
             self.assertEqual(nearest["selected_chain_id"], "A")
             self.assertEqual(nearest["selected_chain_ordinal"], 0)
 
-    def test_md_defaults_preserve_duration_with_stable_one_femtosecond_steps(self) -> None:
+    def test_md_defaults_preserve_nanosecond_production_with_stable_one_femtosecond_steps(self) -> None:
         self.assertEqual(worker.DEFAULT_TIMESTEP_PS, 0.001)
-        self.assertEqual(worker.DEFAULT_EQUILIBRATION_STEPS * worker.DEFAULT_TIMESTEP_PS, 20.0)
+        self.assertEqual(worker.DEFAULT_EQUILIBRATION_STEPS * worker.DEFAULT_TIMESTEP_PS, 100.0)
         self.assertEqual(
             worker.DEFAULT_PRODUCTION_SEGMENTS
             * worker.DEFAULT_PRODUCTION_STEPS_PER_SEGMENT
             * worker.DEFAULT_TIMESTEP_PS,
-            100.0,
+            1000.0,
         )
         self.assertEqual(worker.DEFAULT_MINIMIZATION_ITERATIONS, 2000)
         self.assertEqual(worker.DEFAULT_SOLVENT_BOX_SHAPE, "dodecahedron")

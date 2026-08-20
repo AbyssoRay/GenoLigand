@@ -869,20 +869,14 @@ def choose_search_box(
             if component.residue_name.upper() in ligand_codes
             and component.kind not in {"water", "polymer", "additive"}
         ]
-        if len(matches) == 1:
-            ligand = matches[0]
-        elif len(matches) > 1:
-            ligand = max(matches, key=lambda c: c.heavy_atom_count)
-        else:
-            ligand = _fallback_docking_ligand(components)
+        if len(matches) != 1:
+            raise DockingNotReady("no_trusted_binding_pocket")
+        ligand = matches[0]
     else:
         matches = [component for component in components if component.kind == "ligand_candidate"]
-        if len(matches) == 1:
-            ligand = matches[0]
-        elif matches:
-            ligand = max(matches, key=lambda c: c.heavy_atom_count)
-        else:
-            ligand = _fallback_docking_ligand(components)
+        if len(matches) != 1:
+            raise DockingNotReady("no_trusted_binding_pocket")
+        ligand = matches[0]
     if ligand.key:
         excluded_key = ligand.key
         source_id = ligand.key
@@ -890,7 +884,7 @@ def choose_search_box(
     else:
         excluded_key = None
         source_id = ligand.residue_name
-        provenance = f"fallback_ligand={ligand.residue_name}"
+        provenance = f"coordinate_residue={ligand.residue_name}"
     return SearchBox(
         center=ligand.center,
         source="co_crystal_ligand",
@@ -899,20 +893,6 @@ def choose_search_box(
         excluded_component_key=excluded_key,
         contact_points=ligand.coordinates,
     )
-
-
-def _fallback_docking_ligand(components: list[ReceptorComponent]) -> ReceptorComponent:
-    candidates = [
-        component
-        for component in components
-        if component.kind not in {"water", "polymer", "additive", "standard_protein", "cofactor"}
-    ]
-    if candidates:
-        return max(candidates, key=lambda c: c.heavy_atom_count)
-    candidates = [component for component in components if component.kind != "water"]
-    if candidates:
-        return max(candidates, key=lambda c: c.heavy_atom_count)
-    raise DockingNotReady("no_trusted_binding_pocket")
 
 
 def selected_ligand_codes(selection: dict[str, str]) -> set[str]:

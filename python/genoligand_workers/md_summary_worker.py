@@ -31,12 +31,25 @@ MAX_PEPTIDE_RESIDUES = 80
 PEPTIDE_CONFORMER_COUNT = 12
 SIMULATION_SEED = 20260629
 STANDARD_AMINO_ACIDS = set("ACDEFGHIKLMNPQRSTVWY")
-DEFAULT_EQUILIBRATION_STEPS = 20000
-DEFAULT_PRODUCTION_SEGMENTS = 50
-DEFAULT_PRODUCTION_STEPS_PER_SEGMENT = 2000
+# Molecular dynamics sampling budget.
+#
+# Scientific rationale: a protein-ligand complex must be simulated for at
+# least ~1 ns of production sampling so that the ligand fully relaxes into the
+# docked pose and early pocket-reorganisation / partial dissociation events
+# are observed. The previous budget (0.1 ns) only probed sub-nanosecond
+# harmonic fluctuation and could not distinguish stable from marginal binders.
+#
+# Budget (1 fs timestep, explicit TIP3P solvent):
+#   equilibration = 100_000 steps = 100 ps
+#   production    = 100 segments x 10_000 steps = 1_000_000 steps = 1000 ps = 1 ns
+# These are the default screening-grade budget; operators may override via
+# GENOLIGAND_MD_* environment variables for deeper sampling.
+DEFAULT_EQUILIBRATION_STEPS = 100000
+DEFAULT_PRODUCTION_SEGMENTS = 100
+DEFAULT_PRODUCTION_STEPS_PER_SEGMENT = 10000
 DEFAULT_MINIMIZATION_ITERATIONS = 2000
 DEFAULT_TIMESTEP_PS = 0.001
-SHORT_MD_POLICY_ID = "short_complex_md_screen_v1"
+MD_STABILITY_POLICY_ID = "complex_md_stability_screen_v2"
 DEFAULT_SOLVENT_BOX_SHAPE = "dodecahedron"
 DEFAULT_GPU_TELEMETRY_POLL_SECONDS = 1.0
 GAS_CONSTANT_KJ_PER_MOL_K = 0.00831446261815324
@@ -1762,7 +1775,7 @@ def validate_complex_md_semantics(
     sampling_policy = manifest.get("sampling_policy")
     if (
         not isinstance(sampling_policy, dict)
-        or sampling_policy.get("policy_id") != SHORT_MD_POLICY_ID
+        or sampling_policy.get("policy_id") != MD_STABILITY_POLICY_ID
         or protocol[("sampling_policy", "policy_id")].get("value", "")
         != sampling_policy.get("policy_id")
         or protocol[("sampling_policy", "purpose")].get("value", "")
@@ -2564,7 +2577,7 @@ def build_md_sampling_policy(
 ) -> dict[str, Any]:
     production_steps = production_segments * production_steps_per_segment
     return {
-        "policy_id": SHORT_MD_POLICY_ID,
+        "policy_id": MD_STABILITY_POLICY_ID,
         "purpose": "candidate_local_stability_screen",
         "timestep_ps": timestep_ps,
         "equilibration_steps": equilibration_steps,
