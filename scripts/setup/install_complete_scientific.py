@@ -8848,7 +8848,11 @@ def sync_external_sources(
                         "target_rel_path": target_rel,
                         "status": "ready",
                         "bytes": str(evidence_bytes),
-                        "sha256": evidence_sha256,
+                        "sha256": (
+                            snapshot.get("coordinate_digest", "")
+                            if method == "rcsb_ligand_bound_scope"
+                            else evidence_sha256
+                        ),
                         "plan_digest": external_plan_digest(row),
                         "release_identity": row.get("release_or_date", ""),
                         "trust_source": row.get("trust_source", ""),
@@ -11794,6 +11798,20 @@ def migrate_ligand_source_retention(
         if row.get("derived_paths") != expected:
             row["derived_paths"] = expected
             row["notes"] = "source_payload_removed_after_verified_compact_ligand_index_publish"
+            updated += 1
+        if (
+            row.get("state") == "pruned"
+            and not retained_source_derivatives_ready(science_store, row, summary_cache)
+            and retention_source_identity_and_derivatives_ready(science_store, row, summary_cache)
+            and retention_live_payloads_match_records(science_store, row, summary_cache)
+        ):
+            # 保留记录为 pruned，但源包已被重新放回且与保留记录匹配
+            # （例如修复索引后重新下载源包）。将状态协调为待重新清理，
+            # 让后续 prune_indexed_source_payloads 重新执行清理以恢复一致性。
+            row["state"] = "pruning"
+            row["pruned_bytes"] = "0"
+            row["pruned_at"] = ""
+            row["notes"] = "source_payload_restored_after_prune_pending_recleanup"
             updated += 1
     if updated:
         write_source_retention_rows(science_store, rows)
