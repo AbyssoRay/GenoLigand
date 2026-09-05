@@ -20,7 +20,7 @@ from pathlib import Path
 from typing import Any, Iterable, Iterator
 
 
-SCHEMA_VERSION = "genoligand_ligand_similarity_index_v2"
+SCHEMA_VERSION = "genoligand_ligand_similarity_index_v3"
 FINGERPRINT_TYPE = "morgan_ecfp4"
 FINGERPRINT_RADIUS = 2
 FINGERPRINT_BITS = 2048
@@ -844,6 +844,8 @@ def _populate_evidence(connection: sqlite3.Connection) -> None:
 
 def _inspect_chembl_input(database: Path, manifest_path: Path) -> dict[str, Any]:
     payload = _validated_input_manifest(database, manifest_path)
+    if payload.get("schema_version") != "genoligand_chembl_query_database_v2":
+        raise LigandSimilarityIndexError("chembl_similarity_source_schema_invalid")
     required = {
         "canonical_isomeric_smiles",
         "target_id",
@@ -875,6 +877,8 @@ def _inspect_chembl_input(database: Path, manifest_path: Path) -> dict[str, Any]
 
 def _inspect_bindingdb_input(database: Path, manifest_path: Path) -> dict[str, Any]:
     payload = _validated_input_manifest(database, manifest_path)
+    if payload.get("schema_version") != "genoligand_bindingdb_query_database_v2":
+        raise LigandSimilarityIndexError("bindingdb_similarity_source_schema_invalid")
     required = {
         "canonical_smiles",
         "target_id",
@@ -1214,25 +1218,20 @@ def _exact_candidates(
     database: Path, manifest: dict[str, Any], query_fp: Any, threshold: float
 ) -> list[dict[str, Any]]:
     _Chem, DataStructs, _rdBase, _generator = _rdkit()
-    query_popcount = int(query_fp.GetNumOnBits())
-    low, high = _bitbound(query_popcount, threshold)
+    low, high = _bitbound(int(query_fp.GetNumOnBits()), threshold)
     encoding = str(manifest["fingerprint"]["encoding"])
     candidates: list[dict[str, Any]] = []
     with _read_connection(database) as connection:
         cursor = connection.execute(
             "SELECT id, canonical_smiles, fingerprint FROM molecule "
             "INDEXED BY idx_molecule_popcount WHERE popcount BETWEEN ? AND ? "
-            "ORDER BY ABS(popcount - ?), popcount, id",
-            (low, high, query_popcount),
+            "ORDER BY popcount, id",
+            (low, high),
         )
-        scanned = 0
-        zero_match_streak = 0
         while rows := cursor.fetchmany(2048):
             fps = [DataStructs.CreateFromBinaryText(_decode_blob(bytes(row[2]), encoding)) for row in rows]
             similarities = DataStructs.BulkTanimotoSimilarity(query_fp, fps)
-            batch_matches = 0
             for row, similarity in zip(rows, similarities):
-                scanned += 1
                 if similarity + 1e-12 >= threshold:
                     candidates.append(
                         {
@@ -1241,13 +1240,6 @@ def _exact_candidates(
                             "similarity": float(similarity),
                         }
                     )
-                    batch_matches += 1
-            if batch_matches == 0:
-                zero_match_streak += 1
-            else:
-                zero_match_streak = 0
-            if zero_match_streak >= 32 and len(candidates) >= 10:
-                break
     return candidates
 
 

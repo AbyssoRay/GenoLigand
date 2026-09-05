@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from contextlib import closing
 import csv
 import hashlib
 import json
@@ -17,7 +18,7 @@ from genoligand_workers import ligand_similarity_index as similarity
 
 class LigandSimilarityIndexTests(unittest.TestCase):
     def test_build_connection_reserves_bounded_page_cache(self) -> None:
-        with sqlite3.connect(":memory:") as connection:
+        with closing(sqlite3.connect(":memory:")) as connection, connection:
             similarity._configure_build_connection(connection)
             self.assertEqual(
                 connection.execute("PRAGMA cache_size").fetchone(),
@@ -59,7 +60,7 @@ class LigandSimilarityIndexTests(unittest.TestCase):
             })
             self.assertGreater(first["manifest"]["fingerprint"]["encoding_sample_size"], 0)
 
-            with sqlite3.connect(first["database"]) as connection:
+            with closing(sqlite3.connect(first["database"])) as connection, connection:
                 tables = {
                     row[0]
                     for row in connection.execute(
@@ -158,7 +159,7 @@ class LigandSimilarityIndexTests(unittest.TestCase):
             hot_count = 2_101
             outside_id = first_molecule_id + hot_count
             tail_count = 400
-            with sqlite3.connect(built["database"]) as connection:
+            with closing(sqlite3.connect(built["database"])) as connection, connection:
                 target_start = int(
                     connection.execute("SELECT MAX(id) FROM target").fetchone()[0]
                 ) + 1
@@ -259,7 +260,7 @@ class LigandSimilarityIndexTests(unittest.TestCase):
             threshold = 0.30
             query_fp, _canonical = similarity._fingerprint_from_smiles("CCO")
             truth: set[str] = set()
-            with sqlite3.connect(built["database"]) as connection:
+            with closing(sqlite3.connect(built["database"])) as connection, connection:
                 smiles_values = [row[0] for row in connection.execute(
                     "SELECT canonical_smiles FROM molecule ORDER BY canonical_smiles"
                 )]
@@ -279,6 +280,26 @@ class LigandSimilarityIndexTests(unittest.TestCase):
             plan = similarity.explain_candidate_query(built["database"], "CCO", threshold)
             self.assertTrue(any("idx_molecule_popcount" in row for row in plan), plan)
             self.assertFalse(any("SCAN molecule" in row for row in plan), plan)
+
+            # A later exact hit must survive a long stretch of dissimilar fingerprints.
+            streak_db = root / "streak.sqlite"
+            miss = DataStructs.ExplicitBitVect(query_fp.GetNumBits())
+            for bit in range(query_fp.GetNumBits() - query_fp.GetNumOnBits(), query_fp.GetNumBits()):
+                miss.SetBit(bit)
+            self.assertLess(DataStructs.TanimotoSimilarity(query_fp, miss), threshold)
+            fingerprints = [query_fp] * 10 + [miss] * (33 * 2048) + [query_fp]
+            with closing(sqlite3.connect(streak_db)) as connection, connection:
+                connection.execute("CREATE TABLE molecule(id INTEGER PRIMARY KEY, canonical_smiles TEXT, fingerprint BLOB, popcount INTEGER)")
+                connection.execute("CREATE INDEX idx_molecule_popcount ON molecule(popcount)")
+                connection.executemany("INSERT INTO molecule VALUES (?, ?, ?, ?)", (
+                    (i, str(i), DataStructs.BitVectToBinaryText(fp), fp.GetNumOnBits())
+                    for i, fp in enumerate(fingerprints)
+                ))
+            hits = similarity._exact_candidates(
+                streak_db, {"fingerprint": {"encoding": "rdkit_binary_text"}}, query_fp, threshold
+            )
+            self.assertEqual(len(hits), 11)
+            self.assertIn(len(fingerprints) - 1, {row["id"] for row in hits})
 
     def test_query_targets_uses_similarity_times_best_activity_and_stable_dedup(self) -> None:
         with tempfile.TemporaryDirectory(prefix="genoligand_similarity_targets_") as tmp:
@@ -313,7 +334,7 @@ class LigandSimilarityIndexTests(unittest.TestCase):
             validated_manifest = similarity._runtime_manifest(
                 built["database"], built["manifest_path"]
             )
-            with sqlite3.connect(built["database"]) as connection:
+            with closing(sqlite3.connect(built["database"])) as connection, connection:
                 molecule_id = int(
                     connection.execute(
                         "SELECT id FROM molecule WHERE canonical_smiles='CCO'"
@@ -644,7 +665,7 @@ def _write_source_databases(root: Path) -> dict[str, object]:
         ("CC(O)=N", "CHEMBL_TAUTOMER", "CHEMBL_TAUTOMER", "Tautomer target", "Homo sapiens", "Ki", "=", 30.0, "nM"),
         ("c1ccccc1", "CHEMBL_RING", "CHEMBL_RING", "Ring target", "unknown", "Kd", ">", 500.0, "nM"),
     ]
-    with sqlite3.connect(chembl) as connection:
+    with closing(sqlite3.connect(chembl)) as connection, connection:
         connection.executescript(
             """
             CREATE TABLE genoligand_onsite_activity (
@@ -681,7 +702,7 @@ def _write_source_databases(root: Path) -> dict[str, object]:
         ("CCN", "BIND_NEAR", "Binding near", "Homo sapiens", "25", "Kd (nM)", "=", 25.0, 0, 0.95, "", "", ""),
         ("CC(=O)N", "BIND_TAUTOMER", "Binding tautomer", "unknown", "50", "IC50 (nM)", "=", 50.0, 0, 0.95, "AMD", "3GHI", "3GHI"),
     ]
-    with sqlite3.connect(bindingdb) as connection:
+    with closing(sqlite3.connect(bindingdb)) as connection, connection:
         connection.executescript(
             """
             CREATE TABLE genoligand_bindingdb_activity (
@@ -718,7 +739,7 @@ def _write_source_databases(root: Path) -> dict[str, object]:
         connection.executemany(
             "INSERT INTO genoligand_bindingdb_metadata VALUES (?, ?)",
             [
-                ("schema_version", "genoligand_bindingdb_query_database_v1"),
+                ("schema_version", "genoligand_bindingdb_query_database_v2"),
                 ("source_release", source_release["bindingdb"]),
                 ("source_digest", source_digest["bindingdb"]),
             ],
@@ -754,6 +775,7 @@ def _write_source_manifest(
         json.dumps(
             {
                 "status": "ready",
+                "schema_version": f"genoligand_{'chembl' if database.name.startswith('chembl') else 'bindingdb'}_query_database_v2",
                 "database_bytes": database.stat().st_size,
                 "database_sha256": _sha256(database),
                 "source_release": release,

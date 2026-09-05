@@ -306,8 +306,10 @@ def create_chembl_fixture(root: Path) -> tuple[Path, Path, Path, Path, Path]:
             CREATE TABLE activities (assay_id INTEGER, molregno INTEGER, standard_type TEXT,
                 standard_relation TEXT, standard_value REAL, standard_units TEXT,
                 data_validity_comment TEXT);
-            CREATE TABLE assays (assay_id INTEGER, tid INTEGER);
-            CREATE TABLE target_dictionary (tid INTEGER, chembl_id TEXT, pref_name TEXT, organism TEXT);
+            CREATE TABLE assays (assay_id INTEGER, tid INTEGER, assay_type TEXT,
+                confidence_score INTEGER, relationship_type TEXT);
+            CREATE TABLE target_dictionary (tid INTEGER, chembl_id TEXT, pref_name TEXT, organism TEXT,
+                target_type TEXT);
             CREATE TABLE molecule_dictionary (molregno INTEGER, pref_name TEXT);
             CREATE TABLE compound_structures (molregno INTEGER, canonical_smiles TEXT);
             CREATE TABLE target_components (tid INTEGER, component_id INTEGER);
@@ -324,11 +326,18 @@ def create_chembl_fixture(root: Path) -> tuple[Path, Path, Path, Path, Path]:
                 (1, 9, 'IC50', '<', 5.0, 'nM', NULL),
                 (1, 10, 'IC50', '=', 5.0, NULL, NULL),
                 (1, 11, 'IC50', '=', 5.0, 'nM', 'Potential transcription error'),
-                (1, 12, 'IC50', '=', 1e999, 'nM', NULL);
-            INSERT INTO assays VALUES (1, 1), (2, 2);
+                (1, 12, 'IC50', '=', 1e999, 'nM', NULL),
+                (3, 1, 'IC50', '=', 1.0, 'nM', NULL),
+                (4, 1, 'IC50', '=', 1.0, 'nM', NULL),
+                (5, 1, 'IC50', '=', 1.0, 'nM', NULL),
+                (6, 1, 'IC50', '=', 1.0, 'nM', NULL);
+            INSERT INTO assays VALUES (1, 1, 'B', 9, 'D'), (2, 2, 'B', 9, 'D'),
+                (3, 3, 'B', 1, 'N'), (4, 1, 'F', 9, 'D'),
+                (5, 1, 'B', 8, 'H'), (6, 1, 'B', 9, 'H');
             INSERT INTO target_dictionary VALUES
-                (1, 'CHEMBL_T1', 'Target 1', 'Homo sapiens'),
-                (2, 'CHEMBL_T2', 'Target 2', 'Homo sapiens');
+                (1, 'CHEMBL_T1', 'Target 1', 'Homo sapiens', 'SINGLE PROTEIN'),
+                (2, 'CHEMBL_T2', 'Target 2', 'Homo sapiens', 'SINGLE PROTEIN'),
+                (3, 'CHEMBL_CELL', 'Cell line', 'Homo sapiens', 'CELL-LINE');
             INSERT INTO molecule_dictionary VALUES
                 (1, 'Compound 1'), (2, 'Compound 2'), (3, 'Compound 3'),
                 (4, 'Compound 4'), (5, 'Compound 5'), (6, 'Compound 6'),
@@ -340,7 +349,7 @@ def create_chembl_fixture(root: Path) -> tuple[Path, Path, Path, Path, Path]:
                 (11, 'CF'), (12, 'CS');
             INSERT INTO target_components VALUES (1, 10), (1, 11), (2, 20), (2, 21);
             INSERT INTO component_sequences VALUES
-                (10, 'P12345'), (11, 'P12345'), (20, 'P22222'), (21, 'P33333');
+                (10, 'P12345'), (11, 'P12345'), (20, 'P22222'), (21, 'P22222');
             """
         )
     archive = chembl_dir / "chembl_sqlite.tar.gz"
@@ -3584,7 +3593,9 @@ class InstallerRegressionTests(unittest.TestCase):
                 {
                     ("CCO", "P12345", "CHEMBL_T1", "IC50", "nM", "CHEMBL37", digest),
                     ("CCC", "P12345", "CHEMBL_T1", "Kd", "nM", "CHEMBL37", digest),
-                    ("CCN", "CHEMBL_T2", "CHEMBL_T2", "Ki", "nM", "CHEMBL37", digest),
+                    ("CCN", "P22222", "CHEMBL_T2", "Ki", "nM", "CHEMBL37", digest),
+                    ("CCBr", "P12345", "CHEMBL_T1", "IC50", "nM", "CHEMBL37", digest),
+                    ("CCl", "P12345", "CHEMBL_T1", "IC50", "nM", "CHEMBL37", digest),
                 },
             )
             defaults = {str(row[1]): row[4] for row in table_info}
@@ -3600,10 +3611,10 @@ class InstallerRegressionTests(unittest.TestCase):
                 query_db, query_db.with_suffix(".manifest.json"), result["source_digest"], "CHEMBL37"
             ))
             published_manifest = json.loads(query_db.with_suffix(".manifest.json").read_text(encoding="utf-8"))
-            self.assertEqual(published_manifest["schema_version"], "genoligand_chembl_query_database_v1")
+            self.assertEqual(published_manifest["schema_version"], "genoligand_chembl_query_database_v2")
             self.assertEqual(published_manifest["database_bytes"], query_db.stat().st_size)
             self.assertEqual(published_manifest["database_sha256"], installer.sha256_file(query_db))
-            self.assertEqual(published_manifest["rows"], 3)
+            self.assertEqual(published_manifest["rows"], 5)
             self.assertEqual(list(scratch.glob("chembl-query-rebuild-*")), [])
             self.assertEqual(list(chembl_dir.glob(".*.rebuild-*")), [])
             self.assertEqual(list(chembl_dir.glob(".*.backup-*")), [])

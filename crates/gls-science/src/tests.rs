@@ -4638,9 +4638,20 @@ fn bindingdb_query_index_preserves_all_source_members_without_shared_row_cap() {
         } else {
             &mut second
         };
+        let activity = match index {
+            0 => "1e5".to_string(),
+            1 => ">10".to_string(),
+            2 => "0".to_string(),
+            3 => "-1".to_string(),
+            _ => (index + 1).to_string(),
+        };
+        let accession = if matches!(index, 4 | 5) {
+            String::new()
+        } else {
+            format!("P_CCO_{index}")
+        };
         target.push_str(&format!(
-            "CCO\tethanol\tCCO target {index}\tHomo sapiens\t{}\tP_CCO_{index}\tCCO_{index}\n",
-            index + 1
+            "CCO\tethanol\tCCO target {index}\tHomo sapiens\t{activity}\t{accession}\tSHARED_LIGAND_ID\n"
         ));
         target.push_str(&format!(
             "CCN\tethylamine\tCCN target {index}\tHomo sapiens\t{}\tP_CCN_{index}\tCCN_{index}\n",
@@ -4681,6 +4692,19 @@ fn bindingdb_query_index_preserves_all_source_members_without_shared_row_cap() {
     assert_eq!(rows.iter().filter(|cols| cols[0] == "input_2").count(), 205);
     assert!(rows.iter().any(|cols| cols[2] == "P_CCO_0"));
     assert!(rows.iter().any(|cols| cols[2] == "P_CCO_204"));
+    for (index, expected) in [(0, "0.5500"), (1, "0.0000"), (2, "0.0000"), (3, "0.0000")] {
+        let row = rows
+            .iter()
+            .find(|cols| cols[2] == format!("P_CCO_{index}"))
+            .expect("activity row");
+        assert_eq!(row[6], expected);
+    }
+    let fallback_ids = rows
+        .iter()
+        .filter(|cols| cols[2].starts_with("bindingdb_target_"))
+        .map(|cols| &cols[2])
+        .collect::<BTreeSet<_>>();
+    assert_eq!(fallback_ids.len(), 2);
 
     fs::remove_dir_all(&root).expect("cleanup temp root");
 }
@@ -5475,7 +5499,7 @@ fn md_summary_score_participates_in_ranking_and_report() {
         assert_eq!(sha256_file_hex(&path).as_deref(), Some(digest.as_str()));
     }
     assert!(ranking.contains(&candidate_id));
-    assert!(ranking.contains("0.8667\t1.0000\t0.0000\t0.0000\t0.6667\t0.7167"));
+    assert!(ranking.contains("0.6933\t1.0000\t0.0000\t0.0000\t0.6667\t0.7167"));
     assert!(ranking.contains(
         "\tsmall_molecule\tsmall_molecule_route_v1\t0.4500\t0.0000\t0.2000\t0.1500\t0.2000"
     ));
@@ -5624,6 +5648,11 @@ fn ranking_routes_sum_to_one_and_ignore_inapplicable_channels() {
 
     let small_molecule = ranking_route("small_molecule");
     assert_eq!(small_molecule.metagenome, 0.0);
+    assert!(
+        small_molecule.score_components(0.8, 0.0, 0.0, 0.01, 0.0)
+            > small_molecule.score_components(0.8, 0.0, 0.0, 0.0, 0.0)
+    );
+    assert!((small_molecule.score_components(0.8, 0.0, 0.0, 0.0, 0.0) - 0.36).abs() < 1e-9);
     assert_eq!(
         small_molecule.score_components(0.8, 0.0, 0.6, 0.5, 0.4),
         small_molecule.score_components(0.8, 1.0, 0.6, 0.5, 0.4),
@@ -7549,7 +7578,7 @@ fn runtime_readiness_evidence_binds_small_manifests_without_large_database_hashe
     .expect("compact database sentinel");
     write_text(
         &ligand_similarity_dir.join("ligand_similarity.manifest.json"),
-        "{\"schema_version\":\"genoligand_ligand_similarity_index_v2\",\"status\":\"ready\"}\n",
+        "{\"schema_version\":\"genoligand_ligand_similarity_index_v3\",\"status\":\"ready\"}\n",
     )
     .expect("compact manifest");
     write_text(
@@ -7589,7 +7618,7 @@ fn runtime_readiness_evidence_binds_small_manifests_without_large_database_hashe
     write_test_science_store_readiness(&store, &[]).expect("canonical readiness");
     write_text(
         &ligand_similarity_dir.join("ligand_similarity.manifest.json"),
-        "{\"schema_version\":\"genoligand_ligand_similarity_index_v2\",\"status\":\"changed\"}\n",
+        "{\"schema_version\":\"genoligand_ligand_similarity_index_v3\",\"status\":\"changed\"}\n",
     )
     .expect("changed compact manifest");
     let stale = evaluate_science_store_readiness(&store).expect("stale readiness");
@@ -9228,7 +9257,7 @@ try:
     connection.execute("INSERT INTO evidence VALUES (1, 1, 0.9, 'Ki=12 nM', 0, 12.0)")
     connection.execute("INSERT INTO structure_hint VALUES (1, 1, 'LIG', '1ABC', '1ABC')")
     metadata = {
-        "schema_version": "genoligand_ligand_similarity_index_v2",
+        "schema_version": "genoligand_ligand_similarity_index_v3",
         "status": "ready",
         "counts": json.dumps(counts, sort_keys=True, separators=(",", ":")),
         "fingerprint": json.dumps(fingerprint, sort_keys=True, separators=(",", ":")),
@@ -9247,7 +9276,7 @@ if not 0 < output_bytes < input_bytes:
     print(f"fixture_compact_size_invalid:{output_bytes}>={input_bytes}", file=sys.stderr)
     raise SystemExit(2)
 manifest = {
-    "schema_version": "genoligand_ligand_similarity_index_v2",
+    "schema_version": "genoligand_ligand_similarity_index_v3",
     "status": "ready",
     "database": {
         "path": str(output),
@@ -11638,6 +11667,9 @@ fn scientific_score_parser_rejects_non_finite_values() {
     }
     assert_eq!(parse_finite_number("0.75"), Some(0.75));
     assert_eq!(docking_score_from_affinity("-6.0"), Some(0.5));
+    for value in ["0", "0.9", "1.0", "2.0"] {
+        assert_eq!(docking_score_from_affinity(value), Some(0.0));
+    }
 }
 
 #[test]

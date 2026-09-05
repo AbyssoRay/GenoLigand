@@ -98,7 +98,7 @@ def load_publication(database: Path) -> tuple[Path, dict[str, Any], str]:
         raise RuntimeError(f"invalid publication manifest: {error}") from error
     require(isinstance(manifest, dict), "publication manifest must be an object")
     require(
-        manifest.get("schema_version") == "genoligand_chembl_query_database_v1"
+        manifest.get("schema_version") == "genoligand_chembl_query_database_v2"
         and manifest.get("status") == "ready"
         and manifest.get("table") == TABLE,
         "publication manifest is not ready",
@@ -400,7 +400,7 @@ def write_fixture(science_store: Path) -> dict[str, str]:
     finally:
         connection.close()
     manifest = {
-        "schema_version": "genoligand_chembl_query_database_v1",
+        "schema_version": "genoligand_chembl_query_database_v2",
         "status": "ready",
         "database": str(database),
         "database_bytes": database.stat().st_size,

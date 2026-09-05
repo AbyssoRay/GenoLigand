@@ -445,7 +445,7 @@ def write_ligand_similarity_fixture(store: Path) -> None:
         connection.executemany(
             "INSERT INTO metadata VALUES (?, ?)",
             [
-                ("schema_version", "genoligand_ligand_similarity_index_v2"),
+                ("schema_version", "genoligand_ligand_similarity_index_v3"),
                 ("status", "ready"),
                 ("counts", json.dumps(counts, sort_keys=True)),
                 ("fingerprint", json.dumps(fingerprint, sort_keys=True)),
@@ -458,7 +458,7 @@ def write_ligand_similarity_fixture(store: Path) -> None:
     input_bytes = 1_000_000
     database_bytes = database.stat().st_size
     manifest = {
-        "schema_version": "genoligand_ligand_similarity_index_v2",
+        "schema_version": "genoligand_ligand_similarity_index_v3",
         "status": "ready",
         "database": {
             "path": str(database.resolve()),

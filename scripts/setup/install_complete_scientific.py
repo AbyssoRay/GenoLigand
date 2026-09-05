@@ -179,7 +179,7 @@ OPENFF_FORCEFIELD_SHA256 = "1b24deb47970bae2d179a5b4e023d4a57c9c78614fe431f1670e
 OPENFF_FORCEFIELD_RELEASE = "openff-forcefields-2024.09.0"
 ALIGNMENT_MANIFEST_SCHEMA_VERSION = "genoligand_alignment_database_manifest_v2"
 SCIENCE_READINESS_SCHEMA_VERSION = "genoligand_science_store_readiness_v1"
-LIGAND_SIMILARITY_SCHEMA_VERSION = "genoligand_ligand_similarity_index_v2"
+LIGAND_SIMILARITY_SCHEMA_VERSION = "genoligand_ligand_similarity_index_v3"
 LIGAND_SIMILARITY_DATABASE_REL_PATH = "indexes/ligand_similarity/ligand_similarity.sqlite"
 LIGAND_SIMILARITY_MANIFEST_REL_PATH = "indexes/ligand_similarity/ligand_similarity.manifest.json"
 LIGAND_SIMILARITY_STANDARDIZATION = (
@@ -4677,7 +4677,7 @@ def chembl_query_database_ready(
 ) -> bool:
     payload = read_json_object(manifest)
     if (
-        payload.get("schema_version") != "genoligand_chembl_query_database_v1"
+        payload.get("schema_version") != "genoligand_chembl_query_database_v2"
         or payload.get("status") != "ready"
         or payload.get("source_digest") != source_digest
         or payload.get("source_release") != source_release
@@ -4945,6 +4945,10 @@ def publish_chembl_query_database(
                 WHERE cs.canonical_smiles IS NOT NULL
                   AND TRIM(cs.canonical_smiles) <> ''
                   AND td.chembl_id IS NOT NULL
+                  AND td.target_type = 'SINGLE PROTEIN'
+                  AND assay.assay_type = 'B'
+                  AND assay.confidence_score = 9
+                  AND assay.relationship_type = 'D'
                   AND act.standard_type IN ('Ki', 'Kd', 'IC50', 'EC50')
                   AND act.standard_value IS NOT NULL
                   AND TYPEOF(act.standard_value) IN ('integer', 'real')
@@ -4980,7 +4984,7 @@ def publish_chembl_query_database(
             if connection.execute("PRAGMA quick_check").fetchone() != ("ok",):
                 raise sqlite3.DatabaseError("chembl query database quick_check failed")
         payload = {
-            "schema_version": "genoligand_chembl_query_database_v1",
+            "schema_version": "genoligand_chembl_query_database_v2",
             "status": "ready",
             "database": str(database),
             "database_bytes": staging_database.stat().st_size,
@@ -5206,7 +5210,7 @@ def bindingdb_query_database_ready(
     try:
         database_summary = resource_payload_summary(database, cache=summary_cache)
         return bool(
-            payload.get("schema_version") == "genoligand_bindingdb_query_database_v1"
+            payload.get("schema_version") == "genoligand_bindingdb_query_database_v2"
             and payload.get("status") == "ready"
             and payload.get("table") == "genoligand_bindingdb_activity"
             and type(payload.get("rows")) is int

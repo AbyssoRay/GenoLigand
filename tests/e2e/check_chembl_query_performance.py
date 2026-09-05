@@ -112,7 +112,7 @@ def measure(
         raise RuntimeError(f"invalid publication manifest: {error}") from error
     require(isinstance(manifest, dict), "publication manifest must be an object")
     require(
-        manifest.get("schema_version") == "genoligand_chembl_query_database_v1"
+        manifest.get("schema_version") == "genoligand_chembl_query_database_v2"
         and manifest.get("status") == "ready"
         and manifest.get("table") == "genoligand_onsite_activity",
         "publication manifest is not ready",

@@ -33,17 +33,17 @@ const ALIGNMENT_DATABASE_MANIFEST_SCHEMA_VERSION: &str =
 const SOURCE_ROW_BATCH_SIZE: usize = 512;
 const RANKING_POLICY_VERSION: &str = "genoligand_target_ranking_v4";
 const SCIENCE_READINESS_SCHEMA_VERSION: &str = "genoligand_science_store_readiness_v1";
-const CHEMBL_QUERY_MANIFEST_SCHEMA_VERSION: &str = "genoligand_chembl_query_database_v1";
+const CHEMBL_QUERY_MANIFEST_SCHEMA_VERSION: &str = "genoligand_chembl_query_database_v2";
 const CHEMBL_QUERY_MANIFEST_REL_PATH: &str = "downloads/chembl/chembl_query.manifest.json";
 const SOURCE_RETENTION_SCHEMA_VERSION: &str = "genoligand_source_retention_v1";
-const BINDINGDB_QUERY_MANIFEST_SCHEMA_VERSION: &str = "genoligand_bindingdb_query_database_v1";
+const BINDINGDB_QUERY_MANIFEST_SCHEMA_VERSION: &str = "genoligand_bindingdb_query_database_v2";
 const BINDINGDB_QUERY_DATABASE_REL_PATH: &str = "indexes/bindingdb/bindingdb_query.sqlite";
 const BINDINGDB_QUERY_MANIFEST_REL_PATH: &str = "indexes/bindingdb/bindingdb_query.manifest.json";
 const LIGAND_SIMILARITY_DATABASE_REL_PATH: &str =
     "indexes/ligand_similarity/ligand_similarity.sqlite";
 const LIGAND_SIMILARITY_MANIFEST_REL_PATH: &str =
     "indexes/ligand_similarity/ligand_similarity.manifest.json";
-const LIGAND_SIMILARITY_SCHEMA_VERSION: &str = "genoligand_ligand_similarity_index_v2";
+const LIGAND_SIMILARITY_SCHEMA_VERSION: &str = "genoligand_ligand_similarity_index_v3";
 const STRUCTURE_TARGETS_MANIFEST_REL_PATH: &str = "indexes/structure_targets.manifest.json";
 const STRUCTURE_TARGETS_MANIFEST_SCHEMA_VERSION: &str =
     "genoligand_structure_targets_publication_v2";
@@ -911,24 +911,11 @@ impl RankingRoute {
         md: f64,
     ) -> f64 {
         debug_assert!((self.weight_sum() - 1.0).abs() < 1e-9);
-        let scores = [known, metagenome, structure, docking, md];
-        let weights = [self.known, self.metagenome, self.structure, self.docking, self.md];
-        let mut active = 0.0f64;
-        for i in 0..5 {
-            if scores[i] > 0.0 {
-                active += weights[i];
-            }
-        }
-        if active <= 0.0 {
-            return 0.0;
-        }
-        let scale = 1.0 / active;
-        ((known * self.known
+        (known * self.known
             + metagenome * self.metagenome
             + structure * self.structure
             + docking * self.docking
             + md * self.md)
-            * scale)
             .clamp(0.0, 1.0)
     }
 
@@ -2273,7 +2260,7 @@ try:
         if not columns.issubset(actual):
             raise RuntimeError(f"ligand_similarity_columns_missing:{table}")
     metadata = dict(connection.execute("SELECT key, value FROM metadata"))
-    if metadata.get("schema_version") != "genoligand_ligand_similarity_index_v2":
+    if metadata.get("schema_version") != "genoligand_ligand_similarity_index_v3":
         raise RuntimeError("ligand_similarity_metadata_schema_invalid")
     if metadata.get("status") != "ready":
         raise RuntimeError("ligand_similarity_metadata_status_invalid")
@@ -9753,7 +9740,9 @@ fn append_ligand_similarity_matches<W: Write>(
 fn bindingdb_query_build_script() -> &'static str {
     r#"
 import csv
+import hashlib
 import json
+import math
 import os
 import sqlite3
 import sys
@@ -9774,18 +9763,15 @@ def first(row, names):
 
 def numeric_activity(value):
     text = clean(value).replace(",", "")
-    number = []
-    seen_digit = False
-    for ch in text:
-        if ch.isdigit() or ch == ".":
-            number.append(ch)
-            seen_digit = True
-        elif seen_digit:
+    for relation in ("<=", ">=", "<", ">", "~", "="):
+        if text.startswith(relation):
+            text = text[len(relation):].strip()
             break
     try:
-        return float("".join(number)) if number else 1e300
+        numeric = float(text)
     except ValueError:
         return 1e300
+    return numeric if math.isfinite(numeric) and 0.0 < numeric < 1e300 else 1e300
 
 def activity_relation(value):
     text = clean(value).lstrip()
@@ -9795,11 +9781,10 @@ def activity_relation(value):
     return "="
 
 def activity_score(value):
-    relation = activity_relation(value)
+    if activity_relation(value) != "=":
+        return 0.0
     numeric = numeric_activity(value)
     if numeric >= 1.0e299:
-        return 0.0
-    if relation not in ("=", "~") and numeric <= 0.0:
         return 0.0
     if numeric <= 10:
         return 1.0
@@ -9889,11 +9874,13 @@ try:
                     target_id = first(row, [
                         "UniProt (SwissProt) Primary ID of Target Chain 1",
                         "UniProt (TrEMBL) Primary ID of Target Chain 1",
-                        "BindingDB MonomerID",
-                        "Target Name",
                     ])
                     if not target_id:
-                        continue
+                        sequence = first(row, ["BindingDB Target Chain Sequence 1"])
+                        if not target_name and not sequence:
+                            continue
+                        identity = json.dumps([target_name, organism, "".join(sequence.split()).upper()], ensure_ascii=False, separators=(",", ":"))
+                        target_id = "bindingdb_target_" + hashlib.sha256(identity.encode("utf-8")).hexdigest()
                     if not target_name:
                         target_name = target_id
                     activity_names = ["Ki (nM)", "IC50 (nM)", "Kd (nM)", "EC50 (nM)"]
@@ -9941,7 +9928,7 @@ try:
         "ON genoligand_bindingdb_activity(compact_smiles)"
     )
     metadata = {
-        "schema_version": "genoligand_bindingdb_query_database_v1",
+        "schema_version": "genoligand_bindingdb_query_database_v2",
         "source_digest": source_digest,
         "source_release": source_release,
         "source_archive_sha256": source_archive_sha256,
@@ -10090,7 +10077,7 @@ try:
             "SELECT key, value FROM genoligand_bindingdb_metadata"
         ))
         if (
-            metadata.get("schema_version") != "genoligand_bindingdb_query_database_v1"
+            metadata.get("schema_version") != "genoligand_bindingdb_query_database_v2"
             or metadata.get("source_digest") != source_digest
             or metadata.get("source_release") != source_release
         ):
@@ -17280,13 +17267,7 @@ fn sdf_pose_content_valid(text: &str) -> bool {
 
 fn docking_score_from_affinity(value: &str) -> Option<f64> {
     let raw = parse_finite_number(value)?;
-    if (0.0..=1.0).contains(&raw) {
-        Some(clamp_score(raw))
-    } else if raw < 0.0 {
-        Some(clamp_score((-raw) / 12.0))
-    } else {
-        None
-    }
+    Some(clamp_score((-raw) / 12.0))
 }
 
 fn apply_md_scores(candidates: &mut [Candidate], options: &ScienceOptions) -> Result<(), String> {
@@ -19647,10 +19628,6 @@ where
     );
     let smiles_idx = find_header(headers, &["Ligand SMILES", "SMILES", "Ligand Smiles"]);
     let ligand_name_idx = find_header(headers, &["Ligand Name", "Name", "Compound Name"]);
-    let monomer_idx = find_header(
-        headers,
-        &["BindingDB MonomerID", "MonomerID", "Target MonomerID"],
-    );
     let swiss_idx = find_header(
         headers,
         &[
@@ -19698,12 +19675,17 @@ where
         let smiles = cell(&cols, smiles_idx);
         let ligand_name = cell(&cols, ligand_name_idx);
         let uniprot = first_nonempty(&[cell(&cols, swiss_idx), cell(&cols, trembl_idx)]);
-        let monomer = cell(&cols, monomer_idx);
-        let target_id = first_nonempty(&[uniprot.clone(), monomer.clone(), target_name.clone()]);
-        let target_id = if target_id.is_empty() {
-            format!("BINDINGDB_{}", stable_hash(&sequence))
+        let target_id = if uniprot.is_empty() {
+            let sequence_identity = sequence
+                .split_whitespace()
+                .collect::<String>()
+                .to_uppercase();
+            format!(
+                "bindingdb_target_{}",
+                canonical_json_sha256(&json!([target_name, organism, sequence_identity]))
+            )
         } else {
-            safe_id(&target_id)
+            safe_id(&uniprot)
         };
         let target_name = if target_name.is_empty() {
             target_id.clone()
